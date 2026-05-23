@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# The default token is read-only; the release job widens it to exactly
+# what publishing a GitHub release and signing its provenance need.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release and upload assets
+      id-token: write # sign the build-provenance attestation
+      attestations: write # record the build-provenance attestation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # GoReleaser derives the changelog from the commit history.
+          fetch-depth: 0
+
+      # The release build uses the latest stable Go so published binaries
+      # get the newest compiler; CI pins go.mod's version. The same Go
+      # also satisfies tools/go.mod, which `go tool` resolves GoReleaser
+      # against.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build and publish the release
+        run: make release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Record a build-provenance attestation for every release asset
+      # GoReleaser produced, so consumers can cryptographically verify
+      # that an artifact was built by this workflow from this commit
+      # (gh attestation verify <file> --repo goccy/wasm2go).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+            dist/*.apk
+            dist/checksums.txt

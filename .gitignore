@@ -27,6 +27,16 @@ go.work.sum
 # env file
 .env
 
+# wasm2go CLI binary built at repo root
+/wasm2go
+
+# `make build` output and GoReleaser dist
+/bin/
+/dist/
+
+# Claude Code session artifacts
+/.claude/
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -1,0 +1,33 @@
+name: Release test
+
+# Exercises the release pipeline on every pull request and main push
+# without publishing: it validates the GoReleaser configuration and
+# runs a publish-free dry-run build, so a broken release is caught on
+# the pull request rather than at tag time.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # GoReleaser is a tools/go.mod tool; install the Go version that
+      # module pins so `go tool -modfile=tools/go.mod` can build it.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+
+      - name: Validate the GoReleaser configuration
+        run: make release/check
