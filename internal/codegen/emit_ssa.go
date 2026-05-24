@@ -541,6 +541,24 @@ func computeHoist(f *ssa.Func, usage map[ssa.ValueID]int) map[ssa.ValueID]bool {
 			}
 		}
 	}
+	// Force-hoist the VALUE side of every narrowing store
+	// (i32.store8 / i32.store16 / i64.store32 / i64.store16 / i64.store8).
+	// The inline emitter renders these as `*(*uint8)(...) = uint8(vN)`,
+	// and the truncating cast must be a runtime conversion — an inlined
+	// constant operand like `uint8(int32(255))` would trip Go's
+	// compile-time constant-overflow check. Hoisting args[1] guarantees
+	// the operand is always a typed local variable.
+	for _, blk := range f.Blocks {
+		for _, v := range blk.Values {
+			spec, ok := storeSpec(v)
+			if !ok || spec.elemType == spec.valSrcType {
+				continue
+			}
+			if len(v.Args) >= 2 && v.Args[1] != nil {
+				hoist[v.Args[1].ID] = true
+			}
+		}
+	}
 	return hoist
 }
 
@@ -648,20 +666,13 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		}
 		return &ast.CallExpr{Fun: em.helperRef("memoryGrow"), Args: []ast.Expr{newID("m"), delta}}, nil
 	}
-	// Bulk-memory ops have a Mem result type; they're emitted as
-	// statements via emitSideEffectStmt, but if emitOp is reached we
-	// still need a placeholder expression. emitSideEffectStmt handles
-	// the real emission below.
-	if helper, isLoad, ok := memoryHelperTyped(v); ok && isLoad {
-		base, err := emit(v.Args[0])
-		if err != nil {
-			return nil, err
-		}
-		em.useHelper(helper)
-		return &ast.CallExpr{
-			Fun:  em.helperRef(helper),
-			Args: []ast.Expr{newID("m"), base, uintLit(uint64(v.AuxInt))},
-		}, nil
+	// Inline memory loads: emit the unsafe deref expression directly
+	// rather than calling a helper. See emit_memops.go for the per-
+	// function PC-budget rationale. Both structured and goto-form
+	// paths reach here through emitOp, so the inline form is uniform
+	// across the whole transpiler output.
+	if _, ok := loadSpec(v); ok {
+		return em.emitMemLoadExpr(v, emit)
 	}
 	if tok, mode, ok := binarySSAOp(v.Op); ok {
 		lhs, err := emit(v.Args[0])
@@ -689,10 +700,14 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 }
 
 // emitSideEffectStmt dispatches a side-effecting SSA value to its
-// statement form: store helper, global assignment, or call statement.
+// statement form: inline memory store, global assignment, or call
+// statement.
 func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) (ast.Stmt, error) {
-	if _, isLoad, ok := memoryHelper(v.Op); ok && !isLoad {
-		return em.emitStoreStmt(v, emit)
+	if _, ok := storeSpec(v); ok {
+		// Inline store, one-liner: `*(*T)(unsafe.Add(...)) = T(vN)`.
+		// computeHoist guarantees narrowing-store values are hoisted
+		// so the cast is always runtime-safe. See emit_memops.go.
+		return em.emitMemStoreStmt(v, emit)
 	}
 	switch v.Op {
 	case ssa.OpGlobalSet:
@@ -869,29 +884,6 @@ func (em *ssaEmitter) emitCallIndirect(v *ssa.Value, emit func(*ssa.Value) (ast.
 	return &ast.CallExpr{Fun: asserted, Args: args}, nil
 }
 
-// emitStoreStmt produces the Go-statement form of a memory store. Stores
-// are side-effecting and never have users, so they are emitted as
-// expression statements in their defining block.
-func (em *ssaEmitter) emitStoreStmt(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) (ast.Stmt, error) {
-	helper, isLoad, ok := memoryHelperTyped(v)
-	if !ok || isLoad {
-		return nil, fmt.Errorf("emitStoreStmt: not a store op: %v", v.Op)
-	}
-	base, err := emit(v.Args[0])
-	if err != nil {
-		return nil, err
-	}
-	value, err := emit(v.Args[1])
-	if err != nil {
-		return nil, err
-	}
-	em.useHelper(helper)
-	return &ast.ExprStmt{X: &ast.CallExpr{
-		Fun:  em.helperRef(helper),
-		Args: []ast.Expr{newID("m"), base, uintLit(uint64(v.AuxInt)), value},
-	}}, nil
-}
-
 // useHelper registers a helper name with the translator (if bound) so
 // the helper's source is included in the output's helpers section.
 // nil translator (unit tests) silently no-ops.
@@ -902,6 +894,15 @@ func (em *ssaEmitter) useHelper(name string) {
 	em.t.useHelper(name)
 }
 
+// useImport registers a Go import package with the translator (if
+// bound). nil translator (unit tests) silently no-ops.
+func (em *ssaEmitter) useImport(pkg string) {
+	if em.t == nil {
+		return
+	}
+	em.t.use(pkg)
+}
+
 // helperRef returns the AST expression naming the helper, qualified for
 // multi-package mode (base.Mload32) or bare for single-package mode.
 // Falls back to bare identifier when translator is nil (tests).
@@ -910,92 +911,6 @@ func (em *ssaEmitter) helperRef(name string) ast.Expr {
 		return newID(name)
 	}
 	return em.t.helperRef(name)
-}
-
-// memoryHelper maps an SSA load/store op to the helper-function name
-// emitted at the call site. Both the SSA op AND the value type matter
-// because wasm has distinct ops for i32.store8 (4→1 byte truncating
-// store of an i32 value) and i64.store8 (8→1 byte truncating store of
-// an i64 value); they use different Go helpers because the value
-// argument type differs.
-//
-// For loads, the result type drives helper choice. For stores, the
-// type of the value argument (args[1]) drives it.
-func memoryHelper(op ssa.Op) (name string, isLoad bool, ok bool) {
-	// Default mapping based on op alone; callers that need value-type
-	// distinction should use memoryHelperTyped.
-	switch op {
-	case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
-		ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
-		ssa.OpLoadF32, ssa.OpLoadF64:
-		return "", true, true
-	case ssa.OpStore8, ssa.OpStore16, ssa.OpStore32, ssa.OpStore64,
-		ssa.OpStoreF32, ssa.OpStoreF64:
-		return "", false, true
-	}
-	return "", false, false
-}
-
-// memoryHelperTyped is the type-aware variant. It returns the helper
-// name that matches the value's bit-width / signedness — picking
-// e.g. mload8u (i32 result) vs mload64_8u (i64 result).
-func memoryHelperTyped(v *ssa.Value) (name string, isLoad bool, ok bool) {
-	switch v.Op {
-	case ssa.OpLoad8U:
-		if v.Type == ssa.TypeI64 {
-			return "mload64_8u", true, true
-		}
-		return "mload8u", true, true
-	case ssa.OpLoad8S:
-		if v.Type == ssa.TypeI64 {
-			return "mload64_8s", true, true
-		}
-		return "mload8s", true, true
-	case ssa.OpLoad16U:
-		if v.Type == ssa.TypeI64 {
-			return "mload64_16u", true, true
-		}
-		return "mload16u", true, true
-	case ssa.OpLoad16S:
-		if v.Type == ssa.TypeI64 {
-			return "mload64_16s", true, true
-		}
-		return "mload16s", true, true
-	case ssa.OpLoad32:
-		return "mload32", true, true
-	case ssa.OpLoad32U:
-		return "mload64_32u", true, true
-	case ssa.OpLoad32S:
-		return "mload64_32s", true, true
-	case ssa.OpLoad64:
-		return "mload64", true, true
-	case ssa.OpLoadF32:
-		return "mloadF32", true, true
-	case ssa.OpLoadF64:
-		return "mloadF64", true, true
-	case ssa.OpStore8:
-		if len(v.Args) >= 2 && v.Args[1].Type == ssa.TypeI64 {
-			return "mstore8_64", false, true
-		}
-		return "mstore8", false, true
-	case ssa.OpStore16:
-		if len(v.Args) >= 2 && v.Args[1].Type == ssa.TypeI64 {
-			return "mstore16_64", false, true
-		}
-		return "mstore16", false, true
-	case ssa.OpStore32:
-		if len(v.Args) >= 2 && v.Args[1].Type == ssa.TypeI64 {
-			return "mstore32_64", false, true
-		}
-		return "mstore32", false, true
-	case ssa.OpStore64:
-		return "mstore64", false, true
-	case ssa.OpStoreF32:
-		return "mstoreF32", false, true
-	case ssa.OpStoreF64:
-		return "mstoreF64", false, true
-	}
-	return "", false, false
 }
 
 func goConstI32(n int32) ast.Expr {
