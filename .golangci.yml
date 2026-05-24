@@ -1,0 +1,26 @@
+version: "2"
+
+run:
+  timeout: 30m
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - testdata
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

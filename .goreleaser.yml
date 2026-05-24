@@ -1,0 +1,54 @@
+---
+version: 2
+project_name: wasm2go
+
+builds:
+  - main: ./cmd/wasm2go
+    binary: wasm2go
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+nfpms:
+  - file_name_template: >-
+      {{ .ProjectName }}_{{ .Version }}-1_{{ .Arch }}
+    homepage: https://github.com/goccy/wasm2go
+    maintainer: "Masaaki Goshima <goccy54@gmail.com>"
+    description: WebAssembly-to-Go ahead-of-time transpiler — turns a .wasm into standalone Go source
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  prerelease: auto

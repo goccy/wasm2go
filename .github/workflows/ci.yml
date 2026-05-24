@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# CI only reads the repository; grant the minimum token scope.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # The test suite uses wat2wasm (from WebAssembly's wabt toolkit)
+      # to compile testdata/*.wat fixtures on demand.
+      - name: Install wat2wasm
+        run: make install/wat2wasm
+
+      - name: Build
+        run: make build
+
+      - name: Vet
+        run: make vet
+
+      - name: Test with coverage
+        run: make test-cover
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # golangci-lint is a tools/go.mod tool; install the Go version
+      # that module pins so `go tool -modfile=tools/go.mod` can build it.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+
+      - name: Lint
+        run: make lint
