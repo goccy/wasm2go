@@ -277,7 +277,7 @@ func TestMatrixMultiPackage(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run("multi/"+c.fx, func(t *testing.T) {
-			restore := codegen.SetMultiPackageThresholdForTest(c.chunk)
+			restore := codegen.SetMultiPackageThreshold(c.chunk)
 			defer restore()
 			mod := readFixture(t, c.fx)
 			translateMultiToDir(t, mod, codegen.Options{
@@ -291,7 +291,7 @@ func TestMatrixMultiPackage(t *testing.T) {
 // on: data segments must be written as sidecar files referenced by the main
 // package via //go:embed.
 func TestMultiPackageDataSidecar(t *testing.T) {
-	restore := codegen.SetMultiPackageThresholdForTest(64)
+	restore := codegen.SetMultiPackageThreshold(64)
 	defer restore()
 	mod := readFixture(t, "memory.wasm")
 	res, err := codegen.Translate(nil, mod, codegen.Options{

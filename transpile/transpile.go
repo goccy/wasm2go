@@ -74,3 +74,25 @@ func Transpile(r io.Reader, w io.Writer, opts Options) (Result, error) {
 	}
 	return Translate(w, m, opts)
 }
+
+// SetMultiPackageThreshold overrides the auto-multi-package decision
+// threshold to b bytes for the rest of the current process. Pass 0 to
+// always select the multi-package + linkname-split layout regardless
+// of wasm size; pass -1 to restore the default (auto-derived from
+// wasm size). The returned closure restores the previous value and
+// should be invoked via defer:
+//
+//	defer transpile.SetMultiPackageThreshold(0)()
+//
+// Subprocess invocations of wasm2go (e.g. a wasm2go-using protoc
+// plugin spawned by buf generate) can override the threshold through
+// the WASM2GO_MULTIPACKAGE_THRESHOLD environment variable; the
+// in-process override takes priority when both are set.
+//
+// The defaults are auto-derived from wasm size and most callers
+// should not touch this. The override is supported for diagnostics,
+// build-time memory tuning, and exercising the multi-package path on
+// small fixtures in tests.
+func SetMultiPackageThreshold(b int) func() {
+	return codegen.SetMultiPackageThreshold(b)
+}

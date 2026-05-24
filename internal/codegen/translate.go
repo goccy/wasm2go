@@ -27,12 +27,53 @@ import (
 // auto-derive the multi-package layout with chunks of the same size.
 const defaultMultiPackageThreshold = 1 << 20 // 1 MiB
 
-// multiPackageThresholdOverride is a test-only hook that lets the
-// codegen test suite force multi-package + linkname-split output on
-// fixtures smaller than the production threshold. Production code
-// must NEVER set this — the public API has no knob for it. Modify
-// only via withMultiPackageThreshold in tests.
+// multiPackageThresholdOverride lets callers override the auto-derived
+// threshold above which Translate switches to the multi-package +
+// linkname-split layout. -1 means "unset; fall back to the env var or
+// the default". The defaults are auto-derived from wasm size and most
+// callers should not touch this — but for diagnostics, build-time
+// memory tuning, and exercising the multi-package path on small
+// fixtures in tests, the override is a supported escape hatch.
+//
+// Modify in-process via SetMultiPackageThreshold; from a subprocess
+// (e.g. a wasm2go-using protoc plugin invoked by buf generate), set
+// the WASM2GO_MULTIPACKAGE_THRESHOLD environment variable. The
+// in-process override takes priority when both are set.
 var multiPackageThresholdOverride = -1
+
+// currentMultiPackageThreshold resolves the active byte budget. The
+// in-process override wins; otherwise the env-var fallback is parsed;
+// otherwise the production default is used.
+func currentMultiPackageThreshold() int {
+	if multiPackageThresholdOverride >= 0 {
+		return multiPackageThresholdOverride
+	}
+	if env := os.Getenv("WASM2GO_MULTIPACKAGE_THRESHOLD"); env != "" {
+		if b, err := strconv.Atoi(env); err == nil && b >= 0 {
+			return b
+		}
+	}
+	return defaultMultiPackageThreshold
+}
+
+// SetMultiPackageThreshold overrides the auto-multi-package decision
+// threshold to b bytes for the rest of the current process. Pass 0 to
+// always select the multi-package + linkname-split layout regardless
+// of wasm size; pass -1 to restore the default (auto-derived from
+// wasm size). The returned closure restores the previous value and
+// should be invoked via defer:
+//
+//	defer codegen.SetMultiPackageThreshold(0)()
+//
+// The defaults are auto-derived and most callers should not touch
+// this. The override is supported for diagnostics, build-time memory
+// tuning, and exercising the multi-package path on small fixtures in
+// tests.
+func SetMultiPackageThreshold(b int) func() {
+	prev := multiPackageThresholdOverride
+	multiPackageThresholdOverride = b
+	return func() { multiPackageThresholdOverride = prev }
+}
 
 // Options controls code generation.
 //
@@ -134,10 +175,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	for i := range m.Functions {
 		totalBodyBytes += len(m.Functions[i].Body)
 	}
-	threshold := defaultMultiPackageThreshold
-	if multiPackageThresholdOverride >= 0 {
-		threshold = multiPackageThresholdOverride
-	}
+	threshold := currentMultiPackageThreshold()
 	autoMultiPackage := totalBodyBytes > threshold
 
 	t := &translator{

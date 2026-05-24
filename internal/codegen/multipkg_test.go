@@ -16,7 +16,7 @@ import (
 // and runs `go build ./...` against the emitted module to catch any
 // import-block / linkname-forward drift.
 func TestMultiPackageBuildsAndCompiles(t *testing.T) {
-	restore := codegen.SetMultiPackageThresholdForTest(0)
+	restore := codegen.SetMultiPackageThreshold(0)
 	defer restore()
 	for _, fx := range []string{"arith.wasm", "wexports.wasm", "cg_wasi.wasm", "cg_indirect.wasm"} {
 		fx := fx
@@ -66,7 +66,7 @@ func TestMultiPackageBuildsAndCompiles(t *testing.T) {
 //   - reference //go:linkname for cross-chunk dispatch;
 //   - compile cleanly under `go build ./...`.
 func TestMultiPackageAutoDerive(t *testing.T) {
-	restore := codegen.SetMultiPackageThresholdForTest(0)
+	restore := codegen.SetMultiPackageThreshold(0)
 	defer restore()
 	for _, fx := range []string{"arith.wasm", "memory.wasm", "control.wasm", "cg_wasi.wasm", "wexports.wasm", "cg_indirect.wasm"} {
 		fx := fx
