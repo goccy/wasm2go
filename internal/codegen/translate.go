@@ -1483,11 +1483,11 @@ func parseBulkExportName(name, prefix string) (int32, int32, bool) {
 			return 0, 0, false
 		}
 	}
-	svc, err := strconv.Atoi(svcStr)
+	svc, err := strconv.ParseInt(svcStr, 10, 32)
 	if err != nil || svc < 0 {
 		return 0, 0, false
 	}
-	mt, err := strconv.Atoi(mtStr)
+	mt, err := strconv.ParseInt(mtStr, 10, 32)
 	if err != nil || mt < 0 {
 		return 0, 0, false
 	}
