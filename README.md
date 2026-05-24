@@ -55,6 +55,18 @@ native `wasi_snapshot_preview1`, multi-package + linkname-split for
 large modules) is auto-derived from the input. There is no caller-
 visible knob for any of those decisions.
 
+### WASI support
+
+When the input wasm imports `wasi_snapshot_preview1`, `wasm2go` emits
+a native Go implementation of every preview1 call alongside the
+translated module. The implementation is one self-contained file
+that only uses Go's standard library (`os`, `time`, `syscall`,
+`net`) — there is no platform-specific file split and no third-party
+dependency, so generated output builds for every `GOOS` Go supports
+(linux, darwin, freebsd, netbsd, openbsd, dragonfly, solaris,
+illumos, aix, windows) without any extra wiring on the consumer
+side.
+
 ## Library usage
 
 The translator is also importable as a library via the
@@ -89,6 +101,38 @@ func main() {
 inspect the parsed `Module` between the two steps. See the
 `transpile.Options` documentation for the full set of knobs; they
 mirror the CLI flags above.
+
+## Performance
+
+Generated Go runs natively, so there is no wasm interpreter on the
+hot path. The win shows up most in two places:
+
+- **Cold start** — no JIT / AOT compilation step at program startup.
+- **Per-call overhead** — calls into the module are ordinary Go
+  function calls; no host-↔-guest boundary crossing.
+
+A representative measurement against an equivalent
+wazero-driven build of the same wasm module (the GoogleSQL parser,
+~13 MB wasm, 22 SQL benchmark queries; macOS / Apple Silicon;
+`go test -bench=. -benchtime=200ms`):
+
+| Workload | wazero | wasm2go | Speedup |
+|---|---:|---:|---:|
+| One-time wasm cold compile | 4.67 s | **0.56 s** | **8.4×** |
+| `select_constant` (trivial scalar) | 49.3 µs | **2.7 µs** | **18×** |
+| `rank_dense_rank` (window) | 220 ms | **8.4 ms** | **26×** |
+| `lag_lead` (window) | 229 ms | **10.0 ms** | **23×** |
+| `json_extract_pipeline` | 878 ms | **10.8 ms** | **81×** |
+| `q1_lineitem_pricing_summary` (TPC-H, ~64 ms scan) | **64.2 ms** | 68.2 ms | 0.94× |
+| `q3_shipping_priority` (TPC-H, ~34 s scan) | **33.9 s** | 37.3 s | 0.91× |
+
+wasm2go wins by large factors on short queries (call-boundary
+overhead dominates the wazero path), and is within ±10% on the
+long scan-heavy TPC-H queries where the inner loop work dominates
+the boundary.
+
+Memory allocations per call drop in proportion (e.g. `select_constant`:
+76 → 41 allocs/op, 2.2 KB → 1.3 KB per query).
 
 ## Development
 
