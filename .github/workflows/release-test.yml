@@ -22,12 +22,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      # GoReleaser is a tools/go.mod tool; install the Go version that
-      # module pins so `go tool -modfile=tools/go.mod` can build it.
+      # Match the release job: build with the latest stable Go so the
+      # GoReleaser dry-run validates against the same toolchain the
+      # publish step will use at tag time.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: tools/go.mod
+          go-version: stable
 
       - name: Validate the GoReleaser configuration
         run: make release/check
