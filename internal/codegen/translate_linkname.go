@@ -162,6 +162,13 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		})
 		// Linkname forward decls after imports, before bodies.
 		pkgFile.Decls = append(pkgFile.Decls, t.emitLinknameForwards(chunkIdx)...)
+		// Package-level constant table — see translate.go's
+		// useLargeConst comment for why large memory offsets are
+		// routed through a runtime-loaded table instead of inline
+		// literals.
+		if decl := t.emitLargeConstsDecl(chunkIdx); decl != nil {
+			pkgFile.Decls = append(pkgFile.Decls, decl)
+		}
 		pkgFile.Decls = append(pkgFile.Decls, bodies...)
 
 		path := fmt.Sprintf("p%d/p%d.go", chunkIdx, chunkIdx)
@@ -220,6 +227,9 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	mainFile.Decls = append([]ast.Decl{
 		&ast.GenDecl{Tok: token.IMPORT, Specs: importsAsSpecs(mainImports)},
 	}, t.emitLinknameForwards(-1)...)
+	if decl := t.emitLargeConstsDecl(-1); decl != nil {
+		mainFile.Decls = append(mainFile.Decls, decl)
+	}
 	mainFile.Decls = append(mainFile.Decls, mainDecls...)
 	{
 		buf := &bytes.Buffer{}

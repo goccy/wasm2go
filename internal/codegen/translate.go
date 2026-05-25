@@ -299,6 +299,15 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	}
 	out.Decls = append(out.Decls, bodyDecls...)
 
+	// Package-level constant table for large memory offsets.
+	// Single-package mode uses currentChunk == 0 (its zero value); the
+	// table groups every large constant the body functions emitted.
+	// See useLargeConst for why this routes through a runtime-loaded
+	// slot instead of an inline literal.
+	if decl := t.emitLargeConstsDecl(t.currentChunk); decl != nil {
+		out.Decls = append(out.Decls, decl)
+	}
+
 	// Export wrappers.
 	exportDecls, err := t.emitExportWrappers()
 	if err != nil {
@@ -457,6 +466,22 @@ type translator struct {
 	// from a wasm function index. Local + target name are identical; only
 	// the target chunk differs.
 	linknameSymbolForwards map[int]map[string]linknameSymbol
+
+	// largeConsts records, per emitted file, the unique large memory-
+	// offset constants used in load/store instructions. Storing them in
+	// a package-level `var _consts = [...]uintptr{...}` table moves the
+	// values out of the per-function literal pool (which the ARM64
+	// assembler can fail to reach inside very large transpiled
+	// functions). Each access then becomes
+	// `unsafe.Add(m.M, _consts[<idx>])` — the table lookup is a global
+	// memory load that the Go compiler cannot fold back into the LDR's
+	// immediate, forcing register-offset addressing with effectively
+	// unlimited range.
+	//
+	// Key: file index. -1 == single-package main file; -2 == base file;
+	// 0..N-1 == chunk indices in the linkname-split layout. Each map
+	// runs <const value> -> <slot index in the table>.
+	largeConsts map[int]map[uint64]int
 
 	// memMetrics accumulates the Phase 4 memory-promotion observability
 	// data: every SSA-lowered function's load/store classification is
@@ -647,6 +672,78 @@ func (t *translator) registerLinknameForward(callerChunk int, funcIdx uint32, ta
 //     plain wasm function). Local + target name are identical; signature
 //     was captured at registration time.
 //
+// largeConstThreshold is the smallest absolute offset that gets routed
+// through the package-level _consts table instead of being emitted
+// as an inline literal. Below the threshold, ARM64 LDR's 12-bit
+// scaled immediate (up to 16 KiB for 4-byte loads, smaller for LDP
+// pair loads) covers the value cleanly; the compiler folds the
+// literal into the instruction with no detour through the literal
+// pool. Above the threshold, the assembler would try to place the
+// constant in a PC-relative literal pool — which, inside very large
+// transpiled functions, can become unreachable. Routing through the
+// table forces a register-offset access that has no immediate
+// dependency on the constant magnitude.
+//
+// 4096 is the LDR-scaled cap for 4-byte loads; we keep the same cap
+// for pair / wider loads even though their immediates are smaller,
+// trading a few extra table entries for a single uniform threshold.
+const largeConstThreshold uint64 = 4096
+
+// useLargeConst registers a constant memory offset for the current
+// file's _consts table and returns the table index. Same value used
+// twice returns the same index so the table stays compact. The
+// "file" the constant is scoped to is identified by t.currentChunk:
+// chunk index ≥ 0 in the linkname-split layout, -1 == main, -2 ==
+// base. Single-package mode never sets currentChunk so it stays at
+// the zero value, which is also fine — only one file emits.
+func (t *translator) useLargeConst(value uint64) int {
+	if t.largeConsts == nil {
+		t.largeConsts = map[int]map[uint64]int{}
+	}
+	file := t.currentChunk
+	tbl := t.largeConsts[file]
+	if tbl == nil {
+		tbl = map[uint64]int{}
+		t.largeConsts[file] = tbl
+	}
+	if idx, ok := tbl[value]; ok {
+		return idx
+	}
+	idx := len(tbl)
+	tbl[value] = idx
+	return idx
+}
+
+// emitLargeConstsDecl returns the `var _consts = [N]uintptr{...}`
+// declaration for the given file, or nil when the file has no
+// large constants. Values are emitted in ascending slot order so
+// the generated file is diff-stable.
+func (t *translator) emitLargeConstsDecl(file int) ast.Decl {
+	tbl := t.largeConsts[file]
+	if len(tbl) == 0 {
+		return nil
+	}
+	sorted := make([]uint64, len(tbl))
+	for v, i := range tbl {
+		sorted[i] = v
+	}
+	values := make([]ast.Expr, len(sorted))
+	for i, v := range sorted {
+		values[i] = uintLit(v)
+	}
+	arrType := &ast.ArrayType{
+		Len: &ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(len(sorted))},
+		Elt: newID("uintptr"),
+	}
+	return &ast.GenDecl{
+		Tok: token.VAR,
+		Specs: []ast.Spec{&ast.ValueSpec{
+			Names:  []*ast.Ident{newID("_consts")},
+			Values: []ast.Expr{&ast.CompositeLit{Type: arrType, Elts: values}},
+		}},
+	}
+}
+
 // The order is deterministic (ascending funcIdx, then alphabetical symbol
 // name) so generated output is diff-stable across runs.
 func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
@@ -844,6 +941,17 @@ func (t *translator) emitModuleStruct() ast.Decl {
 			Names: []*ast.Ident{newID(t.fieldName("maxMem"))},
 			Type:  newID("uint64"),
 		})
+		// M caches unsafe.Pointer(unsafe.SliceData(memory)) so every
+		// load/store can deref through m.M without re-fetching the
+		// slice header per access. New() initialises it; memoryGrow
+		// updates it whenever it reallocates the backing array.
+		// Reslice grows leave m.M alone (slice header data pointer
+		// is stable under append-within-cap).
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID("M")},
+			Type:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Pointer")},
+		})
+		t.use("unsafe")
 	}
 
 	for i := range t.mod.Tables {
@@ -950,6 +1058,21 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 				},
 			}},
 		})
+		// Prime the m.M cache so the first load/store doesn't need a
+		// special-case "is M still nil" check. memoryGrow's reallocate
+		// path keeps M in sync.
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID("M")}},
+			Rhs: []ast.Expr{&ast.CallExpr{
+				Fun: &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Pointer")},
+				Args: []ast.Expr{&ast.CallExpr{
+					Fun:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("SliceData")},
+					Args: []ast.Expr{t.fieldRef("memory")},
+				}},
+			}},
+		})
+		t.use("unsafe")
 		if mem.Limits.HasMax {
 			// Cap Max at the wasm32 maximum too; values > 65536
 			// don't make sense and the uint64 multiplication

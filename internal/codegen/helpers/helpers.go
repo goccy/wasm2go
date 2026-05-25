@@ -10,14 +10,18 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"unsafe"
 )
 
 // Module is a placeholder so the helpers package compiles standalone. Real
-// generated output supplies its own Module struct with at least `memory []byte`
-// and `maxMem uint64` fields.
+// generated output supplies its own Module struct with at least `memory []byte`,
+// `maxMem uint64`, and `M unsafe.Pointer` fields. M caches
+// unsafe.Pointer(unsafe.SliceData(memory)) so generated load/store sites can
+// deref through m.M without re-fetching the slice header on every access.
 type Module struct {
 	memory []byte
 	maxMem uint64
+	M      unsafe.Pointer
 }
 
 // ----- Opaque identity helpers ---------------------------------------------
@@ -709,6 +713,10 @@ func memoryGrow(m *Module, n int32) int32 {
 	grown := make([]byte, want, newCap)
 	copy(grown, m.memory)
 	m.memory = grown
+	// Reallocate moved the backing array, so the cached m.M pointer
+	// is now stale. Reslice grows (the early-return path above) leave
+	// the data pointer untouched so don't need this refresh.
+	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
 	return prev
 }
 
