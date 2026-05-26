@@ -152,7 +152,13 @@ func TestEmitMemLoadExpr_Load32(t *testing.T) {
 		t.Fatalf("emitMemLoadExpr: %v", err)
 	}
 	got := formatExpr(t, expr)
-	want := "*(*int32)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(m.memory)), uintptr(uint32(int32(0))+8)))"
+	// New compact form: the unsafe.Pointer(unsafe.SliceData(m.memory))
+	// chain is cached into the function-entry local `_m`, so the access
+	// site references just `_m`. unsafe.Add accepts IntegerType so the
+	// outer uintptr() wrap is gone; the int32 constant operand collapses
+	// to a bare untyped literal (positive int32 constants are passed as
+	// uint64 fitting into Go's untyped-constant rules).
+	want := "*(*int32)(unsafe.Add(m.M, 8))"
 	if got != want {
 		t.Errorf("Load32 inline form:\n got:  %s\n want: %s", got, want)
 	}
@@ -178,8 +184,13 @@ func TestEmitMemLoadExpr_Load8U(t *testing.T) {
 	if !strings.HasPrefix(got, "int32(*(*uint8)") {
 		t.Errorf("Load8U should be int32-cast over *(*uint8)(...); got: %s", got)
 	}
-	if !strings.Contains(got, "unsafe.SliceData(m.memory)") {
-		t.Errorf("Load8U missing unsafe.SliceData(m.memory); got: %s", got)
+	// New compact form: the unsafe.Pointer(unsafe.SliceData(m.memory))
+	// chain is cached into the function-entry local `_m`, so the access
+	// site only references it. Verify the cache var name shows up; the
+	// SliceData lookup itself lives in the prologue emitted by
+	// emitFuncBody, not in unsafeDerefExpr's output.
+	if !strings.Contains(got, "unsafe.Add(m.M,") {
+		t.Errorf("Load8U missing m.M cache reference; got: %s", got)
 	}
 }
 
@@ -201,7 +212,10 @@ func TestEmitMemStoreStmt_Store32(t *testing.T) {
 		t.Fatalf("emitMemStoreStmt: %v", err)
 	}
 	got := formatStmt(t, stmt)
-	want := "*(*int32)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(m.memory)), uintptr(uint32(int32(0))))) = int32(7)"
+	// New compact form: see TestEmitMemLoadExpr_Load32 for the
+	// motivation. The destination references the cached _m base and
+	// the offset is a bare untyped literal.
+	want := "*(*int32)(unsafe.Add(m.M, 0)) = int32(7)"
 	if got != want {
 		t.Errorf("Store32 inline form:\n got:  %s\n want: %s", got, want)
 	}
@@ -238,7 +252,7 @@ func TestEmitMemStoreStmt_Store8(t *testing.T) {
 		t.Fatalf("emitMemStoreStmt: %v", err)
 	}
 	got := formatStmt(t, stmt)
-	want := "*(*uint8)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(m.memory)), uintptr(uint32(int32(0))))) = uint8(v9)"
+	want := "*(*uint8)(unsafe.Add(m.M, 0)) = uint8(v9)"
 	if got != want {
 		t.Errorf("Store8 narrowing form:\n got:  %s\n want: %s", got, want)
 	}

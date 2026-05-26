@@ -140,7 +140,11 @@ func TestEndToEndAdd(t *testing.T) {
 	// Reference: run via wazero.
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
+	t.Cleanup(func() {
+		if err := r.Close(ctx); err != nil {
+			t.Errorf("wazero runtime close: %v", err)
+		}
+	})
 	mod, err := r.Instantiate(ctx, bin)
 	if err != nil {
 		t.Fatal(err)

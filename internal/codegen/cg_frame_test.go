@@ -25,7 +25,11 @@ func runExportMatrix(t *testing.T, fixture string, calls []call) {
 	}
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
+	t.Cleanup(func() {
+		if err := r.Close(ctx); err != nil {
+			t.Errorf("wazero runtime close: %v", err)
+		}
+	})
 	wmod, err := r.Instantiate(ctx, bin)
 	if err != nil {
 		t.Fatalf("wazero instantiate: %v", err)
@@ -126,7 +130,11 @@ func TestSpecialFPRuntime(t *testing.T) {
 	}
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
+	t.Cleanup(func() {
+		if err := r.Close(ctx); err != nil {
+			t.Errorf("wazero runtime close: %v", err)
+		}
+	})
 	wmod, err := r.Instantiate(ctx, bin)
 	if err != nil {
 		t.Fatalf("wazero instantiate: %v", err)
@@ -185,7 +193,11 @@ func TestGlobalsRuntime(t *testing.T) {
 	}
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
+	t.Cleanup(func() {
+		if err := r.Close(ctx); err != nil {
+			t.Errorf("wazero runtime close: %v", err)
+		}
+	})
 	wmod, err := r.Instantiate(ctx, bin)
 	if err != nil {
 		t.Fatalf("wazero instantiate: %v", err)

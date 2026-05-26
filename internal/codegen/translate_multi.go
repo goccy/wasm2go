@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"sort"
@@ -46,10 +47,15 @@ func chunkUsedDeps(decls []ast.Decl) []int {
 			if !isChunkPkgName(pkg.Name) {
 				return true
 			}
+			// isChunkPkgName has already verified pkg.Name == "p" +
+			// digits; Atoi failing here would mean isChunkPkgName let a
+			// non-numeric suffix through — an invariant violation in
+			// this file's chunker, not a runtime input condition.
 			depIdx, err := strconv.Atoi(pkg.Name[1:])
-			if err == nil {
-				used[depIdx] = true
+			if err != nil {
+				panic(fmt.Sprintf("isChunkPkgName(%q) accepted a non-numeric chunk suffix: %v", pkg.Name, err))
 			}
+			used[depIdx] = true
 			return true
 		})
 	}

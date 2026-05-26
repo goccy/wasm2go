@@ -3,6 +3,7 @@ package wasm
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -38,7 +39,7 @@ func Parse(r io.Reader) (*Module, error) {
 	m := &Module{}
 	for {
 		id, err := br.ReadByte()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

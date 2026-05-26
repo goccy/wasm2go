@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"strconv"
 
 	"github.com/goccy/wasm2go/internal/ssa"
 )
@@ -119,33 +120,143 @@ func (em *ssaEmitter) emitMemStoreStmt(v *ssa.Value, emitExpr func(*ssa.Value) (
 // unsafeDerefExpr builds the typed-pointer dereference used as both
 // the load source and the store destination:
 //
-//	*(*<elemType>)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(m.Memory)),
-//	                          uintptr(uint32(base)[+offset])))
+//	*(*<elemType>)(unsafe.Add(m.M, <off>))
+//
+// m.M is the per-Module unsafe.Pointer cache populated by New() and
+// kept current by memoryGrow's reallocate path. Reslice grows leave
+// the underlying data pointer unchanged, so the cache stays valid
+// across every memory.grow that fits in the existing capacity; only
+// the rare reallocating grow refreshes m.M, and it does so atomically
+// before returning to the caller. The result is one shared pointer
+// every load/store can deref without any per-function prologue or
+// per-call refresh statements.
+//
+// The <off> argument is passed to unsafe.Add directly — Add's signature
+// is `Add(ptr Pointer, len IntegerType) Pointer` and the spec already
+// performs the implicit uintptr conversion, so the caller does not need
+// to wrap it. wasm i32 addresses are semantically unsigned 32-bit, so
+// for runtime int32 SSA values we wrap in uint32(...) to prevent Go's
+// sign-extension to uintptr on 64-bit hosts; positive untyped constants
+// are passed bare.
 //
 // Registers "unsafe" with the translator so the generated file picks
 // up the import.
 func (em *ssaEmitter) unsafeDerefExpr(spec memOpSpec, baseExpr ast.Expr, offset uint64) ast.Expr {
 	em.useImport("unsafe")
-	addr := ast.Expr(&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{baseExpr}})
-	if offset != 0 {
-		addr = &ast.BinaryExpr{X: addr, Op: token.ADD, Y: uintLit(offset)}
-	}
-	addrUptr := &ast.CallExpr{Fun: newID("uintptr"), Args: []ast.Expr{addr}}
-	sliceData := &ast.CallExpr{
-		Fun:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("SliceData")},
-		Args: []ast.Expr{em.fieldRef("memory")},
-	}
-	asPtr := &ast.CallExpr{
-		Fun:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Pointer")},
-		Args: []ast.Expr{sliceData},
-	}
 	added := &ast.CallExpr{
 		Fun:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Add")},
-		Args: []ast.Expr{asPtr, addrUptr},
+		Args: []ast.Expr{em.memBasePtrExpr(), em.memOffsetExpr(baseExpr, offset)},
 	}
 	castFn := &ast.ParenExpr{X: &ast.StarExpr{X: newID(spec.elemType)}}
 	cast := &ast.CallExpr{Fun: castFn, Args: []ast.Expr{added}}
 	return &ast.StarExpr{X: cast}
+}
+
+// memBasePtrExpr returns the `m.M` selector expression — the cached
+// unsafe.Pointer to the start of the wasm linear memory's backing
+// array. See emitModuleStruct (where the M field is declared) and
+// memoryGrow (where M is refreshed on reallocate) for the lifecycle.
+func (em *ssaEmitter) memBasePtrExpr() ast.Expr {
+	return &ast.SelectorExpr{X: newID("m"), Sel: newID("M")}
+}
+
+// memOffsetExpr returns the integer offset passed to unsafe.Add. It
+// elides redundant casts and routes large constant offsets through
+// the package-level _consts table:
+//
+//   - A constant baseExpr emitted as int32(N) by emitConst is unwrapped:
+//     small totals (< largeConstThreshold) become a bare untyped literal
+//     `N+offset`; large totals are stored once in the file's _consts
+//     table and emitted as `_consts[<idx>]`. The indirection forces a
+//     runtime memory load, which the Go ARM64 backend resolves with
+//     register-offset LDR — sidestepping the literal-pool reachability
+//     failure that otherwise blows up very large transpiled functions.
+//   - Values whose int32 representation has the high bit set keep the
+//     uint32 wrap so the bit pattern survives Go's sign-extension to
+//     uintptr (only applies on the inline literal path; table entries
+//     already hold the full uintptr bit pattern).
+//   - Runtime int32 baseExprs are wrapped in uint32(...) for the same
+//     zero-extension guarantee.
+func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64) ast.Expr {
+	n, ok := constInt32(baseExpr)
+	if !ok {
+		// baseExpr is not a compile-time int32 constant — fall back to
+		// the runtime cast path with an explicit uint32 wrap so wasm's
+		// unsigned-i32 address semantics survive Go's sign-extension
+		// to uintptr.
+		addr := ast.Expr(&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{baseExpr}})
+		if offset != 0 {
+			addr = &ast.BinaryExpr{X: addr, Op: token.ADD, Y: uintLit(offset)}
+		}
+		return addr
+	}
+	total := uint64(uint32(n)) + offset
+	// Large positive offsets land in the table. Negative-int32
+	// constants (high-bit-set unsigned addresses) ALWAYS go to the
+	// table — they're always above the threshold once interpreted
+	// as uint64, and the table entry stores the full pattern so we
+	// don't need the uint32 wrap on the access site.
+	if total >= largeConstThreshold && em.t != nil {
+		return em.constsIndexExpr(total)
+	}
+	if n >= 0 {
+		return uintLit(total)
+	}
+	return &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{uintLit(total)}}
+}
+
+// constsIndexExpr returns `_consts[<idx>]` for the given constant
+// value, registering it in the current file's table on first use.
+func (em *ssaEmitter) constsIndexExpr(value uint64) ast.Expr {
+	idx := em.t.useLargeConst(value)
+	return &ast.IndexExpr{
+		X:     newID("_consts"),
+		Index: &ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(idx)},
+	}
+}
+
+// constInt32 reports whether expr is a compile-time int32 constant
+// in the form produced by goConstI32, i.e. `int32(N)` where N is a
+// non-negative integer literal, and returns its value when it is.
+//
+// The (value, ok) shape is deliberate: "expression matches this
+// pattern" is a binary classification, not a fallible operation, so
+// the (value, ok) idiom (cf. `v, ok := m[k]`) is the right fit.
+// Callers must inspect `ok` and route the !ok case explicitly.
+//
+// goConstI32 is the SSA emitter's only source of i32 constants used
+// as memory addresses, so this is the only form the caller needs to
+// recognise: every other expression returns (0, false) and the caller
+// emits the runtime cast path.
+//
+// Negative-i32 constants are emitted as `int32(-N)` — an inner
+// UnaryExpr around the BasicLit — and intentionally do not match
+// here; they need the uint32 sign-extension wrap and so are handled
+// by the runtime path.
+//
+// The `int32(N)` cast itself asserts at the Go-source level that N
+// fits int32 (Go's compiler would reject the generated source
+// otherwise). A literal that fails the int32 range parse therefore
+// indicates an emitter bug, not a runtime input condition, and we
+// panic rather than fall through silently.
+func constInt32(expr ast.Expr) (int32, bool) {
+	call, isCall := expr.(*ast.CallExpr)
+	if !isCall {
+		return 0, false
+	}
+	id, isIdent := call.Fun.(*ast.Ident)
+	if !isIdent || id.Name != "int32" || len(call.Args) != 1 {
+		return 0, false
+	}
+	lit, isLit := call.Args[0].(*ast.BasicLit)
+	if !isLit || lit.Kind != token.INT {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(lit.Value, 0, 32)
+	if err != nil {
+		panic(fmt.Sprintf("constInt32: emitter produced int32(%s) but the literal does not fit int32: %v", lit.Value, err))
+	}
+	return int32(n), true
 }
 
 // memOpSpec describes one memory op's in-memory shape.

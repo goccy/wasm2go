@@ -6,17 +6,33 @@ run:
 linters:
   default: standard
   enable:
+    # errcheck + check-blank catches `_, _ = f()` style full ignores; the
+    # errorlint / nilerr / nilnesserr trio catches the more subtle anti-
+    # patterns of comparing wrapped errors with == , wrapping with %v
+    # instead of %w, and returning nil while err is non-nil.
     - errcheck
+    - errorlint
     - govet
     - ineffassign
+    - nilerr
+    - nilnesserr
     - staticcheck
     - unused
+  settings:
+    errcheck:
+      # Catch `x, _ := f()` style suppressions. Type assertions are a
+      # different axis (invariant-style "must be T") and intentionally
+      # not toggled on here — this config is scoped to error-handling.
+      check-blank: true
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
   exclusions:
     presets:
       - comments
       - common-false-positives
       - legacy
-      - std-error-handling
     paths:
       - testdata
 

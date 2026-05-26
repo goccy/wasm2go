@@ -33,7 +33,7 @@ func readU64(r io.ByteReader) (uint64, error) {
 	for i := 0; i < 10; i++ {
 		b, err := r.ReadByte()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return 0, errLEB128Truncated
 			}
 			return 0, err
@@ -88,7 +88,7 @@ func readS64Bits(r io.ByteReader, bits uint) (int64, error) {
 		var err error
 		b, err = r.ReadByte()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return 0, errLEB128Truncated
 			}
 			return 0, err

@@ -139,7 +139,7 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 			fmt.Fprintf(os.Stderr, "=== VERIFY FAILED fn%d (%s): %v ===\n%s\n",
 				funcIdx, name, err, ssa.FuncString(b.Func()))
 		}
-		return nil, fmt.Errorf("%w: verify fn%d: %v", ErrSSAUnsupported, funcIdx, err)
+		return nil, fmt.Errorf("%w: verify fn%d: %w", ErrSSAUnsupported, funcIdx, err)
 	}
 	return b.Func(), nil
 }
@@ -250,7 +250,7 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 			case opBlock, opLoop, opIf:
 				ls.unreachableDepth++
 				if err := r.skipImmediates(op); err != nil {
-					return fmt.Errorf("%w: skipping unreachable block-open 0x%02x: %v", ErrSSAUnsupported, op, err)
+					return fmt.Errorf("%w: skipping unreachable block-open 0x%02x: %w", ErrSSAUnsupported, op, err)
 				}
 			case opElse:
 				if ls.unreachableDepth > 0 {
@@ -274,7 +274,7 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 				}
 			default:
 				if err := r.skipImmediates(op); err != nil {
-					return fmt.Errorf("%w: skipping unreachable opcode 0x%02x: %v", ErrSSAUnsupported, op, err)
+					return fmt.Errorf("%w: skipping unreachable opcode 0x%02x: %w", ErrSSAUnsupported, op, err)
 				}
 			}
 			continue
@@ -646,7 +646,7 @@ func (ls *lowerState) handleBlock(r *instrReader) error {
 	}
 	results, err := decodeBlockResults(bt)
 	if err != nil {
-		return fmt.Errorf("%w: block blocktype %v: %v", ErrSSAUnsupported, bt, err)
+		return fmt.Errorf("%w: block blocktype %v: %w", ErrSSAUnsupported, bt, err)
 	}
 	postBlk := ls.b.NewBlock(ssa.BlockPlain)
 	ls.ctrl = append(ls.ctrl, &ctrlFrame{
@@ -672,7 +672,7 @@ func (ls *lowerState) handleLoop(r *instrReader) error {
 	}
 	results, err := decodeBlockResults(bt)
 	if err != nil {
-		return fmt.Errorf("%w: loop blocktype %v: %v", ErrSSAUnsupported, bt, err)
+		return fmt.Errorf("%w: loop blocktype %v: %w", ErrSSAUnsupported, bt, err)
 	}
 
 	header := ls.b.NewBlock(ssa.BlockPlain)
@@ -1127,7 +1127,7 @@ func (ls *lowerState) handleIf(r *instrReader) error {
 	}
 	results, err := decodeBlockResults(bt)
 	if err != nil {
-		return fmt.Errorf("%w: if blocktype %v: %v", ErrSSAUnsupported, bt, err)
+		return fmt.Errorf("%w: if blocktype %v: %w", ErrSSAUnsupported, bt, err)
 	}
 	cond, err := ls.pop()
 	if err != nil {

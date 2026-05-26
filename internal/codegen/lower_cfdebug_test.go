@@ -47,7 +47,11 @@ func TestSSAControlFlow(t *testing.T) {
 	// wazero reference values.
 	ctx := context.Background()
 	r := wazero.NewRuntime(ctx)
-	defer r.Close(ctx)
+	t.Cleanup(func() {
+		if err := r.Close(ctx); err != nil {
+			t.Errorf("wazero runtime close: %v", err)
+		}
+	})
 	mod, err := r.Instantiate(ctx, bin)
 	if err != nil {
 		t.Fatalf("wazero instantiate: %v", err)
