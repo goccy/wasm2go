@@ -387,6 +387,23 @@ func (w *WasiStubs) Clock_time_get(m *Module, clockID int32, precision int64, ti
 	return _wasiESUCCESS
 }
 
+// closeWasiOpen releases every underlying handle held by op and
+// joins any Close errors so callers can map them to a wasi errno
+// instead of silently dropping the failure.
+func closeWasiOpen(op *wasiOpen) error {
+	var err error
+	if op.f != nil {
+		err = errors.Join(err, op.f.Close())
+	}
+	if op.conn != nil {
+		err = errors.Join(err, op.conn.Close())
+	}
+	if op.listener != nil {
+		err = errors.Join(err, op.listener.Close())
+	}
+	return err
+}
+
 func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -394,16 +411,11 @@ func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	if op == nil {
 		return _wasiEBADF
 	}
-	if op.f != nil {
-		_ = op.f.Close()
-	}
-	if op.conn != nil {
-		_ = op.conn.Close()
-	}
-	if op.listener != nil {
-		_ = op.listener.Close()
-	}
+	closeErr := closeWasiOpen(op)
 	delete(w.fdTable, fd)
+	if closeErr != nil {
+		return mapOSError(closeErr)
+	}
 	return _wasiESUCCESS
 }
 
@@ -541,7 +553,10 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd, atimHi, atimLo, mtimHi,
 	}
 	atim := combine64(atimHi, atimLo)
 	mtim := combine64(mtimHi, mtimLo)
-	atime, mtime := resolveFiletimes(atim, mtim, fstFlags, op.f)
+	atime, mtime, err := resolveFiletimes(atim, mtim, fstFlags, op.f)
+	if err != nil {
+		return mapOSError(err)
+	}
 	if err := os.Chtimes(op.f.Name(), atime, mtime); err != nil {
 		return mapOSError(err)
 	}
@@ -558,12 +573,20 @@ func combine64(hi, lo int32) uint64 {
 // resolveFiletimes decides the (atime, mtime) pair to apply given a
 // fstFlags bitmask. Bits 0x2 (ATIME_NOW) and 0x8 (MTIME_NOW) override the
 // explicit values with time.Now(). Unset ATIME/MTIME bits keep the
-// existing on-disk time.
-func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f *os.File) (time.Time, time.Time) {
+// existing on-disk time, so f.Stat must succeed when those bits are
+// unset; the error is returned so the caller can surface it as a wasi
+// errno rather than silently writing epoch.
+func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f *os.File) (time.Time, time.Time, error) {
 	now := time.Now()
 	var atime, mtime time.Time
-	st, err := f.Stat()
-	if err == nil {
+	// We only need the current on-disk times when at least one of
+	// ATIME or MTIME is going to be preserved (its bit is unset).
+	needCurrent := fstFlags&(0x1|0x2) == 0 || fstFlags&(0x4|0x8) == 0
+	if needCurrent {
+		st, err := f.Stat()
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
 		atime = st.ModTime()
 		mtime = st.ModTime()
 	}
@@ -579,7 +602,7 @@ func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f *os.File) (time.T
 	if fstFlags&0x8 != 0 {
 		mtime = now
 	}
-	return atime, mtime
+	return atime, mtime, nil
 }
 
 func (w *WasiStubs) Fd_prestat_get(m *Module, fd, ptr int32) int32 {
@@ -923,19 +946,15 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 	if !ok {
 		return _wasiEBADF
 	}
+	var closeErr error
 	if dst, ok2 := w.fdTable[to]; ok2 {
-		if dst.f != nil {
-			_ = dst.f.Close()
-		}
-		if dst.conn != nil {
-			_ = dst.conn.Close()
-		}
-		if dst.listener != nil {
-			_ = dst.listener.Close()
-		}
+		closeErr = closeWasiOpen(dst)
 	}
 	w.fdTable[to] = src
 	delete(w.fdTable, from)
+	if closeErr != nil {
+		return mapOSError(closeErr)
+	}
 	return _wasiESUCCESS
 }
 
@@ -1147,12 +1166,13 @@ func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, ofla
 	}
 	st, statErr := f.Stat()
 	if statErr != nil {
-		_ = f.Close()
-		return mapOSError(statErr)
+		return mapOSError(errors.Join(statErr, f.Close()))
 	}
 	isDir := st.IsDir()
 	if requireDir && !isDir {
-		_ = f.Close()
+		if cerr := f.Close(); cerr != nil {
+			return mapOSError(cerr)
+		}
 		return _wasiENOTDIR
 	}
 	w.mu.Lock()
@@ -1510,8 +1530,10 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			// current size as the readable byte count (best-effort).
 			if ev.isRead {
 				if st, err := op.f.Stat(); err == nil {
-					cur, _ := op.f.Seek(0, 1)
-					if st.Size() > cur {
+					// Best-effort: skip the byte-count hint if Seek
+					// fails. nbytes is advisory, callers will surface
+					// the real state via the actual Read.
+					if cur, err := op.f.Seek(0, 1); err == nil && st.Size() > cur {
 						nbytes = uint64(st.Size() - cur)
 					}
 				}
@@ -1670,15 +1692,22 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	}
 	sh, ok := op.conn.(shutdowner)
 	if !ok {
-		// Generic conn: just close it.
-		_ = op.conn.Close()
+		// Generic conn: just close it. Surface a failure via the wasi
+		// errno so the guest can see write-on-broken-socket failures.
+		if err := op.conn.Close(); err != nil {
+			return mapOSError(err)
+		}
 		return _wasiESUCCESS
 	}
+	var shErr error
 	if how&0x1 != 0 {
-		_ = sh.CloseRead()
+		shErr = errors.Join(shErr, sh.CloseRead())
 	}
 	if how&0x2 != 0 {
-		_ = sh.CloseWrite()
+		shErr = errors.Join(shErr, sh.CloseWrite())
+	}
+	if shErr != nil {
+		return mapOSError(shErr)
 	}
 	return _wasiESUCCESS
 }
@@ -1766,6 +1795,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"Environ_sizes_get":       true,
 			"Clock_res_get":           true,
 			"Clock_time_get":          true,
+			"closeWasiOpen":           true,
 			"Fd_close":                true,
 			"Fd_fdstat_get":           true,
 			"Fd_fdstat_set_flags":     true,

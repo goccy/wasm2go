@@ -509,7 +509,11 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 	if err != nil {
 		t.Skipf("listen tcp: %v", err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("close listener: %v", err)
+		}
+	})
 
 	w, m := newTestStubs(t, t.TempDir())
 	// Register the listener under fd 7.
@@ -526,14 +530,22 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 			t.Errorf("dial: %v", err)
 			return
 		}
-		defer c.Close()
+		defer func() {
+			if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Errorf("client close: %v", err)
+			}
+		}()
 		<-clientReady
 		if _, werr := c.Write([]byte("ping")); werr != nil {
 			t.Errorf("client write: %v", werr)
 			return
 		}
 		buf := make([]byte, 32)
-		n, _ := c.Read(buf)
+		n, rerr := c.Read(buf)
+		if rerr != nil && !errors.Is(rerr, io.EOF) {
+			t.Errorf("client read: %v", rerr)
+			return
+		}
 		if string(buf[:n]) != "pong" {
 			t.Errorf("client got %q", buf[:n])
 		}
@@ -989,7 +1001,10 @@ func TestWasi_PathOpenRespectsAppend(t *testing.T) {
 	if rc := w.Fd_write(m, fd, 300, 1, 400); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_write rc=%d", rc)
 	}
-	data, _ := os.ReadFile(filepath.Join(dir, "a"))
+	data, err := os.ReadFile(filepath.Join(dir, "a"))
+	if err != nil {
+		t.Fatalf("read appended file: %v", err)
+	}
 	if !bytes.Equal(data, []byte("orig\nmore\n")) {
 		t.Fatalf("append failed: %q", data)
 	}
@@ -1005,14 +1020,24 @@ func TestWasi_ResolveFiletimes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close f: %v", err)
+		}
+	})
 	// Set explicit times; check resolveFiletimes echoes them.
-	at, mt := resolveFiletimes(uint64(time.Unix(100, 0).UnixNano()), uint64(time.Unix(200, 0).UnixNano()), 0x1|0x4, f)
+	at, mt, err := resolveFiletimes(uint64(time.Unix(100, 0).UnixNano()), uint64(time.Unix(200, 0).UnixNano()), 0x1|0x4, f)
+	if err != nil {
+		t.Fatalf("resolveFiletimes (explicit): %v", err)
+	}
 	if at.Unix() != 100 || mt.Unix() != 200 {
 		t.Fatalf("resolveFiletimes returned %v / %v", at, mt)
 	}
 	// ATIME_NOW + MTIME_NOW.
-	at, mt = resolveFiletimes(0, 0, 0x2|0x8, f)
+	at, mt, err = resolveFiletimes(0, 0, 0x2|0x8, f)
+	if err != nil {
+		t.Fatalf("resolveFiletimes (NOW): %v", err)
+	}
 	if time.Since(at) > time.Second || time.Since(mt) > time.Second {
 		t.Fatalf("resolveFiletimes NOW too old: %v %v", at, mt)
 	}
@@ -1189,14 +1214,27 @@ func TestWasi_FdReadStdin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
-	defer wpipe.Close()
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Errorf("close r: %v", err)
+		}
+	})
+	wpipeClosed := false
+	t.Cleanup(func() {
+		if wpipeClosed {
+			return
+		}
+		if err := wpipe.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Errorf("close wpipe: %v", err)
+		}
+	})
 	if _, err := wpipe.Write([]byte("hi")); err != nil {
 		t.Fatal(err)
 	}
 	if err := wpipe.Close(); err != nil {
 		t.Fatal(err)
 	}
+	wpipeClosed = true
 
 	w := &WasiStubs{
 		stdin:     r,
@@ -1223,7 +1261,11 @@ func TestWasi_FdWriteToStdoutErr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r.Close()
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Errorf("close r: %v", err)
+		}
+	})
 	w := &WasiStubs{
 		stdout:    wp,
 		stderr:    wp,
@@ -1237,9 +1279,14 @@ func TestWasi_FdWriteToStdoutErr(t *testing.T) {
 	if rc := w.Fd_write(m, 2, 200, 1, 400); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_write(stderr) rc=%d", rc)
 	}
-	wp.Close()
+	if err := wp.Close(); err != nil {
+		t.Fatalf("close wp: %v", err)
+	}
 	buf := make([]byte, 32)
-	n, _ := r.Read(buf)
+	n, rerr := r.Read(buf)
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		t.Fatalf("read pipe: %v", rerr)
+	}
 	if string(buf[:n]) != "stderrmsg" {
 		t.Fatalf("stderr captured=%q", buf[:n])
 	}
@@ -1287,7 +1334,10 @@ func TestWasi_FdAllocateFallbackTruncate(t *testing.T) {
 	if rc := w.Fd_allocate(m, fd, 0, 8192); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_allocate rc=%d", rc)
 	}
-	st, _ := os.Stat(filepath.Join(dir, "fa"))
+	st, err := os.Stat(filepath.Join(dir, "fa"))
+	if err != nil {
+		t.Fatalf("stat fa: %v", err)
+	}
 	if st.Size() < 8192 {
 		t.Fatalf("Fd_allocate did not extend file (size=%d)", st.Size())
 	}

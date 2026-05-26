@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,17 +61,27 @@ func captureStdout(t *testing.T, f func()) string {
 		var buf bytes.Buffer
 		tmp := make([]byte, 4096)
 		for {
-			n, _ := r.Read(tmp)
+			n, err := r.Read(tmp)
+			if n > 0 {
+				buf.Write(tmp[:n])
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					t.Errorf("captureStdout read pipe: %v", err)
+				}
+				break
+			}
 			if n == 0 {
 				break
 			}
-			buf.Write(tmp[:n])
 		}
 		done <- buf.String()
 	}()
 
 	f()
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Errorf("captureStdout close pipe: %v", err)
+	}
 	return <-done
 }
 
@@ -89,17 +101,27 @@ func captureStderr(t *testing.T, f func()) string {
 		var buf bytes.Buffer
 		tmp := make([]byte, 4096)
 		for {
-			n, _ := r.Read(tmp)
+			n, err := r.Read(tmp)
+			if n > 0 {
+				buf.Write(tmp[:n])
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					t.Errorf("captureStderr read pipe: %v", err)
+				}
+				break
+			}
 			if n == 0 {
 				break
 			}
-			buf.Write(tmp[:n])
 		}
 		done <- buf.String()
 	}()
 
 	f()
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Errorf("captureStderr close pipe: %v", err)
+	}
 	return <-done
 }
 
@@ -119,7 +141,11 @@ func TestStdinInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open wasm: %v", err)
 	}
-	defer f.Close()
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close wasm file: %v", err)
+		}
+	})
 
 	oldStdin := os.Stdin
 	os.Stdin = f
@@ -306,7 +332,16 @@ func buildAndRun(t *testing.T, args ...string) *exec.Cmd {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
 	cmd := exec.Command(bin, args...)
-	_ = cmd.Run() // ignore error; we check ExitCode
+	// An ExitError is the expected failure path — the test inspects
+	// cmd.ProcessState.ExitCode separately. Any other error (process
+	// failed to start, lost stdio, etc.) is fatal because ExitCode
+	// would be meaningless.
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("cmd.Run: %v", err)
+		}
+	}
 	return cmd
 }
 

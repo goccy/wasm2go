@@ -49,7 +49,14 @@ func currentMultiPackageThreshold() int {
 		return multiPackageThresholdOverride
 	}
 	if env := os.Getenv("WASM2GO_MULTIPACKAGE_THRESHOLD"); env != "" {
-		if b, err := strconv.Atoi(env); err == nil && b >= 0 {
+		b, err := strconv.Atoi(env)
+		if err != nil || b < 0 {
+			// Malformed env var. Surface so the user sees why their
+			// override was ignored, then fall back to the default.
+			fmt.Fprintf(os.Stderr,
+				"wasm2go: invalid WASM2GO_MULTIPACKAGE_THRESHOLD=%q (using default %d): %v\n",
+				env, defaultMultiPackageThreshold, err)
+		} else {
 			return b
 		}
 	}
@@ -1561,11 +1568,11 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// A pass bug that produced a malformed CFG must not reach emit;
 	// surface the verify failure so the SSA bug is fixed at its source.
 	if err := ssa.Verify(ssaFn); err != nil {
-		return nil, fmt.Errorf("%w: post-opt verify: %v", ErrSSAUnsupported, err)
+		return nil, fmt.Errorf("%w: post-opt verify: %w", ErrSSAUnsupported, err)
 	}
 	body, err := newSSAEmitter(t).emitFuncBody(ssaFn)
 	if err != nil {
-		return nil, fmt.Errorf("%w: emit: %v", ErrSSAUnsupported, err)
+		return nil, fmt.Errorf("%w: emit: %w", ErrSSAUnsupported, err)
 	}
 	if t.memMetrics != nil {
 		t.memMetrics.AddOpt(insBefore, insAfter)

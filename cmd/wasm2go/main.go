@@ -47,7 +47,11 @@ func main() {
 		if err != nil {
 			fail("open input: %v", err)
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				fail("close input: %v", err)
+			}
+		}()
 		r = bufio.NewReader(f)
 	}
 
@@ -57,7 +61,9 @@ func main() {
 	}
 
 	if *dump {
-		printSummary(os.Stderr, mod)
+		if err := printSummary(os.Stderr, mod); err != nil {
+			fail("print summary: %v", err)
+		}
 		return
 	}
 
@@ -113,16 +119,28 @@ func main() {
 	var outDirForSidecars string
 	if *out == "" {
 		bw := bufio.NewWriter(os.Stdout)
-		defer bw.Flush()
+		defer func() {
+			if err := bw.Flush(); err != nil {
+				fail("flush stdout: %v", err)
+			}
+		}()
 		w = bw
 	} else {
 		f, err := os.Create(*out)
 		if err != nil {
 			fail("create output: %v", err)
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				fail("close output: %v", err)
+			}
+		}()
 		bw := bufio.NewWriter(f)
-		defer bw.Flush()
+		defer func() {
+			if err := bw.Flush(); err != nil {
+				fail("flush output: %v", err)
+			}
+		}()
 		w = bw
 		outDirForSidecars = filepath.Dir(*out)
 	}
@@ -171,41 +189,68 @@ func parseEntryExports(v string) []string {
 }
 
 func fail(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "wasm2go: "+format+"\n", args...)
+	// fail() is a terminal sink: nothing reasonable can be done if the
+	// error message itself fails to write, because we are about to
+	// os.Exit and there is no other channel to surface a write error.
+	// Check the error explicitly so the linter sees the awareness,
+	// even though the only useful action is to keep exiting.
+	if _, err := fmt.Fprintf(os.Stderr, "wasm2go: "+format+"\n", args...); err != nil {
+		// stderr is broken; exit anyway.
+		_ = err
+	}
 	os.Exit(1)
 }
 
-func printSummary(w io.Writer, m *wasm.Module) {
-	fmt.Fprintf(w, "types:    %d\n", len(m.Types))
-	fmt.Fprintf(w, "imports:  %d (funcs %d, tables %d, mems %d, globals %d)\n",
+// errWriter wraps an io.Writer so a sequence of Fprintf calls can be
+// emitted without a per-call error check; the first failure is kept
+// and surfaced when the caller asks for it. Keeps printSummary
+// readable while still propagating write errors instead of dropping
+// them.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (ew *errWriter) Fprintf(format string, args ...any) {
+	if ew.err != nil {
+		return
+	}
+	_, ew.err = fmt.Fprintf(ew.w, format, args...)
+}
+
+func printSummary(w io.Writer, m *wasm.Module) error {
+	ew := &errWriter{w: w}
+	ew.Fprintf("types:    %d\n", len(m.Types))
+	ew.Fprintf("imports:  %d (funcs %d, tables %d, mems %d, globals %d)\n",
 		len(m.Imports), m.NumImportedFuncs, m.NumImportedTables, m.NumImportedMems, m.NumImportedGlobals)
-	fmt.Fprintf(w, "functions:%d (defined; total incl imports = %d)\n",
+	ew.Fprintf("functions:%d (defined; total incl imports = %d)\n",
 		len(m.Functions), uint32(len(m.Functions))+m.NumImportedFuncs)
-	fmt.Fprintf(w, "tables:   %d (defined)\n", len(m.Tables))
-	fmt.Fprintf(w, "memories: %d (defined)\n", len(m.Memories))
+	ew.Fprintf("tables:   %d (defined)\n", len(m.Tables))
+	ew.Fprintf("memories: %d (defined)\n", len(m.Memories))
 	for i, mem := range m.Memories {
-		fmt.Fprintf(w, "  mem[%d]: min=%d pages (=%d MiB) max=%d hasMax=%v\n",
+		ew.Fprintf("  mem[%d]: min=%d pages (=%d MiB) max=%d hasMax=%v\n",
 			i, mem.Limits.Min, mem.Limits.Min*64/1024, mem.Limits.Max, mem.Limits.HasMax)
 	}
-	fmt.Fprintf(w, "globals:  %d (defined)\n", len(m.Globals))
-	fmt.Fprintf(w, "exports:  %d\n", len(m.Exports))
+	ew.Fprintf("globals:  %d (defined)\n", len(m.Globals))
+	ew.Fprintf("exports:  %d\n", len(m.Exports))
 	for _, e := range m.Exports {
 		kind := []string{"func", "table", "memory", "global"}[e.Kind]
-		fmt.Fprintf(w, "  %s %q -> %d\n", kind, e.Name, e.Index)
+		ew.Fprintf("  %s %q -> %d\n", kind, e.Name, e.Index)
 	}
-	fmt.Fprintf(w, "elements: %d segments\n", len(m.Elements))
+	ew.Fprintf("elements: %d segments\n", len(m.Elements))
 	var elemTotal int
 	for _, e := range m.Elements {
 		elemTotal += len(e.FuncIdxs)
 	}
-	fmt.Fprintf(w, "  total entries: %d\n", elemTotal)
-	fmt.Fprintf(w, "datas:    %d segments\n", len(m.Datas))
+	ew.Fprintf("  total entries: %d\n", elemTotal)
+	ew.Fprintf("datas:    %d segments\n", len(m.Datas))
 	var dataTotal int
 	for _, d := range m.Datas {
 		dataTotal += len(d.Bytes)
 	}
-	fmt.Fprintf(w, "  total bytes: %d\n", dataTotal)
+	ew.Fprintf("  total bytes: %d\n", dataTotal)
 	if m.Start != nil {
-		fmt.Fprintf(w, "start:    func %d\n", *m.Start)
+		ew.Fprintf("start:    func %d\n", *m.Start)
 	}
+	return ew.err
 }
