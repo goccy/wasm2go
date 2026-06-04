@@ -21,11 +21,12 @@ import (
 func TestWexportsBulkDispatch(t *testing.T) {
 	mod := readFixture(t, "wexports.wasm")
 	var buf bytes.Buffer
-	if _, err := codegen.Translate(&buf, mod, codegen.Options{
+	res, err := codegen.Translate(&buf, mod, codegen.Options{
 		Package:          "pkg",
 		OutputImportPath: "gentest/pkg",
 		BulkExportPrefix: "w_",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
 	out := buf.String()
@@ -35,7 +36,7 @@ func TestWexportsBulkDispatch(t *testing.T) {
 	if strings.Contains(out, "func (m *Module) InvokeExport(") {
 		t.Errorf("consolidated InvokeExport method should be gone in the per-export layout")
 	}
-	assertSingleFileCompiles(t, out, nil)
+	assertSingleFileCompiles(t, out, res.Sidecars, res.AuxFiles, res.Files)
 }
 
 // TestNativeWASIDefault drives the wasi fixture through the auto-on
@@ -125,7 +126,7 @@ func TestBulkMemoryRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 	gotLines := strings.Split(out, "\n")
 	if len(gotLines) != len(want) {
 		t.Fatalf("got %d lines want %d\n%s", len(gotLines), len(want), out)
@@ -192,7 +193,7 @@ func TestDispatchIfRuntime(t *testing.T) {
 	// br_table through a BlockSwitch SSA op or extend matchDispatcher
 	// to recognise the if-chain shape, at which point this assertion
 	// can be restored.
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 	gotLines := strings.Fields(out)
 	if len(gotLines) != len(want) {
 		t.Fatalf("got %d lines want %d\n%s", len(gotLines), len(want), out)

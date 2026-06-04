@@ -81,7 +81,7 @@ func TestSSAControlFlowGoto(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)
@@ -118,5 +118,5 @@ func TestSSAControlFlowPromotionReport(t *testing.T) {
 	if len(data) == 0 || data[0] != '{' {
 		t.Errorf("promotion report is not JSON: %q", data)
 	}
-	assertSingleFileCompiles(t, buf.String(), res.Sidecars)
+	assertSingleFileCompiles(t, buf.String(), res.Sidecars, res.AuxFiles, res.Files)
 }

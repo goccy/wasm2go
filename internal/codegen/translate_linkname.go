@@ -247,6 +247,36 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	for k, v := range t.auxFiles {
 		files["base/"+k] = v
 	}
+
+	// Asm-always-on tail: emit per-chunk asm + decls, split each
+	// chunk's pN.go into pN.go (shared) and pN_pure.go (Go fallback
+	// bodies gated `!amd64 && !arm64`), and drop base/wrappers.go
+	// with the cross-cutting dispatch wrappers chunks reference via
+	// base·callImport_N(SB) etc.
+	for chunkIdx, chunk := range plan.Chunks {
+		asmFiles, err := buildAsmFilesMultiChunk(t.mod, t.opts, chunkIdx, chunk, plan)
+		if err != nil {
+			return Result{}, err
+		}
+		for relPath, content := range asmFiles {
+			files[fmt.Sprintf("p%d/%s", chunkIdx, relPath)] = content
+		}
+		origPath := fmt.Sprintf("p%d/p%d.go", chunkIdx, chunkIdx)
+		orig, ok := files[origPath]
+		if !ok {
+			return Result{}, fmt.Errorf("missing %s after chunk serialization", origPath)
+		}
+		shared, fallback, err := splitForAsm(orig, fmt.Sprintf("p%d", chunkIdx))
+		if err != nil {
+			return Result{}, fmt.Errorf("split %s: %w", origPath, err)
+		}
+		files[origPath] = shared
+		files[fmt.Sprintf("p%d/p%d_pure.go", chunkIdx, chunkIdx)] = fallback
+	}
+	if wrappers := buildAsmWrappersFile(t.mod); wrappers != nil {
+		files["base/wrappers.go"] = wrappers
+	}
+
 	t.reportMemMetrics()
 	return Result{Files: files, Sidecars: sidecars}, nil
 }

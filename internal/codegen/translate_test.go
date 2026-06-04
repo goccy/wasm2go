@@ -108,7 +108,11 @@ func runGoSnippetWithAux(t *testing.T, generated, mainSrc string, sidecars []map
 	}
 	for _, sc := range sidecars {
 		for name, data := range sc {
-			if err := os.WriteFile(filepath.Join(dir, "pkg", name), data, 0644); err != nil {
+			p := filepath.Join(dir, "pkg", name)
+			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, data, 0644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -163,7 +167,8 @@ func TestEndToEndAdd(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if _, err := codegen.Translate(&buf, parsed, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"}); err != nil {
+	res, err := codegen.Translate(&buf, parsed, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	main := `package main
@@ -177,7 +182,7 @@ func main() {
 	fmt.Println(v)
 }
 `
-	out := runGoSnippet(t, buf.String(), main)
+	out := runGoSnippet(t, buf.String(), main, res.Sidecars, res.Files)
 	if got := strings.TrimSpace(out); got != "42" {
 		t.Fatalf("wasm2go add(7,35) printed %q want %q\n--generated--\n%s", got, "42", buf.String())
 	}

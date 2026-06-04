@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/testfixture"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -22,6 +23,10 @@ import (
 //   - A phi is inserted at the merge for the divergent result.
 //   - emitSSAFuncBody renders the function as valid Go (compileable
 //     by go-build via runGoSnippet equivalence).
+//
+// This is an integration test of the lower+emit pair, so it lives in
+// the codegen package (where emitSSAFuncBody is in scope) rather than
+// in internal/lower.
 func TestLowerIfElseMax(t *testing.T) {
 	bin := testfixture.Wasm(t, "control")
 	mod, err := wasm.Parse(bytes.NewReader(bin))
@@ -38,7 +43,7 @@ func TestLowerIfElseMax(t *testing.T) {
 	if idx == ^uint32(0) {
 		t.Fatalf("control.wasm: missing max export")
 	}
-	fn, err := LowerFunction(mod, idx, "max")
+	fn, err := lower.LowerFunction(mod, idx, "max")
 	if err != nil {
 		t.Fatalf("lower max: %v", err)
 	}
@@ -61,7 +66,7 @@ func TestLowerIfElseMax(t *testing.T) {
 		}
 	}
 	if !hasPhi {
-		t.Errorf("max: expected at least one OpPhi from then/else merge:\n%s", dumpSSAFunc(fn))
+		t.Errorf("max: expected at least one OpPhi from then/else merge")
 	}
 
 	body, err := emitSSAFuncBody(fn)

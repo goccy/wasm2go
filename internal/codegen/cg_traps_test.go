@@ -41,7 +41,8 @@ func TestTrapOpsArePreservedThroughDCE(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if _, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"}); err != nil {
+	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
 	generated := buf.String()
@@ -62,7 +63,7 @@ func main() {
 	fmt.Printf("no-trap got=%%d\n", v)
 }
 `, method)
-			out, ok := runGoSnippetExpectPanic(t, generated, main)
+			out, ok := runGoSnippetExpectPanic(t, generated, main, res.Sidecars, res.Files)
 			if ok {
 				t.Fatalf("expected panic for %s, got clean exit:\n%s", tc.export, out)
 			}
@@ -107,7 +108,7 @@ func TestMemGrowDropEmitsOnceNotTwice(t *testing.T) {
 // runGoSnippetExpectPanic is the panic-tolerant variant of
 // runGoSnippet: it does NOT call t.Fatal on a non-zero exit. Returns
 // (combined output, processExitedSuccessfully).
-func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string) (string, bool) {
+func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string, extraFiles ...map[string][]byte) (string, bool) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module gentest\n\ngo 1.25.0\n"), 0644); err != nil {
@@ -118,6 +119,17 @@ func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string) (string, b
 	}
 	if err := os.WriteFile(filepath.Join(dir, "pkg", "gen.go"), []byte(generated), 0644); err != nil {
 		t.Fatal(err)
+	}
+	for _, files := range extraFiles {
+		for name, data := range files {
+			p := filepath.Join(dir, "pkg", name)
+			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, data, 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(mainSrc), 0644); err != nil {
 		t.Fatal(err)

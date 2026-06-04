@@ -1,4 +1,4 @@
-package codegen
+package lower
 
 import (
 	"bytes"

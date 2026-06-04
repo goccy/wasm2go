@@ -98,7 +98,7 @@ func TestSSAControlFlow(t *testing.T) {
 	}
 	mainSB.WriteString("}\n")
 
-	got := runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars)
+	got := runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files)
 
 	// Build the expected output block.
 	var wantSB strings.Builder

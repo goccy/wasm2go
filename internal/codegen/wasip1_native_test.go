@@ -519,10 +519,22 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 	// Register the listener under fd 7.
 	w.fdTable[7] = &wasiOpen{listener: ln}
 
-	// Drive a client in a goroutine.
+	// Drive a client in a goroutine. doneShutdown is closed by the main
+	// thread once Sock_shutdown has run; the client must NOT close its
+	// end of the TCP socket before that — otherwise the server-side fd
+	// observes ENOTCONN by the time Sock_shutdown reaches the kernel and
+	// the assertion fires intermittently under suite load.
+	//
+	// Both the channel close and the wg.Wait are deferred so an early
+	// t.Fatalf from the main thread still unblocks and joins the
+	// goroutine instead of leaking it. Defers run LIFO, so wg.Wait()
+	// (registered first) executes AFTER close(doneShutdown).
 	var wg sync.WaitGroup
 	wg.Add(1)
+	defer wg.Wait()
 	clientReady := make(chan struct{})
+	doneShutdown := make(chan struct{})
+	defer close(doneShutdown)
 	go func() {
 		defer wg.Done()
 		c, err := net.Dial("tcp", ln.Addr().String())
@@ -549,6 +561,7 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 		if string(buf[:n]) != "pong" {
 			t.Errorf("client got %q", buf[:n])
 		}
+		<-doneShutdown
 	}()
 
 	// Sock_accept.
@@ -581,7 +594,6 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 	if rc := w.Sock_shutdown(m, newFD, 0x3); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_shutdown rc=%d", rc)
 	}
-	wg.Wait()
 }
 
 func TestWasi_SockAcceptNotSocket(t *testing.T) {

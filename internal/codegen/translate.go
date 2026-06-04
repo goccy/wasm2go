@@ -3,6 +3,7 @@
 package codegen
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/ssa/pass"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -352,11 +354,48 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		out.Decls = append([]ast.Decl{gd}, out.Decls...)
 	}
 
-	if err := format.Node(w, t.fset, out); err != nil {
+	// Render the Go source into a buffer first so the asm-bundle
+	// post-process can split it into a shared file (written to w)
+	// and a fallback `<pkg>_pure.go` file (in Result.Files, gated
+	// !amd64 && !arm64).
+	var goBuf bytes.Buffer
+	if err := format.Node(&goBuf, t.fset, out); err != nil {
 		return Result{}, err
 	}
 	t.reportMemMetrics()
-	return Result{Sidecars: t.sidecars, AuxFiles: t.auxFiles}, nil
+	return finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
+}
+
+// finalizeSinglePkgWithAsm is the asm-always-on tail of single-package
+// Translate. It splits the Go source produced by the translator into
+// a shared file (Module struct, helpers, exports, ...) — written to
+// the caller's w — and a `<pkg>_pure.go` file holding the function
+// bodies under `//go:build !amd64 && !arm64`. The asm bundle goes
+// into Result.Files. On asm-target GOARCHs the pure file is dormant
+// and the asm bodies in `<pkg>/amd64.s` (and arm64.s) take over.
+func finalizeSinglePkgWithAsm(m *wasm.Module, opts Options, w io.Writer, goSrc []byte, sidecars map[string][]byte, auxFiles map[string][]byte) (Result, error) {
+	shared, fallback, err := splitForAsm(goSrc, opts.Package)
+	if err != nil {
+		return Result{}, fmt.Errorf("asm-bundle split: %w", err)
+	}
+	if _, err := w.Write(shared); err != nil {
+		return Result{}, err
+	}
+	asmFiles, err := buildAsmFilesSingle(m, opts)
+	if err != nil {
+		return Result{}, err
+	}
+	files := map[string][]byte{
+		opts.Package + "_pure.go": fallback,
+	}
+	for k, v := range asmFiles {
+		files[k] = v
+	}
+	return Result{
+		Files:    files,
+		Sidecars: sidecars,
+		AuxFiles: auxFiles,
+	}, nil
 }
 
 // emitSidecarDecls returns //go:embed var decls for each registered sidecar.
@@ -776,12 +815,59 @@ func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
 		fnName := t.funcName(funcIdx)
 		linknameTarget := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, targetChunk, fnName)
 		ft := t.mod.FuncTypeOf(funcIdx)
+
+		// A bare //go:linkname forward creates an alias visible to
+		// Go source but NOT a local symbol — there is no
+		// `<caller_pkg>.<fnName>` for the linker to resolve from
+		// asm `·Fn48(SB)` references. To make cross-chunk calls
+		// work from both pure-Go AND asm, emit a trampoline pair:
+		//   //go:linkname _x<fnName> <pX>.<fnName>
+		//   func _x<fnName>(...) ...
+		//   func <fnName>(...) ... { return _x<fnName>(...) }
+		// The trampoline gives the local symbol asm needs; the
+		// linkname-aliased helper provides the cross-chunk hop.
+		// Pure-Go consumers see one extra call frame; asm consumers
+		// see a CALL to the trampoline that immediately tail-calls
+		// the remote — equivalent to the pre-trampoline path
+		// modulo one extra return.
+		hiddenName := "_x" + fnName
 		decls = append(decls, &ast.FuncDecl{
 			Doc: &ast.CommentGroup{List: []*ast.Comment{
-				{Text: fmt.Sprintf("//go:linkname %s %s", fnName, linknameTarget)},
+				{Text: fmt.Sprintf("//go:linkname %s %s", hiddenName, linknameTarget)},
+			}},
+			Name: newID(hiddenName),
+			Type: t.funcSignature(ft, true /*withModuleParam*/),
+		})
+		// Build the trampoline body. Parameter names are m, l0, l1, ...
+		params := []*ast.Ident{newID("m")}
+		for i := range ft.Params {
+			params = append(params, newID(fmt.Sprintf("l%d", i)))
+		}
+		callArgs := make([]ast.Expr, len(params))
+		for i, p := range params {
+			callArgs[i] = p
+		}
+		var bodyStmt ast.Stmt
+		if len(ft.Results) > 0 {
+			bodyStmt = &ast.ReturnStmt{Results: []ast.Expr{
+				&ast.CallExpr{Fun: newID(hiddenName), Args: callArgs},
+			}}
+		} else {
+			bodyStmt = &ast.ExprStmt{X: &ast.CallExpr{Fun: newID(hiddenName), Args: callArgs}}
+		}
+		// //go:noinline prevents the Go inliner from collapsing the
+		// trampoline into its caller. Inlining would erase the
+		// runtime call boundary that the linker uses to set up the
+		// ABI0↔ABIInternal bridge between the asm caller and the
+		// linkname-aliased asm callee, leading to scrambled
+		// arguments at the target.
+		decls = append(decls, &ast.FuncDecl{
+			Doc: &ast.CommentGroup{List: []*ast.Comment{
+				{Text: "//go:noinline"},
 			}},
 			Name: newID(fnName),
 			Type: t.funcSignature(ft, true /*withModuleParam*/),
+			Body: &ast.BlockStmt{List: []ast.Stmt{bodyStmt}},
 		})
 	}
 
@@ -1527,7 +1613,7 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 // value counts feed the optimization metrics.
 func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.BlockStmt, error) {
 	_ = fn // body bytes live on the *wasm.Module; kept for API symmetry.
-	ssaFn, err := LowerFunction(t.mod, funcIdx, t.funcName(funcIdx))
+	ssaFn, err := lower.LowerFunction(t.mod, funcIdx, t.funcName(funcIdx))
 	if err != nil {
 		return nil, err
 	}
@@ -1568,11 +1654,11 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// A pass bug that produced a malformed CFG must not reach emit;
 	// surface the verify failure so the SSA bug is fixed at its source.
 	if err := ssa.Verify(ssaFn); err != nil {
-		return nil, fmt.Errorf("%w: post-opt verify: %w", ErrSSAUnsupported, err)
+		return nil, fmt.Errorf("%w: post-opt verify: %w", lower.ErrSSAUnsupported, err)
 	}
 	body, err := newSSAEmitter(t).emitFuncBody(ssaFn)
 	if err != nil {
-		return nil, fmt.Errorf("%w: emit: %w", ErrSSAUnsupported, err)
+		return nil, fmt.Errorf("%w: emit: %w", lower.ErrSSAUnsupported, err)
 	}
 	if t.memMetrics != nil {
 		t.memMetrics.AddOpt(insBefore, insAfter)
