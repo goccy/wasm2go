@@ -228,10 +228,43 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 	}
 
 	files := map[string]string{}
+	// Decls collapse: if every target emitted the same decl block
+	// (no per-arch stubs needed), write a single shared decls.go
+	// gated on the union of arch tags. The bare declarations are
+	// arch-independent (they're just `func FnN(...) ret`); only the
+	// asm bodies differ. When one arch needed stubs, the union is
+	// no longer safe (the stubs file owns the FnN symbol on that
+	// arch), so we fall back to the per-arch decls_<arch>.go layout.
+	declsAreUniform := func() bool {
+		if len(targets) < 2 {
+			return false
+		}
+		base := targets[0].declBuf.String()
+		for _, t := range targets[1:] {
+			if t.declBuf.String() != base {
+				return false
+			}
+			if t.stubBuf.Len() != 0 {
+				return false
+			}
+		}
+		return targets[0].stubBuf.Len() == 0
+	}
+	if declsAreUniform() && targets[0].declBuf.Len() > 0 {
+		tagsOR := make([]string, len(targets))
+		for i, t := range targets {
+			tagsOR[i] = t.archName
+		}
+		buildTag := "//go:build " + strings.Join(tagsOR, " || ")
+		head := fmt.Sprintf("%s\n\npackage %s\n%s\n", buildTag, pkg, declImport)
+		files["decls.go"] = head + targets[0].declBuf.String()
+	}
 	for _, t := range targets {
 		head := fmt.Sprintf("%s\n\npackage %s\n%s\n", t.buildTag, pkg, declImport)
-		if t.declBuf.Len() > 0 {
-			files["decls_"+t.archName+".go"] = head + t.declBuf.String()
+		if _, ok := files["decls.go"]; !ok {
+			if t.declBuf.Len() > 0 {
+				files["decls_"+t.archName+".go"] = head + t.declBuf.String()
+			}
 		}
 		if t.asmBuf.Len() > 0 {
 			asmHead := fmt.Sprintf("%s\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n", t.buildTag)

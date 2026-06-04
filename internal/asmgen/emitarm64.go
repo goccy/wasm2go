@@ -143,6 +143,22 @@ func emitValueARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		fmt.Fprintf(b, "\tMOVD $%d, R0\n", v.AuxInt)
 		fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", plan.offsets[v.ID])
 		return nil
+	case ssa.OpConstF32:
+		// OpConstF32 carries the f32 bit pattern in AuxInt (set by
+		// lower as `int64(math.Float32bits(v))`). Reinterpret-store
+		// the low 32 bits into the destination slot — MOVW into a
+		// float slot is fine because the slot is just bytes (the
+		// downstream float ops reload via FMOVS, which interprets
+		// those 4 bytes as the IEEE-754 single).
+		fmt.Fprintf(b, "\tMOVD $%d, R0\n", int32(uint32(v.AuxInt)))
+		fmt.Fprintf(b, "\tMOVW R0, %d(RSP)\n", plan.offsets[v.ID])
+		return nil
+	case ssa.OpConstF64:
+		// OpConstF64's AuxInt is the f64 bit pattern. Same
+		// reinterpret-store as ConstF32, just 8 bytes.
+		fmt.Fprintf(b, "\tMOVD $%d, R0\n", v.AuxInt)
+		fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", plan.offsets[v.ID])
+		return nil
 
 	case ssa.OpParam:
 		return emitParamARM64(b, v, frame, plan)
