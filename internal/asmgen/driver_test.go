@@ -1,7 +1,6 @@
 package asmgen
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -76,16 +75,17 @@ func TestGoAsmSymbol(t *testing.T) {
 		{"base.Fn42", "base·Fn42(SB)"},
 		{"callImport_3", "·callImport_3(SB)"},
 		{"base.SubG", "base·SubG(SB)"},
+		// Full import path: slashes become U+2215 (division slash)
+		// and intra-component dots become U+00B7 (middle dot) so
+		// plan 9 asm's scanner accepts them as identifier runes.
+		// Last `.` in the qualified name is the package/symbol
+		// boundary and renders as the canonical "·" separator.
+		{"github.com/foo/bar.Fn42", "github·com∕foo∕bar·Fn42(SB)"},
+		{"x/y.Z", "x∕y·Z(SB)"},
 	}
 	for _, c := range cases {
 		if got := goAsmSymbol(c.in); got != c.want {
 			t.Errorf("goAsmSymbol(%q) = %q want %q", c.in, got, c.want)
 		}
-	}
-	// Symbols with multiple dots aren't a thing the project produces
-	// today; document the (split-on-first-dot) behavior so a regression
-	// shows up loudly.
-	if got := goAsmSymbol("pkg.sub.X"); !strings.Contains(got, "pkg·sub.X(SB)") {
-		t.Errorf("multi-dot fallback unexpected: %q", got)
 	}
 }

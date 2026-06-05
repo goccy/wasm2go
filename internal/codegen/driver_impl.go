@@ -1,6 +1,8 @@
 package codegen
 
 import (
+	"fmt"
+
 	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -32,17 +34,25 @@ func (t *translator) FieldName(s string) string { return t.fieldName(s) }
 // FuncName is the exported alias for funcName, satisfying emit.Driver.
 func (t *translator) FuncName(funcIdx uint32) string { return t.funcName(funcIdx) }
 
-// FuncRefName returns the bare identifier used to call funcIdx from
-// the current emit context. In multi-package mode this may register
-// a //go:linkname forward as a side effect so the returned bare name
-// is safe to use across chunk packages — the chunk-file assembler
-// will then attach the //go:linkname directive. funcRef relies on
-// the same registration and just wraps the returned name in an AST
-// identifier.
+// FuncRefName returns the qualified Go-syntax identifier the asm
+// emitter should hand to goAsmSymbol when rendering a CALL. For an
+// own-chunk callee or single-package mode the result is the bare
+// name (e.g. "Fn42") so the CALL stays as a local-package
+// ·Fn42(SB). For a cross-chunk callee in multi-package mode the
+// result is the FULL Go-side qualified name (e.g.
+// "github.com/foo/bar/pX.Fn42") so goAsmSymbol can render a direct
+// cross-package CALL — plan 9 asm's scanner accepts U+2215 in
+// place of "/" as an identifier rune (see
+// src/cmd/asm/internal/lex/tokenizer.go: isIdentRune), so we don't
+// need a per-chunk Go-body trampoline to bounce the asm caller
+// through a local-package symbol. The Go-body trampoline pair is
+// still emitted for the pure-Go fallback bodies in pN_pure.go via
+// funcRef (the AST-side ref), and the Go linker DCEs it on the
+// amd64/arm64 build where the .s files supply the asm bodies.
 func (t *translator) FuncRefName(funcIdx uint32) string {
 	if t.multiPackage && t.plan != nil {
 		if targetChunk, ok := t.plan.FuncToChunk[funcIdx]; ok && targetChunk != t.currentChunk {
-			t.registerLinknameForward(t.currentChunk, funcIdx, targetChunk)
+			return fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, targetChunk, t.funcName(funcIdx))
 		}
 	}
 	return t.funcName(funcIdx)

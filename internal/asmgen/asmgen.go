@@ -943,12 +943,30 @@ func wrapperSymbol(helperPfx, name string) string {
 
 // goAsmSymbol renders a plan9 asm symbol from a Go-side qualified
 // name. "Fn42" (same-package) becomes "·Fn42(SB)"; "base.Fn42"
-// (cross-package, multi-package + linkname-split layout) becomes
-// "base·Fn42(SB)". Plan9 syntax uses "·" between package and symbol
-// where Go source uses ".".
+// (single-name cross-package) becomes "base·Fn42(SB)";
+// "github.com/foo/bar.Fn42" (full import path) becomes
+// "github·com∕foo∕bar·Fn42(SB)". Plan9 asm's scanner does not
+// accept "/" or "." as identifier runes — it reserves "/" as the
+// division operator and "." as the addressing-mode dot — but it
+// DOES accept the Unicode DIVISION SLASH U+2215 ("∕") and MIDDLE
+// DOT U+00B7 ("·") as identifier runes (see
+// src/cmd/asm/internal/lex/tokenizer.go: isIdentRune). The two
+// runes survive into the symbol table verbatim and the linker
+// resolves the full name (e.g. asm "github·com∕foo∕bar·Fn42"
+// matches Go "github.com/foo/bar.Fn42"), so the asm CALL hits
+// the target package's ABI0 entry directly without going through
+// a per-chunk Go-body trampoline.
+//
+// The split between package and symbol uses the LAST dot, which
+// is the only dot that can legitimately separate path from symbol
+// — any earlier dots are part of a path component such as
+// "github.com".
 func goAsmSymbol(qualified string) string {
-	if i := strings.IndexByte(qualified, '.'); i >= 0 {
-		return fmt.Sprintf("%s·%s(SB)", qualified[:i], qualified[i+1:])
+	if i := strings.LastIndexByte(qualified, '.'); i >= 0 {
+		pkg := qualified[:i]
+		pkg = strings.ReplaceAll(pkg, "/", "∕")
+		pkg = strings.ReplaceAll(pkg, ".", "·")
+		return fmt.Sprintf("%s·%s(SB)", pkg, qualified[i+1:])
 	}
 	return fmt.Sprintf("·%s(SB)", qualified)
 }

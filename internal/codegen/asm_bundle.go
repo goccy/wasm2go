@@ -59,15 +59,30 @@ func buildAsmFilesSingle(m *wasm.Module, opts Options) (map[string][]byte, error
 // file map (paths like "decls_amd64.go", "amd64.s") which the caller
 // composes under `pN/` in the package directory.
 func buildAsmFilesMultiChunk(m *wasm.Module, opts Options, chunkIdx int, chunk MultiPackageChunk, plan *MultiPackagePlan) (map[string][]byte, error) {
-	// Always return the bare local name. Own-chunk callees are real
-	// definitions in this package; cross-chunk callees resolve via
-	// the //go:linkname forward declarations the linkname-split Go
-	// emitter writes into this chunk's main file. Plan9 asm cannot
-	// reference a function in another package without a host-side
-	// import, but linkname directly maps a local symbol name to a
-	// fully-qualified target, sidestepping the import-graph cycle
-	// that direct cross-chunk imports would introduce.
+	// For own-chunk callees emit the bare local name (the asm body
+	// of FnN is in this chunk's amd64.s, so ·FnN(SB) resolves
+	// directly). For cross-chunk callees, if the host import path
+	// is plan-9-asm-safe (every byte is a letter, digit, "_", "/",
+	// or "."), emit the FULL Go-side qualified path (e.g.
+	// "github.com/foo/bar/pX.FnN") so the asm emitter's
+	// goAsmSymbol can render a direct cross-package CALL by
+	// mapping "/" → U+2215 ("∕") and intra-component "."
+	// → U+00B7 ("·"). Plan 9 asm's scanner only accepts those
+	// two non-ASCII runes as identifier characters (see
+	// src/cmd/asm/internal/lex/tokenizer.go: isIdentRune); the
+	// hyphen, plus sign, and every other punctuation that can
+	// otherwise appear in a Go module path has no identifier
+	// equivalent. When the path is not safe we fall back to the
+	// bare local name so the asm CALL routes through the
+	// per-chunk Go-body trampoline (one extra Go frame) instead
+	// of producing an unparseable plan 9 symbol.
+	canCrossPkg := isPlan9AsmSafe(opts.OutputImportPath)
 	funcSymbol := func(idx uint32) string {
+		if canCrossPkg && plan != nil {
+			if targetChunk, ok := plan.FuncToChunk[idx]; ok && targetChunk != chunkIdx {
+				return fmt.Sprintf("%s/p%d.Fn%d", opts.OutputImportPath, targetChunk, idx)
+			}
+		}
 		return fmt.Sprintf("Fn%d", idx)
 	}
 	files, err := asmgen.BuildPackageFiles(m, asmgen.BuildPackageOptions{
@@ -95,6 +110,34 @@ func buildAsmFilesMultiChunk(m *wasm.Module, opts Options, chunkIdx int, chunk M
 		out[p] = []byte(c)
 	}
 	return out, nil
+}
+
+// isPlan9AsmSafe reports whether path can be embedded verbatim into a
+// plan 9 asm symbol operand by mapping "/" to U+2215 and intra-
+// component "." to U+00B7. The asm scanner only treats letters,
+// digits (after the first character), "_", U+00B7, and U+2215 as
+// identifier runes (src/cmd/asm/internal/lex/tokenizer.go:
+// isIdentRune). Any other byte — hyphen, plus, tilde, etc. — has
+// no identifier-rune substitute and forces us to fall back to the
+// per-chunk Go-body trampoline (so the asm CALL stays a local
+// ·FnN(SB) reference). Empty path is rejected so the caller treats
+// it as unsafe.
+func isPlan9AsmSafe(path string) bool {
+	if path == "" {
+		return false
+	}
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '_' || c == '.' || c == '/':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // buildAsmWrappersFile produces base/wrappers.go for a multi-package
