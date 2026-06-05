@@ -820,6 +820,20 @@ const (
 	// pairs are required whenever the chunk's asm bundle CALLs
 	// the local symbol.
 	linknameForwardWrapperPair
+	// linknameForwardDeclOnly emits a bare Go function declaration
+	// (`func <fnName>(...) ...`) with NO //go:linkname directive
+	// and NO body. The chunk's <arch>.s file is expected to provide
+	// the body — typically as a TEXT directive whose payload is a
+	// tail-JMP into the remote chunk's asm body
+	// (appendAsmCrossChunkTrampolines is what writes that). Used in
+	// asm-trampoline mode when the host import path is plan-9-asm-
+	// safe: there is no //go:linkname for the Go linker to fuse
+	// with the asm-side cross-package CALL — which would otherwise
+	// trip the nosplit wrapper cycle observed empirically with
+	// linkname + asm-body + function-value-reference + cross-pkg
+	// asm CALL all in play — and Go callers route through the
+	// auto-generated ABIInternal wrapper that calls the asm TEXT.
+	linknameForwardDeclOnly
 )
 
 // emitWasmFnForwards returns the //go:linkname forward declarations
@@ -854,6 +868,14 @@ func (t *translator) emitWasmFnForwards(callerChunk int, kind linknameForwardKin
 				Doc: &ast.CommentGroup{List: []*ast.Comment{
 					{Text: fmt.Sprintf("//go:linkname %s %s", fnName, linknameTarget)},
 				}},
+				Name: newID(fnName),
+				Type: t.funcSignature(ft, true /*withModuleParam*/),
+			})
+			continue
+		}
+
+		if kind == linknameForwardDeclOnly {
+			decls = append(decls, &ast.FuncDecl{
 				Name: newID(fnName),
 				Type: t.funcSignature(ft, true /*withModuleParam*/),
 			})

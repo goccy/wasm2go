@@ -267,6 +267,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	// bodies gated `!amd64 && !arm64`), and drop base/wrappers.go
 	// with the cross-cutting dispatch wrappers chunks reference via
 	// base·callImport_N(SB) etc.
+	asmTrampolineMode := isPlan9AsmSafe(t.opts.OutputImportPath)
 	for chunkIdx, chunk := range plan.Chunks {
 		asmFiles, err := buildAsmFilesMultiChunk(t.mod, t.opts, chunkIdx, chunk, plan)
 		if err != nil {
@@ -274,6 +275,25 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		}
 		for relPath, content := range asmFiles {
 			files[fmt.Sprintf("p%d/%s", chunkIdx, relPath)] = content
+		}
+		// In asm-trampoline mode, append per-cross-chunk-Fn TEXT JMP
+		// stubs to each per-arch asm file so the chunk's bodies can
+		// CALL the bare local symbol and tail-jump straight into the
+		// remote chunk's asm body — see
+		// appendAsmCrossChunkTrampolines for the mechanism rationale.
+		if asmTrampolineMode {
+			for _, arch := range []string{"amd64", "arm64"} {
+				key := fmt.Sprintf("p%d/%s.s", chunkIdx, arch)
+				existing, ok := files[key]
+				if !ok {
+					continue
+				}
+				updated, err := t.appendAsmCrossChunkTrampolines(existing, chunkIdx, arch)
+				if err != nil {
+					return Result{}, err
+				}
+				files[key] = updated
+			}
 		}
 		origPath := fmt.Sprintf("p%d/p%d.go", chunkIdx, chunkIdx)
 		orig, ok := files[origPath]
@@ -381,8 +401,19 @@ func (t *translator) emitChunkAliasFiles(pkgName string, callerChunk int, dir st
 		return files, nil
 	}
 
-	wrapPair := t.emitWasmFnForwards(callerChunk, linknameForwardWrapperPair)
-	asmDecls := append([]ast.Decl{}, wrapPair...)
+	// Per-chunk amd64||arm64 alias file. When the host import path
+	// is plan-9-asm-safe, the asm-side trampolines appended to
+	// <arch>.s by appendAsmCrossChunkTrampolines provide the local
+	// ABI0 entry, so the Go-side decl is body-less and
+	// linkname-less (decl-only). Otherwise the historical
+	// wrapper-pair shape forces the Go compiler to emit the local
+	// ABI0 wrapper that asm `CALL ·FnN(SB)` resolves through.
+	asmKind := linknameForwardWrapperPair
+	if isPlan9AsmSafe(t.opts.OutputImportPath) {
+		asmKind = linknameForwardDeclOnly
+	}
+	asmForwards := t.emitWasmFnForwards(callerChunk, asmKind)
+	asmDecls := append([]ast.Decl{}, asmForwards...)
 	asmDecls = append(asmDecls, named...)
 	asmFile, err := t.formatAliasFile(pkgName, "amd64 || arm64", asmDecls)
 	if err != nil {

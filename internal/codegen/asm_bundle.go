@@ -76,15 +76,25 @@ func buildAsmFilesMultiChunk(m *wasm.Module, opts Options, chunkIdx int, chunk M
 	// bare local name so the asm CALL routes through the
 	// per-chunk Go-body trampoline (one extra Go frame) instead
 	// of producing an unparseable plan 9 symbol.
-	canCrossPkg := isPlan9AsmSafe(opts.OutputImportPath)
+	// For BOTH own-chunk and cross-chunk callees the asm CALL is the
+	// bare local-package `·FnN(SB)` form. Cross-chunk callees resolve
+	// either through a Go-body trampoline emitted into alias.go (the
+	// historical pattern, still used when the host import path is not
+	// plan-9-asm-safe) OR through an asm-side tail-JMP trampoline
+	// appended below to <arch>.s (when the path IS safe). Earlier
+	// versions of this code returned the qualified path here for safe
+	// hosts to produce a direct cross-package CALL, but that combination
+	// — bare //go:linkname in alias.go + asm-side cross-package CALL +
+	// function-value references on the target — triggered the Go
+	// linker's nosplit-cycle check at <pY>.FnN<0> ↔ <1>. Routing the
+	// asm CALL through a local symbol provided by an asm TEXT trampoline
+	// (which tail-JMPs to the remote with NO //go:linkname) avoids the
+	// auto-wrapper combination that produced the cycle.
 	funcSymbol := func(idx uint32) string {
-		if canCrossPkg && plan != nil {
-			if targetChunk, ok := plan.FuncToChunk[idx]; ok && targetChunk != chunkIdx {
-				return fmt.Sprintf("%s/p%d.Fn%d", opts.OutputImportPath, targetChunk, idx)
-			}
-		}
 		return fmt.Sprintf("Fn%d", idx)
 	}
+	_ = isPlan9AsmSafe
+	_ = plan
 	files, err := asmgen.BuildPackageFiles(m, asmgen.BuildPackageOptions{
 		Package:       fmt.Sprintf("p%d", chunkIdx),
 		FuncSymbol:    funcSymbol,
@@ -111,6 +121,122 @@ func buildAsmFilesMultiChunk(m *wasm.Module, opts Options, chunkIdx int, chunk M
 	}
 	return out, nil
 }
+
+// appendAsmCrossChunkTrampolines wraps the per-chunk asm bundle with
+// `TEXT ·FnN(SB), NOSPLIT|NOFRAME, $0-<argsize>; JMP cross-pkg·FnN(SB)`
+// stubs (or the arm64 `B` analog) for every cross-chunk callee
+// registered against callerChunk. The result is the source of the
+// caller's local <pX>.FnN.abi0 symbol that asm bodies in this chunk
+// CALL — instead of routing the call through a Go-body trampoline
+// in alias.go, the call enters the local TEXT directive and
+// tail-jumps directly to the remote chunk's asm body, dropping the
+// auto-generated ABI bridge frames that the wrapper-pair shape
+// otherwise paid on every cross-chunk hop.
+//
+// Only emitted when the host's OutputImportPath is plan-9-asm-safe
+// (so the cross-package symbol can be expressed as
+// `<path>∕<pY>·FnN(SB)` after the U+2215 / U+00B7 rune
+// substitution that goAsmSymbol applies).
+func (t *translator) appendAsmCrossChunkTrampolines(asmSrc []byte, callerChunk int, archName string) ([]byte, error) {
+	if t.linknameForwards == nil {
+		return asmSrc, nil
+	}
+	forwards := t.linknameForwards[callerChunk]
+	if len(forwards) == 0 {
+		return asmSrc, nil
+	}
+	keys := make([]uint32, 0, len(forwards))
+	for k := range forwards {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	var buf bytes.Buffer
+	buf.Write(asmSrc)
+	if len(asmSrc) > 0 && asmSrc[len(asmSrc)-1] != '\n' {
+		buf.WriteByte('\n')
+	}
+	buf.WriteString("\n// Cross-chunk tail-JMP trampolines.\n")
+	buf.WriteString("// Each TEXT directive below provides the local-package <pX>.FnN.abi0\n")
+	buf.WriteString("// symbol that asm bodies in this chunk CALL. The body is a single\n")
+	buf.WriteString("// tail-JMP into the remote chunk's asm body, with no Go frame in\n")
+	buf.WriteString("// between, so the cross-chunk hop costs one branch instead of the\n")
+	buf.WriteString("// 5-frame trampoline the Go-body wrapper pair otherwise produced.\n")
+
+	for _, funcIdx := range keys {
+		targetChunk := forwards[funcIdx]
+		fnName := t.funcName(funcIdx)
+		ft := t.mod.FuncTypeOf(funcIdx)
+		argSize := asmArgFrameSize(ft)
+		remoteQualified := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, targetChunk, fnName)
+		remoteAsmSym := goAsmSymbolForCrossPkg(remoteQualified)
+		switch archName {
+		case "amd64":
+			fmt.Fprintf(&buf, "TEXT ·%s(SB), NOSPLIT|NOFRAME, $0-%d\n", fnName, argSize)
+			fmt.Fprintf(&buf, "\tJMP %s\n", remoteAsmSym)
+		case "arm64":
+			fmt.Fprintf(&buf, "TEXT ·%s(SB), NOSPLIT|NOFRAME, $0-%d\n", fnName, argSize)
+			fmt.Fprintf(&buf, "\tB %s\n", remoteAsmSym)
+		default:
+			return nil, fmt.Errorf("appendAsmCrossChunkTrampolines: unsupported arch %q", archName)
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+// goAsmSymbolForCrossPkg renders the plan 9 asm symbol operand for a
+// cross-package callee whose Go-side qualified name is qualified
+// ("<importpath>.<name>"). Mirrors asmgen.goAsmSymbol but lives in
+// codegen because asmgen would otherwise need a public dependency on
+// the codegen-emitted trampoline format. See
+// internal/asmgen/asmgen.go: goAsmSymbol for the rune-substitution
+// rationale (the plan 9 asm scanner only accepts letters, digits,
+// "_", U+00B7, and U+2215 as identifier characters, so ASCII "/"
+// becomes U+2215 and intra-component "." becomes U+00B7 before the
+// canonical name is reconstructed at link time).
+func goAsmSymbolForCrossPkg(qualified string) string {
+	i := strings.LastIndexByte(qualified, '.')
+	if i < 0 {
+		return fmt.Sprintf("·%s(SB)", qualified)
+	}
+	pkg := qualified[:i]
+	pkg = strings.ReplaceAll(pkg, "/", "∕")
+	pkg = strings.ReplaceAll(pkg, ".", "·")
+	return fmt.Sprintf("%s·%s(SB)", pkg, qualified[i+1:])
+}
+
+// asmArgFrameSize computes the plan 9 asm `-<size>` argument-frame
+// figure for ft. wasm2go's calling convention passes a *base.Module
+// pointer (8 bytes) followed by every wasm parameter (i32/f32 → 4,
+// i64/f64 → 8) and reserves space for at most one return value with
+// the same size discipline. Each entry is laid out at its natural
+// alignment with the layout matching what the asmgen-side
+// computeArgFrame produces; using the same total size here keeps the
+// `go vet asmdecl` invariant satisfied for the trampolines we
+// append after asmgen has already emitted its own bodies.
+func asmArgFrameSize(ft wasm.FuncType) int {
+	size := 8 // *base.Module
+	for _, p := range ft.Params {
+		size = alignUp(size, valWidth(p))
+		size += valWidth(p)
+	}
+	if len(ft.Results) > 0 {
+		size = alignUp(size, valWidth(ft.Results[0]))
+		size += valWidth(ft.Results[0])
+	}
+	return size
+}
+
+func valWidth(v wasm.ValType) int {
+	switch v {
+	case wasm.ValI64, wasm.ValF64:
+		return 8
+	default:
+		return 4
+	}
+}
+
+func alignUp(n, a int) int { return (n + a - 1) &^ (a - 1) }
 
 // isPlan9AsmSafe reports whether path can be embedded into a plan 9
 // asm symbol operand by mapping "/" → U+2215 ("∕") and "." →
