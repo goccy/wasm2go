@@ -708,16 +708,6 @@ func (t *translator) registerLinknameForward(callerChunk int, funcIdx uint32, ta
 	t.linknameForwards[callerChunk][funcIdx] = targetChunk
 }
 
-// emitLinknameForwards returns one ast.Decl per registered forward for the
-// given caller chunk. Two kinds of forward are emitted:
-//
-//   - wasm-function-index forwards (registered via registerLinknameForward
-//     during funcRef calls). Local + target name are both Fn<idx>.
-//   - named-symbol forwards (registered via registerLinknameSymbol for
-//     things like InvokeExportShard_K and InitElemSeg_K_n that aren't a
-//     plain wasm function). Local + target name are identical; signature
-//     was captured at registration time.
-//
 // largeConstThreshold is the smallest absolute offset that gets routed
 // through the package-level _consts table instead of being emitted
 // as an inline literal. Below the threshold, ARM64 LDR's 12-bit
@@ -790,12 +780,56 @@ func (t *translator) emitLargeConstsDecl(file int) ast.Decl {
 	}
 }
 
-// The order is deterministic (ascending funcIdx, then alphabetical symbol
-// name) so generated output is diff-stable across runs.
-func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
+// Two kinds of cross-chunk forward live behind these helpers:
+//
+//   - wasm-function-index forwards (registered via
+//     registerLinknameForward during funcRef calls). Local + target
+//     name are both Fn<idx>. Emitted by emitWasmFnForwards in either
+//     the bare-alias or the wrapper-pair shape (see linknameForwardKind).
+//   - named-symbol forwards (registered via registerLinknameSymbol for
+//     things like InvokeExportShard_K and InitElemSeg_K_n that aren't a
+//     plain wasm function). Local + target name are identical;
+//     signature was captured at registration time. Always bare alias —
+//     no asm callers, no ABI0 wrapper requirement.
+//
+// The order is deterministic (ascending funcIdx, then alphabetical
+// symbol name) so generated output is diff-stable across runs.
+//
+// linknameForwardKind selects the source shape emitWasmFnForwards
+// produces for each wasm-function forward.
+type linknameForwardKind int
+
+const (
+	// linknameForwardBare emits a single bare //go:linkname alias
+	// with no body. The Go compiler then aliases <local>.FnN
+	// directly to the cross-chunk target at link time, with no
+	// trampoline frame and no auto-generated ABI0 wrapper.
+	// Sufficient when every caller of <local>.FnN is itself Go (the
+	// main wasm2go.go file, or the pure-Go fallback bodies in
+	// pN_pure.go).
+	linknameForwardBare linknameForwardKind = iota
+	// linknameForwardWrapperPair emits `_x<fnName>` (linkname-only
+	// decl) + `<fnName>` (Go body that tail-calls _x<fnName>).
+	// The Go body forces the Go compiler to emit a local ABI0
+	// wrapper at <local>.<fnName>.abi0, which the chunk's amd64.s
+	// / arm64.s body needs because `CALL ·<fnName>(SB)` resolves
+	// into the ABI0 slot. Bare //go:linkname does NOT generate
+	// that wrapper (verified on go 1.26.2: every per-chunk asm
+	// caller fails to link with `relocation target <pX>.<fnName>
+	// not defined` when the wrapper body is absent), so wrapper
+	// pairs are required whenever the chunk's asm bundle CALLs
+	// the local symbol.
+	linknameForwardWrapperPair
+)
+
+// emitWasmFnForwards returns the //go:linkname forward declarations
+// for the cross-chunk wasm functions registered against callerChunk
+// during translation. kind picks between the bare-alias and the
+// wrapper-pair source shapes (see linknameForwardKind). Returns nil
+// when no forwards are registered for the caller.
+func (t *translator) emitWasmFnForwards(callerChunk int, kind linknameForwardKind) []ast.Decl {
 	forwards := t.linknameForwards[callerChunk]
-	symForwards := t.linknameSymbolForwards[callerChunk]
-	if len(forwards) == 0 && len(symForwards) == 0 {
+	if len(forwards) == 0 {
 		return nil
 	}
 	prevChunk := t.currentChunk
@@ -803,43 +837,19 @@ func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
 	defer func() { t.currentChunk = prevChunk }()
 
 	var decls []ast.Decl
-
-	// Wasm-function forwards.
 	keys := make([]uint32, 0, len(forwards))
 	for k := range forwards {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	// Two forms are emitted, picked by caller-context:
-	//
-	//  - callerChunk == -1 (the main wasm2go.go file): a bare
-	//    //go:linkname alias with no body. There is no asm in the
-	//    main file, so nothing ever issues `CALL ·FnN(SB)` against
-	//    a main-file symbol — the alias is sufficient for Go-side
-	//    callers (Inv_<svc>_<mt>) and the linker resolves
-	//    <main>.FnN directly to <pX>.FnN with no intervening Go
-	//    trampoline frame at runtime.
-	//
-	//  - callerChunk >= 0 (a per-chunk pN.go file): the
-	//    `_x<fnName>` linkname-only decl + `<fnName>` Go-body
-	//    trampoline pair. Bare //go:linkname here does NOT cause
-	//    the Go compiler to emit a local ABI0 wrapper at
-	//    `<pX>.<fnName>.abi0`, and the chunk's amd64.s / arm64.s
-	//    body issues `CALL ·<fnName>(SB)` which resolves through
-	//    that wrapper — so a bare alias leaves the linker with
-	//    `relocation target <pX>.<fnName> not defined` (verified
-	//    on go 1.26.2: every per-chunk caller fails to link). The
-	//    Go-body trampoline forces the wrapper to be generated;
-	//    the body itself tail-calls the linkname-aliased remote
-	//    and pure-Go callers see one extra frame to keep the asm
-	//    side linkable.
+
 	for _, funcIdx := range keys {
 		targetChunk := forwards[funcIdx]
 		fnName := t.funcName(funcIdx)
 		linknameTarget := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, targetChunk, fnName)
 		ft := t.mod.FuncTypeOf(funcIdx)
 
-		if callerChunk == -1 {
+		if kind == linknameForwardBare {
 			decls = append(decls, &ast.FuncDecl{
 				Doc: &ast.CommentGroup{List: []*ast.Comment{
 					{Text: fmt.Sprintf("//go:linkname %s %s", fnName, linknameTarget)},
@@ -890,13 +900,31 @@ func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
 			Body: &ast.BlockStmt{List: []ast.Stmt{bodyStmt}},
 		})
 	}
+	return decls
+}
 
-	// Named-symbol forwards.
+// emitNamedSymbolForwards returns the //go:linkname forward
+// declarations for the per-callerChunk named-symbol forwards
+// (InvokeExportShard_K, InitElemSeg_K_n, …). Always a bare alias —
+// these symbols are Go helpers with no asm-side callers, so the
+// ABI0-wrapper requirement that drives the wasm-function
+// wrapper-pair form does not apply. Returns nil when no
+// named-symbol forwards are registered.
+func (t *translator) emitNamedSymbolForwards(callerChunk int) []ast.Decl {
+	symForwards := t.linknameSymbolForwards[callerChunk]
+	if len(symForwards) == 0 {
+		return nil
+	}
+	prevChunk := t.currentChunk
+	t.currentChunk = callerChunk
+	defer func() { t.currentChunk = prevChunk }()
+
 	symKeys := make([]string, 0, len(symForwards))
 	for k := range symForwards {
 		symKeys = append(symKeys, k)
 	}
 	sort.Strings(symKeys)
+	var decls []ast.Decl
 	for _, name := range symKeys {
 		sym := symForwards[name]
 		linknameTarget := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, sym.targetChunk, name)
