@@ -945,17 +945,32 @@ func wrapperSymbol(helperPfx, name string) string {
 // name. "Fn42" (same-package) becomes "·Fn42(SB)"; "base.Fn42"
 // (single-name cross-package) becomes "base·Fn42(SB)";
 // "github.com/foo/bar.Fn42" (full import path) becomes
-// "github·com∕foo∕bar·Fn42(SB)". Plan9 asm's scanner does not
-// accept "/" or "." as identifier runes — it reserves "/" as the
-// division operator and "." as the addressing-mode dot — but it
-// DOES accept the Unicode DIVISION SLASH U+2215 ("∕") and MIDDLE
-// DOT U+00B7 ("·") as identifier runes (see
-// src/cmd/asm/internal/lex/tokenizer.go: isIdentRune). The two
-// runes survive into the symbol table verbatim and the linker
-// resolves the full name (e.g. asm "github·com∕foo∕bar·Fn42"
-// matches Go "github.com/foo/bar.Fn42"), so the asm CALL hits
-// the target package's ABI0 entry directly without going through
-// a per-chunk Go-body trampoline.
+// "github·com∕foo∕bar·Fn42(SB)".
+//
+// The remapping is forced by two pieces of the plan 9 asm lexer:
+//
+//   - src/cmd/asm/internal/lex/tokenizer.go: isIdentRune accepts
+//     only unicode.IsLetter, digits (after position 0), '_',
+//     U+00B7 ("·"), and U+2215 ("∕") as identifier runes. The
+//     ASCII "/" is reserved as the division operator and ASCII
+//     "." is reserved for offset / displacement syntax, so they
+//     cannot appear directly in a symbol-reference token.
+//
+//   - src/cmd/asm/internal/lex/lex.go: lex.Make post-processes
+//     every identifier token by `strings.ReplaceAll`-ing "·" back
+//     to "." and "∕" back to "/", so the symbol name the linker
+//     finally sees is the canonical Go form
+//     (e.g. "github.com/foo/bar.Fn42"). The Unicode runes are
+//     purely a source-level escape, not a separate name space.
+//
+// Together those two passes give the lexer exactly one way to
+// embed a "/" or "." inside a symbol operand — the U+00B7 /
+// U+2215 substitution we apply here. Any other punctuation that
+// Go module paths permit ("-", "+", "~", ...) has no plan 9
+// counterpart, which is why the asm-CALL optimization in
+// asm_bundle.go is gated behind isPlan9AsmSafe and falls back to
+// the per-chunk Go-body wrapper for hyphenated host paths
+// (see asm_bundle.go's comment on buildAsmFilesMultiChunk).
 //
 // The split between package and symbol uses the LAST dot, which
 // is the only dot that can legitimately separate path from symbol

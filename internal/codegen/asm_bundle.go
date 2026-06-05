@@ -112,15 +112,29 @@ func buildAsmFilesMultiChunk(m *wasm.Module, opts Options, chunkIdx int, chunk M
 	return out, nil
 }
 
-// isPlan9AsmSafe reports whether path can be embedded verbatim into a
-// plan 9 asm symbol operand by mapping "/" to U+2215 and intra-
-// component "." to U+00B7. The asm scanner only treats letters,
-// digits (after the first character), "_", U+00B7, and U+2215 as
-// identifier runes (src/cmd/asm/internal/lex/tokenizer.go:
-// isIdentRune). Any other byte — hyphen, plus, tilde, etc. — has
-// no identifier-rune substitute and forces us to fall back to the
-// per-chunk Go-body trampoline (so the asm CALL stays a local
-// ·FnN(SB) reference). Empty path is rejected so the caller treats
+// isPlan9AsmSafe reports whether path can be embedded into a plan 9
+// asm symbol operand by mapping "/" → U+2215 ("∕") and "." →
+// U+00B7 ("·"). The plan 9 asm lexer is the source of truth:
+//
+//   - src/cmd/asm/internal/lex/tokenizer.go: isIdentRune accepts
+//     unicode.IsLetter, digits (after the first character), "_",
+//     U+00B7, and U+2215 — and nothing else.
+//
+//   - src/cmd/asm/internal/lex/lex.go: lex.Make post-processes
+//     identifier tokens with `strings.ReplaceAll`, mapping U+00B7
+//     back to "." and U+2215 back to "/" before the name is
+//     handed to the symbol-lookup pass. So the only ASCII
+//     punctuation that survives a round-trip through the scanner
+//     into a symbol operand is "." and "/" — every other character
+//     ("-", "+", "~", " ", ...) has no plan 9 substitute and is
+//     simply unrepresentable in an asm CALL operand. There is no
+//     escape syntax: macros must themselves be alphanumeric
+//     identifiers (input.go: macroName) and string literals are
+//     immediate-only ("string constant must be an immediate").
+//
+// Any byte outside [A-Za-z0-9_./] therefore forces a fall back to
+// the per-chunk Go-body trampoline so the asm CALL stays a local
+// ·FnN(SB) reference. Empty path is rejected so the caller treats
 // it as unsafe.
 func isPlan9AsmSafe(path string) bool {
 	if path == "" {
