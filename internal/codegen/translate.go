@@ -810,26 +810,46 @@ func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	// Two forms are emitted, picked by caller-context:
+	//
+	//  - callerChunk == -1 (the main wasm2go.go file): a bare
+	//    //go:linkname alias with no body. There is no asm in the
+	//    main file, so nothing ever issues `CALL ·FnN(SB)` against
+	//    a main-file symbol — the alias is sufficient for Go-side
+	//    callers (Inv_<svc>_<mt>) and the linker resolves
+	//    <main>.FnN directly to <pX>.FnN with no intervening Go
+	//    trampoline frame at runtime.
+	//
+	//  - callerChunk >= 0 (a per-chunk pN.go file): the
+	//    `_x<fnName>` linkname-only decl + `<fnName>` Go-body
+	//    trampoline pair. Bare //go:linkname here does NOT cause
+	//    the Go compiler to emit a local ABI0 wrapper at
+	//    `<pX>.<fnName>.abi0`, and the chunk's amd64.s / arm64.s
+	//    body issues `CALL ·<fnName>(SB)` which resolves through
+	//    that wrapper — so a bare alias leaves the linker with
+	//    `relocation target <pX>.<fnName> not defined` (verified
+	//    on go 1.26.2: every per-chunk caller fails to link). The
+	//    Go-body trampoline forces the wrapper to be generated;
+	//    the body itself tail-calls the linkname-aliased remote
+	//    and pure-Go callers see one extra frame to keep the asm
+	//    side linkable.
 	for _, funcIdx := range keys {
 		targetChunk := forwards[funcIdx]
 		fnName := t.funcName(funcIdx)
 		linknameTarget := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, targetChunk, fnName)
 		ft := t.mod.FuncTypeOf(funcIdx)
 
-		// A bare //go:linkname forward creates an alias visible to
-		// Go source but NOT a local symbol — there is no
-		// `<caller_pkg>.<fnName>` for the linker to resolve from
-		// asm `·Fn48(SB)` references. To make cross-chunk calls
-		// work from both pure-Go AND asm, emit a trampoline pair:
-		//   //go:linkname _x<fnName> <pX>.<fnName>
-		//   func _x<fnName>(...) ...
-		//   func <fnName>(...) ... { return _x<fnName>(...) }
-		// The trampoline gives the local symbol asm needs; the
-		// linkname-aliased helper provides the cross-chunk hop.
-		// Pure-Go consumers see one extra call frame; asm consumers
-		// see a CALL to the trampoline that immediately tail-calls
-		// the remote — equivalent to the pre-trampoline path
-		// modulo one extra return.
+		if callerChunk == -1 {
+			decls = append(decls, &ast.FuncDecl{
+				Doc: &ast.CommentGroup{List: []*ast.Comment{
+					{Text: fmt.Sprintf("//go:linkname %s %s", fnName, linknameTarget)},
+				}},
+				Name: newID(fnName),
+				Type: t.funcSignature(ft, true /*withModuleParam*/),
+			})
+			continue
+		}
+
 		hiddenName := "_x" + fnName
 		decls = append(decls, &ast.FuncDecl{
 			Doc: &ast.CommentGroup{List: []*ast.Comment{
