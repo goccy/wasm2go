@@ -137,11 +137,6 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			Name: newID("base"),
 			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")},
 		})
-		// `_ "unsafe"` required for //go:linkname directives in this file.
-		imports = append(imports, &ast.ImportSpec{
-			Name: newID("_"),
-			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote("unsafe")},
-		})
 		for _, p := range stdlibUsed {
 			imports = append(imports, &ast.ImportSpec{
 				Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(p)},
@@ -160,8 +155,6 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			Tok:   token.IMPORT,
 			Specs: importsAsSpecs(imports),
 		})
-		// Linkname forward decls after imports, before bodies.
-		pkgFile.Decls = append(pkgFile.Decls, t.emitLinknameForwards(chunkIdx)...)
 		// Package-level constant table — see translate.go's
 		// useLargeConst comment for why large memory offsets are
 		// routed through a runtime-loaded table instead of inline
@@ -177,6 +170,19 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			return Result{}, fmt.Errorf("format chunk p%d: %w", chunkIdx, err)
 		}
 		files[path] = buf.Bytes()
+
+		// Per-chunk alias.go — the linkname-forward declarations live
+		// here, separated from the chunk's bodies so the cross-chunk
+		// trampoline pairs are easy to find / audit / regenerate
+		// independently of the function table and init code. Same
+		// package as pN.go, so the trampoline definitions are
+		// callable from bodies in pN.go without qualification.
+		// Emitted only if the chunk actually has forwards.
+		if aliasBytes, err := t.formatAliasFile(fmt.Sprintf("p%d", chunkIdx), chunkIdx); err != nil {
+			return Result{}, err
+		} else if aliasBytes != nil {
+			files[fmt.Sprintf("p%d/alias.go", chunkIdx)] = aliasBytes
+		}
 	}
 
 	// Phase 6: serialize base file.
@@ -201,10 +207,6 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	mainImports := []*ast.ImportSpec{
 		{Name: newID("base"), Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")}},
 	}
-	mainImports = append(mainImports, &ast.ImportSpec{
-		Name: newID("_"),
-		Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote("unsafe")},
-	})
 	for _, p := range mainStdlib {
 		mainImports = append(mainImports, &ast.ImportSpec{
 			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(p)},
@@ -224,9 +226,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		})
 	}
 	mainFile := &ast.File{Name: newID(t.opts.Package)}
-	mainFile.Decls = append([]ast.Decl{
-		&ast.GenDecl{Tok: token.IMPORT, Specs: importsAsSpecs(mainImports)},
-	}, t.emitLinknameForwards(-1)...)
+	mainFile.Decls = append(mainFile.Decls, &ast.GenDecl{Tok: token.IMPORT, Specs: importsAsSpecs(mainImports)})
 	if decl := t.emitLargeConstsDecl(-1); decl != nil {
 		mainFile.Decls = append(mainFile.Decls, decl)
 	}
@@ -237,6 +237,15 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			return Result{}, fmt.Errorf("format main: %w", err)
 		}
 		files[t.opts.Package+".go"] = buf.Bytes()
+	}
+
+	// Main-file alias.go — same arch-agnostic linkname forwards
+	// extracted out of <pkg>.go so they sit next to the per-chunk
+	// alias.go files for symmetry. Emitted only if there are forwards.
+	if aliasBytes, err := t.formatAliasFile(t.opts.Package, -1); err != nil {
+		return Result{}, err
+	} else if aliasBytes != nil {
+		files["alias.go"] = aliasBytes
 	}
 
 	sidecars := map[string][]byte{}
@@ -279,6 +288,54 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 
 	t.reportMemMetrics()
 	return Result{Files: files, Sidecars: sidecars}, nil
+}
+
+// formatAliasFile renders the per-package alias.go that holds the
+// //go:linkname forward declarations for callerChunk. The forwards
+// are arch-agnostic (the trampoline pair / bare-alias shape is the
+// same on amd64, arm64, and the pure-Go fallback) so keeping them in
+// a dedicated file makes them easy to locate, audit, and regenerate
+// independently of the chunk's bodies and the asm bundle.
+//
+// The file declares the same package as <pkg>.go / pN.go so the
+// trampoline definitions are name-callable from those files without
+// qualification. It imports only `base` (for *base.Module typed
+// parameters) and the blank `unsafe` (required by //go:linkname).
+// Returns nil if the chunk has no forwards to emit.
+func (t *translator) formatAliasFile(pkgName string, callerChunk int) ([]byte, error) {
+	prevChunk := t.currentChunk
+	t.currentChunk = callerChunk
+	defer func() { t.currentChunk = prevChunk }()
+
+	forwards := t.emitLinknameForwards(callerChunk)
+	if len(forwards) == 0 {
+		return nil, nil
+	}
+
+	imports := []*ast.ImportSpec{
+		{
+			Name: newID("base"),
+			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")},
+		},
+		{
+			// `_ "unsafe"` is required by the //go:linkname directive.
+			Name: newID("_"),
+			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote("unsafe")},
+		},
+	}
+
+	file := &ast.File{Name: newID(pkgName)}
+	file.Decls = append(file.Decls, &ast.GenDecl{
+		Tok:   token.IMPORT,
+		Specs: importsAsSpecs(imports),
+	})
+	file.Decls = append(file.Decls, forwards...)
+
+	var buf bytes.Buffer
+	if err := format.Node(&buf, t.fset, file); err != nil {
+		return nil, fmt.Errorf("format alias.go for %s: %w", pkgName, err)
+	}
+	return buf.Bytes(), nil
 }
 
 // Compile-time tether so the wasm import path remains hot if future edits
