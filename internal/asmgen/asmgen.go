@@ -196,7 +196,210 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	}
 
 	goDecl = fmt.Sprintf("//go:noescape\nfunc %s%s\n", name, goSignature(sig, opts.ModulePkgRef))
-	return b.String(), goDecl, nil
+	return peepholeOpt(b.String()), goDecl, nil
+}
+
+// peepholeOpt runs a tiny set of arch-agnostic line-level reductions
+// over an emitted asm body. It is line-local — never reorders, never
+// looks past a label, a CALL, or any instruction other than the one
+// it is matching — so it can't change observable behaviour. The
+// reductions remove patterns the emitter produces by construction
+// (every SSA value emits a `MOV reg, slot(SP)` store followed at the
+// next consumer by a `MOV slot(SP), reg` reload, even when the value
+// is still live in the register); removing them shrinks the bundle's
+// machine code without changing semantics.
+//
+// Patterns reduced:
+//
+//  1. Adjacent self-cancelling store/reload pairs, e.g.
+//        MOVL AX, 92(SP)
+//        MOVL 92(SP), AX            ← redundant; value is in AX already
+//     Variants: MOVQ, MOVL with any GP register, MOVSS / MOVSD with
+//     SSE registers. The store stays; the reload is dropped.
+//
+//  2. amd64 `MOVL $imm, AX; ADDQ AX, BX` collapses to
+//        LEAQ imm(BX), BX
+//     when imm is a non-negative literal. Negative literals would
+//     differ in the upper 32 bits (the MOVL form zero-extends imm to
+//     RAX; LEAQ sign-extends the displacement) so we leave those
+//     alone.
+func peepholeOpt(asm string) string {
+	if asm == "" {
+		return asm
+	}
+	lines := strings.Split(asm, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if n := len(out); n > 0 {
+			prev := out[n-1]
+			if peepholeSkipReload(prev, line) {
+				// Drop `line` — value still live in the register.
+				continue
+			}
+			if combined, ok := peepholeLEAQ(prev, line); ok {
+				out[n-1] = combined
+				continue
+			}
+			if peepholeFallthroughJmp(prev, line) {
+				// Drop the unconditional jump in `prev`; the label
+				// on `line` is its target and immediately follows.
+				out[n-1] = line
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// peepholeSkipReload reports whether `cur` is a load that exactly
+// undoes the store in `prev`. Matches:
+//
+//	prev: \tMOV{L,Q} <REG>, <off>(SP)
+//	cur:  \tMOV{L,Q} <off>(SP), <REG>
+//
+// and the SSE float pair (MOVSS / MOVSD with X<n>). The store side
+// is left in place — only the reload is dropped — so the value is
+// still observable in memory for any non-adjacent consumer that may
+// follow later in the same function. Anything between the two lines
+// (a label declaration, another instruction, a CALL) breaks the
+// adjacency and the peephole declines to fire.
+func peepholeSkipReload(prev, cur string) bool {
+	pInstr, pSrc, pDst, ok := parseMOV(prev)
+	if !ok {
+		return false
+	}
+	cInstr, cSrc, cDst, ok := parseMOV(cur)
+	if !ok || pInstr != cInstr {
+		return false
+	}
+	// Store form: src is a register, dst is a memory operand.
+	// Reload form: src is the same memory operand, dst is the same register.
+	return isRegOperand(pSrc) && isMemSPOperand(pDst) && pSrc == cDst && pDst == cSrc
+}
+
+// peepholeFallthroughJmp reports whether `prev` is an unconditional
+// jump to a label that is declared on the very next line. Both arch
+// emitters use the same `\tJMP L<n>` / `\tB L<n>` shape and place the
+// target label on its own line as `L<n>:`. When the two are
+// adjacent, the jump is a fall-through and can be dropped: the
+// branch on `prev` becomes the label line in `cur`. The label is
+// kept (something else may still target it).
+func peepholeFallthroughJmp(prev, cur string) bool {
+	var target string
+	switch {
+	case strings.HasPrefix(prev, "\tJMP L"):
+		target = prev[len("\tJMP "):]
+	case strings.HasPrefix(prev, "\tB L"):
+		target = prev[len("\tB "):]
+	default:
+		return false
+	}
+	if target == "" {
+		return false
+	}
+	for i := 1; i < len(target); i++ {
+		if target[i] < '0' || target[i] > '9' {
+			return false
+		}
+	}
+	return cur == target+":"
+}
+
+// peepholeLEAQ folds a `MOVL $<imm>, AX; ADDQ AX, BX` pair into a
+// single `LEAQ <imm>(BX), BX`. Returns the combined line and true if
+// the pattern matched. Only fires when the immediate is a non-
+// negative decimal literal — for negatives, MOVL zero-extends through
+// RAX while LEAQ would sign-extend the displacement, so the two
+// forms diverge and we leave them alone.
+func peepholeLEAQ(prev, cur string) (string, bool) {
+	// We accept ANY GP register pair as long as MOV's dst register
+	// matches ADD's src register, but in practice the emitter only
+	// uses AX as the scratch so we keep the matcher narrow.
+	const (
+		movPrefix = "\tMOVL $"
+		movSuffix = ", AX"
+		addLine   = "\tADDQ AX, BX"
+	)
+	if !strings.HasPrefix(prev, movPrefix) || !strings.HasSuffix(prev, movSuffix) {
+		return "", false
+	}
+	if cur != addLine {
+		return "", false
+	}
+	imm := prev[len(movPrefix) : len(prev)-len(movSuffix)]
+	if imm == "" || imm[0] == '-' {
+		return "", false
+	}
+	// Reject anything that isn't a plain decimal literal.
+	for i := 0; i < len(imm); i++ {
+		if imm[i] < '0' || imm[i] > '9' {
+			return "", false
+		}
+	}
+	return fmt.Sprintf("\tLEAQ %s(BX), BX", imm), true
+}
+
+// parseMOV decomposes a "\tMOV<suffix> <src>, <dst>" line. Returns
+// the bare opcode (e.g. "MOVL"), the source operand, the destination
+// operand, and whether the line matched the shape. Anything that
+// isn't an indented MOV with exactly one ", " separating two
+// operands is rejected, which is sufficient to keep peephole
+// matching to the emitter's canonical output.
+func parseMOV(line string) (instr, src, dst string, ok bool) {
+	if len(line) < 5 || line[0] != '\t' {
+		return "", "", "", false
+	}
+	body := line[1:]
+	// Match the four MOV opcodes the emitter produces.
+	var prefix string
+	switch {
+	case strings.HasPrefix(body, "MOVL "):
+		prefix = "MOVL"
+	case strings.HasPrefix(body, "MOVQ "):
+		prefix = "MOVQ"
+	case strings.HasPrefix(body, "MOVSS "):
+		prefix = "MOVSS"
+	case strings.HasPrefix(body, "MOVSD "):
+		prefix = "MOVSD"
+	default:
+		return "", "", "", false
+	}
+	rest := body[len(prefix)+1:]
+	i := strings.Index(rest, ", ")
+	if i < 0 {
+		return "", "", "", false
+	}
+	return prefix, rest[:i], rest[i+2:], true
+}
+
+func isRegOperand(s string) bool {
+	switch s {
+	case "AX", "BX", "CX", "DX", "SI", "DI", "BP", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15":
+		return true
+	case "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7":
+		return true
+	}
+	return false
+}
+
+func isMemSPOperand(s string) bool {
+	// "<digits>(SP)" — exactly the stack-slot syntax the emitter
+	// produces for every SSA-value store. Negative offsets are
+	// rejected; the frame planner never emits them.
+	if !strings.HasSuffix(s, "(SP)") {
+		return false
+	}
+	core := s[:len(s)-len("(SP)")]
+	if core == "" {
+		return false
+	}
+	for i := 0; i < len(core); i++ {
+		if core[i] < '0' || core[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // emitBlock emits one block: its label, its values, the phi

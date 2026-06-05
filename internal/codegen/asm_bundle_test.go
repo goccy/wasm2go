@@ -43,7 +43,10 @@ func TestBuildAsmPackageArith(t *testing.T) {
 	}
 
 	// Sanity check: every expected asm/fallback file is present.
-	expect := []string{"arith_pure.go", "decls_amd64.go", "amd64.s", "decls_arm64.go", "arm64.s"}
+	// When both archs declare the same symbols and no stubs are
+	// emitted, the per-arch decls files are collapsed into a single
+	// decls.go gated on `//go:build amd64 || arm64`.
+	expect := []string{"arith_pure.go", "decls.go", "amd64.s", "arm64.s"}
 	for _, f := range expect {
 		if _, ok := res.Files[f]; !ok {
 			t.Errorf("missing %q in output (have: %v)", f, fileList(res.Files))

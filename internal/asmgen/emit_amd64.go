@@ -633,11 +633,21 @@ func emitLoad(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) 
 		fmt.Fprintf(b, "\tMOVQ %d(BX), BX\n", moduleMOffset)
 	}
 	addr := "(BX)"
-	fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
-	if off != 0 {
-		fmt.Fprintf(b, "\tADDL $%d, AX\n", off)
+	// Mirror of emitStore's constant-base fast path: when the base is
+	// a known Const32 we fold `base + off` at generation time and
+	// emit a single MOVx disp(BX), <reg> load, dropping the
+	// MOVL+ADDL+ADDQ address-formation triplet. Same uint32 wrap
+	// semantics as the runtime path.
+	if base, ok := inlineableI32(v.Args[0]); ok {
+		disp := int32(uint32(base) + uint32(off))
+		addr = fmt.Sprintf("%d(BX)", disp)
+	} else {
+		fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
+		if off != 0 {
+			fmt.Fprintf(b, "\tADDL $%d, AX\n", off)
+		}
+		fmt.Fprintf(b, "\tADDQ AX, BX\n")
 	}
-	fmt.Fprintf(b, "\tADDQ AX, BX\n")
 	// Narrow loads (8/16-bit) produce either i32 or i64 depending
 	// on the wasm op — i32.load8_u vs i64.load8_u both lower to
 	// OpLoad8U, distinguished only by v.Type. The asm has to
@@ -720,11 +730,23 @@ func emitStore(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame)
 		fmt.Fprintf(b, "\tMOVQ %d(BX), BX\n", moduleMOffset)
 	}
 	addr := "(BX)"
-	fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
-	if off != 0 {
-		fmt.Fprintf(b, "\tADDL $%d, AX\n", off)
+	// Fast path: if `base` is a Const32 we can fold `base + off` at
+	// generation time and use a single MOVx disp(BX), <val> store
+	// instead of the 3-instruction MOVL+ADDL+ADDQ address build-up.
+	// The displacement uses the same uint32(base+off) wrap as the
+	// runtime path because we form the constant via int32 add and
+	// re-cast as int32 — that gives identical low-32-bit behaviour
+	// for both negative-int32 bases and very-large offsets.
+	if base, ok := inlineableI32(v.Args[0]); ok {
+		disp := int32(uint32(base) + uint32(off))
+		addr = fmt.Sprintf("%d(BX)", disp)
+	} else {
+		fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
+		if off != 0 {
+			fmt.Fprintf(b, "\tADDL $%d, AX\n", off)
+		}
+		fmt.Fprintf(b, "\tADDQ AX, BX\n")
 	}
-	fmt.Fprintf(b, "\tADDQ AX, BX\n")
 	// The wasm store-narrow ops truncate the low N bits of the value.
 	// On amd64 the small-store mnemonics (MOVB/MOVW) naturally write
 	// only the low bits of the register, so we just MOV the value

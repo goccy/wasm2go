@@ -1858,23 +1858,26 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt) error {
 	return nil
 }
 
-// emitSafeInvokeWrap emits the shared trap-recovery helper used by the
-// per-export dispatch functions. It is the
-// global-snapshot + recover logic of SafeInvokeExport, but parametrised
-// over the actual call via a closure so every per-export function can
-// share this single copy:
+// buildSafeInvokeBody constructs the body statements that wrap a single
+// `packed = <callExpr>` line with global-snapshot save/restore and a
+// recover-into-err defer. Used by emitOneExportFunc to inline the same
+// trap-recovery sequence that the historical safeInvokeWrap helper
+// implemented, but without the closure + extra Go call frame: each
+// per-export Inv_<svc>_<mt> now contains the snapshot+defer+call+return
+// directly, so the wasmify bridge → Inv → asm path drops two Go frames
+// (the closure and the wrapper) plus the closure allocation per call.
 //
-//	func safeInvokeWrap(m *Module, call func() int64) (packed int64, err error) {
-//	    savedG0 := m.G0   // and every other mutable global
-//	    defer func() {
-//	        if r := recover(); r != nil { m.G0 = savedG0; err = ... }
-//	    }()
-//	    packed = call()
-//	    return
-//	}
-func (t *translator) emitSafeInvokeWrap() ast.Decl {
+// The emitted shape is:
+//
+//	savedG0 := m.G0   // and every other mutable global
+//	defer func() {
+//	    if r := recover(); r != nil { m.G0 = savedG0; ...; err = ... }
+//	}()
+//	packed = <callExpr>
+//	return
+func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 	t.use("fmt")
-	body := &ast.BlockStmt{}
+	var stmts []ast.Stmt
 	type snap struct{ saved, field string }
 	var snaps []snap
 	for i := range t.mod.Globals {
@@ -1885,7 +1888,7 @@ func (t *translator) emitSafeInvokeWrap() ast.Decl {
 		fld := t.fieldName(fmt.Sprintf("g%d", idx))
 		sav := fmt.Sprintf("savedG%d", idx)
 		snaps = append(snaps, snap{saved: sav, field: fld})
-		body.List = append(body.List, &ast.AssignStmt{
+		stmts = append(stmts, &ast.AssignStmt{
 			Tok: token.DEFINE,
 			Lhs: []ast.Expr{newID(sav)},
 			Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(fld)}},
@@ -1917,70 +1920,52 @@ func (t *translator) emitSafeInvokeWrap() ast.Decl {
 		Cond: &ast.BinaryExpr{X: newID("r"), Op: token.NEQ, Y: newID("nil")},
 		Body: ifBody,
 	})
-	body.List = append(body.List, &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
+	stmts = append(stmts, &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
 		Type: &ast.FuncType{Params: &ast.FieldList{}},
 		Body: recoverBody,
 	}}})
-	body.List = append(body.List, &ast.AssignStmt{
+	stmts = append(stmts, &ast.AssignStmt{
 		Tok: token.ASSIGN,
 		Lhs: []ast.Expr{newID("packed")},
-		Rhs: []ast.Expr{&ast.CallExpr{Fun: newID("call")}},
+		Rhs: []ast.Expr{callExpr},
 	})
-	body.List = append(body.List, &ast.ReturnStmt{})
-
-	callType := &ast.FuncType{
-		Params:  &ast.FieldList{},
-		Results: &ast.FieldList{List: []*ast.Field{{Type: newID("int64")}}},
-	}
-	params := &ast.FieldList{List: []*ast.Field{
-		{Names: []*ast.Ident{newID("m")}, Type: t.moduleType()},
-		{Names: []*ast.Ident{newID("call")}, Type: callType},
-	}}
-	results := &ast.FieldList{List: []*ast.Field{
-		{Names: []*ast.Ident{newID("packed")}, Type: newID("int64")},
-		{Names: []*ast.Ident{newID("err")}, Type: newID("error")},
-	}}
-	return &ast.FuncDecl{
-		Name: newID("safeInvokeWrap"),
-		Type: &ast.FuncType{Params: params, Results: results},
-		Body: body,
-	}
+	stmts = append(stmts, &ast.ReturnStmt{})
+	return stmts
 }
 
 // emitOneExportFunc emits one standalone dispatch function for a single
 // wasmify export:
 //
-//	func Inv_<svc>_<mt>(m *Module, l0, l1 int32) (int64, error) {
-//	    return safeInvokeWrap(m, func() int64 { return FnN(m, l0, l1) })
+//	func Inv_<svc>_<mt>(m *Module, l0, l1 int32) (packed int64, err error) {
+//	    savedG0 := m.G0   // and every other mutable global
+//	    defer func() {
+//	        if r := recover(); r != nil { m.G0 = savedG0; err = ... }
+//	    }()
+//	    packed = FnN(m, l0, l1)
+//	    return
 //	}
 //
-// The wasm function is called directly inside a closure that lives in
-// this function's body — so when the linker proves Inv_<svc>_<mt>
-// unreachable, the closure and its FnN reference are dropped with it.
+// The snapshot+defer+call sequence is inlined per-Inv (rather than
+// routed through a shared safeInvokeWrap helper that took a closure)
+// so the bridge path is two Go frames + one closure allocation
+// shorter per wasmify call: the closure that captured (m, l0, l1)
+// and the safeInvokeWrap frame itself are both gone. Each Inv_*
+// remains independently DCE-able because the FnN call is still
+// only reachable through its own function body.
 func (t *translator) emitOneExportFunc(w wexpEntry) ast.Decl {
-	closure := &ast.FuncLit{
-		Type: &ast.FuncType{
-			Params:  &ast.FieldList{},
-			Results: &ast.FieldList{List: []*ast.Field{{Type: newID("int64")}}},
-		},
-		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{
-			&ast.CallExpr{
-				Fun:  t.funcRef(w.funcIndex),
-				Args: []ast.Expr{newID("m"), newID("l0"), newID("l1")},
-			},
-		}}}},
+	call := &ast.CallExpr{
+		Fun:  t.funcRef(w.funcIndex),
+		Args: []ast.Expr{newID("m"), newID("l0"), newID("l1")},
 	}
-	body := &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{
-		&ast.CallExpr{
-			Fun:  newID("safeInvokeWrap"),
-			Args: []ast.Expr{newID("m"), closure},
-		},
-	}}}}
+	body := &ast.BlockStmt{List: t.buildSafeInvokeBody(call)}
 	params := &ast.FieldList{List: []*ast.Field{
 		{Names: []*ast.Ident{newID("m")}, Type: t.moduleType()},
 		{Names: []*ast.Ident{newID("l0"), newID("l1")}, Type: newID("int32")},
 	}}
-	results := &ast.FieldList{List: []*ast.Field{{Type: newID("int64")}, {Type: newID("error")}}}
+	results := &ast.FieldList{List: []*ast.Field{
+		{Names: []*ast.Ident{newID("packed")}, Type: newID("int64")},
+		{Names: []*ast.Ident{newID("err")}, Type: newID("error")},
+	}}
 	return &ast.FuncDecl{
 		Name: newID(fmt.Sprintf("Inv_%d_%d", w.svc, w.mt)),
 		Type: &ast.FuncType{Params: params, Results: results},
@@ -2087,13 +2072,15 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 	}
 	// Per-export dispatch is always on whenever BulkExportPrefix
 	// matched any export — emit one standalone Inv_<svc>_<mt> function
-	// per bulk export plus the shared safeInvokeWrap. The Go linker
-	// then drops whichever Inv_* the consumer never calls. The
-	// previously-emitted consolidated InvokeExport switch (which kept
-	// every bulk export alive against DCE) has no remaining users in
-	// the new bridge codegen and has been removed entirely.
+	// per bulk export. Each Inv_* contains its own inlined trap-recovery
+	// (no shared safeInvokeWrap helper, no closure allocation) so the
+	// wasmify bridge path goes straight Inv_<svc>_<mt> → FnN with no
+	// intermediate Go frames. The Go linker drops whichever Inv_* the
+	// consumer never calls. The previously-emitted consolidated
+	// InvokeExport switch (which kept every bulk export alive against
+	// DCE) has no remaining users in the new bridge codegen and has
+	// been removed entirely.
 	if len(wexports) > 0 {
-		out = append(out, t.emitSafeInvokeWrap())
 		for _, w := range wexports {
 			out = append(out, t.emitOneExportFunc(w))
 		}
