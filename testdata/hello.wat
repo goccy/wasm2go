@@ -1,7 +1,7 @@
 ;; hello.wat — minimal wasi_snapshot_preview1 fd_write smoke test.
 ;;
 ;; Exports `say_hello`: writes "hello from wasi\n" to fd 1 (stdout).
-;; Used by Phase 2 of wasm2go to verify the native wasip1 codegen.
+;; Used by wasm2go to verify the native wasip1 codegen.
 (module
   (import "wasi_snapshot_preview1" "fd_write"
     (func $fd_write (param i32 i32 i32 i32) (result i32)))

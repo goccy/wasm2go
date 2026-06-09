@@ -12,10 +12,14 @@ import (
 
 // TestPerExportDispatch verifies the per-export dispatch shape that
 // wasm2go always emits when Options.BulkExportPrefix matches at least
-// one export: one standalone `Inv_<svc>_<mt>` function per export and
-// a shared `safeInvokeWrap` helper. The Go linker can then drop
-// whichever exports the consumer never calls. The previously-emitted
-// consolidated `InvokeExport` switch has been removed.
+// one export: one standalone `Inv_<svc>_<mt>` function per export.
+// Each Inv_* inlines its own trap-recovery (defer+recover with the
+// mutable-global snapshot+restore) so there is no shared
+// safeInvokeWrap helper and no closure allocation on the call path
+// — the consumer calls Inv_<svc>_<mt> directly, which calls FnN
+// directly. The Go linker can drop whichever exports the
+// consumer never calls. The previously-emitted consolidated
+// `InvokeExport` switch has been removed.
 func TestPerExportDispatch(t *testing.T) {
 	bin := testfixture.Wasm(t, "wexports")
 	mod, err := wasm.Parse(bytes.NewReader(bin))
@@ -38,11 +42,16 @@ func TestPerExportDispatch(t *testing.T) {
 			t.Errorf("missing %q:\n%s", name, out)
 		}
 	}
-	if !strings.Contains(out, "safeInvokeWrap") {
-		t.Errorf("missing the shared safeInvokeWrap helper")
+	if strings.Contains(out, "safeInvokeWrap") {
+		t.Errorf("safeInvokeWrap must not appear after inlining (closure + helper removed):\n%s", out)
 	}
 	if strings.Contains(out, "func InvokeExport") || strings.Contains(out, "func SafeInvokeExport") {
 		t.Errorf("consolidated InvokeExport / SafeInvokeExport must not be emitted:\n%s", out)
+	}
+	// Each Inv_* must contain its own inlined recover. Spot-check by
+	// matching the recover() call inside Inv_0_0's body.
+	if !strings.Contains(out, "recover()") {
+		t.Errorf("expected inlined defer+recover in Inv_*:\n%s", out)
 	}
 	// The non-bulk "helper" export still gets its direct wrapper.
 	if !strings.Contains(out, "Helper") {

@@ -52,7 +52,11 @@ func TestMultiPackageInProcessOverrideWinsOverEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	if len(res.Files) != 0 {
-		t.Errorf("in-process override did not win over env: Result.Files = %d entries, want 0", len(res.Files))
+	// Asm-always-on emits a per-arch asm sidecar plus
+	// pkg_pure.go and decls.go even in single-file Go mode. The
+	// signature of multi-package is the `base/base.go` split, NOT a
+	// non-empty Files map. Assert on the split file instead.
+	if _, ok := res.Files["base/base.go"]; ok {
+		t.Errorf("in-process override did not win over env: Files contains base/base.go (multi-package layout)")
 	}
 }

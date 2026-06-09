@@ -58,3 +58,43 @@ func TestPublicAPI(t *testing.T) {
 		t.Errorf("Transpile: expected error on malformed input")
 	}
 }
+
+// TestSetMultiPackageThreshold verifies the package-mode override
+// flips the resulting layout. We compare two translations of the
+// same wasm: one with a very high threshold (forces single-file
+// Go output, no `base/`) and one with threshold=0 (forces the
+// multi-package split).
+func TestSetMultiPackageThresholdAPI(t *testing.T) {
+	bin := testfixture.Wasm(t, "arith")
+	m, err := transpile.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	// Single-file: high threshold cannot be exceeded by a small
+	// fixture, so the multi-package layout must NOT trigger.
+	restoreHigh := transpile.SetMultiPackageThreshold(1 << 30)
+	resHigh, err := transpile.Translate(&bytes.Buffer{}, m, transpile.Options{
+		Package: "x", OutputImportPath: "example.com/x",
+	})
+	restoreHigh()
+	if err != nil {
+		t.Fatalf("Translate high-threshold: %v", err)
+	}
+	if _, ok := resHigh.Files["base/base.go"]; ok {
+		t.Errorf("high threshold should keep single-file mode but produced base/base.go")
+	}
+
+	// Threshold 0: every module exceeds and lands in multi-package mode.
+	restoreZero := transpile.SetMultiPackageThreshold(0)
+	resZero, err := transpile.Translate(&bytes.Buffer{}, m, transpile.Options{
+		Package: "x", OutputImportPath: "example.com/x",
+	})
+	restoreZero()
+	if err != nil {
+		t.Fatalf("Translate zero-threshold: %v", err)
+	}
+	if _, ok := resZero.Files["base/base.go"]; !ok {
+		t.Errorf("threshold=0 should trigger multi-package layout but base/base.go missing")
+	}
+}

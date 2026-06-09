@@ -1,6 +1,6 @@
 // Package ssa is an in-house lightweight SSA IR for wasm2go.
 //
-// Design notes (see .claude/plans/glistening-singing-rivest.md Phase 3):
+// Design notes:
 //
 //   - Per-function CFG: each Func has a slice of Blocks, one Entry block,
 //     and a flat list of Values. Block IDs and Value IDs are stable for

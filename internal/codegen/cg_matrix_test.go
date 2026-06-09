@@ -132,7 +132,7 @@ func TestMatrixSingleFile(t *testing.T) {
 				if err != nil {
 					t.Fatalf("translate %s (%s): %v", fx, v.name, err)
 				}
-				assertSingleFileCompiles(t, buf.String(), res.Sidecars, res.AuxFiles)
+				assertSingleFileCompiles(t, buf.String(), res.Sidecars, res.AuxFiles, res.Files)
 			})
 		}
 	}
@@ -155,7 +155,7 @@ func TestMatrixNativeWASI(t *testing.T) {
 				t.Fatalf("translate (NativeWASI): %v", err)
 			}
 			src := buf.String()
-			assertSingleFileCompiles(t, src, res.Sidecars, res.AuxFiles)
+			assertSingleFileCompiles(t, src, res.Sidecars, res.AuxFiles, res.Files)
 			if fx == "cg_wasi.wasm" || fx == "hello.wasm" {
 				if !strings.Contains(src, "DefaultWASI") {
 					t.Errorf("%s: NativeWASI output missing DefaultWASI()", fx)
@@ -197,7 +197,14 @@ func main() {
 	fmt.Printf("arg_count>=0=%v\n", ac >= 0)
 }
 `
-	out := runGoSnippetWithAux(t, buf.String(), main, []map[string][]byte{res.Sidecars}, res.AuxFiles)
+	auxFiles := map[string][]byte{}
+	for k, v := range res.AuxFiles {
+		auxFiles[k] = v
+	}
+	for k, v := range res.Files {
+		auxFiles[k] = v
+	}
+	out := runGoSnippetWithAux(t, buf.String(), main, []map[string][]byte{res.Sidecars}, auxFiles)
 	if !strings.Contains(out, "wasi native ok") {
 		t.Errorf("native wasi say_hello did not write expected string, got:\n%s", out)
 	}
@@ -237,6 +244,9 @@ func translateMultiToDir(t *testing.T, mod *wasm.Module, opts codegen.Options, b
 		}
 		if err := os.WriteFile(p, res.Files[rel], 0644); err != nil {
 			t.Fatal(err)
+		}
+		if strings.HasSuffix(rel, ".s") {
+			continue
 		}
 		fset := token.NewFileSet()
 		if _, err := parser.ParseFile(fset, rel, res.Files[rel], parser.ParseComments); err != nil {
@@ -396,7 +406,7 @@ func TestDispatchSplitRuntime(t *testing.T) {
 			}
 			mainSB.WriteString("}\n")
 
-			out := runGoSnippet(t, src, mainSB.String(), res.Sidecars)
+			out := runGoSnippet(t, src, mainSB.String(), res.Sidecars, res.Files)
 			gotLines := strings.Fields(strings.TrimSpace(out))
 			if len(gotLines) != len(want) {
 				t.Fatalf("dispatch-split: got %d result lines, want %d\n%s", len(gotLines), len(want), out)
@@ -498,7 +508,7 @@ func TestNumericsRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)

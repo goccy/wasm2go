@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -83,8 +84,8 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 		return nil, fmt.Errorf("ssa emit: func %s has no entry block", f.Name)
 	}
 
-	usage := computeValueUsage(f)
-	hoist := computeHoist(f, usage)
+	usage := emit.ComputeValueUsage(f)
+	hoist := emit.ComputeHoist(f, usage)
 
 	body := &ast.BlockStmt{}
 
@@ -93,7 +94,7 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 	// sibling phi's right-hand side reads a phi assigned on that same
 	// edge — the classic loop back-edge swap hazard). Phis NOT in this
 	// set get a plain direct `vN = rhs` copy with no temp.
-	stagedPhi := computeStagedPhis(f, hoist)
+	stagedPhi := emit.ComputeStagedPhis(f, hoist)
 
 	// 1. var declarations for every hoisted value. A trailing
 	// `_ = vN` is emitted only when the value has no reader at all
@@ -373,100 +374,6 @@ func emitPhiAssignsFor(dst *ast.BlockStmt, pred, succ *ssa.Block, predIdx int, e
 // phiTempName is the staging-temp identifier for a phi's edge copy.
 func phiTempName(phi *ssa.Value) string { return fmt.Sprintf("__phi%d", phi.ID) }
 
-// computeStagedPhis returns the phis whose edge-copies must go through
-// a parallel-copy staging temp. A phi P needs staging iff, on some
-// incoming edge, the right-hand side of P (or of a sibling phi assigned
-// on the same edge) reads a phi that is itself a target on that edge —
-// the loop-back-edge swap hazard. if/else merges, where the only target
-// on an edge is the merge phi itself and the RHS comes from outside,
-// never trip this and get a plain direct copy.
-func computeStagedPhis(f *ssa.Func, hoist map[ssa.ValueID]bool) map[ssa.ValueID]bool {
-	staged := map[ssa.ValueID]bool{}
-	for _, succ := range f.Blocks {
-		// Collect succ's phis and the set of phi-target var IDs.
-		var phis []*ssa.Value
-		targets := map[ssa.ValueID]bool{}
-		for _, v := range succ.Values {
-			if v.Op == ssa.OpPhi {
-				phis = append(phis, v)
-				targets[v.ID] = true
-			}
-		}
-		if len(phis) == 0 {
-			continue
-		}
-		for predIdx := range succ.Preds {
-			conflict := false
-			for _, phi := range phis {
-				if predIdx >= len(phi.Args) {
-					continue
-				}
-				src := phi.Args[predIdx]
-				if src == nil || src == phi {
-					continue
-				}
-				refs := map[ssa.ValueID]bool{}
-				collectHoistedRefs(src, hoist, refs)
-				for id := range refs {
-					if targets[id] {
-						conflict = true
-					}
-				}
-			}
-			if conflict {
-				// Parallel-copy is per-edge: stage every phi of succ.
-				for _, phi := range phis {
-					staged[phi.ID] = true
-				}
-				break
-			}
-		}
-	}
-	return staged
-}
-
-// collectHoistedRefs walks v and gathers the IDs of every hoisted value
-// the emitted expression for v would reference. A hoisted value is
-// emitted by name, so recursion stops there; a non-hoisted value is
-// inlined, so its operands are walked.
-func collectHoistedRefs(v *ssa.Value, hoist map[ssa.ValueID]bool, out map[ssa.ValueID]bool) {
-	if v == nil {
-		return
-	}
-	if hoist[v.ID] {
-		out[v.ID] = true
-		return
-	}
-	for _, a := range v.Args {
-		collectHoistedRefs(a, hoist, out)
-	}
-}
-
-// isScalarType reports whether t is an emittable scalar value type
-// (a real Go value, not the Mem state token, Tuple, or Invalid).
-func isScalarType(t ssa.Type) bool {
-	switch t {
-	case ssa.TypeI32, ssa.TypeI64, ssa.TypeF32, ssa.TypeF64, ssa.TypeBool:
-		return true
-	}
-	return false
-}
-
-// isLoadOp reports whether op is a memory load. Loads are not flagged
-// HasSideEffect (they don't write state) but must still be ordered
-// relative to stores/calls; emit_ssa force-hoists them so they emit
-// as in-order statements.
-func isLoadOp(op ssa.Op) bool {
-	switch op {
-	case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
-		ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
-		ssa.OpLoadF32, ssa.OpLoadF64,
-		ssa.OpGlobalGet:
-		return true
-	}
-	return false
-}
-
 // emitBoolCond turns a TypeBool SSA value into a Go boolean expression.
 // Bool values are produced only by comparison ops; if v is a comparison
 // we inline its operator on the operands.
@@ -508,79 +415,6 @@ func (em *ssaEmitter) emitBoolCond(v *ssa.Value, emitExpr func(*ssa.Value) (ast.
 		return nil, err
 	}
 	return &ast.BinaryExpr{X: expr, Op: token.NEQ, Y: intLit(0)}, nil
-}
-
-// computeHoist decides which values need a hoisted `var vN`. A value
-// is hoisted when:
-//   - it is a phi (assigned on predecessor edges, read elsewhere);
-//   - it is a side-effecting value that yields a usable scalar (a call
-//     returning a value) — must be emitted once, not re-inlined;
-//   - it is a memory load — the IR has no Mem token, so a load relies
-//     on statement order; inlining a single-use load could float it
-//     past an intervening store;
-//   - it is referenced two or more times.
-//
-// Params are never hoisted (they are bound to the `lN` arg names).
-func computeHoist(f *ssa.Func, usage map[ssa.ValueID]int) map[ssa.ValueID]bool {
-	hoist := map[ssa.ValueID]bool{}
-	for _, blk := range f.Blocks {
-		for _, v := range blk.Values {
-			switch {
-			case v.Op == ssa.OpPhi:
-				hoist[v.ID] = true
-			case v.Op == ssa.OpParam:
-				// never hoisted
-			case v.HasSideEffect():
-				if isScalarType(v.Type) {
-					hoist[v.ID] = true
-				}
-			case isLoadOp(v.Op):
-				hoist[v.ID] = true
-			case usage[v.ID] >= 2:
-				hoist[v.ID] = true
-			}
-		}
-	}
-	// Force-hoist the VALUE side of every narrowing store
-	// (i32.store8 / i32.store16 / i64.store32 / i64.store16 / i64.store8).
-	// The inline emitter renders these as `*(*uint8)(...) = uint8(vN)`,
-	// and the truncating cast must be a runtime conversion — an inlined
-	// constant operand like `uint8(int32(255))` would trip Go's
-	// compile-time constant-overflow check. Hoisting args[1] guarantees
-	// the operand is always a typed local variable.
-	for _, blk := range f.Blocks {
-		for _, v := range blk.Values {
-			spec, ok := storeSpec(v)
-			if !ok || spec.elemType == spec.valSrcType {
-				continue
-			}
-			if len(v.Args) >= 2 && v.Args[1] != nil {
-				hoist[v.Args[1].ID] = true
-			}
-		}
-	}
-	return hoist
-}
-
-// computeValueUsage returns a map ValueID → number of times the value
-// is referenced as an argument across the function. Used to decide
-// when to hoist into a variable vs inline at use.
-func computeValueUsage(f *ssa.Func) map[ssa.ValueID]int {
-	uses := map[ssa.ValueID]int{}
-	for _, blk := range f.Blocks {
-		for _, v := range blk.Values {
-			for _, a := range v.Args {
-				if a == nil {
-					continue
-				}
-				uses[a.ID]++
-			}
-		}
-		if blk.Control != nil {
-			uses[blk.Control.ID]++
-		}
-	}
-	return uses
 }
 
 // sortedValueIDs returns the keys of m in ascending order.
@@ -630,13 +464,13 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 	case ssa.OpConstF32:
 		f := math.Float32frombits(uint32(v.AuxInt))
 		if (math.IsNaN(float64(f)) || math.IsInf(float64(f), 0)) && em.t != nil {
-			em.t.use("math")
+			em.t.UsePackage("math")
 		}
 		return goConstF32(f), nil
 	case ssa.OpConstF64:
 		f := math.Float64frombits(uint64(v.AuxInt))
 		if (math.IsNaN(f) || math.IsInf(f, 0)) && em.t != nil {
-			em.t.use("math")
+			em.t.UsePackage("math")
 		}
 		return goConstF64(f), nil
 	case ssa.OpCopy:
@@ -705,7 +539,7 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) (ast.Stmt, error) {
 	if _, ok := storeSpec(v); ok {
 		// Inline store, one-liner: `*(*T)(unsafe.Add(...)) = T(vN)`.
-		// computeHoist guarantees narrowing-store values are hoisted
+		// emit.ComputeHoist guarantees narrowing-store values are hoisted
 		// so the cast is always runtime-safe. See emit_memops.go.
 		return em.emitMemStoreStmt(v, emit)
 	}
@@ -832,7 +666,7 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 	if em.t == nil {
 		return nil, fmt.Errorf("ssa emit: CallImport needs translator binding")
 	}
-	imp := em.t.mod.Imports[v.AuxInt]
+	imp := em.t.Module().Imports[v.AuxInt]
 	args := []ast.Expr{newID("m")}
 	for _, a := range v.Args {
 		ae, err := emit(a)
@@ -845,9 +679,9 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 		Fun: &ast.SelectorExpr{
 			X: &ast.SelectorExpr{
 				X:   newID("m"),
-				Sel: newID(em.t.fieldName(MangleModuleField(imp.Module))),
+				Sel: newID(em.t.FieldName(MangleModuleField(imp.Module))),
 			},
-			Sel: newID(em.t.importMethodName(imp)),
+			Sel: newID(em.t.ImportMethodName(imp)),
 		},
 		Args: args,
 	}, nil
@@ -865,7 +699,7 @@ func (em *ssaEmitter) emitCallIndirect(v *ssa.Value, emit func(*ssa.Value) (ast.
 	if err != nil {
 		return nil, err
 	}
-	ft := em.t.mod.Types[v.AuxInt]
+	ft := em.t.Module().Types[v.AuxInt]
 	// Construct typed function type for the assertion.
 	fnType := em.t.funcSignatureUnnamed(ft, true)
 	// Default to table 0 — multi-table modules will need a future
@@ -891,7 +725,7 @@ func (em *ssaEmitter) useHelper(name string) {
 	if em.t == nil {
 		return
 	}
-	em.t.useHelper(name)
+	em.t.UseHelper(name)
 }
 
 // useImport registers a Go import package with the translator (if
@@ -900,7 +734,7 @@ func (em *ssaEmitter) useImport(pkg string) {
 	if em.t == nil {
 		return
 	}
-	em.t.use(pkg)
+	em.t.UsePackage(pkg)
 }
 
 // helperRef returns the AST expression naming the helper, qualified for

@@ -1,4 +1,4 @@
-package codegen
+package lower
 
 import (
 	"errors"
@@ -113,7 +113,7 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 		incoming:   map[*ssa.Block][]incomingEdge{},
 	}
 
-	r := &instrReader{src: fn.Body}
+	r := wasm.NewInstrReader(fn.Body)
 	if err := skipLocalDecls(r); err != nil {
 		return nil, err
 	}
@@ -229,12 +229,12 @@ type incomingEdge struct {
 }
 
 // lowerBody walks the wasm bytecode r and emits SSA into ls.b.
-func (ls *lowerState) lowerBody(r *instrReader) error {
+func (ls *lowerState) lowerBody(r *wasm.InstrReader) error {
 	// depth tracks the open structured-control nesting. The function
 	// body itself is depth 0; the implicit function-level End terminates
 	// at depth 0.
-	for !r.eof() {
-		op, err := r.readByte()
+	for !r.EOF() {
+		op, err := r.ReadByte()
 		if err != nil {
 			return err
 		}
@@ -247,12 +247,12 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 			// (which would pop the wrong ctrlFrame and corrupt the
 			// control stack).
 			switch op {
-			case opBlock, opLoop, opIf:
+			case wasm.OpBlock, wasm.OpLoop, wasm.OpIf:
 				ls.unreachableDepth++
-				if err := r.skipImmediates(op); err != nil {
+				if err := r.SkipImmediates(op); err != nil {
 					return fmt.Errorf("%w: skipping unreachable block-open 0x%02x: %w", ErrSSAUnsupported, op, err)
 				}
-			case opElse:
+			case wasm.OpElse:
 				if ls.unreachableDepth > 0 {
 					// `else` of a dead-region if — stay dead.
 					break
@@ -260,7 +260,7 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 				if err := ls.handleElse(); err != nil {
 					return err
 				}
-			case opEnd:
+			case wasm.OpEnd:
 				if ls.unreachableDepth > 0 {
 					ls.unreachableDepth--
 					break
@@ -273,7 +273,7 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 					return nil
 				}
 			default:
-				if err := r.skipImmediates(op); err != nil {
+				if err := r.SkipImmediates(op); err != nil {
 					return fmt.Errorf("%w: skipping unreachable opcode 0x%02x: %w", ErrSSAUnsupported, op, err)
 				}
 			}
@@ -281,7 +281,7 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 		}
 		// Function-level End must terminate the loop directly so the
 		// done signal isn't swallowed by handleOp.
-		if op == opEnd {
+		if op == wasm.OpEnd {
 			done, err := ls.handleEnd()
 			if err != nil {
 				return err
@@ -298,29 +298,29 @@ func (ls *lowerState) lowerBody(r *instrReader) error {
 	return fmt.Errorf("%w: function body ended without End", ErrSSAUnsupported)
 }
 
-func (ls *lowerState) handleOp(op byte, r *instrReader) error {
+func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 	switch {
-	case op == opEnd:
+	case op == wasm.OpEnd:
 		_, err := ls.handleEnd()
 		return err
-	case op == opElse:
+	case op == wasm.OpElse:
 		return ls.handleElse()
-	case op == opIf:
+	case op == wasm.OpIf:
 		return ls.handleIf(r)
-	case op == opBlock:
+	case op == wasm.OpBlock:
 		return ls.handleBlock(r)
-	case op == opLoop:
+	case op == wasm.OpLoop:
 		return ls.handleLoop(r)
-	case op == opBr:
+	case op == wasm.OpBr:
 		return ls.handleBr(r)
-	case op == opBrIf:
+	case op == wasm.OpBrIf:
 		return ls.handleBrIf(r)
-	case op == opBrTable:
+	case op == wasm.OpBrTable:
 		return ls.handleBrTable(r)
-	case op == opReturn:
+	case op == wasm.OpReturn:
 		return ls.handleReturn()
-	case op == opLocalGet:
-		idx, err := r.readU32()
+	case op == wasm.OpLocalGet:
+		idx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
@@ -329,8 +329,8 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		}
 		ls.push(ls.locals[idx])
 		return nil
-	case op == opLocalSet:
-		idx, err := r.readU32()
+	case op == wasm.OpLocalSet:
+		idx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
@@ -343,8 +343,8 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		}
 		ls.locals[idx] = v
 		return nil
-	case op == opLocalTee:
-		idx, err := r.readU32()
+	case op == wasm.OpLocalTee:
+		idx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
@@ -356,26 +356,26 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		}
 		ls.locals[idx] = ls.stack[len(ls.stack)-1]
 		return nil
-	case op == opI32Const:
-		v, err := r.readS32()
+	case op == wasm.OpI32Const:
+		v, err := r.ReadS32()
 		if err != nil {
 			return err
 		}
 		ls.push(ls.b.Const32(v))
 		return nil
-	case op == opI64Const:
-		v, err := r.readS64()
+	case op == wasm.OpI64Const:
+		v, err := r.ReadS64()
 		if err != nil {
 			return err
 		}
 		ls.push(ls.b.Const64(v))
 		return nil
-	case op == opCall:
+	case op == wasm.OpCall:
 		return ls.handleCall(r)
-	case op == opCallIndirect:
+	case op == wasm.OpCallIndirect:
 		return ls.handleCallIndirect(r)
-	case op == opGlobalGet:
-		idx, err := r.readU32()
+	case op == wasm.OpGlobalGet:
+		idx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
@@ -385,8 +385,8 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		}
 		ls.push(ls.b.NewValueAuxInt(ssa.OpGlobalGet, t, int64(idx)))
 		return nil
-	case op == opGlobalSet:
-		idx, err := r.readU32()
+	case op == wasm.OpGlobalSet:
+		idx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
@@ -398,16 +398,16 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		return nil
 	case isMemoryOp(op):
 		return ls.handleMemoryOp(op, r)
-	case op == opMemSize:
+	case op == wasm.OpMemSize:
 		// memory.size and memory.grow each carry a 1-byte memory index
 		// immediate (must be 0 in MVP wasm).
-		if _, err := r.readByte(); err != nil {
+		if _, err := r.ReadByte(); err != nil {
 			return err
 		}
 		ls.push(ls.b.NewValue(ssa.OpMemSize, ssa.TypeI32))
 		return nil
-	case op == opMemGrow:
-		if _, err := r.readByte(); err != nil {
+	case op == wasm.OpMemGrow:
+		if _, err := r.ReadByte(); err != nil {
 			return err
 		}
 		delta, err := ls.pop()
@@ -416,7 +416,7 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		}
 		ls.push(ls.b.NewValue(ssa.OpMemGrow, ssa.TypeI32, delta))
 		return nil
-	case op == opUnreachable:
+	case op == wasm.OpUnreachable:
 		// `unreachable` is a hard trap. Seal the current block as
 		// Unreachable; subsequent ops are dead until the next
 		// structured boundary.
@@ -424,22 +424,22 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		cur.Kind = ssa.BlockUnreachable
 		ls.unreachable = true
 		return nil
-	case op == opNop:
+	case op == wasm.OpNop:
 		return nil
-	case op == opDrop:
+	case op == wasm.OpDrop:
 		_, err := ls.pop()
 		return err
-	case op == opSelect, op == opSelectT:
+	case op == wasm.OpSelect, op == wasm.OpSelectT:
 		return ls.handleSelect(op, r)
-	case op == opF32Const:
-		v, err := r.readF32()
+	case op == wasm.OpF32Const:
+		v, err := r.ReadF32()
 		if err != nil {
 			return err
 		}
 		ls.push(ls.b.NewValueAuxInt(ssa.OpConstF32, ssa.TypeF32, int64(math.Float32bits(v))))
 		return nil
-	case op == opF64Const:
-		v, err := r.readF64()
+	case op == wasm.OpF64Const:
+		v, err := r.ReadF64()
 		if err != nil {
 			return err
 		}
@@ -483,7 +483,7 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 		spec := helperUnarySpec(op)
 		ls.push(ls.b.NewValueAux(ssa.OpHelperCall, spec.resType, spec.helper, x))
 		return nil
-	case op == opPrefixFC:
+	case op == wasm.OpPrefixFC:
 		return ls.handleFCOp(r)
 	}
 	return fmt.Errorf("%w: opcode 0x%02x not implemented", ErrSSAUnsupported, op)
@@ -493,14 +493,14 @@ func (ls *lowerState) handleOp(op byte, r *instrReader) error {
 // (then-val, else-val, cond) — typed select additionally carries a 1-vec
 // of value types we currently ignore (the polymorphic check is left to
 // validation upstream).
-func (ls *lowerState) handleSelect(op byte, r *instrReader) error {
-	if op == opSelectT {
-		n, err := r.readU32()
+func (ls *lowerState) handleSelect(op byte, r *wasm.InstrReader) error {
+	if op == wasm.OpSelectT {
+		n, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
 		for i := uint32(0); i < n; i++ {
-			if _, err := r.readByte(); err != nil {
+			if _, err := r.ReadByte(); err != nil {
 				return err
 			}
 		}
@@ -538,8 +538,8 @@ func (ls *lowerState) handleSelect(op byte, r *instrReader) error {
 
 // handleFCOp dispatches the wasm 0xFC prefix opcodes: saturating-trunc
 // conversions and bulk-memory ops.
-func (ls *lowerState) handleFCOp(r *instrReader) error {
-	sub, err := r.readU32()
+func (ls *lowerState) handleFCOp(r *wasm.InstrReader) error {
+	sub, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
@@ -565,11 +565,11 @@ func (ls *lowerState) handleFCOp(r *instrReader) error {
 		ls.push(ls.b.NewValueAux(ssa.OpHelperCall, s.resType, s.helper, x))
 		return nil
 	case 8: // memory.init
-		segIdx, err := r.readU32()
+		segIdx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
-		if _, err := r.readByte(); err != nil { // memory index (must be 0)
+		if _, err := r.ReadByte(); err != nil { // memory index (must be 0)
 			return err
 		}
 		n, err := ls.pop()
@@ -587,17 +587,17 @@ func (ls *lowerState) handleFCOp(r *instrReader) error {
 		ls.b.NewValueAuxInt(ssa.OpMemoryInit, ssa.TypeMem, int64(segIdx), dst, src, n)
 		return nil
 	case 9: // data.drop
-		segIdx, err := r.readU32()
+		segIdx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
 		ls.b.NewValueAuxInt(ssa.OpDataDrop, ssa.TypeMem, int64(segIdx))
 		return nil
 	case 10: // memory.copy
-		if _, err := r.readByte(); err != nil { // dst mem index
+		if _, err := r.ReadByte(); err != nil { // dst mem index
 			return err
 		}
-		if _, err := r.readByte(); err != nil { // src mem index
+		if _, err := r.ReadByte(); err != nil { // src mem index
 			return err
 		}
 		n, err := ls.pop()
@@ -615,7 +615,7 @@ func (ls *lowerState) handleFCOp(r *instrReader) error {
 		ls.b.NewValue(ssa.OpMemoryCopy, ssa.TypeMem, dst, src, n)
 		return nil
 	case 11: // memory.fill
-		if _, err := r.readByte(); err != nil {
+		if _, err := r.ReadByte(); err != nil {
 			return err
 		}
 		n, err := ls.pop()
@@ -639,8 +639,8 @@ func (ls *lowerState) handleFCOp(r *instrReader) error {
 // handleBlock implements `block blocktype ... end`. The block opens a
 // new scope whose `br 0` target is the post-block; the body runs in the
 // same SSA basic block until something branches.
-func (ls *lowerState) handleBlock(r *instrReader) error {
-	bt, err := r.readS33()
+func (ls *lowerState) handleBlock(r *wasm.InstrReader) error {
+	bt, err := r.ReadS33()
 	if err != nil {
 		return err
 	}
@@ -665,8 +665,8 @@ func (ls *lowerState) handleBlock(r *instrReader) error {
 // SSA-correct local values we install Braun-style "incomplete phis" at
 // the header: one per local, initially carrying the entry-edge value;
 // further args are appended as branches into the header land.
-func (ls *lowerState) handleLoop(r *instrReader) error {
-	bt, err := r.readS33()
+func (ls *lowerState) handleLoop(r *wasm.InstrReader) error {
+	bt, err := r.ReadS33()
 	if err != nil {
 		return err
 	}
@@ -709,8 +709,8 @@ func (ls *lowerState) handleLoop(r *instrReader) error {
 // handleBr implements unconditional `br N`. The Nth-enclosing frame's
 // target receives an edge; the current block is sealed Plain → target,
 // and execution becomes unreachable until the next structured boundary.
-func (ls *lowerState) handleBr(r *instrReader) error {
-	depth, err := r.readU32()
+func (ls *lowerState) handleBr(r *wasm.InstrReader) error {
+	depth, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
@@ -736,8 +736,8 @@ func (ls *lowerState) handleBr(r *instrReader) error {
 // terminator: then-succ = frame.target, else-succ = a new continuation
 // block. The current block tail is sealed; subsequent ops emit into the
 // continuation.
-func (ls *lowerState) handleBrIf(r *instrReader) error {
-	depth, err := r.readU32()
+func (ls *lowerState) handleBrIf(r *wasm.InstrReader) error {
+	depth, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
@@ -783,12 +783,12 @@ func (ls *lowerState) handleBrIf(r *instrReader) error {
 // compiler is well-equipped to fold such cascades back into a jump
 // table where profitable; the extra blocks are also cheap for the SSA
 // optimization passes because the equality checks are pure.
-func (ls *lowerState) handleBrTable(r *instrReader) error {
-	cases, err := r.readVecU32()
+func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
+	cases, err := r.ReadVecU32()
 	if err != nil {
 		return err
 	}
-	defaultDepth, err := r.readU32()
+	defaultDepth, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
@@ -880,12 +880,12 @@ func (ls *lowerState) handleReturn() error {
 // in scope.
 func isMemoryOp(op byte) bool {
 	switch op {
-	case opI32Load, opI64Load, opF32Load, opF64Load,
-		opI32Load8S, opI32Load8U, opI32Load16S, opI32Load16U,
-		opI64Load8S, opI64Load8U, opI64Load16S, opI64Load16U, opI64Load32S, opI64Load32U,
-		opI32Store, opI64Store, opF32Store, opF64Store,
-		opI32Store8, opI32Store16,
-		opI64Store8, opI64Store16, opI64Store32:
+	case wasm.OpI32Load, wasm.OpI64Load, wasm.OpF32Load, wasm.OpF64Load,
+		wasm.OpI32Load8S, wasm.OpI32Load8U, wasm.OpI32Load16S, wasm.OpI32Load16U,
+		wasm.OpI64Load8S, wasm.OpI64Load8U, wasm.OpI64Load16S, wasm.OpI64Load16U, wasm.OpI64Load32S, wasm.OpI64Load32U,
+		wasm.OpI32Store, wasm.OpI64Store, wasm.OpF32Store, wasm.OpF64Store,
+		wasm.OpI32Store8, wasm.OpI32Store16,
+		wasm.OpI64Store8, wasm.OpI64Store16, wasm.OpI64Store32:
 		return true
 	}
 	return false
@@ -900,51 +900,51 @@ type memoryOpSpec struct {
 
 func memoryOpKind(op byte) memoryOpSpec {
 	switch op {
-	case opI32Load:
+	case wasm.OpI32Load:
 		return memoryOpSpec{ssa.OpLoad32, ssa.TypeI32, false}
-	case opI32Load8S:
+	case wasm.OpI32Load8S:
 		return memoryOpSpec{ssa.OpLoad8S, ssa.TypeI32, false}
-	case opI32Load8U:
+	case wasm.OpI32Load8U:
 		return memoryOpSpec{ssa.OpLoad8U, ssa.TypeI32, false}
-	case opI32Load16S:
+	case wasm.OpI32Load16S:
 		return memoryOpSpec{ssa.OpLoad16S, ssa.TypeI32, false}
-	case opI32Load16U:
+	case wasm.OpI32Load16U:
 		return memoryOpSpec{ssa.OpLoad16U, ssa.TypeI32, false}
-	case opI64Load:
+	case wasm.OpI64Load:
 		return memoryOpSpec{ssa.OpLoad64, ssa.TypeI64, false}
-	case opI64Load8S:
+	case wasm.OpI64Load8S:
 		return memoryOpSpec{ssa.OpLoad8S, ssa.TypeI64, false}
-	case opI64Load8U:
+	case wasm.OpI64Load8U:
 		return memoryOpSpec{ssa.OpLoad8U, ssa.TypeI64, false}
-	case opI64Load16S:
+	case wasm.OpI64Load16S:
 		return memoryOpSpec{ssa.OpLoad16S, ssa.TypeI64, false}
-	case opI64Load16U:
+	case wasm.OpI64Load16U:
 		return memoryOpSpec{ssa.OpLoad16U, ssa.TypeI64, false}
-	case opI64Load32S:
+	case wasm.OpI64Load32S:
 		return memoryOpSpec{ssa.OpLoad32S, ssa.TypeI64, false}
-	case opI64Load32U:
+	case wasm.OpI64Load32U:
 		return memoryOpSpec{ssa.OpLoad32U, ssa.TypeI64, false}
-	case opF32Load:
+	case wasm.OpF32Load:
 		return memoryOpSpec{ssa.OpLoadF32, ssa.TypeF32, false}
-	case opF64Load:
+	case wasm.OpF64Load:
 		return memoryOpSpec{ssa.OpLoadF64, ssa.TypeF64, false}
-	case opI32Store:
+	case wasm.OpI32Store:
 		return memoryOpSpec{ssa.OpStore32, ssa.TypeI32, true}
-	case opI32Store8:
+	case wasm.OpI32Store8:
 		return memoryOpSpec{ssa.OpStore8, ssa.TypeI32, true}
-	case opI32Store16:
+	case wasm.OpI32Store16:
 		return memoryOpSpec{ssa.OpStore16, ssa.TypeI32, true}
-	case opI64Store:
+	case wasm.OpI64Store:
 		return memoryOpSpec{ssa.OpStore64, ssa.TypeI64, true}
-	case opI64Store8:
+	case wasm.OpI64Store8:
 		return memoryOpSpec{ssa.OpStore8, ssa.TypeI64, true}
-	case opI64Store16:
+	case wasm.OpI64Store16:
 		return memoryOpSpec{ssa.OpStore16, ssa.TypeI64, true}
-	case opI64Store32:
+	case wasm.OpI64Store32:
 		return memoryOpSpec{ssa.OpStore32, ssa.TypeI64, true}
-	case opF32Store:
+	case wasm.OpF32Store:
 		return memoryOpSpec{ssa.OpStoreF32, ssa.TypeF32, true}
-	case opF64Store:
+	case wasm.OpF64Store:
 		return memoryOpSpec{ssa.OpStoreF64, ssa.TypeF64, true}
 	}
 	return memoryOpSpec{ssa.OpInvalid, ssa.TypeInvalid, false}
@@ -953,8 +953,8 @@ func memoryOpKind(op byte) memoryOpSpec {
 // handleMemoryOp decodes a wasm load/store and emits the corresponding
 // SSA op. The memarg align is ignored (Go's helpers don't honor it),
 // the offset is recorded as AuxInt.
-func (ls *lowerState) handleMemoryOp(op byte, r *instrReader) error {
-	_, offset, err := r.readMemArg()
+func (ls *lowerState) handleMemoryOp(op byte, r *wasm.InstrReader) error {
+	_, offset, err := r.ReadMemArg()
 	if err != nil {
 		return err
 	}
@@ -989,8 +989,8 @@ func (ls *lowerState) handleMemoryOp(op byte, r *instrReader) error {
 //
 // Multi-result returns (≥2) are not supported yet; OpSelect projection
 // from a tuple value would be the way to handle them.
-func (ls *lowerState) handleCall(r *instrReader) error {
-	funcIdx, err := r.readU32()
+func (ls *lowerState) handleCall(r *wasm.InstrReader) error {
+	funcIdx, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
@@ -1032,12 +1032,12 @@ func (ls *lowerState) handleCall(r *instrReader) error {
 // handleCallIndirect lowers `call_indirect <typeidx> <tableidx>`. The
 // last stack value is the table index; the values below it are the
 // call's parameters.
-func (ls *lowerState) handleCallIndirect(r *instrReader) error {
-	typeIdx, err := r.readU32()
+func (ls *lowerState) handleCallIndirect(r *wasm.InstrReader) error {
+	typeIdx, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
-	tableIdx, err := r.readU32()
+	tableIdx, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
@@ -1119,9 +1119,9 @@ func (ls *lowerState) appendLoopBackArgs(header *ssa.Block) {
 // handleIf implements `if blocktype ... [else ...] end`. Both branches
 // inherit the locals + stack-below-cond snapshot at entry; the join at
 // `end` reconciles via phi when a local or stack-result diverges.
-func (ls *lowerState) handleIf(r *instrReader) error {
+func (ls *lowerState) handleIf(r *wasm.InstrReader) error {
 	// blocktype: s33; 0x40 (empty) or a value type encoded as a negative.
-	bt, err := r.readS33()
+	bt, err := r.ReadS33()
 	if err != nil {
 		return err
 	}
@@ -1558,17 +1558,17 @@ func setupLocals(b *ssa.FuncBuilder, fn wasm.Function, ft wasm.FuncType) ([]*ssa
 		locals = append(locals, b.Param(i, t))
 		types = append(types, t)
 	}
-	r := &instrReader{src: fn.Body}
-	nDecls, err := r.readU32()
+	r := wasm.NewInstrReader(fn.Body)
+	nDecls, err := r.ReadU32()
 	if err != nil {
 		return nil, nil, err
 	}
 	for i := uint32(0); i < nDecls; i++ {
-		count, err := r.readU32()
+		count, err := r.ReadU32()
 		if err != nil {
 			return nil, nil, err
 		}
-		t, err := r.readByte()
+		t, err := r.ReadByte()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1597,16 +1597,16 @@ func setupLocals(b *ssa.FuncBuilder, fn wasm.Function, ft wasm.FuncType) ([]*ssa
 	return locals, types, nil
 }
 
-func skipLocalDecls(r *instrReader) error {
-	nDecls, err := r.readU32()
+func skipLocalDecls(r *wasm.InstrReader) error {
+	nDecls, err := r.ReadU32()
 	if err != nil {
 		return err
 	}
 	for i := uint32(0); i < nDecls; i++ {
-		if _, err := r.readU32(); err != nil {
+		if _, err := r.ReadU32(); err != nil {
 			return err
 		}
-		if _, err := r.readByte(); err != nil {
+		if _, err := r.ReadByte(); err != nil {
 			return err
 		}
 	}
@@ -1618,8 +1618,8 @@ func skipLocalDecls(r *instrReader) error {
 // SSA op with swapped arguments).
 func isGtGe(op byte) bool {
 	switch op {
-	case opI32GtS, opI32GtU, opI32GeS, opI32GeU,
-		opI64GtS, opI64GtU, opI64GeS, opI64GeU:
+	case wasm.OpI32GtS, wasm.OpI32GtU, wasm.OpI32GeS, wasm.OpI32GeU,
+		wasm.OpI64GtS, wasm.OpI64GtU, wasm.OpI64GeS, wasm.OpI64GeU:
 		return true
 	}
 	return false
@@ -1630,14 +1630,14 @@ func isGtGe(op byte) bool {
 // helper-call indirection).
 func isSimpleBinary(op byte) bool {
 	switch op {
-	case opI32Add, opI32Sub, opI32Mul, opI32And, opI32Or, opI32Xor,
-		opI32Shl, opI32ShrS, opI32ShrU,
-		opI64Add, opI64Sub, opI64Mul, opI64And, opI64Or, opI64Xor,
-		opI64Shl, opI64ShrS, opI64ShrU,
-		opI32Eq, opI32Ne, opI32LtS, opI32LtU, opI32LeS, opI32LeU,
-		opI32GtS, opI32GtU, opI32GeS, opI32GeU,
-		opI64Eq, opI64Ne, opI64LtS, opI64LtU, opI64LeS, opI64LeU,
-		opI64GtS, opI64GtU, opI64GeS, opI64GeU:
+	case wasm.OpI32Add, wasm.OpI32Sub, wasm.OpI32Mul, wasm.OpI32And, wasm.OpI32Or, wasm.OpI32Xor,
+		wasm.OpI32Shl, wasm.OpI32ShrS, wasm.OpI32ShrU,
+		wasm.OpI64Add, wasm.OpI64Sub, wasm.OpI64Mul, wasm.OpI64And, wasm.OpI64Or, wasm.OpI64Xor,
+		wasm.OpI64Shl, wasm.OpI64ShrS, wasm.OpI64ShrU,
+		wasm.OpI32Eq, wasm.OpI32Ne, wasm.OpI32LtS, wasm.OpI32LtU, wasm.OpI32LeS, wasm.OpI32LeU,
+		wasm.OpI32GtS, wasm.OpI32GtU, wasm.OpI32GeS, wasm.OpI32GeU,
+		wasm.OpI64Eq, wasm.OpI64Ne, wasm.OpI64LtS, wasm.OpI64LtU, wasm.OpI64LeS, wasm.OpI64LeU,
+		wasm.OpI64GtS, wasm.OpI64GtU, wasm.OpI64GeS, wasm.OpI64GeU:
 		return true
 	}
 	return false
@@ -1646,82 +1646,82 @@ func isSimpleBinary(op byte) bool {
 // simpleBinaryOp maps a wasm opcode to (ssa.Op, result type).
 func simpleBinaryOp(op byte) (ssa.Op, ssa.Type) {
 	switch op {
-	case opI32Add:
+	case wasm.OpI32Add:
 		return ssa.OpAdd32, ssa.TypeI32
-	case opI32Sub:
+	case wasm.OpI32Sub:
 		return ssa.OpSub32, ssa.TypeI32
-	case opI32Mul:
+	case wasm.OpI32Mul:
 		return ssa.OpMul32, ssa.TypeI32
-	case opI32And:
+	case wasm.OpI32And:
 		return ssa.OpAnd32, ssa.TypeI32
-	case opI32Or:
+	case wasm.OpI32Or:
 		return ssa.OpOr32, ssa.TypeI32
-	case opI32Xor:
+	case wasm.OpI32Xor:
 		return ssa.OpXor32, ssa.TypeI32
-	case opI32Shl:
+	case wasm.OpI32Shl:
 		return ssa.OpShl32, ssa.TypeI32
-	case opI32ShrS:
+	case wasm.OpI32ShrS:
 		return ssa.OpShrS32, ssa.TypeI32
-	case opI32ShrU:
+	case wasm.OpI32ShrU:
 		return ssa.OpShrU32, ssa.TypeI32
-	case opI64Add:
+	case wasm.OpI64Add:
 		return ssa.OpAdd64, ssa.TypeI64
-	case opI64Sub:
+	case wasm.OpI64Sub:
 		return ssa.OpSub64, ssa.TypeI64
-	case opI64Mul:
+	case wasm.OpI64Mul:
 		return ssa.OpMul64, ssa.TypeI64
-	case opI64And:
+	case wasm.OpI64And:
 		return ssa.OpAnd64, ssa.TypeI64
-	case opI64Or:
+	case wasm.OpI64Or:
 		return ssa.OpOr64, ssa.TypeI64
-	case opI64Xor:
+	case wasm.OpI64Xor:
 		return ssa.OpXor64, ssa.TypeI64
-	case opI64Shl:
+	case wasm.OpI64Shl:
 		return ssa.OpShl64, ssa.TypeI64
-	case opI64ShrS:
+	case wasm.OpI64ShrS:
 		return ssa.OpShrS64, ssa.TypeI64
-	case opI64ShrU:
+	case wasm.OpI64ShrU:
 		return ssa.OpShrU64, ssa.TypeI64
-	case opI32Eq:
+	case wasm.OpI32Eq:
 		return ssa.OpEq32, ssa.TypeBool
-	case opI32Ne:
+	case wasm.OpI32Ne:
 		return ssa.OpNe32, ssa.TypeBool
-	case opI32LtS:
+	case wasm.OpI32LtS:
 		return ssa.OpLtS32, ssa.TypeBool
-	case opI32LtU:
+	case wasm.OpI32LtU:
 		return ssa.OpLtU32, ssa.TypeBool
-	case opI32LeS:
+	case wasm.OpI32LeS:
 		return ssa.OpLeS32, ssa.TypeBool
-	case opI32LeU:
+	case wasm.OpI32LeU:
 		return ssa.OpLeU32, ssa.TypeBool
-	case opI32GtS:
+	case wasm.OpI32GtS:
 		// gt is lt with swapped args; we'll wrap at emit time.
 		return ssa.OpLtS32, ssa.TypeBool
-	case opI32GtU:
+	case wasm.OpI32GtU:
 		return ssa.OpLtU32, ssa.TypeBool
-	case opI32GeS:
+	case wasm.OpI32GeS:
 		return ssa.OpLeS32, ssa.TypeBool
-	case opI32GeU:
+	case wasm.OpI32GeU:
 		return ssa.OpLeU32, ssa.TypeBool
-	case opI64Eq:
+	case wasm.OpI64Eq:
 		return ssa.OpEq64, ssa.TypeBool
-	case opI64Ne:
+	case wasm.OpI64Ne:
 		return ssa.OpNe64, ssa.TypeBool
-	case opI64LtS:
+	case wasm.OpI64LtS:
 		return ssa.OpLtS64, ssa.TypeBool
-	case opI64LtU:
+	case wasm.OpI64LtU:
 		return ssa.OpLtU64, ssa.TypeBool
-	case opI64LeS:
+	case wasm.OpI64LeS:
 		return ssa.OpLeS64, ssa.TypeBool
-	case opI64LeU:
+	case wasm.OpI64LeU:
 		return ssa.OpLeU64, ssa.TypeBool
-	case opI64GtS:
+	case wasm.OpI64GtS:
 		return ssa.OpLtS64, ssa.TypeBool
-	case opI64GtU:
+	case wasm.OpI64GtU:
 		return ssa.OpLtU64, ssa.TypeBool
-	case opI64GeS:
+	case wasm.OpI64GeS:
 		return ssa.OpLeS64, ssa.TypeBool
-	case opI64GeU:
+	case wasm.OpI64GeU:
 		return ssa.OpLeU64, ssa.TypeBool
 	}
 	panic("simpleBinaryOp: not a binary op")
@@ -1744,15 +1744,15 @@ type helperUnary struct {
 
 func isHelperBinary(op byte) bool {
 	switch op {
-	case opI32Rotl, opI32Rotr, opI64Rotl, opI64Rotr,
-		opI32DivS, opI32DivU, opI32RemS, opI32RemU,
-		opI64DivS, opI64DivU, opI64RemS, opI64RemU,
-		opF32Add, opF32Sub, opF32Mul, opF32Div,
-		opF64Add, opF64Sub, opF64Mul, opF64Div,
-		opF32Min, opF32Max, opF32Copysign,
-		opF64Min, opF64Max, opF64Copysign,
-		opF32Eq, opF32Ne, opF32Lt, opF32Gt, opF32Le, opF32Ge,
-		opF64Eq, opF64Ne, opF64Lt, opF64Gt, opF64Le, opF64Ge:
+	case wasm.OpI32Rotl, wasm.OpI32Rotr, wasm.OpI64Rotl, wasm.OpI64Rotr,
+		wasm.OpI32DivS, wasm.OpI32DivU, wasm.OpI32RemS, wasm.OpI32RemU,
+		wasm.OpI64DivS, wasm.OpI64DivU, wasm.OpI64RemS, wasm.OpI64RemU,
+		wasm.OpF32Add, wasm.OpF32Sub, wasm.OpF32Mul, wasm.OpF32Div,
+		wasm.OpF64Add, wasm.OpF64Sub, wasm.OpF64Mul, wasm.OpF64Div,
+		wasm.OpF32Min, wasm.OpF32Max, wasm.OpF32Copysign,
+		wasm.OpF64Min, wasm.OpF64Max, wasm.OpF64Copysign,
+		wasm.OpF32Eq, wasm.OpF32Ne, wasm.OpF32Lt, wasm.OpF32Gt, wasm.OpF32Le, wasm.OpF32Ge,
+		wasm.OpF64Eq, wasm.OpF64Ne, wasm.OpF64Lt, wasm.OpF64Gt, wasm.OpF64Le, wasm.OpF64Ge:
 		return true
 	}
 	return false
@@ -1760,81 +1760,81 @@ func isHelperBinary(op byte) bool {
 
 func helperBinarySpec(op byte) helperBinary {
 	switch op {
-	case opI32Rotl:
+	case wasm.OpI32Rotl:
 		return helperBinary{"i32_rotl", ssa.TypeI32}
-	case opI32Rotr:
+	case wasm.OpI32Rotr:
 		return helperBinary{"i32_rotr", ssa.TypeI32}
-	case opI64Rotl:
+	case wasm.OpI64Rotl:
 		return helperBinary{"i64_rotl", ssa.TypeI64}
-	case opI64Rotr:
+	case wasm.OpI64Rotr:
 		return helperBinary{"i64_rotr", ssa.TypeI64}
-	case opI32DivS:
+	case wasm.OpI32DivS:
 		return helperBinary{"i32_div_s", ssa.TypeI32}
-	case opI32DivU:
+	case wasm.OpI32DivU:
 		return helperBinary{"i32_div_u_s", ssa.TypeI32}
-	case opI32RemS:
+	case wasm.OpI32RemS:
 		return helperBinary{"i32_rem_s", ssa.TypeI32}
-	case opI32RemU:
+	case wasm.OpI32RemU:
 		return helperBinary{"i32_rem_u_s", ssa.TypeI32}
-	case opI64DivS:
+	case wasm.OpI64DivS:
 		return helperBinary{"i64_div_s", ssa.TypeI64}
-	case opI64DivU:
+	case wasm.OpI64DivU:
 		return helperBinary{"i64_div_u_s", ssa.TypeI64}
-	case opI64RemS:
+	case wasm.OpI64RemS:
 		return helperBinary{"i64_rem_s", ssa.TypeI64}
-	case opI64RemU:
+	case wasm.OpI64RemU:
 		return helperBinary{"i64_rem_u_s", ssa.TypeI64}
-	case opF32Add:
+	case wasm.OpF32Add:
 		return helperBinary{"f32_add", ssa.TypeF32}
-	case opF32Sub:
+	case wasm.OpF32Sub:
 		return helperBinary{"f32_sub", ssa.TypeF32}
-	case opF32Mul:
+	case wasm.OpF32Mul:
 		return helperBinary{"f32_mul", ssa.TypeF32}
-	case opF32Div:
+	case wasm.OpF32Div:
 		return helperBinary{"f32_div", ssa.TypeF32}
-	case opF64Add:
+	case wasm.OpF64Add:
 		return helperBinary{"f64_add", ssa.TypeF64}
-	case opF64Sub:
+	case wasm.OpF64Sub:
 		return helperBinary{"f64_sub", ssa.TypeF64}
-	case opF64Mul:
+	case wasm.OpF64Mul:
 		return helperBinary{"f64_mul", ssa.TypeF64}
-	case opF64Div:
+	case wasm.OpF64Div:
 		return helperBinary{"f64_div", ssa.TypeF64}
-	case opF32Min:
+	case wasm.OpF32Min:
 		return helperBinary{"f32_min", ssa.TypeF32}
-	case opF32Max:
+	case wasm.OpF32Max:
 		return helperBinary{"f32_max", ssa.TypeF32}
-	case opF32Copysign:
+	case wasm.OpF32Copysign:
 		return helperBinary{"f32_copysign", ssa.TypeF32}
-	case opF64Min:
+	case wasm.OpF64Min:
 		return helperBinary{"f64_min", ssa.TypeF64}
-	case opF64Max:
+	case wasm.OpF64Max:
 		return helperBinary{"f64_max", ssa.TypeF64}
-	case opF64Copysign:
+	case wasm.OpF64Copysign:
 		return helperBinary{"f64_copysign", ssa.TypeF64}
-	case opF32Eq:
+	case wasm.OpF32Eq:
 		return helperBinary{"f32_eq", ssa.TypeI32}
-	case opF32Ne:
+	case wasm.OpF32Ne:
 		return helperBinary{"f32_ne", ssa.TypeI32}
-	case opF32Lt:
+	case wasm.OpF32Lt:
 		return helperBinary{"f32_lt", ssa.TypeI32}
-	case opF32Gt:
+	case wasm.OpF32Gt:
 		return helperBinary{"f32_gt", ssa.TypeI32}
-	case opF32Le:
+	case wasm.OpF32Le:
 		return helperBinary{"f32_le", ssa.TypeI32}
-	case opF32Ge:
+	case wasm.OpF32Ge:
 		return helperBinary{"f32_ge", ssa.TypeI32}
-	case opF64Eq:
+	case wasm.OpF64Eq:
 		return helperBinary{"f64_eq", ssa.TypeI32}
-	case opF64Ne:
+	case wasm.OpF64Ne:
 		return helperBinary{"f64_ne", ssa.TypeI32}
-	case opF64Lt:
+	case wasm.OpF64Lt:
 		return helperBinary{"f64_lt", ssa.TypeI32}
-	case opF64Gt:
+	case wasm.OpF64Gt:
 		return helperBinary{"f64_gt", ssa.TypeI32}
-	case opF64Le:
+	case wasm.OpF64Le:
 		return helperBinary{"f64_le", ssa.TypeI32}
-	case opF64Ge:
+	case wasm.OpF64Ge:
 		return helperBinary{"f64_ge", ssa.TypeI32}
 	}
 	panic(fmt.Sprintf("helperBinarySpec: unknown op 0x%02x", op))
@@ -1842,22 +1842,22 @@ func helperBinarySpec(op byte) helperBinary {
 
 func isHelperUnary(op byte) bool {
 	switch op {
-	case opI32Eqz, opI64Eqz,
-		opI32Clz, opI32Ctz, opI32Popcnt,
-		opI64Clz, opI64Ctz, opI64Popcnt,
-		opF32Abs, opF32Neg, opF32Ceil, opF32Floor, opF32Trunc, opF32Nearest, opF32Sqrt,
-		opF64Abs, opF64Neg, opF64Ceil, opF64Floor, opF64Trunc, opF64Nearest, opF64Sqrt,
-		opI32WrapI64,
-		opI32TruncF32S, opI32TruncF32U, opI32TruncF64S, opI32TruncF64U,
-		opI64ExtendI32S, opI64ExtendI32U,
-		opI64TruncF32S, opI64TruncF32U, opI64TruncF64S, opI64TruncF64U,
-		opF32ConvertI32S, opF32ConvertI32U, opF32ConvertI64S, opF32ConvertI64U,
-		opF32DemoteF64,
-		opF64ConvertI32S, opF64ConvertI32U, opF64ConvertI64S, opF64ConvertI64U,
-		opF64PromoteF32,
-		opI32ReinterpretF32, opI64ReinterpretF64, opF32ReinterpretI32, opF64ReinterpretI64,
-		opI32Extend8S, opI32Extend16S,
-		opI64Extend8S, opI64Extend16S, opI64Extend32S:
+	case wasm.OpI32Eqz, wasm.OpI64Eqz,
+		wasm.OpI32Clz, wasm.OpI32Ctz, wasm.OpI32Popcnt,
+		wasm.OpI64Clz, wasm.OpI64Ctz, wasm.OpI64Popcnt,
+		wasm.OpF32Abs, wasm.OpF32Neg, wasm.OpF32Ceil, wasm.OpF32Floor, wasm.OpF32Trunc, wasm.OpF32Nearest, wasm.OpF32Sqrt,
+		wasm.OpF64Abs, wasm.OpF64Neg, wasm.OpF64Ceil, wasm.OpF64Floor, wasm.OpF64Trunc, wasm.OpF64Nearest, wasm.OpF64Sqrt,
+		wasm.OpI32WrapI64,
+		wasm.OpI32TruncF32S, wasm.OpI32TruncF32U, wasm.OpI32TruncF64S, wasm.OpI32TruncF64U,
+		wasm.OpI64ExtendI32S, wasm.OpI64ExtendI32U,
+		wasm.OpI64TruncF32S, wasm.OpI64TruncF32U, wasm.OpI64TruncF64S, wasm.OpI64TruncF64U,
+		wasm.OpF32ConvertI32S, wasm.OpF32ConvertI32U, wasm.OpF32ConvertI64S, wasm.OpF32ConvertI64U,
+		wasm.OpF32DemoteF64,
+		wasm.OpF64ConvertI32S, wasm.OpF64ConvertI32U, wasm.OpF64ConvertI64S, wasm.OpF64ConvertI64U,
+		wasm.OpF64PromoteF32,
+		wasm.OpI32ReinterpretF32, wasm.OpI64ReinterpretF64, wasm.OpF32ReinterpretI32, wasm.OpF64ReinterpretI64,
+		wasm.OpI32Extend8S, wasm.OpI32Extend16S,
+		wasm.OpI64Extend8S, wasm.OpI64Extend16S, wasm.OpI64Extend32S:
 		return true
 	}
 	return false
@@ -1865,109 +1865,109 @@ func isHelperUnary(op byte) bool {
 
 func helperUnarySpec(op byte) helperUnary {
 	switch op {
-	case opI32Eqz:
+	case wasm.OpI32Eqz:
 		return helperUnary{"i32_eqz", ssa.TypeI32}
-	case opI64Eqz:
+	case wasm.OpI64Eqz:
 		return helperUnary{"i64_eqz", ssa.TypeI32}
-	case opI32Clz:
+	case wasm.OpI32Clz:
 		return helperUnary{"i32_clz", ssa.TypeI32}
-	case opI32Ctz:
+	case wasm.OpI32Ctz:
 		return helperUnary{"i32_ctz", ssa.TypeI32}
-	case opI32Popcnt:
+	case wasm.OpI32Popcnt:
 		return helperUnary{"i32_popcnt", ssa.TypeI32}
-	case opI64Clz:
+	case wasm.OpI64Clz:
 		return helperUnary{"i64_clz", ssa.TypeI64}
-	case opI64Ctz:
+	case wasm.OpI64Ctz:
 		return helperUnary{"i64_ctz", ssa.TypeI64}
-	case opI64Popcnt:
+	case wasm.OpI64Popcnt:
 		return helperUnary{"i64_popcnt", ssa.TypeI64}
-	case opF32Abs:
+	case wasm.OpF32Abs:
 		return helperUnary{"f32_abs", ssa.TypeF32}
-	case opF32Neg:
+	case wasm.OpF32Neg:
 		return helperUnary{"f32_neg", ssa.TypeF32}
-	case opF32Ceil:
+	case wasm.OpF32Ceil:
 		return helperUnary{"f32_ceil", ssa.TypeF32}
-	case opF32Floor:
+	case wasm.OpF32Floor:
 		return helperUnary{"f32_floor", ssa.TypeF32}
-	case opF32Trunc:
+	case wasm.OpF32Trunc:
 		return helperUnary{"f32_trunc", ssa.TypeF32}
-	case opF32Nearest:
+	case wasm.OpF32Nearest:
 		return helperUnary{"f32_nearest", ssa.TypeF32}
-	case opF32Sqrt:
+	case wasm.OpF32Sqrt:
 		return helperUnary{"f32_sqrt", ssa.TypeF32}
-	case opF64Abs:
+	case wasm.OpF64Abs:
 		return helperUnary{"f64_abs", ssa.TypeF64}
-	case opF64Neg:
+	case wasm.OpF64Neg:
 		return helperUnary{"f64_neg", ssa.TypeF64}
-	case opF64Ceil:
+	case wasm.OpF64Ceil:
 		return helperUnary{"f64_ceil", ssa.TypeF64}
-	case opF64Floor:
+	case wasm.OpF64Floor:
 		return helperUnary{"f64_floor", ssa.TypeF64}
-	case opF64Trunc:
+	case wasm.OpF64Trunc:
 		return helperUnary{"f64_trunc", ssa.TypeF64}
-	case opF64Nearest:
+	case wasm.OpF64Nearest:
 		return helperUnary{"f64_nearest", ssa.TypeF64}
-	case opF64Sqrt:
+	case wasm.OpF64Sqrt:
 		return helperUnary{"f64_sqrt", ssa.TypeF64}
-	case opI32WrapI64:
+	case wasm.OpI32WrapI64:
 		return helperUnary{"i32_wrap_i64", ssa.TypeI32}
-	case opI32TruncF32S:
+	case wasm.OpI32TruncF32S:
 		return helperUnary{"i32_trunc_f32_s", ssa.TypeI32}
-	case opI32TruncF32U:
+	case wasm.OpI32TruncF32U:
 		return helperUnary{"i32_trunc_f32_u", ssa.TypeI32}
-	case opI32TruncF64S:
+	case wasm.OpI32TruncF64S:
 		return helperUnary{"i32_trunc_f64_s", ssa.TypeI32}
-	case opI32TruncF64U:
+	case wasm.OpI32TruncF64U:
 		return helperUnary{"i32_trunc_f64_u", ssa.TypeI32}
-	case opI64ExtendI32S:
+	case wasm.OpI64ExtendI32S:
 		return helperUnary{"i64_extend_i32_s", ssa.TypeI64}
-	case opI64ExtendI32U:
+	case wasm.OpI64ExtendI32U:
 		return helperUnary{"i64_extend_i32_u", ssa.TypeI64}
-	case opI64TruncF32S:
+	case wasm.OpI64TruncF32S:
 		return helperUnary{"i64_trunc_f32_s", ssa.TypeI64}
-	case opI64TruncF32U:
+	case wasm.OpI64TruncF32U:
 		return helperUnary{"i64_trunc_f32_u", ssa.TypeI64}
-	case opI64TruncF64S:
+	case wasm.OpI64TruncF64S:
 		return helperUnary{"i64_trunc_f64_s", ssa.TypeI64}
-	case opI64TruncF64U:
+	case wasm.OpI64TruncF64U:
 		return helperUnary{"i64_trunc_f64_u", ssa.TypeI64}
-	case opF32ConvertI32S:
+	case wasm.OpF32ConvertI32S:
 		return helperUnary{"f32_convert_i32_s", ssa.TypeF32}
-	case opF32ConvertI32U:
+	case wasm.OpF32ConvertI32U:
 		return helperUnary{"f32_convert_i32_u", ssa.TypeF32}
-	case opF32ConvertI64S:
+	case wasm.OpF32ConvertI64S:
 		return helperUnary{"f32_convert_i64_s", ssa.TypeF32}
-	case opF32ConvertI64U:
+	case wasm.OpF32ConvertI64U:
 		return helperUnary{"f32_convert_i64_u", ssa.TypeF32}
-	case opF32DemoteF64:
+	case wasm.OpF32DemoteF64:
 		return helperUnary{"f32_demote_f64", ssa.TypeF32}
-	case opF64ConvertI32S:
+	case wasm.OpF64ConvertI32S:
 		return helperUnary{"f64_convert_i32_s", ssa.TypeF64}
-	case opF64ConvertI32U:
+	case wasm.OpF64ConvertI32U:
 		return helperUnary{"f64_convert_i32_u", ssa.TypeF64}
-	case opF64ConvertI64S:
+	case wasm.OpF64ConvertI64S:
 		return helperUnary{"f64_convert_i64_s", ssa.TypeF64}
-	case opF64ConvertI64U:
+	case wasm.OpF64ConvertI64U:
 		return helperUnary{"f64_convert_i64_u", ssa.TypeF64}
-	case opF64PromoteF32:
+	case wasm.OpF64PromoteF32:
 		return helperUnary{"f64_promote_f32", ssa.TypeF64}
-	case opI32ReinterpretF32:
+	case wasm.OpI32ReinterpretF32:
 		return helperUnary{"i32_reinterpret_f32", ssa.TypeI32}
-	case opI64ReinterpretF64:
+	case wasm.OpI64ReinterpretF64:
 		return helperUnary{"i64_reinterpret_f64", ssa.TypeI64}
-	case opF32ReinterpretI32:
+	case wasm.OpF32ReinterpretI32:
 		return helperUnary{"f32_reinterpret_i32", ssa.TypeF32}
-	case opF64ReinterpretI64:
+	case wasm.OpF64ReinterpretI64:
 		return helperUnary{"f64_reinterpret_i64", ssa.TypeF64}
-	case opI32Extend8S:
+	case wasm.OpI32Extend8S:
 		return helperUnary{"i32_extend8_s", ssa.TypeI32}
-	case opI32Extend16S:
+	case wasm.OpI32Extend16S:
 		return helperUnary{"i32_extend16_s", ssa.TypeI32}
-	case opI64Extend8S:
+	case wasm.OpI64Extend8S:
 		return helperUnary{"i64_extend8_s", ssa.TypeI64}
-	case opI64Extend16S:
+	case wasm.OpI64Extend16S:
 		return helperUnary{"i64_extend16_s", ssa.TypeI64}
-	case opI64Extend32S:
+	case wasm.OpI64Extend32S:
 		return helperUnary{"i64_extend32_s", ssa.TypeI64}
 	}
 	panic(fmt.Sprintf("helperUnarySpec: unknown op 0x%02x", op))

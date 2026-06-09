@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -227,7 +228,7 @@ func TestEmitMemStoreStmt_Store32(t *testing.T) {
 }
 
 // TestEmitMemStoreStmt_Store8 — narrowing store renders the uint8
-// cast on the RHS (the value side is force-hoisted by computeHoist
+// cast on the RHS (the value side is force-hoisted by emit.ComputeHoist
 // so the emit form is a runtime conversion).
 func TestEmitMemStoreStmt_Store8(t *testing.T) {
 	b := ssa.NewFuncBuilder("t", ssa.FuncSig{})
@@ -259,7 +260,7 @@ func TestEmitMemStoreStmt_Store8(t *testing.T) {
 }
 
 // TestComputeHoistForceHoistsNarrowingStoreValue: when args[1] of a
-// narrowing store is a constant-producing op (OpConst32), computeHoist
+// narrowing store is a constant-producing op (OpConst32), emit.ComputeHoist
 // must mark it for hoisting so emitMemStoreStmt's runtime cast lands
 // on a variable instead of a literal.
 func TestComputeHoistForceHoistsNarrowingStoreValue(t *testing.T) {
@@ -274,11 +275,11 @@ func TestComputeHoistForceHoistsNarrowingStoreValue(t *testing.T) {
 	b.NewValueAuxInt(ssa.OpStore8, ssa.TypeMem, 0, addr, val)
 	f := b.Func()
 
-	usage := computeValueUsage(f)
-	hoist := computeHoist(f, usage)
+	usage := emit.ComputeValueUsage(f)
+	hoist := emit.ComputeHoist(f, usage)
 
 	if !hoist[val.ID] {
-		t.Errorf("computeHoist did not force-hoist OpStore8 value arg (usage=%d, hoist=%v)",
+		t.Errorf("ComputeHoist did not force-hoist OpStore8 value arg (usage=%d, hoist=%v)",
 			usage[val.ID], hoist[val.ID])
 	}
 }
@@ -297,11 +298,11 @@ func TestComputeHoistSkipsNonNarrowingStore(t *testing.T) {
 	b.NewValueAuxInt(ssa.OpStore32, ssa.TypeMem, 0, addr, val)
 	f := b.Func()
 
-	usage := computeValueUsage(f)
-	hoist := computeHoist(f, usage)
+	usage := emit.ComputeValueUsage(f)
+	hoist := emit.ComputeHoist(f, usage)
 
 	if hoist[val.ID] {
-		t.Errorf("computeHoist wrongly force-hoisted OpStore32 value arg (no narrowing cast needed)")
+		t.Errorf("ComputeHoist wrongly force-hoisted OpStore32 value arg (no narrowing cast needed)")
 	}
 }
 

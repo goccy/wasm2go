@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/ssa/pass"
 	"github.com/goccy/wasm2go/internal/testfixture"
@@ -46,7 +47,7 @@ func TestStructuredEmit(t *testing.T) {
 		if idx == ^uint32(0) {
 			t.Fatalf("export %q not found", export)
 		}
-		fn, err := LowerFunction(mod, idx, export)
+		fn, err := lower.LowerFunction(mod, idx, export)
 		if err != nil {
 			return "", false, false
 		}

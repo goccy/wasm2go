@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 
+	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -65,9 +66,9 @@ func (em *ssaEmitter) emitStructured(f *ssa.Func) (body *ast.BlockStmt, ok bool)
 		}
 	}()
 
-	usage := computeValueUsage(f)
-	hoist := computeHoist(f, usage)
-	stagedPhi := computeStagedPhis(f, hoist)
+	usage := emit.ComputeValueUsage(f)
+	hoist := emit.ComputeHoist(f, usage)
+	stagedPhi := emit.ComputeStagedPhis(f, hoist)
 	var emitExpr func(*ssa.Value) (ast.Expr, error)
 	emitExpr = func(v *ssa.Value) (ast.Expr, error) {
 		if v == nil {

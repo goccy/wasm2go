@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/format"
 	"go/token"
+	"path"
 	"strconv"
 
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -66,7 +67,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 
 	files := map[string][]byte{}
 
-	// Phase 1: compile all chunk bodies (no serialization yet).
+	// Step 1: compile all chunk bodies (no serialization yet).
 	chunkBodies := make(map[int][]ast.Decl, len(plan.Chunks))
 	for chunkIdx, chunk := range plan.Chunks {
 		t.currentChunk = chunkIdx
@@ -81,13 +82,13 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		chunkBodies[chunkIdx] = bodies
 	}
 
-	// Phase 2: emit helpers (adds helpers' stdlib imports to t.imports).
+	// Step 2: emit helpers (adds helpers' stdlib imports to t.imports).
 	helpers, err := t.emitHelpers()
 	if err != nil {
 		return Result{}, err
 	}
 
-	// Phase 2b: native wasi impl (only when -native-wasi is on and the
+	// Step 2b: native wasi impl (only when -native-wasi is on and the
 	// wasm imports wasi_snapshot_preview1). Lives in base/ so DefaultWASI
 	// can return *WasiStubs alongside *Module. Imports merged into
 	// t.imports so they land in the snapshot below.
@@ -100,14 +101,14 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		t.use(p)
 	}
 
-	// Phase 3: snapshot t.imports as base's view BEFORE main pass adds
+	// Step 3: snapshot t.imports as base's view BEFORE main pass adds
 	// any further dependencies (e.g. "fmt" via SafeInvokeExport).
 	baseImportSnapshot := make(map[string]string, len(t.imports))
 	for k, v := range t.imports {
 		baseImportSnapshot[k] = v
 	}
 
-	// Phase 4: main pass. Populates chunkExtraDecls + linkname forwards
+	// Step 4: main pass. Populates chunkExtraDecls + linkname forwards
 	// on callerChunk == -1. Mutates t.imports with main's own needs.
 	t.currentChunk = -1
 	mainDecls := []ast.Decl{}
@@ -120,7 +121,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	mainDecls = append(mainDecls, exportDecls...)
 	mainDecls = append(mainDecls, t.emitSidecarDecls()...)
 
-	// Phase 5: serialize per-chunk files.
+	// Step 5: serialize per-chunk files.
 	for chunkIdx := range plan.Chunks {
 		t.currentChunk = chunkIdx
 		pkgFile := &ast.File{Name: newID(fmt.Sprintf("p%d", chunkIdx))}
@@ -136,11 +137,6 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		imports = append(imports, &ast.ImportSpec{
 			Name: newID("base"),
 			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")},
-		})
-		// `_ "unsafe"` required for //go:linkname directives in this file.
-		imports = append(imports, &ast.ImportSpec{
-			Name: newID("_"),
-			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote("unsafe")},
 		})
 		for _, p := range stdlibUsed {
 			imports = append(imports, &ast.ImportSpec{
@@ -160,8 +156,6 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			Tok:   token.IMPORT,
 			Specs: importsAsSpecs(imports),
 		})
-		// Linkname forward decls after imports, before bodies.
-		pkgFile.Decls = append(pkgFile.Decls, t.emitLinknameForwards(chunkIdx)...)
 		// Package-level constant table — see translate.go's
 		// useLargeConst comment for why large memory offsets are
 		// routed through a runtime-loaded table instead of inline
@@ -177,9 +171,24 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			return Result{}, fmt.Errorf("format chunk p%d: %w", chunkIdx, err)
 		}
 		files[path] = buf.Bytes()
+
+		// Per-chunk alias files — see emitChunkAliasFiles for the
+		// per-arch split (wrapper-pair on amd64/arm64, bare alias on
+		// pure-Go). The trampoline source shape lives next to the
+		// chunk's other files rather than inline in pN.go so the
+		// cross-chunk routing surface is easy to find / audit /
+		// regenerate independently of the function table and init
+		// code.
+		aliasFiles, err := t.emitChunkAliasFiles(fmt.Sprintf("p%d", chunkIdx), chunkIdx, fmt.Sprintf("p%d", chunkIdx))
+		if err != nil {
+			return Result{}, err
+		}
+		for rel, content := range aliasFiles {
+			files[rel] = content
+		}
 	}
 
-	// Phase 6: serialize base file.
+	// Step 6: serialize base file.
 	t.currentChunk = -2
 	baseFile := &ast.File{Name: newID("base")}
 	baseFile.Decls = append(baseFile.Decls, t.emitImportInterfaces()...)
@@ -195,16 +204,12 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		files["base/base.go"] = buf.Bytes()
 	}
 
-	// Phase 7: serialize main file.
+	// Step 7: serialize main file.
 	t.currentChunk = -1
 	mainStdlib := scanStdlibRefs(mainDecls)
 	mainImports := []*ast.ImportSpec{
 		{Name: newID("base"), Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")}},
 	}
-	mainImports = append(mainImports, &ast.ImportSpec{
-		Name: newID("_"),
-		Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote("unsafe")},
-	})
 	for _, p := range mainStdlib {
 		mainImports = append(mainImports, &ast.ImportSpec{
 			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(p)},
@@ -224,9 +229,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		})
 	}
 	mainFile := &ast.File{Name: newID(t.opts.Package)}
-	mainFile.Decls = append([]ast.Decl{
-		&ast.GenDecl{Tok: token.IMPORT, Specs: importsAsSpecs(mainImports)},
-	}, t.emitLinknameForwards(-1)...)
+	mainFile.Decls = append(mainFile.Decls, &ast.GenDecl{Tok: token.IMPORT, Specs: importsAsSpecs(mainImports)})
 	if decl := t.emitLargeConstsDecl(-1); decl != nil {
 		mainFile.Decls = append(mainFile.Decls, decl)
 	}
@@ -239,6 +242,17 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		files[t.opts.Package+".go"] = buf.Bytes()
 	}
 
+	// Main-file alias.go — bare //go:linkname aliases only (no asm
+	// in the main file, so no wrapper-pair is needed). Emitted with
+	// no build tag because the same shape works on every arch.
+	mainAlias, err := t.emitChunkAliasFiles(t.opts.Package, -1, "")
+	if err != nil {
+		return Result{}, err
+	}
+	for rel, content := range mainAlias {
+		files[rel] = content
+	}
+
 	sidecars := map[string][]byte{}
 	for k, v := range t.sidecars {
 		sidecars[k] = v
@@ -247,8 +261,179 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	for k, v := range t.auxFiles {
 		files["base/"+k] = v
 	}
+
+	// Asm-always-on tail: emit per-chunk asm + decls, split each
+	// chunk's pN.go into pN.go (shared) and pN_pure.go (Go fallback
+	// bodies gated `!amd64 && !arm64`), and drop base/wrappers.go
+	// with the cross-cutting dispatch wrappers chunks reference via
+	// base·callImport_N(SB) etc.
+	asmTrampolineMode := isPlan9AsmSafe(t.opts.OutputImportPath)
+	for chunkIdx, chunk := range plan.Chunks {
+		asmFiles, err := buildAsmFilesMultiChunk(t.mod, t.opts, chunkIdx, chunk, plan)
+		if err != nil {
+			return Result{}, err
+		}
+		for relPath, content := range asmFiles {
+			files[fmt.Sprintf("p%d/%s", chunkIdx, relPath)] = content
+		}
+		// In asm-trampoline mode, append per-cross-chunk-Fn TEXT JMP
+		// stubs to each per-arch asm file so the chunk's bodies can
+		// CALL the bare local symbol and tail-jump straight into the
+		// remote chunk's asm body — see
+		// appendAsmCrossChunkTrampolines for the mechanism rationale.
+		if asmTrampolineMode {
+			for _, arch := range []string{"amd64", "arm64"} {
+				key := fmt.Sprintf("p%d/%s.s", chunkIdx, arch)
+				existing, ok := files[key]
+				if !ok {
+					continue
+				}
+				updated, err := t.appendAsmCrossChunkTrampolines(existing, chunkIdx, arch)
+				if err != nil {
+					return Result{}, err
+				}
+				files[key] = updated
+			}
+		}
+		origPath := fmt.Sprintf("p%d/p%d.go", chunkIdx, chunkIdx)
+		orig, ok := files[origPath]
+		if !ok {
+			return Result{}, fmt.Errorf("missing %s after chunk serialization", origPath)
+		}
+		shared, fallback, err := splitForAsm(orig, fmt.Sprintf("p%d", chunkIdx))
+		if err != nil {
+			return Result{}, fmt.Errorf("split %s: %w", origPath, err)
+		}
+		files[origPath] = shared
+		files[fmt.Sprintf("p%d/p%d_pure.go", chunkIdx, chunkIdx)] = fallback
+	}
+	if wrappers := buildAsmWrappersFile(t.mod); wrappers != nil {
+		files["base/wrappers.go"] = wrappers
+	}
+
 	t.reportMemMetrics()
 	return Result{Files: files, Sidecars: sidecars}, nil
+}
+
+// formatAliasFile renders a per-package alias file from a given list
+// of //go:linkname forward declarations. buildTag, when non-empty,
+// becomes a `//go:build <tag>` directive at the top so the file is
+// only compiled on matching targets. The file declares pkgName so
+// every alias is name-callable from other files in the same package
+// without qualification. It imports `base` (for *base.Module typed
+// parameters) and the blank `unsafe` (required by //go:linkname).
+// Returns nil if forwards is empty so callers can skip writing the
+// file altogether.
+func (t *translator) formatAliasFile(pkgName string, buildTag string, forwards []ast.Decl) ([]byte, error) {
+	if len(forwards) == 0 {
+		return nil, nil
+	}
+	imports := []*ast.ImportSpec{
+		{
+			Name: newID("base"),
+			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")},
+		},
+		{
+			// `_ "unsafe"` is required by the //go:linkname directive.
+			Name: newID("_"),
+			Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote("unsafe")},
+		},
+	}
+
+	file := &ast.File{Name: newID(pkgName)}
+	file.Decls = append(file.Decls, &ast.GenDecl{
+		Tok:   token.IMPORT,
+		Specs: importsAsSpecs(imports),
+	})
+	file.Decls = append(file.Decls, forwards...)
+
+	var buf bytes.Buffer
+	if err := format.Node(&buf, t.fset, file); err != nil {
+		return nil, fmt.Errorf("format alias file for %s: %w", pkgName, err)
+	}
+	if buildTag == "" {
+		return buf.Bytes(), nil
+	}
+	// Build tag has to appear BEFORE the package clause, so prepend
+	// rather than wedging it into the AST (the AST printer would put
+	// it on the wrong line).
+	return append([]byte(fmt.Sprintf("//go:build %s\n\n", buildTag)), buf.Bytes()...), nil
+}
+
+// emitChunkAliasFiles emits the per-chunk alias files for callerChunk
+// (>= 0 for a chunk, -1 for the main file). It splits the wasm-
+// function forwards by build tag so the wrapper-pair shape — which
+// exists solely to provide the ABI0 wrapper that pN/amd64.s and
+// pN/arm64.s need for `CALL ·FnN(SB)` — never reaches a pure-Go
+// build, and conversely the bare-alias shape (cheaper, no Go
+// trampoline frame) is used on pure-Go where there is no asm caller
+// to satisfy.
+//
+//	pN/alias.go        ← //go:build amd64 || arm64
+//	                     wrapper pair (`_xFnN` linkname + `FnN`
+//	                     Go body) + named-symbol bare aliases
+//	pN/alias_pure.go   ← //go:build !amd64 && !arm64
+//	                     wasm-fn bare aliases + named-symbol bare
+//	                     aliases (the named symbols also satisfy
+//	                     pure-Go fallback callers in pN_pure.go)
+//
+// For callerChunk == -1 (main file) there is no asm caller, so only
+// one file is emitted with no build tag — the bare aliases work for
+// every arch.
+//
+// Returns the rendered files keyed by their on-disk path relative to
+// the wasm2go package root.
+func (t *translator) emitChunkAliasFiles(pkgName string, callerChunk int, dir string) (map[string][]byte, error) {
+	files := map[string][]byte{}
+	named := t.emitNamedSymbolForwards(callerChunk)
+
+	if callerChunk == -1 {
+		bare := t.emitWasmFnForwards(callerChunk, linknameForwardBare)
+		decls := append([]ast.Decl{}, bare...)
+		decls = append(decls, named...)
+		out, err := t.formatAliasFile(pkgName, "", decls)
+		if err != nil {
+			return nil, err
+		}
+		if out != nil {
+			files[path.Join(dir, "alias.go")] = out
+		}
+		return files, nil
+	}
+
+	// Per-chunk amd64||arm64 alias file. When the host import path
+	// is plan-9-asm-safe, the asm-side trampolines appended to
+	// <arch>.s by appendAsmCrossChunkTrampolines provide the local
+	// ABI0 entry, so the Go-side decl is body-less and
+	// linkname-less (decl-only). Otherwise the historical
+	// wrapper-pair shape forces the Go compiler to emit the local
+	// ABI0 wrapper that asm `CALL ·FnN(SB)` resolves through.
+	asmKind := linknameForwardWrapperPair
+	if isPlan9AsmSafe(t.opts.OutputImportPath) {
+		asmKind = linknameForwardDeclOnly
+	}
+	asmForwards := t.emitWasmFnForwards(callerChunk, asmKind)
+	asmDecls := append([]ast.Decl{}, asmForwards...)
+	asmDecls = append(asmDecls, named...)
+	asmFile, err := t.formatAliasFile(pkgName, "amd64 || arm64", asmDecls)
+	if err != nil {
+		return nil, err
+	}
+	if asmFile != nil {
+		files[path.Join(dir, "alias.go")] = asmFile
+	}
+
+	bareWasm := t.emitWasmFnForwards(callerChunk, linknameForwardBare)
+	pureDecls := append([]ast.Decl{}, bareWasm...)
+	pureDecls = append(pureDecls, named...)
+	pureFile, err := t.formatAliasFile(pkgName, "!amd64 && !arm64", pureDecls)
+	if err != nil {
+		return nil, err
+	}
+	if pureFile != nil {
+		files[path.Join(dir, "alias_pure.go")] = pureFile
+	}
+	return files, nil
 }
 
 // Compile-time tether so the wasm import path remains hot if future edits

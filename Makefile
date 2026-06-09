@@ -28,8 +28,15 @@ test:
 
 # test-cover runs the suite with coverage and fails if total statement
 # coverage drops below COVERAGE_THRESHOLD.
+#
+# `-coverpkg=./...` measures cross-package coverage: a statement in
+# package A is counted as covered when any test (in A or anywhere
+# else) executes it. The default per-package mode would only credit
+# tests inside the package itself, which under-reports packages like
+# internal/asmgen and internal/lower that are exercised primarily
+# through integration tests in internal/codegen.
 test-cover:
-	go test -race -covermode=atomic -coverprofile=coverage.out ./...
+	go test -race -covermode=atomic -coverpkg=./... -coverprofile=coverage.out ./...
 	@go tool cover -func=coverage.out | tail -1
 	@total=$$(go tool cover -func=coverage.out | awk '/^total:/ {print $$3}' | tr -d '%'); \
 	awk -v t="$$total" -v th="$(COVERAGE_THRESHOLD)" 'BEGIN { \

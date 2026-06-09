@@ -46,13 +46,13 @@ import (
 // Entry points
 //
 // emitMemLoadExpr returns an ast.Expr suitable for both inline use
-// and as the RHS of a hoisted `vN = ...` assignment (computeHoist
+// and as the RHS of a hoisted `vN = ...` assignment (emit.ComputeHoist
 // already force-hoists every OpLoad*, so loads always come out as
 // assignments at their definition site).
 //
 // emitMemStoreStmt returns a single ast.Stmt — the RHS cast for
 // narrowing stores (i32.store8 / i32.store16 / i64.store32 / ...)
-// relies on computeHoist having force-hoisted args[1] so the cast
+// relies on emit.ComputeHoist having force-hoisted args[1] so the cast
 // is a runtime conversion and Go's constant evaluator never sees
 // the out-of-range literal.
 
@@ -87,7 +87,7 @@ func (em *ssaEmitter) emitMemLoadExpr(v *ssa.Value, emitExpr func(*ssa.Value) (a
 //
 // Narrowing stores pick UNSIGNED elemTypes (uint8 / uint16 / uint32)
 // to match the wasm spec's "store the low N bits" semantics, and
-// rely on computeHoist having force-hoisted args[1] so the cast
+// rely on emit.ComputeHoist having force-hoisted args[1] so the cast
 // operand is always a typed local variable. The constant-evaluator
 // quirk `uint8(int32(255))` produces "constant 255 overflows int8" /
 // "constant -1 overflows uint8" depending on choice of signedness;
@@ -315,7 +315,7 @@ func loadSpec(v *ssa.Value) (memOpSpec, bool) {
 // representation"); a signed elemType would semantically misrepresent
 // the operation (i32.store8 of 255 must write 0xFF, not "out of int8
 // range"). The cast in emitMemStoreStmt is a runtime conversion
-// because args[1] is force-hoisted by computeHoist.
+// because args[1] is force-hoisted by emit.ComputeHoist.
 //
 // For non-narrowing stores (i32.store, i64.store, fN.store) elemType
 // equals valSrcType and no cast is emitted.

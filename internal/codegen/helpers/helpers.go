@@ -48,6 +48,23 @@ func f32(x float32) float32 { runtime.KeepAlive(&x); return x }
 
 func f64(x float64) float64 { runtime.KeepAlive(&x); return x }
 
+// ----- Wasm trap helpers (panic with the exact spec-mandated message) ----
+//
+// Used by the inline asm emit for div/rem/trunc-trap paths. The pure-Go
+// path panics directly inside i32_div_s / i32_trunc_f32_s / etc.; the
+// inline asm short-circuits to one of these helpers via `CALL ·name(SB)`
+// so the resulting panic message matches what the pure-Go path produces.
+// They never return — the runtime turns the panic into a fatal error.
+
+//go:noinline
+func wasm_trap_div_zero() { panic("wasm: integer divide by zero") }
+
+//go:noinline
+func wasm_trap_int_overflow() { panic("wasm: integer overflow") }
+
+//go:noinline
+func wasm_trap_invalid_conv() { panic("wasm: invalid conversion to integer") }
+
 // ----- Integer division with overflow / divide-by-zero traps --------------
 
 func i32_div_s(x, y int32) int32 {

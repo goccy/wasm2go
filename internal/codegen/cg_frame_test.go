@@ -74,7 +74,7 @@ func runExportMatrix(t *testing.T, fixture string, calls []call) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("%s UseSSA=%v: got %d lines want %d\n%s", fixture, useSSA, len(gotLines), len(want), out)
@@ -169,7 +169,7 @@ func TestSpecialFPRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)
@@ -257,7 +257,7 @@ func TestGlobalsRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)
@@ -278,25 +278,25 @@ func TestEntryExports(t *testing.T) {
 	mod := readFixture(t, "arith.wasm")
 	t.Run("single", func(t *testing.T) {
 		var buf bytes.Buffer
-		_, err := codegen.Translate(&buf, mod, codegen.Options{
+		res, err := codegen.Translate(&buf, mod, codegen.Options{
 			Package: "pkg", OutputImportPath: "gentest/pkg",
 			EntryExports: []string{"add"},
 		})
 		if err != nil {
 			t.Fatalf("translate: %v", err)
 		}
-		assertSingleFileCompiles(t, buf.String(), nil)
+		assertSingleFileCompiles(t, buf.String(), nil, res.Files)
 	})
 	t.Run("none", func(t *testing.T) {
 		var buf bytes.Buffer
-		_, err := codegen.Translate(&buf, mod, codegen.Options{
+		res, err := codegen.Translate(&buf, mod, codegen.Options{
 			Package: "pkg", OutputImportPath: "gentest/pkg",
 			EntryExports: []string{},
 		})
 		if err != nil {
 			t.Fatalf("translate: %v", err)
 		}
-		assertSingleFileCompiles(t, buf.String(), nil)
+		assertSingleFileCompiles(t, buf.String(), nil, res.Files)
 	})
 }
 
@@ -327,7 +327,7 @@ func main() {
 	fmt.Printf("inf_gt=%d\n", m.InfGt())
 }
 `
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), main, res.Sidecars))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), main, res.Sidecars, res.Files))
 	if !strings.Contains(out, "is_nan=1") {
 		t.Errorf("NaN global not initialised to NaN: %q", out)
 	}
@@ -372,5 +372,58 @@ func TestDeadEndRuntime(t *testing.T) {
 		{export: "br_root", args: []uint64{0}, argTypes: []wasm.ValType{i32}, resType: i32},
 		{export: "loop_return", args: []uint64{5}, argTypes: []wasm.ValType{i32}, resType: i32},
 		{export: "loop_return", args: []uint64{0}, argTypes: []wasm.ValType{i32}, resType: i32},
+	})
+}
+
+// TestBitTestBranchRuntime drives cg_bittest — branches whose
+// condition is `(x & 1<<bit) != 0` (i32 / i64 variants and an
+// inverted-via-eqz shape). The asm emit's bit-test fusion
+// short-circuits this pattern to BTL+JCC on amd64 and TBZ/TBNZ on
+// arm64; the test exercises the fused branch in both arch outputs
+// via runExportMatrix (wazero as the oracle).
+func TestBitTestBranchRuntime(t *testing.T) {
+	i32 := wasm.ValI32
+	i64 := wasm.ValI64
+	runExportMatrix(t, "cg_bittest.wasm", []call{
+		{export: "bit0_set", args: []uint64{1}, argTypes: []wasm.ValType{i32}, resType: i32},
+		{export: "bit0_set", args: []uint64{2}, argTypes: []wasm.ValType{i32}, resType: i32},
+		{export: "bit3_clear", args: []uint64{8}, argTypes: []wasm.ValType{i32}, resType: i32},
+		{export: "bit3_clear", args: []uint64{4}, argTypes: []wasm.ValType{i32}, resType: i32},
+		{export: "bit32_set_i64", args: []uint64{1 << 32}, argTypes: []wasm.ValType{i64}, resType: i32},
+		{export: "bit32_set_i64", args: []uint64{0xFFFF}, argTypes: []wasm.ValType{i64}, resType: i32},
+	})
+}
+
+// TestLargeMemoryOffsetRuntime drives cg_largeoff — store/load
+// pairs whose `offset=` immediate exceeds the codegen's
+// largeConstThreshold (4096). The pure-Go fallback routes the
+// constant through a `_consts[N]` table on every such site, and
+// this test guarantees a fixture exists that traverses the table
+// emit + lookup paths end-to-end (constsIndexExpr / useLargeConst
+// / emitLargeConstsDecl). The runtime assertion is the same
+// wazero-reference comparison runExportMatrix performs on every
+// other fixture.
+func TestLargeMemoryOffsetRuntime(t *testing.T) {
+	i32 := wasm.ValI32
+	runExportMatrix(t, "cg_largeoff.wasm", []call{
+		{export: "write_at_8192", args: []uint64{42}, argTypes: []wasm.ValType{i32}, resType: 0},
+		{export: "read_at_8192", args: nil, argTypes: nil, resType: i32},
+	})
+}
+
+// TestReachableUnreachable drives cg_unreachable — a function whose
+// `unreachable` opcode is reachable from the entry under a specific
+// input (x == 0). Calling the export with x != 0 takes the non-
+// trapping path and must return 42; the asm emit's BlockUnreachable
+// branch still has to materialise (even though it's not executed at
+// runtime) so the resulting binary links cleanly. wazero is the
+// reference; the comparison matrix in runExportMatrix asserts that
+// the generated code agrees with it.
+func TestReachableUnreachable(t *testing.T) {
+	i32 := wasm.ValI32
+	runExportMatrix(t, "cg_unreachable.wasm", []call{
+		{export: "trap_if_zero", args: []uint64{1}, argTypes: []wasm.ValType{i32}, resType: i32},
+		{export: "trap_if_zero", args: []uint64{42}, argTypes: []wasm.ValType{i32}, resType: i32},
+		{export: "always_42", args: nil, argTypes: nil, resType: i32},
 	})
 }
