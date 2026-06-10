@@ -7,12 +7,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/testfixture"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
 // TestLowerGcd checks that the gcd function from control.wasm — which
 // uses block + loop + br_if — lowers through SSA and emits valid Go.
+// This is an integration test of the lower+emit pair; the pure
+// lowering side lives in internal/lower.
 func TestLowerGcd(t *testing.T) {
 	bin := testfixture.Wasm(t, "control")
 	mod, err := wasm.Parse(bytes.NewReader(bin))
@@ -29,7 +32,7 @@ func TestLowerGcd(t *testing.T) {
 	if idx == ^uint32(0) {
 		t.Skip("gcd not in control.wasm exports")
 	}
-	fn, err := LowerFunction(mod, idx, "gcd")
+	fn, err := lower.LowerFunction(mod, idx, "gcd")
 	if err != nil {
 		t.Fatalf("lower gcd: %v", err)
 	}
@@ -50,29 +53,5 @@ func TestLowerGcd(t *testing.T) {
 	// reference the loop header local at least once.
 	if !strings.Contains(got, "for") && !strings.Contains(got, "goto L") {
 		t.Errorf("expected loop or goto-based control flow in gcd emit:\n%s", got)
-	}
-}
-
-// TestLowerSwitch3 covers the switch3 export — a br_table dispatcher.
-// br_table now lowers to a chain of equality-If blocks, so the lowering
-// should succeed and produce a CFG dominated by goto-based emission.
-func TestLowerSwitch3(t *testing.T) {
-	bin := testfixture.Wasm(t, "control")
-	mod, err := wasm.Parse(bytes.NewReader(bin))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	idx := ^uint32(0)
-	for _, e := range mod.Exports {
-		if e.Kind == wasm.ExportFunc && e.Name == "switch3" {
-			idx = e.Index
-			break
-		}
-	}
-	if idx == ^uint32(0) {
-		t.Skip("switch3 not exported")
-	}
-	if _, err := LowerFunction(mod, idx, "switch3"); err != nil {
-		t.Fatalf("lower switch3: %v", err)
 	}
 }

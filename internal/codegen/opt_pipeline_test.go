@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/ssa/pass"
 	"github.com/goccy/wasm2go/internal/testfixture"
@@ -23,7 +24,7 @@ func runOptPipeline(t *testing.T, mod *wasm.Module, export string) (before, afte
 	if idx == ^uint32(0) {
 		t.Fatalf("export %q not found", export)
 	}
-	fn, err := LowerFunction(mod, idx, export)
+	fn, err := lower.LowerFunction(mod, idx, export)
 	if err != nil {
 		t.Fatalf("lower %s: %v", export, err)
 	}

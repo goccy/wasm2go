@@ -1,7 +1,7 @@
 package ssa
 
 // AliasClass classifies where a memory access lands. It is the
-// observability backbone of Phase 4 (memory promotion): every wasm
+// observability backbone of memory promotion: every wasm
 // load / store is tagged so the transpiler can report — and act on —
 // how much of the linear-memory traffic is provably function-local.
 type AliasClass uint8

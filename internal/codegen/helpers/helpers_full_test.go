@@ -5,6 +5,64 @@ import (
 	"testing"
 )
 
+// TestFloat64Comparators covers the f64 boolean producers
+// (f64_eq/ne/lt/gt/le/ge). Each helper has the same `if cond { 1 }
+// else { 0 }` shape — we hit both arms once per helper. The
+// reference comparison is a direct Go `==`, `!=`, etc. on the same
+// operands so the assertion stays implementation-independent: if
+// the helper agrees with the language operator, it's correct.
+func TestFloat64Comparators(t *testing.T) {
+	cases := []struct {
+		x, y float64
+	}{
+		{1.0, 2.0}, {2.0, 1.0}, {1.0, 1.0}, {0.0, math.Copysign(0, -1)},
+	}
+	check := func(name string, h func(a, b float64) int32, ref func(a, b float64) bool) {
+		for _, c := range cases {
+			want := int32(0)
+			if ref(c.x, c.y) {
+				want = 1
+			}
+			if got := h(c.x, c.y); got != want {
+				t.Errorf("%s(%v, %v) = %d, want %d", name, c.x, c.y, got, want)
+			}
+		}
+	}
+	check("f64_eq", f64_eq, func(a, b float64) bool { return a == b })
+	check("f64_ne", f64_ne, func(a, b float64) bool { return a != b })
+	check("f64_lt", f64_lt, func(a, b float64) bool { return a < b })
+	check("f64_gt", f64_gt, func(a, b float64) bool { return a > b })
+	check("f64_le", f64_le, func(a, b float64) bool { return a <= b })
+	check("f64_ge", f64_ge, func(a, b float64) bool { return a >= b })
+}
+
+// TestFloat64PromoteNaN exercises the NaN-preserving path of
+// f64_promote_f32. The non-NaN path is covered by the cg_numerics
+// fixture's runtime tests; this fills in the NaN branch.
+func TestFloat64PromoteNaN(t *testing.T) {
+	nan := float32(math.NaN())
+	got := f64_promote_f32(nan)
+	if !math.IsNaN(got) {
+		t.Errorf("f64_promote_f32(NaN) = %v, want NaN", got)
+	}
+	// Finite values must round-trip exactly: the helper's wide path
+	// is for NaN only; the normal path is the language `float64(x)`.
+	if got := f64_promote_f32(2.5); got != 2.5 {
+		t.Errorf("f64_promote_f32(2.5) = %v, want 2.5", got)
+	}
+}
+
+// TestWasmTrapHelpers — the three panic-only helpers the asm emit
+// branches to on a div/rem/trunc trap path. Each one must panic
+// with the exact spec-mandated message so the assertion path in
+// TestTrapOpsArePreservedThroughDCE keeps matching what the
+// integer / float trunc helpers raise from the pure-Go side.
+func TestWasmTrapHelpers(t *testing.T) {
+	mustPanic(t, "wasm: integer divide by zero", wasm_trap_div_zero)
+	mustPanic(t, "wasm: integer overflow", wasm_trap_int_overflow)
+	mustPanic(t, "wasm: invalid conversion to integer", wasm_trap_invalid_conv)
+}
+
 // mustPanic calls f and asserts it panics with a message containing want.
 func mustPanic(t *testing.T, want string, f func()) {
 	t.Helper()

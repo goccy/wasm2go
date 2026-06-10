@@ -7,7 +7,7 @@ import (
 )
 
 // MemMetrics accumulates memory-access classification counts across an
-// entire module. It is the data behind the Phase 4 observability
+// entire module. It is the data behind the memory-promotion observability
 // requirement: report, in `promoted / total` (y/x) form, how much of
 // the linear-memory traffic the transpiler proved function-local.
 type MemMetrics struct {

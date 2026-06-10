@@ -3,6 +3,7 @@
 package codegen
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/ssa/pass"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -197,9 +199,9 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// SSA pipeline is always on; an unsupported wasm feature is a hard
 	// error from Translate (the legacy direct-opcode compiler is gone).
 	t.memMetrics = ssa.NewMemMetrics()
-	// In multi-package mode the wasmify-generated bridge expects the
-	// trivial identity helpers (base.I32 / base.I64 / base.F32 /
-	// base.F64) to exist in `base` so its `_ = base.I32` keep-alive
+	// In multi-package mode an external bridge that imports `base`
+	// expects the trivial identity helpers (base.I32 / base.I64 /
+	// base.F32 / base.F64) to exist so its `_ = base.I32` keep-alive
 	// reference resolves. Single-package mode only emits helpers that
 	// the bytecode actually triggers, so we don't need to force them
 	// there.
@@ -209,6 +211,16 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		t.helpers["f32"] = true
 		t.helpers["f64"] = true
 	}
+
+	// Asm always-on needs the wasm-trap panic helpers
+	// available because the inline div/rem/trunc emit short-circuits to
+	// them on the trap path. Without these, the asm fails to link
+	// (·wasm_trap_div_zero(SB) etc. resolve to nothing) — or worse,
+	// silently nil-derefs instead of panicking with the spec message.
+	// Register them up front; emitHelpers filters out unused ones.
+	t.helpers["wasm_trap_div_zero"] = true
+	t.helpers["wasm_trap_int_overflow"] = true
+	t.helpers["wasm_trap_invalid_conv"] = true
 
 	// Compute the call graph once and thread it through reachability
 	// + multi-package planning. The bytecode scan is the same for all
@@ -352,11 +364,48 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		out.Decls = append([]ast.Decl{gd}, out.Decls...)
 	}
 
-	if err := format.Node(w, t.fset, out); err != nil {
+	// Render the Go source into a buffer first so the asm-bundle
+	// post-process can split it into a shared file (written to w)
+	// and a fallback `<pkg>_pure.go` file (in Result.Files, gated
+	// !amd64 && !arm64).
+	var goBuf bytes.Buffer
+	if err := format.Node(&goBuf, t.fset, out); err != nil {
 		return Result{}, err
 	}
 	t.reportMemMetrics()
-	return Result{Sidecars: t.sidecars, AuxFiles: t.auxFiles}, nil
+	return finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
+}
+
+// finalizeSinglePkgWithAsm is the asm-always-on tail of single-package
+// Translate. It splits the Go source produced by the translator into
+// a shared file (Module struct, helpers, exports, ...) — written to
+// the caller's w — and a `<pkg>_pure.go` file holding the function
+// bodies under `//go:build !amd64 && !arm64`. The asm bundle goes
+// into Result.Files. On asm-target GOARCHs the pure file is dormant
+// and the asm bodies in `<pkg>/amd64.s` (and arm64.s) take over.
+func finalizeSinglePkgWithAsm(m *wasm.Module, opts Options, w io.Writer, goSrc []byte, sidecars map[string][]byte, auxFiles map[string][]byte) (Result, error) {
+	shared, fallback, err := splitForAsm(goSrc, opts.Package)
+	if err != nil {
+		return Result{}, fmt.Errorf("asm-bundle split: %w", err)
+	}
+	if _, err := w.Write(shared); err != nil {
+		return Result{}, err
+	}
+	asmFiles, err := buildAsmFilesSingle(m, opts)
+	if err != nil {
+		return Result{}, err
+	}
+	files := map[string][]byte{
+		opts.Package + "_pure.go": fallback,
+	}
+	for k, v := range asmFiles {
+		files[k] = v
+	}
+	return Result{
+		Files:    files,
+		Sidecars: sidecars,
+		AuxFiles: auxFiles,
+	}, nil
 }
 
 // emitSidecarDecls returns //go:embed var decls for each registered sidecar.
@@ -419,7 +468,7 @@ type translator struct {
 	callees [][]uint32
 
 	// importedModules: ordered list of distinct wasm import-module names
-	// (e.g. "env", "wasi_snapshot_preview1", "wasmify").
+	// (e.g. "env", "wasi_snapshot_preview1").
 	importedModules []string
 
 	// imports: stdlib import paths used by generated code, mapped to alias
@@ -490,7 +539,7 @@ type translator struct {
 	// runs <const value> -> <slot index in the table>.
 	largeConsts map[int]map[uint64]int
 
-	// memMetrics accumulates the Phase 4 memory-promotion observability
+	// memMetrics accumulates the memory-promotion observability
 	// data: every SSA-lowered function's load/store classification is
 	// folded in here, then reported once codegen finishes.
 	memMetrics *ssa.MemMetrics
@@ -669,16 +718,6 @@ func (t *translator) registerLinknameForward(callerChunk int, funcIdx uint32, ta
 	t.linknameForwards[callerChunk][funcIdx] = targetChunk
 }
 
-// emitLinknameForwards returns one ast.Decl per registered forward for the
-// given caller chunk. Two kinds of forward are emitted:
-//
-//   - wasm-function-index forwards (registered via registerLinknameForward
-//     during funcRef calls). Local + target name are both Fn<idx>.
-//   - named-symbol forwards (registered via registerLinknameSymbol for
-//     things like InvokeExportShard_K and InitElemSeg_K_n that aren't a
-//     plain wasm function). Local + target name are identical; signature
-//     was captured at registration time.
-//
 // largeConstThreshold is the smallest absolute offset that gets routed
 // through the package-level _consts table instead of being emitted
 // as an inline literal. Below the threshold, ARM64 LDR's 12-bit
@@ -751,12 +790,70 @@ func (t *translator) emitLargeConstsDecl(file int) ast.Decl {
 	}
 }
 
-// The order is deterministic (ascending funcIdx, then alphabetical symbol
-// name) so generated output is diff-stable across runs.
-func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
+// Two kinds of cross-chunk forward live behind these helpers:
+//
+//   - wasm-function-index forwards (registered via
+//     registerLinknameForward during funcRef calls). Local + target
+//     name are both Fn<idx>. Emitted by emitWasmFnForwards in either
+//     the bare-alias or the wrapper-pair shape (see linknameForwardKind).
+//   - named-symbol forwards (registered via registerLinknameSymbol for
+//     things like InvokeExportShard_K and InitElemSeg_K_n that aren't a
+//     plain wasm function). Local + target name are identical;
+//     signature was captured at registration time. Always bare alias —
+//     no asm callers, no ABI0 wrapper requirement.
+//
+// The order is deterministic (ascending funcIdx, then alphabetical
+// symbol name) so generated output is diff-stable across runs.
+//
+// linknameForwardKind selects the source shape emitWasmFnForwards
+// produces for each wasm-function forward.
+type linknameForwardKind int
+
+const (
+	// linknameForwardBare emits a single bare //go:linkname alias
+	// with no body. The Go compiler then aliases <local>.FnN
+	// directly to the cross-chunk target at link time, with no
+	// trampoline frame and no auto-generated ABI0 wrapper.
+	// Sufficient when every caller of <local>.FnN is itself Go (the
+	// main wasm2go.go file, or the pure-Go fallback bodies in
+	// pN_pure.go).
+	linknameForwardBare linknameForwardKind = iota
+	// linknameForwardWrapperPair emits `_x<fnName>` (linkname-only
+	// decl) + `<fnName>` (Go body that tail-calls _x<fnName>).
+	// The Go body forces the Go compiler to emit a local ABI0
+	// wrapper at <local>.<fnName>.abi0, which the chunk's amd64.s
+	// / arm64.s body needs because `CALL ·<fnName>(SB)` resolves
+	// into the ABI0 slot. Bare //go:linkname does NOT generate
+	// that wrapper (verified on go 1.26.2: every per-chunk asm
+	// caller fails to link with `relocation target <pX>.<fnName>
+	// not defined` when the wrapper body is absent), so wrapper
+	// pairs are required whenever the chunk's asm bundle CALLs
+	// the local symbol.
+	linknameForwardWrapperPair
+	// linknameForwardDeclOnly emits a bare Go function declaration
+	// (`func <fnName>(...) ...`) with NO //go:linkname directive
+	// and NO body. The chunk's <arch>.s file is expected to provide
+	// the body — typically as a TEXT directive whose payload is a
+	// tail-JMP into the remote chunk's asm body
+	// (appendAsmCrossChunkTrampolines is what writes that). Used in
+	// asm-trampoline mode when the host import path is plan-9-asm-
+	// safe: there is no //go:linkname for the Go linker to fuse
+	// with the asm-side cross-package CALL — which would otherwise
+	// trip the nosplit wrapper cycle observed empirically with
+	// linkname + asm-body + function-value-reference + cross-pkg
+	// asm CALL all in play — and Go callers route through the
+	// auto-generated ABIInternal wrapper that calls the asm TEXT.
+	linknameForwardDeclOnly
+)
+
+// emitWasmFnForwards returns the //go:linkname forward declarations
+// for the cross-chunk wasm functions registered against callerChunk
+// during translation. kind picks between the bare-alias and the
+// wrapper-pair source shapes (see linknameForwardKind). Returns nil
+// when no forwards are registered for the caller.
+func (t *translator) emitWasmFnForwards(callerChunk int, kind linknameForwardKind) []ast.Decl {
 	forwards := t.linknameForwards[callerChunk]
-	symForwards := t.linknameSymbolForwards[callerChunk]
-	if len(forwards) == 0 && len(symForwards) == 0 {
+	if len(forwards) == 0 {
 		return nil
 	}
 	prevChunk := t.currentChunk
@@ -764,33 +861,102 @@ func (t *translator) emitLinknameForwards(callerChunk int) []ast.Decl {
 	defer func() { t.currentChunk = prevChunk }()
 
 	var decls []ast.Decl
-
-	// Wasm-function forwards.
 	keys := make([]uint32, 0, len(forwards))
 	for k := range forwards {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
 	for _, funcIdx := range keys {
 		targetChunk := forwards[funcIdx]
 		fnName := t.funcName(funcIdx)
 		linknameTarget := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, targetChunk, fnName)
 		ft := t.mod.FuncTypeOf(funcIdx)
+
+		if kind == linknameForwardBare {
+			decls = append(decls, &ast.FuncDecl{
+				Doc: &ast.CommentGroup{List: []*ast.Comment{
+					{Text: fmt.Sprintf("//go:linkname %s %s", fnName, linknameTarget)},
+				}},
+				Name: newID(fnName),
+				Type: t.funcSignature(ft, true /*withModuleParam*/),
+			})
+			continue
+		}
+
+		if kind == linknameForwardDeclOnly {
+			decls = append(decls, &ast.FuncDecl{
+				Name: newID(fnName),
+				Type: t.funcSignature(ft, true /*withModuleParam*/),
+			})
+			continue
+		}
+
+		hiddenName := "_x" + fnName
 		decls = append(decls, &ast.FuncDecl{
 			Doc: &ast.CommentGroup{List: []*ast.Comment{
-				{Text: fmt.Sprintf("//go:linkname %s %s", fnName, linknameTarget)},
+				{Text: fmt.Sprintf("//go:linkname %s %s", hiddenName, linknameTarget)},
+			}},
+			Name: newID(hiddenName),
+			Type: t.funcSignature(ft, true /*withModuleParam*/),
+		})
+		// Build the trampoline body. Parameter names are m, l0, l1, ...
+		params := []*ast.Ident{newID("m")}
+		for i := range ft.Params {
+			params = append(params, newID(fmt.Sprintf("l%d", i)))
+		}
+		callArgs := make([]ast.Expr, len(params))
+		for i, p := range params {
+			callArgs[i] = p
+		}
+		var bodyStmt ast.Stmt
+		if len(ft.Results) > 0 {
+			bodyStmt = &ast.ReturnStmt{Results: []ast.Expr{
+				&ast.CallExpr{Fun: newID(hiddenName), Args: callArgs},
+			}}
+		} else {
+			bodyStmt = &ast.ExprStmt{X: &ast.CallExpr{Fun: newID(hiddenName), Args: callArgs}}
+		}
+		// //go:noinline prevents the Go inliner from collapsing the
+		// trampoline into its caller. Inlining would erase the
+		// runtime call boundary that the linker uses to set up the
+		// ABI0↔ABIInternal bridge between the asm caller and the
+		// linkname-aliased asm callee, leading to scrambled
+		// arguments at the target.
+		decls = append(decls, &ast.FuncDecl{
+			Doc: &ast.CommentGroup{List: []*ast.Comment{
+				{Text: "//go:noinline"},
 			}},
 			Name: newID(fnName),
 			Type: t.funcSignature(ft, true /*withModuleParam*/),
+			Body: &ast.BlockStmt{List: []ast.Stmt{bodyStmt}},
 		})
 	}
+	return decls
+}
 
-	// Named-symbol forwards.
+// emitNamedSymbolForwards returns the //go:linkname forward
+// declarations for the per-callerChunk named-symbol forwards
+// (InvokeExportShard_K, InitElemSeg_K_n, …). Always a bare alias —
+// these symbols are Go helpers with no asm-side callers, so the
+// ABI0-wrapper requirement that drives the wasm-function
+// wrapper-pair form does not apply. Returns nil when no
+// named-symbol forwards are registered.
+func (t *translator) emitNamedSymbolForwards(callerChunk int) []ast.Decl {
+	symForwards := t.linknameSymbolForwards[callerChunk]
+	if len(symForwards) == 0 {
+		return nil
+	}
+	prevChunk := t.currentChunk
+	t.currentChunk = callerChunk
+	defer func() { t.currentChunk = prevChunk }()
+
 	symKeys := make([]string, 0, len(symForwards))
 	for k := range symForwards {
 		symKeys = append(symKeys, k)
 	}
 	sort.Strings(symKeys)
+	var decls []ast.Decl
 	for _, name := range symKeys {
 		sym := symForwards[name]
 		linknameTarget := fmt.Sprintf("%s/p%d.%s", t.opts.OutputImportPath, sym.targetChunk, name)
@@ -1404,8 +1570,8 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		return []ast.Decl{primary}
 	}
 
-	// Build the simple-form `New(env, wasmify, ...)` that omits the
-	// wasi parameter and delegates to NewWithWASI with DefaultWASI()
+	// Build the simple-form `New(env, ...)` that omits the wasi
+	// parameter and delegates to NewWithWASI with DefaultWASI()
 	// inserted at the wasi position.
 	var wrapperParams []*ast.Field
 	var wrapperArgs []ast.Expr
@@ -1527,7 +1693,7 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 // value counts feed the optimization metrics.
 func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.BlockStmt, error) {
 	_ = fn // body bytes live on the *wasm.Module; kept for API symmetry.
-	ssaFn, err := LowerFunction(t.mod, funcIdx, t.funcName(funcIdx))
+	ssaFn, err := lower.LowerFunction(t.mod, funcIdx, t.funcName(funcIdx))
 	if err != nil {
 		return nil, err
 	}
@@ -1568,16 +1734,16 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// A pass bug that produced a malformed CFG must not reach emit;
 	// surface the verify failure so the SSA bug is fixed at its source.
 	if err := ssa.Verify(ssaFn); err != nil {
-		return nil, fmt.Errorf("%w: post-opt verify: %w", ErrSSAUnsupported, err)
+		return nil, fmt.Errorf("%w: post-opt verify: %w", lower.ErrSSAUnsupported, err)
 	}
 	body, err := newSSAEmitter(t).emitFuncBody(ssaFn)
 	if err != nil {
-		return nil, fmt.Errorf("%w: emit: %w", ErrSSAUnsupported, err)
+		return nil, fmt.Errorf("%w: emit: %w", lower.ErrSSAUnsupported, err)
 	}
 	if t.memMetrics != nil {
 		t.memMetrics.AddOpt(insBefore, insAfter)
 	}
-	// Phase 4 observability: classify this function's memory accesses
+	// Memory-promotion observability: classify this function's memory accesses
 	// (frame / rodata / slab) and fold the counts into the module-wide
 	// metrics.
 	if t.memMetrics != nil {
@@ -1586,7 +1752,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	return body, nil
 }
 
-// reportMemMetrics writes the Phase 4 memory-promotion summary to
+// reportMemMetrics writes the memory-promotion summary to
 // stderr once codegen has finished. No-op when no memory accesses were
 // seen. Called by each translate* path.
 func (t *translator) reportMemMetrics() {
@@ -1772,23 +1938,26 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt) error {
 	return nil
 }
 
-// emitSafeInvokeWrap emits the shared trap-recovery helper used by the
-// per-export dispatch functions. It is the
-// global-snapshot + recover logic of SafeInvokeExport, but parametrised
-// over the actual call via a closure so every per-export function can
-// share this single copy:
+// buildSafeInvokeBody constructs the body statements that wrap a single
+// `packed = <callExpr>` line with global-snapshot save/restore and a
+// recover-into-err defer. Used by emitOneExportFunc to inline the same
+// trap-recovery sequence that the historical safeInvokeWrap helper
+// implemented, but without the closure + extra Go call frame: each
+// per-export Inv_<svc>_<mt> now contains the snapshot+defer+call+return
+// directly, so the bulk-dispatch → Inv → asm path drops two Go frames
+// (the closure and the wrapper) plus the closure allocation per call.
 //
-//	func safeInvokeWrap(m *Module, call func() int64) (packed int64, err error) {
-//	    savedG0 := m.G0   // and every other mutable global
-//	    defer func() {
-//	        if r := recover(); r != nil { m.G0 = savedG0; err = ... }
-//	    }()
-//	    packed = call()
-//	    return
-//	}
-func (t *translator) emitSafeInvokeWrap() ast.Decl {
+// The emitted shape is:
+//
+//	savedG0 := m.G0   // and every other mutable global
+//	defer func() {
+//	    if r := recover(); r != nil { m.G0 = savedG0; ...; err = ... }
+//	}()
+//	packed = <callExpr>
+//	return
+func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 	t.use("fmt")
-	body := &ast.BlockStmt{}
+	var stmts []ast.Stmt
 	type snap struct{ saved, field string }
 	var snaps []snap
 	for i := range t.mod.Globals {
@@ -1799,7 +1968,7 @@ func (t *translator) emitSafeInvokeWrap() ast.Decl {
 		fld := t.fieldName(fmt.Sprintf("g%d", idx))
 		sav := fmt.Sprintf("savedG%d", idx)
 		snaps = append(snaps, snap{saved: sav, field: fld})
-		body.List = append(body.List, &ast.AssignStmt{
+		stmts = append(stmts, &ast.AssignStmt{
 			Tok: token.DEFINE,
 			Lhs: []ast.Expr{newID(sav)},
 			Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(fld)}},
@@ -1831,70 +2000,53 @@ func (t *translator) emitSafeInvokeWrap() ast.Decl {
 		Cond: &ast.BinaryExpr{X: newID("r"), Op: token.NEQ, Y: newID("nil")},
 		Body: ifBody,
 	})
-	body.List = append(body.List, &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
+	stmts = append(stmts, &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
 		Type: &ast.FuncType{Params: &ast.FieldList{}},
 		Body: recoverBody,
 	}}})
-	body.List = append(body.List, &ast.AssignStmt{
+	stmts = append(stmts, &ast.AssignStmt{
 		Tok: token.ASSIGN,
 		Lhs: []ast.Expr{newID("packed")},
-		Rhs: []ast.Expr{&ast.CallExpr{Fun: newID("call")}},
+		Rhs: []ast.Expr{callExpr},
 	})
-	body.List = append(body.List, &ast.ReturnStmt{})
+	stmts = append(stmts, &ast.ReturnStmt{})
+	return stmts
+}
 
-	callType := &ast.FuncType{
-		Params:  &ast.FieldList{},
-		Results: &ast.FieldList{List: []*ast.Field{{Type: newID("int64")}}},
+// emitOneExportFunc emits one standalone dispatch function for a single
+// bulk-dispatch export:
+//
+//	func Inv_<svc>_<mt>(m *Module, l0, l1 int32) (packed int64, err error) {
+//	    savedG0 := m.G0   // and every other mutable global
+//	    defer func() {
+//	        if r := recover(); r != nil { m.G0 = savedG0; err = ... }
+//	    }()
+//	    packed = FnN(m, l0, l1)
+//	    return
+//	}
+//
+// The snapshot+defer+call sequence is inlined per-Inv (rather than
+// routed through a shared safeInvokeWrap helper that took a closure)
+// so the dispatch path is two Go frames + one closure allocation
+// shorter per bulk-dispatch call: the closure that captured
+// (m, l0, l1) and the safeInvokeWrap frame itself are both gone.
+// Each Inv_*
+// remains independently DCE-able because the FnN call is still
+// only reachable through its own function body.
+func (t *translator) emitOneExportFunc(w wexpEntry) ast.Decl {
+	call := &ast.CallExpr{
+		Fun:  t.funcRef(w.funcIndex),
+		Args: []ast.Expr{newID("m"), newID("l0"), newID("l1")},
 	}
+	body := &ast.BlockStmt{List: t.buildSafeInvokeBody(call)}
 	params := &ast.FieldList{List: []*ast.Field{
 		{Names: []*ast.Ident{newID("m")}, Type: t.moduleType()},
-		{Names: []*ast.Ident{newID("call")}, Type: callType},
+		{Names: []*ast.Ident{newID("l0"), newID("l1")}, Type: newID("int32")},
 	}}
 	results := &ast.FieldList{List: []*ast.Field{
 		{Names: []*ast.Ident{newID("packed")}, Type: newID("int64")},
 		{Names: []*ast.Ident{newID("err")}, Type: newID("error")},
 	}}
-	return &ast.FuncDecl{
-		Name: newID("safeInvokeWrap"),
-		Type: &ast.FuncType{Params: params, Results: results},
-		Body: body,
-	}
-}
-
-// emitOneExportFunc emits one standalone dispatch function for a single
-// wasmify export:
-//
-//	func Inv_<svc>_<mt>(m *Module, l0, l1 int32) (int64, error) {
-//	    return safeInvokeWrap(m, func() int64 { return FnN(m, l0, l1) })
-//	}
-//
-// The wasm function is called directly inside a closure that lives in
-// this function's body — so when the linker proves Inv_<svc>_<mt>
-// unreachable, the closure and its FnN reference are dropped with it.
-func (t *translator) emitOneExportFunc(w wexpEntry) ast.Decl {
-	closure := &ast.FuncLit{
-		Type: &ast.FuncType{
-			Params:  &ast.FieldList{},
-			Results: &ast.FieldList{List: []*ast.Field{{Type: newID("int64")}}},
-		},
-		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{
-			&ast.CallExpr{
-				Fun:  t.funcRef(w.funcIndex),
-				Args: []ast.Expr{newID("m"), newID("l0"), newID("l1")},
-			},
-		}}}},
-	}
-	body := &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{
-		&ast.CallExpr{
-			Fun:  newID("safeInvokeWrap"),
-			Args: []ast.Expr{newID("m"), closure},
-		},
-	}}}}
-	params := &ast.FieldList{List: []*ast.Field{
-		{Names: []*ast.Ident{newID("m")}, Type: t.moduleType()},
-		{Names: []*ast.Ident{newID("l0"), newID("l1")}, Type: newID("int32")},
-	}}
-	results := &ast.FieldList{List: []*ast.Field{{Type: newID("int64")}, {Type: newID("error")}}}
 	return &ast.FuncDecl{
 		Name: newID(fmt.Sprintf("Inv_%d_%d", w.svc, w.mt)),
 		Type: &ast.FuncType{Params: params, Results: results},
@@ -2001,13 +2153,15 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 	}
 	// Per-export dispatch is always on whenever BulkExportPrefix
 	// matched any export — emit one standalone Inv_<svc>_<mt> function
-	// per bulk export plus the shared safeInvokeWrap. The Go linker
-	// then drops whichever Inv_* the consumer never calls. The
-	// previously-emitted consolidated InvokeExport switch (which kept
-	// every bulk export alive against DCE) has no remaining users in
-	// the new bridge codegen and has been removed entirely.
+	// per bulk export. Each Inv_* contains its own inlined trap-recovery
+	// (no shared safeInvokeWrap helper, no closure allocation) so the
+	// dispatch path goes straight Inv_<svc>_<mt> → FnN with no
+	// intermediate Go frames. The Go linker drops whichever Inv_* the
+	// consumer never calls. The previously-emitted consolidated
+	// InvokeExport switch (which kept every bulk export alive against
+	// DCE) has no remaining users in the new dispatch codegen and has
+	// been removed entirely.
 	if len(wexports) > 0 {
-		out = append(out, t.emitSafeInvokeWrap())
 		for _, w := range wexports {
 			out = append(out, t.emitOneExportFunc(w))
 		}

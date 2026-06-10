@@ -9,6 +9,14 @@ It is useful when you want to ship a wasm-compiled library (for
 example a large C/C++ codebase built with the WASI SDK) inside a Go
 program without paying the startup and memory cost of a wasm engine.
 
+The generated output is dual-arch: every function ships an `amd64.s`
+and an `arm64.s` body produced by an SSA-based register allocator
+(block-local regalloc + cross-block stack allocation + m-pointer
+caching + slot reuse + peephole + branch-fusion), with a pure-Go
+fallback selected by build constraint on any other GOOS/GOARCH. The asm and pure-Go paths share
+the same `New()` / exported-method API, so callers never see the
+distinction.
+
 ## Install
 
 ```sh
@@ -111,9 +119,9 @@ hot path. The win shows up most in two places:
 - **Per-call overhead** — calls into the module are ordinary Go
   function calls; no host-↔-guest boundary crossing.
 
-A representative measurement against an equivalent
-wazero-driven build of the same wasm module (the GoogleSQL parser,
-~13 MB wasm, 22 SQL benchmark queries; macOS / Apple Silicon;
+A representative measurement against an equivalent wazero-driven
+build of the same wasm module (a ~13 MB SQL parser/analyzer wasm,
+22 SQL benchmark queries; macOS / Apple Silicon;
 `go test -bench=. -benchtime=200ms`):
 
 | Workload | wazero | wasm2go | Speedup |

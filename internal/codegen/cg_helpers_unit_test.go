@@ -1,11 +1,13 @@
 package codegen
 
 import (
+	"bytes"
 	"go/ast"
 	"go/token"
 	"math"
 	"testing"
 
+	"github.com/goccy/wasm2go/internal/testfixture"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
@@ -144,27 +146,6 @@ func TestChunkUsedDeps(t *testing.T) {
 	}
 }
 
-// TestParseEnvInt covers the env-int parser with set/unset/garbage inputs.
-func TestParseEnvInt(t *testing.T) {
-	const key = "WASM2GO_TEST_PARSEENVINT"
-	t.Setenv(key, "")
-	if got := parseEnvInt(key, 7); got != 7 {
-		t.Errorf("parseEnvInt unset = %d want default 7", got)
-	}
-	t.Setenv(key, "123")
-	if got := parseEnvInt(key, 7); got != 123 {
-		t.Errorf("parseEnvInt(123) = %d want 123", got)
-	}
-	t.Setenv(key, "-5")
-	if got := parseEnvInt(key, 7); got != -5 {
-		t.Errorf("parseEnvInt(-5) = %d want -5", got)
-	}
-	t.Setenv(key, "not-a-number")
-	if got := parseEnvInt(key, 7); got != 7 {
-		t.Errorf("parseEnvInt(garbage) = %d want default 7", got)
-	}
-}
-
 // TestImportShortName covers the import-alias resolution used to decide
 // which base-package imports are actually referenced.
 func TestImportShortName(t *testing.T) {
@@ -284,7 +265,7 @@ func TestMangleID(t *testing.T) {
 }
 
 // TestExportMethodName covers the wasm-export → Go-method-name mapping,
-// including the numeric-segment-preserving rule for wasmify exports.
+// including the numeric-segment-preserving rule for bulk exports.
 func TestExportMethodName(t *testing.T) {
 	cases := map[string]string{
 		"add":        "Add",
@@ -363,5 +344,132 @@ func TestFloatInitExpr(t *testing.T) {
 	enan := floatInitExpr(math.NaN(), false)
 	if sel, ok := enan.(*ast.CallExpr).Fun.(*ast.SelectorExpr); !ok || sel.Sel.Name != "Float64frombits" {
 		t.Errorf("NaN f64 init should route through math.Float64frombits")
+	}
+}
+
+// TestIsPlan9AsmSafe pins the per-byte safety predicate that decides
+// whether the asm CALL syntax can embed a Go import path verbatim
+// (mapping "/" → "∕" and "." → "·") or whether we have to fall back
+// to the per-chunk Go-body trampoline because some byte in the path
+// has no plan 9 identifier substitute.
+func TestIsPlan9AsmSafe(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// Single-name stdlib-style paths: safe.
+		{"runtime", true},
+		{"syscall", true},
+		// Nested paths with letters / digits / underscores: safe.
+		{"internal/runtime/atomic", true},
+		{"a/b/c", true},
+		{"foo_bar/baz", true},
+		// Domain-style paths: dots are remapped to U+00B7, still safe.
+		{"github.com/foo/bar", true},
+		{"x.y.z/pkg", true},
+		// Hyphen has no identifier-rune substitute — unsafe. This is
+		// what makes any module path containing a "-" fall back to
+		// the per-chunk Go-body trampoline.
+		{"github.com/example/foo-bar", false},
+		{"a-b", false},
+		// Other punctuation that can legally appear in module paths
+		// but breaks plan 9 asm identifier scanning.
+		{"a+b", false},
+		{"a~b", false},
+		{"foo bar", false},
+		// Empty path: treated as unsafe so the caller skips the
+		// optimization rather than emitting "·" alone.
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isPlan9AsmSafe(c.path); got != c.want {
+			t.Errorf("isPlan9AsmSafe(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
+
+// TestPlanLinknamePackagesPublic exercises the package-public chunk
+// planner against an arbitrary parsed module. The behavioural
+// guarantees we assert are minimal and stable across any future
+// re-balancing of the bin-packing algorithm:
+//
+//   - The plan returns at least one chunk for a non-empty module.
+//   - Every defined function (with a non-empty body) appears in
+//     exactly one chunk's func list.
+//   - chunkBytes <= 0 falls back to a sane default and still
+//     produces a non-empty plan.
+//
+// No internal field of MultiPackagePlan is inspected beyond what's
+// publicly documented — purposefully so a refactor of the planner
+// keeps the test green.
+func TestPlanLinknamePackagesPublic(t *testing.T) {
+	// Use cg_manyfuncs (many small functions) so the planner has
+	// to actually distribute across chunks rather than handing the
+	// single function back as one chunk.
+	bin := testfixture.Wasm(t, "cg_manyfuncs")
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("wasm.Parse: %v", err)
+	}
+
+	plan, err := PlanLinknamePackages(mod, 1024, nil)
+	if err != nil {
+		t.Fatalf("PlanLinknamePackages: %v", err)
+	}
+	if plan == nil || len(plan.Chunks) == 0 {
+		t.Fatalf("PlanLinknamePackages returned empty plan")
+	}
+
+	// Every defined function with a body must land in exactly one
+	// chunk. (The planner may drop dead SCCs when `reachable` is
+	// non-nil; we passed nil so the body-count must match.)
+	seen := map[uint32]int{}
+	for _, ch := range plan.Chunks {
+		for _, fidx := range ch.FuncIdxs {
+			seen[fidx]++
+		}
+	}
+	for i := range mod.Functions {
+		global := mod.NumImportedFuncs + uint32(i)
+		if seen[global] != 1 {
+			t.Errorf("function %d appears %d times in plan, want 1", global, seen[global])
+		}
+	}
+
+	// chunkBytes <= 0 is documented to mean "use default". We
+	// don't assert what the default IS, just that the plan is
+	// still non-empty under it.
+	planDefault, err := PlanLinknamePackages(mod, 0, nil)
+	if err != nil || planDefault == nil || len(planDefault.Chunks) == 0 {
+		t.Errorf("PlanLinknamePackages(chunkBytes=0): err=%v plan=%v", err, planDefault)
+	}
+
+	// `reachable` non-nil exercises the dead-SCC drop path. Mark a
+	// single function as reachable; the planner must include it
+	// (and any SCC it pulls in) but skip the rest.
+	if len(mod.Functions) > 0 {
+		reach := map[uint32]bool{mod.NumImportedFuncs: true}
+		planReach, err := PlanLinknamePackages(mod, 1024, reach)
+		if err != nil {
+			t.Fatalf("PlanLinknamePackages(reachable=…): %v", err)
+		}
+		if planReach == nil {
+			t.Fatal("PlanLinknamePackages(reachable=…) returned nil plan")
+		}
+		// We don't assert exactly which functions land — the SCC
+		// algorithm decides that. The contract we assert is: the
+		// plan stays consistent (every listed function has a
+		// non-empty body and exists in the module).
+		for _, ch := range planReach.Chunks {
+			for _, fidx := range ch.FuncIdxs {
+				if fidx < mod.NumImportedFuncs {
+					t.Errorf("plan included import-index %d (NumImported=%d)", fidx, mod.NumImportedFuncs)
+				}
+				local := fidx - mod.NumImportedFuncs
+				if int(local) >= len(mod.Functions) {
+					t.Errorf("plan referenced local-index %d, max %d", local, len(mod.Functions)-1)
+				}
+			}
+		}
 	}
 }

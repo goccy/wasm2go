@@ -41,7 +41,8 @@ func TestTrapOpsArePreservedThroughDCE(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if _, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"}); err != nil {
+	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
 	generated := buf.String()
@@ -62,7 +63,7 @@ func main() {
 	fmt.Printf("no-trap got=%%d\n", v)
 }
 `, method)
-			out, ok := runGoSnippetExpectPanic(t, generated, main)
+			out, ok := runGoSnippetExpectPanic(t, generated, main, res.Sidecars, res.Files)
 			if ok {
 				t.Fatalf("expected panic for %s, got clean exit:\n%s", tc.export, out)
 			}
@@ -90,24 +91,66 @@ func TestMemGrowDropEmitsOnceNotTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if _, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"}); err != nil {
+	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	src := buf.String()
-	// Count call-site invocations: `memoryGrow(m,` (the host pattern
-	// for an emitted helper call) — distinct from the helper's
-	// definition line `func memoryGrow(m *Module, n int32) int32 {`.
-	got := strings.Count(src, "memoryGrow(m,")
-	if got != 1 {
-		t.Errorf("memoryGrow emitted %d times in generated package; want 1.\nsource:\n%s",
-			got, src)
+	// Asm-always-on ships TWO emit paths in the same
+	// package — the per-arch asm sidecar (a `CALL ·memoryGrow(SB)`
+	// per arch.s file) and the pure-Go fallback (a
+	// `memoryGrow(m, ...)` call in pkg_pure.go) — chosen at build
+	// time by build constraints. The pre-asm-always-on shape was
+	// just one Go call in gen.go.
+	//
+	// The regression this test guards is "side-effecting op whose
+	// result is dropped emits its CALL twice in the SAME emit path".
+	// So we count per path and assert each path emits at most one.
+	goSrc := buf.String()
+	mainGoCalls := strings.Count(goSrc, "memoryGrow(m,")
+	pureGoCalls := 0
+	asmCallsPerArch := map[string]int{}
+	sweep := func(name string, data []byte) {
+		switch {
+		case strings.HasSuffix(name, ".s"):
+			asmCallsPerArch[name] = strings.Count(string(data), "CALL ·memoryGrow(SB)")
+		default:
+			pureGoCalls += strings.Count(string(data), "memoryGrow(m,")
+		}
+	}
+	for name, data := range res.Sidecars {
+		sweep(name, data)
+	}
+	for name, data := range res.Files {
+		sweep(name, data)
+	}
+	if mainGoCalls > 1 {
+		t.Errorf("memoryGrow emitted %d times in gen.go; want at most 1.\nsource:\n%s",
+			mainGoCalls, goSrc)
+	}
+	if pureGoCalls > 1 {
+		t.Errorf("memoryGrow emitted %d times in pkg_pure.go (or other Go file); want at most 1.",
+			pureGoCalls)
+	}
+	for name, n := range asmCallsPerArch {
+		if n > 1 {
+			t.Errorf("memoryGrow emitted %d times in %s; want at most 1.", n, name)
+		}
+	}
+	// Sanity: at least one of the emit paths must carry the call,
+	// otherwise the export's body is silently empty.
+	total := mainGoCalls + pureGoCalls
+	for _, n := range asmCallsPerArch {
+		total += n
+	}
+	if total == 0 {
+		t.Errorf("memoryGrow not emitted in any path — the export body is empty.")
 	}
 }
 
 // runGoSnippetExpectPanic is the panic-tolerant variant of
 // runGoSnippet: it does NOT call t.Fatal on a non-zero exit. Returns
 // (combined output, processExitedSuccessfully).
-func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string) (string, bool) {
+func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string, extraFiles ...map[string][]byte) (string, bool) {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module gentest\n\ngo 1.25.0\n"), 0644); err != nil {
@@ -118,6 +161,17 @@ func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string) (string, b
 	}
 	if err := os.WriteFile(filepath.Join(dir, "pkg", "gen.go"), []byte(generated), 0644); err != nil {
 		t.Fatal(err)
+	}
+	for _, files := range extraFiles {
+		for name, data := range files {
+			p := filepath.Join(dir, "pkg", name)
+			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, data, 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(mainSrc), 0644); err != nil {
 		t.Fatal(err)
