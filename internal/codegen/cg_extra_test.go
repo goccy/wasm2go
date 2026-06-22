@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -57,6 +58,40 @@ func TestNativeWASIDefault(t *testing.T) {
 	}
 	if !strings.Contains(src, "NewWithWASI") {
 		t.Errorf("native wasi output missing NewWithWASI(): %s", src)
+	}
+}
+
+// TestNativeWASIReserve verifies the initial-linear-memory reservation API:
+// the full-body constructor is NewWithWASIReserve(..., reserveBytes int), the
+// memory make() takes a capacity argument so start-up grows are zero-copy
+// reslices, and the plain NewWithWASI delegates with a default headroom.
+func TestNativeWASIReserve(t *testing.T) {
+	mod := readFixture(t, "cg_wasi.wasm")
+	var buf bytes.Buffer
+	if _, err := codegen.Translate(&buf, mod, codegen.Options{
+		Package:          "pkg",
+		OutputImportPath: "gentest/pkg",
+	}); err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	src := buf.String()
+	if !strings.Contains(src, "func NewWithWASIReserve(") {
+		t.Errorf("output missing NewWithWASIReserve(): %s", src)
+	}
+	if !strings.Contains(src, "reserveBytes int") {
+		t.Errorf("NewWithWASIReserve missing reserveBytes param: %s", src)
+	}
+	// 3-arg make: make([]byte, <min>, <cap>) — two commas before the close.
+	if !regexp.MustCompile(`make\(\[\]byte,[^,)]+,[^,)]+\)`).MatchString(src) {
+		t.Errorf("memory make() is not 3-arg (no capacity reservation): %s", src)
+	}
+	// Clamp so cap is never below len (make would panic otherwise).
+	if !strings.Contains(src, "__memcap") {
+		t.Errorf("missing reserveBytes->cap clamp: %s", src)
+	}
+	// NewWithWASI must delegate to NewWithWASIReserve with a default headroom.
+	if !regexp.MustCompile(`return NewWithWASIReserve\(.*,\s*\d+\)`).MatchString(src) {
+		t.Errorf("NewWithWASI does not delegate to NewWithWASIReserve with a default cap: %s", src)
 	}
 }
 

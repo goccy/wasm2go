@@ -589,7 +589,7 @@ func TestEmitControlAMD64(t *testing.T) {
 // emitted unconditionally before the conditional jump, so the loop's
 // back-edge phi target (e.g. `p = mem[p+20]`) clobbered the loop
 // variable even on the exit-edge fall-through. Symptoms surfaced in
-// the googlesql dlmalloc tree-walk inside Fn39263 (free()): the walk
+// a transpiled dlmalloc tree-walk inside Fn39263 (free()): the walk
 // exited with p = 0 instead of the last live tree node, downstream
 // code observed empty smallbins, and subsequent mallocs returned the
 // wrong chunk — eventually loading a ~4 GiB out-of-bounds address
@@ -796,6 +796,10 @@ func TestRegallocLoopCarryPhiArg(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planFunc: %v", err)
 	}
+	// emitFunc seeds this from arch.SupportsLoopCarryCoalesce(); this
+	// test drives computeRegHomes directly, so set it explicitly to
+	// exercise the amd64 (coalesce-enabled) path.
+	plan.supportsCoalesce = true
 	computeRegHomes(b.Func(), plan)
 
 	// Expectation: pPhi and pNext are now COALESCED into the same
@@ -841,6 +845,363 @@ func TestRegallocLoopCarryPhiArg(t *testing.T) {
 	}
 }
 
+// TestRegallocLoopCarryMultiBackEdgeWithCall is a regression for a
+// loop-carry coalesce miscompile that surfaced as a SIGSEGV running a
+// transpiled module: a tight scan loop's counter was pinned to
+// a reserved register across the whole loop, but one of the loop's
+// continue paths routed back through a CALL that clobbers that
+// register (Go ABI0 classes every GP register caller-save), so a later
+// iteration computed a wild memory address from the corrupted counter.
+//
+// The root cause was that the coalesce pass reasoned about each back
+// edge in isolation. A loop header can be the target of MORE THAN ONE
+// back edge (several `continue` sites). naturalLoopBody for one
+// call-free back edge returns a CALL-free sub-body, so the pass pinned
+// the carry to a register and reserved it — only across that sub-body.
+// A sibling back edge routed the SAME carry through a block with a
+// CALL. Because plan.regHome[carry] was set globally, the phi-edge copy
+// on the call-carrying edge was short-circuited (the emit trusts
+// "carry already in its register"), so the carry was never restored
+// after the clobbering call.
+//
+// The fix reasons about the loop as a whole: the body is the UNION of
+// naturalLoopBody over every back edge into the header, and coalescing
+// is allowed only when that whole union is CALL-free. This test builds
+// the smallest shape with two back edges to one header — one call-free,
+// one containing a CALL — both carrying the same phi, and asserts the
+// pass DECLINES to coalesce.
+//
+// SSA shape:
+//
+//	b0 (Plain):  jmp b1
+//	b1 (If):     p_phi = phi(start[b0], p_next[b4], p_next[b5])
+//	             p_next = OpSub32(p_phi, 1)
+//	             cond   = OpLtS32(p_next, 0)
+//	             if cond -> b2 (exit) else -> b3
+//	b3 (If):     cond2  = OpLtS32(p_next, start)
+//	             if cond2 -> b4 (call-free continue) else -> b5 (call continue)
+//	b4 (Plain):  jmp b1                         // back edge 1 (CALL-free)
+//	b5 (Plain):  _ = OpMemGrow(delta)           // CALL barrier
+//	             jmp b1                         // back edge 2 (has CALL)
+//	b2 (Ret):    return p_next
+func TestRegallocLoopCarryMultiBackEdgeWithCall(t *testing.T) {
+	fsig := ssa.FuncSig{Params: []ssa.Type{ssa.TypeI32}, Results: []ssa.Type{ssa.TypeI32}}
+	b := ssa.NewFuncBuilder("loopcarry_multiedge", fsig)
+
+	b0 := b.NewBlock(ssa.BlockPlain)
+	b1 := b.NewBlock(ssa.BlockIf)
+	b2 := b.NewBlock(ssa.BlockRet)
+	b3 := b.NewBlock(ssa.BlockIf)
+	b4 := b.NewBlock(ssa.BlockPlain)
+	b5 := b.NewBlock(ssa.BlockPlain)
+	b.SetEntry(b0)
+
+	// b0 — entry.
+	b.SetCurrent(b0)
+	start := b.Param(0, ssa.TypeI32)
+	b.LinkPlain(b1) // b1.Preds = [b0]
+
+	// b1 — loop header. The phi has three args, one per predecessor
+	// (b0, b4, b5). The back-edge args are patched to p_next once it
+	// exists. Seeding them with `start` keeps every arg non-nil for
+	// the interim (the SSA verifier rejects nil args).
+	b.SetCurrent(b1)
+	pPhi := b.NewValue(ssa.OpPhi, ssa.TypeI32, start, start, start)
+	one := b.Const32(1)
+	pNext := b.NewValue(ssa.OpSub32, ssa.TypeI32, pPhi, one)
+	cond := b.NewValue(ssa.OpLtS32, ssa.TypeBool, pNext, b.Const32(0))
+	b.LinkIf(cond, b2, b3)
+
+	// b3 — split the two continue paths.
+	b.SetCurrent(b3)
+	cond2 := b.NewValue(ssa.OpLtS32, ssa.TypeBool, pNext, start)
+	b.LinkIf(cond2, b4, b5)
+
+	// b4 — call-free back edge.
+	b.SetCurrent(b4)
+	b.LinkPlain(b1) // b1.Preds = [b0, b4]
+
+	// b5 — back edge that crosses a CALL barrier (OpMemGrow emits a
+	// real CALL; its result is intentionally unused).
+	b.SetCurrent(b5)
+	b.NewValue(ssa.OpMemGrow, ssa.TypeI32, b.Const32(1))
+	b.LinkPlain(b1) // b1.Preds = [b0, b4, b5]
+
+	// b2 — exit, returns the carry.
+	b.SetCurrent(b2)
+	b.FinishRet(pNext)
+
+	// Patch the back-edge phi args (preds 1=b4, 2=b5) to the carry.
+	pPhi.Args[1] = pNext
+	pPhi.Args[2] = pNext
+
+	f := b.Func()
+	if err := ssa.Verify(f); err != nil {
+		t.Fatalf("SSA verify: %v", err)
+	}
+
+	// Sanity: there really are two back edges into the same header,
+	// otherwise the test would not exercise the union path.
+	hdrBackEdges := 0
+	for _, e := range ssa.BackEdges(f) {
+		if e[1] == b1 {
+			hdrBackEdges++
+		}
+	}
+	if hdrBackEdges < 2 {
+		t.Fatalf("test precondition: expected >=2 back edges into b1, got %d", hdrBackEdges)
+	}
+
+	plan := &funcPlan{
+		branchFused:  map[ssa.ValueID]bool{},
+		globalInline: map[ssa.ValueID]globalInlineInfo{},
+		regHome:      map[ssa.ValueID]string{},
+		coalescedPhi: map[ssa.ValueID]string{},
+	}
+	runCoalescePass(f, plan)
+
+	// The union loop body {b1,b3,b4,b5} contains a CALL (in b5), so the
+	// carry must NOT be coalesced — it has to stay slot-resident and be
+	// reloaded each iteration, which is what makes it survive the call.
+	if h := plan.regHome[pPhi.ID]; h != "" {
+		t.Errorf("phi carry pPhi (v%d) was given regHome %q across a loop whose body "+
+			"contains a CALL; the carry would be clobbered — coalesce must decline", pPhi.ID, h)
+	}
+	if h := plan.regHome[pNext.ID]; h != "" {
+		t.Errorf("carry pNext (v%d) was given regHome %q across a CALL-containing loop; "+
+			"coalesce must decline", pNext.ID, h)
+	}
+	if r := plan.coalescedPhi[pPhi.ID]; r != "" {
+		t.Errorf("pPhi (v%d) entered in coalescedPhi (%q) despite a CALL in the loop body", pPhi.ID, r)
+	}
+	if len(plan.reservedRegs) != 0 {
+		t.Errorf("reservedRegs should be empty when no coalesce fires, got %v", plan.reservedRegs)
+	}
+}
+
+// TestRegallocLoopCarryEscapesAcrossExitCall is a regression for a
+// loop-carry coalesce miscompile that surfaced as a SIGSEGV in a
+// transpiled module — a tight scan loop (function Fn7078 in the
+// generated output) whose iteration counter was consumed after the
+// loop on a subprocess output-capture path. The loop BODY is call-free
+// — so the existing callFree check is satisfied —
+// but the carry is also live OUT of the loop and consumed AFTER a CALL
+// on the exit path. The coalesce pass reserves a caller-save register
+// (R12/R13/R15) for the carry; Go ABI0 preserves none of those across
+// a CALL, so the callee clobbered the carry before the out-of-loop
+// read, which then fed an address computation and segfaulted the guest.
+//
+// The fix (liveAcrossExternalCall) makes the pass decline a coalesce
+// whenever the carry is live across a CALL outside the loop body. This
+// is the complement of TestRegallocLoopCarryPhiArg, where the carry
+// also escapes the loop but its exit path is call-free and the coalesce
+// is therefore allowed to fire.
+func TestRegallocLoopCarryEscapesAcrossExitCall(t *testing.T) {
+	fsig := ssa.FuncSig{Params: []ssa.Type{ssa.TypeI32}, Results: []ssa.Type{ssa.TypeI32}}
+	b := ssa.NewFuncBuilder("loopcarry_exitcall", fsig)
+
+	b0 := b.NewBlock(ssa.BlockPlain)
+	b1 := b.NewBlock(ssa.BlockIf)
+	b2 := b.NewBlock(ssa.BlockRet)
+	b3 := b.NewBlock(ssa.BlockPlain)
+	b.SetEntry(b0)
+
+	// b0 — entry.
+	b.SetCurrent(b0)
+	start := b.Param(0, ssa.TypeI32)
+	b.LinkPlain(b1) // b1.Preds = [b0]
+
+	// b1 — loop header. Call-free body {b1, b3}. pNext is the sole
+	// user of pPhi (the carry); back-edge arg patched after pNext
+	// exists.
+	b.SetCurrent(b1)
+	pPhi := b.NewValue(ssa.OpPhi, ssa.TypeI32, start, nil)
+	pNext := b.NewValue(ssa.OpSub32, ssa.TypeI32, pPhi, b.Const32(1))
+	pPhi.Args[1] = pNext
+	cond := b.NewValue(ssa.OpLtS32, ssa.TypeBool, pNext, b.Const32(0))
+	b.LinkIf(cond, b2, b3) // then: exit via b2, else: continue via b3
+
+	// b3 — call-free back edge.
+	b.SetCurrent(b3)
+	b.LinkPlain(b1) // b1.Preds = [b0, b3]
+
+	// b2 — exit path. A CALL (OpMemGrow emits a real CALL; result
+	// unused) executes BEFORE the carry is read by the return, so the
+	// carry is live across that call.
+	b.SetCurrent(b2)
+	b.NewValue(ssa.OpMemGrow, ssa.TypeI32, b.Const32(1))
+	b.FinishRet(pNext)
+
+	f := b.Func()
+	if err := ssa.Verify(f); err != nil {
+		t.Fatalf("SSA verify: %v", err)
+	}
+
+	plan := &funcPlan{
+		branchFused:  map[ssa.ValueID]bool{},
+		globalInline: map[ssa.ValueID]globalInlineInfo{},
+		regHome:      map[ssa.ValueID]string{},
+		coalescedPhi: map[ssa.ValueID]string{},
+	}
+	runCoalescePass(f, plan)
+
+	if h := plan.regHome[pPhi.ID]; h != "" {
+		t.Errorf("phi carry pPhi (v%d) was given regHome %q though the carry is live "+
+			"across a CALL on the loop-exit path; the callee would clobber it — "+
+			"coalesce must decline", pPhi.ID, h)
+	}
+	if h := plan.regHome[pNext.ID]; h != "" {
+		t.Errorf("carry pNext (v%d) was given regHome %q though it is consumed after a "+
+			"CALL outside the loop; coalesce must decline", pNext.ID, h)
+	}
+	if r := plan.coalescedPhi[pPhi.ID]; r != "" {
+		t.Errorf("pPhi (v%d) entered in coalescedPhi (%q) despite an exit-path CALL", pPhi.ID, r)
+	}
+	if len(plan.reservedRegs) != 0 {
+		t.Errorf("reservedRegs should be empty when no coalesce fires, got %v", plan.reservedRegs)
+	}
+}
+
+// TestRegallocLoopCarryPhiArgEscapesAcrossCall covers the case where the
+// carry leaves the loop NOT by a direct read but by being consumed as an
+// out-of-loop phi argument, with a CALL on the exit block before that
+// edge. liveAcrossExternalCall must attribute the phi-arg use to the
+// predecessor edge (the carry is live-out of the call-bearing exit block,
+// not live-through the phi's own block) and therefore decline. This is the
+// branch the direct-read escape tests do not exercise.
+func TestRegallocLoopCarryPhiArgEscapesAcrossCall(t *testing.T) {
+	fsig := ssa.FuncSig{Params: []ssa.Type{ssa.TypeI32}, Results: []ssa.Type{ssa.TypeI32}}
+	b := ssa.NewFuncBuilder("loopcarry_phiarg_exitcall", fsig)
+
+	b0 := b.NewBlock(ssa.BlockPlain)
+	b1 := b.NewBlock(ssa.BlockIf)
+	b2 := b.NewBlock(ssa.BlockPlain)
+	b3 := b.NewBlock(ssa.BlockPlain)
+	b4 := b.NewBlock(ssa.BlockRet)
+	b.SetEntry(b0)
+
+	// b0 — entry.
+	b.SetCurrent(b0)
+	start := b.Param(0, ssa.TypeI32)
+	b.LinkPlain(b1) // b1.Preds = [b0]
+
+	// b1 — loop header, call-free body {b1, b3}.
+	b.SetCurrent(b1)
+	pPhi := b.NewValue(ssa.OpPhi, ssa.TypeI32, start, nil)
+	pNext := b.NewValue(ssa.OpSub32, ssa.TypeI32, pPhi, b.Const32(1))
+	pPhi.Args[1] = pNext
+	cond := b.NewValue(ssa.OpLtS32, ssa.TypeBool, pNext, b.Const32(0))
+	b.LinkIf(cond, b2, b3) // then: exit via b2, else: continue via b3
+
+	// b3 — call-free back edge.
+	b.SetCurrent(b3)
+	b.LinkPlain(b1) // b1.Preds = [b0, b3]
+
+	// b2 — exit block with a CALL (OpMemGrow), then flows to b4 where the
+	// carry is consumed by a phi on the b2 -> b4 edge.
+	b.SetCurrent(b2)
+	b.NewValue(ssa.OpMemGrow, ssa.TypeI32, b.Const32(1))
+	b.LinkPlain(b4) // b4.Preds = [b2]
+
+	// b4 — out-of-loop merge: a phi reads the carry from the b2 edge.
+	b.SetCurrent(b4)
+	q := b.NewValue(ssa.OpPhi, ssa.TypeI32, pNext)
+	b.FinishRet(q)
+
+	f := b.Func()
+	if err := ssa.Verify(f); err != nil {
+		t.Fatalf("SSA verify: %v", err)
+	}
+
+	plan := &funcPlan{
+		branchFused:  map[ssa.ValueID]bool{},
+		globalInline: map[ssa.ValueID]globalInlineInfo{},
+		regHome:      map[ssa.ValueID]string{},
+		coalescedPhi: map[ssa.ValueID]string{},
+	}
+	runCoalescePass(f, plan)
+
+	if h := plan.regHome[pPhi.ID]; h != "" {
+		t.Errorf("phi carry pPhi (v%d) was coalesced (regHome %q) though it reaches an "+
+			"out-of-loop phi across a CALL on the exit block; coalesce must decline", pPhi.ID, h)
+	}
+	if h := plan.regHome[pNext.ID]; h != "" {
+		t.Errorf("carry pNext (v%d) was coalesced (regHome %q) though it is consumed by an "+
+			"out-of-loop phi across an exit-block CALL; coalesce must decline", pNext.ID, h)
+	}
+	if len(plan.reservedRegs) != 0 {
+		t.Errorf("reservedRegs should be empty when no coalesce fires, got %v", plan.reservedRegs)
+	}
+}
+
+// TestRegallocLoopCarryMultiHopCallFreeEscape covers the positive
+// counterpart: the carry escapes the loop and travels through MORE THAN
+// ONE out-of-body block before being read, but every block on that path
+// is call-free. The multi-block backward-liveness propagation must still
+// conclude the register is safe and let the coalesce fire — guarding
+// against an over-conservative "any escape is unsafe" regression.
+func TestRegallocLoopCarryMultiHopCallFreeEscape(t *testing.T) {
+	fsig := ssa.FuncSig{Params: []ssa.Type{ssa.TypeI32}, Results: []ssa.Type{ssa.TypeI32}}
+	b := ssa.NewFuncBuilder("loopcarry_multihop_callfree", fsig)
+
+	b0 := b.NewBlock(ssa.BlockPlain)
+	b1 := b.NewBlock(ssa.BlockIf)
+	b2 := b.NewBlock(ssa.BlockPlain)
+	b3 := b.NewBlock(ssa.BlockPlain)
+	b4 := b.NewBlock(ssa.BlockRet)
+	b.SetEntry(b0)
+
+	// b0 — entry.
+	b.SetCurrent(b0)
+	start := b.Param(0, ssa.TypeI32)
+	b.LinkPlain(b1) // b1.Preds = [b0]
+
+	// b1 — loop header, call-free body {b1, b3}.
+	b.SetCurrent(b1)
+	pPhi := b.NewValue(ssa.OpPhi, ssa.TypeI32, start, nil)
+	pNext := b.NewValue(ssa.OpSub32, ssa.TypeI32, pPhi, b.Const32(1))
+	pPhi.Args[1] = pNext
+	cond := b.NewValue(ssa.OpLtS32, ssa.TypeBool, pNext, b.Const32(0))
+	b.LinkIf(cond, b2, b3) // then: exit via b2, else: continue via b3
+
+	// b3 — call-free back edge.
+	b.SetCurrent(b3)
+	b.LinkPlain(b1) // b1.Preds = [b0, b3]
+
+	// b2 — call-free intermediate exit hop.
+	b.SetCurrent(b2)
+	b.LinkPlain(b4) // b4.Preds = [b2]
+
+	// b4 — reads the carry after a two-hop, fully call-free exit path.
+	b.SetCurrent(b4)
+	b.FinishRet(pNext)
+
+	f := b.Func()
+	if err := ssa.Verify(f); err != nil {
+		t.Fatalf("SSA verify: %v", err)
+	}
+
+	plan := &funcPlan{
+		branchFused:  map[ssa.ValueID]bool{},
+		globalInline: map[ssa.ValueID]globalInlineInfo{},
+		regHome:      map[ssa.ValueID]string{},
+		coalescedPhi: map[ssa.ValueID]string{},
+	}
+	runCoalescePass(f, plan)
+
+	if plan.regHome[pPhi.ID] == "" || plan.regHome[pNext.ID] == "" {
+		t.Errorf("carry should coalesce across a fully call-free multi-hop exit path; "+
+			"got pPhi=%q pNext=%q", plan.regHome[pPhi.ID], plan.regHome[pNext.ID])
+	}
+	if plan.regHome[pPhi.ID] != plan.regHome[pNext.ID] {
+		t.Errorf("phi and carry must share the reserved register; got pPhi=%q pNext=%q",
+			plan.regHome[pPhi.ID], plan.regHome[pNext.ID])
+	}
+	if r := plan.coalescedPhi[pPhi.ID]; r == "" {
+		t.Errorf("pPhi (v%d) not entered in coalescedPhi despite a safe coalesce", pPhi.ID)
+	}
+}
+
 // TestRegTrackInvalidatesOnByteWrite is a regression for a
 // follow-on bug from regHome-aware emit: emitCmp32 with a
 // register-home destination emits
@@ -855,10 +1216,10 @@ func TestRegallocLoopCarryPhiArg(t *testing.T) {
 // AX ↔ v_slot mapping established by the initial MOVL alive past
 // the SETEQ, so a subsequent slot read like `MOVL <v_slot>, R9`
 // got rewritten to `MOVL AX, R9` — reading AX whose low byte had
-// been replaced by the SET<cc>'s 0/1 result. Symptoms in the
-// googlesql bundle were a nil-pointer panic during module init
-// (TestDateParamRoundTrip et al), narrowed by bisection to a
-// single function (Fn24994) that emitted exactly this pattern.
+// been replaced by the SET<cc>'s 0/1 result. Symptoms in a
+// transpiled bundle were a nil-pointer panic during module init
+// (surfaced by a downstream consumer's tests), narrowed by bisection
+// to a single function (Fn24994) that emitted exactly this pattern.
 //
 // The fix is in regtrack.go: when the pass sees `SET<cc> AL/BL/
 // CL/DL/...` it now invalidates the byte's 64-bit parent register

@@ -105,7 +105,18 @@ func applyNewRegalloc(f *ssa.Func, plan *funcPlan, a arch) (didStackalloc bool) 
 			useCount[reg]++
 		}
 	}
-	for vid, reg := range r.Home {
+	// Apply the overrides in a deterministic (value-ID sorted) order. The
+	// useCount guard below lets only the FIRST value claim a contended
+	// register (peers are skipped once useCount[reg] > 0), so iterating
+	// r.Home in Go's random map order would make the winner — and therefore
+	// the final regHome assignment and the emitted asm — vary between runs.
+	overrideVids := make([]ssa.ValueID, 0, len(r.Home))
+	for vid := range r.Home {
+		overrideVids = append(overrideVids, vid)
+	}
+	sortValueIDs(overrideVids)
+	for _, vid := range overrideVids {
+		reg := r.Home[vid]
 		baseline, ok := plan.regHome[vid]
 		if !ok {
 			continue

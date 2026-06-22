@@ -3,6 +3,7 @@ package asmgen
 import (
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/goccy/wasm2go/internal/ssa"
 )
@@ -145,6 +146,12 @@ func regHomeEligibleOp(op ssa.Op) bool {
 //
 // Setting WASM2GO_REGALLOC_DUMP=<funcName> dumps the regalloc
 // decisions for the matching function to stderr.
+//
+// Setting WASM2GO_NO_COALESCE disables the cross-block loop-carry
+// coalesce pass (every carry stays slot-resident). Setting
+// WASM2GO_COALESCE_DEBUG=<funcName> (or =1 for all) logs each coalesce
+// decision — header, phi, carry value, reserved register, loop body —
+// to stderr.
 func computeRegHomes(f *ssa.Func, plan *funcPlan) {
 	// The cross-block loop-carry coalesce pass runs FIRST so the
 	// per-block linear scan sees the reserved-register set in
@@ -153,7 +160,20 @@ func computeRegHomes(f *ssa.Func, plan *funcPlan) {
 	// a per-block scan could pick a coalesced register for a
 	// transient block-local value, silently corrupting the loop
 	// carry it was holding for.
-	runCoalescePass(f, plan)
+	// The cross-block loop-carry coalesce pass runs only on arches with
+	// a validated coalesce emit path (plan.supportsCoalesce, set from
+	// arch.SupportsLoopCarryCoalesce()). It is STRICTLY stronger than
+	// block-local regalloc: it keeps a carry in a reserved register
+	// across the whole loop with no per-iteration slot reload, so every
+	// per-op emit that can produce the carry must honour plan.regHome on
+	// the write side. An arch that only partially honours regHome (e.g.
+	// arm64 today) must NOT run this pass or the carry is silently
+	// clobbered. WASM2GO_NO_COALESCE additionally disables it everywhere
+	// — a fast kill-switch for confirming or ruling out the pass when a
+	// codegen miscompile is suspected.
+	if plan.supportsCoalesce && os.Getenv("WASM2GO_NO_COALESCE") == "" {
+		runCoalescePass(f, plan)
+	}
 	for _, blk := range f.Blocks {
 		assignBlockRegHomes(blk, f, plan)
 	}
@@ -492,19 +512,29 @@ func assignBlockRegHomes(blk *ssa.Block, f *ssa.Func, plan *funcPlan) {
 		*pool = append(*pool, r)
 	}
 
+	// expireFrom releases every register in active whose lifetime ended
+	// before idx, returning it to free. The expired registers are collected
+	// and sorted before they are pushed back: ranging a Go map yields a
+	// random order, and since popFree hands out registers from the front of
+	// the pool, a map-order push would make the next value's register choice
+	// depend on map iteration — i.e. non-deterministic asm output across runs.
+	// Sorting keeps the freed-register order stable so codegen is reproducible.
+	expireFrom := func(active map[string]activeEntry, free *[]string, idx int) {
+		var expired []string
+		for r, e := range active {
+			if e.lastIdx < idx {
+				expired = append(expired, r)
+			}
+		}
+		sort.Strings(expired)
+		for _, r := range expired {
+			delete(active, r)
+			pushFree(free, r)
+		}
+	}
 	expireAt := func(idx int) {
-		for r, e := range gpActive {
-			if e.lastIdx < idx {
-				delete(gpActive, r)
-				pushFree(&gpFree, r)
-			}
-		}
-		for r, e := range sseActive {
-			if e.lastIdx < idx {
-				delete(sseActive, r)
-				pushFree(&sseFree, r)
-			}
-		}
+		expireFrom(gpActive, &gpFree, idx)
+		expireFrom(sseActive, &sseFree, idx)
 	}
 
 	for i, v := range blk.Values {

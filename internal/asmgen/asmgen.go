@@ -150,6 +150,15 @@ type arch interface {
 	// operandSrcFloat would emit
 	// amd64-only X<n> register names that arm64's assembler rejects.
 	SupportsRegHome() bool
+	// SupportsLoopCarryCoalesce reports whether the arch has a
+	// validated emit path for the cross-block loop-carry coalesce pass
+	// (a carry kept in a reserved register across an entire loop body,
+	// with the back-edge phi copy short-circuited). This is STRICTLY
+	// stronger than SupportsRegHome: amd64 opts in; arm64 does not yet
+	// (its per-op emits honour plan.regHome only partially, so a carry
+	// pinned across a loop is not reliably maintained). When false the
+	// coalesce pass is skipped and carries stay slot-resident.
+	SupportsLoopCarryCoalesce() bool
 	// RegHomeEligibleOp narrows the regalloc eligibility list per
 	// arch. The default for amd64 is "every op whose producer can
 	// write directly to a register" — that's the existing
@@ -262,6 +271,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	plan.gpRegPool = a.GPRegPool()
 	plan.sseRegPool = a.SSERegPool()
 	plan.regHomeEligibleOpFn = a.RegHomeEligibleOp
+	plan.supportsCoalesce = a.SupportsLoopCarryCoalesce()
 
 	// m-pointer caching: stage `m` into a function-wide register
 	// so every memop / global access / call-site arg-staging that
@@ -1692,7 +1702,8 @@ func emitPhiEdgeCopies(b *strings.Builder, pred, succ *ssa.Block, predIdx int, p
 			// body sees the right initial value. Delegated to the
 			// arch — only amd64 implements coalescing today; arm64
 			// never sees plan.coalescedPhi populated because the
-			// coalesce pass runs behind arch.SupportsRegHome.
+			// coalesce pass runs behind arch.SupportsLoopCarryCoalesce
+			// (false on arm64).
 			if err := a.EmitPhiCopyValueToReg(b, src, reg, phi.Type, plan, frame); err != nil {
 				return err
 			}
@@ -1885,18 +1896,25 @@ type funcPlan struct {
 	// op-by-op as each per-op emit learns to honour plan.regHome
 	// on the write side.
 	regHomeEligibleOpFn func(ssa.Op) bool
-	offsets             map[ssa.ValueID]int
-	hoist               map[ssa.ValueID]bool
-	phiTemp             map[ssa.ValueID]int
-	phisOf              map[ssa.BlockID][]*ssa.Value
-	hasPhi              map[ssa.BlockID]bool
-	staged              map[ssa.BlockID]bool
-	hasCall             bool
-	frameSize           int
-	calleeArea          int // bytes reserved at low SP for callee-arg staging
-	helperPfx           string
-	helperRefs          map[ssa.ValueID]string
-	directs             map[ssa.ValueID]*directCall
+	// supportsCoalesce gates the cross-block loop-carry coalesce pass.
+	// It is SEPARATE from block-local regalloc (SupportsRegHome): an
+	// arch can honour plan.regHome for in-block values yet not have a
+	// validated emit path for a carry held in a reserved register
+	// across a whole loop. emitFunc seeds it from
+	// arch.SupportsLoopCarryCoalesce(); only amd64 opts in today.
+	supportsCoalesce bool
+	offsets          map[ssa.ValueID]int
+	hoist            map[ssa.ValueID]bool
+	phiTemp          map[ssa.ValueID]int
+	phisOf           map[ssa.BlockID][]*ssa.Value
+	hasPhi           map[ssa.BlockID]bool
+	staged           map[ssa.BlockID]bool
+	hasCall          bool
+	frameSize        int
+	calleeArea       int // bytes reserved at low SP for callee-arg staging
+	helperPfx        string
+	helperRefs       map[ssa.ValueID]string
+	directs          map[ssa.ValueID]*directCall
 	// hasMem records whether the function performs at least one
 	// load / store / mem-size / mem-grow op. Drives the
 	// `mCacheCandidate` decision — only memory-touching functions
@@ -2271,7 +2289,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 	// since their lifetimes can overlap arbitrarily with each
 	// other under branching control flow. This is the main lever
 	// against the per-value slot growth that pushed Fn18113 in
-	// the googlesql bundle to a 680 KB frame; with reuse, only
+	// a large transpiled bundle to a 680 KB frame; with reuse, only
 	// the cross-block residual + the per-block peak survive.
 	off := maxCallee
 	usage := emit.ComputeValueUsage(f)

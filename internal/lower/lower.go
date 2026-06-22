@@ -220,6 +220,22 @@ const (
 	ctrlIf
 )
 
+// branchArity returns the number of operand-stack values a branch (br /
+// br_if / br_table) targeting this frame carries. For a block or if the
+// branch goes to the post-block, so the arity is the result arity. For a
+// loop the branch goes to the HEADER, which re-consumes the loop's
+// PARAMETERS, so the arity is the loop's param count — currently always 0
+// because decodeBlockResults only accepts inline value-type blocktypes
+// (which have no params). When function-type-index blocktypes (which can
+// carry params) are supported, store the loop's param count on the frame
+// and return it here.
+func (f *ctrlFrame) branchArity() int {
+	if f.kind == ctrlLoop {
+		return 0
+	}
+	return f.resultCount
+}
+
 // incomingEdge captures the locals + result-stack snapshot of a
 // predecessor at the moment it branches into a target block.
 type incomingEdge struct {
@@ -718,7 +734,7 @@ func (ls *lowerState) handleBr(r *wasm.InstrReader) error {
 		return fmt.Errorf("br %d: out of range (ctrl depth %d)", depth, len(ls.ctrl))
 	}
 	frame := ls.ctrl[len(ls.ctrl)-1-int(depth)]
-	ls.recordIncoming(frame.target, frame.resultCount)
+	ls.recordIncoming(frame.target, frame.branchArity())
 	// For loops, `br 0` is a back-edge into the header phi. Each
 	// header local phi gets one more incoming arg = current value.
 	if frame.kind == ctrlLoop {
@@ -752,7 +768,7 @@ func (ls *lowerState) handleBrIf(r *wasm.InstrReader) error {
 	cont := ls.b.NewBlock(ssa.BlockPlain)
 
 	// Snapshot for the taken edge.
-	ls.recordIncoming(frame.target, frame.resultCount)
+	ls.recordIncoming(frame.target, frame.branchArity())
 	if frame.kind == ctrlLoop {
 		ls.appendLoopBackArgs(frame.target)
 	}
@@ -811,16 +827,22 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 	}
 
 	// Validate that every target (cases + default) carries the same
-	// result arity. The wasm spec requires this — without the check a
+	// BRANCH arity. The wasm spec requires this — without the check a
 	// malformed input would silently miscompile by passing the wrong
-	// stack-top values through one of the branches.
+	// stack-top values through one of the branches. NOTE: the branch
+	// arity is per-frame-kind — for a loop it is the loop's PARAMETER
+	// arity (a branch jumps to the header, which re-consumes params),
+	// NOT its result arity. Using resultCount here would wrongly reject
+	// valid br_tables that mix a `loop (result T)` (result arity 1, param
+	// arity 0) with a `block` of result arity 0 — exactly what a
+	// computed-goto dispatch (e.g. a bytecode interpreter loop) emits.
 	defFrame := ls.ctrl[len(ls.ctrl)-1-int(defaultDepth)]
-	wantArity := defFrame.resultCount
+	wantArity := defFrame.branchArity()
 	for i, d := range cases {
 		f := ls.ctrl[len(ls.ctrl)-1-int(d)]
-		if f.resultCount != wantArity {
-			return fmt.Errorf("%w: br_table target %d has arity %d, default has %d",
-				ErrSSAUnsupported, i, f.resultCount, wantArity)
+		if f.branchArity() != wantArity {
+			return fmt.Errorf("%w: br_table target %d has branch arity %d, default has %d",
+				ErrSSAUnsupported, i, f.branchArity(), wantArity)
 		}
 	}
 
@@ -829,7 +851,7 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 	for i, depth := range cases {
 		frame := ls.ctrl[len(ls.ctrl)-1-int(depth)]
 		cont := ls.b.NewBlock(ssa.BlockPlain)
-		ls.recordIncoming(frame.target, frame.resultCount)
+		ls.recordIncoming(frame.target, frame.branchArity())
 		if frame.kind == ctrlLoop {
 			ls.appendLoopBackArgs(frame.target)
 		}
@@ -844,7 +866,7 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 
 	// Default branch — the final block is sealed as Plain → default.
 	frame := ls.ctrl[len(ls.ctrl)-1-int(defaultDepth)]
-	ls.recordIncoming(frame.target, frame.resultCount)
+	ls.recordIncoming(frame.target, frame.branchArity())
 	if frame.kind == ctrlLoop {
 		ls.appendLoopBackArgs(frame.target)
 	}
