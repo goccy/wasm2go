@@ -1176,11 +1176,33 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		}
 	}
 
+	// When the module has linear memory and we're emitting the WASI-wrapper
+	// family, the full-body constructor becomes
+	// NewWithWASIReserve(..., reserveBytes int): callers pre-size the initial
+	// linear-memory slice capacity so the first memory.grow calls extend len
+	// into spare capacity (a zero-copy reslice) instead of reallocating and
+	// copying the whole linear memory. NewWithWASI delegates with a default
+	// headroom. See the memory-init block below for why this matters.
+	emitReserve := emitNativeWASIWrapper && len(t.mod.Memories) > 0
+	if emitReserve {
+		primaryName = "NewWithWASIReserve"
+	}
+
 	var params []*ast.Field
 	for _, mod := range t.importedModules {
 		params = append(params, &ast.Field{
 			Names: []*ast.Ident{newID(MangleModuleField(mod))},
 			Type:  t.importIfaceTypeRef(mod),
+		})
+	}
+	// modParams is the import-only signature (no reserveBytes), used to build
+	// the thin NewWithWASI / New delegators. The primary gets reserveBytes
+	// appended when emitReserve.
+	modParams := params
+	if emitReserve {
+		params = append(append([]*ast.Field{}, params...), &ast.Field{
+			Names: []*ast.Ident{newID("reserveBytes")},
+			Type:  newID("int"),
 		})
 	}
 
@@ -1199,6 +1221,11 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		Lhs: []ast.Expr{newID("m")},
 		Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: composite}},
 	})
+
+	// defaultReserveCap is the initial linear-memory slice capacity that
+	// NewWithWASI (and the non-WASI New) pass when emitReserve: minBytes plus
+	// a 25% headroom, so typical start-up grows are zero-copy reslices.
+	var defaultReserveCap uint64
 
 	// Memory init.
 	if len(t.mod.Memories) > 0 {
@@ -1220,6 +1247,32 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 				}},
 			}}
 		}
+		minBytesU := mem.Limits.Min * 65536
+		defaultReserveCap = minBytesU + minBytesU/4
+		// Choose the make() capacity arg. NewWithWASIReserve uses the caller's
+		// reserveBytes clamped up to minBytes (make panics if cap < len);
+		// every other constructor uses the default headroom literal.
+		var capArg ast.Expr
+		if emitReserve {
+			body.List = append(body.List,
+				&ast.AssignStmt{
+					Tok: token.DEFINE,
+					Lhs: []ast.Expr{newID("__memcap")},
+					Rhs: []ast.Expr{newID("reserveBytes")},
+				},
+				&ast.IfStmt{
+					Cond: &ast.BinaryExpr{X: newID("__memcap"), Op: token.LSS, Y: uintLit(minBytesU)},
+					Body: &ast.BlockStmt{List: []ast.Stmt{&ast.AssignStmt{
+						Tok: token.ASSIGN,
+						Lhs: []ast.Expr{newID("__memcap")},
+						Rhs: []ast.Expr{uintLit(minBytesU)},
+					}}},
+				},
+			)
+			capArg = newID("__memcap")
+		} else {
+			capArg = uintLit(defaultReserveCap)
+		}
 		body.List = append(body.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
 			Lhs: []ast.Expr{t.fieldRef("memory")},
@@ -1227,7 +1280,8 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 				Fun: newID("make"),
 				Args: []ast.Expr{
 					&ast.ArrayType{Elt: newID("byte")},
-					uintLit(mem.Limits.Min * 65536),
+					uintLit(minBytesU),
+					capArg,
 				},
 			}},
 		})
@@ -1611,7 +1665,39 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		},
 		Body: wrapperBody,
 	}
-	return []ast.Decl{primary, wrapper}
+	if !emitReserve {
+		return []ast.Decl{primary, wrapper}
+	}
+
+	// NewWithWASI: thin delegator to NewWithWASIReserve with the default
+	// headroom capacity, so existing callers keep the same signature while
+	// still benefiting from the zero-copy-grow reservation.
+	var reserveFwdArgs []ast.Expr
+	for _, mod := range t.importedModules {
+		reserveFwdArgs = append(reserveFwdArgs, newID(MangleModuleField(mod)))
+	}
+	reserveFwdArgs = append(reserveFwdArgs, uintLit(defaultReserveCap))
+	newWithWASI := &ast.FuncDecl{
+		Doc: &ast.CommentGroup{List: []*ast.Comment{{
+			Text: "// NewWithWASI constructs a *Module with a custom\n" +
+				"// wasi_snapshot_preview1 implementation and a default initial\n" +
+				"// linear-memory reservation. Use NewWithWASIReserve to pre-size\n" +
+				"// the reservation (e.g. to cover an interpreter's whole boot and\n" +
+				"// avoid reallocating/copying linear memory on the first grow).",
+		}}},
+		Name: newID("NewWithWASI"),
+		Type: &ast.FuncType{
+			Params:  &ast.FieldList{List: modParams},
+			Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}},
+		},
+		Body: &ast.BlockStmt{List: []ast.Stmt{
+			&ast.ReturnStmt{Results: []ast.Expr{&ast.CallExpr{
+				Fun:  newID("NewWithWASIReserve"),
+				Args: reserveFwdArgs,
+			}}},
+		}},
+	}
+	return []ast.Decl{primary, newWithWASI, wrapper}
 }
 
 // emitDefinedFunctions emits one Go function per defined wasm function.

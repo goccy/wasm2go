@@ -1,6 +1,10 @@
 package asmgen
 
 import (
+	"fmt"
+	"os"
+	"sort"
+
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -106,15 +110,94 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 
 	freePool := append([]string{}, coalesceReservedPool...)
 
-	// Process each back edge as one potential loop.
+	// Pre-compute P-is-used-only-by-V check inputs (function-wide,
+	// independent of any one loop). For each candidate (P, V) we must
+	// verify that V is the SOLE user of P in the entire function —
+	// otherwise the coalesce would destroy P's value the moment V
+	// writes to the shared register, and any later read of P (e.g.
+	// another phi's back-edge arg, a second consumer in some other
+	// block) would silently observe V's bytes instead.
+	phiUsers := map[ssa.ValueID]int{}
+	phiUsedAsControl := map[ssa.ValueID]bool{}
+	// useBlocks[id] is the set of blocks that reference value id (as an
+	// arg or as a block control). Used to verify a coalesce candidate's
+	// live range is confined to the loop body: a carry value used in a
+	// block OUTSIDE the loop escapes it, and the exit path may cross a
+	// CALL that clobbers the reserved (caller-save) register — Go ABI0
+	// preserves none of R12/R13/R15. The loop-body callFree check only
+	// proves the body is call-free, not the exit paths.
+	useBlocks := map[ssa.ValueID]map[ssa.BlockID]bool{}
+	noteUse := func(id ssa.ValueID, bid ssa.BlockID) {
+		s := useBlocks[id]
+		if s == nil {
+			s = map[ssa.BlockID]bool{}
+			useBlocks[id] = s
+		}
+		s[bid] = true
+	}
+	for _, blk2 := range f.Blocks {
+		for _, v2 := range blk2.Values {
+			for _, a := range v2.Args {
+				if a == nil {
+					continue
+				}
+				if act := resolveCopy(a); act != nil {
+					phiUsers[act.ID]++
+					noteUse(act.ID, blk2.ID)
+				}
+			}
+		}
+		if blk2.Control != nil {
+			if act := resolveCopy(blk2.Control); act != nil {
+				phiUsedAsControl[act.ID] = true
+				noteUse(act.ID, blk2.ID)
+			}
+		}
+	}
+
+	// Group back edges by header. A loop header can be the target of
+	// MORE THAN ONE back edge (e.g. a loop body with several `continue`
+	// sites all branching back to the test). Each back edge's
+	// naturalLoopBody only covers the blocks on paths to THAT edge's
+	// source; the real loop — and the live range of any loop-carry phi
+	// at the header — is the UNION over all back edges to the header.
+	// We must therefore reason about that union, not each edge in
+	// isolation: a carry assigned a register is only safe if the WHOLE
+	// loop is CALL-free, and the register must be reserved across the
+	// whole loop. Processing edges independently (as an earlier version
+	// did) could pick a call-free sub-body, pin the carry to a register
+	// globally, and then have a sibling back edge route the same carry
+	// through a CALL that clobbers it — corrupting the loop counter.
+	hdrOrder := make([]ssa.BlockID, 0, len(backEdges))
+	hdrByID := map[ssa.BlockID]*ssa.Block{}
+	srcsByHdr := map[ssa.BlockID][]*ssa.Block{}
 	for _, e := range backEdges {
 		src, hdr := e[0], e[1]
-		body := naturalLoopBody(f, src, hdr)
+		if _, seen := srcsByHdr[hdr.ID]; !seen {
+			hdrOrder = append(hdrOrder, hdr.ID)
+			hdrByID[hdr.ID] = hdr
+		}
+		srcsByHdr[hdr.ID] = append(srcsByHdr[hdr.ID], src)
+	}
+
+	// Process each loop (one per header) as a unit.
+	for _, hid := range hdrOrder {
+		hdr := hdrByID[hid]
+		srcs := srcsByHdr[hid]
+
+		// Union loop body over every back edge into this header.
+		body := map[ssa.BlockID]bool{}
+		for _, src := range srcs {
+			for bid := range naturalLoopBody(f, src, hdr) {
+				body[bid] = true
+			}
+		}
 		if len(body) == 0 {
 			continue
 		}
-		// Loop body must be CALL-free for the carry to survive in
-		// a register across iterations.
+		// The ENTIRE loop must be CALL-free for the carry to survive
+		// in a register across every path through the body. Go ABI0's
+		// caller-save rule clobbers the carry across any CALL.
 		callFree := true
 		for bid := range body {
 			if blockHasCall[bid] {
@@ -125,65 +208,59 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		if !callFree {
 			continue
 		}
-		// Find the index of src in hdr.Preds — that is the
-		// back-edge arg position in hdr's phis.
-		backIdx := -1
+		// Back-edge arg positions: indices in hdr.Preds whose pred is
+		// one of this loop's back-edge sources.
+		backIdxs := make([]int, 0, len(srcs))
 		for i, p := range hdr.Preds {
-			if p.Block == src {
-				backIdx = i
-				break
+			for _, src := range srcs {
+				if p.Block == src {
+					backIdxs = append(backIdxs, i)
+					break
+				}
 			}
 		}
-		if backIdx < 0 {
+		if len(backIdxs) == 0 {
 			continue
 		}
 
-		// Pre-compute P-is-used-only-by-V check inputs. For each
-		// candidate (P, V) we must verify that V is the SOLE user
-		// of P in the entire function — otherwise the coalesce
-		// would destroy P's value the moment V writes to the
-		// shared register, and any later read of P (e.g. another
-		// phi's back-edge arg, a second consumer in some other
-		// block) would silently observe V's bytes instead.
-		// Building a function-wide use map once per candidate
-		// loop avoids quadratic cost across loops.
-		phiUsers := map[ssa.ValueID]int{}
-		phiUsedAsControl := map[ssa.ValueID]bool{}
-		for _, blk2 := range f.Blocks {
-			for _, v2 := range blk2.Values {
-				for _, a := range v2.Args {
-					if a == nil {
-						continue
-					}
-					if act := resolveCopy(a); act != nil {
-						phiUsers[act.ID]++
-					}
-				}
-			}
-			if blk2.Control != nil {
-				if act := resolveCopy(blk2.Control); act != nil {
-					phiUsedAsControl[act.ID] = true
-				}
-			}
-		}
-
-		// Walk hdr's phis. Each phi whose backIdx-th arg is a
-		// regHome-eligible value defined inside the loop body is a
-		// candidate. Multiple phis can coalesce per loop — each
-		// gets its own register from freePool.
+		// Walk hdr's phis. A phi is a coalesce candidate when ALL of
+		// its back-edge args resolve to the SAME value V — i.e. one
+		// loop carry flowing back from every continue site. (When the
+		// back edges carry different values we conservatively decline:
+		// a single reserved register can hold only one of them, and
+		// the emit-side short-circuit assumes the carry is already
+		// resident.) V must be regHome-eligible and defined inside the
+		// loop body. Each candidate gets its own register from freePool.
 		for _, phi := range hdr.Values {
 			if phi.Op != ssa.OpPhi {
 				continue
 			}
-			if backIdx >= len(phi.Args) {
-				continue
+			// All back-edge args must resolve to the same V.
+			var actual *ssa.Value
+			sameV := true
+			for _, bi := range backIdxs {
+				if bi >= len(phi.Args) {
+					sameV = false
+					break
+				}
+				arg := phi.Args[bi]
+				if arg == nil {
+					sameV = false
+					break
+				}
+				act := resolveCopy(arg)
+				if act == nil {
+					sameV = false
+					break
+				}
+				if actual == nil {
+					actual = act
+				} else if act != actual {
+					sameV = false
+					break
+				}
 			}
-			arg := phi.Args[backIdx]
-			if arg == nil {
-				continue
-			}
-			actual := resolveCopy(arg)
-			if actual == nil {
+			if !sameV || actual == nil {
 				continue
 			}
 			if !planRegHomeEligibleOp(plan, actual.Op) {
@@ -223,6 +300,28 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			if phiUsers[phi.ID] != 1 || phiUsedAsControl[phi.ID] {
 				continue
 			}
+			// SAFETY: the reserved register is one of R12/R13/R15,
+			// none of which Go's ABI0 preserves across a CALL. The
+			// loop body is proven call-free above, so the carry is
+			// safe WHILE it stays in the loop. But a carry that is
+			// also live OUT of the loop — used in a block not in
+			// `body` — travels an exit path we have not proven
+			// call-free. If any CALL lies on that path with the carry
+			// still live across it (a very common shape: a scan-loop
+			// counter consumed after the loop, past a helper call),
+			// the callee clobbers the register and the out-of-loop
+			// reader sees garbage; the corrupted value then feeds the
+			// next iteration's address computation and the guest
+			// segfaults. We must keep such a carry slot-resident
+			// (decline the coalesce). A carry that escapes only onto
+			// call-free exit paths (e.g. returned directly) is still
+			// safe, so this checks for a CALL crossing, not mere
+			// escape. Both P and V are checked; P's sole user is V
+			// (verified above) so in practice only V can escape.
+			if liveAcrossExternalCall(f, phi, body, blockHasCall, useBlocks) ||
+				liveAcrossExternalCall(f, actual, body, blockHasCall, useBlocks) {
+				continue
+			}
 			// Pick a register; bail if the dedicated pool is
 			// drained (nested loops with many carries — rare).
 			if len(freePool) == 0 {
@@ -231,6 +330,15 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			reg := freePool[0]
 			freePool = freePool[1:]
 
+			if dbg := os.Getenv("WASM2GO_COALESCE_DEBUG"); dbg != "" && (dbg == "1" || dbg == f.Name) {
+				bodyIDs := make([]int, 0, len(body))
+				for bid := range body {
+					bodyIDs = append(bodyIDs, int(bid))
+				}
+				sort.Ints(bodyIDs)
+				fmt.Fprintf(os.Stderr, "[coalesce] fn=%s hdr=b%d phi=v%d carry=v%d reg=%s body=%v\n",
+					f.Name, hdr.ID, phi.ID, actual.ID, reg, bodyIDs)
+			}
 			plan.regHome[phi.ID] = reg
 			plan.regHome[actual.ID] = reg
 			plan.coalescedPhi[phi.ID] = reg
@@ -247,6 +355,123 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			}
 		}
 	}
+}
+
+// liveAcrossExternalCall reports whether value v is live across a CALL
+// in some block OUTSIDE the loop body. The loop body is call-free by
+// construction, so a reserved caller-save register (R12/R13/R15) only
+// survives while the carry stays in the body; this is the check that a
+// carry escaping onto an exit path does not have its register clobbered
+// by an intervening call.
+//
+// It runs a single-value backward liveness over the out-of-body region:
+// in-body blocks are treated as absorbing (the carry's def lives there
+// and the body is safe), so propagation flows from out-of-body uses up
+// to — and stops at — the loop body. A block outside the body that has
+// a CALL and into which v is live on entry means v crosses that call.
+//
+// Phi-arg uses are attributed to the predecessor edge (the value is
+// live-out of the predecessor, not live-through the phi's own block),
+// so a carry handed to an out-of-loop phi via a call-free exit copy is
+// correctly judged safe.
+//
+// useBlocks (the function-wide arg/control use index) is used only as a
+// fast reject: a value with no out-of-body uses cannot be live across an
+// out-of-body call, so the dataflow is skipped entirely.
+func liveAcrossExternalCall(
+	f *ssa.Func,
+	v *ssa.Value,
+	body map[ssa.BlockID]bool,
+	blockHasCall map[ssa.BlockID]bool,
+	useBlocks map[ssa.ValueID]map[ssa.BlockID]bool,
+) bool {
+	// Fast reject: no use outside the body at all.
+	anyExternal := false
+	for bid := range useBlocks[v.ID] {
+		if !body[bid] {
+			anyExternal = true
+			break
+		}
+	}
+	if !anyExternal {
+		return false
+	}
+
+	usedIn := map[ssa.BlockID]bool{}
+	liveIn := map[ssa.BlockID]bool{}
+	liveOut := map[ssa.BlockID]bool{}
+	for _, blk := range f.Blocks {
+		if body[blk.ID] {
+			continue
+		}
+		for _, v2 := range blk.Values {
+			if v2.Op == ssa.OpPhi {
+				// A phi arg is consumed on the edge from the matching
+				// predecessor, so it makes v live-out of that pred, not
+				// live-through this phi's block.
+				for k, a := range v2.Args {
+					if a == nil {
+						continue
+					}
+					if resolveCopy(a) == v && k < len(blk.Preds) {
+						if pb := blk.Preds[k].Block; pb != nil {
+							liveOut[pb.ID] = true
+						}
+					}
+				}
+				continue
+			}
+			for _, a := range v2.Args {
+				if a == nil {
+					continue
+				}
+				if resolveCopy(a) == v {
+					usedIn[blk.ID] = true
+				}
+			}
+		}
+		if blk.Control != nil && resolveCopy(blk.Control) == v {
+			usedIn[blk.ID] = true
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, blk := range f.Blocks {
+			if body[blk.ID] {
+				continue
+			}
+			lo := liveOut[blk.ID]
+			for _, e := range blk.Succs {
+				s := e.Block
+				if s == nil || body[s.ID] {
+					continue
+				}
+				if liveIn[s.ID] {
+					lo = true
+				}
+			}
+			li := usedIn[blk.ID] || lo
+			if lo != liveOut[blk.ID] {
+				liveOut[blk.ID] = lo
+				changed = true
+			}
+			if li != liveIn[blk.ID] {
+				liveIn[blk.ID] = li
+				changed = true
+			}
+		}
+	}
+
+	for _, blk := range f.Blocks {
+		if body[blk.ID] {
+			continue
+		}
+		if blockHasCall[blk.ID] && liveIn[blk.ID] {
+			return true
+		}
+	}
+	return false
 }
 
 // naturalLoopBody returns the set of blocks (by ID) that form

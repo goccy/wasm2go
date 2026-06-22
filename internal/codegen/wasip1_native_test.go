@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -76,6 +77,7 @@ func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 		env:        []string{"FOO=bar", "BAZ=qux"},
 		monoStart:  time.Now(),
 		preopenDir: dir,
+		fsys:       osFS{root: dir},
 	}
 	m := &Module{memory: make([]byte, 1<<16)}
 	return w, m
@@ -99,6 +101,289 @@ func makeIovec(m *Module, iovOff, bufOff, bufLen int32) {
 }
 
 // ─── Tier 1: file primitives ────────────────────────────────────────
+
+// TestWasi_FSAccessHook verifies the host-controlled filesystem policy:
+// the hook is consulted on open/create/unlink with the guest path and a
+// write flag, and a false return surfaces as EACCES without touching the
+// disk. This is the control point an embedding wires its whitelist into.
+func TestWasi_FSAccessHook(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "secret"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ok"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+
+	type call struct {
+		path  string
+		write bool
+	}
+	var seen []call
+	w.SetFSAccessHook(func(path string, write bool) bool {
+		seen = append(seen, call{path, write})
+		if path == "secret" {
+			return false // deny reads/writes of "secret"
+		}
+		if write && path == "readonly" {
+			return false // deny writes to "readonly", allow reads
+		}
+		return true
+	})
+
+	rightsRead := int64(1 << 1)
+	rightsWrite := int64(1 << 6)
+
+	// Reading "secret" is denied.
+	off, ln := putPath(m, 128, "secret")
+	if rc := w.Path_open(m, 3, 0, off, ln, 0, rightsRead, 0, 0, 200); rc != _wasiEACCES {
+		t.Fatalf("open secret(read): want EACCES(%d), got %d", _wasiEACCES, rc)
+	}
+	// Reading "ok" is allowed.
+	off, ln = putPath(m, 128, "ok")
+	if rc := w.Path_open(m, 3, 0, off, ln, 0, rightsRead, 0, 0, 200); rc != _wasiESUCCESS {
+		t.Fatalf("open ok(read): want SUCCESS, got %d", rc)
+	}
+	// Writing "readonly" (with O_CREAT) is denied; the file must not appear.
+	off, ln = putPath(m, 128, "readonly")
+	if rc := w.Path_open(m, 3, 0, off, ln, 0x1, rightsWrite, 0, 0, 200); rc != _wasiEACCES {
+		t.Fatalf("open readonly(write): want EACCES, got %d", rc)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "readonly")); !os.IsNotExist(err) {
+		t.Fatalf("denied write must not create the file; stat err=%v", err)
+	}
+	// The write flag must be reported correctly.
+	if len(seen) < 3 || seen[2].path != "readonly" || !seen[2].write {
+		t.Fatalf("hook write-flag not propagated: %+v", seen)
+	}
+	// Clearing the hook restores unrestricted access.
+	w.SetFSAccessHook(nil)
+	off, ln = putPath(m, 128, "secret")
+	if rc := w.Path_open(m, 3, 0, off, ln, 0, rightsRead, 0, 0, 200); rc != _wasiESUCCESS {
+		t.Fatalf("open secret after clearing hook: want SUCCESS, got %d", rc)
+	}
+}
+
+// TestWasi_NetAccessHook verifies the network policy hook gates the
+// accept/recv/send surface before any socket work happens (a denied op
+// returns EACCES; an allowed op falls through to the normal ENOTSOCK for
+// these fd-less test calls, proving the hook let it pass).
+func TestWasi_NetAccessHook(t *testing.T) {
+	_, m := newTestStubs(t, t.TempDir())
+	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+
+	denied := map[string]bool{"send": true}
+	w.SetNetAccessHook(func(op string) bool { return !denied[op] })
+
+	// send is denied → EACCES.
+	if rc := w.Sock_send(m, 4, 0, 0, 0, 200); rc != _wasiEACCES {
+		t.Fatalf("Sock_send denied: want EACCES, got %d", rc)
+	}
+	// recv is allowed by the hook → passes the hook, then ENOTSOCK (fd 4
+	// has no conn).
+	if rc := w.Sock_recv(m, 4, 0, 0, 0, 200, 204); rc != _wasiENOTSOCK {
+		t.Fatalf("Sock_recv allowed: want ENOTSOCK, got %d", rc)
+	}
+	if rc := w.Sock_accept(m, 4, 0, 200); rc != _wasiENOTSOCK {
+		t.Fatalf("Sock_accept allowed: want ENOTSOCK, got %d", rc)
+	}
+	// Clearing the hook makes send fall through to ENOTSOCK too.
+	w.SetNetAccessHook(nil)
+	if rc := w.Sock_send(m, 4, 0, 0, 0, 200); rc != _wasiENOTSOCK {
+		t.Fatalf("Sock_send after clearing hook: want ENOTSOCK, got %d", rc)
+	}
+}
+
+// TestWasi_SockSocketConnect verifies the outbound-socket host imports:
+// Sock_socket allocates a socket fd, Sock_connect dials a live listener and
+// attaches the conn (so Sock_send/Sock_recv work), the dial whitelist denies
+// blocked destinations with EACCES, and a refused destination maps to
+// ECONNREFUSED.
+func TestWasi_SockSocketConnect(t *testing.T) {
+	// Echo server on loopback.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("listener close: %v", err)
+		}
+	}()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() {
+					if cerr := c.Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+						t.Errorf("conn close: %v", cerr)
+					}
+				}()
+				if _, cerr := io.Copy(c, c); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+					t.Errorf("echo copy: %v", cerr)
+				}
+			}(c)
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	// 127.0.0.1 in sockaddr_in.sin_addr.s_addr (network order) read as a
+	// little-endian uint32 is 0x0100007f.
+	const loopbackBE = int32(0x0100007f)
+
+	_, m := newTestStubs(t, t.TempDir())
+	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+
+	// Sock_socket allocates a fresh fd (family is validated by the bridge
+	// shim, not here).
+	fd := w.Sock_socket(m, 2 /*AF_INET*/, 1 /*SOCK_STREAM*/)
+	if fd < 4 {
+		t.Fatalf("Sock_socket returned bad fd %d", fd)
+	}
+
+	// Whitelist denies first.
+	var dialed []string
+	w.SetDialHook(func(network, ip string, p int) bool {
+		dialed = append(dialed, fmt.Sprintf("%s/%s:%d", network, ip, p))
+		return false
+	})
+	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != -_wasiEACCES {
+		t.Fatalf("denied connect: want -EACCES, got %d", rc)
+	}
+	if len(dialed) != 1 || dialed[0] != fmt.Sprintf("tcp/127.0.0.1:%d", port) {
+		t.Fatalf("dial hook saw %v, want tcp/127.0.0.1:%d", dialed, port)
+	}
+
+	// Allow → connect succeeds and attaches the conn.
+	w.SetDialHook(func(network, ip string, p int) bool { return true })
+	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != _wasiESUCCESS {
+		t.Fatalf("allowed connect: want SUCCESS, got %d", rc)
+	}
+	if op := w.fdTable[fd]; op == nil || op.conn == nil {
+		t.Fatalf("connect did not attach a conn to fd %d", fd)
+	}
+
+	// Connecting an already-connected socket → EISCONN.
+	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != -_wasiEISCONN {
+		t.Fatalf("re-connect: want -EISCONN, got %d", rc)
+	}
+
+	// Connect on a non-socket fd → ENOTSOCK.
+	if rc := w.Sock_connect(m, 999, loopbackBE, int32(port)); rc != -_wasiENOTSOCK {
+		t.Fatalf("connect bad fd: want -ENOTSOCK, got %d", rc)
+	}
+
+	// Refused destination (closed listener) → ECONNREFUSED.
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := ln2.Addr().(*net.TCPAddr).Port
+	if err := ln2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fd2 := w.Sock_socket(m, 2, 1)
+	if rc := w.Sock_connect(m, fd2, loopbackBE, int32(rp)); rc != -_wasiECONNREFUSED {
+		t.Fatalf("refused connect: want -ECONNREFUSED, got %d", rc)
+	}
+}
+
+// TestWasi_SockGetaddrinfo covers the host name-resolution import: numeric
+// IPv4 passes through without a lookup, an empty host yields INADDR_ANY, and
+// the resolve whitelist hook denies a blocked host with EACCES.
+func TestWasi_SockGetaddrinfo(t *testing.T) {
+	_, m := newTestStubs(t, t.TempDir())
+	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+
+	// Numeric IPv4 → fast path, 4-byte network-order result at outPtr.
+	off, ln := putPath(m, 128, "203.0.113.7")
+	if rc := w.Sock_getaddrinfo(m, off, ln, 200); rc != _wasiESUCCESS {
+		t.Fatalf("getaddrinfo numeric rc=%d", rc)
+	}
+	if got := []byte{m.memory[200], m.memory[201], m.memory[202], m.memory[203]}; got[0] != 203 || got[1] != 0 || got[2] != 113 || got[3] != 7 {
+		t.Fatalf("numeric IP bytes = %v, want [203 0 113 7]", got)
+	}
+
+	// Empty host → INADDR_ANY (0).
+	if rc := w.Sock_getaddrinfo(m, 0, 0, 300); rc != _wasiESUCCESS {
+		t.Fatalf("getaddrinfo empty rc=%d", rc)
+	}
+	if n := readU32(m.memory, 300); n != 0 {
+		t.Fatalf("empty host should be INADDR_ANY(0), got %#x", n)
+	}
+
+	// Resolve whitelist denies → EACCES, hook sees the host.
+	var seen []string
+	w.SetResolveHook(func(host string) bool { seen = append(seen, host); return host != "blocked.invalid" })
+	off, ln = putPath(m, 128, "blocked.invalid")
+	if rc := w.Sock_getaddrinfo(m, off, ln, 200); rc != -_wasiEACCES {
+		t.Fatalf("denied resolve: want -EACCES, got %d", rc)
+	}
+	if len(seen) != 1 || seen[0] != "blocked.invalid" {
+		t.Fatalf("resolve hook saw %v", seen)
+	}
+	// An allowed numeric host still bypasses the resolver (and the hook
+	// is consulted but permits it).
+	off, ln = putPath(m, 128, "198.51.100.9")
+	if rc := w.Sock_getaddrinfo(m, off, ln, 200); rc != _wasiESUCCESS {
+		t.Fatalf("allowed numeric resolve rc=%d", rc)
+	}
+}
+
+// TestWasi_SetEnvArgs covers the sandbox env/argv overrides: SetEnv / SetArgs
+// replace what the guest sees via environ_*/args_*, so an embedding does not
+// leak the host process environment.
+func TestWasi_SetEnvArgs(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+
+	w.SetEnv([]string{"APP_MODE=sandbox", "X=1"})
+	if rc := w.Environ_sizes_get(m, 0, 4); rc != _wasiESUCCESS {
+		t.Fatalf("Environ_sizes_get rc=%d", rc)
+	}
+	if n := readU32(m.memory, 0); n != 2 {
+		t.Fatalf("envc after SetEnv = %d, want 2", n)
+	}
+	if rc := w.Environ_get(m, 16, 64); rc != _wasiESUCCESS {
+		t.Fatalf("Environ_get rc=%d", rc)
+	}
+	// First env string pointer is at 16; it should read "APP_MODE=sandbox".
+	p := int(readU32(m.memory, 16))
+	got := readCString(m.memory, p)
+	if got != "APP_MODE=sandbox" {
+		t.Fatalf("env[0] = %q, want APP_MODE=sandbox", got)
+	}
+
+	// Empty env → zero count (no host leak).
+	w.SetEnv(nil)
+	if rc := w.Environ_sizes_get(m, 0, 4); rc != _wasiESUCCESS {
+		t.Fatalf("Environ_sizes_get(empty) rc=%d", rc)
+	}
+	if n := readU32(m.memory, 0); n != 0 {
+		t.Fatalf("envc after SetEnv(nil) = %d, want 0", n)
+	}
+
+	// SetArgs override.
+	w.SetArgs([]string{"prog", "--flag"})
+	if rc := w.Args_sizes_get(m, 0, 4); rc != _wasiESUCCESS {
+		t.Fatalf("Args_sizes_get rc=%d", rc)
+	}
+	if n := readU32(m.memory, 0); n != 2 {
+		t.Fatalf("argc after SetArgs = %d, want 2", n)
+	}
+}
+
+// readCString reads a NUL-terminated string from mem starting at off.
+func readCString(mem []byte, off int) string {
+	end := off
+	for end < len(mem) && mem[end] != 0 {
+		end++
+	}
+	return string(mem[off:end])
+}
 
 func TestWasi_PathCreateAndUnlink(t *testing.T) {
 	dir := t.TempDir()
@@ -297,7 +582,7 @@ func TestWasi_PathFilestatSetTimes(t *testing.T) {
 	}
 	pathOff, pathLen := putPath(m, 0, "f")
 	// Set MTIME explicitly to 1000000000 ns past epoch.
-	rc := w.Path_filestat_set_times(m, 3, 0x1, pathOff, pathLen, 0, 0, 0, 1000000000, 0x4)
+	rc := w.Path_filestat_set_times(m, 3, 0x1, pathOff, pathLen, 0, 1000000000, 0x4)
 	if rc != _wasiESUCCESS {
 		t.Fatalf("Path_filestat_set_times rc=%d", rc)
 	}
@@ -340,6 +625,14 @@ func TestWasi_FdReaddir(t *testing.T) {
 		namelen := readU32(m.memory, off+16)
 		if namelen == 0 {
 			break
+		}
+		// d_ino (8-byte field at off+8) MUST be non-zero: wasi-libc's
+		// readdir() treats a dirent whose d_ino==0 as a deleted/empty
+		// slot and silently skips it. A zero here caused a guest runtime
+		// to fail to load standard-library modules (the whole Lib/ tree
+		// looked empty). Regression guard for that fix.
+		if ino := readU64(m.memory, off+8); ino == 0 {
+			t.Fatalf("Fd_readdir dirent at off=%d has d_ino==0 (wasi-libc would skip it)", off)
 		}
 		nameStart := off + 24
 		if nameStart+int(namelen) > int(bufOff)+int(used) {
@@ -430,7 +723,7 @@ func TestWasi_FdFilestatSetTimes(t *testing.T) {
 	}
 	fd := int32(readU32(m.memory, 128))
 	// MTIME ns = 5e9 (5 seconds past epoch).
-	if rc := w.Fd_filestat_set_times(m, fd, 0, 0, 1, 0xb9aca00, 0x4); rc != _wasiESUCCESS {
+	if rc := w.Fd_filestat_set_times(m, fd, 0, 0x10b9aca00, 0x4); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_filestat_set_times rc=%d", rc)
 	}
 }
@@ -593,6 +886,48 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 	}
 	if rc := w.Sock_shutdown(m, newFD, 0x3); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_shutdown rc=%d", rc)
+	}
+}
+
+// TestWasi_SockRecvRoflagsLayout is a regression for ro_flags clobbering
+// ro_datalen. __wasi_roflags_t is a 16-bit value and wasi-libc's recv() packs
+// it only 2 bytes before the 4-byte ro_datalen. Writing 4 bytes for ro_flags
+// (as the code once did) overwrote the low half of ro_datalen, so recv()
+// reported 0 bytes received even though data had been read into the buffer —
+// which broke every outbound socket read. This drives Sock_recv with that
+// tight layout and asserts the returned length survives.
+func TestWasi_SockRecvRoflagsLayout(t *testing.T) {
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() {
+		if err := c1.Close(); err != nil {
+			t.Errorf("c1 close: %v", err)
+		}
+		if err := c2.Close(); err != nil {
+			t.Errorf("c2 close: %v", err)
+		}
+	})
+	_, m := newTestStubs(t, t.TempDir())
+	w := &WasiStubs{fdTable: map[int32]*wasiOpen{5: {conn: c2}}, nextFD: 6}
+
+	go func() {
+		if _, werr := c1.Write([]byte("HELLO")); werr != nil {
+			t.Errorf("pipe write: %v", werr)
+		}
+	}()
+
+	makeIovec(m, 200, 300, 16)
+	// wasi-libc layout: ro_flags (u16) at 404, ro_datalen (u32) at 406.
+	const roFlagsPtr, roDataLenPtr = int32(404), int32(406)
+	binary.LittleEndian.PutUint32(m.memory[roDataLenPtr:], 0xdeadbeef) // poison
+
+	if rc := w.Sock_recv(m, 5, 200, 1, 0, roDataLenPtr, roFlagsPtr); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_recv rc=%d", rc)
+	}
+	if n := readU32(m.memory, int(roDataLenPtr)); n != 5 {
+		t.Fatalf("ro_datalen=%d, want 5 (ro_flags 4-byte write clobbered it)", n)
+	}
+	if got := string(m.memory[300:305]); got != "HELLO" {
+		t.Fatalf("payload=%q, want HELLO", got)
 	}
 }
 
@@ -839,20 +1174,114 @@ func TestWasi_FdWriteBadDst(t *testing.T) {
 	}
 }
 
+// TestMemFS exercises the in-memory FS backend directly (write/read/stat/
+// mkdir/readdir/remove + cross-instance isolation), independent of the WASI
+// host or any guest runtime.
+func TestMemFS(t *testing.T) {
+	a := NewMemFS()
+
+	if err := a.WriteFile("dir/hello.txt", []byte("hi"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	f, err := a.OpenFile("dir/hello.txt", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, rerr := f.Read(buf)
+	if rerr != nil {
+		t.Fatalf("Read: %v", rerr)
+	}
+	if string(buf[:n]) != "hi" {
+		t.Fatalf("read = %q, want hi", buf[:n])
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := a.Stat("dir/hello.txt")
+	if err != nil || st.Size() != 2 || st.IsDir() {
+		t.Fatalf("Stat = %+v err=%v", st, err)
+	}
+	if di, err := a.Stat("dir"); err != nil || !di.IsDir() {
+		t.Fatalf("dir Stat = %+v err=%v", di, err)
+	}
+
+	// ReadDir of the parent.
+	df, err := a.OpenFile("dir", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ents, err := df.ReadDir(-1)
+	if cerr := df.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	if err != nil || len(ents) != 1 || ents[0].Name() != "hello.txt" {
+		t.Fatalf("ReadDir = %v err=%v", ents, err)
+	}
+
+	// Missing file → fs.ErrNotExist (maps to ENOENT).
+	if _, err := a.OpenFile("nope", os.O_RDONLY, 0); !os.IsNotExist(err) {
+		t.Fatalf("missing open err = %v, want IsNotExist", err)
+	}
+
+	// Overwrite + truncate semantics.
+	if err := a.WriteFile("dir/hello.txt", []byte("longer-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wf, err := a.OpenFile("dir/hello.txt", os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wf.Write([]byte("xy")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st2, serr := a.Stat("dir/hello.txt")
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if st2.Size() != 2 {
+		t.Fatalf("after trunc+write size=%d want 2", st2.Size())
+	}
+
+	// Remove.
+	if err := a.Remove("dir/hello.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Stat("dir/hello.txt"); !os.IsNotExist(err) {
+		t.Fatalf("after remove stat err=%v want IsNotExist", err)
+	}
+
+	// Isolation: a second MemFS is independent.
+	b := NewMemFS()
+	if err := a.WriteFile("shared.txt", []byte("in-a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Stat("shared.txt"); !os.IsNotExist(err) {
+		t.Fatalf("MemFS b saw a's file (not isolated): err=%v", err)
+	}
+}
+
 func TestWasi_PreopenJoinDefault(t *testing.T) {
-	w := &WasiStubs{
-		fdTable:    map[int32]*wasiOpen{},
-		nextFD:     4,
-		preopenDir: "",
+	// The default os backend maps guest paths under "/".
+	if got := (osFS{root: ""}).join("foo"); got != "/foo" {
+		t.Fatalf("empty-root join=%q, want /foo", got)
 	}
-	w.SetPreopenDir("")
-	got := w.joinPreopen("foo")
-	if got != "/foo" {
-		t.Fatalf("default preopen join=%q", got)
+	if got := (osFS{root: "/"}).join("foo"); got != "/foo" {
+		t.Fatalf("slash-root join=%q, want /foo", got)
 	}
+	if got := (osFS{root: "/tmp/abc"}).join("foo"); got != "/tmp/abc/foo" {
+		t.Fatalf("scoped join=%q, want /tmp/abc/foo", got)
+	}
+	// SetPreopenDir installs an osFS rooted at the directory.
+	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
 	w.SetPreopenDir("/tmp/abc")
-	if g := w.joinPreopen("foo"); g != "/tmp/abc/foo" {
-		t.Fatalf("scoped preopen join=%q", g)
+	of, ok := w.fsys.(osFS)
+	if !ok || of.root != "/tmp/abc" {
+		t.Fatalf("SetPreopenDir did not install osFS{root:/tmp/abc}: %#v", w.fsys)
 	}
 }
 
@@ -1189,7 +1618,7 @@ func TestWasi_PathFilestatSetTimesUnfollow(t *testing.T) {
 	}
 	pathOff, pathLen := putPath(m, 0, "lnk")
 	// flags=0 means no follow; fst_flags=0x4 means set MTIME.
-	rc := w.Path_filestat_set_times(m, 3, 0, pathOff, pathLen, 0, 0, 0, 1000000000, 0x4)
+	rc := w.Path_filestat_set_times(m, 3, 0, pathOff, pathLen, 0, 1000000000, 0x4)
 	if rc != _wasiESUCCESS {
 		// Some platforms don't support setting symlink times; either
 		// way the call must not crash and the return must be a wasi

@@ -179,6 +179,11 @@ func emitFusedCmpBranchAMD64(b *strings.Builder, cond *ssa.Value, plan *funcPlan
 
 func (archAMD64) SupportsRegHome() bool { return true }
 
+// SupportsLoopCarryCoalesce — amd64 has the validated coalesce emit
+// path (EmitPhiCopyValueToReg on the entry edge, back-edge copy
+// short-circuited).
+func (archAMD64) SupportsLoopCarryCoalesce() bool { return true }
+
 // RegHomeEligibleOp — amd64 honours regHome on every op the
 // package-level regHomeEligibleOp filter accepts.
 func (archAMD64) RegHomeEligibleOp(op ssa.Op) bool {

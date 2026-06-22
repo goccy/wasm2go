@@ -31,3 +31,55 @@ func TestLowerSwitch3(t *testing.T) {
 		t.Fatalf("lower switch3: %v", err)
 	}
 }
+
+// TestLowerBrTableLoopArity is a regression test for a br_table whose
+// targets have different RESULT arities but the same BRANCH (label) arity —
+// the pattern a computed-goto dispatch emits and which previously
+// made lowering fail with "br_table target N has arity 0, default has 1".
+//
+// The hand-built function is:
+//
+//	(func (param i32) (result i32)
+//	  (block            ;; $b: result [] -> branch arity 0
+//	    (loop (result i32)   ;; $l: result [i32] -> resultCount 1, but branch
+//	                         ;;     arity 0 (a branch jumps to the header,
+//	                         ;;     which consumes the loop's 0 params)
+//	      local.get 0
+//	      br_table 1 0   ;; case0 -> $b (block), default -> $l (loop)
+//	    )
+//	  )
+//	  i32.const 0)
+//
+// The br_table mixes a block target (result arity 0) with a loop default
+// (result arity 1). Before the fix the validator compared result arities
+// (0 != 1) and rejected it; with branchArity() both are 0, so it lowers.
+func TestLowerBrTableLoopArity(t *testing.T) {
+	bin := []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+		// type section: (param i32) (result i32)
+		0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+		// function section: func0 : type0
+		0x03, 0x02, 0x01, 0x00,
+		// export section: "f" = func0
+		0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+		// code section
+		0x0a, 0x12, 0x01, // section id, size, func count
+		0x10,       // body size
+		0x00,       // 0 local decls
+		0x02, 0x40, // block (empty blocktype)
+		0x03, 0x7f, // loop (result i32)
+		0x20, 0x00, // local.get 0
+		0x0e, 0x01, 0x01, 0x00, // br_table [1] default 0
+		0x0b,       // end loop
+		0x0b,       // end block
+		0x41, 0x00, // i32.const 0
+		0x0b, // end func
+	}
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := LowerFunction(mod, 0, "f"); err != nil {
+		t.Fatalf("lower br_table-loop-arity func: %v", err)
+	}
+}

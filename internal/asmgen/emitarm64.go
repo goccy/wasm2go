@@ -82,15 +82,23 @@ func emitCondBranchARM64(b *strings.Builder, branchOp, branchOpInv, thenLabel, e
 	fmt.Fprintf(b, "\tJMP %s\n", elseLabel)
 }
 
-// SupportsRegHome — arm64 opts in for block-local regalloc,
-// loop-carry coalesce, frame compaction, and cross-block stackalloc
-// in a follow-up that teaches every per-op emit to honour
-// plan.regHome on the write side (operandSrc32/64ARM64 already
-// honours it on the read side). For now keep it false so the
-// emit-side contract isn't broken, but expose GPRegPool / SSERegPool
-// already so the regalloc machinery sees the arm64 register set and
-// the gate flip becomes a one-line change.
+// SupportsRegHome — arm64 opts in for BLOCK-LOCAL regalloc: its
+// operandSrc32/64ARM64 honour plan.regHome on the read side and the
+// per-op emits that RegHomeEligibleOp accepts honour it on the write
+// side. Block-local regalloc keeps every value within one block, so a
+// carry is reloaded from its slot each iteration — always correct.
 func (archARM64) SupportsRegHome() bool { return true }
+
+// SupportsLoopCarryCoalesce — arm64 does NOT opt into the cross-block
+// loop-carry coalesce pass. That pass keeps a carry ONLY in a reserved
+// register across the whole loop body (no per-iteration slot reload),
+// which requires every per-op emit that can produce the carry to honour
+// plan.regHome on the write side. arm64 honours regHome for only a
+// subset of ops today, so a coalesced carry is not reliably maintained
+// across the loop — leaving it false keeps carries slot-resident, which
+// is correct. Flip to true only once the arm64 emit path is validated
+// end-to-end (and a matching reserved-register pool is chosen).
+func (archARM64) SupportsLoopCarryCoalesce() bool { return false }
 
 // RegHomeEligibleOp — arm64 honours regHome on the set of ops
 // where both the consumer-side reader (operandSrc{32,64}ARM64 /
@@ -275,12 +283,13 @@ func (a archARM64) EmitPhiCopySlot(b *strings.Builder, srcOff, dstOff int, t ssa
 	return a.emitPhiCopyARM64(b, fmt.Sprintf("%d(RSP)", srcOff), dstOff, t)
 }
 
-// EmitPhiCopyValueToReg is the arm64 stub for the loop-carry coalesce
-// path. arm64 reports SupportsRegHome() == false, so the regalloc
-// never assigns a regHome to ANY value on arm64 — which means
-// plan.coalescedPhi is also empty by construction. Reaching this
-// method on arm64 would be an internal-consistency failure, hence
-// the error.
+// EmitPhiCopyValueToReg is the arm64 entry-edge copy for the loop-carry
+// coalesce path. arm64 reports SupportsLoopCarryCoalesce() == false, so
+// the coalesce pass never runs and plan.coalescedPhi stays empty — this
+// method is therefore not reached in practice. The implementation is
+// kept (and correct) so that flipping the gate to true is the only
+// change required once the arm64 write-side regHome contract is
+// validated end-to-end.
 func (archARM64) EmitPhiCopyValueToReg(b *strings.Builder, src *ssa.Value, dstReg string, t ssa.Type, plan *funcPlan, frame argFrame) error {
 	// Same shape as archAMD64: read the source operand and MOV it
 	// straight into the coalesced register. arm64's `MOVW src, Rn`
