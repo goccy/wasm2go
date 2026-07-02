@@ -460,6 +460,12 @@ func assignBlockRegHomes(blk *ssa.Block, f *ssa.Func, plan *funcPlan) {
 		if _, ok := plan.globalInline[v.ID]; ok {
 			continue
 		}
+		// Inline-emitted helpers clobber only the fixed scratches
+		// (AX/CX/DX/X0/X1), never a pool register — a lifetime that
+		// crosses one is register-safe.
+		if helperCallIsInline(plan, v) {
+			continue
+		}
 		hasCallAt[i] = true
 	}
 

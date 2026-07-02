@@ -100,6 +100,13 @@ func (archARM64) SupportsRegHome() bool { return true }
 // end-to-end (and a matching reserved-register pool is chosen).
 func (archARM64) SupportsLoopCarryCoalesce() bool { return false }
 
+// HelperIsInline — conservative false for every helper until the
+// arm64 inline-helper set is audited for scratch-register discipline
+// the way inlineHelperNamesAMD64 was. Returning false keeps every
+// OpHelperCall a CALL barrier on arm64, exactly the pre-existing
+// behaviour.
+func (archARM64) HelperIsInline(string) bool { return false }
+
 // RegHomeEligibleOp — arm64 honours regHome on the set of ops
 // where both the consumer-side reader (operandSrc{32,64}ARM64 /
 // operandSrcFloat) and the producer-side write path have been

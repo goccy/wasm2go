@@ -46,10 +46,34 @@ import (
 //     body; plan.coalescedPhi[P.ID] = R so emitPhiCopyValue can
 //     short-circuit the back-edge copy.
 //
-// This is intentionally conservative — single-phi natural loops
-// with no CALL inside, only — to keep the failure mode bounded
-// while we land it. Nested loops, multi-phi coalescing, and
-// CALL-spanning carries are follow-ups.
+// Two coalesce modes exist, tried in this order per phi:
+//
+//   - SHARED mode (the original): P and its unique back-edge carry V
+//     share one register. Requires V to be P's SOLE user function-wide
+//     (V's write to the shared register destroys P) and V's producer
+//     to honour regHome on the write side. The back-edge copy is
+//     elided entirely.
+//
+//   - OWN-REGISTER mode: P gets a register of its own; V is left
+//     wherever it lives (slot or block-local register). Every edge
+//     copy into P becomes a single `MOV <src>, R` (emitted by
+//     EmitPhiCopyValueToReg on entry AND back edges), and every
+//     in-loop read of P comes out of R via operandSrc. This fires for
+//     the multi-user carries the shared mode must decline — the
+//     varint-decoder shape (pos/shift/acc phis each read by several
+//     ops per iteration) that pprof flagged as the dominant asm-vs-
+//     pure-Go gap on the window suite. The per-iteration win is the
+//     removal of the store-to-load forwarding chain through the
+//     phi's stack slot.
+//
+// Both modes require the loop body to be CALL-free (Go ABI0
+// preserves none of R12/R13/R15 across a CALL) and the carry to not
+// be live across a CALL on any loop-exit path. The reserved register
+// is excluded from the per-block linear scan in every loop-body
+// block AND every out-of-body block the phi (or shared carry) is
+// still live in — an exit-path reader consumes the register long
+// after the body, so a block-local value grabbing R12 there would
+// clobber the carry before its last read.
 
 // coalesceReservedPool is the dedicated register set the
 // coalesce pass draws from when reserving a register across a
@@ -94,6 +118,14 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			if _, ok := plan.globalInline[v.ID]; ok {
 				continue
 			}
+			// Inline-emitted helpers (extends, rotates, div/rem,
+			// float arith) produce no returning CALL and never touch
+			// a reserved register — without this subtraction a
+			// single i64.extend in a varint-decode loop marks the
+			// whole loop call-unsafe and blocks every coalesce in it.
+			if helperCallIsInline(plan, v) {
+				continue
+			}
 			blockHasCall[blk.ID] = true
 			break
 		}
@@ -118,6 +150,14 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 	// another phi's back-edge arg, a second consumer in some other
 	// block) would silently observe V's bytes instead.
 	phiUsers := map[ssa.ValueID]int{}
+	// soleUser[id] remembers the (last-seen) value that reads id; it is
+	// THE user exactly when phiUsers[id] == 1. The shared coalesce must
+	// verify that P's single user IS the back-edge carry V — a phi whose
+	// one user is anything else (the "lag" pattern: prev = phi(init, cur)
+	// with prev consumed by an exit read or an unrelated op) reads P
+	// AFTER V has already overwritten the shared register within the
+	// iteration, observing the new value instead of the phi.
+	soleUser := map[ssa.ValueID]*ssa.Value{}
 	phiUsedAsControl := map[ssa.ValueID]bool{}
 	// useBlocks[id] is the set of blocks that reference value id (as an
 	// arg or as a block control). Used to verify a coalesce candidate's
@@ -135,6 +175,17 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		}
 		s[bid] = true
 	}
+	// phiArgOf[id] is the set of OpPhi values (by ID) that reference
+	// value id in their args, EXCLUDING self-references (a phi whose
+	// back-edge arg is the phi itself is a harmless no-op copy — the
+	// emit-side regHome-equality check skips it). Used by the
+	// own-register mode's parallel-copy hazard guard: edge copies for
+	// one edge are emitted in phi order with no staging for register
+	// destinations, so a phi P that is read by a SIBLING phi of the
+	// same header (or that reads a sibling) must stay slot-resident —
+	// the slot path is protected by the staged-phi machinery, the
+	// register path is not.
+	phiArgOf := map[ssa.ValueID]map[ssa.ValueID]bool{}
 	for _, blk2 := range f.Blocks {
 		for _, v2 := range blk2.Values {
 			for _, a := range v2.Args {
@@ -143,7 +194,16 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 				}
 				if act := resolveCopy(a); act != nil {
 					phiUsers[act.ID]++
+					soleUser[act.ID] = v2
 					noteUse(act.ID, blk2.ID)
+					if v2.Op == ssa.OpPhi && act.ID != v2.ID {
+						s := phiArgOf[act.ID]
+						if s == nil {
+							s = map[ssa.ValueID]bool{}
+							phiArgOf[act.ID] = s
+						}
+						s[v2.ID] = true
+					}
 				}
 			}
 		}
@@ -179,6 +239,39 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		}
 		srcsByHdr[hdr.ID] = append(srcsByHdr[hdr.ID], src)
 	}
+
+	// reserve marks reg as untouchable by the block-local linear scan
+	// in every listed block.
+	reserve := func(reg string, blocks map[ssa.BlockID]bool) {
+		if plan.reservedRegs == nil {
+			plan.reservedRegs = map[ssa.BlockID]map[string]bool{}
+		}
+		for bid := range blocks {
+			m := plan.reservedRegs[bid]
+			if m == nil {
+				m = map[string]bool{}
+				plan.reservedRegs[bid] = m
+			}
+			m[reg] = true
+		}
+	}
+
+	// Own-register candidates are collected across every loop first
+	// and assigned AFTER all shared coalesces, ranked by in-loop use
+	// count: the shared mode saves strictly more per iteration (the
+	// back-edge copy disappears entirely), so it keeps first claim on
+	// the 3-register pool, and when the leftovers cannot cover every
+	// own-register candidate the hottest phis win.
+	type ownRegCand struct {
+		phi  *ssa.Value
+		body map[ssa.BlockID]bool
+		// liveOutside is the out-of-body live-in region (exit blocks
+		// that still read the phi after the loop). Pre-checked to be
+		// CALL-free; the register must stay reserved there.
+		liveOutside map[ssa.BlockID]bool
+		uses        int
+	}
+	var ownCands []ownRegCand
 
 	// Process each loop (one per header) as a unit.
 	for _, hid := range hdrOrder {
@@ -223,55 +316,23 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			continue
 		}
 
-		// Walk hdr's phis. A phi is a coalesce candidate when ALL of
-		// its back-edge args resolve to the SAME value V — i.e. one
-		// loop carry flowing back from every continue site. (When the
-		// back edges carry different values we conservatively decline:
-		// a single reserved register can hold only one of them, and
-		// the emit-side short-circuit assumes the carry is already
-		// resident.) V must be regHome-eligible and defined inside the
-		// loop body. Each candidate gets its own register from freePool.
+		// Sibling-phi index for the own-register parallel-copy hazard
+		// guard: edge copies for one edge are emitted in phi order, and
+		// register-destination copies bypass the staged-phi temp
+		// machinery, so a register phi must not read — or be read by —
+		// another phi of the same header.
+		hdrPhiIDs := map[ssa.ValueID]bool{}
+		for _, q := range hdr.Values {
+			if q.Op == ssa.OpPhi {
+				hdrPhiIDs[q.ID] = true
+			}
+		}
+
+		// Walk hdr's phis. Try the SHARED coalesce first (see the file
+		// header); a phi the shared mode must decline can still become
+		// an OWN-REGISTER candidate.
 		for _, phi := range hdr.Values {
 			if phi.Op != ssa.OpPhi {
-				continue
-			}
-			// All back-edge args must resolve to the same V.
-			var actual *ssa.Value
-			sameV := true
-			for _, bi := range backIdxs {
-				if bi >= len(phi.Args) {
-					sameV = false
-					break
-				}
-				arg := phi.Args[bi]
-				if arg == nil {
-					sameV = false
-					break
-				}
-				act := resolveCopy(arg)
-				if act == nil {
-					sameV = false
-					break
-				}
-				if actual == nil {
-					actual = act
-				} else if act != actual {
-					sameV = false
-					break
-				}
-			}
-			if !sameV || actual == nil {
-				continue
-			}
-			if !planRegHomeEligibleOp(plan, actual.Op) {
-				continue
-			}
-			// V must be defined inside the loop body. (If V is
-			// defined OUTSIDE the body — e.g., a constant from
-			// before the loop — coalescing has no value beyond
-			// what the regular block-local regalloc already provides.)
-			vBlk, ok := valueBlock[actual.ID]
-			if !ok || !body[vBlk] {
 				continue
 			}
 			// Phi's destination must be a scalar of a kind GP
@@ -280,111 +341,328 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			if !isCoalesceableType(phi.Type) {
 				continue
 			}
-			// Avoid double-coalescing: if either P or V already
-			// has a regHome (set by an earlier loop iteration of
-			// this pass), skip.
+			// Avoid double-coalescing: if P already has a regHome
+			// (set by an earlier loop iteration of this pass), skip.
 			if plan.regHome[phi.ID] != "" {
 				continue
 			}
-			if plan.regHome[actual.ID] != "" {
+			if trySharedCoalesce(f, plan, phi, hdr, body, backIdxs, valueBlock, phiUsers, soleUser, phiUsedAsControl, useBlocks, blockHasCall, &freePool, reserve) {
 				continue
 			}
-			// SAFETY: V's write to the shared register destroys
-			// P's value. So P must have NO uses other than V
-			// itself, anywhere in the function. (V is one of P's
-			// users — phi.ID appears in V.Args, the OpSub32 /
-			// OpAdd32 / etc. that reads the phi.) If P appears
-			// as an arg in some OTHER value besides V, or as a
-			// block control anywhere, the coalesce would silently
-			// hand the new V bytes to that other reader. Deny.
-			if phiUsers[phi.ID] != 1 || phiUsedAsControl[phi.ID] {
-				continue
-			}
-			// SAFETY: the reserved register is one of R12/R13/R15,
-			// none of which Go's ABI0 preserves across a CALL. The
-			// loop body is proven call-free above, so the carry is
-			// safe WHILE it stays in the loop. But a carry that is
-			// also live OUT of the loop — used in a block not in
-			// `body` — travels an exit path we have not proven
-			// call-free. If any CALL lies on that path with the carry
-			// still live across it (a very common shape: a scan-loop
-			// counter consumed after the loop, past a helper call),
-			// the callee clobbers the register and the out-of-loop
-			// reader sees garbage; the corrupted value then feeds the
-			// next iteration's address computation and the guest
-			// segfaults. We must keep such a carry slot-resident
-			// (decline the coalesce). A carry that escapes only onto
-			// call-free exit paths (e.g. returned directly) is still
-			// safe, so this checks for a CALL crossing, not mere
-			// escape. Both P and V are checked; P's sole user is V
-			// (verified above) so in practice only V can escape.
-			if liveAcrossExternalCall(f, phi, body, blockHasCall, useBlocks) ||
-				liveAcrossExternalCall(f, actual, body, blockHasCall, useBlocks) {
-				continue
-			}
-			// Pick a register; bail if the dedicated pool is
-			// drained (nested loops with many carries — rare).
-			if len(freePool) == 0 {
-				return
-			}
-			reg := freePool[0]
-			freePool = freePool[1:]
 
-			if dbg := os.Getenv("WASM2GO_COALESCE_DEBUG"); dbg != "" && (dbg == "1" || dbg == f.Name) {
-				bodyIDs := make([]int, 0, len(body))
-				for bid := range body {
-					bodyIDs = append(bodyIDs, int(bid))
+			// ---- OWN-REGISTER candidacy ----
+			// The pool only ever shrinks; once drained no later
+			// candidate can be assigned either.
+			if len(freePool) == 0 {
+				continue
+			}
+			// Parallel-copy hazard guard (both directions, see
+			// hdrPhiIDs above). Self-references are exempt: the
+			// emit-side regHome-equality check turns them into
+			// emitted-nothing no-ops.
+			hazard := false
+			for uid := range phiArgOf[phi.ID] {
+				if hdrPhiIDs[uid] {
+					hazard = true
+					break
 				}
-				sort.Ints(bodyIDs)
-				fmt.Fprintf(os.Stderr, "[coalesce] fn=%s hdr=b%d phi=v%d carry=v%d reg=%s body=%v\n",
-					f.Name, hdr.ID, phi.ID, actual.ID, reg, bodyIDs)
 			}
-			plan.regHome[phi.ID] = reg
-			plan.regHome[actual.ID] = reg
-			plan.coalescedPhi[phi.ID] = reg
-			if plan.reservedRegs == nil {
-				plan.reservedRegs = map[ssa.BlockID]map[string]bool{}
-			}
-			for bid := range body {
-				m := plan.reservedRegs[bid]
-				if m == nil {
-					m = map[string]bool{}
-					plan.reservedRegs[bid] = m
+			if !hazard {
+				for _, a := range phi.Args {
+					if a == nil {
+						continue
+					}
+					act := resolveCopy(a)
+					if act != nil && act.ID != phi.ID && act.Op == ssa.OpPhi && hdrPhiIDs[act.ID] {
+						hazard = true
+						break
+					}
 				}
-				m[reg] = true
 			}
+			if hazard {
+				continue
+			}
+			// Exit-path safety: the phi must not be live across a
+			// CALL outside the loop (the register is caller-save).
+			liveP := outOfBodyLiveIn(f, phi, body, useBlocks)
+			if liveHitsCall(liveP, blockHasCall) {
+				continue
+			}
+			// Worth a reserved register only when the loop actually
+			// re-reads the phi; a single in-loop read breaks even
+			// (one saved slot load vs one entry-edge register MOV)
+			// and is not worth burning a pool slot on.
+			uses := countInLoopUses(f, phi, body)
+			if uses < 2 {
+				continue
+			}
+			ownCands = append(ownCands, ownRegCand{phi: phi, body: body, liveOutside: liveP, uses: uses})
 		}
+	}
+
+	// Assign own-register candidates from whatever the shared mode
+	// left in the pool, hottest first. Ties break on phi ID to keep
+	// the emitted asm deterministic across runs.
+	sort.SliceStable(ownCands, func(i, j int) bool {
+		if ownCands[i].uses != ownCands[j].uses {
+			return ownCands[i].uses > ownCands[j].uses
+		}
+		return ownCands[i].phi.ID < ownCands[j].phi.ID
+	})
+	for _, c := range ownCands {
+		if len(freePool) == 0 {
+			break
+		}
+		if plan.regHome[c.phi.ID] != "" {
+			continue
+		}
+		reg := freePool[0]
+		freePool = freePool[1:]
+		if dbg := os.Getenv("WASM2GO_COALESCE_DEBUG"); dbg != "" && (dbg == "1" || dbg == f.Name) {
+			bodyIDs := make([]int, 0, len(c.body))
+			for bid := range c.body {
+				bodyIDs = append(bodyIDs, int(bid))
+			}
+			sort.Ints(bodyIDs)
+			fmt.Fprintf(os.Stderr, "[coalesce-own] fn=%s phi=v%d reg=%s uses=%d body=%v\n",
+				f.Name, c.phi.ID, reg, c.uses, bodyIDs)
+		}
+		plan.regHome[c.phi.ID] = reg
+		plan.coalescedPhi[c.phi.ID] = reg
+		reserve(reg, c.body)
+		reserve(reg, c.liveOutside)
 	}
 }
 
-// liveAcrossExternalCall reports whether value v is live across a CALL
-// in some block OUTSIDE the loop body. The loop body is call-free by
-// construction, so a reserved caller-save register (R12/R13/R15) only
-// survives while the carry stays in the body; this is the check that a
-// carry escaping onto an exit path does not have its register clobbered
-// by an intervening call.
+// trySharedCoalesce attempts the original shared-register coalesce
+// for one phi: P and its unique back-edge carry V share a reserved
+// register, eliding the back-edge copy entirely. Returns true when
+// the coalesce was assigned. The conditions are unchanged from the
+// original single-mode pass; see the comments inline.
+func trySharedCoalesce(
+	f *ssa.Func,
+	plan *funcPlan,
+	phi *ssa.Value,
+	hdr *ssa.Block,
+	body map[ssa.BlockID]bool,
+	backIdxs []int,
+	valueBlock map[ssa.ValueID]ssa.BlockID,
+	phiUsers map[ssa.ValueID]int,
+	soleUser map[ssa.ValueID]*ssa.Value,
+	phiUsedAsControl map[ssa.ValueID]bool,
+	useBlocks map[ssa.ValueID]map[ssa.BlockID]bool,
+	blockHasCall map[ssa.BlockID]bool,
+	freePool *[]string,
+	reserve func(reg string, blocks map[ssa.BlockID]bool),
+) bool {
+	// All back-edge args must resolve to the same V — one loop carry
+	// flowing back from every continue site. (When the back edges
+	// carry different values a single shared register cannot hold
+	// them; the own-register mode may still apply.)
+	var actual *ssa.Value
+	for _, bi := range backIdxs {
+		if bi >= len(phi.Args) {
+			return false
+		}
+		arg := phi.Args[bi]
+		if arg == nil {
+			return false
+		}
+		act := resolveCopy(arg)
+		if act == nil {
+			return false
+		}
+		if actual == nil {
+			actual = act
+		} else if act != actual {
+			return false
+		}
+	}
+	if actual == nil {
+		return false
+	}
+	// V's producer must honour regHome on the write side.
+	if !planRegHomeEligibleOp(plan, actual.Op) {
+		return false
+	}
+	// V must be defined inside the loop body. (If V is defined
+	// OUTSIDE the body — e.g., a constant from before the loop —
+	// coalescing has no value beyond what the regular block-local
+	// regalloc already provides.)
+	vBlk, ok := valueBlock[actual.ID]
+	if !ok || !body[vBlk] {
+		return false
+	}
+	if plan.regHome[actual.ID] != "" {
+		return false
+	}
+	// SAFETY: V's write to the shared register destroys P's value.
+	// So P must have NO uses other than V itself, anywhere in the
+	// function. If P appears as an arg in some OTHER value besides V,
+	// or as a block control anywhere, the coalesce would silently
+	// hand the new V bytes to that other reader. Deny.
+	if phiUsers[phi.ID] != 1 || phiUsedAsControl[phi.ID] {
+		return false
+	}
+	// The single user must BE V. A phi whose one user is anything
+	// else — the "lag" pattern `prev = phi(init, cur)` where cur does
+	// NOT read prev and the one reader is an exit copy or an
+	// unrelated op — reads P at a point that may execute AFTER V's
+	// write to the shared register within the same iteration, so the
+	// reader would observe the new carry instead of the phi. (Fn39800
+	// in the integration corpus has exactly this shape in its hash-
+	// probe loop; sharing there corrupts the probe index and the
+	// guest heap.) The own-register mode handles these safely — its
+	// back-edge copy runs at the very end of the edge, after every
+	// in-iteration read.
+	if soleUser[phi.ID] != actual {
+		return false
+	}
+	// The shared register also makes V's OWN emit read P through the
+	// home register, and the read must precede the emit's first
+	// write to the home. emitBinALU32/64 and emitShift32/64 write
+	// the home in their FIRST instruction (`MOV <src0>, home`), so P
+	// may only appear as src0 — a `V = x <op> P` shape with x != P
+	// would read the home after `MOV x, home` clobbered it. (When
+	// src0 is also P the leading MOV is a self-move and every later
+	// read still sees P.) Cmp / Load / Call emits write the home
+	// last, so any arg position is safe there.
+	switch actual.Op {
+	case ssa.OpAdd32, ssa.OpSub32, ssa.OpMul32,
+		ssa.OpAnd32, ssa.OpOr32, ssa.OpXor32,
+		ssa.OpAdd64, ssa.OpSub64, ssa.OpMul64,
+		ssa.OpAnd64, ssa.OpOr64, ssa.OpXor64,
+		ssa.OpShl32, ssa.OpShrS32, ssa.OpShrU32,
+		ssa.OpShl64, ssa.OpShrS64, ssa.OpShrU64:
+		if len(actual.Args) > 0 && resolveCopy(actual.Args[0]) != phi {
+			for _, a := range actual.Args[1:] {
+				if a != nil && resolveCopy(a) == phi {
+					return false
+				}
+			}
+		}
+	}
+	// SAFETY: the reserved register is one of R12/R13/R15, none of
+	// which Go's ABI0 preserves across a CALL. The loop body is
+	// proven call-free by the caller, so the carry is safe WHILE it
+	// stays in the loop. But a carry that is also live OUT of the
+	// loop travels an exit path we have not proven call-free. If any
+	// CALL lies on that path with the carry still live across it,
+	// the callee clobbers the register and the out-of-loop reader
+	// sees garbage. Keep such a carry slot-resident. A carry that
+	// escapes only onto call-free exit paths (e.g. returned
+	// directly) is still safe — the check is for a CALL crossing,
+	// not mere escape. Both P and V are checked; P's sole user is V
+	// (verified above) so in practice only V can escape.
+	liveP := outOfBodyLiveIn(f, phi, body, useBlocks)
+	if liveHitsCall(liveP, blockHasCall) {
+		return false
+	}
+	liveV := outOfBodyLiveIn(f, actual, body, useBlocks)
+	if liveHitsCall(liveV, blockHasCall) {
+		return false
+	}
+	// Pick a register; decline if the dedicated pool is drained
+	// (nested loops with many carries — rare).
+	if len(*freePool) == 0 {
+		return false
+	}
+	reg := (*freePool)[0]
+	*freePool = (*freePool)[1:]
+
+	if dbg := os.Getenv("WASM2GO_COALESCE_DEBUG"); dbg != "" && (dbg == "1" || dbg == f.Name) {
+		bodyIDs := make([]int, 0, len(body))
+		for bid := range body {
+			bodyIDs = append(bodyIDs, int(bid))
+		}
+		sort.Ints(bodyIDs)
+		fmt.Fprintf(os.Stderr, "[coalesce] fn=%s hdr=b%d phi=v%d carry=v%d reg=%s body=%v\n",
+			f.Name, hdr.ID, phi.ID, actual.ID, reg, bodyIDs)
+	}
+	plan.regHome[phi.ID] = reg
+	plan.regHome[actual.ID] = reg
+	plan.coalescedPhi[phi.ID] = reg
+	reserve(reg, body)
+	// The register must survive on every out-of-body block the carry
+	// (or the phi) is still live in: an exit-path reader consumes it
+	// via operandSrc long after the loop, and a block-local value
+	// grabbing the register there would clobber the carry before its
+	// last read.
+	reserve(reg, liveP)
+	reserve(reg, liveV)
+	return true
+}
+
+// countInLoopUses counts how many in-loop reads the phi has: args of
+// non-phi values in body blocks plus block controls. Edge-copy reads
+// by sibling phis are excluded (the hazard guard already declined
+// those candidates) and self-loop args are no-op copies.
+func countInLoopUses(f *ssa.Func, phi *ssa.Value, body map[ssa.BlockID]bool) int {
+	n := 0
+	for _, blk := range f.Blocks {
+		if !body[blk.ID] {
+			continue
+		}
+		for _, v2 := range blk.Values {
+			if v2.Op == ssa.OpPhi {
+				continue
+			}
+			for _, a := range v2.Args {
+				if a == nil {
+					continue
+				}
+				if resolveCopy(a) == phi {
+					n++
+				}
+			}
+		}
+		if blk.Control != nil && resolveCopy(blk.Control) == phi {
+			n++
+		}
+	}
+	return n
+}
+
+// liveHitsCall reports whether any block in the live-in set contains
+// a CALL — the caller-save reserved register would be clobbered with
+// the value still live.
+func liveHitsCall(liveIn map[ssa.BlockID]bool, blockHasCall map[ssa.BlockID]bool) bool {
+	for bid := range liveIn {
+		if blockHasCall[bid] {
+			return true
+		}
+	}
+	return false
+}
+
+// outOfBodyLiveIn computes the set of out-of-body blocks value v is
+// live into (or used in). The loop body is call-free by construction,
+// so a reserved caller-save register (R12/R13/R15) survives while the
+// carry stays in the body; the returned region is where the carry is
+// STILL live after leaving the loop — the caller must (a) verify no
+// block in it contains a CALL (liveHitsCall) and (b) reserve the
+// register there so a block-local allocation cannot clobber the carry
+// before its last exit-path read.
 //
 // It runs a single-value backward liveness over the out-of-body region:
 // in-body blocks are treated as absorbing (the carry's def lives there
 // and the body is safe), so propagation flows from out-of-body uses up
-// to — and stops at — the loop body. A block outside the body that has
-// a CALL and into which v is live on entry means v crosses that call.
+// to — and stops at — the loop body.
 //
 // Phi-arg uses are attributed to the predecessor edge (the value is
 // live-out of the predecessor, not live-through the phi's own block),
 // so a carry handed to an out-of-loop phi via a call-free exit copy is
-// correctly judged safe.
+// correctly scoped.
 //
 // useBlocks (the function-wide arg/control use index) is used only as a
-// fast reject: a value with no out-of-body uses cannot be live across an
-// out-of-body call, so the dataflow is skipped entirely.
-func liveAcrossExternalCall(
+// fast reject: a value with no out-of-body uses has an empty region, so
+// the dataflow is skipped entirely and nil is returned.
+func outOfBodyLiveIn(
 	f *ssa.Func,
 	v *ssa.Value,
 	body map[ssa.BlockID]bool,
-	blockHasCall map[ssa.BlockID]bool,
 	useBlocks map[ssa.ValueID]map[ssa.BlockID]bool,
-) bool {
+) map[ssa.BlockID]bool {
 	// Fast reject: no use outside the body at all.
 	anyExternal := false
 	for bid := range useBlocks[v.ID] {
@@ -394,7 +672,7 @@ func liveAcrossExternalCall(
 		}
 	}
 	if !anyExternal {
-		return false
+		return nil
 	}
 
 	usedIn := map[ssa.BlockID]bool{}
@@ -463,15 +741,20 @@ func liveAcrossExternalCall(
 		}
 	}
 
+	// Collect the live region: every out-of-body block v is live into.
+	// liveIn subsumes usedIn and liveOut by construction of the
+	// fixpoint (liveIn = usedIn ∨ liveOut), including the pure
+	// phi-arg-attribution blocks (liveOut set directly above).
+	region := map[ssa.BlockID]bool{}
 	for _, blk := range f.Blocks {
 		if body[blk.ID] {
 			continue
 		}
-		if blockHasCall[blk.ID] && liveIn[blk.ID] {
-			return true
+		if liveIn[blk.ID] {
+			region[blk.ID] = true
 		}
 	}
-	return false
+	return region
 }
 
 // naturalLoopBody returns the set of blocks (by ID) that form
