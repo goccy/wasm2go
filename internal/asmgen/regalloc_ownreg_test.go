@@ -485,3 +485,85 @@ func TestRegallocSharedCoalesceArgPositionHazard(t *testing.T) {
 			"emitBinALU32 would compute limit - limit", pPhi.ID, pReg, pNext.ID)
 	}
 }
+
+// TestRegallocOwnRegisterPhiARM64Pool runs the two-carry fixture with
+// the arm64 arch hooks (register pools, eligibility filter, coalesce
+// pool) and checks both coalesce modes assign registers from arm64's
+// R13/R14/R15 pool. The allocation pass is arch-independent; this
+// pins the arm64 plumbing (plan.coalescePool + RegHomeEligibleOp).
+func TestRegallocOwnRegisterPhiARM64Pool(t *testing.T) {
+	f, sig, blocks, phis, carries := buildTwoCarryLoop(t)
+	b1, b3 := blocks[1], blocks[3]
+	posPhi, accPhi := phis[0], phis[1]
+	accNext := carries[1]
+
+	plan, err := planFunc(f, FuncOptions{ModulePkgRef: "*Module"}, sig, archARM64{}.CallArgBias(), true)
+	if err != nil {
+		t.Fatalf("planFunc: %v", err)
+	}
+	a := archARM64{}
+	plan.gpRegPool = a.GPRegPool()
+	plan.sseRegPool = a.SSERegPool()
+	plan.regHomeEligibleOpFn = a.RegHomeEligibleOp
+	plan.supportsCoalesce = a.SupportsLoopCarryCoalesce()
+	plan.coalescePool = a.CoalesceRegPool()
+	plan.helperInlineFn = a.HelperIsInline
+	computeRegHomes(f, plan)
+
+	inPool := func(reg string) bool {
+		for _, r := range a.CoalesceRegPool() {
+			if r == reg {
+				return true
+			}
+		}
+		return false
+	}
+	accReg := plan.regHome[accPhi.ID]
+	if accReg == "" || !inPool(accReg) {
+		t.Fatalf("accPhi shared coalesce on arm64: regHome=%q, want a register from %v", accReg, a.CoalesceRegPool())
+	}
+	if got := plan.regHome[accNext.ID]; got != accReg {
+		t.Errorf("shared coalesce: accNext regHome=%q, want %q", got, accReg)
+	}
+	posReg := plan.regHome[posPhi.ID]
+	if posReg == "" || !inPool(posReg) {
+		t.Fatalf("posPhi own-register on arm64: regHome=%q, want a register from %v", posReg, a.CoalesceRegPool())
+	}
+	if posReg == accReg {
+		t.Errorf("posPhi and accPhi must not share a register; both got %q", posReg)
+	}
+	for _, blk := range []int{int(b1.ID), int(b3.ID)} {
+		for _, reg := range []string{posReg, accReg} {
+			if !plan.reservedRegs[ssa.BlockID(blk)][reg] {
+				t.Errorf("register %q not reserved in loop-body block %d", reg, blk)
+			}
+		}
+	}
+}
+
+// TestRegallocOwnRegisterPhiEmitARM64 checks the emitted arm64 asm
+// for the two-carry loop: edge copies target the coalesce-pool
+// registers (R13/R14/R15) and the emit completes without error with
+// the coalesce active.
+func TestRegallocOwnRegisterPhiEmitARM64(t *testing.T) {
+	f, sig, _, _, _ := buildTwoCarryLoop(t)
+	asm, _, err := EmitFuncARM64("twocarry", sig, f, FuncOptions{ModulePkgRef: "*Module"})
+	if err != nil {
+		t.Fatalf("EmitFuncARM64: %v", err)
+	}
+	saw := false
+	for _, line := range strings.Split(asm, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "MOVW ") {
+			continue
+		}
+		for _, reg := range (archARM64{}).CoalesceRegPool() {
+			if strings.HasSuffix(trimmed, ", "+reg) {
+				saw = true
+			}
+		}
+	}
+	if !saw {
+		t.Errorf("expected a MOVW edge copy targeting an arm64 coalesce-pool register:\n%s", asm)
+	}
+}

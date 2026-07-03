@@ -140,7 +140,11 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		}
 	}
 
-	freePool := append([]string{}, coalesceReservedPool...)
+	pool := plan.coalescePool
+	if pool == nil {
+		pool = coalesceReservedPool
+	}
+	freePool := append([]string{}, pool...)
 
 	// Pre-compute P-is-used-only-by-V check inputs (function-wide,
 	// independent of any one loop). For each candidate (P, V) we must

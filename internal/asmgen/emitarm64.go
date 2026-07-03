@@ -89,23 +89,31 @@ func emitCondBranchARM64(b *strings.Builder, branchOp, branchOpInv, thenLabel, e
 // carry is reloaded from its slot each iteration — always correct.
 func (archARM64) SupportsRegHome() bool { return true }
 
-// SupportsLoopCarryCoalesce — arm64 does NOT opt into the cross-block
-// loop-carry coalesce pass. That pass keeps a carry ONLY in a reserved
-// register across the whole loop body (no per-iteration slot reload),
-// which requires every per-op emit that can produce the carry to honour
-// plan.regHome on the write side. arm64 honours regHome for only a
-// subset of ops today, so a coalesced carry is not reliably maintained
-// across the loop — leaving it false keeps carries slot-resident, which
-// is correct. Flip to true only once the arm64 emit path is validated
-// end-to-end (and a matching reserved-register pool is chosen).
-func (archARM64) SupportsLoopCarryCoalesce() bool { return false }
+// SupportsLoopCarryCoalesce — arm64 opts into the cross-block
+// loop-carry coalesce pass. The SHARED mode is safe because the
+// candidate filter only accepts carries whose producer op passes
+// archARM64.RegHomeEligibleOp — exactly the ops whose write side
+// honours plan.regHome — and the OWN-REGISTER mode never requires a
+// producer write at all (the edge copies go through
+// EmitPhiCopyValueToReg). Reservation bookkeeping (loop body +
+// out-of-body live region) is arch-independent.
+func (archARM64) SupportsLoopCarryCoalesce() bool { return true }
 
-// HelperIsInline — conservative false for every helper until the
-// arm64 inline-helper set is audited for scratch-register discipline
-// the way inlineHelperNamesAMD64 was. Returning false keeps every
-// OpHelperCall a CALL barrier on arm64, exactly the pre-existing
-// behaviour.
-func (archARM64) HelperIsInline(string) bool { return false }
+// CoalesceRegPool — the unallocated tail of arm64's block-local pool
+// (R5..R15). R13/R14/R15 are not used as scratches by any arm64
+// per-op emit (R0-R3 / F0-F1 only), are not the m-cache (R4), and are
+// not Go-reserved (R18 platform, R27 assembler temp, R28 g, R29/R30
+// FP/LR).
+func (archARM64) CoalesceRegPool() []string {
+	return []string{"R13", "R14", "R15"}
+}
+
+// HelperIsInline — arm64 emits the helpers in inlineHelperNamesARM64
+// without a returning CALL (see emitInlineHelperARM64); everything
+// else stages args and CALLs the Go-side helper.
+func (archARM64) HelperIsInline(name string) bool {
+	return inlineHelperNamesARM64[name]
+}
 
 // RegHomeEligibleOp — arm64 honours regHome on the set of ops
 // where both the consumer-side reader (operandSrc{32,64}ARM64 /
@@ -940,6 +948,14 @@ func emitHelperCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame
 	if len(v.Args) != len(spec.params) {
 		return fmt.Errorf("helper %q wants %d args, got %d", name, len(spec.params), len(v.Args))
 	}
+	// Prefer inline asm — same policy as amd64's emitHelperCall. The
+	// helpers arm64 does not natively implement fall through to the
+	// staged CALL below.
+	if done, err := emitInlineHelperARM64(b, v, plan, frame, name); err != nil {
+		return err
+	} else if done {
+		return nil
+	}
 	// Same +8 bias as emitCallDirectARM64 — see CallArgBias() comment.
 	const bias = 8 // archARM64.CallArgBias()
 	off := 0
@@ -1178,4 +1194,628 @@ func emitCallDirectARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame
 		return fmt.Errorf("%v v%d: result type %v unsupported", v.Op, v.ID, d.sig.Results[0])
 	}
 	return nil
+}
+
+// inlineHelperNamesARM64 is the set of helper names
+// emitInlineHelperARM64 handles WITHOUT a returning CALL. It must
+// stay in sync with that function's switch —
+// TestInlineHelperPredicateMatchesEmitARM64 pins the correspondence
+// by dry-running the emitter for every registered helper name.
+//
+// Names in this set are transparent to the CALL-barrier analyses
+// (block-local regalloc, loop-carry coalesce, m-cache refresh): their
+// emit clobbers only the fixed scratches (R0-R3 / F0-F1), never a
+// pool or reserved register. The inline div/rem bodies contain
+// conditional `CALL ·wasm_trap_*(SB)` branches, but those helpers
+// panic and never return — execution never rejoins the function with
+// clobbered registers, so they are not a barrier.
+//
+// Differences from the amd64 set: popcnt stays a CALL (no scalar
+// arm64 popcount instruction), while ALL FOUR trunc_sat unsigned
+// variants join the inline set (FCVTZU saturates natively; amd64
+// only inlines the signed pair).
+var inlineHelperNamesARM64 = map[string]bool{
+	"i32_eqz": true, "i64_eqz": true,
+	"i32_clz": true, "i32_ctz": true, "i64_clz": true, "i64_ctz": true,
+	"i32_rotl": true, "i32_rotr": true, "i64_rotl": true, "i64_rotr": true,
+	"i32_div_s": true, "i32_div_u_s": true,
+	"i32_rem_s": true, "i32_rem_u_s": true,
+	"i64_div_s": true, "i64_div_u_s": true,
+	"i64_rem_s": true, "i64_rem_u_s": true,
+	"i32_wrap_i64": true, "i64_extend_i32_s": true, "i64_extend_i32_u": true,
+	"i32_extend8_s": true, "i32_extend16_s": true,
+	"i64_extend8_s": true, "i64_extend16_s": true, "i64_extend32_s": true,
+	"i32_reinterpret_f32": true, "f32_reinterpret_i32": true,
+	"i64_reinterpret_f64": true, "f64_reinterpret_i64": true,
+	"f32_add": true, "f32_sub": true, "f32_mul": true, "f32_div": true,
+	"f64_add": true, "f64_sub": true, "f64_mul": true, "f64_div": true,
+	"f32_sqrt": true, "f64_sqrt": true,
+	"f32_abs": true, "f64_abs": true, "f32_neg": true, "f64_neg": true,
+	"f32_eq": true, "f32_ne": true, "f32_lt": true, "f32_le": true, "f32_gt": true, "f32_ge": true,
+	"f64_eq": true, "f64_ne": true, "f64_lt": true, "f64_le": true, "f64_gt": true, "f64_ge": true,
+	"f32_ceil": true, "f32_floor": true, "f32_trunc": true, "f32_nearest": true,
+	"f64_ceil": true, "f64_floor": true, "f64_trunc": true, "f64_nearest": true,
+	"f32_min": true, "f32_max": true, "f64_min": true, "f64_max": true,
+	"f32_copysign": true, "f64_copysign": true,
+	"f32_demote_f64": true, "f64_promote_f32": true,
+	"f32_convert_i32_s": true, "f32_convert_i64_s": true,
+	"f64_convert_i32_s": true, "f64_convert_i64_s": true,
+	"f32_convert_i32_u": true, "f32_convert_i64_u": true,
+	"f64_convert_i32_u": true, "f64_convert_i64_u": true,
+	"i32_trunc_sat_f32_s": true, "i32_trunc_sat_f32_u": true,
+	"i32_trunc_sat_f64_s": true, "i32_trunc_sat_f64_u": true,
+	"i64_trunc_sat_f32_s": true, "i64_trunc_sat_f32_u": true,
+	"i64_trunc_sat_f64_s": true, "i64_trunc_sat_f64_u": true,
+}
+
+// isFloatRegARM64 reports whether s names an arm64 FP register (the
+// SSERegPool entries F2..F7 plus the F0/F1 scratches).
+func isFloatRegARM64(s string) bool {
+	return len(s) >= 2 && s[0] == 'F' && s[1] >= '0' && s[1] <= '9'
+}
+
+// emitInlineHelperARM64 emits the inline arm64 body for a known
+// helper — no CALL to a Go-side helper function. Returns true when
+// the helper was handled inline; emitHelperCallARM64 falls back to
+// the staged CALL otherwise.
+//
+// Scratch discipline: bodies read operands via
+// operandSrc{32,64}ARM64 / operandSrcFloat into R0/R1/R2/R3 and
+// F0/F1 only, and write the result to plan.regHome[v.ID] when the
+// regalloc assigned one (OpHelperCall is regHome-eligible on arm64)
+// or to the value's slot otherwise. Pool registers (R5..R15,
+// F2..F7) are never used as intermediates, so the CALL-barrier
+// subtraction in the regalloc/coalesce analyses stays sound. The
+// result register is only written AFTER every operand has been
+// read — an operand may itself live in the home register's pool
+// neighbourhood, but never in the result's own home (the linear
+// scan keeps an operand's register live through its last use).
+//
+// Instruction-selection notes (all verified by native execution on
+// darwin/arm64 before this landed):
+//   - SDIVW/UDIVW Rm, Rn, Rd computes Rd = Rn / Rm; MSUBW Rm, Rn,
+//     Ra, Rd computes Rd = Rn − Ra×Rm — together they form wasm's
+//     div/rem. arm64 division does NOT fault: div-by-zero returns 0
+//     and INT_MIN/−1 wraps, so the wasm traps are explicit compare+
+//     branch to the never-returning wasm_trap_* helpers (amd64 gets
+//     the same traps from the hardware #DE).
+//   - RORW/ROR $imm|Rm rotates right; rotl is ROR of the negated
+//     count (NEGW/NEG), which the hardware masks mod width.
+//   - FCMPS/FCMPD Fm, Fn sets flags from Fn ? Fm with unordered
+//     mapping such that CSET MI/LS/GT/GE/EQ are exactly wasm's
+//     lt/le/gt/ge/eq (false on NaN) and NE is wasm ne (true on NaN).
+//   - FCVTZS/FCVTZU saturate to the destination range and map NaN
+//     to 0 — precisely wasm's trunc_sat semantics, one instruction.
+//   - FMIN/FMAX propagate NaN and order ±0 the way wasm requires.
+//   - CLZ handles a zero input (returns the width) with no branch,
+//     so clz/ctz have no labels at all (ctz = CLZ ∘ RBIT).
+func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame, name string) (bool, error) {
+	dst := plan.offsets[v.ID]
+	home := plan.regHome[v.ID]
+	// Integer result target: the value's home register when it has
+	// one, else the R0 scratch followed by a slot store.
+	iTgt, iStore := "R0", true
+	if home != "" && !isFloatRegARM64(home) {
+		iTgt, iStore = home, false
+	}
+	fTgt, fStore := "F0", true
+	if home != "" && isFloatRegARM64(home) {
+		fTgt, fStore = home, false
+	}
+	storeI32 := func() {
+		if iStore {
+			fmt.Fprintf(b, "\tMOVW %s, %d(RSP)\n", iTgt, dst)
+		}
+	}
+	storeI64 := func() {
+		if iStore {
+			fmt.Fprintf(b, "\tMOVD %s, %d(RSP)\n", iTgt, dst)
+		}
+	}
+	storeF32 := func() {
+		if fStore {
+			fmt.Fprintf(b, "\tFMOVS %s, %d(RSP)\n", fTgt, dst)
+		}
+	}
+	storeF64 := func() {
+		if fStore {
+			fmt.Fprintf(b, "\tFMOVD %s, %d(RSP)\n", fTgt, dst)
+		}
+	}
+	src32 := func(i int) string { return operandSrc32ARM64(v.Args[i], plan, frame) }
+	src64 := func(i int) string { return operandSrc64ARM64(v.Args[i], plan, frame) }
+	srcF := func(i int) string { return operandSrcFloat(v.Args[i], plan, frame, "RSP") }
+
+	// floatBin/floatUn/floatCmp factor the fully regular float
+	// families; the switch below routes each name with its mnemonic.
+	floatBin := func(mnem string, is64 bool) (bool, error) {
+		mov := "FMOVS"
+		if is64 {
+			mov = "FMOVD"
+		}
+		fmt.Fprintf(b, "\t%s %s, F0\n", mov, srcF(0))
+		fmt.Fprintf(b, "\t%s %s, F1\n", mov, srcF(1))
+		fmt.Fprintf(b, "\t%s F1, F0\n", mnem) // F0 = F0 <op> F1
+		if fTgt != "F0" {
+			fmt.Fprintf(b, "\t%s F0, %s\n", mov, fTgt)
+		}
+		if is64 {
+			storeF64()
+		} else {
+			storeF32()
+		}
+		return true, nil
+	}
+	floatBin3 := func(mnem string, is64 bool) (bool, error) {
+		// FMIN/FMAX use the 3-operand form so the result can land in
+		// the home register directly.
+		mov := "FMOVS"
+		if is64 {
+			mov = "FMOVD"
+		}
+		fmt.Fprintf(b, "\t%s %s, F0\n", mov, srcF(0))
+		fmt.Fprintf(b, "\t%s %s, F1\n", mov, srcF(1))
+		fmt.Fprintf(b, "\t%s F1, F0, %s\n", mnem, fTgt) // fTgt = min/max(F0, F1)
+		if is64 {
+			storeF64()
+		} else {
+			storeF32()
+		}
+		return true, nil
+	}
+	floatUn := func(mnem string, is64 bool) (bool, error) {
+		mov := "FMOVS"
+		if is64 {
+			mov = "FMOVD"
+		}
+		fmt.Fprintf(b, "\t%s %s, F0\n", mov, srcF(0))
+		fmt.Fprintf(b, "\t%s F0, %s\n", mnem, fTgt)
+		if is64 {
+			storeF64()
+		} else {
+			storeF32()
+		}
+		return true, nil
+	}
+	floatCmp := func(cond string, is64 bool) (bool, error) {
+		mov, cmp := "FMOVS", "FCMPS"
+		if is64 {
+			mov, cmp = "FMOVD", "FCMPD"
+		}
+		fmt.Fprintf(b, "\t%s %s, F0\n", mov, srcF(0))
+		fmt.Fprintf(b, "\t%s %s, F1\n", mov, srcF(1))
+		fmt.Fprintf(b, "\t%s F1, F0\n", cmp) // flags from F0 ? F1
+		fmt.Fprintf(b, "\tCSET %s, %s\n", cond, iTgt)
+		storeI32()
+		return true, nil
+	}
+	convert := func(cvt string, srcIs64 bool, dstIs64 bool) (bool, error) {
+		if srcIs64 {
+			fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		} else {
+			fmt.Fprintf(b, "\tMOVWU %s, R1\n", src32(0))
+		}
+		fmt.Fprintf(b, "\t%s R1, %s\n", cvt, fTgt)
+		if dstIs64 {
+			storeF64()
+		} else {
+			storeF32()
+		}
+		return true, nil
+	}
+	truncSat := func(cvt string, srcIs64 bool, dstIs64 bool) (bool, error) {
+		mov := "FMOVS"
+		if srcIs64 {
+			mov = "FMOVD"
+		}
+		fmt.Fprintf(b, "\t%s %s, F0\n", mov, srcF(0))
+		fmt.Fprintf(b, "\t%s F0, %s\n", cvt, iTgt)
+		if dstIs64 {
+			storeI64()
+		} else {
+			storeI32()
+		}
+		return true, nil
+	}
+	// divRem emits the shared div/rem skeleton: explicit div-by-zero
+	// trap, optional signed-overflow trap (div_s only — rem_s of
+	// INT_MIN/−1 is 0 by MSUB wraparound, which is what wasm wants),
+	// then SDIV/UDIV (+ MSUB for rem).
+	divRem := func(is64, signed, rem bool) (bool, error) {
+		movLoad := "MOVWU"
+		if signed {
+			movLoad = "MOVW"
+		}
+		cmp, div, msub, minConst := "CMPW", "UDIVW", "MSUBW", ""
+		if signed {
+			div = "SDIVW"
+			minConst = "$-2147483648"
+		}
+		if is64 {
+			cmp, div, msub = "CMP", "UDIV", "MSUB"
+			if signed {
+				div = "SDIV"
+				minConst = "$-9223372036854775808"
+			}
+			movLoad = "MOVD"
+		}
+		var s0, s1 string
+		if is64 {
+			s0, s1 = src64(0), src64(1)
+		} else {
+			s0, s1 = src32(0), src32(1)
+		}
+		zeroLbl := fmt.Sprintf("DIVZ_%d", v.ID)
+		doneLbl := fmt.Sprintf("DIVD_%d", v.ID)
+		okLbl := fmt.Sprintf("DIVOK_%d", v.ID)
+		fmt.Fprintf(b, "\t%s %s, R1\n", movLoad, s0)
+		fmt.Fprintf(b, "\t%s %s, R2\n", movLoad, s1)
+		fmt.Fprintf(b, "\t%s $0, R2\n", cmp)
+		fmt.Fprintf(b, "\tBEQ %s\n", zeroLbl)
+		if signed && !rem {
+			// wasm div_s traps on INT_MIN / −1; arm64 SDIV wraps
+			// silently, so the trap is explicit.
+			fmt.Fprintf(b, "\t%s $-1, R2\n", cmp)
+			fmt.Fprintf(b, "\tBNE %s\n", okLbl)
+			fmt.Fprintf(b, "\tMOVD %s, R3\n", minConst)
+			fmt.Fprintf(b, "\t%s R3, R1\n", cmp)
+			fmt.Fprintf(b, "\tBNE %s\n", okLbl)
+			fmt.Fprintf(b, "\tCALL %s\n", goCallSymbol(plan.helperPfx, "wasm_trap_int_overflow"))
+			fmt.Fprintf(b, "%s:\n", okLbl)
+		}
+		if rem {
+			fmt.Fprintf(b, "\t%s R2, R1, R3\n", div)
+			fmt.Fprintf(b, "\t%s R2, R1, R3, %s\n", msub, iTgt) // iTgt = R1 − R3×R2
+		} else {
+			fmt.Fprintf(b, "\t%s R2, R1, %s\n", div, iTgt)
+		}
+		if is64 {
+			storeI64()
+		} else {
+			storeI32()
+		}
+		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
+		fmt.Fprintf(b, "%s:\n", zeroLbl)
+		fmt.Fprintf(b, "\tCALL %s\n", goCallSymbol(plan.helperPfx, "wasm_trap_div_zero"))
+		fmt.Fprintf(b, "%s:\n", doneLbl)
+		return true, nil
+	}
+	rotate := func(is64, left bool) (bool, error) {
+		width := 32
+		movLoad, ror, neg := "MOVWU", "RORW", "NEGW"
+		if is64 {
+			width = 64
+			movLoad, ror, neg = "MOVD", "ROR", "NEG"
+		}
+		var s0 string
+		var imm int64
+		var immOK bool
+		if is64 {
+			s0 = src64(0)
+			imm, immOK = inlineableI64(v.Args[1])
+		} else {
+			s0 = src32(0)
+			var imm32 int32
+			imm32, immOK = inlineableI32(v.Args[1])
+			imm = int64(imm32)
+		}
+		fmt.Fprintf(b, "\t%s %s, R1\n", movLoad, s0)
+		if immOK {
+			n := uint64(imm) & uint64(width-1)
+			if left {
+				n = uint64(width) - n
+				n &= uint64(width - 1)
+			}
+			fmt.Fprintf(b, "\t%s $%d, R1, %s\n", ror, n, iTgt)
+		} else {
+			var s1 string
+			if is64 {
+				s1 = src64(1)
+			} else {
+				s1 = src32(1)
+			}
+			fmt.Fprintf(b, "\t%s %s, R2\n", movLoad, s1)
+			if left {
+				// rotl(x, n) == rotr(x, −n); the hardware masks the
+				// count mod width, which also makes n == 0 exact.
+				fmt.Fprintf(b, "\t%s R2, R2\n", neg)
+			}
+			fmt.Fprintf(b, "\t%s R2, R1, %s\n", ror, iTgt)
+		}
+		if is64 {
+			storeI64()
+		} else {
+			storeI32()
+		}
+		return true, nil
+	}
+
+	switch name {
+	// --- integer predicates / bit scans ---
+	case "i32_eqz":
+		fmt.Fprintf(b, "\tMOVWU %s, R1\n", src32(0))
+		fmt.Fprintf(b, "\tCMPW $0, R1\n")
+		fmt.Fprintf(b, "\tCSET EQ, %s\n", iTgt)
+		storeI32()
+		return true, nil
+	case "i64_eqz":
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		fmt.Fprintf(b, "\tCMP $0, R1\n")
+		fmt.Fprintf(b, "\tCSET EQ, %s\n", iTgt)
+		storeI32()
+		return true, nil
+	case "i32_clz":
+		fmt.Fprintf(b, "\tMOVWU %s, R1\n", src32(0))
+		fmt.Fprintf(b, "\tCLZW R1, %s\n", iTgt)
+		storeI32()
+		return true, nil
+	case "i32_ctz":
+		fmt.Fprintf(b, "\tMOVWU %s, R1\n", src32(0))
+		fmt.Fprintf(b, "\tRBITW R1, R1\n")
+		fmt.Fprintf(b, "\tCLZW R1, %s\n", iTgt)
+		storeI32()
+		return true, nil
+	case "i64_clz":
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		fmt.Fprintf(b, "\tCLZ R1, %s\n", iTgt)
+		storeI64()
+		return true, nil
+	case "i64_ctz":
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		fmt.Fprintf(b, "\tRBIT R1, R1\n")
+		fmt.Fprintf(b, "\tCLZ R1, %s\n", iTgt)
+		storeI64()
+		return true, nil
+
+	// --- rotates ---
+	case "i32_rotl":
+		return rotate(false, true)
+	case "i32_rotr":
+		return rotate(false, false)
+	case "i64_rotl":
+		return rotate(true, true)
+	case "i64_rotr":
+		return rotate(true, false)
+
+	// --- division / remainder ---
+	case "i32_div_s":
+		return divRem(false, true, false)
+	case "i32_div_u_s":
+		return divRem(false, false, false)
+	case "i32_rem_s":
+		return divRem(false, true, true)
+	case "i32_rem_u_s":
+		return divRem(false, false, true)
+	case "i64_div_s":
+		return divRem(true, true, false)
+	case "i64_div_u_s":
+		return divRem(true, false, false)
+	case "i64_rem_s":
+		return divRem(true, true, true)
+	case "i64_rem_u_s":
+		return divRem(true, false, true)
+
+	// --- width changes ---
+	case "i32_wrap_i64":
+		fmt.Fprintf(b, "\tMOVWU %s, %s\n", src64(0), iTgt)
+		storeI32()
+		return true, nil
+	case "i64_extend_i32_s":
+		fmt.Fprintf(b, "\tMOVW %s, %s\n", src32(0), iTgt)
+		storeI64()
+		return true, nil
+	case "i64_extend_i32_u":
+		fmt.Fprintf(b, "\tMOVWU %s, %s\n", src32(0), iTgt)
+		storeI64()
+		return true, nil
+	case "i32_extend8_s":
+		fmt.Fprintf(b, "\tMOVB %s, %s\n", src32(0), iTgt)
+		storeI32()
+		return true, nil
+	case "i32_extend16_s":
+		fmt.Fprintf(b, "\tMOVH %s, %s\n", src32(0), iTgt)
+		storeI32()
+		return true, nil
+	case "i64_extend8_s":
+		fmt.Fprintf(b, "\tMOVB %s, %s\n", src64(0), iTgt)
+		storeI64()
+		return true, nil
+	case "i64_extend16_s":
+		fmt.Fprintf(b, "\tMOVH %s, %s\n", src64(0), iTgt)
+		storeI64()
+		return true, nil
+	case "i64_extend32_s":
+		fmt.Fprintf(b, "\tMOVW %s, %s\n", src64(0), iTgt)
+		storeI64()
+		return true, nil
+
+	// --- reinterpret ---
+	case "i32_reinterpret_f32":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", srcF(0))
+		fmt.Fprintf(b, "\tFMOVS F0, %s\n", iTgt)
+		storeI32()
+		return true, nil
+	case "f32_reinterpret_i32":
+		fmt.Fprintf(b, "\tMOVWU %s, R1\n", src32(0))
+		fmt.Fprintf(b, "\tFMOVS R1, %s\n", fTgt)
+		storeF32()
+		return true, nil
+	case "i64_reinterpret_f64":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", srcF(0))
+		fmt.Fprintf(b, "\tFMOVD F0, %s\n", iTgt)
+		storeI64()
+		return true, nil
+	case "f64_reinterpret_i64":
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		fmt.Fprintf(b, "\tFMOVD R1, %s\n", fTgt)
+		storeF64()
+		return true, nil
+
+	// --- float arithmetic ---
+	case "f32_add":
+		return floatBin("FADDS", false)
+	case "f32_sub":
+		return floatBin("FSUBS", false)
+	case "f32_mul":
+		return floatBin("FMULS", false)
+	case "f32_div":
+		return floatBin("FDIVS", false)
+	case "f64_add":
+		return floatBin("FADDD", true)
+	case "f64_sub":
+		return floatBin("FSUBD", true)
+	case "f64_mul":
+		return floatBin("FMULD", true)
+	case "f64_div":
+		return floatBin("FDIVD", true)
+	case "f32_sqrt":
+		return floatUn("FSQRTS", false)
+	case "f64_sqrt":
+		return floatUn("FSQRTD", true)
+	case "f32_abs":
+		return floatUn("FABSS", false)
+	case "f64_abs":
+		return floatUn("FABSD", true)
+	case "f32_neg":
+		return floatUn("FNEGS", false)
+	case "f64_neg":
+		return floatUn("FNEGD", true)
+	case "f32_min":
+		return floatBin3("FMINS", false)
+	case "f32_max":
+		return floatBin3("FMAXS", false)
+	case "f64_min":
+		return floatBin3("FMIND", true)
+	case "f64_max":
+		return floatBin3("FMAXD", true)
+
+	// --- float compares (flags false on NaN except NE) ---
+	case "f32_eq":
+		return floatCmp("EQ", false)
+	case "f32_ne":
+		return floatCmp("NE", false)
+	case "f32_lt":
+		return floatCmp("MI", false)
+	case "f32_le":
+		return floatCmp("LS", false)
+	case "f32_gt":
+		return floatCmp("GT", false)
+	case "f32_ge":
+		return floatCmp("GE", false)
+	case "f64_eq":
+		return floatCmp("EQ", true)
+	case "f64_ne":
+		return floatCmp("NE", true)
+	case "f64_lt":
+		return floatCmp("MI", true)
+	case "f64_le":
+		return floatCmp("LS", true)
+	case "f64_gt":
+		return floatCmp("GT", true)
+	case "f64_ge":
+		return floatCmp("GE", true)
+
+	// --- float rounding ---
+	case "f32_ceil":
+		return floatUn("FRINTPS", false)
+	case "f32_floor":
+		return floatUn("FRINTMS", false)
+	case "f32_trunc":
+		return floatUn("FRINTZS", false)
+	case "f32_nearest":
+		return floatUn("FRINTNS", false)
+	case "f64_ceil":
+		return floatUn("FRINTPD", true)
+	case "f64_floor":
+		return floatUn("FRINTMD", true)
+	case "f64_trunc":
+		return floatUn("FRINTZD", true)
+	case "f64_nearest":
+		return floatUn("FRINTND", true)
+
+	// --- copysign (bit surgery through the GP side) ---
+	case "f32_copysign":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", srcF(0))
+		fmt.Fprintf(b, "\tFMOVS %s, F1\n", srcF(1))
+		fmt.Fprintf(b, "\tFMOVS F0, R1\n")
+		fmt.Fprintf(b, "\tFMOVS F1, R2\n")
+		fmt.Fprintf(b, "\tBICW $2147483648, R1, R1\n")
+		fmt.Fprintf(b, "\tANDW $2147483648, R2, R2\n")
+		fmt.Fprintf(b, "\tORRW R2, R1, R1\n")
+		fmt.Fprintf(b, "\tFMOVS R1, %s\n", fTgt)
+		storeF32()
+		return true, nil
+	case "f64_copysign":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", srcF(0))
+		fmt.Fprintf(b, "\tFMOVD %s, F1\n", srcF(1))
+		fmt.Fprintf(b, "\tFMOVD F0, R1\n")
+		fmt.Fprintf(b, "\tFMOVD F1, R2\n")
+		fmt.Fprintf(b, "\tBIC $-9223372036854775808, R1, R1\n")
+		fmt.Fprintf(b, "\tAND $-9223372036854775808, R2, R2\n")
+		fmt.Fprintf(b, "\tORR R2, R1, R1\n")
+		fmt.Fprintf(b, "\tFMOVD R1, %s\n", fTgt)
+		storeF64()
+		return true, nil
+
+	// --- float width conversions ---
+	case "f32_demote_f64":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", srcF(0))
+		fmt.Fprintf(b, "\tFCVTDS F0, %s\n", fTgt)
+		storeF32()
+		return true, nil
+	case "f64_promote_f32":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", srcF(0))
+		fmt.Fprintf(b, "\tFCVTSD F0, %s\n", fTgt)
+		storeF64()
+		return true, nil
+
+	// --- int → float conversions (arm64 has native unsigned forms) ---
+	case "f32_convert_i32_s":
+		fmt.Fprintf(b, "\tMOVW %s, R1\n", src32(0))
+		fmt.Fprintf(b, "\tSCVTFWS R1, %s\n", fTgt)
+		storeF32()
+		return true, nil
+	case "f64_convert_i32_s":
+		fmt.Fprintf(b, "\tMOVW %s, R1\n", src32(0))
+		fmt.Fprintf(b, "\tSCVTFWD R1, %s\n", fTgt)
+		storeF64()
+		return true, nil
+	case "f32_convert_i64_s":
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		fmt.Fprintf(b, "\tSCVTFS R1, %s\n", fTgt)
+		storeF32()
+		return true, nil
+	case "f64_convert_i64_s":
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", src64(0))
+		fmt.Fprintf(b, "\tSCVTFD R1, %s\n", fTgt)
+		storeF64()
+		return true, nil
+	case "f32_convert_i32_u":
+		return convert("UCVTFWS", false, false)
+	case "f64_convert_i32_u":
+		return convert("UCVTFWD", false, true)
+	case "f32_convert_i64_u":
+		return convert("UCVTFS", true, false)
+	case "f64_convert_i64_u":
+		return convert("UCVTFD", true, true)
+
+	// --- saturating float → int (single native instruction) ---
+	case "i32_trunc_sat_f32_s":
+		return truncSat("FCVTZSSW", false, false)
+	case "i32_trunc_sat_f64_s":
+		return truncSat("FCVTZSDW", true, false)
+	case "i64_trunc_sat_f32_s":
+		return truncSat("FCVTZSS", false, true)
+	case "i64_trunc_sat_f64_s":
+		return truncSat("FCVTZSD", true, true)
+	case "i32_trunc_sat_f32_u":
+		return truncSat("FCVTZUSW", false, false)
+	case "i32_trunc_sat_f64_u":
+		return truncSat("FCVTZUDW", true, false)
+	case "i64_trunc_sat_f32_u":
+		return truncSat("FCVTZUS", false, true)
+	case "i64_trunc_sat_f64_u":
+		return truncSat("FCVTZUD", true, true)
+	}
+	return false, nil
 }

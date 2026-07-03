@@ -190,6 +190,13 @@ func (archAMD64) RegHomeEligibleOp(op ssa.Op) bool {
 	return regHomeEligibleOp(op)
 }
 
+// CoalesceRegPool — amd64 draws loop-carry registers from the
+// unallocated tail of its block-local pool (see coalesceReservedPool
+// for the rationale).
+func (archAMD64) CoalesceRegPool() []string {
+	return coalesceReservedPool
+}
+
 // GPRegPool — amd64's block-local regalloc set. AX/CX/DX/BX/SI are
 // scratch in emitBin/emitLoad/emitStore; BP is the Go frame
 // pointer; R14 is the goroutine pointer. R11 is in the pool but

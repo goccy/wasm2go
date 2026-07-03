@@ -66,3 +66,58 @@ func TestInlineHelperPredicateMatchesEmit(t *testing.T) {
 		}
 	}
 }
+
+// TestInlineHelperPredicateMatchesEmitARM64 is the arm64 counterpart
+// of TestInlineHelperPredicateMatchesEmit: inlineHelperNamesARM64
+// must agree with a dry-run of emitInlineHelperARM64 for every
+// registered helper name.
+func TestInlineHelperPredicateMatchesEmitARM64(t *testing.T) {
+	synth := func(id ssa.ValueID, typ ssa.Type) *ssa.Value {
+		v := &ssa.Value{ID: id, Type: typ}
+		switch typ {
+		case ssa.TypeI32:
+			v.Op = ssa.OpConst32
+			v.AuxInt = 1
+		case ssa.TypeI64:
+			v.Op = ssa.OpConst64
+			v.AuxInt = 1
+		case ssa.TypeF32:
+			v.Op = ssa.OpConstF32
+		case ssa.TypeF64:
+			v.Op = ssa.OpConstF64
+		default:
+			t.Fatalf("unexpected helper param type %v", typ)
+		}
+		return v
+	}
+	for name, spec := range helperSigs {
+		args := make([]*ssa.Value, len(spec.params))
+		for i, pt := range spec.params {
+			args[i] = synth(ssa.ValueID(i+1), pt)
+		}
+		retType := spec.ret
+		if retType == ssa.TypeInvalid {
+			retType = ssa.TypeMem
+		}
+		v := &ssa.Value{ID: 100, Op: ssa.OpHelperCall, Type: retType, Args: args}
+		plan := &funcPlan{
+			offsets: map[ssa.ValueID]int{},
+			regHome: map[ssa.ValueID]string{},
+		}
+		var b strings.Builder
+		done, err := emitInlineHelperARM64(&b, v, plan, argFrame{}, name)
+		if err != nil {
+			t.Errorf("helper %q: arm64 dry-run emit error: %v", name, err)
+			continue
+		}
+		if got := inlineHelperNamesARM64[name]; got != done {
+			t.Errorf("helper %q: inlineHelperNamesARM64=%v but emitInlineHelperARM64 handled-inline=%v — keep the set in sync with the switch",
+				name, got, done)
+		}
+	}
+	for name := range inlineHelperNamesARM64 {
+		if _, ok := helperSigs[name]; !ok {
+			t.Errorf("inlineHelperNamesARM64 names unknown helper %q", name)
+		}
+	}
+}

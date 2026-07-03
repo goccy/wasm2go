@@ -569,6 +569,16 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 							"i64_rem_s", "i64_rem_u", "i64_rem_u_s":
 							helpersUsed["wasm_trap_div_zero"] = true
 						}
+						// The arm64 inline div_s emit additionally traps
+						// INT_MIN / −1 with an explicit
+						// `CALL ·wasm_trap_int_overflow(SB)` (arm64 SDIV
+						// wraps silently where amd64 IDIV raises #DE), so
+						// the signed divisions also need that stub in the
+						// per-chunk trampoline set.
+						switch name {
+						case "i32_div_s", "i64_div_s":
+							helpersUsed["wasm_trap_int_overflow"] = true
+						}
 					}
 				}
 			}

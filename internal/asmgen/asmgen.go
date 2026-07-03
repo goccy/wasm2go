@@ -159,6 +159,13 @@ type arch interface {
 	// pinned across a loop is not reliably maintained). When false the
 	// coalesce pass is skipped and carries stay slot-resident.
 	SupportsLoopCarryCoalesce() bool
+	// CoalesceRegPool is the dedicated register set the loop-carry
+	// coalesce pass draws from when reserving a register across a
+	// loop body (and the carry's out-of-body live region). Entries
+	// must never be used as per-op emit scratches and are excluded
+	// from the block-local scan in every reserved block. Only
+	// consulted when SupportsLoopCarryCoalesce() is true.
+	CoalesceRegPool() []string
 	// RegHomeEligibleOp narrows the regalloc eligibility list per
 	// arch. The default for amd64 is "every op whose producer can
 	// write directly to a register" — that's the existing
@@ -283,6 +290,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	plan.sseRegPool = a.SSERegPool()
 	plan.regHomeEligibleOpFn = a.RegHomeEligibleOp
 	plan.supportsCoalesce = a.SupportsLoopCarryCoalesce()
+	plan.coalescePool = a.CoalesceRegPool()
 	plan.helperInlineFn = a.HelperIsInline
 
 	// m-pointer caching: stage `m` into a function-wide register
@@ -2012,6 +2020,10 @@ type funcPlan struct {
 	// OpHelperCall whose name this reports inline is NOT a CALL
 	// barrier: see helperCallIsInline.
 	helperInlineFn func(name string) bool
+	// coalescePool is the arch's CoalesceRegPool (nil when the plan
+	// was built without an arch — hand-built test fixtures fall back
+	// to the amd64 coalesceReservedPool var).
+	coalescePool []string
 	// coalescedPhi records loop-carry phi destinations
 	// that have been merged with their back-edge args into a
 	// shared register. When emitPhiCopyValue sees a phi-edge-copy
