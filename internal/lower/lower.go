@@ -789,16 +789,22 @@ func (ls *lowerState) handleBrIf(r *wasm.InstrReader) error {
 // result arity (validated by wasm), so the same top-K stack values are
 // passed as the branch payload regardless of which target is taken.
 //
-// We do not introduce a new SSA block kind for switch dispatch; instead
-// we lower the table to a chain of If blocks of the form
+// Arity-0 tables (no branch payload) lower to a single BlockBrTable —
+// one successor per unique target, selector as Control — which the
+// pure emitter renders as a Go switch statement and asmgen as a
+// binary-search compare tree. This matters: the Go compiler lowers
+// dense switch STATEMENTS to jump tables but never reconstructs a
+// switch from an if-else cascade, so the previous chain-of-Ifs
+// lowering executed O(len(cases)) sequential compares per dispatch
+// (CPython's eval loop: a 255-deep chain, ~127 compares per bytecode).
+//
+// Payload-carrying tables (branch arity > 0) still lower to the chain
+// of If blocks
 //
 //	if sel == 0 { goto cases[0] } else if sel == 1 { goto cases[1] }
 //	... else { goto default }
 //
-// which the goto-based SSA emitter handles natively. The downstream Go
-// compiler is well-equipped to fold such cascades back into a jump
-// table where profitable; the extra blocks are also cheap for the SSA
-// optimization passes because the equality checks are pure.
+// which the goto-based SSA emitter handles natively.
 func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 	cases, err := r.ReadVecU32()
 	if err != nil {
@@ -844,6 +850,49 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 			return fmt.Errorf("%w: br_table target %d has branch arity %d, default has %d",
 				ErrSSAUnsupported, i, f.branchArity(), wantArity)
 		}
+	}
+
+	// Arity-0 dispatch — the shape a bytecode interpreter's computed
+	// goto compiles to, and the hot path this lowering exists for —
+	// becomes a single BlockBrTable with one edge per UNIQUE target.
+	// The pure emitter turns it into a Go switch (which the Go
+	// compiler lowers to a jump table) and asmgen into a
+	// binary-search compare tree; the old equality-If chain cost
+	// O(len(cases)) sequential compare+branch pairs per dispatch —
+	// measured at a 255-deep chain on CPython's eval loop, ~127
+	// compares per bytecode executed.
+	//
+	// Payload-carrying br_tables (branch arity > 0) keep the If-chain
+	// lowering below: their per-edge stack payload rides the same
+	// recordIncoming machinery, but they are rare and never the hot
+	// dispatch shape.
+	if wantArity == 0 {
+		cur := ls.b.Current()
+		cur.Kind = ssa.BlockBrTable
+		cur.Control = sel
+		succIdx := map[*ssa.Block]int{}
+		addTarget := func(depth uint32) int {
+			frame := ls.ctrl[len(ls.ctrl)-1-int(depth)]
+			if si, ok := succIdx[frame.target]; ok {
+				return si
+			}
+			si := len(cur.Succs)
+			succIdx[frame.target] = si
+			ls.recordIncoming(frame.target, 0)
+			if frame.kind == ctrlLoop {
+				ls.appendLoopBackArgs(frame.target)
+			}
+			ssa.AddEdge(cur, frame.target)
+			cur.TableCases = append(cur.TableCases, nil)
+			return si
+		}
+		for i, depth := range cases {
+			si := addTarget(depth)
+			cur.TableCases[si] = append(cur.TableCases[si], int32(i))
+		}
+		cur.TableDefault = addTarget(defaultDepth)
+		ls.unreachable = true
+		return nil
 	}
 
 	// Emit one If block per case index. The fall-through path of each

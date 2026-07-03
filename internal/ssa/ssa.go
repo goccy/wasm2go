@@ -98,9 +98,19 @@ type Block struct {
 	Preds  []Edge
 	Succs  []Edge
 	Values []*Value // owned values, in dependency order
-	// Control is the value the block branches on (for If kind), the
-	// returned value(s) marker (Ret kind), or nil (Plain).
+	// Control is the value the block branches on (for If and BrTable
+	// kinds), the returned value(s) marker (Ret kind), or nil (Plain).
 	Control *Value
+
+	// TableCases / TableDefault describe a BlockBrTable terminator
+	// (nil / 0 otherwise). TableCases[i] lists the selector values
+	// routed to Succs[i]; every selector value not present in any
+	// list goes to Succs[TableDefault]. Successor blocks are unique
+	// (a wasm br_table routing several indices — or the default — to
+	// one label dedupes into a single edge), which keeps phi-arg
+	// bookkeeping one-arg-per-pred like every other block kind.
+	TableCases   [][]int32
+	TableDefault int
 
 	f *Func
 }
@@ -128,6 +138,14 @@ const (
 	BlockRet
 	// Unreachable: zero successors, traps at runtime.
 	BlockUnreachable
+	// BrTable: one successor per unique branch target of a wasm
+	// br_table. Control is the i32 selector; Block.TableCases /
+	// Block.TableDefault map selector values to successors. Lowered
+	// from arity-0 br_table dispatch (a bytecode interpreter's
+	// computed goto); emitted as a Go switch (pure) or a
+	// binary-search compare tree (asm) instead of the O(n)
+	// equality-If chain used before.
+	BlockBrTable
 )
 
 // AddEdge wires src → dst as a CFG edge, updating both lists. The returned
