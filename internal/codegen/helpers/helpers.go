@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -22,6 +23,12 @@ type Module struct {
 	memory []byte
 	maxMem uint64
 	M      unsafe.Pointer
+	// memMu serialises mutations of the memory slice header (and any
+	// relocation of its backing array) against out-of-band readers and
+	// writers — see memoryGrow and accessMemory. Generated output
+	// declares the same field at the END of its Module struct so the
+	// memory/maxMem/M offsets the asm hardcodes stay put.
+	memMu sync.Mutex
 }
 
 // ----- Opaque identity helpers ---------------------------------------------
@@ -693,6 +700,15 @@ func memorySize(m *Module) int32 {
 // capacity makes the common grow a zero-copy reslice and amortizes the
 // reallocations to O(n).
 func memoryGrow(m *Module, n int32) int32 {
+	// The slice-header rewrite below (and the backing-array relocation
+	// on the slow path) must not run concurrently with an out-of-band
+	// accessMemory: a host goroutine writing through the old header
+	// mid-relocation would land its write in the abandoned array. The
+	// guest's own loads/stores never take this lock — only grow does,
+	// so the hot memory path is unaffected and the cost is one
+	// uncontended lock per memory.grow call.
+	m.memMu.Lock()
+	defer m.memMu.Unlock()
 	prev := int32(len(m.memory) >> 16)
 	if n == 0 {
 		return prev
@@ -735,6 +751,31 @@ func memoryGrow(m *Module, n int32) int32 {
 	// the data pointer untouched so don't need this refresh.
 	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
 	return prev
+}
+
+// accessMemory runs f with the module's current linear memory while
+// holding the same lock memoryGrow takes to mutate the memory slice
+// header or relocate its backing array. It is the ONE safe way to
+// touch linear memory from OUTSIDE the module's execution goroutine —
+// e.g. a watchdog goroutine raising CPython's eval-breaker bit while
+// an evaluation is running. For the duration of f the memory can
+// neither be resliced nor relocated, so f's writes land in the array
+// the guest observes; a grow that raced in just before blocks until f
+// returns and then copies f's writes forward with the rest of the
+// contents. Determinism notes for callers:
+//
+//   - f MUST NOT call back into the module or into memoryGrow — that
+//     would self-deadlock.
+//   - f should be short: a running guest blocks inside memory.grow
+//     until f returns (ordinary guest loads/stores do not block).
+//   - Bytes the guest reads or writes concurrently with f (that is
+//     the point of an eval-breaker-style flag) are exchanged with
+//     plain single-word accesses; keep such shared words
+//     word-aligned and word-sized.
+func accessMemory(m *Module, f func(mem []byte)) {
+	m.memMu.Lock()
+	defer m.memMu.Unlock()
+	f(m.memory)
 }
 
 // ----- Integer unary helpers ----------------------------------------------
