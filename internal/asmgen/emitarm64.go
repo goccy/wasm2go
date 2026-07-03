@@ -298,13 +298,9 @@ func (a archARM64) EmitPhiCopySlot(b *strings.Builder, srcOff, dstOff int, t ssa
 	return a.emitPhiCopyARM64(b, fmt.Sprintf("%d(RSP)", srcOff), dstOff, t)
 }
 
-// EmitPhiCopyValueToReg is the arm64 entry-edge copy for the loop-carry
-// coalesce path. arm64 reports SupportsLoopCarryCoalesce() == false, so
-// the coalesce pass never runs and plan.coalescedPhi stays empty — this
-// method is therefore not reached in practice. The implementation is
-// kept (and correct) so that flipping the gate to true is the only
-// change required once the arm64 write-side regHome contract is
-// validated end-to-end.
+// EmitPhiCopyValueToReg is the arm64 edge copy for the loop-carry
+// coalesce path: every edge of an own-register phi and the forward
+// (entry) edge of a shared coalesce route through here.
 func (archARM64) EmitPhiCopyValueToReg(b *strings.Builder, src *ssa.Value, dstReg string, t ssa.Type, plan *funcPlan, frame argFrame) error {
 	// Same shape as archAMD64: read the source operand and MOV it
 	// straight into the coalesced register. arm64's `MOVW src, Rn`

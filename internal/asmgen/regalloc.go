@@ -162,15 +162,16 @@ func computeRegHomes(f *ssa.Func, plan *funcPlan) {
 	// carry it was holding for.
 	// The cross-block loop-carry coalesce pass runs only on arches with
 	// a validated coalesce emit path (plan.supportsCoalesce, set from
-	// arch.SupportsLoopCarryCoalesce()). It is STRICTLY stronger than
-	// block-local regalloc: it keeps a carry in a reserved register
-	// across the whole loop with no per-iteration slot reload, so every
-	// per-op emit that can produce the carry must honour plan.regHome on
-	// the write side. An arch that only partially honours regHome (e.g.
-	// arm64 today) must NOT run this pass or the carry is silently
-	// clobbered. WASM2GO_NO_COALESCE additionally disables it everywhere
-	// — a fast kill-switch for confirming or ruling out the pass when a
-	// codegen miscompile is suspected.
+	// arch.SupportsLoopCarryCoalesce(); both amd64 and arm64 opt in).
+	// The SHARED mode is STRICTLY stronger than block-local regalloc —
+	// it keeps a carry in a reserved register across the whole loop
+	// with no per-iteration slot reload, so the eligibility filter
+	// only admits carries whose producer emit honours plan.regHome on
+	// the write side (planRegHomeEligibleOp, per arch). The
+	// OWN-REGISTER mode needs no producer cooperation (edge copies go
+	// through EmitPhiCopyValueToReg). WASM2GO_NO_COALESCE disables the
+	// pass everywhere — a fast kill-switch for confirming or ruling
+	// out the pass when a codegen miscompile is suspected.
 	if plan.supportsCoalesce && os.Getenv("WASM2GO_NO_COALESCE") == "" {
 		runCoalescePass(f, plan)
 	}
@@ -461,11 +462,10 @@ func assignBlockRegHomes(blk *ssa.Block, f *ssa.Func, plan *funcPlan) {
 			continue
 		}
 		// Inline-emitted helpers clobber only the fixed scratches
-		// (AX/CX/DX/X0/X1), never a pool register — a lifetime that
-		// crosses one is register-safe. WASM2GO_HELPER_BARRIER_REGALLOC
-		// restores the legacy behaviour (inline helpers barrier the
-		// block-local scan) — a bisect kill-switch.
-		if os.Getenv("WASM2GO_HELPER_BARRIER_REGALLOC") == "" && helperCallIsInline(plan, v) {
+		// (AX/CX/DX/X0/X1 on amd64, R0-R3/F0-F1 on arm64), never a
+		// pool register — a lifetime that crosses one is
+		// register-safe.
+		if helperCallIsInline(plan, v) {
 			continue
 		}
 		hasCallAt[i] = true

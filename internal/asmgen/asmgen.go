@@ -132,10 +132,11 @@ type arch interface {
 	EmitPhiCopySlot(b *strings.Builder, srcOff, dstOff int, t ssa.Type) error
 	// EmitPhiCopyValueToReg copies an SSA value into a register that
 	// the loop-carry coalesce pass reserved. Called instead of
-	// EmitPhiCopyValue on the forward (entry) edge of a coalesced
-	// loop, so the loop body sees the right initial value in the
-	// reserved register. arm64 returns an error — the coalesce pass
-	// only fires behind SupportsRegHome().
+	// EmitPhiCopyValue on every edge of an own-register phi and on
+	// the forward (entry) edge of a shared coalesce, so the loop
+	// body sees the right value in the reserved register. Both
+	// archs implement it (the coalesce pass fires behind
+	// SupportsLoopCarryCoalesce()).
 	EmitPhiCopyValueToReg(b *strings.Builder, src *ssa.Value, dstReg string, t ssa.Type, plan *funcPlan, frame argFrame) error
 	// SkipValue reports whether the arch's operandSrc helpers handle
 	// v inline at every consumer, so the materialise instruction in
@@ -1578,8 +1579,7 @@ func emitBlock(b *strings.Builder, blk *ssa.Block, f *ssa.Func, plan *funcPlan, 
 		// either: their scratch usage never touches mCacheReg, so
 		// the cache stays valid and the refresh pair would be pure
 		// waste in exactly the hot loops the inlining serves.
-		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] &&
-			!(os.Getenv("WASM2GO_HELPER_BARRIER_REFRESH") == "" && helperCallIsInline(plan, v)) {
+		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] && !helperCallIsInline(plan, v) {
 			if _, inline := plan.globalInline[v.ID]; !inline {
 				a.EmitMCachePrime(b, plan.mCacheReg)
 			}

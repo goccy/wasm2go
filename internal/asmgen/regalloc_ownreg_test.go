@@ -567,3 +567,82 @@ func TestRegallocOwnRegisterPhiEmitARM64(t *testing.T) {
 		t.Errorf("expected a MOVW edge copy targeting an arm64 coalesce-pool register:\n%s", asm)
 	}
 }
+
+// TestRegallocOwnRegisterPhiEmitI64 drives the 64-bit variant of the
+// two-carry loop through BOTH arch emitters, covering the MOVQ / MOVD
+// paths of EmitPhiCopyValueToReg (the 32-bit fixtures only exercise
+// MOVL / MOVW).
+func TestRegallocOwnRegisterPhiEmitI64(t *testing.T) {
+	build := func(t *testing.T) (*ssa.Func, wasm.FuncType) {
+		t.Helper()
+		sig := wasm.FuncType{Params: []wasm.ValType{wasm.ValI64, wasm.ValI64}, Results: []wasm.ValType{wasm.ValI64}}
+		fsig := ssa.FuncSig{Params: []ssa.Type{ssa.TypeI64, ssa.TypeI64}, Results: []ssa.Type{ssa.TypeI64}}
+		b := ssa.NewFuncBuilder("twocarry64", fsig)
+
+		b0 := b.NewBlock(ssa.BlockPlain)
+		b1 := b.NewBlock(ssa.BlockIf)
+		b2 := b.NewBlock(ssa.BlockRet)
+		b3 := b.NewBlock(ssa.BlockPlain)
+		b.SetEntry(b0)
+
+		b.SetCurrent(b0)
+		start := b.Param(0, ssa.TypeI64)
+		limit := b.Param(1, ssa.TypeI64)
+		b.LinkPlain(b1)
+
+		b.SetCurrent(b1)
+		posPhi := b.NewValue(ssa.OpPhi, ssa.TypeI64, start, nil)
+		accPhi := b.NewValue(ssa.OpPhi, ssa.TypeI64, start, nil)
+		one := b.Const64(1)
+		posNext := b.NewValue(ssa.OpAdd64, ssa.TypeI64, posPhi, one)
+		posPhi.Args[1] = posNext
+		accNext := b.NewValue(ssa.OpAdd64, ssa.TypeI64, accPhi, posPhi)
+		accPhi.Args[1] = accNext
+		cond := b.NewValue(ssa.OpLtS64, ssa.TypeBool, posNext, limit)
+		b.LinkIf(cond, b3, b2)
+
+		b.SetCurrent(b3)
+		b.LinkPlain(b1)
+
+		b.SetCurrent(b2)
+		b.FinishRet(accNext)
+
+		if err := ssa.Verify(b.Func()); err != nil {
+			t.Fatalf("SSA verify: %v", err)
+		}
+		return b.Func(), sig
+	}
+
+	t.Run("amd64", func(t *testing.T) {
+		f, sig := build(t)
+		asm, _, err := EmitFuncAMD64("twocarry64", sig, f, FuncOptions{ModulePkgRef: "*Module"})
+		if err != nil {
+			t.Fatalf("EmitFuncAMD64: %v", err)
+		}
+		saw := false
+		for _, reg := range coalesceReservedPool {
+			if strings.Contains(asm, ", "+reg+"\n") {
+				saw = true
+			}
+		}
+		if !saw {
+			t.Errorf("expected a 64-bit edge copy targeting a coalesce-pool register:\n%s", asm)
+		}
+	})
+	t.Run("arm64", func(t *testing.T) {
+		f, sig := build(t)
+		asm, _, err := EmitFuncARM64("twocarry64", sig, f, FuncOptions{ModulePkgRef: "*Module"})
+		if err != nil {
+			t.Fatalf("EmitFuncARM64: %v", err)
+		}
+		saw := false
+		for _, reg := range (archARM64{}).CoalesceRegPool() {
+			if strings.Contains(asm, ", "+reg+"\n") {
+				saw = true
+			}
+		}
+		if !saw {
+			t.Errorf("expected a 64-bit edge copy targeting an arm64 coalesce-pool register:\n%s", asm)
+		}
+	})
+}
