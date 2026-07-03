@@ -759,8 +759,12 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 	}
 	off := int32(v.AuxInt)
 	dst := plan.offsets[v.ID]
-	// Compute effective address into R2:
-	//   R2 = *(m + moduleMOffset) + uint32(base) + uint32(off)
+	// R2 = m.M; R3 = uint32(base + off); the access itself uses
+	// register-offset addressing `(R2)(R3)`. Keeping the add inside
+	// the addressing mode (instead of the historical
+	// `ADD R3, R2, R2` + `(R2)`) both saves that ADD and leaves
+	// R2 == m.M intact across the memop, which is what lets
+	// memBaseFlowDedup delete the R2 reloads of later memops.
 	if plan.mCacheReg != "" {
 		// m is in mCacheReg, skip the `MOVD m+0(FP), R2`
 		// and read m.M directly off the cached pointer.
@@ -772,12 +776,16 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 	// Compute base+off in 32-bit so a negative int32 base wraps
 	// the way wasm semantics require — the pure-Go path uses
 	// `uint32(base + int32(off))`. ADDW writes the low 32 bits and
-	// zero-extends to 64, leaving R3 holding the correct u32.
+	// zero-extends to 64, leaving R3 holding the correct u32. The
+	// explicit MOVWU zero-extend stays even when the base already
+	// sits in a register home: arm64 register-register MOVW
+	// sign-extends, so (unlike amd64) "i32 home ⇒ upper bits zero"
+	// is NOT an invariant here and the home cannot serve as the
+	// offset register directly.
 	fmt.Fprintf(b, "\tMOVWU %s, R3\n", operandSrc32ARM64(v.Args[0], plan, frame))
 	if off != 0 {
 		fmt.Fprintf(b, "\tADDW $%d, R3, R3\n", off)
 	}
-	fmt.Fprintf(b, "\tADD R3, R2, R2\n")
 	is64 := v.Type == ssa.TypeI64
 	// Load directly into the destination register when the value
 	// has a regHome. Saves the final `MOVx R0, dst(RSP)` slot
@@ -790,7 +798,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 	}
 	switch v.Op {
 	case ssa.OpLoad8U:
-		fmt.Fprintf(b, "\tMOVBU (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVBU (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			if is64 {
 				fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
@@ -799,7 +807,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 			}
 		}
 	case ssa.OpLoad8S:
-		fmt.Fprintf(b, "\tMOVB (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVB (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			if is64 {
 				fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
@@ -808,7 +816,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 			}
 		}
 	case ssa.OpLoad16U:
-		fmt.Fprintf(b, "\tMOVHU (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVHU (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			if is64 {
 				fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
@@ -817,7 +825,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 			}
 		}
 	case ssa.OpLoad16S:
-		fmt.Fprintf(b, "\tMOVH (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVH (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			if is64 {
 				fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
@@ -826,13 +834,13 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 			}
 		}
 	case ssa.OpLoad32:
-		fmt.Fprintf(b, "\tMOVW (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVW (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			fmt.Fprintf(b, "\tMOVW R0, %d(RSP)\n", dst)
 		}
 	case ssa.OpLoad32U:
 		// i64.load32_u: read u32 → zero-extend to i64.
-		fmt.Fprintf(b, "\tMOVWU (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVWU (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
 		}
@@ -840,13 +848,13 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 		// Sign-extend in place. SXTW writes the full 64-bit
 		// result so the destination register holds the i64
 		// the consumer expects.
-		fmt.Fprintf(b, "\tMOVW (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVW (R2)(R3), %s\n", loadReg)
 		fmt.Fprintf(b, "\tSXTW %s, %s\n", loadReg, loadReg)
 		if home == "" {
 			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
 		}
 	case ssa.OpLoad64:
-		fmt.Fprintf(b, "\tMOVD (R2), %s\n", loadReg)
+		fmt.Fprintf(b, "\tMOVD (R2)(R3), %s\n", loadReg)
 		if home == "" {
 			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
 		}
@@ -857,7 +865,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 		if home != "" {
 			fLoadReg = home
 		}
-		fmt.Fprintf(b, "\tFMOVS (R2), %s\n", fLoadReg)
+		fmt.Fprintf(b, "\tFMOVS (R2)(R3), %s\n", fLoadReg)
 		if home == "" {
 			fmt.Fprintf(b, "\tFMOVS F0, %d(RSP)\n", dst)
 		}
@@ -866,7 +874,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 		if home != "" {
 			fLoadReg = home
 		}
-		fmt.Fprintf(b, "\tFMOVD (R2), %s\n", fLoadReg)
+		fmt.Fprintf(b, "\tFMOVD (R2)(R3), %s\n", fLoadReg)
 		if home == "" {
 			fmt.Fprintf(b, "\tFMOVD F0, %d(RSP)\n", dst)
 		}
@@ -888,12 +896,12 @@ func emitStoreARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		fmt.Fprintf(b, "\tMOVD m+0(FP), R2\n")
 		fmt.Fprintf(b, "\tMOVD %d(R2), R2\n", moduleMOffset)
 	}
-	// Same u32 wrap-around story as emitLoadARM64.
+	// Same u32 wrap-around story and register-offset addressing as
+	// emitLoadARM64 — R2 stays == m.M across the store.
 	fmt.Fprintf(b, "\tMOVWU %s, R3\n", operandSrc32ARM64(v.Args[0], plan, frame))
 	if off != 0 {
 		fmt.Fprintf(b, "\tADDW $%d, R3, R3\n", off)
 	}
-	fmt.Fprintf(b, "\tADD R3, R2, R2\n")
 	valIs64 := v.Args[1].Type == ssa.TypeI64
 	val32 := operandSrc32ARM64(v.Args[1], plan, frame)
 	val64 := operandSrc64ARM64(v.Args[1], plan, frame)
@@ -905,30 +913,30 @@ func emitStoreARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		} else {
 			fmt.Fprintf(b, "\tMOVW %s, R0\n", val32)
 		}
-		fmt.Fprintf(b, "\tMOVB R0, (R2)\n")
+		fmt.Fprintf(b, "\tMOVB R0, (R2)(R3)\n")
 	case ssa.OpStore16:
 		if valIs64 {
 			fmt.Fprintf(b, "\tMOVD %s, R0\n", val64)
 		} else {
 			fmt.Fprintf(b, "\tMOVW %s, R0\n", val32)
 		}
-		fmt.Fprintf(b, "\tMOVH R0, (R2)\n")
+		fmt.Fprintf(b, "\tMOVH R0, (R2)(R3)\n")
 	case ssa.OpStore32:
 		if valIs64 {
 			fmt.Fprintf(b, "\tMOVD %s, R0\n", val64)
 		} else {
 			fmt.Fprintf(b, "\tMOVW %s, R0\n", val32)
 		}
-		fmt.Fprintf(b, "\tMOVW R0, (R2)\n")
+		fmt.Fprintf(b, "\tMOVW R0, (R2)(R3)\n")
 	case ssa.OpStore64:
 		fmt.Fprintf(b, "\tMOVD %s, R0\n", val64)
-		fmt.Fprintf(b, "\tMOVD R0, (R2)\n")
+		fmt.Fprintf(b, "\tMOVD R0, (R2)(R3)\n")
 	case ssa.OpStoreF32:
 		fmt.Fprintf(b, "\tFMOVS %s, F0\n", valFlt)
-		fmt.Fprintf(b, "\tFMOVS F0, (R2)\n")
+		fmt.Fprintf(b, "\tFMOVS F0, (R2)(R3)\n")
 	case ssa.OpStoreF64:
 		fmt.Fprintf(b, "\tFMOVD %s, F0\n", valFlt)
-		fmt.Fprintf(b, "\tFMOVD F0, (R2)\n")
+		fmt.Fprintf(b, "\tFMOVD F0, (R2)(R3)\n")
 	default:
 		return fmt.Errorf("OpStore variant %v not supported", v.Op)
 	}

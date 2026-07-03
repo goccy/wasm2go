@@ -939,6 +939,19 @@ func emitLoad(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) 
 	if base, ok := inlineableI32(v.Args[0]); ok {
 		disp := int32(uint32(base) + uint32(off))
 		addr = fmt.Sprintf("%d(BX)", disp)
+	} else if home := gpRegHomeOf(plan, v.Args[0]); home != "" && off >= 0 {
+		// Direct-index fast path: the base value already lives in a
+		// GP register, and every i32 producer writes its register
+		// through a 32-bit op (upper halves are zero per amd64), so
+		// the register can serve as the scaled-index operand as-is —
+		// the `MOVL <src>, SI` staging hop disappears. Negative
+		// offsets keep the SI path: they need a wrapping ADDL that
+		// must not mutate the value's home register.
+		if off > 0 {
+			addr = fmt.Sprintf("%d(BX)(%s*1)", off, home)
+		} else {
+			addr = fmt.Sprintf("(BX)(%s*1)", home)
+		}
 	} else {
 		// Dynamic base: form the address through SI, then access via
 		// (BX)(SI*1) indexed addressing instead of `ADDQ AX, BX` +
@@ -1076,6 +1089,22 @@ func emitLoad(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) 
 	return nil
 }
 
+// gpRegHomeOf resolves v through OpCopy chains and returns its GP
+// register home, or "" when the value is slot-resident, SSE-homed,
+// constant, or a parameter. Used by the memop emitters' direct-index
+// fast path.
+func gpRegHomeOf(plan *funcPlan, v *ssa.Value) string {
+	actual := resolveCopy(v)
+	if actual == nil {
+		return ""
+	}
+	home := plan.regHome[actual.ID]
+	if home == "" || isSSEReg(home) {
+		return ""
+	}
+	return home
+}
+
 // emitStore lowers a wasm linear-memory write. args = [base, value,
 // mem]; AuxInt = offset. Narrowing stores (Store8/16/32 of an i64)
 // truncate the value to the requested width.
@@ -1106,6 +1135,13 @@ func emitStore(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame)
 	if base, ok := inlineableI32(v.Args[0]); ok {
 		disp := int32(uint32(base) + uint32(off))
 		addr = fmt.Sprintf("%d(BX)", disp)
+	} else if home := gpRegHomeOf(plan, v.Args[0]); home != "" && off >= 0 {
+		// Direct-index fast path — see emitLoad.
+		if off > 0 {
+			addr = fmt.Sprintf("%d(BX)(%s*1)", off, home)
+		} else {
+			addr = fmt.Sprintf("(BX)(%s*1)", home)
+		}
 	} else {
 		// Dynamic-base store: form the address in SI so the access
 		// uses `(BX)(SI*1)` indexed addressing. Mirror of emitLoad's
@@ -2031,17 +2067,23 @@ func emitInlineFloatCmp(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame 
 	fmt.Fprintf(b, "\t%s %s, X0\n", cmp, operandSrcFloat(v.Args[1], plan, frame, "SP"))
 	fmt.Fprintf(b, "\t%s AL\n", setOp)
 	fmt.Fprintf(b, "\tMOVBLZX AL, AX\n")
+	// The parity fix-up stages through DX, NOT BX: BX carries the
+	// linear-memory base between memops (memBaseFlowDedup deletes
+	// reloads only while BX provably survives, so a BX write here
+	// would kill the fact at every float compare) and the
+	// inline-helper scratch contract documented on HelperIsInline is
+	// AX/CX/DX/X0/X1.
 	switch nanFix {
 	case "and-np":
 		// SETPC (parity clear, PF=0 — "ordered") in plan9 syntax.
-		fmt.Fprintf(b, "\tSETPC BL\n")
-		fmt.Fprintf(b, "\tMOVBLZX BL, BX\n")
-		fmt.Fprintf(b, "\tANDL BX, AX\n")
+		fmt.Fprintf(b, "\tSETPC DL\n")
+		fmt.Fprintf(b, "\tMOVBLZX DL, DX\n")
+		fmt.Fprintf(b, "\tANDL DX, AX\n")
 	case "or-p":
 		// SETPS (parity set, PF=1 — "unordered / NaN") in plan9.
-		fmt.Fprintf(b, "\tSETPS BL\n")
-		fmt.Fprintf(b, "\tMOVBLZX BL, BX\n")
-		fmt.Fprintf(b, "\tORL BX, AX\n")
+		fmt.Fprintf(b, "\tSETPS DL\n")
+		fmt.Fprintf(b, "\tMOVBLZX DL, DX\n")
+		fmt.Fprintf(b, "\tORL DX, AX\n")
 	}
 	fmt.Fprintf(b, "\tMOVL AX, %d(SP)\n", dst)
 	return true, nil
