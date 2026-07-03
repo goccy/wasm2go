@@ -222,6 +222,14 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	t.helpers["wasm_trap_int_overflow"] = true
 	t.helpers["wasm_trap_invalid_conv"] = true
 
+	// accessMemory is the host-facing synchronised window into linear
+	// memory (out-of-band writers like go-python's interrupter use it;
+	// nothing in the generated code calls it). Pull it whenever the
+	// module has a memory so the API is uniformly available.
+	if len(m.Memories) > 0 {
+		t.helpers["accessMemory"] = true
+	}
+
 	// Compute the call graph once and thread it through reachability
 	// + multi-package planning. The bytecode scan is the same for all
 	// three consumers; running it three times wastes a substantial
@@ -1146,6 +1154,18 @@ func (t *translator) emitModuleStruct() ast.Decl {
 			Names: []*ast.Ident{newID(t.fieldName(MangleModuleField(mod)))},
 			Type:  newID(t.importIfaceName(mod)),
 		})
+	}
+
+	// memMu serialises memory-slice-header mutations (memoryGrow) against
+	// out-of-band host access (accessMemory). Declared LAST so the
+	// memory/maxMem/M offsets the generated asm hardcodes (moduleMOffset)
+	// are unaffected.
+	if len(t.mod.Memories) > 0 {
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("memMu"))},
+			Type:  &ast.SelectorExpr{X: newID("sync"), Sel: newID("Mutex")},
+		})
+		t.use("sync")
 	}
 
 	return &ast.GenDecl{
@@ -2561,6 +2581,8 @@ func rewriteHelperNode(n ast.Node, helperNames map[string]bool) ast.Node {
 			out.Type = rewriteHelperNode(v.Type, helperNames).(ast.Expr)
 		}
 		return out
+	case *ast.DeferStmt:
+		return &ast.DeferStmt{Call: rewriteHelperNode(v.Call, helperNames).(*ast.CallExpr)}
 	case *ast.BranchStmt:
 		return v
 	case *ast.LabeledStmt:
