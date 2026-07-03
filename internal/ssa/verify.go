@@ -77,6 +77,40 @@ func Verify(f *Func) error {
 			}
 		case BlockUnreachable:
 			// no constraint
+		case BlockBrTable:
+			if len(b.Succs) == 0 {
+				return fmt.Errorf("verify %s: BrTable b%d has no successors", f.Name, b.ID)
+			}
+			if b.Control == nil {
+				return fmt.Errorf("verify %s: BrTable b%d has nil Control", f.Name, b.ID)
+			}
+			if b.Control.Type != TypeI32 {
+				return fmt.Errorf("verify %s: BrTable b%d selector v%d has type %v (want i32)",
+					f.Name, b.ID, b.Control.ID, b.Control.Type)
+			}
+			if len(b.TableCases) != len(b.Succs) {
+				return fmt.Errorf("verify %s: BrTable b%d has %d case lists for %d successors",
+					f.Name, b.ID, len(b.TableCases), len(b.Succs))
+			}
+			if b.TableDefault < 0 || b.TableDefault >= len(b.Succs) {
+				return fmt.Errorf("verify %s: BrTable b%d default index %d out of range (%d succs)",
+					f.Name, b.ID, b.TableDefault, len(b.Succs))
+			}
+			seenCase := map[int32]bool{}
+			seenSucc := map[BlockID]bool{}
+			for si, vals := range b.TableCases {
+				if seenSucc[b.Succs[si].Block.ID] {
+					return fmt.Errorf("verify %s: BrTable b%d successor b%d appears twice (targets must be deduped)",
+						f.Name, b.ID, b.Succs[si].Block.ID)
+				}
+				seenSucc[b.Succs[si].Block.ID] = true
+				for _, cv := range vals {
+					if seenCase[cv] {
+						return fmt.Errorf("verify %s: BrTable b%d selector value %d routed twice", f.Name, b.ID, cv)
+					}
+					seenCase[cv] = true
+				}
+			}
 		default:
 			return fmt.Errorf("verify %s: b%d has invalid kind %v", f.Name, b.ID, b.Kind)
 		}

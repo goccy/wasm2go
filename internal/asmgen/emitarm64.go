@@ -87,6 +87,24 @@ func emitCondBranchARM64(b *strings.Builder, branchOp, branchOpInv, thenLabel, e
 // per-op emits that RegHomeEligibleOp accepts honour it on the write
 // side. Block-local regalloc keeps every value within one block, so a
 // carry is reloaded from its slot each iteration — always correct.
+// EmitBrTableLoadSel stages the br_table selector in R0 for the
+// compare tree. R0 survives the whole dispatch: the tree emits only
+// CMPW/B<cond>/JMP and labels, none of which write it.
+func (archARM64) EmitBrTableLoadSel(b *strings.Builder, sel *ssa.Value, plan *funcPlan, frame argFrame) {
+	fmt.Fprintf(b, "\tMOVW %s, R0\n", operandSrc32ARM64(sel, plan, frame))
+}
+
+// EmitBrTableCmpBranch — one node of the binary-search dispatch tree.
+// Same CMP orientation as emitFusedCmpBranchARM64 (`CMPW $v, R0`
+// computes R0 - v, so BLT ⇔ sel < v).
+func (archARM64) EmitBrTableCmpBranch(b *strings.Builder, val int32, eqLabel, ltLabel string) {
+	fmt.Fprintf(b, "\tCMPW $%d, R0\n", val)
+	fmt.Fprintf(b, "\tBEQ %s\n", eqLabel)
+	if ltLabel != "" {
+		fmt.Fprintf(b, "\tBLT %s\n", ltLabel)
+	}
+}
+
 func (archARM64) SupportsRegHome() bool { return true }
 
 // SupportsLoopCarryCoalesce — arm64 opts into the cross-block

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -119,6 +120,19 @@ type arch interface {
 	// the optimisation; arches that ignore the hint produce the
 	// classic `JCC thenLabel; JMP elseLabel` pair.
 	EmitIfBranch(b *strings.Builder, cond *ssa.Value, thenLabel, elseLabel, fallthroughLabel string, plan *funcPlan, frame argFrame)
+	// EmitBrTableLoadSel stages a BlockBrTable's i32 selector into the
+	// arch's dispatch scratch register (AX / R0) once, ahead of the
+	// compare tree emitted via EmitBrTableCmpBranch.
+	EmitBrTableLoadSel(b *strings.Builder, sel *ssa.Value, plan *funcPlan, frame argFrame)
+	// EmitBrTableCmpBranch compares the staged selector against the
+	// constant val and branches: to eqLabel when equal, and — when
+	// ltLabel is non-empty — to ltLabel when the selector is
+	// (signed-)less than val. Falls through otherwise. The signed
+	// compare is correct for br_table dispatch because every case
+	// value is a non-negative table index: a "negative" selector
+	// (u32 ≥ 2^31) compares below every case value and walks off the
+	// tree into the default, exactly wasm's out-of-range rule.
+	EmitBrTableCmpBranch(b *strings.Builder, val int32, eqLabel, ltLabel string)
 	// EmitReturn moves the function's K return values into their
 	// FP-relative result locations, then RET.
 	EmitReturn(b *strings.Builder, blk *ssa.Block, sig wasm.FuncType, plan *funcPlan, frame argFrame) error
@@ -1678,6 +1692,55 @@ func emitBlock(b *strings.Builder, blk *ssa.Block, f *ssa.Func, plan *funcPlan, 
 			}
 			a.EmitJmp(b, thenLabel, "")
 		}
+	case ssa.BlockBrTable:
+		if blk.Control == nil || len(blk.Succs) == 0 || len(blk.TableCases) != len(blk.Succs) {
+			return fmt.Errorf("malformed BrTable block b%d", blk.ID)
+		}
+		// Resolve each successor to its dispatch label. Successors
+		// whose blocks carry phis route through a PHI_<blk>_<si>
+		// intermediate (mirroring the BlockIf arms): the tree branches
+		// to the intermediate, which runs the edge copies and jumps
+		// on. Phi-free successors dispatch straight to the (pass-
+		// through-redirected) target label.
+		succLabel := make([]string, len(blk.Succs))
+		type phiInter struct {
+			label string
+			si    int
+		}
+		var inters []phiInter
+		for si, e := range blk.Succs {
+			if plan.hasPhi[e.Block.ID] {
+				succLabel[si] = fmt.Sprintf("PHI_%d_%d", blk.ID, si)
+				inters = append(inters, phiInter{succLabel[si], si})
+			} else {
+				succLabel[si] = labelFor(passthroughTarget(e.Block, plan))
+			}
+		}
+		// Flatten TableCases into a sorted (value → label) list for
+		// the binary-search tree. Values routed to the default block
+		// are dropped — the tree's misses land on default anyway.
+		var pairs []brTableCase
+		for si, vals := range blk.TableCases {
+			if si == blk.TableDefault {
+				continue
+			}
+			for _, cv := range vals {
+				pairs = append(pairs, brTableCase{val: cv, label: succLabel[si]})
+			}
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].val < pairs[j].val })
+		a.EmitBrTableLoadSel(b, blk.Control, plan, frame)
+		emitBrTableTree(b, a, pairs, succLabel[blk.TableDefault], blk.ID, 0)
+		a.EmitJmp(b, succLabel[blk.TableDefault], "")
+		// Phi intermediates.
+		for _, in := range inters {
+			fmt.Fprintf(b, "%s:\n", in.label)
+			succ := blk.Succs[in.si]
+			if err := emitPhiEdgeCopies(b, blk, succ.Block, succ.Index, plan, frame, a); err != nil {
+				return err
+			}
+			a.EmitJmp(b, labelFor(passthroughTarget(succ.Block, plan)), "")
+		}
 	case ssa.BlockRet:
 		if err := a.EmitReturn(b, blk, sig, plan, frame); err != nil {
 			return err
@@ -1688,6 +1751,40 @@ func emitBlock(b *strings.Builder, blk *ssa.Block, f *ssa.Func, plan *funcPlan, 
 		return fmt.Errorf("unsupported block kind %v", blk.Kind)
 	}
 	return nil
+}
+
+// brTableCase is one (selector value → dispatch label) entry of a
+// BlockBrTable's flattened, sorted case list.
+type brTableCase struct {
+	val   int32
+	label string
+}
+
+// emitBrTableTree emits a binary-search compare tree over the sorted
+// case list: O(log n) compares per dispatch instead of the O(n)
+// equality chain the old If-chain lowering produced. Leaves (≤ 4
+// entries) emit a short equality run; inner nodes split at the
+// median with a single compare that branches equal→target and
+// less→left-subtree label, falling through to the right subtree.
+// Control that walks off any leaf reaches the caller-emitted jump to
+// the default label. `depth` disambiguates the per-node labels.
+func emitBrTableTree(b *strings.Builder, a arch, pairs []brTableCase, defaultLabel string, blkID ssa.BlockID, node int) int {
+	if len(pairs) <= 4 {
+		for _, p := range pairs {
+			a.EmitBrTableCmpBranch(b, p.val, p.label, "")
+		}
+		return node
+	}
+	mid := len(pairs) / 2
+	leftLabel := fmt.Sprintf("BT_%d_%d", blkID, node)
+	node++
+	// Equal → dispatch; less → left subtree; fall through → right.
+	a.EmitBrTableCmpBranch(b, pairs[mid].val, pairs[mid].label, leftLabel)
+	node = emitBrTableTree(b, a, pairs[mid+1:], defaultLabel, blkID, node)
+	a.EmitJmp(b, defaultLabel, "")
+	fmt.Fprintf(b, "%s:\n", leftLabel)
+	node = emitBrTableTree(b, a, pairs[:mid], defaultLabel, blkID, node)
+	return node
 }
 
 // emitPhiEdgeCopies emits MOV instructions that copy each phi's

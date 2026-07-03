@@ -177,6 +177,24 @@ func emitFusedCmpBranchAMD64(b *strings.Builder, cond *ssa.Value, plan *funcPlan
 	emitCondBranchAMD64(b, jcc, jccInv, thenLabel, elseLabel, fallthroughLabel)
 }
 
+// EmitBrTableLoadSel stages the br_table selector in AX for the
+// compare tree. AX survives the whole dispatch: the tree emits only
+// CMP/JCC/JMP and labels, none of which write it.
+func (archAMD64) EmitBrTableLoadSel(b *strings.Builder, sel *ssa.Value, plan *funcPlan, frame argFrame) {
+	fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(sel, plan, frame, "SP"))
+}
+
+// EmitBrTableCmpBranch — one node of the binary-search dispatch tree.
+// Same CMP orientation as emitFusedCmpBranchAMD64 (`CMPL AX, $v` +
+// JLT ⇔ sel < v).
+func (archAMD64) EmitBrTableCmpBranch(b *strings.Builder, val int32, eqLabel, ltLabel string) {
+	fmt.Fprintf(b, "\tCMPL AX, $%d\n", val)
+	fmt.Fprintf(b, "\tJE %s\n", eqLabel)
+	if ltLabel != "" {
+		fmt.Fprintf(b, "\tJLT %s\n", ltLabel)
+	}
+}
+
 func (archAMD64) SupportsRegHome() bool { return true }
 
 // SupportsLoopCarryCoalesce — amd64 has the validated coalesce emit

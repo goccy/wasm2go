@@ -83,6 +83,24 @@ func FuncString(f *Func) string {
 			b.WriteString("    Ret\n")
 		case BlockUnreachable:
 			b.WriteString("    Unreachable\n")
+		case BlockBrTable:
+			ctrlID := ValueID(0)
+			if blk.Control != nil {
+				ctrlID = blk.Control.ID
+			}
+			fmt.Fprintf(&b, "    BrTable v%d →", ctrlID)
+			for si, e := range blk.Succs {
+				if si == blk.TableDefault {
+					fmt.Fprintf(&b, " b%d(default", e.Block.ID)
+					if len(blk.TableCases[si]) > 0 {
+						fmt.Fprintf(&b, ",%v", blk.TableCases[si])
+					}
+					b.WriteString(")")
+				} else {
+					fmt.Fprintf(&b, " b%d%v", e.Block.ID, blk.TableCases[si])
+				}
+			}
+			b.WriteString("\n")
 		default:
 			fmt.Fprintf(&b, "    %s\n", "<invalid block kind>")
 		}

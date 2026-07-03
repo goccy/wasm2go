@@ -357,6 +357,45 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 				Body: thenBody,
 				Else: elseBody,
 			})
+		case ssa.BlockBrTable:
+			if blk.Control == nil || len(blk.Succs) == 0 || len(blk.TableCases) != len(blk.Succs) {
+				return nil, fmt.Errorf("ssa emit: malformed BrTable block b%d", blk.ID)
+			}
+			selExpr, err := emitExpr(blk.Control)
+			if err != nil {
+				return nil, err
+			}
+			// One switch STATEMENT, not an if-chain: the Go compiler
+			// lowers dense integer switches to jump tables (O(1)
+			// dispatch) but never recovers a switch from a cascade of
+			// ifs. Each clause carries the per-edge phi assigns and a
+			// goto, exactly like an If arm. The default clause also
+			// absorbs any TableCases values routed to the same block
+			// as the wasm default label — they need no explicit case
+			// literals because default reaches the same target.
+			swBody := &ast.BlockStmt{}
+			for si, e := range blk.Succs {
+				clauseBody := &ast.BlockStmt{}
+				if err := emitPhiAssignsFor(clauseBody, blk, e.Block, e.Index, emitExpr, stagedPhi); err != nil {
+					return nil, err
+				}
+				clauseBody.List = append(clauseBody.List, &ast.BranchStmt{
+					Tok:   token.GOTO,
+					Label: newID(labelForBlock(e.Block)),
+				})
+				var caseExprs []ast.Expr
+				if si != blk.TableDefault {
+					caseExprs = make([]ast.Expr, len(blk.TableCases[si]))
+					for ci, cv := range blk.TableCases[si] {
+						caseExprs[ci] = &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", cv)}
+					}
+				}
+				swBody.List = append(swBody.List, &ast.CaseClause{
+					List: caseExprs, // nil = default
+					Body: clauseBody.List,
+				})
+			}
+			body.List = append(body.List, &ast.SwitchStmt{Tag: selExpr, Body: swBody})
 		case ssa.BlockRet:
 			nRes := len(f.Sig.Results)
 			if nRes == 0 {
