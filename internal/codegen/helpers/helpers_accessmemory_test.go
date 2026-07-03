@@ -54,3 +54,39 @@ func TestAccessMemoryConcurrentGrow(t *testing.T) {
 		t.Fatalf("memorySize = %d, want %d", memorySize(m), wantPages)
 	}
 }
+
+// TestMemoryFillPaths pins both memoryFill fast paths: the constant-
+// zero range fill (compiler memclr form) and the copy-doubling
+// non-zero fill, across sizes that exercise the doubling loop's
+// partial final chunk, plus byte-exact content and neighbour
+// preservation.
+func TestMemoryFillPaths(t *testing.T) {
+	for _, n := range []int32{1, 2, 3, 7, 8, 9, 1000, 4096, 65537} {
+		for _, val := range []int32{0, 0xA5} {
+			m := &Module{memory: make([]byte, 70000)}
+			for i := range m.memory {
+				m.memory[i] = 0xEE
+			}
+			memoryFill(m, 16, val, n)
+			if m.memory[15] != 0xEE || m.memory[16+int(n)] != 0xEE {
+				t.Fatalf("n=%d val=%#x: neighbours clobbered", n, val)
+			}
+			want := byte(val)
+			for i := int32(0); i < n; i++ {
+				if m.memory[16+i] != want {
+					t.Fatalf("n=%d val=%#x: byte %d = %#x, want %#x", n, val, i, m.memory[16+i], want)
+				}
+			}
+		}
+	}
+	// Out-of-bounds still panics.
+	m := &Module{memory: make([]byte, 64)}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected OOB panic")
+			}
+		}()
+		memoryFill(m, 60, 1, 8)
+	}()
+}
