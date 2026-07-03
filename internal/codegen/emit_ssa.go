@@ -17,6 +17,12 @@ import (
 // single-package qualifier choice, etc).
 type ssaEmitter struct {
 	t *translator
+	// memBaseHoisted is set (per function) when the function contains
+	// wasm memory loads/stores: memBasePtrExpr then resolves to the
+	// hoisted `mBase` local instead of the `m.M` field, and the
+	// emitters insert `mBase = m.M` refreshes after every value whose
+	// evaluation could run memory.grow. See emitFuncBody.
+	memBaseHoisted bool
 }
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
@@ -49,21 +55,103 @@ func emitSSAFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 // Callers pass t so helper registrations (e.g. mload32) propagate to
 // the output's import / helper list.
 func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
+	// Hoist the linear-memory base pointer into a function-level local
+	// when the function touches memory at all. `m.M` is a Module FIELD,
+	// so the Go compiler must conservatively reload it after every
+	// unsafe store (any store may alias the field) and every call; as a
+	// LOCAL whose address never escapes, `mBase` stays in a register
+	// across stores, and only the sites that can actually run
+	// memory.grow — calls and memory.grow itself, the only operations
+	// that ever relocate the backing array — re-read it. The refresh
+	// statements are inserted by both block emitters right after each
+	// such value; see maybeMemBaseRefresh.
+	em.memBaseHoisted = funcTouchesMemory(f)
+
 	// Prefer structured reconstruction (if/else, straight-line — no
 	// goto/label). emitStructured returns ok=false for any CFG shape
 	// it cannot cleanly structure (loops, irreducible, ambiguous
 	// joins); those fall through to the goto-based emitMultiBlock,
 	// which handles every shape and is the proven baseline.
-	if body, ok := em.emitStructured(f); ok {
-		if em.t != nil && em.t.memMetrics != nil {
-			em.t.memMetrics.StructuredFuncs++
+	body, err := func() (*ast.BlockStmt, error) {
+		if body, ok := em.emitStructured(f); ok {
+			if em.t != nil && em.t.memMetrics != nil {
+				em.t.memMetrics.StructuredFuncs++
+			}
+			return body, nil
 		}
-		return body, nil
+		if em.t != nil && em.t.memMetrics != nil {
+			em.t.memMetrics.GotoFuncs++
+		}
+		return em.emitMultiBlock(f)
+	}()
+	if err != nil {
+		return nil, err
 	}
-	if em.t != nil && em.t.memMetrics != nil {
-		em.t.memMetrics.GotoFuncs++
+	if em.memBaseHoisted {
+		decl := &ast.AssignStmt{
+			Tok: token.DEFINE,
+			Lhs: []ast.Expr{newID(memBaseLocal)},
+			Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID("M")}},
+		}
+		body.List = append([]ast.Stmt{decl}, body.List...)
 	}
-	return em.emitMultiBlock(f)
+	return body, nil
+}
+
+// memBaseLocal is the name of the per-function hoisted copy of m.M.
+// It cannot collide with generated value names (v<N>), parameters
+// (l<N>), or phi temps (t<N>_...).
+const memBaseLocal = "mBase"
+
+// funcTouchesMemory reports whether f contains any linear-memory load
+// or store — the ops whose emission goes through memBasePtrExpr. Any
+// such op is force-hoisted (loads) or emitted as its own statement
+// (stores), so a true here guarantees the hoisted local is used and a
+// false guarantees it is not declared.
+func funcTouchesMemory(f *ssa.Func) bool {
+	for _, blk := range f.Blocks {
+		for _, v := range blk.Values {
+			switch v.Op {
+			case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
+				ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
+				ssa.OpLoadF32, ssa.OpLoadF64,
+				ssa.OpStore8, ssa.OpStore16, ssa.OpStore32, ssa.OpStore64,
+				ssa.OpStoreF32, ssa.OpStoreF64:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// opCanGrowMemory reports whether evaluating v can run memory.grow —
+// the ONLY operation that relocates the linear-memory backing array
+// and rewrites m.M. Guest calls (direct/indirect) can grow
+// transitively; import calls can re-enter the module from host code;
+// OpMemGrow is the grow itself. Everything else — loads, stores,
+// arithmetic, pure helpers (div/rot/float), memory.size, and the
+// memory.copy/fill builtins (which move bytes but never resize) —
+// cannot.
+func opCanGrowMemory(op ssa.Op) bool {
+	switch op {
+	case ssa.OpCallDirect, ssa.OpCallImport, ssa.OpCallIndirect, ssa.OpMemGrow:
+		return true
+	}
+	return false
+}
+
+// maybeMemBaseRefresh appends `mBase = m.M` to stmts when the just-
+// emitted value can have grown (and therefore relocated) the linear
+// memory. No-op when the function has no hoisted base.
+func (em *ssaEmitter) maybeMemBaseRefresh(stmts []ast.Stmt, v *ssa.Value) []ast.Stmt {
+	if !em.memBaseHoisted || !opCanGrowMemory(v.Op) {
+		return stmts
+	}
+	return append(stmts, &ast.AssignStmt{
+		Tok: token.ASSIGN,
+		Lhs: []ast.Expr{newID(memBaseLocal)},
+		Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID("M")}},
+	})
 }
 
 // emitMultiBlock handles multi-block CFGs using a goto/label form.
@@ -213,6 +301,7 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 			}
 			// Non-hoisted pure values are folded into uses; no
 			// statement here.
+			body.List = em.maybeMemBaseRefresh(body.List, v)
 		}
 
 		// 3. Terminator.

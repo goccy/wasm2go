@@ -974,10 +974,21 @@ func memoryFill(m *Module, dst int32, val int32, n int32) {
 	}
 	b := m.memory[uint32(dst):uint32(end)]
 	v := byte(val)
-	// Use Go's optimised slice fill: for k := range b { b[k] = v } is
-	// rewritten to memclr-like code by the compiler.
-	for k := range b {
-		b[k] = v
+	// The compiler's range-fill-to-memclr rewrite fires only for a
+	// CONSTANT zero — `b[k] = v` with a variable v stays a plain byte
+	// loop (~1 byte/cycle). Dispatch the overwhelmingly common zero
+	// fill (calloc paths) onto the constant form explicitly, and run
+	// the rare non-zero fill at memmove speed by seeding one byte and
+	// doubling with copy() — O(log n) memmoves instead of n stores.
+	if v == 0 {
+		for k := range b {
+			b[k] = 0
+		}
+		return
+	}
+	b[0] = v
+	for filled := 1; filled < len(b); filled *= 2 {
+		copy(b[filled:], b[:filled])
 	}
 }
 

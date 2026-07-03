@@ -382,6 +382,7 @@ func (se *structEmitter) blockValues(blk *ssa.Block) ([]ast.Stmt, error) {
 			}
 			out = append(out, stmt)
 		}
+		out = se.em.maybeMemBaseRefresh(out, v)
 	}
 	return out, nil
 }
