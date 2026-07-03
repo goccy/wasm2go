@@ -228,6 +228,12 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// module has a memory so the API is uniformly available.
 	if len(m.Memories) > 0 {
 		t.helpers["accessMemory"] = true
+		// The Module struct's memMu field needs "sync" — register it
+		// HERE, not only in emitModuleStruct: the multi-package path
+		// snapshots base's import set after emitHelpers but BEFORE
+		// emitModuleStruct runs, so a use() from inside the struct
+		// emitter is too late for base/base.go.
+		t.use("sync")
 	}
 
 	// Compute the call graph once and thread it through reachability
