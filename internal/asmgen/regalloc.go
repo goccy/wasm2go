@@ -462,8 +462,10 @@ func assignBlockRegHomes(blk *ssa.Block, f *ssa.Func, plan *funcPlan) {
 		}
 		// Inline-emitted helpers clobber only the fixed scratches
 		// (AX/CX/DX/X0/X1), never a pool register — a lifetime that
-		// crosses one is register-safe.
-		if helperCallIsInline(plan, v) {
+		// crosses one is register-safe. WASM2GO_HELPER_BARRIER_REGALLOC
+		// restores the legacy behaviour (inline helpers barrier the
+		// block-local scan) — a bisect kill-switch.
+		if os.Getenv("WASM2GO_HELPER_BARRIER_REGALLOC") == "" && helperCallIsInline(plan, v) {
 			continue
 		}
 		hasCallAt[i] = true

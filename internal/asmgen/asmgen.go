@@ -1570,7 +1570,8 @@ func emitBlock(b *strings.Builder, blk *ssa.Block, f *ssa.Func, plan *funcPlan, 
 		// either: their scratch usage never touches mCacheReg, so
 		// the cache stays valid and the refresh pair would be pure
 		// waste in exactly the hot loops the inlining serves.
-		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] && !helperCallIsInline(plan, v) {
+		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] &&
+			!(os.Getenv("WASM2GO_HELPER_BARRIER_REFRESH") == "" && helperCallIsInline(plan, v)) {
 			if _, inline := plan.globalInline[v.ID]; !inline {
 				a.EmitMCachePrime(b, plan.mCacheReg)
 			}

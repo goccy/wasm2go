@@ -125,3 +125,37 @@ func TestRegTrackPass_SlotImmEndToEndFold(t *testing.T) {
 			count, got)
 	}
 }
+
+// TestRegTrackPass_StaleSecondaryMirrorInvalidated is the regression
+// for the Fn39269 128-bit-shift miscompile: a slot can be mirrored by
+// MORE THAN ONE register at once (the store's source stays the
+// canonical slotReg entry; a forwarded load binds its destination as
+// a secondary mirror in regSlot). A later write to the slot must drop
+// EVERY mirror. The buggy invalidateSlot only cleared the canonical
+// entry, so the secondary register (CX below) kept its stale binding
+// and the reload after the slot was overwritten got dropped by the
+// "dst already mirrors src" check — leaving CX holding the PREVIOUS
+// value (64-n instead of n) as the SHRQ shift count.
+func TestRegTrackPass_StaleSecondaryMirrorInvalidated(t *testing.T) {
+	in := joinLines(
+		"\tMOVL l3+32(FP), AX",
+		"\tMOVQ AX, 48(SP)", // slotReg[48]=AX
+		"\tMOVQ 48(SP), CX", // forwarded to "MOVQ AX, CX"; CX becomes a secondary mirror of 48(SP)
+		"\tSHLQ CX, R8",
+		"\tMOVL l3+36(FP), AX", // AX invalidated (canonical mirror gone)
+		"\tMOVQ AX, 48(SP)",    // slot overwritten — must ALSO clear CX's stale mirror
+		"\tMOVQ 48(SP), CX",    // must NOT be dropped (CX holds the OLD slot value)
+		"\tSHRQ CX, R9",
+		"\tRET",
+	)
+	got := regTrackPass(in)
+	// After the second store, CX must be (re)written before the SHRQ —
+	// either the original slot load survives or it is forwarded to the
+	// NEW canonical mirror (MOVQ AX, CX). What must NOT happen is the
+	// line disappearing entirely.
+	idx := strings.Index(got, "SHLQ CX, R8")
+	tail := got[idx:]
+	if !strings.Contains(tail, ", CX\n") {
+		t.Errorf("reload of CX after the slot overwrite was dropped; CX would keep the stale value:\n%s", got)
+	}
+}

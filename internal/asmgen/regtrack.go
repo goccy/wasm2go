@@ -87,10 +87,25 @@ func regTrackPass(asm string) string {
 		}
 	}
 	invalidateSlot := func(slot string) {
-		if reg := slotReg[slot]; reg != "" {
-			delete(regSlot, reg)
-			delete(slotReg, slot)
+		// EVERY register currently mirroring the slot must drop its
+		// binding, not just the canonical slotReg entry. Multiple
+		// registers can mirror one slot at once (a forwarded load
+		// keeps the original writer as slotReg while binding the
+		// load's destination in regSlot; reg-to-reg moves add more
+		// mirrors). Clearing only slotReg[slot] left the secondary
+		// mirrors stale, and a later load of the slot into such a
+		// register was dropped by the "dst already mirrors src"
+		// check even though the slot had been overwritten in
+		// between — the Fn39269 128-bit-shift miscompile: the CX
+		// shift-count reload was deleted while CX still held the
+		// PREVIOUS extend's value that had shared the slot via slot
+		// reuse.
+		for reg, s := range regSlot {
+			if s == slot {
+				delete(regSlot, reg)
+			}
 		}
+		delete(slotReg, slot)
 		delete(slotImm, slot)
 		delete(slotImmInstr, slot)
 	}
