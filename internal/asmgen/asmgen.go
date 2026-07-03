@@ -186,6 +186,7 @@ type arch interface {
 	// false for everything until its inline set is audited the same
 	// way.
 	HelperIsInline(name string) bool
+
 	// GPRegPool returns the GP register pool the block-local regalloc
 	// hands out to int / pointer SSA values. The order matters only
 	// for determinism — first-fit during linear scan. Each entry
@@ -483,6 +484,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	//                      same slot silently overwrites, with no
 	//                      intervening read. D-1.
 	emitted := dedupMemMReload(b.String())
+	emitted = memBaseFlowDedup(emitted)
 	emitted = peepholeOpt(emitted)
 	emitted = regTrackPass(emitted)
 	emitted = peepholeOpt(emitted)
