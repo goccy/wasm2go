@@ -152,11 +152,20 @@ func (em *ssaEmitter) unsafeDerefExpr(spec memOpSpec, baseExpr ast.Expr, offset 
 	return &ast.StarExpr{X: cast}
 }
 
-// memBasePtrExpr returns the `m.M` selector expression — the cached
-// unsafe.Pointer to the start of the wasm linear memory's backing
-// array. See emitModuleStruct (where the M field is declared) and
-// memoryGrow (where M is refreshed on reallocate) for the lifecycle.
+// memBasePtrExpr returns the expression for the linear-memory base
+// pointer at a load/store site. When the function hoisted the base
+// (see emitFuncBody) this is the `mBase` LOCAL — which the Go
+// compiler can keep in a register across unsafe stores, unlike the
+// `m.M` FIELD it shadows, because a local whose address never
+// escapes cannot be aliased by a store. Functions without memops
+// (never reached here) and non-hoisted contexts fall back to the
+// field read. See emitModuleStruct (where the M field is declared)
+// and memoryGrow (where M is refreshed on reallocate) for the
+// lifecycle.
 func (em *ssaEmitter) memBasePtrExpr() ast.Expr {
+	if em.memBaseHoisted {
+		return newID(memBaseLocal)
+	}
 	return &ast.SelectorExpr{X: newID("m"), Sel: newID("M")}
 }
 
