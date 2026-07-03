@@ -190,6 +190,13 @@ func (archAMD64) RegHomeEligibleOp(op ssa.Op) bool {
 	return regHomeEligibleOp(op)
 }
 
+// CoalesceRegPool — amd64 draws loop-carry registers from the
+// unallocated tail of its block-local pool (see coalesceReservedPool
+// for the rationale).
+func (archAMD64) CoalesceRegPool() []string {
+	return coalesceReservedPool
+}
+
 // GPRegPool — amd64's block-local regalloc set. AX/CX/DX/BX/SI are
 // scratch in emitBin/emitLoad/emitStore; BP is the Go frame
 // pointer; R14 is the goroutine pointer. R11 is in the pool but
@@ -1286,6 +1293,59 @@ func emitHelperCall(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		}
 	}
 	return nil
+}
+
+// inlineHelperNamesAMD64 is the set of helper names emitInlineHelper
+// handles WITHOUT a returning CALL. It must stay in sync with the
+// switch in emitInlineHelper — TestInlineHelperPredicateMatchesEmit
+// pins the correspondence by dry-running the emitter for every
+// registered helper name.
+//
+// Names in this set are transparent to the CALL-barrier analyses
+// (block-local regalloc, loop-carry coalesce, m-cache refresh): their
+// emit clobbers only the fixed scratches (AX/CX/DX/X0/X1), never a
+// pool or reserved register. The inline div/rem bodies DO contain a
+// conditional `CALL ·wasm_trap_*(SB)` on the divide-by-zero branch,
+// but those helpers panic and never return — execution never rejoins
+// the function with clobbered registers, so they are not a barrier.
+var inlineHelperNamesAMD64 = map[string]bool{
+	"i32_eqz": true, "i32_clz": true, "i32_ctz": true, "i32_popcnt": true,
+	"i32_rotl": true, "i32_rotr": true,
+	"i64_eqz": true, "i64_clz": true, "i64_ctz": true, "i64_popcnt": true,
+	"i64_rotl": true, "i64_rotr": true,
+	"i32_div_s": true, "i32_div_u_s": true,
+	"i32_rem_s": true, "i32_rem_u_s": true,
+	"i64_div_s": true, "i64_div_u_s": true,
+	"i64_rem_s": true, "i64_rem_u_s": true,
+	"i32_wrap_i64": true, "i64_extend_i32_s": true, "i64_extend_i32_u": true,
+	"i32_extend8_s": true, "i32_extend16_s": true,
+	"i64_extend8_s": true, "i64_extend16_s": true, "i64_extend32_s": true,
+	"i32_reinterpret_f32": true, "f32_reinterpret_i32": true,
+	"i64_reinterpret_f64": true, "f64_reinterpret_i64": true,
+	"f32_add": true, "f32_sub": true, "f32_mul": true, "f32_div": true,
+	"f64_add": true, "f64_sub": true, "f64_mul": true, "f64_div": true,
+	"f32_sqrt": true, "f64_sqrt": true,
+	"f32_abs": true, "f64_abs": true, "f32_neg": true, "f64_neg": true,
+	"f32_eq": true, "f32_ne": true, "f32_lt": true, "f32_le": true, "f32_gt": true, "f32_ge": true,
+	"f64_eq": true, "f64_ne": true, "f64_lt": true, "f64_le": true, "f64_gt": true, "f64_ge": true,
+	"f32_ceil": true, "f32_floor": true, "f32_trunc": true, "f32_nearest": true,
+	"f64_ceil": true, "f64_floor": true, "f64_trunc": true, "f64_nearest": true,
+	"f32_min": true, "f32_max": true, "f64_min": true, "f64_max": true,
+	"f32_copysign": true, "f64_copysign": true,
+	"f32_demote_f64": true, "f64_promote_f32": true,
+	"f32_convert_i32_s": true, "f32_convert_i64_s": true,
+	"f64_convert_i32_s": true, "f64_convert_i64_s": true,
+	"f32_convert_i32_u": true, "f64_convert_i32_u": true,
+	"f32_convert_i64_u": true, "f64_convert_i64_u": true,
+	"i32_trunc_sat_f32_s": true, "i32_trunc_sat_f64_s": true,
+	"i64_trunc_sat_f32_s": true, "i64_trunc_sat_f64_s": true,
+}
+
+// HelperIsInline — amd64 emits the helpers in inlineHelperNamesAMD64
+// without a returning CALL; everything else stages args and CALLs the
+// Go-side helper.
+func (archAMD64) HelperIsInline(name string) bool {
+	return inlineHelperNamesAMD64[name]
 }
 
 // emitInlineHelper emits the inline asm body for a known helper —

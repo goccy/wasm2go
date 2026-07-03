@@ -132,10 +132,11 @@ type arch interface {
 	EmitPhiCopySlot(b *strings.Builder, srcOff, dstOff int, t ssa.Type) error
 	// EmitPhiCopyValueToReg copies an SSA value into a register that
 	// the loop-carry coalesce pass reserved. Called instead of
-	// EmitPhiCopyValue on the forward (entry) edge of a coalesced
-	// loop, so the loop body sees the right initial value in the
-	// reserved register. arm64 returns an error — the coalesce pass
-	// only fires behind SupportsRegHome().
+	// EmitPhiCopyValue on every edge of an own-register phi and on
+	// the forward (entry) edge of a shared coalesce, so the loop
+	// body sees the right value in the reserved register. Both
+	// archs implement it (the coalesce pass fires behind
+	// SupportsLoopCarryCoalesce()).
 	EmitPhiCopyValueToReg(b *strings.Builder, src *ssa.Value, dstReg string, t ssa.Type, plan *funcPlan, frame argFrame) error
 	// SkipValue reports whether the arch's operandSrc helpers handle
 	// v inline at every consumer, so the materialise instruction in
@@ -159,6 +160,13 @@ type arch interface {
 	// pinned across a loop is not reliably maintained). When false the
 	// coalesce pass is skipped and carries stay slot-resident.
 	SupportsLoopCarryCoalesce() bool
+	// CoalesceRegPool is the dedicated register set the loop-carry
+	// coalesce pass draws from when reserving a register across a
+	// loop body (and the carry's out-of-body live region). Entries
+	// must never be used as per-op emit scratches and are excluded
+	// from the block-local scan in every reserved block. Only
+	// consulted when SupportsLoopCarryCoalesce() is true.
+	CoalesceRegPool() []string
 	// RegHomeEligibleOp narrows the regalloc eligibility list per
 	// arch. The default for amd64 is "every op whose producer can
 	// write directly to a register" — that's the existing
@@ -167,6 +175,17 @@ type arch interface {
 	// side; the rest still need a slot. Returning false here makes
 	// the regalloc skip the value so its slot store survives.
 	RegHomeEligibleOp(op ssa.Op) bool
+	// HelperIsInline reports whether the arch emits the named
+	// OpHelperCall helper as inline asm with NO returning CALL. The
+	// CALL-barrier analyses (block-local regalloc lifetimes, the
+	// loop-carry coalesce's call-free check, the m-cache refresh)
+	// treat such values as ordinary ALU ops instead of register-
+	// clobbering calls. Trap CALLs on never-returning branches
+	// (divide-by-zero panics) do not count as "returning". amd64
+	// consults inlineHelperNamesAMD64; arm64 conservatively returns
+	// false for everything until its inline set is audited the same
+	// way.
+	HelperIsInline(name string) bool
 	// GPRegPool returns the GP register pool the block-local regalloc
 	// hands out to int / pointer SSA values. The order matters only
 	// for determinism — first-fit during linear scan. Each entry
@@ -272,6 +291,8 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	plan.sseRegPool = a.SSERegPool()
 	plan.regHomeEligibleOpFn = a.RegHomeEligibleOp
 	plan.supportsCoalesce = a.SupportsLoopCarryCoalesce()
+	plan.coalescePool = a.CoalesceRegPool()
+	plan.helperInlineFn = a.HelperIsInline
 
 	// m-pointer caching: stage `m` into a function-wide register
 	// so every memop / global access / call-site arg-staging that
@@ -1553,7 +1574,12 @@ func emitBlock(b *strings.Builder, blk *ssa.Block, f *ssa.Func, plan *funcPlan, 
 		// the source site (the BlockIf terminator inlines the
 		// compare). Without these guards every inlined access would
 		// cost the refresh pair it was supposed to save.
-		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] {
+		// Inline-emitted helpers (extends, rotates, div/rem, float
+		// arith — see HelperIsInline) produce no returning CALL
+		// either: their scratch usage never touches mCacheReg, so
+		// the cache stays valid and the refresh pair would be pure
+		// waste in exactly the hot loops the inlining serves.
+		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] && !helperCallIsInline(plan, v) {
 			if _, inline := plan.globalInline[v.ID]; !inline {
 				a.EmitMCachePrime(b, plan.mCacheReg)
 			}
@@ -1740,6 +1766,21 @@ func emitPhiEdgeCopies(b *strings.Builder, pred, succ *ssa.Block, predIdx int, p
 }
 
 func labelFor(b *ssa.Block) string { return fmt.Sprintf("L%d", b.ID) }
+
+// helperCallIsInline reports whether v is an OpHelperCall the arch
+// emits inline with no returning CALL — i.e. a false positive of
+// opEmitsCall. The CALL-barrier analyses (block-local regalloc
+// lifetimes, the loop-carry coalesce's call-free check) and the
+// m-cache refresh subtract these the same way they subtract
+// branchFused and globalInline values. Conservative false when the
+// plan has no arch hook (hand-built test fixtures) or the helper
+// name is unknown.
+func helperCallIsInline(plan *funcPlan, v *ssa.Value) bool {
+	if v.Op != ssa.OpHelperCall || plan.helperInlineFn == nil {
+		return false
+	}
+	return plan.helperInlineFn(plan.helperRefs[v.ID])
+}
 
 // opEmitsCall reports whether emitting v results in a runtime
 // CALL instruction (helper, direct, indirect, import, global
@@ -1974,6 +2015,15 @@ type funcPlan struct {
 	// regHome-eligible carry, etc.), this stays nil and the per-
 	// block scan runs unchanged.
 	reservedRegs map[ssa.BlockID]map[string]bool
+	// helperInlineFn is the arch's HelperIsInline hook (nil when the
+	// plan was built without an arch — hand-built test fixtures). An
+	// OpHelperCall whose name this reports inline is NOT a CALL
+	// barrier: see helperCallIsInline.
+	helperInlineFn func(name string) bool
+	// coalescePool is the arch's CoalesceRegPool (nil when the plan
+	// was built without an arch — hand-built test fixtures fall back
+	// to the amd64 coalesceReservedPool var).
+	coalescePool []string
 	// coalescedPhi records loop-carry phi destinations
 	// that have been merged with their back-edge args into a
 	// shared register. When emitPhiCopyValue sees a phi-edge-copy
