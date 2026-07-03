@@ -2,18 +2,50 @@ package asmgen
 
 import "strings"
 
-// memBaseFlowDedup removes m.M reloads (`MOVQ 32(R11), BX`, and the
-// two-line `MOVQ m+0(FP), BX; MOVQ 32(BX), BX` no-mcache form) that
-// are redundant on EVERY control-flow path — a dataflow
-// generalisation of dedupMemMReload, which can only track validity
-// through straight-line spans and must give up at labels.
+// memMFlowConfig names, per architecture, the emitted-text patterns
+// whose redundancy memBaseFlowDedup eliminates: the reload of m.M
+// into the memop base register, and that register itself (the
+// dataflow fact tracked is "<reg> == m.M").
+type memMFlowConfig struct {
+	genCache string // m-cache form: one-line m.M read
+	genFP1   string // no-cache form, line 1: m pointer from the frame
+	genFP2   string // no-cache form, line 2: m.M off the m pointer
+	reg      string // the register the fact is about
+	regByte  string // partial-register alias whose write kills reg ("" if none)
+}
+
+var memMFlowConfigs = []memMFlowConfig{
+	{
+		// amd64: BX carries m.M; R11 is the function-wide m cache.
+		genCache: "\tMOVQ 32(R11), BX",
+		genFP1:   "\tMOVQ m+0(FP), BX",
+		genFP2:   "\tMOVQ 32(BX), BX",
+		reg:      "BX",
+		regByte:  "BL",
+	},
+	{
+		// arm64: R2 carries m.M; R4 is the m cache. Only meaningful
+		// once memops address memory as (R2)(R3) — the historical
+		// `ADD R3, R2, R2` form killed the fact inside every memop.
+		genCache: "\tMOVD 32(R4), R2",
+		genFP1:   "\tMOVD m+0(FP), R2",
+		genFP2:   "\tMOVD 32(R2), R2",
+		reg:      "R2",
+	},
+}
+
+// memBaseFlowDedup removes m.M reloads (per-arch patterns in
+// memMFlowConfigs) that are redundant on EVERY control-flow path — a
+// dataflow generalisation of dedupMemMReload, which can only track
+// validity through straight-line spans and must give up at labels.
 //
-// The property computed is the classic "available expression": BX
-// holds m.M on entry to a block iff it holds it on exit of ALL
-// predecessors. m.M itself can only change inside a CALL (memory.grow
-// is a call), and CALLs clobber BX anyway, so the kill set is simply
-// {CALL, any BX write}. The pass only DELETES existing reload lines —
-// it never inserts code — so unlike a prologue-loaded function-wide
+// The property computed is the classic "available expression": the
+// base register holds m.M on entry to a block iff it holds it on
+// exit of ALL predecessors. m.M itself can only change inside a CALL
+// (memory.grow is a call), and CALLs clobber every caller-save
+// register anyway, so the kill set is simply {CALL, any write of the
+// base register}. The pass only DELETES existing reload lines — it
+// never inserts code — so unlike a prologue-loaded function-wide
 // cache it cannot regress functions whose shape doesn't profit
 // (Phase F-1's failure mode, re-measured and reproduced as a
 // consistent window-suite loss before this pass replaced that
@@ -25,10 +57,15 @@ import "strings"
 // the optimism is what lets loop headers keep validity across
 // call-free loop bodies.
 func memBaseFlowDedup(asm string) string {
-	if !strings.Contains(asm, "\tMOVQ 32(R11), BX") &&
-		!strings.Contains(asm, "\tMOVQ m+0(FP), BX") {
-		return asm
+	for _, cfg := range memMFlowConfigs {
+		if strings.Contains(asm, cfg.genCache) || strings.Contains(asm, cfg.genFP1) {
+			asm = memBaseFlowDedupFor(asm, cfg)
+		}
 	}
+	return asm
+}
+
+func memBaseFlowDedupFor(asm string, cfg memMFlowConfig) string {
 	lines := strings.Split(asm, "\n")
 
 	// ---- 1. Partition into blocks. A leader is line 0, every label,
@@ -81,7 +118,7 @@ func memBaseFlowDedup(asm string) string {
 
 	// ---- 2. Successor edges: explicit branch targets plus
 	// fall-through (unless the block's last line is an unconditional
-	// JMP or RET).
+	// JMP / B or RET).
 	branchTarget := func(s string) (string, bool) {
 		t := strings.TrimSpace(s)
 		sp := strings.IndexAny(t, " \t")
@@ -89,6 +126,10 @@ func memBaseFlowDedup(asm string) string {
 			return "", false
 		}
 		return strings.TrimSpace(t[sp:]), true
+	}
+	isUncond := func(t string) bool {
+		return strings.HasPrefix(t, "JMP ") || strings.HasPrefix(t, "JMP\t") ||
+			strings.HasPrefix(t, "B ") || strings.HasPrefix(t, "B\t")
 	}
 	for bi := range blocks {
 		blk := &blocks[bi]
@@ -107,7 +148,7 @@ func memBaseFlowDedup(asm string) string {
 					blk.succs = append(blk.succs, blockAt[pos])
 				}
 			}
-			if strings.HasPrefix(t, "JMP ") || strings.HasPrefix(t, "JMP\t") {
+			if isUncond(t) {
 				fallThrough = false
 			}
 		}
@@ -122,33 +163,29 @@ func memBaseFlowDedup(asm string) string {
 		}
 	}
 
-	// ---- 3. Per-line transfer over the "BX == m.M" fact.
-	const (
-		genR11  = "\tMOVQ 32(R11), BX"
-		genFP   = "\tMOVQ m+0(FP), BX"
-		genFP2  = "\tMOVQ 32(BX), BX"
-		bxKillB = "BL" // byte-writer alias of BX
-	)
+	// ---- 3. Per-line transfer over the "<reg> == m.M" fact.
 	step := func(valid bool, i int) bool {
 		ln := strings.TrimRight(lines[i], " \t")
 		switch {
-		case ln == genR11:
+		case ln == cfg.genCache:
 			return true
-		case ln == genFP:
+		case ln == cfg.genFP1:
 			// Only the completed two-line pair re-establishes the
-			// fact; the first line alone leaves BX = m.
-			if i+1 < len(lines) && strings.TrimRight(lines[i+1], " \t") == genFP2 {
+			// fact; the first line alone leaves the register = m.
+			if i+1 < len(lines) && strings.TrimRight(lines[i+1], " \t") == cfg.genFP2 {
 				return valid // decided when the pair's 2nd line runs
 			}
 			return false
-		case ln == genFP2 && i > 0 && strings.TrimRight(lines[i-1], " \t") == genFP:
+		case ln == cfg.genFP2 && i > 0 && strings.TrimRight(lines[i-1], " \t") == cfg.genFP1:
 			return true
 		case isAsmCall(lines[i]):
 			return false
 		default:
-			// A byte write through BL clobbers BX's low byte; treat it
-			// as a full kill (nothing emits BL today, but stay safe).
-			if writesRegister(lines[i], "BX") || writesRegister(lines[i], bxKillB) {
+			// A partial-register write (BL on amd64) clobbers the low
+			// byte; treat it as a full kill (nothing emits BL today,
+			// but stay safe).
+			if writesRegister(lines[i], cfg.reg) ||
+				(cfg.regByte != "" && writesRegister(lines[i], cfg.regByte)) {
 				return false
 			}
 			return valid
@@ -198,11 +235,11 @@ func memBaseFlowDedup(asm string) string {
 		v := in[bi]
 		for i := blocks[bi].start; i < blocks[bi].end; i++ {
 			ln := strings.TrimRight(lines[i], " \t")
-			if v && ln == genR11 {
+			if v && ln == cfg.genCache {
 				dropped[i] = true
 			}
-			if v && ln == genFP && i+1 < blocks[bi].end &&
-				strings.TrimRight(lines[i+1], " \t") == genFP2 {
+			if v && ln == cfg.genFP1 && i+1 < blocks[bi].end &&
+				strings.TrimRight(lines[i+1], " \t") == cfg.genFP2 {
 				dropped[i] = true
 				dropped[i+1] = true
 			}

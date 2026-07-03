@@ -671,12 +671,12 @@ func extractSPSlots(line string) []string {
 }
 
 // dedupMemMReload drops redundant `MOVQ m+0(FP), BX; MOVQ 32(BX), BX`
-// (amd64) and `MOVD m+0(FP), R0; MOVD 32(R0), R0` (arm64) pairs when
+// (amd64) and `MOVD m+0(FP), R2; MOVD 32(R2), R2` (arm64) pairs when
 // the target register still holds m.M from a previous load. The
 // per-value emitter has no shared state, so every load / store
 // emits its own preamble — but between two const-base loads or
 // stores in the same straight-line span the second preamble is
-// dead code (the first preamble's BX / R0 is still live, the
+// dead code (the first preamble's BX / R2 is still live, the
 // `MOVx imm, disp(BX)` store form does not write BX, and no
 // other generated instruction between them touches BX as a
 // destination).
@@ -692,8 +692,8 @@ func extractSPSlots(line string) []string {
 //     on the branch keeps the analysis straight even if a later
 //     pass interleaves fall-through code).
 //   - Any instruction whose destination operand is exactly the
-//     target register (bare BX / R0 — `MOVQ src, BX`, `LEAQ ..., BX`,
-//     `ADDQ src, BX`, `MOVD src, R0`, etc.). CMP / TEST do not
+//     target register (bare BX / R2 — `MOVQ src, BX`, `LEAQ ..., BX`,
+//     `ADDQ src, BX`, `MOVD src, R2`, etc.). CMP / TEST do not
 //     write either operand and are excluded.
 //
 // The pass is a separate post-step from peepholeOpt because it
@@ -707,7 +707,7 @@ func dedupMemMReload(asm string) string {
 	lines := strings.Split(asm, "\n")
 	out := make([]string, 0, len(lines))
 	bxValid := false
-	r0Valid := false
+	r2Valid := false
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		// amd64 m.M load pair?
@@ -741,46 +741,48 @@ func dedupMemMReload(asm string) string {
 		}
 		// arm64 m.M load pair?
 		if i+1 < len(lines) &&
-			strings.TrimRight(line, " \t") == "\tMOVD m+0(FP), R0" &&
-			strings.TrimRight(lines[i+1], " \t") == "\tMOVD 32(R0), R0" {
-			if r0Valid {
+			strings.TrimRight(line, " \t") == "\tMOVD m+0(FP), R2" &&
+			strings.TrimRight(lines[i+1], " \t") == "\tMOVD 32(R2), R2" {
+			if r2Valid {
 				i++
 				continue
 			}
 			out = append(out, line, lines[i+1])
 			i++
-			r0Valid = true
+			r2Valid = true
 			continue
 		}
-		// arm64 m.M load via the R26 m-cache?
-		// Pattern: `MOVD 32(R26), R0`. Same logic as amd64's
+		// arm64 m.M load via the R4 m-cache?
+		// Pattern: `MOVD 32(R4), R2`. Same logic as amd64's
 		// `MOVQ 32(R11), BX`. The arm64 m-cache reservation places m
-		// in R26.
-		if strings.TrimRight(line, " \t") == "\tMOVD 32(R26), R0" {
-			if r0Valid {
+		// in R4 (archARM64.MCacheReg) and the memop emitters carry
+		// m.M in R2, addressing memory as (R2)(R3) so the memop
+		// itself never clobbers R2.
+		if strings.TrimRight(line, " \t") == "\tMOVD 32(R4), R2" {
+			if r2Valid {
 				continue
 			}
 			out = append(out, line)
-			r0Valid = true
+			r2Valid = true
 			continue
 		}
 		// State transitions for the current line.
 		switch {
 		case isAsmLabel(line):
 			bxValid = false
-			r0Valid = false
+			r2Valid = false
 		case isAsmCall(line):
 			bxValid = false
-			r0Valid = false
+			r2Valid = false
 		case isAsmUnconditionalOrCondBranch(line):
 			bxValid = false
-			r0Valid = false
+			r2Valid = false
 		default:
 			if writesRegister(line, "BX") {
 				bxValid = false
 			}
-			if writesRegister(line, "R0") {
-				r0Valid = false
+			if writesRegister(line, "R2") {
+				r2Valid = false
 			}
 		}
 		out = append(out, line)

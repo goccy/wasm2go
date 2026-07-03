@@ -226,3 +226,82 @@ func TestFlowDedupAcrossDiamondEndToEnd(t *testing.T) {
 		t.Errorf("want at most 2 m.M reloads (one per arm, none at the merge), got %d:\n%s", n, asm)
 	}
 }
+
+// TestMemBaseFlowDedup_ARM64LoopHeader mirrors the amd64 loop-header
+// shape for the arm64 config: R2 carries m.M, R4 is the m cache, and
+// register-offset addressing keeps R2 alive through the memop, so
+// the in-loop reload folds when the body is call-free.
+func TestMemBaseFlowDedup_ARM64LoopHeader(t *testing.T) {
+	in := strings.Join([]string{
+		"\tMOVD 32(R4), R2",
+		"\tMOVWU R5, R3",
+		"\tMOVW (R2)(R3), R6",
+		"L1:",
+		"\tMOVD 32(R4), R2", // redundant: preheader valid, body call-free
+		"\tMOVWU R6, R3",
+		"\tMOVW (R2)(R3), R6",
+		"\tADDW $1, R7, R7",
+		"\tCMPW R8, R7",
+		"\tBNE L1",
+		"\tRET",
+	}, "\n")
+	got := memBaseFlowDedup(in)
+	if n := strings.Count(got, "\tMOVD 32(R4), R2"); n != 1 {
+		t.Fatalf("want 1 arm64 reload (preheader only), got %d:\n%s", n, got)
+	}
+}
+
+// TestMemBaseFlowDedup_ARM64CallKills: a CALL in the loop body keeps
+// the header reload alive.
+func TestMemBaseFlowDedup_ARM64CallKills(t *testing.T) {
+	in := strings.Join([]string{
+		"\tMOVD 32(R4), R2",
+		"L1:",
+		"\tMOVD 32(R4), R2",
+		"\tMOVWU R5, R3",
+		"\tMOVW (R2)(R3), R6",
+		"\tCALL ·Fn1(SB)",
+		"\tMOVD m+0(FP), R4",
+		"\tBNE L1",
+		"\tRET",
+	}, "\n")
+	got := memBaseFlowDedup(in)
+	if n := strings.Count(got, "\tMOVD 32(R4), R2"); n != 2 {
+		t.Fatalf("want both arm64 reloads kept, got %d:\n%s", n, got)
+	}
+}
+
+// TestARM64RegisterOffsetAndFlowDedupEndToEnd pins the arm64 memop
+// shape on real emitted output: accesses use register-offset
+// addressing `(R2)(R3)` (no `ADD R3, R2, R2` clobber), so dependent
+// loads share a single m.M read.
+func TestARM64RegisterOffsetAndFlowDedupEndToEnd(t *testing.T) {
+	sig := wasm.FuncType{Params: []wasm.ValType{wasm.ValI32}, Results: []wasm.ValType{wasm.ValI32}}
+	fsig := ssa.FuncSig{Params: []ssa.Type{ssa.TypeI32}, Results: []ssa.Type{ssa.TypeI32}}
+	bb := ssa.NewFuncBuilder("dixa64", fsig)
+	b0 := bb.NewBlock(ssa.BlockRet)
+	bb.SetEntry(b0)
+	bb.SetCurrent(b0)
+	base := bb.Param(0, ssa.TypeI32)
+	v1 := bb.NewValueAuxInt(ssa.OpLoad32, ssa.TypeI32, 0, base)
+	v2 := bb.NewValueAuxInt(ssa.OpLoad32, ssa.TypeI32, 8, v1)
+	v3 := bb.NewValueAuxInt(ssa.OpLoad32, ssa.TypeI32, 4, v1)
+	sum := bb.NewValue(ssa.OpAdd32, ssa.TypeI32, v2, v3)
+	bb.FinishRet(sum)
+	if err := ssa.Verify(bb.Func()); err != nil {
+		t.Fatalf("SSA verify: %v", err)
+	}
+	asm, _, err := EmitFuncARM64("dixa64", sig, bb.Func(), FuncOptions{ModulePkgRef: "*Module"})
+	if err != nil {
+		t.Fatalf("EmitFuncARM64: %v", err)
+	}
+	if strings.Contains(asm, "ADD R3, R2, R2") {
+		t.Errorf("R2-clobbering ADD survived — memops must use (R2)(R3) addressing:\n%s", asm)
+	}
+	if !strings.Contains(asm, "(R2)(R3)") {
+		t.Errorf("expected register-offset `(R2)(R3)` addressing:\n%s", asm)
+	}
+	if n := strings.Count(asm, "\tMOVD 32(R4), R2"); n != 1 {
+		t.Errorf("want exactly 1 m.M reload for 3 dependent loads, got %d:\n%s", n, asm)
+	}
+}
