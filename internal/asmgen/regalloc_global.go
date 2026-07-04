@@ -266,7 +266,9 @@ func computeGlobalRegHomes(f *ssa.Func, plan *funcPlan) {
 		}
 		if vs := os.Getenv("WASM2GO_GLOBAL_REGALLOC_DEBUG_VAL"); vs != "" {
 			var vid int
-			fmt.Sscanf(vs, "%d", &vid)
+			if _, err := fmt.Sscanf(vs, "%d", &vid); err != nil {
+				vid = -1
+			}
 			for j, b2 := range f.Blocks {
 				if liveIn[j][ssa.ValueID(vid)] || liveOut[j][ssa.ValueID(vid)] {
 					fmt.Fprintf(os.Stderr, "  v%d live ord=%d blockID=%d in=%v out=%v\n",
