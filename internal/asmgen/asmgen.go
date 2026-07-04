@@ -165,6 +165,13 @@ type arch interface {
 	// operandSrcFloat would emit
 	// amd64-only X<n> register names that arm64's assembler rejects.
 	SupportsRegHome() bool
+	// SupportsGlobalRegalloc reports whether the arch's emit paths
+	// honour plan.regHome for cross-block, whole-lifetime register
+	// residency of arbitrary (non-phi) values — the Phase R
+	// function-wide linear scan. amd64 opts in (its coalesce path
+	// already proved the cross-block contract); arm64 stays off
+	// until its per-op emits pass the same audit.
+	SupportsGlobalRegalloc() bool
 	// SupportsLoopCarryCoalesce reports whether the arch has a
 	// validated emit path for the cross-block loop-carry coalesce pass
 	// (a carry kept in a reserved register across an entire loop body,
@@ -306,6 +313,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	plan.sseRegPool = a.SSERegPool()
 	plan.regHomeEligibleOpFn = a.RegHomeEligibleOp
 	plan.supportsCoalesce = a.SupportsLoopCarryCoalesce()
+	plan.supportsGlobalRegalloc = a.SupportsGlobalRegalloc()
 	plan.coalescePool = a.CoalesceRegPool()
 	plan.helperInlineFn = a.HelperIsInline
 
@@ -2045,18 +2053,24 @@ type funcPlan struct {
 	// across a whole loop. emitFunc seeds it from
 	// arch.SupportsLoopCarryCoalesce(); only amd64 opts in today.
 	supportsCoalesce bool
-	offsets          map[ssa.ValueID]int
-	hoist            map[ssa.ValueID]bool
-	phiTemp          map[ssa.ValueID]int
-	phisOf           map[ssa.BlockID][]*ssa.Value
-	hasPhi           map[ssa.BlockID]bool
-	staged           map[ssa.BlockID]bool
-	hasCall          bool
-	frameSize        int
-	calleeArea       int // bytes reserved at low SP for callee-arg staging
-	helperPfx        string
-	helperRefs       map[ssa.ValueID]string
-	directs          map[ssa.ValueID]*directCall
+	// supportsGlobalRegalloc gates the function-wide linear scan
+	// (Phase R). Requires the arch's producer AND consumer emit paths
+	// to honour plan.regHome for values read/written in blocks other
+	// than the defining one — the same contract the coalesce pass
+	// exercises, extended to non-phi values.
+	supportsGlobalRegalloc bool
+	offsets                map[ssa.ValueID]int
+	hoist                  map[ssa.ValueID]bool
+	phiTemp                map[ssa.ValueID]int
+	phisOf                 map[ssa.BlockID][]*ssa.Value
+	hasPhi                 map[ssa.BlockID]bool
+	staged                 map[ssa.BlockID]bool
+	hasCall                bool
+	frameSize              int
+	calleeArea             int // bytes reserved at low SP for callee-arg staging
+	helperPfx              string
+	helperRefs             map[ssa.ValueID]string
+	directs                map[ssa.ValueID]*directCall
 	// hasMem records whether the function performs at least one
 	// load / store / mem-size / mem-grow op. Drives the
 	// `mCacheCandidate` decision — only memory-touching functions

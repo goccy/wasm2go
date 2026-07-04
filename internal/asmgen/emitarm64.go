@@ -107,6 +107,11 @@ func (archARM64) EmitBrTableCmpBranch(b *strings.Builder, val int32, eqLabel, lt
 
 func (archARM64) SupportsRegHome() bool { return true }
 
+// SupportsGlobalRegalloc — arm64 stays off until its per-op emit
+// paths pass the cross-block regHome audit (several still assume
+// slot-resident operands outside the block-local patterns).
+func (archARM64) SupportsGlobalRegalloc() bool { return false }
+
 // SupportsLoopCarryCoalesce — arm64 opts into the cross-block
 // loop-carry coalesce pass. The SHARED mode is safe because the
 // candidate filter only accepts carries whose producer op passes

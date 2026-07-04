@@ -197,6 +197,11 @@ func (archAMD64) EmitBrTableCmpBranch(b *strings.Builder, val int32, eqLabel, lt
 
 func (archAMD64) SupportsRegHome() bool { return true }
 
+// SupportsGlobalRegalloc — amd64's producer/consumer emits honour
+// plan.regHome across blocks (proven by the loop-carry coalesce
+// path), so the Phase R function-wide scan is enabled.
+func (archAMD64) SupportsGlobalRegalloc() bool { return true }
+
 // SupportsLoopCarryCoalesce — amd64 has the validated coalesce emit
 // path (EmitPhiCopyValueToReg on the entry edge, back-edge copy
 // short-circuited).
@@ -656,14 +661,16 @@ func operandSrc32(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) st
 	if v.Op == ssa.OpConst32 {
 		return fmt.Sprintf("$%d", int32(v.AuxInt))
 	}
+	// regHome first: a split-range OpParam (Phase R) lives in its
+	// register between calls; only home-less params read the FP slot.
+	if reg := plan.regHome[v.ID]; reg != "" {
+		return reg
+	}
 	if v.Op == ssa.OpParam {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
 		}
-	}
-	if reg := plan.regHome[v.ID]; reg != "" {
-		return reg
 	}
 	return fmt.Sprintf("%d(%s)", plan.offsets[v.ID], spReg)
 }
@@ -680,14 +687,16 @@ func operandSrc64(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) st
 			return fmt.Sprintf("$%d", c)
 		}
 	}
+	// regHome first: a split-range OpParam (Phase R) lives in its
+	// register between calls; only home-less params read the FP slot.
+	if reg := plan.regHome[v.ID]; reg != "" {
+		return reg
+	}
 	if v.Op == ssa.OpParam {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
 		}
-	}
-	if reg := plan.regHome[v.ID]; reg != "" {
-		return reg
 	}
 	return fmt.Sprintf("%d(%s)", plan.offsets[v.ID], spReg)
 }
@@ -737,14 +746,16 @@ func operandSrc64ARM64(v *ssa.Value, plan *funcPlan, frame argFrame) string {
 // OpConstF32/F64 (those still allocate a slot).
 func operandSrcFloat(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) string {
 	v = resolveCopy(v)
+	// regHome first: a split-range OpParam (Phase R) lives in its
+	// register between calls; only home-less params read the FP slot.
+	if reg := plan.regHome[v.ID]; reg != "" {
+		return reg
+	}
 	if v.Op == ssa.OpParam {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
 		}
-	}
-	if reg := plan.regHome[v.ID]; reg != "" {
-		return reg
 	}
 	return fmt.Sprintf("%d(%s)", plan.offsets[v.ID], spReg)
 }

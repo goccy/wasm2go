@@ -175,6 +175,13 @@ func computeRegHomes(f *ssa.Func, plan *funcPlan) {
 	if plan.supportsCoalesce && os.Getenv("WASM2GO_NO_COALESCE") == "" {
 		runCoalescePass(f, plan)
 	}
+	// The function-wide linear scan (Phase R, regalloc_global.go) runs
+	// between the coalesce pass (whose loop reservations it honours)
+	// and the per-block scan (which honours the interval reservations
+	// it writes). Ordering is load-bearing — see computeGlobalRegHomes.
+	if plan.supportsGlobalRegalloc {
+		computeGlobalRegHomes(f, plan)
+	}
 	for _, blk := range f.Blocks {
 		assignBlockRegHomes(blk, f, plan)
 	}

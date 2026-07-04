@@ -435,6 +435,20 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		plan.coalescedPhi[c.phi.ID] = reg
 		reserve(reg, c.body)
 		reserve(reg, c.liveOutside)
+		// Every predecessor of the phi's block runs an entry- or
+		// back-edge copy INTO the reserved register at its tail
+		// (EmitPhiCopyValueToReg). Blocks outside body/liveOutside —
+		// a forward entry pred in particular — must also be reserved,
+		// or an allocator handing the register to a value whose last
+		// use is a phi-arg read at that same tail gets clobbered by
+		// the adjacent edge copy (found by the Phase R global scan:
+		// entry-pred tail did `MOVL src, R13` right between another
+		// value's R13 def and its edge-copy read).
+		predBlocks := map[ssa.BlockID]bool{}
+		for _, pe := range c.phi.Block.Preds {
+			predBlocks[pe.Block.ID] = true
+		}
+		reserve(reg, predBlocks)
 	}
 }
 
@@ -587,6 +601,14 @@ func trySharedCoalesce(
 	plan.regHome[actual.ID] = reg
 	plan.coalescedPhi[phi.ID] = reg
 	reserve(reg, body)
+	// Reserve the phi block's predecessors too — their tails run the
+	// edge copies that write the register (see the own-register mode
+	// for the clobber this prevents).
+	hdrPreds := map[ssa.BlockID]bool{}
+	for _, pe := range phi.Block.Preds {
+		hdrPreds[pe.Block.ID] = true
+	}
+	reserve(reg, hdrPreds)
 	// The register must survive on every out-of-body block the carry
 	// (or the phi) is still live in: an exit-path reader consumes it
 	// via operandSrc long after the loop, and a block-local value
