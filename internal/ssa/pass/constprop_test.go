@@ -80,3 +80,58 @@ func TestConstPropLeavesUnknownAlone(t *testing.T) {
 		t.Errorf("OpAdd32 disappeared:\n%s", dump)
 	}
 }
+
+// TestConstPropFoldsWidthConversions pins the unary folds: extends
+// and truncations of integer constants become constants. The shapes
+// rarely survive the wasm frontend alone but appear as soon as any
+// pass substitutes a constant into an existing expression — and the
+// amd64 emitter cannot encode `MOVLQSX $imm, reg`, so the fold
+// doubles as a correctness backstop.
+func TestConstPropFoldsWidthConversions(t *testing.T) {
+	cases := []struct {
+		op   ssa.Op
+		in   int64
+		out  int64
+		outT ssa.Type
+	}{
+		{ssa.OpExtend32To64S, -1, -1, ssa.TypeI64},
+		{ssa.OpExtend32To64S, 0x7FFFFFFF, 0x7FFFFFFF, ssa.TypeI64},
+		{ssa.OpExtend32To64U, -1, 0xFFFFFFFF, ssa.TypeI64},
+		{ssa.OpTrunc64To32, 0x1_0000_0005, 5, ssa.TypeI32},
+		{ssa.OpTrunc64To32, -1, -1, ssa.TypeI32},
+	}
+	for _, tc := range cases {
+		bb := ssa.NewFuncBuilder("f", ssa.FuncSig{Results: []ssa.Type{tc.outT}})
+		b0 := bb.NewBlock(ssa.BlockRet)
+		bb.SetEntry(b0)
+		bb.SetCurrent(b0)
+		var c *ssa.Value
+		if tc.op == ssa.OpTrunc64To32 {
+			c = bb.Const64(tc.in)
+		} else {
+			c = bb.Const32(int32(tc.in))
+		}
+		conv := bb.NewValue(tc.op, tc.outT, c)
+		bb.FinishRet(conv)
+		f := bb.Func()
+		if !ConstProp(f) {
+			t.Errorf("%v(%d): no fold", tc.op, tc.in)
+			continue
+		}
+		if conv.Op != ssa.OpConst32 && conv.Op != ssa.OpConst64 {
+			t.Errorf("%v(%d): folded to %v, want a constant", tc.op, tc.in, conv.Op)
+			continue
+		}
+		got := conv.AuxInt
+		if conv.Op == ssa.OpConst32 {
+			got = int64(int32(got))
+		}
+		want := tc.out
+		if tc.outT == ssa.TypeI32 {
+			want = int64(int32(want))
+		}
+		if got != want {
+			t.Errorf("%v(%d) = %d, want %d", tc.op, tc.in, got, want)
+		}
+	}
+}

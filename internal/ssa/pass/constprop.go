@@ -34,6 +34,37 @@ func ConstProp(f *ssa.Func) bool {
 // foldValue rewrites v in place if both of its arguments are known
 // integer constants. Returns true on change.
 func foldValue(v *ssa.Value) bool {
+	// Unary width conversions of a constant. These shapes rarely
+	// survive the wasm frontend on their own, but cross-function
+	// inlining (and any future pass that substitutes constants into
+	// cloned bodies) exposes them — and the amd64 emitter relies on
+	// extend operands never being immediates (`MOVLQSX $-1, AX` is
+	// not encodable), so folding here is a correctness backstop as
+	// well as an optimization.
+	if len(v.Args) == 1 && v.Args[0] != nil {
+		if c, ok := intConst(v.Args[0]); ok {
+			switch v.Op {
+			case ssa.OpExtend32To64S:
+				v.Op = ssa.OpConst64
+				v.Type = ssa.TypeI64
+				v.AuxInt = int64(int32(c))
+			case ssa.OpExtend32To64U:
+				v.Op = ssa.OpConst64
+				v.Type = ssa.TypeI64
+				v.AuxInt = int64(uint32(c))
+			case ssa.OpTrunc64To32:
+				v.Op = ssa.OpConst32
+				v.Type = ssa.TypeI32
+				v.AuxInt = int64(int32(c))
+			default:
+				return false
+			}
+			v.Args = nil
+			v.Aux = nil
+			return true
+		}
+		return false
+	}
 	if len(v.Args) != 2 {
 		return false
 	}
