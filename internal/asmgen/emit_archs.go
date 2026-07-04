@@ -548,10 +548,23 @@ func emitValueAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 
 	// --- Integer extensions / truncation ---
 	case ssa.OpExtend32To64S:
+		// MOVLQSX rejects immediate sources; a constant arg (possible
+		// whenever a pass substitutes constants without a ConstProp
+		// re-run) is extended at generation time instead.
+		if c, ok := inlineableI32(v.Args[0]); ok {
+			fmt.Fprintf(b, "\tMOVQ $%d, AX\n", int64(c))
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", plan.offsets[v.ID])
+			return nil
+		}
 		fmt.Fprintf(b, "\tMOVLQSX %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
 		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", plan.offsets[v.ID])
 		return nil
 	case ssa.OpExtend32To64U:
+		if c, ok := inlineableI32(v.Args[0]); ok {
+			fmt.Fprintf(b, "\tMOVQ $%d, AX\n", int64(uint32(c)))
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", plan.offsets[v.ID])
+			return nil
+		}
 		fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
 		// MOVL into a 64-bit register zero-extends on amd64.
 		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", plan.offsets[v.ID])
