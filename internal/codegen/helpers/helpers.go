@@ -72,45 +72,59 @@ func wasm_trap_int_overflow() { panic("wasm: integer overflow") }
 //go:noinline
 func wasm_trap_invalid_conv() { panic("wasm: invalid conversion to integer") }
 
+//go:noinline
+func wasm_trap_unreachable() { panic("wasm: unreachable") }
+
+//go:noinline
+func wasm_trap_memfill_oob() { panic("wasm: memory.fill out of bounds") }
+
+//go:noinline
+func wasm_trap_memcopy_oob() { panic("wasm: memory.copy out of bounds") }
+
+// wasm_trap_unreachable is only called from generated function bodies
+// (the SSA emitter's BlockUnreachable/OpUnreachable lowering), never
+// from the other helpers in this file.
+var _ = wasm_trap_unreachable
+
 // ----- Integer division with overflow / divide-by-zero traps --------------
 
 func i32_div_s(x, y int32) int32 {
 	if y == -1 && x == math.MinInt32 {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	return x / y
 }
 
 func i64_div_s(x, y int64) int64 {
 	if y == -1 && x == math.MinInt64 {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	return x / y
 }
 
 func i32_div_u(x, y uint32) uint32 {
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	return x / y
 }
 
 func i64_div_u(x, y uint64) uint64 {
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	return x / y
 }
 
 func i32_rem_s(x, y int32) int32 {
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	if y == -1 {
 		// Per spec, MIN_INT % -1 == 0 and does NOT trap.
@@ -121,7 +135,7 @@ func i32_rem_s(x, y int32) int32 {
 
 func i64_rem_s(x, y int64) int64 {
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	if y == -1 {
 		return 0
@@ -131,14 +145,14 @@ func i64_rem_s(x, y int64) int64 {
 
 func i32_rem_u(x, y uint32) uint32 {
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	return x % y
 }
 
 func i64_rem_u(x, y uint64) uint64 {
 	if y == 0 {
-		panic("wasm: integer divide by zero")
+		wasm_trap_div_zero()
 	}
 	return x % y
 }
@@ -291,31 +305,31 @@ func f64_nearest(x float64) float64 { return math.RoundToEven(x) }
 
 func i32_trunc_f32_s(x float32) int32 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	// Lower bound is `> -2147483904.0` (one ULP below -2^31 in f32),
 	// not `>= -2^31`, because every f32 in (-2147483904, -2147483648]
 	// rounds to -2^31 and is representable as int32. The wasm
 	// reference interpreter uses these bounds; replicate.
 	if !(x > -2147483904.0 && x < 2147483648.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int32(x)
 }
 
 func i32_trunc_f32_u(x float32) int32 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	if !(x > -1.0 && x < 4294967296.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int32(uint32(x))
 }
 
 func i32_trunc_f64_s(x float64) int32 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	// The wasm spec accepts every f64 whose truncation lies in
 	// [-2^31, 2^31). With f64 precision, -2147483648.5 truncates to
@@ -323,24 +337,24 @@ func i32_trunc_f64_s(x float64) int32 {
 	// below -2^31 (-2147483649.0). The previous closed lower bound
 	// rejected -2147483648.5 / -2147483648.9999 — both legal inputs.
 	if !(x > -2147483649.0 && x < 2147483648.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int32(x)
 }
 
 func i32_trunc_f64_u(x float64) int32 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	if !(x > -1.0 && x < 4294967296.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int32(uint32(x))
 }
 
 func i64_trunc_f32_s(x float32) int64 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	// Lower bound is one f32 ULP below -2^63. The smallest f32
 	// strictly greater than -2^64 is -9223373136366403584.0 — every
@@ -348,37 +362,37 @@ func i64_trunc_f32_s(x float32) int64 {
 	// smallest int64. The wasm reference interpreter uses these
 	// strict-inequality bounds; replicate.
 	if !(float64(x) > -9223373136366403584.0 && float64(x) < 9223372036854775808.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int64(x)
 }
 
 func i64_trunc_f32_u(x float32) int64 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	if !(x > -1.0 && float64(x) < 18446744073709551616.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int64(uint64(x))
 }
 
 func i64_trunc_f64_s(x float64) int64 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	if !(x >= -9223372036854775808.0 && x < 9223372036854775808.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int64(x)
 }
 
 func i64_trunc_f64_u(x float64) int64 {
 	if x != x {
-		panic("wasm: invalid conversion to integer")
+		wasm_trap_invalid_conv()
 	}
 	if !(x > -1.0 && x < 18446744073709551616.0) {
-		panic("wasm: integer overflow")
+		wasm_trap_int_overflow()
 	}
 	return int64(uint64(x))
 }
@@ -970,7 +984,7 @@ func memoryFill(m *Module, dst int32, val int32, n int32) {
 	}
 	end := uint64(uint32(dst)) + uint64(uint32(n))
 	if end > uint64(len(m.memory)) {
-		panic("wasm: memory.fill out of bounds")
+		wasm_trap_memfill_oob()
 	}
 	b := m.memory[uint32(dst):uint32(end)]
 	v := byte(val)
@@ -999,7 +1013,7 @@ func memoryCopy(m *Module, dst int32, src int32, n int32) {
 	srcEnd := uint64(uint32(src)) + uint64(uint32(n))
 	dstEnd := uint64(uint32(dst)) + uint64(uint32(n))
 	if srcEnd > uint64(len(m.memory)) || dstEnd > uint64(len(m.memory)) {
-		panic("wasm: memory.copy out of bounds")
+		wasm_trap_memcopy_oob()
 	}
 	copy(m.memory[uint32(dst):uint32(dstEnd)], m.memory[uint32(src):uint32(srcEnd)])
 }

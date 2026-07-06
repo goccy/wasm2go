@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -89,6 +90,20 @@ func runGoSnippet(t *testing.T, generated string, mainSrc string, sidecars ...ma
 	return runGoSnippetWithAux(t, generated, mainSrc, sidecars, nil)
 }
 
+// pureGuardRe matches codegen's pure-Go fallback build constraint.
+var pureGuardRe = regexp.MustCompile(`(?m)^//go:build !amd64 && !arm64\n`)
+
+// stripPureGuard removes the `//go:build !amd64 && !arm64` constraint from
+// a generated file so codegen's pure-Go function bodies compile and run on
+// the amd64/arm64 test host. In production the gcasm backend supplies the
+// per-arch asm for those GOARCHs (see transpile.Translate); codegen alone
+// now emits only the pure bodies, so these codegen tests — which exercise
+// that output directly and cannot import transpile (import cycle) — must
+// activate the pure path on the host. No-op on files without the guard.
+func stripPureGuard(data []byte) []byte {
+	return pureGuardRe.ReplaceAll(data, nil)
+}
+
 // runGoSnippetWithAux is the auxFiles-aware variant of runGoSnippet. The
 // auxFiles map carries raw Go-source files (typically the WASI per-
 // platform companions) that must land alongside gen.go without going
@@ -112,7 +127,7 @@ func runGoSnippetWithAux(t *testing.T, generated, mainSrc string, sidecars []map
 			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(p, data, 0644); err != nil {
+			if err := os.WriteFile(p, stripPureGuard(data), 0644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -122,7 +137,7 @@ func runGoSnippetWithAux(t *testing.T, generated, mainSrc string, sidecars []map
 		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p, data, 0644); err != nil {
+		if err := os.WriteFile(p, stripPureGuard(data), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}

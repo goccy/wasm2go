@@ -51,7 +51,7 @@ func assertSingleFileCompiles(t *testing.T, src string, sidecars map[string][]by
 		t.Fatal(err)
 	}
 	for name, data := range sidecars {
-		if err := os.WriteFile(filepath.Join(dir, "pkg", name), data, 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "pkg", name), stripPureGuard(data), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -61,7 +61,7 @@ func assertSingleFileCompiles(t *testing.T, src string, sidecars map[string][]by
 			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(p, data, 0644); err != nil {
+			if err := os.WriteFile(p, stripPureGuard(data), 0644); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -242,7 +242,7 @@ func translateMultiToDir(t *testing.T, mod *wasm.Module, opts codegen.Options, b
 		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p, res.Files[rel], 0644); err != nil {
+		if err := os.WriteFile(p, stripPureGuard(res.Files[rel]), 0644); err != nil {
 			t.Fatal(err)
 		}
 		if strings.HasSuffix(rel, ".s") {
@@ -254,7 +254,7 @@ func translateMultiToDir(t *testing.T, mod *wasm.Module, opts codegen.Options, b
 		}
 	}
 	for name, data := range res.Sidecars {
-		if err := os.WriteFile(filepath.Join(dir, subdir, name), data, 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, subdir, name), stripPureGuard(data), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -322,12 +322,12 @@ func TestMultiPackageDataSidecar(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p, data, 0644); err != nil {
+		if err := os.WriteFile(p, stripPureGuard(data), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for name, data := range res.Sidecars {
-		if err := os.WriteFile(filepath.Join(dir, "wmod", name), data, 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "wmod", name), stripPureGuard(data), 0644); err != nil {
 			t.Fatal(err)
 		}
 	}

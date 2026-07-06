@@ -416,10 +416,16 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 			}
 			body.List = append(body.List, &ast.ReturnStmt{Results: results})
 		case ssa.BlockUnreachable:
+			// Out-of-line trap helper, not an inline panic: keeps the
+			// cold panic constructor (and its rodata operands) out of
+			// hot function bodies, matching the other wasm_trap_*
+			// paths.
 			body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
-				Fun:  newID("panic"),
-				Args: []ast.Expr{stringLit("wasm: unreachable")},
+				Fun: em.helperRef("wasm_trap_unreachable"),
 			}})
+			// The helper never returns, but Go's termination analysis
+			// only trusts panic/for{} — keep the function well-formed.
+			body.List = append(body.List, &ast.ForStmt{Body: &ast.BlockStmt{}})
 		default:
 			return nil, fmt.Errorf("ssa emit: unknown block kind %v on b%d", blk.Kind, blk.ID)
 		}
@@ -681,9 +687,9 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 		}
 		return &ast.ExprStmt{X: expr}, nil
 	case ssa.OpUnreachable:
+		// Same out-of-line trap shape as BlockUnreachable above.
 		return &ast.ExprStmt{X: &ast.CallExpr{
-			Fun:  newID("panic"),
-			Args: []ast.Expr{stringLit("wasm: unreachable")},
+			Fun: em.helperRef("wasm_trap_unreachable"),
 		}}, nil
 	case ssa.OpMemGrow:
 		// memory.grow value typically discarded; still emit as expr stmt.

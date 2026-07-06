@@ -22,10 +22,12 @@ package transpile
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/codegen"
+	"github.com/goccy/wasm2go/internal/gcasm"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
@@ -61,11 +63,47 @@ func Parse(r io.Reader) (*Module, error) {
 // When the wasm exceeds the budget, w is unused and Result.Files
 // holds the relative-path → bytes for the multi-package layout. It
 // is the library entry point that the wasm2go command itself wraps.
+//
+// The amd64 fast path is the gcasm backend: the pure-Go bodies are
+// compiled by the host Go toolchain at GENERATION time, the -S
+// listings are captured and mechanically transformed into ABI0 .s
+// (see internal/gcasm). Functions the transform cannot register-map
+// keep their pure bodies per-function. Every non-amd64 GOARCH builds
+// the pure code, which outperforms the retired own-emitter asm in
+// every measured configuration.
 func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
-	res, err := codegen.Translate(w, m, opts)
+	var mainBuf bytes.Buffer
+	res, err := codegen.Translate(&mainBuf, m, opts)
 	if err != nil {
 		return res, err
 	}
+
+	// gcasm backend: replace the own-emitter asm bundle.
+	treeIn := map[string][]byte{}
+	for name, data := range res.Sidecars {
+		treeIn[name] = data
+	}
+	for name, data := range res.Files {
+		treeIn[name] = data
+	}
+	gcasmFiles, _, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath)
+	if err != nil {
+		return res, fmt.Errorf("gcasm backend: %w", err)
+	}
+	if res.Files == nil {
+		res.Files = map[string][]byte{}
+	}
+	for name, data := range gcasmFiles {
+		if data == nil {
+			delete(res.Files, name)
+			continue
+		}
+		res.Files[name] = data
+	}
+	if _, err := w.Write(mainBuf.Bytes()); err != nil {
+		return res, err
+	}
+
 	// Weave a `purego` escape into every generated build constraint so the
 	// pure-Go fallback can be selected on ANY GOARCH with `-tags purego`.
 	// This is a no-op for normal builds (purego is off by default, so the
@@ -106,9 +144,14 @@ func rewriteLeadingBuildConstraint(src []byte) []byte {
 			return src // already escaped
 		}
 		var ne string
-		if expr == "!amd64 && !arm64" {
+		switch expr {
+		case "!amd64 && !arm64":
 			ne = "(!amd64 && !arm64) || purego"
-		} else {
+		case "!amd64":
+			// gcasm-mode pure guard: pure serves every non-amd64
+			// GOARCH, plus amd64 under -tags purego.
+			ne = "!amd64 || purego"
+		default:
 			ne = "(" + expr + ") && !purego"
 		}
 		lines[i] = []byte("//go:build " + ne)

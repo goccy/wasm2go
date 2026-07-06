@@ -168,7 +168,7 @@ func runGoSnippetExpectPanic(t *testing.T, generated, mainSrc string, extraFiles
 			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(p, data, 0644); err != nil {
+			if err := os.WriteFile(p, stripPureGuard(data), 0644); err != nil {
 				t.Fatal(err)
 			}
 		}
