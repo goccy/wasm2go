@@ -195,7 +195,21 @@ func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64) ast.Expr {
 		// to uintptr.
 		addr := ast.Expr(&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{baseExpr}})
 		if offset != 0 {
-			addr = &ast.BinaryExpr{X: addr, Op: token.ADD, Y: uintLit(offset)}
+			var off ast.Expr = uintLit(offset)
+			// A large static offset added to a runtime index must NOT be
+			// emitted as a bare immediate: the gc ARM64 backend fuses
+			// adjacent f64 loads at a common base into an FLDPD (load-pair)
+			// and bakes the offset into its immediate field, whose range
+			// is tiny — a multi-MB offset then fails to assemble
+			// ("constant is not in pool"). Routing the offset through the
+			// _consts table forces a runtime memory load, so the backend
+			// keeps the offset in a register (register-offset LDR) and no
+			// out-of-range immediate is ever formed. uint32(...) preserves
+			// the wasm unsigned-i32 wrap of the index+offset addition.
+			if offset >= largeConstThreshold && em.t != nil {
+				off = &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{em.constsIndexExpr(offset)}}
+			}
+			addr = &ast.BinaryExpr{X: addr, Op: token.ADD, Y: off}
 		}
 		return addr
 	}
