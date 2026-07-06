@@ -38,12 +38,12 @@ func TestMultiPackageBuildsAndCompiles(t *testing.T) {
 				if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(p, data, 0644); err != nil {
+				if err := os.WriteFile(p, stripPureGuard(data), 0644); err != nil {
 					t.Fatal(err)
 				}
 			}
 			for name, data := range res.Sidecars {
-				if err := os.WriteFile(filepath.Join(dir, "wmod", name), data, 0644); err != nil {
+				if err := os.WriteFile(filepath.Join(dir, "wmod", name), stripPureGuard(data), 0644); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -3,9 +3,9 @@
 // and the trivial SSA-only predicates those decisions rely on.
 //
 // Anything Go-syntax specific (Go-AST construction, identifier names,
-// type spellings) stays in internal/codegen. Anything per-architecture
-// (plan9 asm encoding, register allocation) stays in internal/asmgen.
-// emit is the layer they share.
+// type spellings) stays in internal/codegen. Per-architecture assembly
+// generation is the internal/gcasm backend (which captures gc's `-S`
+// output and transforms it). emit is the analysis layer they share.
 package emit
 
 import (

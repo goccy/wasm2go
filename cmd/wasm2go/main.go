@@ -20,8 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/goccy/wasm2go/internal/codegen"
 	"github.com/goccy/wasm2go/internal/wasm"
+	"github.com/goccy/wasm2go/transpile"
 )
 
 const multiFileThreshold = 1 << 20 // mirrors codegen.defaultMultiPackageThreshold
@@ -80,7 +80,7 @@ func main() {
 	}
 	wantsMulti := total > multiFileThreshold
 
-	opts := codegen.Options{
+	opts := transpile.Options{
 		Package:             *pkg,
 		OutputImportPath:    *importPath,
 		BulkExportPrefix:    *bulkExportPrefix,
@@ -93,7 +93,7 @@ func main() {
 		if *outDir == "" {
 			fail("input wasm requires multi-package output (total %d bytes of function bodies > %d threshold); pass -out-dir", total, multiFileThreshold)
 		}
-		res, err := codegen.Translate(io.Discard, mod, opts)
+		res, err := transpile.Translate(io.Discard, mod, opts)
 		if err != nil {
 			fail("translate: %v", err)
 		}
@@ -145,11 +145,22 @@ func main() {
 		outDirForSidecars = filepath.Dir(*out)
 	}
 
-	res, err := codegen.Translate(w, mod, opts)
+	res, err := transpile.Translate(w, mod, opts)
 	if err != nil {
 		fail("translate: %v", err)
 	}
 	if outDirForSidecars != "" {
+		// Single-file mode still carries companion files (the pure
+		// fallback + gcasm bundle) in res.Files.
+		for name, data := range res.Files {
+			p := filepath.Join(outDirForSidecars, name)
+			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+				fail("mkdir for %s: %v", p, err)
+			}
+			if err := os.WriteFile(p, data, 0644); err != nil {
+				fail("write %s: %v", p, err)
+			}
+		}
 		for name, data := range res.Sidecars {
 			p := filepath.Join(outDirForSidecars, name)
 			if err := os.WriteFile(p, data, 0644); err != nil {

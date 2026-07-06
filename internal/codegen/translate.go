@@ -221,6 +221,10 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	t.helpers["wasm_trap_div_zero"] = true
 	t.helpers["wasm_trap_int_overflow"] = true
 	t.helpers["wasm_trap_invalid_conv"] = true
+	// wasm_trap_unreachable is referenced by fn bodies emitted AFTER
+	// emitHelpers runs (the pure fallback render), so lazy helperRef
+	// registration is too late — pre-register like the others.
+	t.helpers["wasm_trap_unreachable"] = true
 
 	// accessMemory is the host-facing synchronised window into linear
 	// memory (out-of-band writers like go-python's interrupter use it;
@@ -405,15 +409,11 @@ func finalizeSinglePkgWithAsm(m *wasm.Module, opts Options, w io.Writer, goSrc [
 	if _, err := w.Write(shared); err != nil {
 		return Result{}, err
 	}
-	asmFiles, err := buildAsmFilesSingle(m, opts)
-	if err != nil {
-		return Result{}, err
-	}
+	// The gcasm backend (transpile.Translate) captures these pure bodies
+	// and emits the per-arch asm that replaces them; codegen produces the
+	// shared file (to w) and the `<pkg>_pure.go` fallback only.
 	files := map[string][]byte{
 		opts.Package + "_pure.go": fallback,
-	}
-	for k, v := range asmFiles {
-		files[k] = v
 	}
 	return Result{
 		Files:    files,
@@ -847,10 +847,9 @@ const (
 	// linknameForwardDeclOnly emits a bare Go function declaration
 	// (`func <fnName>(...) ...`) with NO //go:linkname directive
 	// and NO body. The chunk's <arch>.s file is expected to provide
-	// the body — typically as a TEXT directive whose payload is a
-	// tail-JMP into the remote chunk's asm body
-	// (appendAsmCrossChunkTrampolines is what writes that). Used in
-	// asm-trampoline mode when the host import path is plan-9-asm-
+	// the body — the gcasm backend emits the per-arch asm that
+	// provides that local symbol (transpile.Translate runs gcasm over
+	// the pure bodies). Used when the host import path is plan-9-asm-
 	// safe: there is no //go:linkname for the Go linker to fuse
 	// with the asm-side cross-package CALL — which would otherwise
 	// trip the nosplit wrapper cycle observed empirically with

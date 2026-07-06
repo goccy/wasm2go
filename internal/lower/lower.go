@@ -791,8 +791,8 @@ func (ls *lowerState) handleBrIf(r *wasm.InstrReader) error {
 //
 // Arity-0 tables (no branch payload) lower to a single BlockBrTable —
 // one successor per unique target, selector as Control — which the
-// pure emitter renders as a Go switch statement and asmgen as a
-// binary-search compare tree. This matters: the Go compiler lowers
+// pure emitter renders as a Go switch statement and the gcasm backend
+// as a binary-search compare tree. This matters: the Go compiler lowers
 // dense switch STATEMENTS to jump tables but never reconstructs a
 // switch from an if-else cascade, so the previous chain-of-Ifs
 // lowering executed O(len(cases)) sequential compares per dispatch
@@ -856,7 +856,7 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 	// goto compiles to, and the hot path this lowering exists for —
 	// becomes a single BlockBrTable with one edge per UNIQUE target.
 	// The pure emitter turns it into a Go switch (which the Go
-	// compiler lowers to a jump table) and asmgen into a
+	// compiler lowers to a jump table) and the gcasm backend into a
 	// binary-search compare tree; the old equality-If chain cost
 	// O(len(cases)) sequential compare+branch pairs per dispatch —
 	// measured at a 255-deep chain on CPython's eval loop, ~127

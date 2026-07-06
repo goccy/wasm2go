@@ -203,10 +203,15 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			out = append(out, rs)
 			b = nil
 		case ssa.BlockUnreachable:
+			// Out-of-line trap helper, matching the multi-block
+			// emitter: keeps the cold panic constructor out of hot
+			// function bodies.
 			out = append(out, &ast.ExprStmt{X: &ast.CallExpr{
-				Fun:  newID("panic"),
-				Args: []ast.Expr{stringLit("wasm: unreachable")},
+				Fun: se.em.helperRef("wasm_trap_unreachable"),
 			}})
+			// The helper never returns, but Go's termination analysis
+			// only trusts panic/for{} — keep the function well-formed.
+			out = append(out, &ast.ForStmt{Body: &ast.BlockStmt{}})
 			b = nil
 		case ssa.BlockPlain:
 			if len(b.Succs) != 1 {
