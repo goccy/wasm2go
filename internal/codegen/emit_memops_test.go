@@ -317,3 +317,32 @@ func constArgExpr(v *ssa.Value) ast.Expr {
 	}
 	return newID("?")
 }
+
+// TestMemOffsetExpr_RuntimeBaseLargeOffset guards the fix for the gc
+// ARM64 "FLDPD ... constant is not in pool" assembly failure. A large
+// static offset added to a RUNTIME index must be routed through the
+// _consts table (a runtime memory load) rather than emitted as a bare
+// immediate: the ARM64 backend fuses adjacent f64 loads at a common base
+// into a load-pair and bakes the offset into its tiny immediate field,
+// so a multi-MB offset otherwise fails to assemble. Small offsets stay
+// inline. (The constant-base path was already covered; this pins the
+// runtime-base path that regressed arm64 for wasmify's simplelib bundle.)
+func TestMemOffsetExpr_RuntimeBaseLargeOffset(t *testing.T) {
+	em := newSSAEmitter(&translator{})
+
+	large := formatExpr(t, em.memOffsetExpr(newID("v160"), 33571920))
+	if !strings.Contains(large, "_consts[") {
+		t.Errorf("large runtime-base offset must route through _consts, got: %s", large)
+	}
+	if strings.Contains(large, "33571920") {
+		t.Errorf("large offset must not appear as a bare immediate, got: %s", large)
+	}
+
+	small := formatExpr(t, em.memOffsetExpr(newID("v160"), 8))
+	if strings.Contains(small, "_consts") {
+		t.Errorf("small runtime-base offset must stay inline, got: %s", small)
+	}
+	if !strings.Contains(small, "8") {
+		t.Errorf("small offset should be an inline literal, got: %s", small)
+	}
+}
