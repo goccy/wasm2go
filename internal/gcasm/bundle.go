@@ -29,8 +29,8 @@ import (
 // OutputImportPath. Output: a file map to MERGE over the translated
 // tree — it re-tags each pure file to `//go:build !amd64`, drops the
 // own-backend .s/decls files (returning empty content marks deletion:
-// callers skip writing empties), and adds gcasm_amd64.s +
-// gcasm_decls_amd64.go per package.
+// callers skip writing empties), and adds amd64.s +
+// decls_amd64.go per package.
 type BuildStats struct {
 	Transformed int
 	Fallback    int
@@ -311,7 +311,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 				kb.WriteString("\t" + call + "\n")
 			}
 			kb.WriteString("}\n")
-			out[prefix+"gcasm_keepalive_"+spec.name+".go"] = []byte(kb.String())
+			out[prefix+"keepalive_"+spec.name+".go"] = []byte(kb.String())
 		}
 	}
 
@@ -476,7 +476,7 @@ var stdlibWrapperTable = map[string]struct {
 }
 
 // buildPkg transforms one package's functions and renders its bundle
-// files (gcasm_amd64.s, gcasm_decls_amd64.go, retagged pure file).
+// files (amd64.s, decls_amd64.go, retagged pure file).
 // archSpec carries the per-architecture transform and its emission
 // details so buildPkg can produce amd64 and arm64 bundles from one
 // code path.
@@ -519,9 +519,12 @@ func buildPkg(
 	pool := &ConstPool{}
 	types := &TypeTable{}
 	var asmB strings.Builder
-	// The filename pins GOARCH; the constraint keeps the pure-Go
-	// escape hatch (`-tags purego`) working on amd64 too.
-	asmB.WriteString("//go:build !purego\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
+	// The build tag pins GOARCH explicitly: the bundle uses bare
+	// arch filenames (amd64.s/arm64.s), which — having no prefix
+	// before the arch — get NO implicit GOARCH constraint from the
+	// name (Go 1.4+ only auto-tags files with a non-empty prefix).
+	// The `&& !purego` half keeps the pure-Go escape hatch working.
+	asmB.WriteString("//go:build " + arch.name + " && !purego\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
 	var declFns strings.Builder
 
 	calleeSig := func(sym string) ([]ArgKind, bool, ArgKind, string, bool) {
@@ -842,8 +845,8 @@ var (
 		prefix = rel + "/"
 	}
 	files := map[string][]byte{
-		prefix + "gcasm_" + arch.name + ".s":        []byte(asmB.String()),
-		prefix + "gcasm_decls_" + arch.name + ".go": []byte(decl.String()),
+		prefix + arch.name + ".s":             []byte(asmB.String()),
+		prefix + "decls_" + arch.name + ".go": []byte(decl.String()),
 	}
 	return files, nil
 }
