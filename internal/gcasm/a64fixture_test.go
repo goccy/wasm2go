@@ -186,8 +186,8 @@ func a64FixtureGate(t *testing.T, fixture string) {
 		}
 		runFiles["pkg/"+name] = data
 	}
-	runFiles["pkg/gcasm_arm64.s"] = []byte(asmB.String())
-	runFiles["pkg/gcasm_decls_arm64.go"] = []byte(declB.String())
+	runFiles["pkg/arm64.s"] = []byte(asmB.String())
+	runFiles["pkg/decls_arm64.go"] = []byte(declB.String())
 
 	var driver strings.Builder
 	driver.WriteString("package pkg\n\nimport (\n\t\"math\"\n\t\"testing\"\n)\n\nvar _ = math.Float32bits\n\ntype outcome struct{ val int64; panicked bool }\n\nfunc run(f func() int64) (o outcome) {\n\tdefer func() { if recover() != nil { o.panicked = true } }()\n\to.val = f()\n\treturn\n}\n\nfunc TestA64FG(t *testing.T) {\n")

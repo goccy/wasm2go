@@ -290,7 +290,7 @@ func gcasmBitsTrailingZeros64(x uint64) int  { return bits.TrailingZeros64(x) }
 			dm[d.Name] = d
 		}
 		var asmB, declB strings.Builder
-		asmB.WriteString("#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
+		asmB.WriteString("//go:build amd64\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
 		declB.WriteString("//go:build amd64\n\npackage pkg\n")
 		declB.WriteString(stdlibWrappers)
 		declB.WriteString("\n")
@@ -426,8 +426,8 @@ var (
 		}
 		runFiles["pkg/"+name] = data
 	}
-	runFiles["pkg/gcasm_amd64.s"] = []byte(asm1)
-	runFiles["pkg/gcasm_decls.go"] = []byte(decls)
+	runFiles["pkg/amd64.s"] = []byte(asm1)
+	runFiles["pkg/decls_amd64.go"] = []byte(decls)
 
 	var driver strings.Builder
 	driver.WriteString(`package pkg
@@ -527,7 +527,7 @@ func TestFixtureGate(t *testing.T) {
 
 	// -unreachable=false: the generated pure bodies trip the
 	// unreachable-code analyzer by design (goto-heavy control flow);
-	// the check that matters here is asmdecl over gcasm_amd64.s.
+	// the check that matters here is asmdecl over amd64.s.
 	cmd := exec.Command("go", "vet", "-unreachable=false", "./pkg/")
 	cmd.Dir = runDir
 	if out, err := cmd.CombinedOutput(); err != nil {
