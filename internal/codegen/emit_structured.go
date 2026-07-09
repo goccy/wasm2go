@@ -16,8 +16,10 @@ import (
 // any CFG shape it cannot prove cleanly structurable, and emitFuncBody
 // then routes the function through emitMultiBlock.
 //
-// Supported shapes: straight-line, if/else, and single (non-nested)
-// natural loops with one exit. Nested loops, multi-exit loops and
+// Supported shapes: straight-line, if/else, br_table (as a Go switch), and
+// nested natural loops each with a single exit. Shared forward joins whose
+// convergence point is not a clean post-dominator are handled by bounded block
+// duplication (see the re-entry path in region). Multi-exit loops and
 // irreducible CFGs fall back to the goto emitter.
 
 // loopInfo describes one natural loop.
@@ -52,6 +54,24 @@ type structEmitter struct {
 	ctx []loopFrame
 	// emitted guards against emitting a block twice.
 	emitted map[ssa.BlockID]bool
+	// tryOpened marks try-region entry blocks already wrapped, so the
+	// recursive region() call for the protected body does not re-trigger the
+	// try wrapper on its own entry block.
+	tryOpened map[ssa.BlockID]bool
+	// emitCount counts block emissions; dupCap bounds duplication of shared
+	// forward-join blocks (see the re-entry handling in region). Exceeding it
+	// aborts structured emission (fall back to the goto emitter) rather than
+	// risk an exponential blow-up on a pathological CFG.
+	emitCount int
+	dupCap    int
+	// inTryDepth is >0 while emitting the protected BODY of a try region into
+	// its `func() *wasmExc { ... }` closure. A function-level BlockRet cannot be
+	// rendered as a plain `return <vals>` there — the closure returns *wasmExc,
+	// so `return v` (an i32/…) is a type error, and the real return must escape
+	// the closure. The structured emitter has no escape protocol, so a Ret
+	// reached at depth>0 bails to the recover-trampoline emitter, which threads
+	// returns out of try bodies via return flags.
+	inTryDepth int
 }
 
 // emitStructured renders f as structured Go when the CFG permits.
@@ -83,8 +103,10 @@ func (em *ssaEmitter) emitStructured(f *ssa.Func) (body *ast.BlockStmt, ok bool)
 	se := &structEmitter{
 		em: em, f: f, hoist: hoist, usage: usage, stagedPhi: stagedPhi,
 		emitExpr: emitExpr, postdom: ssa.PostDominators(f),
-		loops:   analyzeLoops(f),
-		emitted: map[ssa.BlockID]bool{},
+		loops:     analyzeLoops(f),
+		emitted:   map[ssa.BlockID]bool{},
+		tryOpened: map[ssa.BlockID]bool{},
+		dupCap:    8*len(f.Blocks) + 64,
 	}
 	for _, li := range se.loops {
 		if li.bad {
@@ -105,9 +127,97 @@ func (em *ssaEmitter) emitStructured(f *ssa.Func) (body *ast.BlockStmt, ok bool)
 	return out, true
 }
 
+// ehVirtualPreds returns, per EH catch-handler block, the protected-body blocks
+// that reach it via the (non-CFG) exceptional edge. A `throw` anywhere in a try
+// body unwinds to the handler, so for loop analysis the handler is reachable
+// from every block of its protected region. Without this, an exception-resume
+// loop (the shape clang emits for setjmp/longjmp — the catch handler branches
+// back to the loop header) has its body mis-computed to just {header, handler}.
+func ehVirtualPreds(f *ssa.Func) map[ssa.BlockID][]*ssa.Block {
+	if len(f.TryRegions) == 0 {
+		return nil
+	}
+	byID := map[ssa.BlockID]*ssa.Block{}
+	for _, b := range f.Blocks {
+		byID[b.ID] = b
+	}
+	out := map[ssa.BlockID][]*ssa.Block{}
+	for _, tr := range f.TryRegions {
+		// Protected body = forward-reachable from Entry, not crossing Post or
+		// any handler block.
+		stop := map[ssa.BlockID]bool{}
+		if tr.Post != nil {
+			stop[tr.Post.ID] = true
+		}
+		for _, h := range tr.Handlers {
+			if h.Block != nil {
+				stop[h.Block.ID] = true
+			}
+		}
+		body := map[ssa.BlockID]bool{}
+		var work []*ssa.Block
+		if tr.Entry != nil {
+			work = append(work, tr.Entry)
+		}
+		for len(work) > 0 {
+			b := work[len(work)-1]
+			work = work[:len(work)-1]
+			if b == nil || body[b.ID] || stop[b.ID] {
+				continue
+			}
+			body[b.ID] = true
+			for _, e := range b.Succs {
+				work = append(work, e.Block)
+			}
+		}
+		var bodyBlocks []*ssa.Block
+		for id := range body {
+			bodyBlocks = append(bodyBlocks, byID[id])
+		}
+		for _, h := range tr.Handlers {
+			if h.Block != nil {
+				out[h.Block.ID] = append(out[h.Block.ID], bodyBlocks...)
+			}
+		}
+	}
+	return out
+}
+
+// blocksReachingRet returns the set of blocks that can reach a BlockRet by
+// following CFG successors. A loop exit to a block NOT in this set is a
+// trap/throw dead-end (BlockUnreachable / BlockThrow), not a real structured
+// exit, so exit analysis ignores it.
+func blocksReachingRet(f *ssa.Func) map[ssa.BlockID]bool {
+	reach := map[ssa.BlockID]bool{}
+	changed := true
+	for changed {
+		changed = false
+		for _, b := range f.Blocks {
+			if reach[b.ID] {
+				continue
+			}
+			if b.Kind == ssa.BlockRet {
+				reach[b.ID] = true
+				changed = true
+				continue
+			}
+			for _, e := range b.Succs {
+				if reach[e.Block.ID] {
+					reach[b.ID] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	return reach
+}
+
 // analyzeLoops computes the natural loop for every loop header.
 func analyzeLoops(f *ssa.Func) map[ssa.BlockID]*loopInfo {
 	loops := map[ssa.BlockID]*loopInfo{}
+	vpreds := ehVirtualPreds(f)
+	reachRet := blocksReachingRet(f)
 	for _, e := range ssa.BackEdges(f) {
 		src, hdr := e[0], e[1]
 		li := loops[hdr.ID]
@@ -128,19 +238,29 @@ func analyzeLoops(f *ssa.Func) map[ssa.BlockID]*loopInfo {
 			for _, pe := range b.Preds {
 				work = append(work, pe.Block)
 			}
+			// Exceptional edge: a catch handler is reachable from its
+			// protected body, so those body blocks are loop-body preds too.
+			work = append(work, vpreds[b.ID]...)
 		}
 	}
-	// Exit analysis: the blocks outside the body that body blocks
-	// branch to. Exactly one ⇒ a clean `for {}` + follow; zero ⇒ the
-	// loop is left only via return; more than one ⇒ unstructurable.
+	// Exit analysis: the blocks outside the body that body blocks branch to.
+	// Exactly one ⇒ a clean `for {}` + follow; zero ⇒ the loop is left only via
+	// return; more than one ⇒ unstructurable. A successor that cannot reach a
+	// Ret is a trap/throw dead-end (BlockUnreachable / BlockThrow), not a
+	// structured exit — it is emitted inline where it is branched to, so it
+	// does not count toward the exit set.
 	for _, li := range loops {
 		exits := map[ssa.BlockID]*ssa.Block{}
 		for id := range li.body {
 			b := blockByID(f, id)
 			for _, se := range b.Succs {
-				if !li.body[se.Block.ID] {
-					exits[se.Block.ID] = se.Block
+				if li.body[se.Block.ID] {
+					continue
 				}
+				if !reachRet[se.Block.ID] {
+					continue // trap/throw dead-end, not a real exit
+				}
+				exits[se.Block.ID] = se.Block
 			}
 		}
 		switch len(exits) {
@@ -168,9 +288,145 @@ func blockByID(f *ssa.Func, id ssa.BlockID) *ssa.Block {
 
 // region emits the structured statements for the CFG region starting
 // at b and stopping just before `stop` (nil ⇒ to the function exit).
+// tryRegionAt returns the TryRegion whose protected body starts at b, or nil.
+func (se *structEmitter) tryRegionAt(b *ssa.Block) *ssa.TryRegion {
+	for _, tr := range se.f.TryRegions {
+		if tr.Entry == b {
+			return tr
+		}
+	}
+	return nil
+}
+
+// emitTryRegion renders one EH try/catch region:
+//
+//	__excN := func() (c *wasmExc) {
+//	    defer func() { c = wasm_catch(recover()) }()
+//	    <body region — assigns the post phi var on normal fall-through>
+//	    return nil
+//	}()
+//	if __excN != nil {
+//	    switch {
+//	    case __excN.Tag == <tag0>: <handler0 region>
+//	    ...
+//	    default: <catch_all region>   // or: panic(__excN)
+//	    }
+//	}
+//
+// Function-scope locals (`lN`) and the hoisted post-phi var are captured by the
+// closure by reference, so a local written in the body before a throw is
+// observed at its throw-time value in the handler (wasm EH semantics).
+func (se *structEmitter) emitTryRegion(tr *ssa.TryRegion) ([]ast.Stmt, bool) {
+	if se.em.t != nil {
+		se.em.t.usesWasmExc = true
+		se.em.useHelper("wasm_catch")
+	}
+	excVar := fmt.Sprintf("__exc%d", tr.Entry.ID)
+
+	// Body region, emitted inside the closure. A function return reached inside
+	// the body cannot be represented in the *wasmExc closure (see inTryDepth);
+	// region() bails when it hits one, routing the whole function to the
+	// trampoline.
+	se.inTryDepth++
+	bodyStmts, ok := se.region(tr.Entry, tr.Post)
+	se.inTryDepth--
+	if !ok {
+		return nil, false
+	}
+	deferStmt := &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
+		Type: &ast.FuncType{Params: &ast.FieldList{}},
+		Body: &ast.BlockStmt{List: []ast.Stmt{
+			&ast.AssignStmt{
+				Tok: token.ASSIGN,
+				Lhs: []ast.Expr{newID("c")},
+				Rhs: []ast.Expr{&ast.CallExpr{
+					Fun:  se.em.helperRef("wasm_catch"),
+					Args: []ast.Expr{&ast.CallExpr{Fun: newID("recover")}},
+				}},
+			},
+		}},
+	}}}
+	closureBody := append([]ast.Stmt{deferStmt}, bodyStmts...)
+	closureBody = append(closureBody, &ast.ReturnStmt{Results: []ast.Expr{newID("nil")}})
+	closure := &ast.FuncLit{
+		Type: &ast.FuncType{
+			Params: &ast.FieldList{},
+			Results: &ast.FieldList{List: []*ast.Field{{
+				Names: []*ast.Ident{newID("c")},
+				Type:  &ast.StarExpr{X: se.em.wasmExcType()},
+			}}},
+		},
+		Body: &ast.BlockStmt{List: closureBody},
+	}
+	out := []ast.Stmt{&ast.AssignStmt{
+		Tok: token.DEFINE,
+		Lhs: []ast.Expr{newID(excVar)},
+		Rhs: []ast.Expr{&ast.CallExpr{Fun: closure}},
+	}}
+
+	// Dispatch a caught exception to its handler.
+	var clauses []ast.Stmt
+	hasCatchAll := false
+	for _, h := range tr.Handlers {
+		se.em.catchExcVar = excVar
+		hStmts, ok := se.region(h.Block, tr.Post)
+		se.em.catchExcVar = ""
+		if !ok {
+			return nil, false
+		}
+		if h.CatchAll {
+			hasCatchAll = true
+			clauses = append(clauses, &ast.CaseClause{Body: hStmts})
+			continue
+		}
+		cond := &ast.BinaryExpr{
+			X:  &ast.SelectorExpr{X: newID(excVar), Sel: newID("Tag")},
+			Op: token.EQL,
+			Y:  &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.TagIndex)},
+		}
+		clauses = append(clauses, &ast.CaseClause{List: []ast.Expr{cond}, Body: hStmts})
+	}
+	if !hasCatchAll {
+		// No catch_all: an unmatched exception propagates to the enclosing
+		// handler (or out of the function).
+		clauses = append(clauses, &ast.CaseClause{Body: []ast.Stmt{
+			&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(excVar)}}},
+		}})
+	}
+	out = append(out, &ast.IfStmt{
+		Cond: &ast.BinaryExpr{X: newID(excVar), Op: token.NEQ, Y: newID("nil")},
+		Body: &ast.BlockStmt{List: []ast.Stmt{
+			&ast.SwitchStmt{Body: &ast.BlockStmt{List: clauses}},
+		}},
+	})
+	return out, true
+}
+
 func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 	var out []ast.Stmt
 	for b != nil && b != stop {
+		// EH try region: emit the protected body in a closure with
+		// defer/recover, then dispatch a caught wasmExc to its handler, then
+		// continue after the try at Post.
+		if tr := se.tryRegionAt(b); tr != nil && !se.tryOpened[b.ID] {
+			se.tryOpened[b.ID] = true
+			stmts, ok := se.emitTryRegion(tr)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, stmts...)
+			// Continue after the try at Post only when Post is a live join
+			// (the body / a handler falls through to it, having already
+			// emitted its phi edge-copies). If every path through the try
+			// throws, branches away (a setjmp-resume loop), or returns, Post
+			// has no preds (was pruned) — nothing follows the try.
+			if tr.Post != nil && len(tr.Post.Preds) > 0 {
+				b = tr.Post
+			} else {
+				b = nil
+			}
+			continue
+		}
 		// Open a `for {}` when b heads a loop we are not already in.
 		if li := se.loops[b.ID]; li != nil && !se.insideLoop(b) {
 			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow})
@@ -183,10 +439,19 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			b = li.follow
 			continue
 		}
-		if se.emitted[b.ID] {
-			return nil, false // re-entry — not a clean tree
-		}
+		// A block re-entered here is a shared FORWARD join: two branches (e.g.
+		// arms of a br_table whose targets do not reconverge at its post-
+		// dominator) both flow through it. Loops are already lifted out (the
+		// for{} + jump machinery turns back-edges into continue/break), so the
+		// residual CFG walked here is a DAG — duplicating the block into each
+		// path is correct (each path executes its own copy exactly once) and
+		// terminates. dupCap bounds the total emission so a pathological CFG
+		// that would duplicate exponentially aborts to the goto emitter instead.
 		se.emitted[b.ID] = true
+		se.emitCount++
+		if se.emitCount > se.dupCap {
+			return nil, false
+		}
 
 		vs, err := se.blockValues(b)
 		if err != nil {
@@ -196,6 +461,11 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 
 		switch b.Kind {
 		case ssa.BlockRet:
+			// A function return inside a try body cannot be a plain return in
+			// the *wasmExc closure — bail to the trampoline (see inTryDepth).
+			if se.inTryDepth > 0 {
+				return nil, false
+			}
 			rs, err := se.retStmt(b)
 			if err != nil {
 				return nil, false
@@ -212,6 +482,13 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			// The helper never returns, but Go's termination analysis
 			// only trusts panic/for{} — keep the function well-formed.
 			out = append(out, &ast.ForStmt{Body: &ast.BlockStmt{}})
+			b = nil
+		case ssa.BlockThrow:
+			ts, err := se.em.throwStmt(b, se.emitExpr)
+			if err != nil {
+				return nil, false
+			}
+			out = append(out, ts)
 			b = nil
 		case ssa.BlockPlain:
 			if len(b.Succs) != 1 {
@@ -253,6 +530,46 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			})
 			// Continue past the join. The join may itself be a
 			// continue/break target of an enclosing loop.
+			if join == nil {
+				b = nil
+			} else if js, ok := se.jump(join); ok {
+				out = append(out, js...)
+				b = nil
+			} else {
+				b = join
+			}
+		case ssa.BlockBrTable:
+			// N-way branch: the structured analogue of BlockIf. Each unique
+			// target becomes a Go switch clause carrying that edge's phi copies
+			// and the sub-region up to the common post-dominator join (via
+			// se.branch, exactly like an If arm — so a target that is an
+			// enclosing loop's header/follow lowers to continue/break, and a
+			// shared forward join is duplicated per arm). The wasm default
+			// label's target is the `default:` clause.
+			if len(b.Succs) == 0 || b.Control == nil || len(b.TableCases) != len(b.Succs) {
+				return nil, false
+			}
+			join := se.postdom[b.ID]
+			sel, err := se.emitExpr(b.Control)
+			if err != nil {
+				return nil, false
+			}
+			swBody := &ast.BlockStmt{}
+			for si, e := range b.Succs {
+				arm, ok := se.branch(b, e.Block, e.Index, join)
+				if !ok {
+					return nil, false
+				}
+				var caseExprs []ast.Expr
+				if si != b.TableDefault {
+					caseExprs = make([]ast.Expr, len(b.TableCases[si]))
+					for ci, cv := range b.TableCases[si] {
+						caseExprs[ci] = &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", cv)}
+					}
+				}
+				swBody.List = append(swBody.List, &ast.CaseClause{List: caseExprs, Body: arm})
+			}
+			out = append(out, &ast.SwitchStmt{Tag: sel, Body: swBody})
 			if join == nil {
 				b = nil
 			} else if js, ok := se.jump(join); ok {

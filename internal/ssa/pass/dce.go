@@ -25,8 +25,12 @@ func DCE(f *ssa.Func) bool {
 	for _, b := range f.Blocks {
 		mark(b.Control)
 		nRes := 0
-		if b.Kind == ssa.BlockRet {
+		switch b.Kind {
+		case ssa.BlockRet:
 			nRes = len(f.Sig.Results)
+		case ssa.BlockThrow:
+			// A BlockThrow's tail markers are its thrown operands.
+			nRes = b.ThrowArgc
 		}
 		retStart := len(b.Values) - nRes
 		for i, v := range b.Values {

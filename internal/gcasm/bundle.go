@@ -158,9 +158,16 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	// one arch falls back on all of them, keeping the fallback set
 	// arch-consistent (the pure guard and cross-package wiring assume it).
 	duffIdx := map[uint32]bool{}
+	// ehIdx: functions whose bodies use exception-handling / defer-recover
+	// runtime machinery (panic/recover, &wasmExc heap alloc, defer). Those
+	// bodies are not representable as leaf asm, so — like duff — they run
+	// through the pure Go fallback on every arch.
+	ehIdx := map[uint32]bool{}
 	for _, spec := range archSpecs {
 		for _, f := range caps[spec.name].fns {
-			if !hasDuffPseudo(f.Insns) {
+			duff := hasDuffPseudo(f.Insns)
+			eh := hasEHRuntimeCall(f.Insns)
+			if !duff && !eh {
 				continue
 			}
 			i := strings.LastIndex(f.Name, ".")
@@ -172,12 +179,17 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 				continue
 			}
 			if idx64, perr := strconv.ParseUint(m[1], 10, 32); perr == nil {
-				duffIdx[uint32(idx64)] = true
+				if duff {
+					duffIdx[uint32(idx64)] = true
+				}
+				if eh {
+					ehIdx[uint32(idx64)] = true
+				}
 			}
 		}
 	}
 	isFallbackSig := func(idx uint32) bool {
-		if duffIdx[idx] {
+		if duffIdx[idx] || ehIdx[idx] {
 			return true
 		}
 		if bisectLo >= 0 && int(idx) >= bisectLo && int(idx) < bisectHi {
@@ -604,9 +616,10 @@ func buildPkg(
 			Types:     types,
 		})
 		if terr != nil {
-			// A duff body reaching here (the up-front union scan should
-			// have caught it) still falls back rather than aborting.
-			if errors.Is(terr, errUnsupportedDuff) {
+			// A duff body, or a jump table whose flag state cannot be replayed
+			// at the leaf asm, falls back to the pure Go body (transparent to
+			// callers) rather than aborting the whole bundle.
+			if errors.Is(terr, errUnsupportedDuff) || errors.Is(terr, errUnsupportedJumpTable) {
 				fallbackNames[name] = true
 				stats.Fallback++
 				continue

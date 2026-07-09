@@ -17,11 +17,41 @@ import (
 // used at call sites is identical for transformed and fallback fns.
 var errUnsupportedDuff = errors.New("gcasm: DUFFZERO/DUFFCOPY pseudo-op unsupported in hand-written asm")
 
+// errUnsupportedJumpTable signals that a captured body has a jump table whose
+// consumed flag state cannot be replayed at the leaf assembly (the flag-setter
+// is a memory compare, or there is no clean preceding setter). Like the duff
+// case, Build routes such a function to its pure fallback (a Go switch handles
+// the jump table fine) rather than aborting the whole bundle.
+var errUnsupportedJumpTable = errors.New("gcasm: jump-table flag state not replayable in hand-written asm")
+
 // hasDuffPseudo reports whether any instruction is a DUFFZERO/DUFFCOPY.
 func hasDuffPseudo(insns []Insn) bool {
 	for _, in := range insns {
 		if strings.HasPrefix(in.Text, "DUFFZERO") || strings.HasPrefix(in.Text, "DUFFCOPY") {
 			return true
+		}
+	}
+	return false
+}
+
+// ehRuntimeCalls are the runtime symbols emitted by exception-handling /
+// defer-recover Go bodies (a wasm try/catch or throw). A function that calls
+// any of them cannot be lowered to leaf asm and must use the pure fallback.
+var ehRuntimeCalls = []string{
+	"runtime.newobject",      // &wasmExc{...} heap allocation
+	"runtime.gopanic",        // panic(...)
+	"runtime.gorecover",      // recover()
+	"runtime.deferreturn",    // deferred recover
+	"runtime.deferprocStack", // defer setup
+	"runtime.deferproc",      // defer setup
+}
+
+func hasEHRuntimeCall(insns []Insn) bool {
+	for _, in := range insns {
+		for _, rc := range ehRuntimeCalls {
+			if strings.Contains(in.Text, rc) {
+				return true
+			}
 		}
 	}
 	return false

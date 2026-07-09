@@ -81,10 +81,47 @@ func wasm_trap_memfill_oob() { panic("wasm: memory.fill out of bounds") }
 //go:noinline
 func wasm_trap_memcopy_oob() { panic("wasm: memory.copy out of bounds") }
 
+// ----- Exception handling (EH proposal / setjmp-longjmp) --------------------
+//
+// A wasm `throw` becomes a Go panic carrying a wasmExc; a try/catch landing pad
+// recovers it. Operand values are bit-reinterpreted into uint64 slots (i32/f32
+// occupy the low 32 bits) and narrowed back at the catch by the generated code.
+
+type wasmExc struct {
+	Tag  uint32
+	Vals []uint64
+}
+
+// wasm_throw raises exception tag with the given operand slots. It never
+// returns (it panics), so the generated code emits it as a block terminator.
+func wasm_throw(tag uint32, vals ...uint64) { panic(&wasmExc{Tag: tag, Vals: vals}) }
+
+// wasm_catch is called in a try landing pad's deferred recover: it returns the
+// caught *wasmExc, nil if there was no panic, and re-panics anything that is
+// not a wasmExc (a real Go panic must not be swallowed by a wasm catch).
+func wasm_catch(r any) *wasmExc {
+	if r == nil {
+		return nil
+	}
+	if e, ok := r.(*wasmExc); ok {
+		return e
+	}
+	panic(r)
+}
+
 // wasm_trap_unreachable is only called from generated function bodies
 // (the SSA emitter's BlockUnreachable/OpUnreachable lowering), never
 // from the other helpers in this file.
 var _ = wasm_trap_unreachable
+
+// The exception-handling helpers above are likewise emitted into generated
+// code, not called from within this package; reference them so the unused
+// analyzer stays quiet.
+var (
+	_ = wasmExc{}
+	_ = wasm_throw
+	_ = wasm_catch
+)
 
 // ----- Integer division with overflow / divide-by-zero traps --------------
 

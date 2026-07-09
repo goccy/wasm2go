@@ -23,6 +23,12 @@ type ssaEmitter struct {
 	// emitters insert `mBase = m.M` refreshes after every value whose
 	// evaluation could run memory.grow. See emitFuncBody.
 	memBaseHoisted bool
+
+	// catchExcVar is the Go variable holding the *wasmExc currently being
+	// handled, set while the structured emitter renders an EH catch handler
+	// region so OpCatchArg can read its operand slots. Empty outside a
+	// handler.
+	catchExcVar string
 }
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
@@ -67,6 +73,11 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// such value; see maybeMemBaseRefresh.
 	em.memBaseHoisted = funcTouchesMemory(f)
 
+	// EH in multi-package output: the wasmExc type + wasm_catch helper live in
+	// the base package (exported as WasmExc / Wasm_catch); the generated body
+	// references them cross-package (base.WasmExc, base.Wasm_catch). Wired via
+	// wasmExcTypeExpr / helperRef, so no gate here.
+
 	// Prefer structured reconstruction (if/else, straight-line — no
 	// goto/label). emitStructured returns ok=false for any CFG shape
 	// it cannot cleanly structure (loops, irreducible, ambiguous
@@ -94,6 +105,31 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 			Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID("M")}},
 		}
 		body.List = append([]ast.Stmt{decl}, body.List...)
+	}
+	// In mutable-locals mode (try functions), declared (non-param) locals are
+	// mutable Go vars `lN`, zero-initialised to match wasm's zeroed locals.
+	// Params already exist as function arguments `l0..`.
+	if f.MutableLocals {
+		nParams := len(f.Sig.Params)
+		var decls []ast.Stmt
+		for i := nParams; i < len(f.LocalTypes); i++ {
+			name := fmt.Sprintf("l%d", i)
+			decls = append(decls, &ast.DeclStmt{Decl: &ast.GenDecl{
+				Tok: token.VAR,
+				Specs: []ast.Spec{&ast.ValueSpec{
+					Names: []*ast.Ident{newID(name)},
+					Type:  goTypeForSSAType(f.LocalTypes[i]),
+				}},
+			}})
+			// Blank-use so a write-only or unused local does not trip Go's
+			// "declared and not used" (matches the hoisted-var handling).
+			decls = append(decls, &ast.AssignStmt{
+				Tok: token.ASSIGN,
+				Lhs: []ast.Expr{newID("_")},
+				Rhs: []ast.Expr{newID(name)},
+			})
+		}
+		body.List = append(decls, body.List...)
 	}
 	return body, nil
 }
@@ -171,6 +207,10 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 	if f.Entry == nil {
 		return nil, fmt.Errorf("ssa emit: func %s has no entry block", f.Name)
 	}
+	// EH catch handlers are landing pads entered by unwinding, not by a CFG
+	// edge, so they cannot be laid out flat. A function with try regions is
+	// emitted as a recover-trampoline (see the len(f.TryRegions) > 0 branch
+	// after the value-decl setup below).
 
 	usage := emit.ComputeValueUsage(f)
 	hoist := emit.ComputeHoist(f, usage)
@@ -256,180 +296,436 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 		}
 	}
 
+	flatEc := &emitCtx{
+		f: f, hoist: hoist, stagedPhi: stagedPhi,
+		emitExpr: emitExpr, labelSet: gotoTargets,
+	}
+
+	// A function with EH try regions cannot be laid out flat (catch landing pads
+	// are entered by unwinding, not a CFG edge). Emit it as a recover-trampoline
+	// instead. Non-EH functions keep the proven flat layout below.
+	if len(f.TryRegions) > 0 {
+		return em.emitTrampoline(f, body, flatEc, gotoTargets)
+	}
+
 	for _, blk := range f.Blocks {
-		// Emit a label only when the block is a goto target. Entry
-		// block (and any other un-referenced block, which shouldn't
-		// normally exist) is just an inline starting point.
-		if gotoTargets[blk.ID] {
-			body.List = append(body.List, &ast.LabeledStmt{
-				Label: newID(labelForBlock(blk)),
-				Stmt:  &ast.EmptyStmt{Implicit: true},
-			})
-		}
-
-		// Values defined in this block (excluding the trailing OpCopy
-		// markers for Ret blocks — those are handled in the terminator).
-		valuesEnd := len(blk.Values)
-		if blk.Kind == ssa.BlockRet {
-			valuesEnd -= len(f.Sig.Results)
-			if valuesEnd < 0 {
-				valuesEnd = 0
-			}
-		}
-		for i := 0; i < valuesEnd; i++ {
-			v := blk.Values[i]
-			// Phis are assigned by the predecessor block, not here.
-			if v.Op == ssa.OpPhi {
-				continue
-			}
-			if hoist[v.ID] {
-				rhs, err := em.emitOp(v, emitExpr)
-				if err != nil {
-					return nil, err
-				}
-				body.List = append(body.List, &ast.AssignStmt{
-					Tok: token.ASSIGN,
-					Lhs: []ast.Expr{newID(varNameForValue(v))},
-					Rhs: []ast.Expr{rhs},
-				})
-			} else if v.HasSideEffect() {
-				stmt, err := em.emitSideEffectStmt(v, emitExpr)
-				if err != nil {
-					return nil, err
-				}
-				body.List = append(body.List, stmt)
-			}
-			// Non-hoisted pure values are folded into uses; no
-			// statement here.
-			body.List = em.maybeMemBaseRefresh(body.List, v)
-		}
-
-		// 3. Terminator.
-		switch blk.Kind {
-		case ssa.BlockPlain:
-			if len(blk.Succs) != 1 {
-				return nil, fmt.Errorf("ssa emit: Plain block b%d has %d successors", blk.ID, len(blk.Succs))
-			}
-			succ := blk.Succs[0].Block
-			predIdx := blk.Succs[0].Index
-			if err := emitPhiAssignsFor(body, blk, succ, predIdx, emitExpr, stagedPhi); err != nil {
-				return nil, err
-			}
-			body.List = append(body.List, &ast.BranchStmt{
-				Tok:   token.GOTO,
-				Label: newID(labelForBlock(succ)),
-			})
-		case ssa.BlockIf:
-			if len(blk.Succs) != 2 || blk.Control == nil {
-				return nil, fmt.Errorf("ssa emit: malformed If block b%d", blk.ID)
-			}
-			thenBlk := blk.Succs[0].Block
-			elseBlk := blk.Succs[1].Block
-			thenPredIdx := blk.Succs[0].Index
-			elsePredIdx := blk.Succs[1].Index
-
-			// Build the cond expression. SSA stores it as a Bool
-			// value; bring it down to a Go bool expression.
-			condExpr, err := em.emitBoolCond(blk.Control, emitExpr)
-			if err != nil {
-				return nil, err
-			}
-			// Then branch: emit phi assigns for thenBlk, then goto.
-			thenBody := &ast.BlockStmt{}
-			if err := emitPhiAssignsFor(thenBody, blk, thenBlk, thenPredIdx, emitExpr, stagedPhi); err != nil {
-				return nil, err
-			}
-			thenBody.List = append(thenBody.List, &ast.BranchStmt{
-				Tok:   token.GOTO,
-				Label: newID(labelForBlock(thenBlk)),
-			})
-			// Else branch: emit phi assigns then goto.
-			elseBody := &ast.BlockStmt{}
-			if err := emitPhiAssignsFor(elseBody, blk, elseBlk, elsePredIdx, emitExpr, stagedPhi); err != nil {
-				return nil, err
-			}
-			elseBody.List = append(elseBody.List, &ast.BranchStmt{
-				Tok:   token.GOTO,
-				Label: newID(labelForBlock(elseBlk)),
-			})
-			body.List = append(body.List, &ast.IfStmt{
-				Cond: condExpr,
-				Body: thenBody,
-				Else: elseBody,
-			})
-		case ssa.BlockBrTable:
-			if blk.Control == nil || len(blk.Succs) == 0 || len(blk.TableCases) != len(blk.Succs) {
-				return nil, fmt.Errorf("ssa emit: malformed BrTable block b%d", blk.ID)
-			}
-			selExpr, err := emitExpr(blk.Control)
-			if err != nil {
-				return nil, err
-			}
-			// One switch STATEMENT, not an if-chain: the Go compiler
-			// lowers dense integer switches to jump tables (O(1)
-			// dispatch) but never recovers a switch from a cascade of
-			// ifs. Each clause carries the per-edge phi assigns and a
-			// goto, exactly like an If arm. The default clause also
-			// absorbs any TableCases values routed to the same block
-			// as the wasm default label — they need no explicit case
-			// literals because default reaches the same target.
-			swBody := &ast.BlockStmt{}
-			for si, e := range blk.Succs {
-				clauseBody := &ast.BlockStmt{}
-				if err := emitPhiAssignsFor(clauseBody, blk, e.Block, e.Index, emitExpr, stagedPhi); err != nil {
-					return nil, err
-				}
-				clauseBody.List = append(clauseBody.List, &ast.BranchStmt{
-					Tok:   token.GOTO,
-					Label: newID(labelForBlock(e.Block)),
-				})
-				var caseExprs []ast.Expr
-				if si != blk.TableDefault {
-					caseExprs = make([]ast.Expr, len(blk.TableCases[si]))
-					for ci, cv := range blk.TableCases[si] {
-						caseExprs[ci] = &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", cv)}
-					}
-				}
-				swBody.List = append(swBody.List, &ast.CaseClause{
-					List: caseExprs, // nil = default
-					Body: clauseBody.List,
-				})
-			}
-			body.List = append(body.List, &ast.SwitchStmt{Tag: selExpr, Body: swBody})
-		case ssa.BlockRet:
-			nRes := len(f.Sig.Results)
-			if nRes == 0 {
-				body.List = append(body.List, &ast.ReturnStmt{})
-				break
-			}
-			retVals := blk.Values[len(blk.Values)-nRes:]
-			results := make([]ast.Expr, nRes)
-			for i, rv := range retVals {
-				if rv.Op != ssa.OpCopy {
-					return nil, fmt.Errorf("ssa emit: expected OpCopy at Ret tail, got %v", rv.Op)
-				}
-				e, err := emitExpr(rv.Args[0])
-				if err != nil {
-					return nil, err
-				}
-				results[i] = e
-			}
-			body.List = append(body.List, &ast.ReturnStmt{Results: results})
-		case ssa.BlockUnreachable:
-			// Out-of-line trap helper, not an inline panic: keeps the
-			// cold panic constructor (and its rodata operands) out of
-			// hot function bodies, matching the other wasm_trap_*
-			// paths.
-			body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
-				Fun: em.helperRef("wasm_trap_unreachable"),
-			}})
-			// The helper never returns, but Go's termination analysis
-			// only trusts panic/for{} — keep the function well-formed.
-			body.List = append(body.List, &ast.ForStmt{Body: &ast.BlockStmt{}})
-		default:
-			return nil, fmt.Errorf("ssa emit: unknown block kind %v on b%d", blk.Kind, blk.ID)
+		if err := em.emitBlockInto(blk, &body.List, flatEc); err != nil {
+			return nil, err
 		}
 	}
+	return body, nil
+}
+
+// emitCtx carries the shared per-function goto-emitter state, plus (when `tramp`
+// is set) the recover-trampoline exit protocol used while emitting blocks inside
+// the trampoline closure.
+type emitCtx struct {
+	f         *ssa.Func
+	hoist     map[ssa.ValueID]bool
+	stagedPhi map[ssa.ValueID]bool
+	emitExpr  func(*ssa.Value) (ast.Expr, error)
+	labelSet  map[ssa.BlockID]bool // blocks that get a Go label
+
+	tramp *trampCtx
+}
+
+// trampCtx is the recover-trampoline protocol (see emitTrampoline): a BlockRet
+// records the function return in flags and exits the closure with `return nil`;
+// entering a try body sets its __inTryN flag; an edge to a try's Post clears it.
+type trampCtx struct {
+	retVar    string
+	rvVars    []string
+	entrySet  map[ssa.BlockID]string // try-entry block → __inTryN var to set true
+	postClear map[ssa.BlockID]string // try Post block → __inTryN var to clear on entry
+}
+
+// edge emits the pred→succ transition: phi edge-copies, an optional __inTryN
+// clear when succ is a try Post (trampoline), then the goto.
+func (ec *emitCtx) edge(pred, succ *ssa.Block, predIdx int) ([]ast.Stmt, error) {
+	tmp := &ast.BlockStmt{}
+	if err := emitPhiAssignsFor(tmp, pred, succ, predIdx, ec.emitExpr, ec.stagedPhi); err != nil {
+		return nil, err
+	}
+	out := tmp.List
+	if ec.tramp != nil {
+		if v := ec.tramp.postClear[succ.ID]; v != "" {
+			out = append(out, assignBool(v, false))
+		}
+	}
+	out = append(out, &ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(succ))})
+	return out, nil
+}
+
+// ret emits a BlockRet terminator: a plain `return <vals>` at function level, or
+// — in the trampoline — a flag-set + `return nil` so the return escapes the
+// closure and is re-issued by the trampoline loop.
+func (ec *emitCtx) ret(blk *ssa.Block) ([]ast.Stmt, error) {
+	nRes := len(ec.f.Sig.Results)
+	results := make([]ast.Expr, nRes)
+	if nRes > 0 {
+		retVals := blk.Values[len(blk.Values)-nRes:]
+		for i, rv := range retVals {
+			if rv.Op != ssa.OpCopy {
+				return nil, fmt.Errorf("ssa emit: expected OpCopy at Ret tail, got %v", rv.Op)
+			}
+			e, err := ec.emitExpr(rv.Args[0])
+			if err != nil {
+				return nil, err
+			}
+			results[i] = e
+		}
+	}
+	if ec.tramp == nil {
+		return []ast.Stmt{&ast.ReturnStmt{Results: results}}, nil
+	}
+	out := []ast.Stmt{assignBool(ec.tramp.retVar, true)}
+	for i := range results {
+		out = append(out, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID(ec.tramp.rvVars[i])},
+			Rhs: []ast.Expr{results[i]},
+		})
+	}
+	out = append(out, &ast.ReturnStmt{Results: []ast.Expr{newID("nil")}})
+	return out, nil
+}
+
+func assignBool(name string, v bool) ast.Stmt {
+	lit := "false"
+	if v {
+		lit = "true"
+	}
+	return &ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(name)}, Rhs: []ast.Expr{newID(lit)}}
+}
+
+// emitBlockInto emits one block (label, an optional __inTryN set, values,
+// terminator) into out. It is the single per-block emission path shared by the
+// flat function-level loop and the trampoline closure; ec.tramp selects the exit
+// protocol.
+func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx) error {
+	if ec.labelSet[blk.ID] {
+		*out = append(*out, &ast.LabeledStmt{
+			Label: newID(labelForBlock(blk)),
+			Stmt:  &ast.EmptyStmt{Implicit: true},
+		})
+	}
+	if ec.tramp != nil {
+		if v := ec.tramp.entrySet[blk.ID]; v != "" {
+			*out = append(*out, assignBool(v, true))
+		}
+	}
+
+	valuesEnd := len(blk.Values)
+	if blk.Kind == ssa.BlockRet {
+		valuesEnd -= len(ec.f.Sig.Results)
+		if valuesEnd < 0 {
+			valuesEnd = 0
+		}
+	}
+	for i := 0; i < valuesEnd; i++ {
+		v := blk.Values[i]
+		if v.Op == ssa.OpPhi {
+			continue
+		}
+		if ec.hoist[v.ID] {
+			rhs, err := em.emitOp(v, ec.emitExpr)
+			if err != nil {
+				return err
+			}
+			*out = append(*out, &ast.AssignStmt{
+				Tok: token.ASSIGN,
+				Lhs: []ast.Expr{newID(varNameForValue(v))},
+				Rhs: []ast.Expr{rhs},
+			})
+		} else if v.HasSideEffect() {
+			stmt, err := em.emitSideEffectStmt(v, ec.emitExpr)
+			if err != nil {
+				return err
+			}
+			*out = append(*out, stmt)
+		}
+		*out = em.maybeMemBaseRefresh(*out, v)
+	}
+
+	switch blk.Kind {
+	case ssa.BlockPlain:
+		if len(blk.Succs) != 1 {
+			return fmt.Errorf("ssa emit: Plain block b%d has %d successors", blk.ID, len(blk.Succs))
+		}
+		s, err := ec.edge(blk, blk.Succs[0].Block, blk.Succs[0].Index)
+		if err != nil {
+			return err
+		}
+		*out = append(*out, s...)
+	case ssa.BlockIf:
+		if len(blk.Succs) != 2 || blk.Control == nil {
+			return fmt.Errorf("ssa emit: malformed If block b%d", blk.ID)
+		}
+		condExpr, err := em.emitBoolCond(blk.Control, ec.emitExpr)
+		if err != nil {
+			return err
+		}
+		thenS, err := ec.edge(blk, blk.Succs[0].Block, blk.Succs[0].Index)
+		if err != nil {
+			return err
+		}
+		elseS, err := ec.edge(blk, blk.Succs[1].Block, blk.Succs[1].Index)
+		if err != nil {
+			return err
+		}
+		*out = append(*out, &ast.IfStmt{
+			Cond: condExpr,
+			Body: &ast.BlockStmt{List: thenS},
+			Else: &ast.BlockStmt{List: elseS},
+		})
+	case ssa.BlockBrTable:
+		if blk.Control == nil || len(blk.Succs) == 0 || len(blk.TableCases) != len(blk.Succs) {
+			return fmt.Errorf("ssa emit: malformed BrTable block b%d", blk.ID)
+		}
+		selExpr, err := ec.emitExpr(blk.Control)
+		if err != nil {
+			return err
+		}
+		swBody := &ast.BlockStmt{}
+		for si, e := range blk.Succs {
+			arm, err := ec.edge(blk, e.Block, e.Index)
+			if err != nil {
+				return err
+			}
+			var caseExprs []ast.Expr
+			if si != blk.TableDefault {
+				caseExprs = make([]ast.Expr, len(blk.TableCases[si]))
+				for ci, cv := range blk.TableCases[si] {
+					caseExprs[ci] = &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("%d", cv)}
+				}
+			}
+			swBody.List = append(swBody.List, &ast.CaseClause{List: caseExprs, Body: arm})
+		}
+		*out = append(*out, &ast.SwitchStmt{Tag: selExpr, Body: swBody})
+	case ssa.BlockRet:
+		s, err := ec.ret(blk)
+		if err != nil {
+			return err
+		}
+		*out = append(*out, s...)
+	case ssa.BlockUnreachable:
+		*out = append(*out, &ast.ExprStmt{X: &ast.CallExpr{
+			Fun: em.helperRef("wasm_trap_unreachable"),
+		}})
+		*out = append(*out, &ast.ForStmt{Body: &ast.BlockStmt{}})
+	case ssa.BlockThrow:
+		ts, err := em.throwStmt(blk, ec.emitExpr)
+		if err != nil {
+			return err
+		}
+		*out = append(*out, ts)
+	default:
+		return fmt.Errorf("ssa emit: unknown block kind %v on b%d", blk.Kind, blk.ID)
+	}
+	return nil
+}
+
+// emitTrampoline emits an EH function as a recover-trampoline: the whole
+// function body runs inside a closure, so loops (even ones that span a try
+// region) and catch-handler resume are expressed as re-entry via a program
+// counter, not gotos across a closure boundary.
+//
+//	var __pc int32 = <entry>
+//	for {
+//	    __exc = func() (c *wasmExc) {
+//	        defer func() { c = wasm_catch(recover()) }()
+//	        switch __pc { case <entry>: goto L<entry>; case <handler>: goto L<handler> }
+//	        <all blocks: Ret ⇒ __ret/__rvN + return nil; throw ⇒ panic; a try body's
+//	         entry sets __inTryN=true, an edge to its Post clears it>
+//	        return nil
+//	    }()
+//	    if __ret { return __rvN… }
+//	    switch { case __inTryN: __inTryN=false; __pc=<handlerN>; continue; …; default: panic(__exc) }
+//	}
+//
+// __inTryN tracks — dynamically, as control flows — whether execution is inside
+// try N's body, so a caught panic routes to the right handler even when a loop
+// re-enters "body" blocks after the try has exited (the block runs with
+// __inTryN=false then). Only non-nested handler trys are supported; anything
+// else returns an error (the function then cannot be emitted, as before).
+func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *emitCtx, gotoTargets map[ssa.BlockID]bool) (*ast.BlockStmt, error) {
+	byID := map[ssa.BlockID]*ssa.Block{}
+	for _, b := range f.Blocks {
+		byID[b.ID] = b
+	}
+	type htPlan struct {
+		tr      *ssa.TryRegion
+		inTry   string
+		handler *ssa.Block // first (only supported) handler landing pad
+	}
+	var plans []*htPlan
+	bodySets := map[*ssa.TryRegion]map[ssa.BlockID]bool{}
+	for _, tr := range f.TryRegions {
+		if len(tr.Handlers) == 0 {
+			continue // delegate — throws propagate to the enclosing recover
+		}
+		if tr.Entry == nil || tr.Post == nil || tr.Handlers[0].Block == nil {
+			return nil, fmt.Errorf("ssa emit: malformed try region")
+		}
+		// The single-handler restriction keeps the catch dispatch a plain
+		// tag check; multi-tag catch cascades are not needed by clang SjLj.
+		if len(tr.Handlers) != 1 || tr.Handlers[0].CatchAll {
+			return nil, fmt.Errorf("ssa emit: trampoline supports a single non-catch_all handler")
+		}
+		stop := map[ssa.BlockID]bool{tr.Post.ID: true, tr.Handlers[0].Block.ID: true}
+		bodySet := map[ssa.BlockID]bool{}
+		work := []*ssa.Block{tr.Entry}
+		for len(work) > 0 {
+			b := work[len(work)-1]
+			work = work[:len(work)-1]
+			if b == nil || bodySet[b.ID] || stop[b.ID] {
+				continue
+			}
+			bodySet[b.ID] = true
+			for _, e := range b.Succs {
+				work = append(work, e.Block)
+			}
+		}
+		bodySets[tr] = bodySet
+		plans = append(plans, &htPlan{tr: tr, inTry: fmt.Sprintf("__inTry%d", tr.Entry.ID), handler: tr.Handlers[0].Block})
+	}
+	// Nested handler trys are supported: each has its own __inTry flag, and a
+	// caught panic routes to the INNERMOST active try. Order the catch dispatch
+	// innermost-first — depth = how many other trys' bodies contain this try's
+	// entry — so the first matching __inTry in the dispatch switch is the
+	// innermost one.
+	depth := map[*htPlan]int{}
+	for _, p := range plans {
+		for _, q := range plans {
+			if p != q && bodySets[q.tr][p.tr.Entry.ID] {
+				depth[p]++
+			}
+		}
+	}
+	sort.SliceStable(plans, func(i, j int) bool { return depth[plans[i]] > depth[plans[j]] })
+
+	// Label set: goto targets plus the switch resume targets (function entry and
+	// each handler landing pad).
+	labels := map[ssa.BlockID]bool{}
+	for k := range gotoTargets {
+		labels[k] = true
+	}
+	labels[f.Entry.ID] = true
+	entrySet := map[ssa.BlockID]string{}
+	postClear := map[ssa.BlockID]string{}
+	for _, p := range plans {
+		labels[p.handler.ID] = true
+		entrySet[p.tr.Entry.ID] = p.inTry
+		postClear[p.tr.Post.ID] = p.inTry
+	}
+
+	const pcVar, retVar, excVar = "__pc", "__ret", "__exc"
+	rvVars := make([]string, len(f.Sig.Results))
+	for i := range f.Sig.Results {
+		rvVars[i] = fmt.Sprintf("__rv%d", i)
+	}
+
+	// State declarations (after the hoisted-value decls already in body).
+	decl := func(name string, typ ast.Expr, zero string) {
+		body.List = append(body.List,
+			&ast.DeclStmt{Decl: &ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{&ast.ValueSpec{
+				Names: []*ast.Ident{newID(name)}, Type: typ,
+			}}}},
+			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID("_")}, Rhs: []ast.Expr{newID(name)}},
+		)
+	}
+	decl(pcVar, newID("int32"), "")
+	body.List = append(body.List, &ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(pcVar)},
+		Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(f.Entry.ID)}}})
+	decl(retVar, newID("bool"), "")
+	decl(excVar, &ast.StarExpr{X: em.wasmExcType()}, "")
+	for i, rv := range rvVars {
+		decl(rv, goTypeForSSAType(f.Sig.Results[i]), "")
+	}
+	for _, p := range plans {
+		decl(p.inTry, newID("bool"), "")
+	}
+	if em.t != nil {
+		em.t.usesWasmExc = true
+	}
+	em.useHelper("wasm_catch")
+
+	// Closure body: defer/recover, the PC-dispatch switch, then every block.
+	trampEc := &emitCtx{
+		f: f, hoist: flatEc.hoist, stagedPhi: flatEc.stagedPhi, emitExpr: flatEc.emitExpr,
+		labelSet: labels,
+		tramp:    &trampCtx{retVar: retVar, rvVars: rvVars, entrySet: entrySet, postClear: postClear},
+	}
+	deferStmt := &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
+		Type: &ast.FuncType{Params: &ast.FieldList{}},
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.AssignStmt{
+			Tok: token.ASSIGN, Lhs: []ast.Expr{newID("c")},
+			Rhs: []ast.Expr{&ast.CallExpr{Fun: em.helperRef("wasm_catch"), Args: []ast.Expr{&ast.CallExpr{Fun: newID("recover")}}}},
+		}}},
+	}}}
+	var pcCases []ast.Stmt
+	pcCases = append(pcCases, &ast.CaseClause{
+		List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(f.Entry.ID)}},
+		Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(f.Entry))}},
+	})
+	for _, p := range plans {
+		pcCases = append(pcCases, &ast.CaseClause{
+			List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(p.handler.ID)}},
+			Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(p.handler))}},
+		})
+	}
+	closureBody := []ast.Stmt{deferStmt, &ast.SwitchStmt{Tag: newID(pcVar), Body: &ast.BlockStmt{List: pcCases}}}
+	// Catch landing pads read their exception via em.catchExcVar (the function-
+	// level __exc set by the previous closure return).
+	prevCatch := em.catchExcVar
+	em.catchExcVar = excVar
+	for _, blk := range f.Blocks {
+		if err := em.emitBlockInto(blk, &closureBody, trampEc); err != nil {
+			em.catchExcVar = prevCatch
+			return nil, err
+		}
+	}
+	em.catchExcVar = prevCatch
+	closureBody = append(closureBody, &ast.ReturnStmt{Results: []ast.Expr{newID("nil")}})
+	closure := &ast.FuncLit{
+		Type: &ast.FuncType{Params: &ast.FieldList{}, Results: &ast.FieldList{List: []*ast.Field{{
+			Names: []*ast.Ident{newID("c")}, Type: &ast.StarExpr{X: em.wasmExcType()},
+		}}}},
+		Body: &ast.BlockStmt{List: closureBody},
+	}
+
+	// The trampoline loop.
+	loopBody := []ast.Stmt{&ast.AssignStmt{
+		Tok: token.ASSIGN, Lhs: []ast.Expr{newID(excVar)}, Rhs: []ast.Expr{&ast.CallExpr{Fun: closure}},
+	}}
+	retExprs := make([]ast.Expr, len(rvVars))
+	for i, rv := range rvVars {
+		retExprs[i] = newID(rv)
+	}
+	loopBody = append(loopBody, &ast.IfStmt{
+		Cond: newID(retVar),
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: retExprs}}},
+	})
+	// Dispatch the caught exception to the innermost active try's handler, else
+	// re-panic (uncaught / propagates out of this function).
+	var dispatch []ast.Stmt
+	for _, p := range plans {
+		dispatch = append(dispatch, &ast.CaseClause{
+			List: []ast.Expr{newID(p.inTry)},
+			Body: []ast.Stmt{
+				assignBool(p.inTry, false),
+				&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(pcVar)},
+					Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(p.handler.ID)}}},
+				&ast.BranchStmt{Tok: token.CONTINUE},
+			},
+		})
+	}
+	dispatch = append(dispatch, &ast.CaseClause{Body: []ast.Stmt{
+		&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(excVar)}}},
+	}})
+	loopBody = append(loopBody, &ast.SwitchStmt{Body: &ast.BlockStmt{List: dispatch}})
+
+	body.List = append(body.List, &ast.ForStmt{Body: &ast.BlockStmt{List: loopBody}})
 	return body, nil
 }
 
@@ -564,6 +860,106 @@ func sortedValueIDs(m map[ssa.ValueID]bool) []ssa.ValueID {
 func varNameForValue(v *ssa.Value) string { return fmt.Sprintf("v%d", v.ID) }
 func labelForBlock(b *ssa.Block) string   { return fmt.Sprintf("L%d", b.ID) }
 
+// throwStmt renders a BlockThrow terminator as `panic(&wasmExc{Tag, Vals})`.
+// The `panic` builtin is recognised by Go's termination analysis, so no
+// trailing for{} is needed. The thrown operands are the block's last ThrowArgc
+// OpCopy markers (mirroring BlockRet), widened to the wasmExc uint64 slots.
+func (em *ssaEmitter) throwStmt(blk *ssa.Block, emitExpr func(*ssa.Value) (ast.Expr, error)) (ast.Stmt, error) {
+	if em.t != nil {
+		em.t.usesWasmExc = true
+	}
+	// rethrow: re-raise the exception currently held by the enclosing catch
+	// handler. panic(<catch exc>) — no fresh wasmExc is built.
+	if blk.IsRethrow {
+		if em.catchExcVar == "" {
+			return nil, fmt.Errorf("ssa emit: rethrow outside a catch handler")
+		}
+		return &ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(em.catchExcVar)}}}, nil
+	}
+	n := blk.ThrowArgc
+	if len(blk.Values) < n {
+		return nil, fmt.Errorf("ssa emit: Throw block has %d values, need %d operands", len(blk.Values), n)
+	}
+	ops := blk.Values[len(blk.Values)-n:]
+	vals := make([]ast.Expr, 0, n)
+	for _, o := range ops {
+		if o.Op != ssa.OpCopy {
+			return nil, fmt.Errorf("ssa emit: expected OpCopy at Throw tail, got %v", o.Op)
+		}
+		e, err := emitExpr(o.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		vals = append(vals, em.widenToExcSlot(e, o.Args[0].Type))
+	}
+	lit := &ast.UnaryExpr{Op: token.AND, X: &ast.CompositeLit{
+		Type: em.wasmExcType(),
+		Elts: []ast.Expr{
+			&ast.KeyValueExpr{Key: newID("Tag"), Value: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(blk.TagIndex)}},
+			&ast.KeyValueExpr{Key: newID("Vals"), Value: &ast.CompositeLit{
+				Type: &ast.ArrayType{Elt: newID("uint64")},
+				Elts: vals,
+			}},
+		},
+	}}
+	return &ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{lit}}}, nil
+}
+
+// narrowExcSlot converts a wasmExc uint64 operand slot back to its wasm type.
+func (em *ssaEmitter) narrowExcSlot(slot ast.Expr, t ssa.Type) ast.Expr {
+	call := func(fn string, arg ast.Expr) ast.Expr {
+		return &ast.CallExpr{Fun: newID(fn), Args: []ast.Expr{arg}}
+	}
+	switch t {
+	case ssa.TypeI64:
+		return call("int64", slot)
+	case ssa.TypeF32:
+		if em.t != nil {
+			em.t.UsePackage("math")
+		}
+		return &ast.CallExpr{
+			Fun:  &ast.SelectorExpr{X: newID("math"), Sel: newID("Float32frombits")},
+			Args: []ast.Expr{call("uint32", slot)},
+		}
+	case ssa.TypeF64:
+		if em.t != nil {
+			em.t.UsePackage("math")
+		}
+		return &ast.CallExpr{
+			Fun:  &ast.SelectorExpr{X: newID("math"), Sel: newID("Float64frombits")},
+			Args: []ast.Expr{slot},
+		}
+	default: // i32 / bool
+		return call("int32", slot)
+	}
+}
+
+// widenToExcSlot converts a wasm value expression to the uint64 operand slot
+// used by wasmExc (the inverse of narrowExcSlot).
+func (em *ssaEmitter) widenToExcSlot(expr ast.Expr, t ssa.Type) ast.Expr {
+	u64 := func(arg ast.Expr) ast.Expr {
+		return &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{arg}}
+	}
+	switch t {
+	case ssa.TypeI64:
+		return u64(expr)
+	case ssa.TypeF32:
+		if em.t != nil {
+			em.t.UsePackage("math")
+		}
+		return u64(&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{
+			&ast.CallExpr{Fun: &ast.SelectorExpr{X: newID("math"), Sel: newID("Float32bits")}, Args: []ast.Expr{expr}},
+		}})
+	case ssa.TypeF64:
+		if em.t != nil {
+			em.t.UsePackage("math")
+		}
+		return &ast.CallExpr{Fun: &ast.SelectorExpr{X: newID("math"), Sel: newID("Float64bits")}, Args: []ast.Expr{expr}}
+	default: // i32 / bool: zero-extend the 32-bit value
+		return u64(&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{expr}})
+	}
+}
+
 func goTypeForSSAType(t ssa.Type) ast.Expr {
 	switch t {
 	case ssa.TypeI32:
@@ -611,6 +1007,21 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		return emit(v.Args[0])
 	case ssa.OpPhi:
 		return newID(varNameForValue(v)), nil
+	case ssa.OpLocalGet:
+		// Mutable-locals mode: read the local variable `lN` (params and
+		// declared locals share the same naming).
+		return newID(fmt.Sprintf("l%d", v.AuxInt)), nil
+	case ssa.OpCatchArg:
+		// The i-th operand of the exception being handled, narrowed from its
+		// uint64 slot back to the operand's wasm type.
+		if em.catchExcVar == "" {
+			return nil, fmt.Errorf("ssa emit: OpCatchArg outside a catch handler")
+		}
+		slot := &ast.IndexExpr{
+			X:     &ast.SelectorExpr{X: newID(em.catchExcVar), Sel: newID("Vals")},
+			Index: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(v.AuxInt)},
+		}
+		return em.narrowExcSlot(slot, v.Type), nil
 	}
 	switch v.Op {
 	case ssa.OpGlobalGet:
@@ -678,6 +1089,17 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 		return em.emitMemStoreStmt(v, emit)
 	}
 	switch v.Op {
+	case ssa.OpLocalSet:
+		// Mutable-locals mode: assign the local variable `lN = <value>`.
+		rhs, err := emit(v.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID(fmt.Sprintf("l%d", v.AuxInt))},
+			Rhs: []ast.Expr{rhs},
+		}, nil
 	case ssa.OpGlobalSet:
 		return em.emitGlobalSetStmt(v, emit)
 	case ssa.OpCallDirect, ssa.OpCallImport, ssa.OpCallIndirect:
@@ -879,6 +1301,15 @@ func (em *ssaEmitter) helperRef(name string) ast.Expr {
 		return newID(name)
 	}
 	return em.t.helperRef(name)
+}
+
+// wasmExcType returns the type-name expression for the wasmExc exception struct,
+// qualified for the current package in multi-package mode (base.WasmExc).
+func (em *ssaEmitter) wasmExcType() ast.Expr {
+	if em.t == nil {
+		return newID("wasmExc")
+	}
+	return em.t.wasmExcTypeExpr()
 }
 
 func goConstI32(n int32) ast.Expr {

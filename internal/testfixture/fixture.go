@@ -47,7 +47,9 @@ func Wasm(t testing.TB, name string) []byte {
 		t.Fatalf("testfixture: wat source not found: %s", watPath)
 	}
 
-	cmd := exec.Command("wat2wasm", "--output=-", watPath)
+	// --enable-exceptions lets EH fixtures (try/catch/throw/tag) compile; it
+	// only enables the feature, so non-EH fixtures are unaffected.
+	cmd := exec.Command("wat2wasm", "--enable-exceptions", "--output=-", watPath)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

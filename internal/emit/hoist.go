@@ -198,7 +198,11 @@ func IsLoadOp(op ssa.Op) bool {
 	case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
 		ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
 		ssa.OpLoadF32, ssa.OpLoadF64,
-		ssa.OpGlobalGet:
+		ssa.OpGlobalGet,
+		// OpLocalGet reads a mutable local var (EH mutable-locals mode); it
+		// must emit as an in-order statement, not be reused across an
+		// intervening OpLocalSet.
+		ssa.OpLocalGet:
 		return true
 	}
 	return false

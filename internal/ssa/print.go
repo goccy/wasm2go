@@ -83,6 +83,8 @@ func FuncString(f *Func) string {
 			b.WriteString("    Ret\n")
 		case BlockUnreachable:
 			b.WriteString("    Unreachable\n")
+		case BlockThrow:
+			fmt.Fprintf(&b, "    Throw tag=%d\n", blk.TagIndex)
 		case BlockBrTable:
 			ctrlID := ValueID(0)
 			if blk.Control != nil {

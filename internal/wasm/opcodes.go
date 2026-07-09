@@ -3,12 +3,24 @@ package wasm
 // WebAssembly MVP opcodes plus the 0xfc prefix.
 // For the full list see https://webassembly.github.io/spec/core/binary/instructions.html
 const (
-	OpUnreachable  byte = 0x00
-	OpNop          byte = 0x01
-	OpBlock        byte = 0x02
-	OpLoop         byte = 0x03
-	OpIf           byte = 0x04
-	OpElse         byte = 0x05
+	OpUnreachable byte = 0x00
+	OpNop         byte = 0x01
+	OpBlock       byte = 0x02
+	OpLoop        byte = 0x03
+	OpIf          byte = 0x04
+	OpElse        byte = 0x05
+
+	// Legacy exception-handling proposal (what clang/wasi-sdk emits for
+	// setjmp/longjmp under `-mllvm -wasm-enable-sjlj`). try opens a handler
+	// region with a blocktype; catch/catch_all begin handlers; throw raises a
+	// tag; rethrow/delegate re-raise. These carry the setjmp/longjmp lowering.
+	OpTry      byte = 0x06
+	OpCatch    byte = 0x07
+	OpThrow    byte = 0x08
+	OpRethrow  byte = 0x09
+	OpDelegate byte = 0x18
+	OpCatchAll byte = 0x19
+
 	OpEnd          byte = 0x0b
 	OpBr           byte = 0x0c
 	OpBrIf         byte = 0x0d
