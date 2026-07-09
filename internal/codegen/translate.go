@@ -495,8 +495,10 @@ type translator struct {
 	// the bytecode-scan cost.
 	callees [][]uint32
 
-	// importedModules: ordered list of distinct wasm import-module names
-	// (e.g. "env", "wasi_snapshot_preview1").
+	// importedModules: distinct wasm import-module names in a fixed, prescribed
+	// order (knownImportModuleOrder; see collectImportModules). The constructor
+	// parameter order and the Module struct's import-field layout derive from
+	// this, so it must not depend on the wasm's import-declaration order.
 	importedModules []string
 
 	// imports: stdlib import paths used by generated code, mapped to alias
@@ -1051,12 +1053,39 @@ func (t *translator) use(pkg string) { t.imports[pkg] = "" }
 // useHelper marks a helper as needed.
 func (t *translator) useHelper(name string) { t.helpers[name] = true }
 
+// knownImportModuleOrder is the fixed parameter order for the host-import
+// modules the wasmify pipeline emits: the WASI host interface first, then env,
+// then the wasmify bridge module. The generated constructor (New / NewWithWASI)
+// takes one parameter per module the wasm imports, always in this order, and the
+// Module struct lays out its import fields the same way — so the signature never
+// depends on the wasm's import-declaration order.
+var knownImportModuleOrder = []string{"wasi_snapshot_preview1", "env", "wasmify"}
+
+// collectImportModules records the distinct host-import modules the wasm uses.
+// Only WHICH modules appear is wasm-specific (a wasm that never calls a
+// wasmify-bridge import gets no "wasmify" entry, and therefore no such
+// constructor parameter); the ORDER is prescribed by knownImportModuleOrder, not
+// derived from the wasm — so there is no need to sort or otherwise compute it.
 func (t *translator) collectImportModules() {
-	seen := map[string]bool{}
+	present := map[string]bool{}
 	for _, imp := range t.mod.Imports {
-		if !seen[imp.Module] {
-			seen[imp.Module] = true
+		present[imp.Module] = true
+	}
+	// Emit the known modules first, in the prescribed order, if the wasm uses them.
+	for _, mod := range knownImportModuleOrder {
+		if present[mod] {
+			t.importedModules = append(t.importedModules, mod)
+			delete(present, mod)
+		}
+	}
+	// wasm2go also transpiles wasm outside the wasmify pipeline, which may import
+	// from other modules; each still needs its own interface + constructor
+	// parameter, so append any leftover module in first-seen order (no
+	// hand-written binding targets these, so only per-wasm determinism matters).
+	for _, imp := range t.mod.Imports {
+		if present[imp.Module] {
 			t.importedModules = append(t.importedModules, imp.Module)
+			delete(present, imp.Module)
 		}
 	}
 }
