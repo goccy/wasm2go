@@ -385,7 +385,11 @@ type goSigB struct {
 // go/parser (exact, unlike regex parsing).
 func parseSigsAST(src []byte, out map[string]goSigB) error {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "src.go", src, 0)
+	// SkipObjectResolution: only top-level func signatures are read
+	// below (no ident.Obj / scope use), so the deprecated resolver is
+	// dead work — and its maxScopeDepth=1000 bailout would reject the
+	// deeply nested bodies gc compiles fine (setjmp/longjmp dispatch).
+	f, err := parser.ParseFile(fset, "src.go", src, parser.SkipObjectResolution)
 	if err != nil {
 		return err
 	}

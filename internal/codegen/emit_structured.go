@@ -72,6 +72,17 @@ type structEmitter struct {
 	// reached at depth>0 bails to the recover-trampoline emitter, which threads
 	// returns out of try bodies via return flags.
 	inTryDepth int
+	// depth tracks the current region() nesting (one level per if/else arm,
+	// loop body, or try body). nestCap bounds it: a CFG whose structured form
+	// would nest deeper — e.g. a long chain of non-reconverging conditionals,
+	// as clang emits for some CPython dispatch — aborts structured emission and
+	// falls back to the flat goto emitter. Go's own go/parser (and the protobuf
+	// protogen post-parse the plugin runs) cap identifier resolution at
+	// maxScopeDepth=1000; emitting past that produces source no downstream tool
+	// can re-parse. The cap sits well under 1000 to leave headroom for the extra
+	// scopes gofmt/blocks introduce per level.
+	depth   int
+	nestCap int
 }
 
 // emitStructured renders f as structured Go when the CFG permits.
@@ -107,6 +118,7 @@ func (em *ssaEmitter) emitStructured(f *ssa.Func) (body *ast.BlockStmt, ok bool)
 		emitted:   map[ssa.BlockID]bool{},
 		tryOpened: map[ssa.BlockID]bool{},
 		dupCap:    8*len(f.Blocks) + 64,
+		nestCap:   200,
 	}
 	for _, li := range se.loops {
 		if li.bad {
@@ -403,6 +415,14 @@ func (se *structEmitter) emitTryRegion(tr *ssa.TryRegion) ([]ast.Stmt, bool) {
 }
 
 func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
+	// Bound structured nesting: past nestCap levels, abort to the goto emitter,
+	// whose output is flat (labels + goto) and so never trips the go/parser /
+	// protogen maxScopeDepth=1000 re-parse limit.
+	se.depth++
+	defer func() { se.depth-- }()
+	if se.depth > se.nestCap {
+		return nil, false
+	}
 	var out []ast.Stmt
 	for b != nil && b != stop {
 		// EH try region: emit the protected body in a closure with
