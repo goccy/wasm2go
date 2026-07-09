@@ -523,8 +523,10 @@ func buildPkg(
 	// arch filenames (amd64.s/arm64.s), which — having no prefix
 	// before the arch — get NO implicit GOARCH constraint from the
 	// name (Go 1.4+ only auto-tags files with a non-empty prefix).
-	// The `&& !purego` half keeps the pure-Go escape hatch working.
-	asmB.WriteString("//go:build " + arch.name + " && !purego\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
+	// This is exactly the header the own-asm backend emitted, and
+	// matches the plain `//go:build <arch>` tag on the decls and
+	// keepalive files below.
+	asmB.WriteString("//go:build " + arch.name + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
 	var declFns strings.Builder
 
 	calleeSig := func(sym string) ([]ArgKind, bool, ArgKind, string, bool) {
