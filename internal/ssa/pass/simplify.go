@@ -119,11 +119,18 @@ func trivialPhiArg(v *ssa.Value) *ssa.Value {
 func retMarkerSet(f *ssa.Func) map[ssa.ValueID]bool {
 	set := map[ssa.ValueID]bool{}
 	for _, b := range f.Blocks {
-		if b.Kind != ssa.BlockRet {
+		var nMarkers int
+		switch b.Kind {
+		case ssa.BlockRet:
+			nMarkers = len(f.Sig.Results)
+		case ssa.BlockThrow:
+			// A BlockThrow's tail markers are its thrown operands.
+			nMarkers = b.ThrowArgc
+		default:
 			continue
 		}
 		n := len(b.Values)
-		for i := n - len(f.Sig.Results); i < n; i++ {
+		for i := n - nMarkers; i < n; i++ {
 			if i >= 0 {
 				set[b.Values[i].ID] = true
 			}

@@ -77,6 +77,10 @@ func Verify(f *Func) error {
 			}
 		case BlockUnreachable:
 			// no constraint
+		case BlockThrow:
+			if len(b.Succs) != 0 {
+				return fmt.Errorf("verify %s: Throw b%d has %d successors (want 0)", f.Name, b.ID, len(b.Succs))
+			}
 		case BlockBrTable:
 			if len(b.Succs) == 0 {
 				return fmt.Errorf("verify %s: BrTable b%d has no successors", f.Name, b.ID)
@@ -147,6 +151,16 @@ func Verify(f *Func) error {
 	// a branch target was created but never wired — a lowering bug.
 	reached := map[BlockID]bool{}
 	stack := []*Block{f.Entry}
+	// EH catch/catch_all handler blocks are landing pads: they are entered by
+	// the runtime unwinding into the try, not by a CFG edge, so they are
+	// legitimate reachability roots even with zero predecessors.
+	for _, tr := range f.TryRegions {
+		for _, h := range tr.Handlers {
+			if h.Block != nil {
+				stack = append(stack, h.Block)
+			}
+		}
+	}
 	for len(stack) > 0 {
 		b := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]

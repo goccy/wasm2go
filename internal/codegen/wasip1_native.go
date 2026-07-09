@@ -2831,7 +2831,7 @@ var wasip1NativeRaw []byte
 // into the file the decls land in (base/ in multi-package mode, the
 // single output file in single-package mode).
 //
-// In multi-package mode (currentChunk == -2) the field references like
+// In multi-package mode (currentChunk == chunkBase) the field references like
 // m.memory get rewritten to m.Memory by capitalizeModuleFieldRefs,
 // matching how helpers are handled.
 //

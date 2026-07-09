@@ -163,6 +163,13 @@ const (
 	OpMemoryFill
 	OpMemoryInit
 	OpDataDrop
+
+	// OpCatchArg is the i-th operand of the exception caught by an
+	// enclosing EH catch handler. AuxInt = operand index; the result type
+	// is the operand's type. Emitted as a read of the recovered wasmExc's
+	// i-th value. Impure (its value comes from the caught exception, not a
+	// pure computation), so it must not be CSE'd or hoisted.
+	OpCatchArg
 )
 
 // String renders the op name. Used by IR dumps and golden tests.
@@ -275,6 +282,7 @@ var opNames = [...]string{
 	OpMemGrow:    "OpMemGrow",
 	OpMemoryCopy: "OpMemoryCopy",
 	OpMemoryFill: "OpMemoryFill",
+	OpCatchArg:   "OpCatchArg",
 	OpMemoryInit: "OpMemoryInit",
 	OpDataDrop:   "OpDataDrop",
 }
@@ -315,7 +323,8 @@ func (op Op) UsesAuxInt() bool {
 		OpGlobalGet, OpGlobalSet,
 		OpLocalGet, OpLocalSet,
 		OpSelect,
-		OpMemoryInit, OpDataDrop:
+		OpMemoryInit, OpDataDrop,
+		OpCatchArg:
 		return true
 	}
 	return false
@@ -340,6 +349,7 @@ func (op Op) HasSideEffect() bool {
 	switch op {
 	case OpStore8, OpStore16, OpStore32, OpStore64, OpStoreF32, OpStoreF64,
 		OpGlobalSet,
+		OpLocalSet, // writes a mutable local var (EH mutable-locals mode)
 		OpCallDirect, OpCallIndirect, OpCallImport,
 		OpHelperCall, // may trap (div, rem, non-saturating trunc-to-int)
 		OpUnreachable,

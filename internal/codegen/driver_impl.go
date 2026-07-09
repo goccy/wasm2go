@@ -65,7 +65,7 @@ func (t *translator) FuncRefName(funcIdx uint32) string {
 func (t *translator) HelperName(name string) string {
 	if t.multiPackage {
 		up := capitalize(name)
-		if t.currentChunk == -2 {
+		if t.currentChunk == chunkBase {
 			return up
 		}
 		return "base." + up

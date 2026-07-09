@@ -41,8 +41,37 @@ type Func struct {
 	// ValueID can mean "none".
 	Values []*Value
 
+	// MutableLocals is set for functions lowered in de-SSA local mode (those
+	// containing an EH try): locals are OpLocalGet/OpLocalSet against mutable
+	// Go vars `lN`. LocalTypes gives every local's type (params first, then
+	// declared locals) so the emitter can declare the non-param `var lN T`.
+	MutableLocals bool
+	LocalTypes    []Type
+
+	// TryRegions records every EH try/catch region in the function so the
+	// emitter can wrap each protected body in a Go defer/recover and route a
+	// caught wasmExc to the right handler. Handler entry blocks are landing
+	// pads: they have no CFG predecessor (entered via runtime unwind, not a
+	// branch), but they are predecessors of Post via their own fall-through.
+	TryRegions []*TryRegion
+
 	nextValueID ValueID
 	nextBlockID BlockID
+}
+
+// TryRegion describes one EH try/catch region.
+type TryRegion struct {
+	Entry    *Block // first block of the protected (try) body
+	Post     *Block // continuation after the try's `end`
+	Handlers []TryHandler
+}
+
+// TryHandler is one catch / catch_all clause of a TryRegion.
+type TryHandler struct {
+	CatchAll bool   // true for `catch_all`
+	TagIndex uint32 // exception tag matched (valid when !CatchAll)
+	Block    *Block // handler entry block (a landing pad; 0 CFG preds)
+	NumArgs  int    // operand count pushed as OpCatchArg (0 for catch_all)
 }
 
 // FuncSig captures the parameter and result types of a Func. Matches the
@@ -112,6 +141,18 @@ type Block struct {
 	TableCases   [][]int32
 	TableDefault int
 
+	// TagIndex is the exception tag thrown by a BlockThrow terminator
+	// (unused for other kinds). The thrown operands are the block's last
+	// ThrowArgc OpCopy markers, exactly like BlockRet's return values.
+	TagIndex  uint32
+	ThrowArgc int
+
+	// IsRethrow marks a BlockThrow that re-raises the exception caught by the
+	// enclosing catch handler (the wasm `rethrow` op) instead of constructing a
+	// fresh one. Such a block has ThrowArgc == 0; the emit pass renders it as
+	// panic(<current catch exc>).
+	IsRethrow bool
+
 	f *Func
 }
 
@@ -146,6 +187,10 @@ const (
 	// binary-search compare tree (asm) instead of the O(n)
 	// equality-If chain used before.
 	BlockBrTable
+	// Throw: zero successors. Raises the exception tag Block.TagIndex with
+	// the block's trailing OpCopy markers as operands (the EH `throw`
+	// opcode). Emitted as a Go panic; unwinds to an enclosing try/catch.
+	BlockThrow
 )
 
 // AddEdge wires src → dst as a CFG edge, updating both lists. The returned

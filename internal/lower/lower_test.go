@@ -101,3 +101,92 @@ func dumpSSAFunc(f interface{}) string {
 // ssa.FuncString so we keep the dependency on internal/ssa internal to
 // this file pair (no test-side import of internal/ssa).
 var _ = ssaFuncString // referenced by dumpSSAFunc
+
+// TestLowerThrow lowers the $throwing function of eh_trycatch.wat
+// (`i32.const 7; throw $e`) and checks it seals the block as BlockThrow
+// carrying the tag index and the i32 operand — the EH/SjLj `throw` lowering.
+func TestLowerThrow(t *testing.T) {
+	bin := testfixture.Wasm(t, "eh_trycatch")
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// $throwing is the first defined function (no imports in the fixture).
+	fn, err := LowerFunction(mod, 0, "throwing")
+	if err != nil {
+		t.Fatalf("lower throwing: %v", err)
+	}
+	dump := dumpSSAFunc(fn)
+	if !bytes.Contains([]byte(dump), []byte("Throw tag=0")) {
+		t.Errorf("expected a `Throw tag=0` terminator, got:\n%s", dump)
+	}
+	// The thrown i32 operand (const 7) must survive as a trailing OpCopy.
+	if !bytes.Contains([]byte(dump), []byte("OpCopy")) {
+		t.Errorf("expected the thrown operand as an OpCopy marker, got:\n%s", dump)
+	}
+}
+
+// TestLowerTryCatch lowers $catching (try/catch/catch_all with an i32 result)
+// and checks the TryRegion metadata: a protected body plus two handlers (a
+// tagged catch and a catch_all), all merging into a post block.
+func TestLowerTryCatch(t *testing.T) {
+	bin := testfixture.Wasm(t, "eh_trycatch")
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	fn, err := LowerFunction(mod, 1, "catching") // $catching
+	if err != nil {
+		t.Fatalf("lower catching: %v", err)
+	}
+	if len(fn.TryRegions) != 1 {
+		t.Fatalf("TryRegions: got %d, want 1", len(fn.TryRegions))
+	}
+	tr := fn.TryRegions[0]
+	if tr.Entry == nil || tr.Post == nil {
+		t.Fatalf("TryRegion Entry/Post must be set: %+v", tr)
+	}
+	if len(tr.Handlers) != 2 {
+		t.Fatalf("handlers: got %d, want 2 (catch + catch_all)", len(tr.Handlers))
+	}
+	if tr.Handlers[0].CatchAll {
+		t.Errorf("handler[0] should be a tagged catch, got catch_all")
+	}
+	if tr.Handlers[0].NumArgs != 1 {
+		t.Errorf("handler[0] (catch $e) NumArgs: got %d, want 1", tr.Handlers[0].NumArgs)
+	}
+	if !tr.Handlers[1].CatchAll {
+		t.Errorf("handler[1] should be catch_all")
+	}
+	// The tagged handler must materialise the exception operand as OpCatchArg.
+	dump := dumpSSAFunc(fn)
+	if !bytes.Contains([]byte(dump), []byte("OpCatchArg")) {
+		t.Errorf("expected OpCatchArg for the catch operand, got:\n%s", dump)
+	}
+}
+
+// TestLowerMutableLocalsTry lowers $withlocal, a try-function that sets a local
+// before the try and reads it in the body and the catch handler. Try-functions
+// use mutable-locals mode: local.get/set stay as OpLocalGet/OpLocalSet (mutable
+// Go vars) rather than being promoted to SSA + phi'd.
+func TestLowerMutableLocalsTry(t *testing.T) {
+	bin := testfixture.Wasm(t, "eh_trycatch")
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	fn, err := LowerFunction(mod, 4, "withlocal") // $withlocal
+	if err != nil {
+		t.Fatalf("lower withlocal: %v", err)
+	}
+	dump := dumpSSAFunc(fn)
+	if !bytes.Contains([]byte(dump), []byte("OpLocalGet")) {
+		t.Errorf("mutable-locals mode should retain OpLocalGet, got:\n%s", dump)
+	}
+	if !bytes.Contains([]byte(dump), []byte("OpLocalSet")) {
+		t.Errorf("mutable-locals mode should retain OpLocalSet, got:\n%s", dump)
+	}
+	if len(fn.TryRegions) != 1 {
+		t.Errorf("TryRegions: got %d, want 1", len(fn.TryRegions))
+	}
+}

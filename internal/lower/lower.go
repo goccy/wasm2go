@@ -104,13 +104,23 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 		return nil, err
 	}
 
+	// A function containing an EH `try` uses the mutable-locals lowering
+	// mode: locals are NOT promoted to SSA but kept as mutable Go variables
+	// (retained OpLocalGet/OpLocalSet), so a Go panic/recover at a catch
+	// landing pad sees each local's throw-time value (wasm EH semantics).
+	mutableLocals, err := bodyHasTry(fn.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	ls := &lowerState{
-		b:          b,
-		mod:        mod,
-		ft:         ft,
-		locals:     locals,
-		localTypes: localTypes,
-		incoming:   map[*ssa.Block][]incomingEdge{},
+		b:             b,
+		mod:           mod,
+		ft:            ft,
+		locals:        locals,
+		localTypes:    localTypes,
+		incoming:      map[*ssa.Block][]incomingEdge{},
+		mutableLocals: mutableLocals,
 	}
 
 	r := wasm.NewInstrReader(fn.Body)
@@ -118,8 +128,21 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 		return nil, err
 	}
 
+	// In mutable-locals mode, seed each parameter's mutable variable from
+	// its OpParam at entry (non-param locals zero-init via the emitted Go
+	// `var`, matching wasm's zeroed locals).
+	if mutableLocals {
+		for i := range ft.Params {
+			ls.b.NewValueAuxInt(ssa.OpLocalSet, ssa.TypeMem, int64(i), locals[i])
+		}
+	}
+
 	if err := ls.lowerBody(r); err != nil {
 		return nil, err
+	}
+	if mutableLocals {
+		b.Func().MutableLocals = true
+		b.Func().LocalTypes = localTypes
 	}
 	// Drop isolated (no-edge) blocks left behind by structured-control
 	// lowering — e.g. the unused post block of a loop that never falls
@@ -178,6 +201,12 @@ type lowerState struct {
 	// dead (unreachable) region. Their matching `end`s are consumed
 	// without touching the live control stack.
 	unreachableDepth int
+
+	// mutableLocals selects the de-SSA local mode used for functions that
+	// contain an EH `try`: local.get/set become retained OpLocalGet/
+	// OpLocalSet (mutable Go vars) instead of SSA values, and locals are
+	// not threaded through block phis.
+	mutableLocals bool
 }
 
 // ctrlFrame is one entry on the wasm control stack.
@@ -210,6 +239,10 @@ type ctrlFrame struct {
 	// start from this snapshot (not the then-branch's mutated state),
 	// and an if-without-else's implicit else edge carries it verbatim.
 	entryLocals []*ssa.Value
+	// tryRegion, for ctrlTry frames, is the in-progress EH region. Entry
+	// and Post are set when the frame opens; each catch / catch_all
+	// appends a handler. target / fallthrough_ both point at Post.
+	tryRegion *ssa.TryRegion
 }
 
 type ctrlKind uint8
@@ -218,6 +251,7 @@ const (
 	ctrlBlock ctrlKind = iota + 1
 	ctrlLoop
 	ctrlIf
+	ctrlTry
 )
 
 // branchArity returns the number of operand-stack values a branch (br /
@@ -263,7 +297,7 @@ func (ls *lowerState) lowerBody(r *wasm.InstrReader) error {
 			// (which would pop the wrong ctrlFrame and corrupt the
 			// control stack).
 			switch op {
-			case wasm.OpBlock, wasm.OpLoop, wasm.OpIf:
+			case wasm.OpBlock, wasm.OpLoop, wasm.OpIf, wasm.OpTry:
 				ls.unreachableDepth++
 				if err := r.SkipImmediates(op); err != nil {
 					return fmt.Errorf("%w: skipping unreachable block-open 0x%02x: %w", ErrSSAUnsupported, op, err)
@@ -274,6 +308,25 @@ func (ls *lowerState) lowerBody(r *wasm.InstrReader) error {
 					break
 				}
 				if err := ls.handleElse(); err != nil {
+					return err
+				}
+			case wasm.OpCatch, wasm.OpCatchAll:
+				if ls.unreachableDepth > 0 {
+					// catch of a dead-region try — stay dead (skip the
+					// tag immediate for catch).
+					if err := r.SkipImmediates(op); err != nil {
+						return err
+					}
+					break
+				}
+				// A catch at the current try's depth re-establishes a
+				// reachable cursor: the body/prior-handler ended dead
+				// (e.g. threw), and this handler is a fresh landing pad.
+				if op == wasm.OpCatch {
+					if err := ls.handleCatch(r); err != nil {
+						return err
+					}
+				} else if err := ls.handleCatchAll(); err != nil {
 					return err
 				}
 			case wasm.OpEnd:
@@ -327,6 +380,12 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		return ls.handleBlock(r)
 	case op == wasm.OpLoop:
 		return ls.handleLoop(r)
+	case op == wasm.OpTry:
+		return ls.handleTry(r)
+	case op == wasm.OpCatch:
+		return ls.handleCatch(r)
+	case op == wasm.OpCatchAll:
+		return ls.handleCatchAll()
 	case op == wasm.OpBr:
 		return ls.handleBr(r)
 	case op == wasm.OpBrIf:
@@ -335,13 +394,24 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		return ls.handleBrTable(r)
 	case op == wasm.OpReturn:
 		return ls.handleReturn()
+	case op == wasm.OpThrow:
+		return ls.handleThrow(r)
+	case op == wasm.OpDelegate:
+		return ls.handleDelegate(r)
+	case op == wasm.OpRethrow:
+		return ls.handleRethrow(r)
 	case op == wasm.OpLocalGet:
 		idx, err := r.ReadU32()
 		if err != nil {
 			return err
 		}
-		if int(idx) >= len(ls.locals) {
+		if int(idx) >= len(ls.localTypes) {
 			return fmt.Errorf("local.get out of range: %d", idx)
+		}
+		if ls.mutableLocals {
+			// Read the mutable local variable (impure — not CSE'd).
+			ls.push(ls.b.NewValueAuxInt(ssa.OpLocalGet, ls.localTypes[idx], int64(idx)))
+			return nil
 		}
 		ls.push(ls.locals[idx])
 		return nil
@@ -350,12 +420,18 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		if err != nil {
 			return err
 		}
-		if int(idx) >= len(ls.locals) {
+		if int(idx) >= len(ls.localTypes) {
 			return fmt.Errorf("local.set out of range: %d", idx)
 		}
 		v, err := ls.pop()
 		if err != nil {
 			return err
+		}
+		if ls.mutableLocals {
+			// Write the mutable local variable (side-effecting; ordered
+			// by block-value position).
+			ls.b.NewValueAuxInt(ssa.OpLocalSet, ssa.TypeMem, int64(idx), v)
+			return nil
 		}
 		ls.locals[idx] = v
 		return nil
@@ -364,11 +440,16 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		if err != nil {
 			return err
 		}
-		if int(idx) >= len(ls.locals) {
+		if int(idx) >= len(ls.localTypes) {
 			return fmt.Errorf("local.tee out of range: %d", idx)
 		}
 		if len(ls.stack) == 0 {
 			return fmt.Errorf("local.tee on empty stack")
+		}
+		if ls.mutableLocals {
+			// tee = set + keep the value on the stack.
+			ls.b.NewValueAuxInt(ssa.OpLocalSet, ssa.TypeMem, int64(idx), ls.stack[len(ls.stack)-1])
+			return nil
 		}
 		ls.locals[idx] = ls.stack[len(ls.stack)-1]
 		return nil
@@ -705,12 +786,18 @@ func (ls *lowerState) handleLoop(r *wasm.InstrReader) error {
 	// preds arrive). Stack values at this point belong to the
 	// surrounding scope and stay as-is.
 	ls.b.SetCurrent(header)
-	headerPhis := make([]*ssa.Value, len(ls.locals))
-	for i, v := range ls.locals {
-		phi := ls.b.NewValue(ssa.OpPhi, ls.localTypes[i], v)
-		headerPhis[i] = phi
+	// In mutable-locals mode (try functions) locals live in mutable Go vars,
+	// not SSA values, so the loop header needs no local phis — the back-edge
+	// carries them through the vars. (Loops carry no stack params today, so
+	// the header then needs no phis at all.)
+	if !ls.mutableLocals {
+		headerPhis := make([]*ssa.Value, len(ls.locals))
+		for i, v := range ls.locals {
+			phi := ls.b.NewValue(ssa.OpPhi, ls.localTypes[i], v)
+			headerPhis[i] = phi
+		}
+		ls.locals = headerPhis
 	}
-	ls.locals = headerPhis
 
 	ls.ctrl = append(ls.ctrl, &ctrlFrame{
 		kind:               ctrlLoop,
@@ -720,6 +807,174 @@ func (ls *lowerState) handleLoop(r *wasm.InstrReader) error {
 		stackHeightAtEntry: len(ls.stack),
 	})
 	return nil
+}
+
+// handleTry opens an EH try region. The protected body starts in a fresh
+// entry block (a clean boundary the emitter wraps in defer/recover); `end`
+// and `br N` targeting this frame go to the post block. A try implies
+// mutable-locals mode (set in LowerFunction), so locals are not phi'd here.
+func (ls *lowerState) handleTry(r *wasm.InstrReader) error {
+	bt, err := r.ReadS33()
+	if err != nil {
+		return err
+	}
+	results, err := decodeBlockResults(bt)
+	if err != nil {
+		return fmt.Errorf("%w: try blocktype %v: %w", ErrSSAUnsupported, bt, err)
+	}
+	entryBlk := ls.b.NewBlock(ssa.BlockPlain)
+	postBlk := ls.b.NewBlock(ssa.BlockPlain)
+
+	// Fall into the protected body. Single pred, so operands/locals carry
+	// directly (no phi).
+	cur := ls.b.Current()
+	cur.Kind = ssa.BlockPlain
+	ssa.AddEdge(cur, entryBlk)
+	ls.b.SetCurrent(entryBlk)
+
+	region := &ssa.TryRegion{Entry: entryBlk, Post: postBlk}
+	ls.b.Func().TryRegions = append(ls.b.Func().TryRegions, region)
+
+	ls.ctrl = append(ls.ctrl, &ctrlFrame{
+		kind:               ctrlTry,
+		target:             postBlk,
+		fallthrough_:       postBlk,
+		resultCount:        len(results),
+		stackHeightAtEntry: len(ls.stack),
+		tryRegion:          region,
+	})
+	return nil
+}
+
+// handleDelegate closes a `try ... delegate N` — a try whose protected body
+// forwards any exception to the N-th enclosing label instead of catching it.
+// We close the body into post with NO handler; emitTryRegion turns a
+// handler-less TryRegion into `body-closure; if exc != nil { panic(exc) }`,
+// i.e. it recovers and re-panics, which IS delegate's forward-to-enclosing-
+// handler behaviour under Go's panic propagation (the re-panic unwinds to the
+// nearest enclosing recover, matching the target for the tag the SjLj runtime
+// uses). The label operand is consumed but not otherwise needed: Go propagation
+// reaches the enclosing handler without an explicit target. Mirrors the ctrlTry
+// arm of handleEnd, minus any handler.
+func (ls *lowerState) handleDelegate(r *wasm.InstrReader) error {
+	if _, err := r.ReadU32(); err != nil { // labelidx (relative depth)
+		return err
+	}
+	if len(ls.ctrl) == 0 || ls.ctrl[len(ls.ctrl)-1].kind != ctrlTry {
+		return fmt.Errorf("%w: delegate with no open try", ErrSSAUnsupported)
+	}
+	f := ls.ctrl[len(ls.ctrl)-1]
+	ls.ctrl = ls.ctrl[:len(ls.ctrl)-1]
+
+	if !ls.unreachable {
+		ls.recordIncoming(f.target, f.resultCount)
+		cur := ls.b.Current()
+		cur.Kind = ssa.BlockPlain
+		ssa.AddEdge(cur, f.target)
+	}
+	if _, ok := ls.incoming[f.target]; ok {
+		ls.b.SetCurrent(f.target)
+		ls.unreachable = false
+		if err := ls.resolveIncoming(f.target, f.resultCount, f.stackHeightAtEntry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handleRethrow implements `rethrow N` — re-raise the exception caught by the
+// N-th enclosing catch. It terminates the current block by re-panicking the
+// in-scope caught exception (the emit pass renders it as panic(<catch exc>)).
+func (ls *lowerState) handleRethrow(r *wasm.InstrReader) error {
+	if _, err := r.ReadU32(); err != nil { // labelidx (relative depth to a try's catch)
+		return err
+	}
+	ls.b.FinishRethrow()
+	ls.unreachable = true
+	return nil
+}
+
+func (ls *lowerState) handleCatch(r *wasm.InstrReader) error {
+	tagIdx, err := r.ReadU32()
+	if err != nil {
+		return err
+	}
+	return ls.beginHandler(false, tagIdx)
+}
+
+func (ls *lowerState) handleCatchAll() error {
+	return ls.beginHandler(true, 0)
+}
+
+// beginHandler closes the current try sub-region (the body, or the previous
+// handler) with a fall-through edge to post, then opens the next catch /
+// catch_all handler block. The handler block is a landing pad: it has no CFG
+// predecessor (it is entered by the runtime unwinding into the try, emitted as
+// defer/recover), but it falls through to post like any other sub-region. The
+// operand stack is reset to the try-entry base and, for `catch`, the tag's
+// operands are pushed as OpCatchArg values.
+func (ls *lowerState) beginHandler(catchAll bool, tagIdx uint32) error {
+	if len(ls.ctrl) == 0 || ls.ctrl[len(ls.ctrl)-1].kind != ctrlTry {
+		return fmt.Errorf("%w: catch/catch_all with no open try", ErrSSAUnsupported)
+	}
+	f := ls.ctrl[len(ls.ctrl)-1]
+
+	// Close the current sub-region into post (skip if it threw/branched away).
+	if !ls.unreachable {
+		ls.recordIncoming(f.target, f.resultCount)
+		cur := ls.b.Current()
+		cur.Kind = ssa.BlockPlain
+		ssa.AddEdge(cur, f.target)
+	}
+
+	// Open the handler landing pad.
+	hBlk := ls.b.NewBlock(ssa.BlockPlain)
+	ls.b.SetCurrent(hBlk)
+	ls.unreachable = false
+
+	// Reset the operand stack to the try-entry base (the values pushed by the
+	// try body are unwound), then push the exception operands for `catch`.
+	if f.stackHeightAtEntry > len(ls.stack) {
+		return fmt.Errorf("%w: catch stack underflow (entry %d, have %d)", ErrSSAUnsupported, f.stackHeightAtEntry, len(ls.stack))
+	}
+	ls.stack = ls.stack[:f.stackHeightAtEntry]
+
+	nArgs := 0
+	if !catchAll {
+		types, err := ls.tagOperandTypes(tagIdx)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrSSAUnsupported, err)
+		}
+		for i, t := range types {
+			ls.push(ls.b.NewValueAuxInt(ssa.OpCatchArg, t, int64(i)))
+		}
+		nArgs = len(types)
+	}
+
+	f.tryRegion.Handlers = append(f.tryRegion.Handlers, ssa.TryHandler{
+		CatchAll: catchAll,
+		TagIndex: tagIdx,
+		Block:    hBlk,
+		NumArgs:  nArgs,
+	})
+	return nil
+}
+
+// tagOperandTypes returns the SSA operand types the exception tag carries.
+func (ls *lowerState) tagOperandTypes(tagIdx uint32) ([]ssa.Type, error) {
+	params, err := ls.tagOperandParams(tagIdx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ssa.Type, len(params))
+	for i, p := range params {
+		t := toSSAType(p)
+		if t == ssa.TypeInvalid {
+			return nil, fmt.Errorf("tag %d operand %d has unsupported type %v", tagIdx, i, p)
+		}
+		out[i] = t
+	}
+	return out, nil
 }
 
 // handleBr implements unconditional `br N`. The Nth-enclosing frame's
@@ -930,6 +1185,74 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 // of nResults values and routes them as the function result, then
 // marks the cursor unreachable. The function-level End will see the
 // previously-Ret block and not double-emit.
+// handleThrow lowers the EH `throw <tag>` opcode: it pops the tag's operands
+// and seals the current block as BlockThrow (a Go panic at emit time). A throw
+// with no enclosing try in this function propagates out — modelled as a leaf
+// terminator, like return/unreachable.
+func (ls *lowerState) handleThrow(r *wasm.InstrReader) error {
+	tagIdx, err := r.ReadU32()
+	if err != nil {
+		return err
+	}
+	n, err := ls.tagOperandCount(tagIdx)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrSSAUnsupported, err)
+	}
+	if len(ls.stack) < n {
+		return fmt.Errorf("%w: throw tag %d needs %d operands, stack has %d", ErrSSAUnsupported, tagIdx, n, len(ls.stack))
+	}
+	operands := make([]*ssa.Value, n)
+	copy(operands, ls.stack[len(ls.stack)-n:])
+	ls.stack = ls.stack[:len(ls.stack)-n]
+	ls.b.FinishThrow(tagIdx, operands...)
+	ls.unreachable = true
+	return nil
+}
+
+// tagOperandCount returns how many operands the exception tag tagIdx carries.
+func (ls *lowerState) tagOperandCount(tagIdx uint32) (int, error) {
+	params, err := ls.tagOperandParams(tagIdx)
+	if err != nil {
+		return 0, err
+	}
+	return len(params), nil
+}
+
+// tagOperandParams returns the operand value types of exception tag tagIdx (the
+// params of its type). The tag index space is imported tags first, then the
+// module's own tag section.
+func (ls *lowerState) tagOperandParams(tagIdx uint32) ([]wasm.ValType, error) {
+	var typeIdx uint32
+	if tagIdx < ls.mod.NumImportedTags {
+		k := uint32(0)
+		found := false
+		for _, imp := range ls.mod.Imports {
+			if imp.Kind != wasm.ImportTag {
+				continue
+			}
+			if k == tagIdx {
+				typeIdx = imp.Tag.TypeIdx
+				found = true
+				break
+			}
+			k++
+		}
+		if !found {
+			return nil, fmt.Errorf("tag: imported tag %d not found", tagIdx)
+		}
+	} else {
+		di := tagIdx - ls.mod.NumImportedTags
+		if int(di) >= len(ls.mod.Tags) {
+			return nil, fmt.Errorf("tag index %d out of range (%d defined tags)", tagIdx, len(ls.mod.Tags))
+		}
+		typeIdx = ls.mod.Tags[di].TypeIdx
+	}
+	if int(typeIdx) >= len(ls.mod.Types) {
+		return nil, fmt.Errorf("tag type index %d out of range", typeIdx)
+	}
+	return ls.mod.Types[typeIdx].Params, nil
+}
+
 func (ls *lowerState) handleReturn() error {
 	nRes := len(ls.ft.Results)
 	if len(ls.stack) < nRes {
@@ -1169,6 +1492,9 @@ func (ls *lowerState) globalType(idx uint32) ssa.Type {
 // appendLoopBackArgs extends each phi at the loop header with the
 // current per-local value, recording the back-edge contribution.
 func (ls *lowerState) appendLoopBackArgs(header *ssa.Block) {
+	if ls.mutableLocals {
+		return // no local phis in mutable-locals mode
+	}
 	for i, v := range ls.locals {
 		// Find the phi for local i at the header. We installed them
 		// at handleLoop in the same order, so it's the i'th OpPhi
@@ -1411,6 +1737,46 @@ func (ls *lowerState) handleEnd() (bool, error) {
 				return false, err
 			}
 		}
+	case ctrlTry:
+		// The `end` closes the LAST handler sub-region; fall it through to
+		// post (the body and earlier handlers were closed at each catch).
+		// Every sub-region — body and handlers — is a pred of post; the
+		// handler entry blocks are landing pads with no CFG pred.
+		if !ls.unreachable {
+			ls.recordIncoming(f.target, f.resultCount)
+			cur := ls.b.Current()
+			cur.Kind = ssa.BlockPlain
+			ssa.AddEdge(cur, f.target)
+		}
+		if _, ok := ls.incoming[f.target]; ok {
+			ls.b.SetCurrent(f.target)
+			ls.unreachable = false
+			if err := ls.resolveIncoming(f.target, f.resultCount, f.stackHeightAtEntry); err != nil {
+				return false, err
+			}
+		}
+	}
+	return false, nil
+}
+
+// bodyHasTry reports whether a function body's instruction stream contains an
+// EH `try` (which selects the mutable-locals lowering mode).
+func bodyHasTry(body []byte) (bool, error) {
+	r := wasm.NewInstrReader(body)
+	if err := skipLocalDecls(r); err != nil {
+		return false, err
+	}
+	for !r.EOF() {
+		op, err := r.ReadByte()
+		if err != nil {
+			return false, err
+		}
+		if op == wasm.OpTry {
+			return true, nil
+		}
+		if err := r.SkipImmediates(op); err != nil {
+			return false, err
+		}
 	}
 	return false, nil
 }
@@ -1419,7 +1785,12 @@ func (ls *lowerState) handleEnd() (bool, error) {
 // values as an edge flowing into target.
 func (ls *lowerState) recordIncoming(target *ssa.Block, resultCount int) {
 	from := ls.b.Current()
-	locSnap := append([]*ssa.Value(nil), ls.locals...)
+	// In mutable-locals mode, locals live in mutable Go vars that persist
+	// across blocks, so they are not threaded through phis — snapshot none.
+	var locSnap []*ssa.Value
+	if !ls.mutableLocals {
+		locSnap = append([]*ssa.Value(nil), ls.locals...)
+	}
 	var stackSnap []*ssa.Value
 	if resultCount > 0 {
 		base := len(ls.stack) - resultCount

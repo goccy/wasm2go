@@ -358,7 +358,7 @@ func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map
 					// rewrite, which does not apply at the leaves.
 					if (!strings.HasPrefix(t, "CMP") && !strings.HasPrefix(t, "TEST")) ||
 						strings.Contains(t, "(SP)") || strings.Contains(t, "(SB)") {
-						return nil, fmt.Errorf("jump table at +%d: flags consumed by targets but preceding writer %q is not replayable", in.Off, t)
+						return nil, fmt.Errorf("%w: jump table at +%d: flags consumed by targets but preceding writer %q", errUnsupportedJumpTable, in.Off, t)
 					}
 					site.replay = t
 					found = true
@@ -369,7 +369,7 @@ func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map
 				}
 			}
 			if !found {
-				return nil, fmt.Errorf("jump table at +%d: flags consumed by targets but no replayable flag-setter found", in.Off)
+				return nil, fmt.Errorf("%w: jump table at +%d: flags consumed by targets but no replayable flag-setter found", errUnsupportedJumpTable, in.Off)
 			}
 		}
 		sites[i] = site

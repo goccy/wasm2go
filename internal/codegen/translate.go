@@ -462,6 +462,20 @@ func sanitizeFilename(s string) string {
 	return string(out)
 }
 
+// Sentinel values for translator.currentChunk in multi-package mode. Numbered
+// chunk files use their index (0..N-1); these two negative sentinels name the
+// packages that are not numbered chunks. In single-package mode currentChunk is
+// unused and stays at its zero value.
+const (
+	// chunkMain is the root package — the module's top-level .go file that
+	// callers import (the one carrying the public API and Module type).
+	chunkMain = -1
+	// chunkBase is the shared base package that holds the common runtime types
+	// (base.Module, base.WasmExc, the import interfaces) the numbered chunks and
+	// main all reference.
+	chunkBase = -2
+)
+
 // translator carries codegen state for one module.
 type translator struct {
 	mod  *wasm.Module
@@ -492,6 +506,11 @@ type translator struct {
 	// function-body emission and resolved at the end.
 	helpers map[string]bool
 
+	// usesWasmExc is set when the module emits a wasm `throw` (panic with a
+	// wasmExc) or a try/catch: the wasmExc type declaration must then be
+	// pulled into the output even if no func helper is used.
+	usesWasmExc bool
+
 	// helpersFile is parsed lazily by emitHelpers.
 	helpersFile *ast.File
 
@@ -510,7 +529,8 @@ type translator struct {
 	elemInitChunks []ast.Decl
 
 	// Multi-package state. plan != nil iff opts.MultiPackage is true.
-	// currentChunk is the chunk being emitted (-1 = main, -2 = base).
+	// currentChunk is the chunk being emitted: chunkMain, chunkBase, or a
+	// numbered chunk index (0..N-1).
 	plan         *MultiPackagePlan
 	currentChunk int
 
@@ -605,9 +625,9 @@ func (t *translator) fieldRef(field string) ast.Expr {
 
 // moduleType returns the AST expression for `*Module`.
 func (t *translator) moduleType() ast.Expr {
-	if t.multiPackage && t.currentChunk != -2 {
+	if t.multiPackage && t.currentChunk != chunkBase {
 		// Chunks and the main package both reference base.Module.
-		// currentChunk == -2 is reserved for the base package itself.
+		// currentChunk == chunkBase is reserved for the base package itself.
 		return &ast.StarExpr{X: &ast.SelectorExpr{X: newID("base"), Sel: newID("Module")}}
 	}
 	return &ast.StarExpr{X: newID("Module")}
@@ -616,7 +636,7 @@ func (t *translator) moduleType() ast.Expr {
 // moduleTypeName returns the AST node for the bare Module type (no `*`),
 // suitable for composite literals like `&Module{...}`.
 func (t *translator) moduleTypeName() ast.Expr {
-	if t.multiPackage && t.currentChunk != -2 {
+	if t.multiPackage && t.currentChunk != chunkBase {
 		return &ast.SelectorExpr{X: newID("base"), Sel: newID("Module")}
 	}
 	return newID("Module")
@@ -627,7 +647,7 @@ func (t *translator) moduleTypeName() ast.Expr {
 // multi-pkg outside base).
 func (t *translator) importIfaceTypeRef(mod string) ast.Expr {
 	name := t.importIfaceName(mod)
-	if t.multiPackage && t.currentChunk != -2 {
+	if t.multiPackage && t.currentChunk != chunkBase {
 		return &ast.SelectorExpr{X: newID("base"), Sel: newID(name)}
 	}
 	return newID(name)
@@ -678,14 +698,30 @@ func capitalize(s string) string {
 	return "X" + s
 }
 
+// wasmExcTypeExpr returns the type-name expression for the wasmExc exception
+// struct. Single-package output keeps it unexported (`wasmExc`). Multi-package
+// output puts the type in `base` and exports it as `WasmExc`, so non-base chunks
+// reference `base.WasmExc` and base itself (currentChunk == chunkBase) uses the bare
+// exported name. Keep in sync with the type-decl capitalization in emitHelpers
+// and the helper-body rewrite (both switch to WasmExc when multiPackage).
+func (t *translator) wasmExcTypeExpr() ast.Expr {
+	if t.multiPackage {
+		if t.currentChunk == chunkBase {
+			return newID("WasmExc")
+		}
+		return &ast.SelectorExpr{X: newID("base"), Sel: newID("WasmExc")}
+	}
+	return newID("wasmExc")
+}
+
 // helperRef returns the AST expression that names a helper function. In
 // multi-package mode helpers live in `base` so non-base callers prefix:
-// `base.Subg`. In base itself (currentChunk == -2) and in single-package
+// `base.Subg`. In base itself (currentChunk == chunkBase) and in single-package
 // mode, the bare uppercase name is used.
 func (t *translator) helperRef(name string) ast.Expr {
 	if t.multiPackage {
 		up := capitalize(name)
-		if t.currentChunk == -2 {
+		if t.currentChunk == chunkBase {
 			return newID(up)
 		}
 		return &ast.SelectorExpr{X: newID("base"), Sel: newID(up)}
@@ -719,8 +755,9 @@ func (t *translator) funcRef(funcIdx uint32) ast.Expr {
 
 // registerLinknameForward records that callerChunk needs a //go:linkname
 // forward declaration for funcIdx (owned by targetChunk). Caller chunk
-// indices: 0..N for chunks, -1 for main, -2 for base (base never references
-// chunk functions directly so calls with callerChunk==-2 are an error path
+// indices: 0..N for chunks, chunkMain for main, chunkBase for base (base never
+// references chunk functions directly so calls with callerChunk==chunkBase are
+// an error path
 // surfaced at emit time).
 func (t *translator) registerLinknameForward(callerChunk int, funcIdx uint32, targetChunk int) {
 	if t.linknameForwards == nil {
@@ -1039,6 +1076,14 @@ func (t *translator) emitImportInterfaces() []ast.Decl {
 		ifaceName := t.importIfaceName(mod)
 		var methods []*ast.Field
 		for _, imp := range byMod[mod] {
+			// Only FUNCTION imports become interface methods — those are the
+			// host callables the Go embedder implements. Non-func imports
+			// (tags for EH, e.g. __c_longjmp, plus table/memory/global) are not
+			// callable and must not appear as a named method (a named interface
+			// method's type must be a func signature, not `any`).
+			if imp.Kind != wasm.ImportFunc {
+				continue
+			}
 			methods = append(methods, t.importMethodField(imp))
 		}
 		decls = append(decls, &ast.GenDecl{
@@ -1657,7 +1702,7 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 	// In multi-package mode the WasiStubs + DefaultWASI live in base/;
 	// callers outside base reference them through the `base.` prefix.
 	var defaultWASICall ast.Expr = &ast.CallExpr{Fun: newID("DefaultWASI")}
-	if t.multiPackage && t.currentChunk != -2 {
+	if t.multiPackage && t.currentChunk != chunkBase {
 		defaultWASICall = &ast.CallExpr{Fun: &ast.SelectorExpr{X: newID("base"), Sel: newID("DefaultWASI")}}
 	}
 	for i, mod := range t.importedModules {
@@ -2320,7 +2365,7 @@ var helpersSrc string
 // emitHelpers parses helpers.go (lazily) and pulls out only the requested
 // helpers. Resolves their stdlib package usage and registers them into t.imports.
 func (t *translator) emitHelpers() ([]ast.Decl, error) {
-	if len(t.helpers) == 0 {
+	if len(t.helpers) == 0 && !t.usesWasmExc {
 		return nil, nil
 	}
 	if t.helpersFile == nil {
@@ -2412,16 +2457,74 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 		// to be callable from chunk packages. Rename the function, any
 		// `m.memory`/`m.maxMem` field accesses, and any bare-name calls
 		// to other helpers (e.g. i32_div_u_s → i32_div_u) in the body
-		// to their capitalized form.
+		// to their capitalized form. The rewrite set also carries the wasmExc
+		// TYPE name so the EH helpers (wasm_catch/wasm_throw) reference the
+		// exported `WasmExc` in both their SIGNATURE and BODY — matching the
+		// exported type decl emitted below and the base.WasmExc references the
+		// chunk bodies use.
 		if t.multiPackage {
+			rewriteNames := make(map[string]bool, len(helperNames)+1)
+			for k := range helperNames {
+				rewriteNames[k] = true
+			}
+			rewriteNames["wasmExc"] = true
 			renamed := *fn
 			renamed.Name = newID(capitalize(fn.Name.Name))
-			renamed.Body = rewriteHelperBody(fn.Body, helperNames)
+			// Only rebuild the signature when it actually references a rewritten
+			// name (e.g. wasm_catch returns *wasmExc). rewriteHelperNode emits
+			// position-less nodes, which would displace any //go: directive
+			// comment on the FuncDecl — so leave untouched signatures alone.
+			if funcTypeRefsAny(fn.Type, rewriteNames) {
+				renamed.Type = rewriteHelperNode(fn.Type, rewriteNames).(*ast.FuncType)
+			}
+			renamed.Body = rewriteHelperBody(fn.Body, rewriteNames)
 			fn = &renamed
 		}
 		out = append(out, fn)
 	}
+	// The wasmExc type is not a FuncDecl, so pull it in explicitly whenever the
+	// module throws or catches. In multi-package mode the type lives in base and
+	// must be exported (WasmExc) so chunk packages can name it; single-package
+	// keeps it unexported (wasmExc). Field names (Tag, Vals) are already
+	// exported, so only the type name needs capitalizing.
+	if t.usesWasmExc {
+		for _, decl := range t.helpersFile.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || ts.Name.Name != "wasmExc" {
+					continue
+				}
+				emitted := ts
+				if t.multiPackage {
+					renamedTS := *ts
+					renamedTS.Name = newID("WasmExc")
+					emitted = &renamedTS
+				}
+				out = append(out, &ast.GenDecl{Tok: token.TYPE, Specs: []ast.Spec{emitted}})
+			}
+		}
+	}
 	return out, nil
+}
+
+// funcTypeRefsAny reports whether a helper's signature (params/results)
+// references any identifier in names — used to decide whether the signature
+// must be rebuilt for multi-package export (which would otherwise strip
+// position info from an otherwise-unchanged signature).
+func funcTypeRefsAny(ft *ast.FuncType, names map[string]bool) bool {
+	found := false
+	ast.Inspect(ft, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && names[id.Name] {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // capitalizeModuleFieldRefs rewrites `m.<lowercase>` selectors to
@@ -2605,6 +2708,36 @@ func rewriteHelperNode(n ast.Node, helperNames map[string]bool) ast.Node {
 		return out
 	case *ast.KeyValueExpr:
 		return &ast.KeyValueExpr{Key: rewriteHelperNode(v.Key, helperNames).(ast.Expr), Value: rewriteHelperNode(v.Value, helperNames).(ast.Expr)}
+	case *ast.Ellipsis:
+		out := &ast.Ellipsis{}
+		if v.Elt != nil {
+			out.Elt = rewriteHelperNode(v.Elt, helperNames).(ast.Expr)
+		}
+		return out
+	case *ast.FuncType:
+		// Rewrite parameter/result type references (e.g. a helper whose
+		// signature names wasmExc) so a renamed type stays consistent between
+		// the declaration and its uses. Params/Results are FieldLists.
+		out := &ast.FuncType{}
+		if v.Params != nil {
+			out.Params = rewriteHelperNode(v.Params, helperNames).(*ast.FieldList)
+		}
+		if v.Results != nil {
+			out.Results = rewriteHelperNode(v.Results, helperNames).(*ast.FieldList)
+		}
+		return out
+	case *ast.FieldList:
+		out := &ast.FieldList{List: make([]*ast.Field, len(v.List))}
+		for i, f := range v.List {
+			out.List[i] = rewriteHelperNode(f, helperNames).(*ast.Field)
+		}
+		return out
+	case *ast.Field:
+		out := &ast.Field{Names: v.Names, Tag: v.Tag}
+		if v.Type != nil {
+			out.Type = rewriteHelperNode(v.Type, helperNames).(ast.Expr)
+		}
+		return out
 	}
 	return n
 }

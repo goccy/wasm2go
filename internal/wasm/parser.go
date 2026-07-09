@@ -72,6 +72,8 @@ func Parse(r io.Reader) (*Module, error) {
 			m.NumImportedMems++
 		case ImportGlobal:
 			m.NumImportedGlobals++
+		case ImportTag:
+			m.NumImportedTags++
 		}
 	}
 	return m, nil
@@ -127,6 +129,8 @@ func parseSection(m *Module, id byte, r byteReader, raw []byte) error {
 		// DataCount: just a u32; we don't need it because we read the data section directly.
 		_, err := readU32(r)
 		return err
+	case 13:
+		return parseTagSection(m, r)
 	default:
 		return fmt.Errorf("unknown section id %d", id)
 	}
@@ -268,10 +272,46 @@ func parseImportSection(m *Module, r byteReader) error {
 				return err
 			}
 			imp.Global = GlobalType{Type: ValType(vt), Mutable: mut == 1}
+		case ImportTag:
+			attr, err := r.ReadByte()
+			if err != nil {
+				return err
+			}
+			ti, err := readU32(r)
+			if err != nil {
+				return err
+			}
+			imp.Tag = Tag{Attribute: attr, TypeIdx: ti}
 		default:
 			return fmt.Errorf("import[%d]: unknown kind 0x%02x", i, kind)
 		}
 		m.Imports[i] = imp
+	}
+	return nil
+}
+
+// parseTagSection parses the tag section (id 13) of the exception-handling
+// proposal: a vec of tags, each an attribute byte (0x00 = exception) followed
+// by a type index whose params are the exception's operand types.
+func parseTagSection(m *Module, r byteReader) error {
+	n, err := readU32(r)
+	if err != nil {
+		return err
+	}
+	if n > maxVectorLen {
+		return fmt.Errorf("tag section: count %d exceeds %d-element cap", n, maxVectorLen)
+	}
+	m.Tags = make([]Tag, n)
+	for i := uint32(0); i < n; i++ {
+		attr, err := r.ReadByte()
+		if err != nil {
+			return fmt.Errorf("tag[%d] attribute: %w", i, err)
+		}
+		ti, err := readU32(r)
+		if err != nil {
+			return fmt.Errorf("tag[%d] type index: %w", i, err)
+		}
+		m.Tags[i] = Tag{Attribute: attr, TypeIdx: ti}
 	}
 	return nil
 }

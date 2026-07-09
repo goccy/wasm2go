@@ -50,7 +50,7 @@ import (
 //  2. emitHelpers (adds helpers' stdlib needs to t.imports)
 //  3. Snapshot t.imports as base's view
 //  4. Run main pass (mutates t.imports, populates chunkExtraDecls and
-//     linkname forwards under callerChunk == -1)
+//     linkname forwards under callerChunk == chunkMain)
 //  5. Serialize per-chunk files (bodies + extras + linkname forwards)
 //  6. Serialize base file (using snapshot)
 //  7. Serialize main file (using full t.imports for stdlib)
@@ -92,7 +92,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	// wasm imports wasi_snapshot_preview1). Lives in base/ so DefaultWASI
 	// can return *WasiStubs alongside *Module. Imports merged into
 	// t.imports so they land in the snapshot below.
-	t.currentChunk = -2
+	t.currentChunk = chunkBase
 	wasiDecls, wasiImports, err := t.emitWasip1Native()
 	if err != nil {
 		return Result{}, err
@@ -109,8 +109,8 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	}
 
 	// Step 4: main pass. Populates chunkExtraDecls + linkname forwards
-	// on callerChunk == -1. Mutates t.imports with main's own needs.
-	t.currentChunk = -1
+	// on callerChunk == chunkMain. Mutates t.imports with main's own needs.
+	t.currentChunk = chunkMain
 	mainDecls := []ast.Decl{}
 	mainDecls = append(mainDecls, t.emitNewFuncs()...)
 	mainDecls = append(mainDecls, t.elemInitChunks...)
@@ -189,7 +189,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	}
 
 	// Step 6: serialize base file.
-	t.currentChunk = -2
+	t.currentChunk = chunkBase
 	baseFile := &ast.File{Name: newID("base")}
 	baseFile.Decls = append(baseFile.Decls, t.emitImportInterfaces()...)
 	baseFile.Decls = append(baseFile.Decls, t.emitModuleStruct())
@@ -205,7 +205,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	}
 
 	// Step 7: serialize main file.
-	t.currentChunk = -1
+	t.currentChunk = chunkMain
 	mainStdlib := scanStdlibRefs(mainDecls)
 	mainImports := []*ast.ImportSpec{
 		{Name: newID("base"), Path: &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(t.opts.OutputImportPath + "/base")}},
@@ -348,7 +348,7 @@ func (t *translator) formatAliasFile(pkgName string, buildTag string, forwards [
 //	                     aliases (the named symbols also satisfy
 //	                     pure-Go fallback callers in pN_pure.go)
 //
-// For callerChunk == -1 (main file) there is no asm caller, so only
+// For callerChunk == chunkMain (main file) there is no asm caller, so only
 // one file is emitted with no build tag — the bare aliases work for
 // every arch.
 //
@@ -358,7 +358,7 @@ func (t *translator) emitChunkAliasFiles(pkgName string, callerChunk int, dir st
 	files := map[string][]byte{}
 	named := t.emitNamedSymbolForwards(callerChunk)
 
-	if callerChunk == -1 {
+	if callerChunk == chunkMain {
 		bare := t.emitWasmFnForwards(callerChunk, linknameForwardBare)
 		decls := append([]ast.Decl{}, bare...)
 		decls = append(decls, named...)

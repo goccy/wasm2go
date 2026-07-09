@@ -1,0 +1,7 @@
+built from:
+  static jmp_buf jb;
+  static int helper(void){ longjmp(jb,7); return 0; }
+  int run(void){ int v=setjmp(jb); if(v)return 100+v; helper(); return -1; }
+with: clang --target=wasm32-wasip1 -mllvm -wasm-enable-sjlj -O1 -mexec-model=reactor
+      -nostartfiles -Wl,--export=run -Wl,--no-entry -lsetjmp
+run() returns 107 (longjmp value 7 -> 100+7).

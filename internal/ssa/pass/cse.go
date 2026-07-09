@@ -97,7 +97,10 @@ func cseEligible(v *ssa.Value) bool {
 	switch v.Op {
 	case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
 		ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
-		ssa.OpLoadF32, ssa.OpLoadF64, ssa.OpGlobalGet:
+		ssa.OpLoadF32, ssa.OpLoadF64, ssa.OpGlobalGet,
+		// OpLocalGet reads a mutable local var (EH mutable-locals mode);
+		// two identical reads separated by an OpLocalSet differ.
+		ssa.OpLocalGet:
 		return false
 	}
 	return true

@@ -239,7 +239,9 @@ func (r *InstrReader) SkipImmediates(op byte) error {
 	}
 	switch op {
 	case OpBr, OpBrIf, OpLocalGet, OpLocalSet, OpLocalTee,
-		OpGlobalGet, OpGlobalSet, OpCall:
+		OpGlobalGet, OpGlobalSet, OpCall,
+		// EH: catch/throw take a tag index; rethrow/delegate a label index.
+		OpCatch, OpThrow, OpRethrow, OpDelegate:
 		if _, err := r.ReadU32(); err != nil {
 			return err
 		}
@@ -278,13 +280,13 @@ func (r *InstrReader) SkipImmediates(op byte) error {
 			return err
 		}
 		return nil
-	case OpBlock, OpLoop, OpIf:
-		// blocktype: s33
+	case OpBlock, OpLoop, OpIf, OpTry:
+		// blocktype: s33 (try opens a handler region with a blocktype)
 		if _, err := r.ReadS33(); err != nil {
 			return err
 		}
 		return nil
-	case OpElse, OpEnd, OpReturn, OpUnreachable, OpNop, OpDrop, OpSelect:
+	case OpElse, OpEnd, OpReturn, OpUnreachable, OpNop, OpDrop, OpSelect, OpCatchAll:
 		return nil
 	case OpSelectT:
 		// vec(valtype) — n + n bytes

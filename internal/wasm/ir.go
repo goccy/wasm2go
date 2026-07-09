@@ -72,6 +72,7 @@ const (
 	ImportTable  ImportKind = 0x01
 	ImportMemory ImportKind = 0x02
 	ImportGlobal ImportKind = 0x03
+	ImportTag    ImportKind = 0x04
 )
 
 // Import is a single import entry.
@@ -83,6 +84,16 @@ type Import struct {
 	Table   TableType  // for ImportTable
 	Memory  MemoryType // for ImportMemory
 	Global  GlobalType // for ImportGlobal
+	Tag     Tag        // for ImportTag
+}
+
+// Tag is an exception-handling tag (section 13 / tag import). The
+// exception-handling proposal models each `throw`able exception as a tag whose
+// operand types are given by a function type (params = operands, results
+// empty). Attribute is 0x00 for exceptions.
+type Tag struct {
+	Attribute byte
+	TypeIdx   uint32 // index into Types; params are the exception's operand types
 }
 
 // ExportKind selects the kind of an export.
@@ -145,6 +156,7 @@ type Module struct {
 	Start     *uint32
 	Elements  []ElementSegment
 	Datas     []DataSegment
+	Tags      []Tag // defined tags (section 13); tag index space is imported tags then these
 
 	// Convenience: number of imported funcs (= count of Imports with Kind==ImportFunc).
 	// Function index space is [imported funcs ...] then Functions[i].
@@ -152,6 +164,7 @@ type Module struct {
 	NumImportedTables  uint32
 	NumImportedMems    uint32
 	NumImportedGlobals uint32
+	NumImportedTags    uint32
 }
 
 // FuncTypeOf returns the function type at the given function index, accounting

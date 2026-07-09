@@ -126,3 +126,31 @@ func (b *FuncBuilder) FinishRet(results ...*Value) {
 		b.cur.Values = append(b.cur.Values, b.f.newValue(OpCopy, r.Type, []*Value{r}, b.cur, 0, nil))
 	}
 }
+
+// FinishThrow marks the current block as Throw: it raises exception tag tagIdx
+// with the given operands. Mirrors FinishRet — the operands are stored as
+// trailing OpCopy markers so the emit pass finds them in a canonical place.
+func (b *FuncBuilder) FinishThrow(tagIdx uint32, operands ...*Value) {
+	if b.cur == nil {
+		panic("ssa.FuncBuilder: FinishThrow with no current block")
+	}
+	b.cur.Kind = BlockThrow
+	b.cur.TagIndex = tagIdx
+	b.cur.ThrowArgc = len(operands)
+	for _, o := range operands {
+		b.cur.Values = append(b.cur.Values, b.f.newValue(OpCopy, o.Type, []*Value{o}, b.cur, 0, nil))
+	}
+}
+
+// FinishRethrow marks the current block as a re-raise of the exception caught by
+// the enclosing catch handler (the `rethrow` op). It is a BlockThrow carrying NO
+// fresh operands (ThrowArgc stays 0, so every tail-marker consumer is
+// unaffected) with the IsRethrow flag set, so the emit pass renders
+// `panic(<current catch exc>)` rather than `panic(&wasmExc{Tag,Vals})`.
+func (b *FuncBuilder) FinishRethrow() {
+	if b.cur == nil {
+		panic("ssa.FuncBuilder: FinishRethrow with no current block")
+	}
+	b.cur.Kind = BlockThrow
+	b.cur.IsRethrow = true
+}
