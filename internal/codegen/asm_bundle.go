@@ -108,7 +108,13 @@ func isLinknameTrampolineBody(body *ast.BlockStmt) bool {
 // where the asm files supply the function bodies instead.
 func splitForAsm(src []byte, pkg string) (shared, fallback []byte, err error) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "translate.go", src, parser.ParseComments)
+	// SkipObjectResolution: this split only reshuffles top-level decls
+	// and never inspects ident.Obj / file.Scope, so the parser's
+	// (deprecated) identifier resolver is dead work here — and its
+	// hard-coded maxScopeDepth=1000 bailout would reject legitimately
+	// deep control flow (e.g. the nested dispatch setjmp/longjmp
+	// translation emits) that gc itself compiles fine.
+	file, err := parser.ParseFile(fset, "translate.go", src, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse: %w", err)
 	}
