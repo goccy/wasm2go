@@ -108,6 +108,15 @@ func TestIdentityHelpers(t *testing.T) {
 	if got := f64(3.14); got != 3.14 {
 		t.Errorf("f64 = %v", got)
 	}
+	// b2i32 carries a wasm comparison result out of a Go bool. The emitter
+	// relies on exactly 0 and 1 — the result feeds arithmetic and bitwise
+	// operators, not just branches.
+	if got := b2i32(true); got != 1 {
+		t.Errorf("b2i32(true) = %d, want 1", got)
+	}
+	if got := b2i32(false); got != 0 {
+		t.Errorf("b2i32(false) = %d, want 0", got)
+	}
 	if got := f32(float32(math.NaN())); !math.IsNaN(float64(got)) {
 		t.Errorf("f32(NaN) should be NaN")
 	}
