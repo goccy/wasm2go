@@ -51,6 +51,27 @@ func ui32(x int32) uint32 { return uint32(x) }
 
 func ui64(x int64) uint64 { return uint64(x) }
 
+// b2i32 materialises a wasm comparison result — an i32 that is 0 or 1 — from
+// the Go bool the comparison expression evaluates to.
+//
+// It exists as a named helper rather than an inline `func() int32 { ... }()`
+// because the gcasm backend requires every direct call left in the compiled
+// output to be either a package-local FnN or something the Go inliner removed.
+// A func literal is normally inlined at its call site, but the inliner gives up
+// once the ENCLOSING function grows past its budget — and a single wasm function
+// can translate to tens of thousands of lines of Go, as an interpreter's
+// bytecode dispatch loop does. The literal is then outlined into a real closure
+// symbol (FnN.funcA.funcB), which reaches the assembler as a direct call gcasm
+// cannot marshal. A named helper this small is always inlined, and if it ever
+// were not, it would fail loudly at its own symbol rather than as a nested
+// closure.
+func b2i32(b bool) int32 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func f32(x float32) float32 { runtime.KeepAlive(&x); return x }
 
 func f64(x float64) float64 { runtime.KeepAlive(&x); return x }

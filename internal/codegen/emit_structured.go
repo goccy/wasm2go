@@ -38,6 +38,21 @@ type loopInfo struct {
 type loopFrame struct {
 	header *ssa.Block
 	follow *ssa.Block
+	// switchDepth is se.switchDepth as it stood when the loop was opened. A
+	// `break` emitted while se.switchDepth is deeper than this sits lexically
+	// inside a `switch` that the loop does not contain, so a bare `break` would
+	// leave the switch and fall to the bottom of the loop body instead of
+	// exiting the loop. Such a break must name the loop.
+	switchDepth int
+	// label is the loop's Go label, assigned lazily by jump() the first time a
+	// break needs to name it. Empty means the `for` is emitted unlabelled —
+	// which it must be, because Go rejects a label that nothing uses.
+	//
+	// The name comes from a per-function counter, not from the header block's
+	// ID: region() duplicates a shared forward join into each path that reaches
+	// it, so one loop header can be emitted more than once in a function, and
+	// two `for`s carrying the same label do not compile.
+	label string
 }
 
 // structEmitter holds the per-function state for structured emission.
@@ -52,6 +67,14 @@ type structEmitter struct {
 	loops     map[ssa.BlockID]*loopInfo
 	// ctx is the stack of enclosing loops, innermost last.
 	ctx []loopFrame
+	// switchDepth counts the `switch` statements currently open around the
+	// emission point — one per br_table, one per exception dispatch. Go's
+	// `break` binds to the innermost for/switch/select, so a loop-exit break
+	// emitted at a deeper switch depth than its loop has to be labelled.
+	switchDepth int
+	// labelSeq names those labels. It is per function and monotonic, so a loop
+	// emitted twice (block duplication) gets two distinct labels.
+	labelSeq int
 	// emitted guards against emitting a block twice.
 	emitted map[ssa.BlockID]bool
 	// tryOpened marks try-region entry blocks already wrapped, so the
@@ -379,6 +402,10 @@ func (se *structEmitter) emitTryRegion(tr *ssa.TryRegion) ([]ast.Stmt, bool) {
 	// Dispatch a caught exception to its handler.
 	var clauses []ast.Stmt
 	hasCatchAll := false
+	// Handler bodies land inside the dispatch switch below, so a loop-exit break
+	// in one of them must name its loop (see jump).
+	se.switchDepth++
+	defer func() { se.switchDepth-- }()
 	for _, h := range tr.Handlers {
 		se.em.catchExcVar = excVar
 		hStmts, ok := se.region(h.Block, tr.Post)
@@ -449,13 +476,20 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 		}
 		// Open a `for {}` when b heads a loop we are not already in.
 		if li := se.loops[b.ID]; li != nil && !se.insideLoop(b) {
-			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow})
+			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow, switchDepth: se.switchDepth})
 			forBody, ok := se.region(b, nil)
+			// Read the frame back before popping: jump() names the loop lazily,
+			// from arbitrarily deep inside the body it just emitted.
+			label := se.ctx[len(se.ctx)-1].label
 			se.ctx = se.ctx[:len(se.ctx)-1]
 			if !ok {
 				return nil, false
 			}
-			out = append(out, &ast.ForStmt{Body: &ast.BlockStmt{List: forBody}})
+			var loop ast.Stmt = &ast.ForStmt{Body: &ast.BlockStmt{List: forBody}}
+			if label != "" {
+				loop = &ast.LabeledStmt{Label: newID(label), Stmt: loop}
+			}
+			out = append(out, loop)
 			b = li.follow
 			continue
 		}
@@ -574,10 +608,14 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			if err != nil {
 				return nil, false
 			}
+			// The arms are emitted inside the switch, so a loop-exit break in one
+			// of them must name its loop (see jump).
+			se.switchDepth++
 			swBody := &ast.BlockStmt{}
 			for si, e := range b.Succs {
 				arm, ok := se.branch(b, e.Block, e.Index, join)
 				if !ok {
+					se.switchDepth--
 					return nil, false
 				}
 				var caseExprs []ast.Expr
@@ -589,6 +627,7 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 				}
 				swBody.List = append(swBody.List, &ast.CaseClause{List: caseExprs, Body: arm})
 			}
+			se.switchDepth--
 			out = append(out, &ast.SwitchStmt{Tag: sel, Body: swBody})
 			if join == nil {
 				b = nil
@@ -645,19 +684,35 @@ func (se *structEmitter) goTo(target, pred *ssa.Block, predIdx int, stop *ssa.Bl
 // jump returns the `continue` / `break` statement when `target` is the
 // header or follow of an enclosing loop. ok=false means it is an
 // ordinary block. Only the INNERMOST enclosing loop is handled with a
-// bare continue/break; a jump to an outer loop returns ok=false so the
+// continue/break; a jump to an outer loop returns ok=false so the
 // whole function falls back to the goto emitter (labelled loops are a
 // follow-up).
+//
+// A break is labelled when the emission point is inside a `switch` the loop
+// does not contain. Go binds a bare `break` to the innermost for/switch/select,
+// so a bare break under a br_table's switch would leave only the switch and
+// then fall to the bottom of the loop body — silently turning the loop's exit
+// into a back-edge. The induction variable is updated on the OTHER arm, so what
+// results is not a slow loop but a stuck one. `continue` needs no label: it
+// binds to the innermost for regardless of any switch in between.
 func (se *structEmitter) jump(target *ssa.Block) ([]ast.Stmt, bool) {
 	if len(se.ctx) == 0 {
 		return nil, false
 	}
-	inner := se.ctx[len(se.ctx)-1]
+	inner := &se.ctx[len(se.ctx)-1]
 	if target == inner.header {
 		return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}, true
 	}
 	if inner.follow != nil && target == inner.follow {
-		return []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}}, true
+		br := &ast.BranchStmt{Tok: token.BREAK}
+		if se.switchDepth > inner.switchDepth {
+			if inner.label == "" {
+				se.labelSeq++
+				inner.label = fmt.Sprintf("wl%d", se.labelSeq)
+			}
+			br.Label = newID(inner.label)
+		}
+		return []ast.Stmt{br}, true
 	}
 	// A jump to an outer loop's header/follow would need a labelled
 	// continue/break. Signal "not handled" so emitStructured bails.

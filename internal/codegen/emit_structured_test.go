@@ -30,9 +30,9 @@ func TestStructuredEmit(t *testing.T) {
 	// structured (no goto): if/else for branches, for {} for loops.
 	structured := []string{"abs", "clamp_if", "early", "deadnest", "ret_nested",
 		"deep", "brblock", "fold_arith", "fold_cse", "fold_dead",
-		"count", "sum", "mul2"}
+		"count", "sum", "mul2", "table_loop_exit"}
 	// loopExports must additionally contain a `for` loop.
-	loopExports := map[string]bool{"count": true, "sum": true, "mul2": true}
+	loopExports := map[string]bool{"count": true, "sum": true, "mul2": true, "table_loop_exit": true}
 
 	// emitOne lowers + optimises an export and runs the structured
 	// emitter. ok2 is false when the function could not be SSA-lowered
