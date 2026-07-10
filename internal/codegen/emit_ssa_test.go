@@ -92,7 +92,14 @@ func TestEmitSSAComparison(t *testing.T) {
 	if !strings.Contains(got, "ui32(l0) < ui32(l1)") {
 		t.Errorf("lt_u missing ui32 helper cast:\n%s", got)
 	}
-	if !strings.Contains(got, "return 1") || !strings.Contains(got, "return 0") {
-		t.Errorf("lt_u missing bool→i32 wrapping:\n%s", got)
+	// The bool→i32 conversion goes through the named b2i32 helper. It must NOT
+	// be an inline `func() int32 { ... }()`: the Go inliner drops a func literal
+	// once the enclosing function outgrows its budget, and the resulting closure
+	// symbol is a direct call the gcasm backend cannot marshal.
+	if !strings.Contains(got, "b2i32(ui32(l0) < ui32(l1))") {
+		t.Errorf("lt_u missing b2i32 bool→i32 wrapping:\n%s", got)
+	}
+	if strings.Contains(got, "func()") {
+		t.Errorf("lt_u emitted a func literal; gcasm cannot marshal an outlined closure:\n%s", got)
 	}
 }

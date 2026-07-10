@@ -1073,7 +1073,7 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		if v.Op == ssa.OpShrU32 || v.Op == ssa.OpShrU64 {
 			return em.emitShrU(lhs, rhs, v), nil
 		}
-		return wrapBinary(mode, lhs, rhs, tok, v), nil
+		return em.wrapBinary(mode, lhs, rhs, tok, v), nil
 	}
 	return nil, fmt.Errorf("ssa emit: unsupported op %v", v.Op)
 }
@@ -1496,7 +1496,7 @@ func tokenShift(op ssa.Op) token.Token {
 	return token.ILLEGAL
 }
 
-func wrapBinary(mode binaryMode, lhs, rhs ast.Expr, tok token.Token, v *ssa.Value) ast.Expr {
+func (em *ssaEmitter) wrapBinary(mode binaryMode, lhs, rhs ast.Expr, tok token.Token, v *ssa.Value) ast.Expr {
 	isUnsigned := mode&(1<<4) != 0
 	pureMode := mode &^ binaryMode(1<<4)
 	switch pureMode {
@@ -1533,7 +1533,7 @@ func wrapBinary(mode binaryMode, lhs, rhs ast.Expr, tok token.Token, v *ssa.Valu
 		} else {
 			compared = &ast.BinaryExpr{X: lhs, Op: tok, Y: rhs}
 		}
-		return boolToI32(compared)
+		return em.boolToI32(compared)
 	}
 	return &ast.BinaryExpr{X: lhs, Op: tok, Y: rhs}
 }
@@ -1550,27 +1550,16 @@ func (em *ssaEmitter) wrapBinaryUnsignedCmp(lhs, rhs ast.Expr, tok token.Token, 
 		Op: tok,
 		Y:  &ast.CallExpr{Fun: hr, Args: []ast.Expr{rhs}},
 	}
-	return boolToI32(compared)
+	return em.boolToI32(compared)
 }
 
-func boolToI32(cond ast.Expr) ast.Expr {
-	return &ast.CallExpr{
-		Fun: &ast.FuncLit{
-			Type: &ast.FuncType{
-				Params:  &ast.FieldList{},
-				Results: &ast.FieldList{List: []*ast.Field{{Type: newID("int32")}}},
-			},
-			Body: &ast.BlockStmt{List: []ast.Stmt{
-				&ast.IfStmt{
-					Cond: cond,
-					Body: &ast.BlockStmt{List: []ast.Stmt{
-						&ast.ReturnStmt{Results: []ast.Expr{intLit(1)}},
-					}},
-				},
-				&ast.ReturnStmt{Results: []ast.Expr{intLit(0)}},
-			}},
-		},
-	}
+// boolToI32 turns a Go bool expression into the wasm i32 (0 or 1) a comparison
+// leaves on the stack, via the b2i32 helper. It must not emit a func literal:
+// see b2i32's comment in helpers/helpers.go for why an inline IIFE breaks the
+// gcasm backend on large functions.
+func (em *ssaEmitter) boolToI32(cond ast.Expr) ast.Expr {
+	em.useHelper("b2i32")
+	return &ast.CallExpr{Fun: em.helperRef("b2i32"), Args: []ast.Expr{cond}}
 }
 
 var _ = binaryUnsigned // not yet used; reserved for future ops
