@@ -745,6 +745,43 @@ func TestPruneDeadBlocks(t *testing.T) {
 	}
 }
 
+// A catch landing pad has no predecessors — it is entered by unwinding, not by
+// a CFG edge. One that ends the function (return / unreachable / throw) has no
+// successors either, so the isolation rule would sweep it away while the
+// TryRegion kept pointing at it, leaving the emitters to reference a block that
+// no longer exists.
+func TestPruneDeadBlocksCatchLandingPadKept(t *testing.T) {
+	b := NewFuncBuilder("prune_landingpad", FuncSig{Results: []Type{TypeI32}})
+	entry := b.NewBlock(BlockRet)
+	pad := b.NewBlock(BlockRet) // no preds, no succs — reached only by unwinding
+	dead := b.NewBlock(BlockRet)
+	b.SetEntry(entry)
+	b.SetCurrent(entry)
+	b.FinishRet(b.Const32(1))
+	b.SetCurrent(pad)
+	b.FinishRet(b.Const32(42))
+	b.SetCurrent(dead)
+	b.FinishRet(b.Const32(0))
+	f := b.Func()
+	f.TryRegions = []*TryRegion{{Entry: entry, Post: entry, Handlers: []TryHandler{{Block: pad}}}}
+
+	PruneDeadBlocks(f)
+
+	kept := map[*Block]bool{}
+	for _, blk := range f.Blocks {
+		kept[blk] = true
+	}
+	if !kept[entry] {
+		t.Error("entry block removed by prune")
+	}
+	if !kept[pad] {
+		t.Error("catch landing pad removed by prune")
+	}
+	if kept[dead] {
+		t.Error("genuinely isolated block survived prune")
+	}
+}
+
 func TestPruneDeadBlocksEntryKept(t *testing.T) {
 	// Entry block with no preds and no succs must not be pruned.
 	b := NewFuncBuilder("prune_entry", FuncSig{})

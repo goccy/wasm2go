@@ -53,6 +53,13 @@ type loopFrame struct {
 	// it, so one loop header can be emitted more than once in a function, and
 	// two `for`s carrying the same label do not compile.
 	label string
+	// tryDepth is se.inTryDepth as it stood when the loop was opened. A
+	// break/continue emitted while se.inTryDepth is deeper than this would have
+	// to jump out of an EH try-region closure (emitTryRegion wraps the protected
+	// body in a `func() *wasmExc { ... }()`), but Go labels are function-scoped
+	// and `break`/`continue` cannot cross a func literal — so such a jump bails
+	// to the goto emitter instead (see jump()).
+	tryDepth int
 }
 
 // structEmitter holds the per-function state for structured emission.
@@ -476,7 +483,7 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 		}
 		// Open a `for {}` when b heads a loop we are not already in.
 		if li := se.loops[b.ID]; li != nil && !se.insideLoop(b) {
-			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow, switchDepth: se.switchDepth})
+			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow, switchDepth: se.switchDepth, tryDepth: se.inTryDepth})
 			forBody, ok := se.region(b, nil)
 			// Read the frame back before popping: jump() names the loop lazily,
 			// from arbitrarily deep inside the body it just emitted.
@@ -700,10 +707,29 @@ func (se *structEmitter) jump(target *ssa.Block) ([]ast.Stmt, bool) {
 		return nil, false
 	}
 	inner := &se.ctx[len(se.ctx)-1]
+	// A jump to a loop opened OUTSIDE the try-region closure we are currently
+	// emitting into cannot be a `break`/`continue` — not even a labelled one.
+	// Go labels are function-scoped and neither statement crosses the
+	// `func() *wasmExc { ... }()` that emitTryRegion wraps the protected body
+	// in. Panic to abort structured emission (emitStructured recovers and falls
+	// back to the goto emitter, which threads control out of try bodies via
+	// return flags rather than lexical break). Mirrors the outer-loop case
+	// below, and the BlockRet-inside-try bail in region().
+	//
+	// The check sits inside each target test, not above them: an ordinary
+	// forward jump inside a try is not a loop jump at all, and must keep
+	// returning ok=false so the caller emits its target inline.
+	crossesTryClosure := func() {
+		if se.inTryDepth > inner.tryDepth {
+			panic("structured emit: break/continue cannot cross a try closure")
+		}
+	}
 	if target == inner.header {
+		crossesTryClosure()
 		return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}, true
 	}
 	if inner.follow != nil && target == inner.follow {
+		crossesTryClosure()
 		br := &ast.BranchStmt{Tok: token.BREAK}
 		if se.switchDepth > inner.switchDepth {
 			if inner.label == "" {
