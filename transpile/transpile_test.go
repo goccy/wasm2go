@@ -502,6 +502,73 @@ func main() {
 	}
 }
 
+// TestTranspileEHCatchReturns covers a catch landing pad that leaves the
+// function directly. A landing pad has no CFG predecessors (it is entered by
+// unwinding), and one that ends in `return` has no successors either — so
+// PruneDeadBlocks, whose rule is "no preds and no succs", swept it out of
+// Func.Blocks while the TryRegion kept pointing at it. The recover trampoline
+// then emitted `case <id>: goto L<id>` for a label nobody defined and the
+// generated Go did not compile.
+//
+// `plain` is the minimal shape; `inLoop` is where it was first hit, and there
+// the missing block also tripped the structured emitter's block-count check, so
+// the function fell back to the goto emitter — into the same broken output.
+func TestTranspileEHCatchReturns(t *testing.T) {
+	bin := testfixture.Wasm(t, "eh_catch_returns")
+	m, err := transpile.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var buf bytes.Buffer
+	res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "ehr/pkg"})
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+
+	dir := t.TempDir()
+	write := func(rel string, data []byte) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", []byte("module ehr\n\ngo 1.25.0\n"))
+	write("pkg/gen.go", buf.Bytes())
+	for rel, data := range res.Files {
+		write("pkg/"+rel, data)
+	}
+	for name, data := range res.Sidecars {
+		write("pkg/"+name, data)
+	}
+	write("main.go", []byte(`package main
+
+import (
+	"fmt"
+
+	"ehr/pkg"
+)
+
+func main() {
+	m := pkg.New()
+	fmt.Println(m.Plain(0), m.Plain(7), m.InLoop(0), m.InLoop(7))
+}
+`))
+	// The whole point is that this COMPILES: a pruned landing pad leaves the
+	// trampoline's resume `goto` dangling ("label L3 not defined").
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go run failed (catch landing pad likely pruned): %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "1 42 3 42" {
+		t.Fatalf("eh catch-returns: got %q, want %q\n%s", got, "1 42 3 42", out)
+	}
+}
+
 // TestTranspileEHMultiPackage proves EH try/catch works in MULTI-package
 // output: the wasmExc type + wasm_catch helper live in `base` (exported as
 // WasmExc / Wasm_catch), and the chunk package emitting the try/catch references

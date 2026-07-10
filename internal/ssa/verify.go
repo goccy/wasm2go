@@ -362,7 +362,8 @@ func blockID(b *Block) BlockID {
 }
 
 // PruneDeadBlocks removes blocks that are fully isolated — zero
-// predecessors and zero successors — and are not the entry block.
+// predecessors and zero successors — and are not the entry block or an
+// EH catch landing pad.
 //
 // Such blocks arise legitimately during structured-control lowering:
 // e.g. a `loop` whose body always branches (br 0 back-edge or br N
@@ -376,13 +377,32 @@ func blockID(b *Block) BlockID {
 // unreachable block can never have acquired a successor edge either.
 // So an isolated block carries no values anyone depends on.
 //
+// A catch landing pad breaks that reasoning: it is entered by unwinding,
+// not by a CFG edge, so it has no predecessors. Usually it also has a
+// successor (the `end` of the try falls through to the region's Post),
+// which is why the pruner did not notice — but a handler that ends in
+// `return`, `unreachable` or a `throw` has neither. Removing it leaves
+// the TryRegion pointing at a block nobody emits: the recover
+// trampoline still generates the `case <id>: goto L<id>` that resumes
+// into the handler, and the resulting Go does not compile
+// ("label L3 not defined"). The structured emitter fares no better —
+// its block-count check fails and the whole function falls back.
+//
 // Run before Verify.
 func PruneDeadBlocks(f *Func) {
+	roots := map[BlockID]bool{}
+	for _, tr := range f.TryRegions {
+		for _, h := range tr.Handlers {
+			if h.Block != nil {
+				roots[h.Block.ID] = true
+			}
+		}
+	}
 	for {
 		removed := false
 		kept := f.Blocks[:0]
 		for _, b := range f.Blocks {
-			if b != f.Entry && len(b.Preds) == 0 && len(b.Succs) == 0 {
+			if b != f.Entry && !roots[b.ID] && len(b.Preds) == 0 && len(b.Succs) == 0 {
 				removed = true
 				continue
 			}
