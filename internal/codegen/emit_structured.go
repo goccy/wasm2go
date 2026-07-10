@@ -707,19 +707,29 @@ func (se *structEmitter) jump(target *ssa.Block) ([]ast.Stmt, bool) {
 		return nil, false
 	}
 	inner := &se.ctx[len(se.ctx)-1]
-	// The jump target is a loop opened outside the try-region closure we are
-	// currently emitting into. A `break`/`continue` — even a labelled one —
-	// cannot leave the `func() *wasmExc { ... }()` the try body lives in, so
-	// abort structured emission and let the goto emitter (which threads control
-	// out of try bodies via return flags, not lexical break) handle this
-	// function. Mirrors the BlockRet-inside-try bail in region().
-	if se.inTryDepth > inner.tryDepth {
-		return nil, false
+	// A jump to a loop opened OUTSIDE the try-region closure we are currently
+	// emitting into cannot be a `break`/`continue` — not even a labelled one.
+	// Go labels are function-scoped and neither statement crosses the
+	// `func() *wasmExc { ... }()` that emitTryRegion wraps the protected body
+	// in. Panic to abort structured emission (emitStructured recovers and falls
+	// back to the goto emitter, which threads control out of try bodies via
+	// return flags rather than lexical break). Mirrors the outer-loop case
+	// below, and the BlockRet-inside-try bail in region().
+	//
+	// The check sits inside each target test, not above them: an ordinary
+	// forward jump inside a try is not a loop jump at all, and must keep
+	// returning ok=false so the caller emits its target inline.
+	crossesTryClosure := func() {
+		if se.inTryDepth > inner.tryDepth {
+			panic("structured emit: break/continue cannot cross a try closure")
+		}
 	}
 	if target == inner.header {
+		crossesTryClosure()
 		return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}, true
 	}
 	if inner.follow != nil && target == inner.follow {
+		crossesTryClosure()
 		br := &ast.BranchStmt{Tok: token.BREAK}
 		if se.switchDepth > inner.switchDepth {
 			if inner.label == "" {
