@@ -156,4 +156,38 @@
         (local.set 1 (i32.add (local.get 1) (i32.const 1)))
         (br 0)))
     (local.get 2))
+
+  ;; --- br_table inside a loop, one arm exiting the loop ---
+  ;; table_loop_exit(n): advance i from n until i is odd and i >= n+3.
+  ;;
+  ;; The loop's exit is a `br $done` nested inside one arm of a br_table. The
+  ;; structured emitter renders the table as a Go `switch`, and every arm here
+  ;; terminates, so nothing follows the switch and the `for` body ends with it.
+  ;; Go binds a bare `break` to the innermost switch — so the exit must NAME
+  ;; the loop. A bare break would leave only the switch and fall off the end of
+  ;; the loop body, which is the back-edge: the loop would never terminate.
+  (func (export "table_loop_exit") (param i32) (result i32)
+    (local i32) ;; 1: i
+    (local.set 1 (local.get 0))
+    (block $done
+      (loop $again
+        (local.set 1 (i32.add (local.get 1) (i32.const 1)))
+        (block $trap
+          (block $odd
+            (block $even
+              ;; selector is 0 or 1, so the default ($trap) arm is dead. It is
+              ;; here to remove the br_table's post-dominator, which is what
+              ;; makes the `switch` the last statement of the loop body — and
+              ;; therefore what makes a mis-bound `break` fall onto the
+              ;; back-edge instead of onto a following statement.
+              (br_table $even $odd $trap
+                (i32.and (local.get 1) (i32.const 1))))
+            ;; even: keep going
+            (br $again))
+          ;; odd: leave once i has caught up with n+5
+          (br_if $done (i32.ge_s (local.get 1) (i32.add (local.get 0) (i32.const 5))))
+          (br $again))
+        (unreachable)))
+    (local.get 1))
+
 )

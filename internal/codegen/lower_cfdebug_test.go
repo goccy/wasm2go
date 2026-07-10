@@ -42,6 +42,11 @@ func TestSSAControlFlow(t *testing.T) {
 		{"fold_arith", []int32{0}},
 		{"fold_cse", []int32{0, 3, 7}},
 		{"fold_dead", []int32{0, 5, 41}},
+		// A br_table arm that exits the enclosing loop. The structured emitter
+		// renders the table as a Go `switch`, and Go binds a bare `break` to the
+		// innermost switch — so the exit arm has to name the loop or the generated
+		// code spins forever instead of returning.
+		{"table_loop_exit", []int32{0, 1, 2, 3, 8, 20}},
 	}
 
 	// wazero reference values.
