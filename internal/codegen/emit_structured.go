@@ -53,6 +53,13 @@ type loopFrame struct {
 	// it, so one loop header can be emitted more than once in a function, and
 	// two `for`s carrying the same label do not compile.
 	label string
+	// tryDepth is se.inTryDepth as it stood when the loop was opened. A
+	// break/continue emitted while se.inTryDepth is deeper than this would have
+	// to jump out of an EH try-region closure (emitTryRegion wraps the protected
+	// body in a `func() *wasmExc { ... }()`), but Go labels are function-scoped
+	// and `break`/`continue` cannot cross a func literal — so such a jump bails
+	// to the goto emitter instead (see jump()).
+	tryDepth int
 }
 
 // structEmitter holds the per-function state for structured emission.
@@ -476,7 +483,7 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 		}
 		// Open a `for {}` when b heads a loop we are not already in.
 		if li := se.loops[b.ID]; li != nil && !se.insideLoop(b) {
-			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow, switchDepth: se.switchDepth})
+			se.ctx = append(se.ctx, loopFrame{header: b, follow: li.follow, switchDepth: se.switchDepth, tryDepth: se.inTryDepth})
 			forBody, ok := se.region(b, nil)
 			// Read the frame back before popping: jump() names the loop lazily,
 			// from arbitrarily deep inside the body it just emitted.
@@ -700,6 +707,15 @@ func (se *structEmitter) jump(target *ssa.Block) ([]ast.Stmt, bool) {
 		return nil, false
 	}
 	inner := &se.ctx[len(se.ctx)-1]
+	// The jump target is a loop opened outside the try-region closure we are
+	// currently emitting into. A `break`/`continue` — even a labelled one —
+	// cannot leave the `func() *wasmExc { ... }()` the try body lives in, so
+	// abort structured emission and let the goto emitter (which threads control
+	// out of try bodies via return flags, not lexical break) handle this
+	// function. Mirrors the BlockRet-inside-try bail in region().
+	if se.inTryDepth > inner.tryDepth {
+		return nil, false
+	}
 	if target == inner.header {
 		return []ast.Stmt{&ast.BranchStmt{Tok: token.CONTINUE}}, true
 	}

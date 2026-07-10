@@ -440,6 +440,68 @@ func main() {
 	}
 }
 
+// TestTranspileEHLoopBreakInTry is the regression for the perl.wasm miscompile:
+// a single-exit loop whose TRY BODY holds a br_table that exits the loop. The
+// structured emitter would emit `break wlN` for the loop-exit arm, but that
+// break sits inside the try region's `func() *wasmExc { … }()` closure where the
+// loop label is out of scope, yielding uncompilable Go. jump() must detect the
+// jump crossing the closure and bail to the goto emitter. run(0)=0, run(7)=42.
+func TestTranspileEHLoopBreakInTry(t *testing.T) {
+	bin := testfixture.Wasm(t, "eh_loop_break_in_try")
+	m, err := transpile.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var buf bytes.Buffer
+	res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "ehl/pkg"})
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+
+	dir := t.TempDir()
+	write := func(rel string, data []byte) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", []byte("module ehl\n\ngo 1.25.0\n"))
+	write("pkg/gen.go", buf.Bytes())
+	for rel, data := range res.Files {
+		write("pkg/"+rel, data)
+	}
+	for name, data := range res.Sidecars {
+		write("pkg/"+name, data)
+	}
+	write("main.go", []byte(`package main
+
+import (
+	"fmt"
+
+	"ehl/pkg"
+)
+
+func main() {
+	m := pkg.New()
+	fmt.Println(m.Run(0), m.Run(7))
+}
+`))
+	// The whole point is that this COMPILES — a `break wlN` across the try
+	// closure would fail `go run` here with "break label not defined".
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go run failed (structured emit likely emitted a break across the try closure): %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "0 42" {
+		t.Fatalf("eh loop break-in-try: got %q, want %q\n%s", got, "0 42", out)
+	}
+}
+
 // TestTranspileEHMultiPackage proves EH try/catch works in MULTI-package
 // output: the wasmExc type + wasm_catch helper live in `base` (exported as
 // WasmExc / Wasm_catch), and the chunk package emitting the try/catch references
