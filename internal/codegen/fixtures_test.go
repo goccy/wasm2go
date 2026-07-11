@@ -111,6 +111,22 @@ var fixtures = []fixture{
 			{export: "call_method", args: []uint64{48, 1}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
 		},
 	},
+	{
+		// Negative-zero float constants: Go has no -0.0 literal, so every
+		// constant-emission path must go through math.Float*frombits for it.
+		name: "cg_negzero.wasm",
+		calls: []call{
+			{export: "f64_negzero_bits", resType: wasm.ValI64},
+			{export: "f32_negzero_bits", resType: wasm.ValI32},
+			{export: "f64_negzero_call_bits", resType: wasm.ValI64},
+			{export: "f32_negzero_call_bits", resType: wasm.ValI32},
+			{export: "global_f64_negzero_bits", resType: wasm.ValI64},
+			{export: "global_f32_negzero_bits", resType: wasm.ValI32},
+			{export: "f64_negzero_mul1_bits", resType: wasm.ValI64},
+			{export: "f64_min_negzero_bits", resType: wasm.ValI64},
+			{export: "f64_nan_payload_bits", resType: wasm.ValI64},
+		},
+	},
 }
 
 func TestFixtures(t *testing.T) {

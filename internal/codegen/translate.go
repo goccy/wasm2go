@@ -1477,12 +1477,12 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 				}})
 				continue
 			}
-			if fv == 0 {
-				continue // zero value already correct
+			if fv == 0 && !math.Signbit(fv) {
+				continue // zero value already correct (-0 == 0, but is not it)
 			}
-			// NaN/Inf initializers route through math.Float*frombits, so
+			// NaN/Inf/-0 initializers route through math.Float*frombits, so
 			// the math import must be registered for the emitted file.
-			if math.IsNaN(fv) || math.IsInf(fv, 0) {
+			if floatNeedsBitsEmission(fv) {
 				t.use("math")
 			}
 			if g.Type.Type == wasm.ValF32 {
