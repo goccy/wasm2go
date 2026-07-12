@@ -112,6 +112,24 @@ var fixtures = []fixture{
 		},
 	},
 	{
+		// Negative zero flowing through non-constant shapes (locals, block
+		// results, phis, select, data segments, arithmetic).
+		name: "cg_negzero_flows.wasm",
+		calls: []call{
+			{export: "via_local", resType: wasm.ValI64},
+			{export: "via_block", resType: wasm.ValI64},
+			{export: "via_phi", args: []uint64{1}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI64},
+			{export: "via_select", args: []uint64{1}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI64},
+			{export: "via_copysign_cc", resType: wasm.ValI64},
+			{export: "via_copysign_cv", resType: wasm.ValI64},
+			{export: "via_copysign_vc", resType: wasm.ValI64},
+			{export: "via_neg_zero", resType: wasm.ValI64},
+			{export: "via_load", resType: wasm.ValI64},
+			{export: "via_add", resType: wasm.ValI64},
+			{export: "via_mul_neg1", resType: wasm.ValI64},
+		},
+	},
+	{
 		// br_table selecting on a comparison result (SSA type bool): must
 		// verify and route 0/1 correctly. Mirrors SpiderMonkey's Intl build.
 		name: "cg_brtable_bool.wasm",
