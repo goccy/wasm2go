@@ -993,13 +993,13 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		return goConstI64(v.AuxInt), nil
 	case ssa.OpConstF32:
 		f := math.Float32frombits(uint32(v.AuxInt))
-		if (math.IsNaN(float64(f)) || math.IsInf(float64(f), 0)) && em.t != nil {
+		if floatNeedsBitsEmission(float64(f)) && em.t != nil {
 			em.t.UsePackage("math")
 		}
 		return goConstF32(f), nil
 	case ssa.OpConstF64:
 		f := math.Float64frombits(uint64(v.AuxInt))
-		if (math.IsNaN(f) || math.IsInf(f, 0)) && em.t != nil {
+		if floatNeedsBitsEmission(f) && em.t != nil {
 			em.t.UsePackage("math")
 		}
 		return goConstF64(f), nil
@@ -1327,11 +1327,11 @@ func goConstI64(n int64) ast.Expr {
 }
 
 // goConstF32 renders an f32 constant. Finite values are emitted as
-// float32(<lit>); NaN/Inf bits go through math.Float32frombits because
-// Go has no NaN/Inf literal.
+// float32(<lit>); NaN/Inf/-0 bits go through math.Float32frombits because
+// Go has no literal for them (`float32(-0)` is +0).
 func goConstF32(v float32) ast.Expr {
 	bits := math.Float32bits(v)
-	if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+	if floatNeedsBitsEmission(float64(v)) {
 		return &ast.CallExpr{
 			Fun: &ast.SelectorExpr{X: newID("math"), Sel: newID("Float32frombits")},
 			Args: []ast.Expr{
@@ -1349,10 +1349,11 @@ func goConstF32(v float32) ast.Expr {
 	}
 }
 
-// goConstF64 renders an f64 constant. Same NaN/Inf consideration as goConstF32.
+// goConstF64 renders an f64 constant. Same NaN/Inf/-0 consideration as
+// goConstF32.
 func goConstF64(v float64) ast.Expr {
 	bits := math.Float64bits(v)
-	if math.IsNaN(v) || math.IsInf(v, 0) {
+	if floatNeedsBitsEmission(v) {
 		return &ast.CallExpr{
 			Fun: &ast.SelectorExpr{X: newID("math"), Sel: newID("Float64frombits")},
 			Args: []ast.Expr{

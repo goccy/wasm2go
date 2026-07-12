@@ -66,12 +66,20 @@ func evalConstExprFloat(expr []byte) (float64, error) {
 	return 0, fmt.Errorf("unsupported float const-expr opcode 0x%02x", expr[0])
 }
 
+// floatNeedsBitsEmission reports whether v cannot be reproduced by a Go
+// decimal literal: NaN and ±Inf have no literal syntax, and Go constant
+// arithmetic has no negative zero (`float64(-0)` is +0), so -0 must be
+// materialized via math.Float{32,64}frombits as well.
+func floatNeedsBitsEmission(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0) || (v == 0 && math.Signbit(v))
+}
+
 // floatInitExpr builds a Go expression for a float global's initial value.
-// Finite values use a decimal literal cast to the target type; NaN/Inf
-// values route through math.Float{32,64}frombits since Go has no NaN/Inf
-// literal syntax. isF32 selects between float32 and float64 emission.
+// Finite values use a decimal literal cast to the target type; NaN/Inf/-0
+// values route through math.Float{32,64}frombits since Go has no literal
+// syntax for them. isF32 selects between float32 and float64 emission.
 func floatInitExpr(v float64, isF32 bool) ast.Expr {
-	special := math.IsNaN(v) || math.IsInf(v, 0)
+	special := floatNeedsBitsEmission(v)
 	if isF32 {
 		if special {
 			return &ast.CallExpr{
