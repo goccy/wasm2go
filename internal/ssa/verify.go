@@ -88,7 +88,12 @@ func Verify(f *Func) error {
 			if b.Control == nil {
 				return fmt.Errorf("verify %s: BrTable b%d has nil Control", f.Name, b.ID)
 			}
-			if b.Control.Type != TypeI32 {
+			// TypeBool is a comparison result: wasm leaves those as i32
+			// 0/1 and may br_table on them directly (SpiderMonkey's Intl
+			// build does, Fn7964). The emitter always materializes bool
+			// values through b2i32, so a bool selector emits as a plain
+			// i32 switch operand.
+			if b.Control.Type != TypeI32 && b.Control.Type != TypeBool {
 				return fmt.Errorf("verify %s: BrTable b%d selector v%d has type %v (want i32)",
 					f.Name, b.ID, b.Control.ID, b.Control.Type)
 			}
