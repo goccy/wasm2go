@@ -112,6 +112,16 @@ var fixtures = []fixture{
 		},
 	},
 	{
+		// br_table selecting on a comparison result (SSA type bool): must
+		// verify and route 0/1 correctly. Mirrors SpiderMonkey's Intl build.
+		name: "cg_brtable_bool.wasm",
+		calls: []call{
+			{export: "pick", args: []uint64{3}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "pick", args: []uint64{5}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "pick", args: []uint64{9}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+		},
+	},
+	{
 		// Negative-zero float constants: Go has no -0.0 literal, so every
 		// constant-emission path must go through math.Float*frombits for it.
 		name: "cg_negzero.wasm",
