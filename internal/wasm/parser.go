@@ -206,6 +206,10 @@ func readLimits(r byteReader) (Limits, error) {
 		return Limits{}, err
 	}
 	lim := Limits{Min: min}
+	if flags&0x02 != 0 {
+		// Threads proposal: shared memories must also declare a maximum.
+		lim.Shared = true
+	}
 	if flags&0x01 != 0 {
 		max, err := readU64(r)
 		if err != nil {
@@ -570,6 +574,13 @@ func parseDataSection(m *Module, r byteReader) error {
 				return err
 			}
 			m.Datas = append(m.Datas, DataSegment{MemIdx: 0, Offset: off, Bytes: b})
+		case 0x01:
+			// passive: vec(byte) only
+			b, err := readByteVec(r)
+			if err != nil {
+				return err
+			}
+			m.Datas = append(m.Datas, DataSegment{Bytes: b, Passive: true})
 		case 0x02:
 			// active, memidx, offset, vec(byte)
 			mi, err := readU32(r)

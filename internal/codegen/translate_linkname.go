@@ -101,6 +101,14 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		t.use(p)
 	}
 
+	// Globals save/restore lands in base (it reads the Module's gN fields), so
+	// it has to register its imports before the snapshot below freezes base's
+	// import set. See emitGlobalsSnapshot; NewFromSnapshot calls it.
+	globalsSnap, err := t.emitGlobalsSnapshot()
+	if err != nil {
+		return Result{}, err
+	}
+
 	// Step 3: snapshot t.imports as base's view BEFORE main pass adds
 	// any further dependencies (e.g. "fmt" via SafeInvokeExport).
 	baseImportSnapshot := make(map[string]string, len(t.imports))
@@ -194,6 +202,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	baseFile.Decls = append(baseFile.Decls, t.emitImportInterfaces()...)
 	baseFile.Decls = append(baseFile.Decls, t.emitModuleStruct())
 	baseFile.Decls = append(baseFile.Decls, helpers...)
+	baseFile.Decls = append(baseFile.Decls, globalsSnap...)
 	baseFile.Decls = append(baseFile.Decls, wasiDecls...)
 	baseFile.Decls = prependImportsForBase(baseFile.Decls, baseImportSnapshot)
 	{
@@ -202,6 +211,17 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 			return Result{}, fmt.Errorf("format base: %w", err)
 		}
 		files["base/base.go"] = buf.Bytes()
+	}
+
+	// The copy-on-write shared-image runtime rides along in base, next to the
+	// Module whose fields it reads. It is inert unless an embedder calls
+	// NewSharedImage.
+	shared, err := t.emitSharedImage("base")
+	if err != nil {
+		return Result{}, err
+	}
+	for name, content := range shared {
+		files["base/"+name] = content
 	}
 
 	// Step 7: serialize main file.

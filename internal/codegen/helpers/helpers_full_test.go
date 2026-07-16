@@ -769,7 +769,7 @@ func TestLoadStore(t *testing.T) {
 // ---- Module-aware memory helpers -------------------------------------------
 
 func newMemModule(size int) *Module {
-	return &Module{memory: make([]byte, size)}
+	return newTestModule(make([]byte, size))
 }
 
 func TestMLoad8(t *testing.T) {
@@ -947,7 +947,8 @@ func TestB32(t *testing.T) {
 
 func TestMemoryGrowMaxMem(t *testing.T) {
 	// maxMem that allows geometric realloc capped at maxMem
-	m := &Module{memory: make([]byte, 65536), maxMem: 4 * 65536}
+	m := newTestModule(make([]byte, 65536))
+	m.maxMem = 4 * 65536
 	// grow 2 pages — cap doubles to 2*65536 but that's below maxMem
 	if got := memoryGrow(m, 2); got != 1 {
 		t.Errorf("grow 2 pages: prev=%d want 1", got)
@@ -965,7 +966,7 @@ func TestMemoryGrowBeyond4GiB(t *testing.T) {
 	// Simulate being at 4 GiB boundary — want>1<<32 triggers -1.
 	// We can't actually allocate 4 GiB in a test; instead verify
 	// the computation path via a module whose logical size would overflow.
-	m := &Module{memory: make([]byte, 65536)}
+	m := newTestModule(make([]byte, 65536))
 	// n pages such that want > 1<<32: e.g. (1<<32/65536)+1 = 65537 pages
 	if got := memoryGrow(m, 65537); got != -1 {
 		t.Errorf("grow 65537 pages: %d want -1", got)
@@ -976,7 +977,7 @@ func TestMemoryGrowSpareCapacity(t *testing.T) {
 	// Pre-allocate backing array larger than initial len so the first grow
 	// takes the reslice (spare capacity) path.
 	mem := make([]byte, 65536, 4*65536)
-	m := &Module{memory: mem}
+	m := newTestModule(mem)
 	prev := memoryGrow(m, 1)
 	if prev != 1 {
 		t.Errorf("prev pages = %d, want 1", prev)

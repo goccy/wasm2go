@@ -1,0 +1,19 @@
+//go:build !unix
+
+package {{.Pkg}}
+
+import (
+	"fmt"
+	"os"
+)
+
+// Platforms without mmap (windows, js/wasm, ...) get the historical behaviour:
+// every instance allocates and initializes its own linear memory. Correct, only
+// larger — see sharedimage.go for what the sharing buys.
+const mmapSupported = false
+
+func mmapImage(f *os.File, ceiling int) ([]byte, error) {
+	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+}
+
+func unmapMemory(mem []byte) {}

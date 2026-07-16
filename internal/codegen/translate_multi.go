@@ -73,12 +73,17 @@ func chunkUsedDeps(decls []ast.Decl) []int {
 // import paths.
 func scanStdlibRefs(decls []ast.Decl) []string {
 	pkgs := map[string]string{
+		"bytes":   "bytes",
 		"bits":    "math/bits",
 		"math":    "math",
 		"binary":  "encoding/binary",
 		"runtime": "runtime",
 		"unsafe":  "unsafe",
 		"fmt":     "fmt",
+		// New() initializes the pointered shared state (&sync.Mutex{},
+		// &atomic.Uint64{}) in whichever package hosts the constructor.
+		"sync":   "sync",
+		"atomic": "sync/atomic",
 	}
 	used := map[string]bool{}
 	for _, d := range decls {

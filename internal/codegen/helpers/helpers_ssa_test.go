@@ -9,7 +9,7 @@ import (
 // tests; here we just probe the signatures so they're reachable to
 // staticcheck's `unused` linter and exercise the most basic shape.
 func TestMemorySize(t *testing.T) {
-	m := &Module{memory: make([]byte, 65536)}
+	m := newTestModule(make([]byte, 65536))
 	if got := memorySize(m); got != 1 {
 		t.Errorf("memorySize=%d want 1", got)
 	}
@@ -239,7 +239,7 @@ func TestSignExtend(t *testing.T) {
 }
 
 func TestMemoryCopyFill(t *testing.T) {
-	m := &Module{memory: make([]byte, 65536)}
+	m := newTestModule(make([]byte, 65536))
 	memoryFill(m, 10, 0x42, 4)
 	if got := m.memory[10:14]; got[0] != 0x42 || got[3] != 0x42 {
 		t.Errorf("memoryFill: %v", got)
@@ -261,7 +261,7 @@ func TestMemoryCopyFill(t *testing.T) {
 }
 
 func TestMemoryGrowEmpty(t *testing.T) {
-	m := &Module{memory: make([]byte, 0)}
+	m := newTestModule(make([]byte, 0))
 	if got := memoryGrow(m, 0); got != 0 {
 		t.Errorf("memoryGrow(0) on empty=%d", got)
 	}

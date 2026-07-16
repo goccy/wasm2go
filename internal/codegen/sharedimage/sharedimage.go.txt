@@ -1,0 +1,200 @@
+package {{.Pkg}}
+
+// Shared, copy-on-write linear memory.
+//
+// Most of what an instance of a large wasm module costs is memory that is
+// IDENTICAL in every instance and, apart from a handful of pages, never written
+// to. A big engine can carry tens of MB of static tables in its data segments,
+// and build more heap still while it starts its runtime up. Every instance
+// paying for its own copy of all that is pure waste.
+//
+// So build it ONCE per process and give every instance a private copy-on-write
+// map of it: read-only pages stay physically shared, and only a page a guest
+// actually writes becomes private.
+//
+// There are two kinds of image, and they differ in how much of the built
+// instance they keep:
+//
+//   - NewSharedImage keeps the data segments. Instances (NewWithMemory) re-run
+//     their own initialization over them, so the image must carry NOTHING above
+//     the segments: that tail is BSS, and it holds the start section's
+//     "already ran" flag and the C++ static state. Inheriting the flag makes
+//     the start section trap on its second run; inheriting statics that point
+//     into a heap the image does not carry breaks the first thing that follows
+//     one of those pointers. What makes even the segments survive the re-run is
+//     that memory.init compares before it writes (see memoryInit) — it finds
+//     them already in place and leaves the pages shared.
+//
+//   - NewSharedSnapshot keeps the whole initialized instance, memory and wasm
+//     globals both. Instances (NewFromSnapshot) re-run NOTHING, which is what
+//     lets the snapshot keep the BSS and the heap that the first kind has to
+//     throw away. It shares much more; it also freezes whatever the build did.
+//
+// Measured on one large embedding (instances live in a 4 GiB container, created
+// until the kernel kills the process): a hundred-odd without any image, several
+// times that with the data-segment image, and an order of magnitude more with
+// the snapshot, which shares the started runtime's heap on top of the segments.
+//
+// Where mmap is unavailable (windows, js/wasm — see sharedimage_nommap.go),
+// every instance allocates and initializes its own memory, exactly as before.
+
+import (
+	"fmt"
+	"os"
+	"sync"
+)
+
+// SharedImage is a process-wide initialized linear-memory template.
+type SharedImage struct {
+	f       *os.File // unlinked; holds the image
+	size    uint64   // the guest's memory.size for the image
+	dataEnd uint32   // where the data segments stop and BSS begins
+	globals []uint64 // non-nil for a snapshot: the instance's wasm globals
+	err     error    // non-nil if the image could not be built
+}
+
+// ImageBuilder brings up one throwaway instance. The caller supplies it because
+// only the generated package knows how to construct a Module (its constructor's
+// signature depends on the wasm's imports). How far it must initialize that
+// instance depends on which of the two images below is being built.
+type ImageBuilder func() (m *{{.Module}}, err error)
+
+// NewSharedImage builds the DATA-SEGMENT image once and caches it. Every later
+// call returns the same one. A failure is remembered, not retried: callers then
+// fall back to a private allocation, which is correct, only larger.
+//
+// build must run the start section (the ordinary constructor does) and nothing
+// more: everything above the data segments is discarded. Instances go through
+// NewWithMemory and re-run their own initialization over the shared segments.
+func NewSharedImage(build ImageBuilder) *SharedImage {
+	sharedOnce.Do(func() { sharedImg = buildSharedImage(build, false) })
+	return sharedImg
+}
+
+// NewSharedSnapshot builds an image of a FULLY INITIALIZED instance — memory
+// and wasm globals, everything, exactly as build() left it — and caches it the
+// same way. Instances go through NewFromSnapshot, which re-runs nothing at all.
+//
+// This shares far more than NewSharedImage does. A runtime's initialization
+// (C++ static constructors, an interpreter's own start-up) leaves megabytes of
+// heap behind that are identical in every instance, and NewSharedImage cannot
+// share ANY of it: it must zero the BSS, because a fresh instance re-runs the
+// initialization and would trip over the previous one's leftovers. A snapshot
+// re-runs nothing, so it can keep the lot.
+//
+// The catch is that build() must leave the instance in a state every later
+// instance can start from. Anything build() does is done for all of them — an
+// instance that is already holding a lock or mid-request is not a snapshot, it
+// is a bug. Build it clean and take it at rest.
+//
+// Unlike NewSharedImage, this does NOT cache: a snapshot bakes in whatever
+// build() configured, so whether two callers want the same snapshot is a
+// question only the caller can answer. Build it once and hold on to it (a
+// caller whose instances come in flavours will want one per flavour); building
+// it per instance would be slower than not sharing at all.
+func NewSharedSnapshot(build ImageBuilder) *SharedImage {
+	return buildSharedImage(build, true)
+}
+
+var (
+	sharedOnce sync.Once
+	sharedImg  *SharedImage
+)
+
+func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
+	if !mmapSupported {
+		return &SharedImage{err: fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")}
+	}
+	m, err := build()
+	if err != nil {
+		return &SharedImage{err: fmt.Errorf("wasm2go: building the shared memory image: %w", err)}
+	}
+	size := m.{{.MemSize}}.Load()
+	dataEnd := m.{{.DataEnd}}
+	if dataEnd == 0 || uint64(dataEnd) > size {
+		return &SharedImage{err: fmt.Errorf(
+			"wasm2go: shared memory image: no data segments were installed (dataEnd=%d, size=%d)",
+			dataEnd, size)}
+	}
+
+	// How much of the built instance the image keeps is the whole difference
+	// between the two kinds.
+	//
+	// A snapshot keeps ALL of it, and its instances re-run nothing.
+	//
+	// A data-segment image keeps the segments and NOTHING above them, because
+	// its instances DO re-run their initialization: that tail is BSS, and it
+	// holds the start section's "already ran" flag and the C++ static state.
+	// Inheriting the flag makes the start section trap on its second run;
+	// inheriting statics that point into a heap this image does not carry
+	// breaks the first thing that follows one of those pointers. A fresh
+	// make() zeroes it for us.
+	keep := uint64(dataEnd)
+	if snapshot {
+		keep = size
+	}
+	img := make([]byte, size)
+	copy(img, m.{{.Memory}}[:keep])
+
+	var globals []uint64
+	if snapshot {
+		// Globals live outside linear memory, so the image cannot carry them —
+		// and the guest's TLS base and stack pointer are globals. Without them
+		// the memory would describe an initialized instance that the Module
+		// does not know it is.
+		globals = {{.SaveGlobals}}(m)
+	}
+
+	f, err := os.CreateTemp("", "wasm2go-image-*")
+	if err != nil {
+		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
+	}
+	// Unlink now: the image must never be reachable by name. The pages live
+	// as long as we hold the descriptor.
+	_ = os.Remove(f.Name())
+	if _, err := f.Write(img); err != nil {
+		f.Close()
+		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
+	}
+	return &SharedImage{f: f, size: size, dataEnd: dataEnd, globals: globals}
+}
+
+// Err reports why the image is unavailable, or nil. A caller that gets an
+// error must build each instance's memory itself.
+func (s *SharedImage) Err() error { return s.err }
+
+// Size is the guest's memory.size for the image, in bytes: what a Module built
+// on it must be told its memory already holds.
+func (s *SharedImage) Size() uint64 { return s.size }
+
+// DataEnd is where the image's data segments stop and its BSS begins. For an
+// image from NewSharedImage that is also where the image stops carrying data;
+// a snapshot carries everything.
+func (s *SharedImage) DataEnd() uint32 { return s.dataEnd }
+
+// Globals are the snapshotted instance's wasm globals, to be handed to
+// NewFromSnapshot along with the memory. Nil for a NewSharedImage image, which
+// snapshots no instance and whose instances initialize their own globals.
+func (s *SharedImage) Globals() []uint64 { return s.globals }
+
+// Memory returns a private, copy-on-write mapping of the image, ceiling bytes
+// long. The instance built on it must still run the start section and the
+// module's initializers: memory.init will find the segments already in place
+// and write nothing, while the initializers build this instance's own BSS.
+//
+// The mapping is NOT Go heap — the GC will not reclaim it. Pass it to
+// UnmapMemory when the instance is done.
+func (s *SharedImage) Memory(ceiling int) ([]byte, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if uint64(ceiling) < s.size {
+		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the image (%d bytes)", ceiling, s.size)
+	}
+	return mmapImage(s.f, ceiling)
+}
+
+// UnmapMemory releases a mapping returned by SharedImage.Memory. Calling it on
+// a slice that did not come from there is a no-op on platforms without mmap
+// and undefined otherwise, so do not.
+func UnmapMemory(mem []byte) { unmapMemory(mem) }

@@ -172,6 +172,25 @@ func (r *InstrReader) ReadVecU32() ([]uint32, error) {
 // drop real call edges (e.g. when an unknown opcode was followed by a
 // `call` opcode value that SkipImmediates then misread as raw bytes).
 func (r *InstrReader) SkipImmediates(op byte) error {
+	// 0xfe-prefixed threads-proposal atomics.
+	if op == OpPrefixFE {
+		sub, err := r.ReadU32()
+		if err != nil {
+			return err
+		}
+		if sub == 0x03 { // atomic.fence: one reserved 0x00 byte
+			_, err := r.ReadByte()
+			return err
+		}
+		if sub <= 0x4e { // wait/notify/loads/stores/RMWs: memarg (align, offset)
+			if _, err := r.ReadU32(); err != nil {
+				return err
+			}
+			_, err := r.ReadU32()
+			return err
+		}
+		return fmt.Errorf("unknown 0xfe sub-opcode 0x%02x", sub)
+	}
 	// 0xfc-prefixed extended ops.
 	if op == OpPrefixFC {
 		sub, err := r.ReadU32()

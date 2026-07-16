@@ -72,11 +72,44 @@ func (em *ssaEmitter) emitMemLoadExpr(v *ssa.Value, emitExpr func(*ssa.Value) (a
 	if err != nil {
 		return nil, err
 	}
-	expr := em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt))
+	var expr ast.Expr
+	if em.t != nil && em.t.memIsShared() {
+		// SHARED memory: another agent's stores must stay visible to plain
+		// reads — wasm gives non-atomic accesses hardware-like coherence,
+		// but the Go compiler is free to CSE or hoist an ordinary *ptr
+		// read (musl's __lock/__unlock decides whether to WAKE a futex
+		// waiter from a plain read of the waiters word; a cached read
+		// skips the wake and strands the waiter forever). Route the read
+		// through a //go:noinline helper so every executed load really
+		// touches memory; the CPU's coherence does the rest. Non-shared
+		// modules keep the direct dereference.
+		expr = em.sharedLoadExpr(spec, baseExpr, uint64(v.AuxInt))
+	} else {
+		expr = em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt))
+	}
 	if spec.outerCast != "" {
 		expr = &ast.CallExpr{Fun: newID(spec.outerCast), Args: []ast.Expr{expr}}
 	}
 	return expr, nil
+}
+
+// sharedLoadExpr renders `memLoad<T>(mBase, uintptr(ea))` — the
+// noinline-helper form of unsafeDerefExpr used for shared memories.
+func (em *ssaEmitter) sharedLoadExpr(spec memOpSpec, baseExpr ast.Expr, offset uint64) ast.Expr {
+	helper := map[string]string{
+		"uint8": "memLoad8", "int8": "memLoad8S",
+		"uint16": "memLoad16", "int16": "memLoad16S",
+		"uint32": "memLoad32U", "int32": "memLoad32",
+		"int64":   "memLoad64",
+		"float32": "memLoadF32", "float64": "memLoadF64",
+	}[spec.elemType]
+	em.useHelper(helper)
+	return &ast.CallExpr{
+		Fun: em.helperRef(helper),
+		Args: []ast.Expr{newID("m"), &ast.CallExpr{
+			Fun: newID("uint32"), Args: []ast.Expr{em.memOffsetExpr(baseExpr, offset)},
+		}},
+	}
 }
 
 // emitMemStoreStmt renders an OpStore* as one assignment statement:
@@ -104,6 +137,31 @@ func (em *ssaEmitter) emitMemStoreStmt(v *ssa.Value, emitExpr func(*ssa.Value) (
 	valExpr, err := emitExpr(v.Args[1])
 	if err != nil {
 		return nil, err
+	}
+	if em.t != nil && em.t.memIsShared() {
+		rhs := valExpr
+		if spec.elemType != spec.valSrcType {
+			// The helpers take 32-bit-or-wider values (gcasm marshalling
+			// vocabulary); sub-word truncation happens inside the helper.
+			castTo := spec.elemType
+			if castTo == "uint8" || castTo == "uint16" {
+				castTo = "uint32"
+			}
+			rhs = &ast.CallExpr{Fun: newID(castTo), Args: []ast.Expr{rhs}}
+		}
+		helper := map[string]string{
+			"uint8": "memStore8", "uint16": "memStore16",
+			"uint32": "memStore32U", "int32": "memStore32",
+			"int64":   "memStore64",
+			"float32": "memStoreF32", "float64": "memStoreF64",
+		}[spec.elemType]
+		em.useHelper(helper)
+		return &ast.ExprStmt{X: &ast.CallExpr{
+			Fun: em.helperRef(helper),
+			Args: []ast.Expr{newID("m"), &ast.CallExpr{
+				Fun: newID("uint32"), Args: []ast.Expr{em.memOffsetExpr(baseExpr, uint64(v.AuxInt))},
+			}, rhs},
+		}}, nil
 	}
 	dst := em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt))
 	rhs := valExpr
