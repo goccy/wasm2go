@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -582,6 +583,8 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		return nil
 	case op == wasm.OpPrefixFC:
 		return ls.handleFCOp(r)
+	case op == wasm.OpPrefixFE:
+		return ls.handleFEOp(r)
 	}
 	return fmt.Errorf("%w: opcode 0x%02x not implemented", ErrSSAUnsupported, op)
 }
@@ -630,6 +633,123 @@ func (ls *lowerState) handleSelect(op byte, r *wasm.InstrReader) error {
 	ls.b.SetCurrent(postBlk)
 	phi := ls.b.NewValue(ssa.OpPhi, thenVal.Type, thenVal, elseVal)
 	ls.push(phi)
+	return nil
+}
+
+// feAtomicSpec describes one threads-proposal atomic op: the module-aware
+// helper it lowers to, its result type, and how many value operands it pops
+// beyond the address (0 = load, 1 = store/RMW/notify, 2 = cmpxchg/wait).
+type feAtomicSpec struct {
+	helper  string
+	resType ssa.Type
+	extra   int
+	// wait64's expected operand and cmpxchg64's operands are i64; everything
+	// else extra-operand-wise is inferred from resType except waits (i32
+	// result, typed operands) — recorded explicitly where it matters.
+}
+
+// feAtomics maps 0xFE sub-opcodes to their lowering. Sub-opcode layout is
+// fixed by the threads proposal: 0x00 notify, 0x01/0x02 wait32/64,
+// 0x03 fence, 0x10.. loads, 0x17.. stores, then RMW families in op order
+// add/sub/and/or/xor/xchg/cmpxchg, each over
+// {i32, i64, i32_8u, i32_16u, i64_8u, i64_16u, i64_32u}.
+var feAtomics = map[uint32]feAtomicSpec{
+	0x00: {"atomicNotify", ssa.TypeI32, 1},
+	0x01: {"atomicWait32", ssa.TypeI32, 2},
+	0x02: {"atomicWait64", ssa.TypeI32, 2},
+
+	0x10: {"atomicLoad32", ssa.TypeI32, 0},
+	0x11: {"atomicLoad64", ssa.TypeI64, 0},
+	0x12: {"atomicLoad32_8u", ssa.TypeI32, 0},
+	0x13: {"atomicLoad32_16u", ssa.TypeI32, 0},
+	0x14: {"atomicLoad64_8u", ssa.TypeI64, 0},
+	0x15: {"atomicLoad64_16u", ssa.TypeI64, 0},
+	0x16: {"atomicLoad64_32u", ssa.TypeI64, 0},
+
+	0x17: {"atomicStore32", ssa.TypeI32, 1},
+	0x18: {"atomicStore64", ssa.TypeI32, 1},
+	0x19: {"atomicStore32_8", ssa.TypeI32, 1},
+	0x1a: {"atomicStore32_16", ssa.TypeI32, 1},
+	0x1b: {"atomicStore64_8", ssa.TypeI32, 1},
+	0x1c: {"atomicStore64_16", ssa.TypeI32, 1},
+	0x1d: {"atomicStore64_32", ssa.TypeI32, 1},
+}
+
+func init() {
+	// The seven RMW families share the size/type layout of the load family.
+	families := []struct {
+		base uint32
+		name string
+	}{
+		{0x1e, "Add"}, {0x25, "Sub"}, {0x2c, "And"}, {0x33, "Or"},
+		{0x3a, "Xor"}, {0x41, "Xchg"}, {0x48, "Cmpxchg"},
+	}
+	sizes := []struct {
+		suffix string
+		typ    ssa.Type
+	}{
+		{"32", ssa.TypeI32}, {"64", ssa.TypeI64},
+		{"32_8u", ssa.TypeI32}, {"32_16u", ssa.TypeI32},
+		{"64_8u", ssa.TypeI64}, {"64_16u", ssa.TypeI64}, {"64_32u", ssa.TypeI64},
+	}
+	for _, f := range families {
+		for i, sz := range sizes {
+			extra := 1
+			if f.name == "Cmpxchg" {
+				extra = 2
+			}
+			feAtomics[f.base+uint32(i)] = feAtomicSpec{
+				"atomicRmw" + f.name + sz.suffix, sz.typ, extra,
+			}
+		}
+	}
+}
+
+// handleFEOp dispatches the wasm 0xFE threads-proposal opcodes. Every memory
+// atomic lowers to an OpAtomicCall of a module-aware helper taking
+// (m, addr, offset, operands...); alignment and bounds are checked in the
+// helper (misalignment traps, as the proposal requires).
+func (ls *lowerState) handleFEOp(r *wasm.InstrReader) error {
+	sub, err := r.ReadU32()
+	if err != nil {
+		return err
+	}
+	if sub == 0x03 { // atomic.fence: reserved byte, no operands
+		if _, err := r.ReadByte(); err != nil {
+			return err
+		}
+		ls.b.NewValueAux(ssa.OpAtomicCall, ssa.TypeI32, "atomicFence")
+		return nil
+	}
+	spec, ok := feAtomics[sub]
+	if !ok {
+		return fmt.Errorf("%w: 0xfe sub-opcode 0x%02x not implemented", ErrSSAUnsupported, sub)
+	}
+	if _, err := r.ReadU32(); err != nil { // memarg align (validated upstream)
+		return err
+	}
+	offset, err := r.ReadU32()
+	if err != nil {
+		return err
+	}
+	extras := make([]*ssa.Value, spec.extra)
+	for i := spec.extra - 1; i >= 0; i-- {
+		v, err := ls.pop()
+		if err != nil {
+			return err
+		}
+		extras[i] = v
+	}
+	addr, err := ls.pop()
+	if err != nil {
+		return err
+	}
+	args := append([]*ssa.Value{addr, ls.b.Const32(int32(offset))}, extras...)
+	v := ls.b.NewValueAux(ssa.OpAtomicCall, spec.resType, spec.helper, args...)
+	if strings.HasPrefix(spec.helper, "atomicStore") {
+		return nil // stores leave nothing on the stack
+	}
+	ls.push(v)
 	return nil
 }
 

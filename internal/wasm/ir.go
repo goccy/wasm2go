@@ -44,6 +44,7 @@ type Limits struct {
 	Min    uint64
 	Max    uint64
 	HasMax bool
+	Shared bool // threads proposal: memory declared shared (limits flag 0x02)
 }
 
 // TableType describes a table.
@@ -140,8 +141,14 @@ type ElementSegment struct {
 // DataSegment is a (subset of) wasm data segment. Active segments only.
 type DataSegment struct {
 	MemIdx uint32
-	Offset []byte // raw const-expr including terminating 0x0b
+	Offset []byte // raw const-expr including terminating 0x0b; nil when Passive
 	Bytes  []byte
+	// Passive segments (flag 0x01) have no offset: they sit inert until a
+	// memory.init copies from them (data.drop then discards them). LLVM emits
+	// ALL data passive for shared-memory builds — the threads proposal forbids
+	// active segments re-initializing memory on every thread's instantiation —
+	// and initializes exactly once from a __wasm_init_memory start function.
+	Passive bool
 }
 
 // Module is the parsed in-memory representation of a wasm binary.

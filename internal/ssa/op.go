@@ -146,6 +146,13 @@ const (
 	// expanding the SSA Op enum for every wasm instruction.
 	OpHelperCall
 
+	// OpAtomicCall delegates to a MODULE-AWARE helper (emitted as
+	// helper(m, args...)) implementing a threads-proposal atomic op:
+	// loads/stores/RMWs/cmpxchg, memory.atomic.wait/notify, atomic.fence.
+	// Aux is the helper name. Always side-effecting: atomics synchronize
+	// with other agents, so they must never be DCE'd, CSE'd or reordered.
+	OpAtomicCall
+
 	// OpMemSize / OpMemGrow are the wasm linear-memory size queries.
 	// OpMemSize takes (mem) and returns the current page count.
 	// OpMemGrow takes (delta_pages, mem) and returns the previous page
@@ -277,6 +284,7 @@ var opNames = [...]string{
 	OpUnreachable: "OpUnreachable",
 
 	OpHelperCall: "OpHelperCall",
+	OpAtomicCall: "OpAtomicCall",
 
 	OpMemSize:    "OpMemSize",
 	OpMemGrow:    "OpMemGrow",
@@ -352,6 +360,7 @@ func (op Op) HasSideEffect() bool {
 		OpLocalSet, // writes a mutable local var (EH mutable-locals mode)
 		OpCallDirect, OpCallIndirect, OpCallImport,
 		OpHelperCall, // may trap (div, rem, non-saturating trunc-to-int)
+		OpAtomicCall, // synchronizes with other agents; never removable
 		OpUnreachable,
 		OpMemGrow, OpMemoryCopy, OpMemoryFill, OpMemoryInit, OpDataDrop:
 		return true
@@ -370,6 +379,9 @@ func (op Op) HasSideEffect() bool {
 func (v *Value) HasSideEffect() bool {
 	if v == nil {
 		return false
+	}
+	if v.Op == OpAtomicCall {
+		return true
 	}
 	if v.Op != OpHelperCall {
 		return v.Op.HasSideEffect()

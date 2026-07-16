@@ -66,7 +66,7 @@ func captureArch(pkgDir, pkgPath, arch string) ([]*Fn, []*DataSym, error) {
 	cmd.Env = append(os.Environ(), "GOARCH="+arch)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, clip(out))
+		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, diagnostics(out))
 	}
 	return ParseListing(string(out))
 }
@@ -181,6 +181,36 @@ func ParseListing(listing string) ([]*Fn, []*DataSym, error) {
 	sort.Slice(fns, func(i, j int) bool { return fns[i].Name < fns[j].Name })
 	sort.Slice(datas, func(i, j int) bool { return datas[i].Name < datas[j].Name })
 	return fns, datas, nil
+}
+
+// diagnostics extracts go build's error lines from a -gcflags=-S run. The
+// listing dwarfs the errors by megabytes and, with parallel package compiles,
+// the errors can land anywhere in the stream — a head or tail clip usually
+// keeps only listing noise. KEEP the shapes an error takes (package headers,
+// file:line:col messages, go's own tool complaints) instead of trying to
+// enumerate every listing shape there is.
+func diagnostics(b []byte) string {
+	errLine := regexp.MustCompile(`^[^\s#].*\.(go|s):[0-9]+(:[0-9]+)?: `)
+	var diag []string
+	for _, ln := range strings.Split(string(b), "\n") {
+		switch {
+		case strings.HasPrefix(ln, "# "),
+			strings.HasPrefix(ln, "go: "),
+			strings.HasPrefix(ln, "go build"),
+			errLine.MatchString(ln):
+			diag = append(diag, ln)
+		}
+	}
+	out := strings.Join(diag, "\n")
+	if out == "" {
+		// Nothing error-shaped: fall back to the raw tail rather than hiding
+		// everything.
+		return clip(b[max(0, len(b)-2000):])
+	}
+	if len(out) > 8000 {
+		out = out[:8000] + "...[clipped]"
+	}
+	return out
 }
 
 func clip(b []byte) string {

@@ -211,4 +211,5 @@ const (
 	OpRefFunc byte = 0xd2
 
 	OpPrefixFC byte = 0xfc // saturating-trunc, bulk-memory
+	OpPrefixFE byte = 0xfe // threads proposal: atomics
 )

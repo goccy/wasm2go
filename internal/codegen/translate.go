@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/codegen/sharedimage"
 	"github.com/goccy/wasm2go/internal/lower"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/ssa/pass"
@@ -359,6 +360,13 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	}
 	out.Decls = append(out.Decls, helpers...)
 
+	// Globals save/restore — see emitGlobalsSnapshot; NewFromSnapshot calls it.
+	globalsSnap, err := t.emitGlobalsSnapshot()
+	if err != nil {
+		return Result{}, err
+	}
+	out.Decls = append(out.Decls, globalsSnap...)
+
 	// //go:embed declarations for data sidecars (if any).
 	out.Decls = append(out.Decls, t.emitSidecarDecls()...)
 
@@ -391,7 +399,152 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	t.reportMemMetrics()
+	shared, err := t.emitSharedImage(opts.Package)
+	if err != nil {
+		return Result{}, err
+	}
+	for name, content := range shared {
+		if t.auxFiles == nil {
+			t.auxFiles = map[string][]byte{}
+		}
+		t.auxFiles[name] = content
+	}
 	return finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
+}
+
+// emitGlobalsSnapshot emits SaveGlobals/RestoreGlobals over the module's
+// MUTABLE globals. They belong to the package that holds the Module struct,
+// because they are the only code that can see the gN fields.
+//
+// Globals live outside linear memory, so an image of an initialized instance's
+// memory is not by itself enough to reconstruct that instance: the guest's TLS
+// base and stack pointer are globals, and a Module built fresh would have them
+// at their declared init values (typically zero) with the memory saying
+// otherwise. These two carry them across. Immutable globals are skipped — they
+// cannot have moved, and the fresh Module already has them right.
+func (t *translator) emitGlobalsSnapshot() ([]ast.Decl, error) {
+	if len(t.mod.Memories) == 0 {
+		return nil, nil // no memory, no image, nobody to snapshot for
+	}
+	type gl struct {
+		field string
+		typ   wasm.ValType
+	}
+	var gs []gl
+	for i, g := range t.mod.Globals {
+		if !g.Type.Mutable {
+			continue
+		}
+		gs = append(gs, gl{
+			field: t.fieldName(fmt.Sprintf("g%d", int(t.mod.NumImportedGlobals)+i)),
+			typ:   g.Type.Type,
+		})
+	}
+
+	save := &strings.Builder{}
+	restore := &strings.Builder{}
+	needMath := false
+	for i, g := range gs {
+		switch g.typ {
+		case wasm.ValI32:
+			fmt.Fprintf(save, "\tg[%d] = uint64(uint32(m.%s))\n", i, g.field)
+			fmt.Fprintf(restore, "\tm.%s = int32(uint32(g[%d]))\n", g.field, i)
+		case wasm.ValI64:
+			fmt.Fprintf(save, "\tg[%d] = uint64(m.%s)\n", i, g.field)
+			fmt.Fprintf(restore, "\tm.%s = int64(g[%d])\n", g.field, i)
+		case wasm.ValF32:
+			needMath = true
+			fmt.Fprintf(save, "\tg[%d] = uint64(math.Float32bits(m.%s))\n", i, g.field)
+			fmt.Fprintf(restore, "\tm.%s = math.Float32frombits(uint32(g[%d]))\n", g.field, i)
+		case wasm.ValF64:
+			needMath = true
+			fmt.Fprintf(save, "\tg[%d] = math.Float64bits(m.%s)\n", i, g.field)
+			fmt.Fprintf(restore, "\tm.%s = math.Float64frombits(g[%d])\n", g.field, i)
+		default:
+			// A reference-typed global cannot be snapshotted as a scalar; it
+			// also cannot survive a process boundary. Leave it to the fresh
+			// Module's own initializer.
+			fmt.Fprintf(save, "\t// g%d: reference type, not snapshottable\n", i)
+		}
+	}
+	if needMath {
+		t.use("math")
+	}
+
+	saveName, restoreName := "saveGlobals", "restoreGlobals"
+	if t.multiPackage {
+		saveName, restoreName = "SaveGlobals", "RestoreGlobals"
+	}
+	src := fmt.Sprintf(`package p
+
+%s
+
+// %s returns the module's mutable globals, in a form that can be handed back
+// to %s. It is how a snapshot of an instance captures the state that does not
+// live in linear memory.
+func %s(m *Module) []uint64 {
+	g := make([]uint64, %d)
+%s	return g
+}
+
+// %s puts a snapshot's globals back. A snapshot from a different module (or a
+// different build of the same one) has a different global count; rather than
+// index out of bounds, take what fits and leave the rest at their declared
+// initializers.
+func %s(m *Module, g []uint64) {
+	if len(g) != %d {
+		return
+	}
+%s}
+`,
+		mathImport(needMath),
+		saveName, restoreName, saveName, len(gs), save.String(),
+		restoreName, restoreName, len(gs), restore.String())
+
+	f, err := parser.ParseFile(t.fset, "globals_snapshot.go", src, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("wasm2go: emitting the globals snapshot: %w", err)
+	}
+	var decls []ast.Decl
+	for _, d := range f.Decls {
+		if _, ok := d.(*ast.FuncDecl); ok {
+			decls = append(decls, d)
+		}
+	}
+	return decls, nil
+}
+
+// mathImport is the import block emitGlobalsSnapshot's synthetic file needs to
+// parse; the decls are then lifted out and the import is registered on the real
+// file through t.use.
+func mathImport(need bool) string {
+	if need {
+		return `import "math"`
+	}
+	return ""
+}
+
+// emitSharedImage renders the copy-on-write shared-memory-image runtime into
+// the package that holds the Module struct. It reads three of that struct's
+// fields, and their names differ between single- and multi-package output
+// (multi-package exports them), so the source is a template rather than a
+// fixed file. A module with no linear memory has nothing to share.
+func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
+	if len(t.mod.Memories) == 0 {
+		return nil, nil
+	}
+	saveGlobals := "saveGlobals"
+	if t.multiPackage {
+		saveGlobals = "SaveGlobals"
+	}
+	return sharedimage.Files(sharedimage.Names{
+		Pkg:         pkg,
+		Module:      "Module",
+		Memory:      t.fieldName("memory"),
+		MemSize:     t.fieldName("memSize"),
+		DataEnd:     t.fieldName("dataEnd"),
+		SaveGlobals: saveGlobals,
+	})
 }
 
 // finalizeSinglePkgWithAsm is the asm-always-on tail of single-package
@@ -515,6 +668,10 @@ type translator struct {
 
 	// helpersFile is parsed lazily by emitHelpers.
 	helpersFile *ast.File
+
+	// passiveLocs maps original data-segment index → its span in the data.bin
+	// blob, for passive segments only (dataSegs views are sliced from these).
+	passiveLocs map[int]blobSpan
 
 	// sidecars maps sidecar filename → bytes (populated when DataSidecar is true).
 	sidecars map[string][]byte
@@ -714,6 +871,18 @@ func (t *translator) wasmExcTypeExpr() ast.Expr {
 		return &ast.SelectorExpr{X: newID("base"), Sel: newID("WasmExc")}
 	}
 	return newID("wasmExc")
+}
+
+// threadPoolTypeExpr names the wasi-threads pool type, mirroring
+// wasmExcTypeExpr: exported and homed in `base` under multi-package output.
+func (t *translator) threadPoolTypeExpr() ast.Expr {
+	if t.multiPackage {
+		if t.currentChunk == chunkBase {
+			return newID("ThreadPool")
+		}
+		return &ast.SelectorExpr{X: newID("base"), Sel: newID("ThreadPool")}
+	}
+	return newID("threadPool")
 }
 
 // helperRef returns the AST expression that names a helper function. In
@@ -1053,6 +1222,14 @@ func (t *translator) use(pkg string) { t.imports[pkg] = "" }
 // useHelper marks a helper as needed.
 func (t *translator) useHelper(name string) { t.helpers[name] = true }
 
+// importHandledInternally reports whether a wasm import never surfaces to the
+// host because the code generator implements it inline (today: wasi-threads'
+// thread-spawn, which becomes a goroutine).
+func importHandledInternally(imp wasm.Import) bool {
+	return (imp.Module == "wasi" && imp.Name == "thread-spawn") ||
+		(imp.Module == "wasi_snapshot_preview1" && imp.Name == "thread_spawn")
+}
+
 // knownImportModuleOrder is the fixed parameter order for the host-import
 // modules the wasmify pipeline emits: the WASI host interface first, then env,
 // then the wasmify bridge module. The generated constructor (New / NewWithWASI)
@@ -1069,6 +1246,13 @@ var knownImportModuleOrder = []string{"wasi_snapshot_preview1", "env", "wasmify"
 func (t *translator) collectImportModules() {
 	present := map[string]bool{}
 	for _, imp := range t.mod.Imports {
+		if importHandledInternally(imp) {
+			// wasi-threads' thread-spawn never reaches the host — the emitter
+			// maps it onto a goroutine spawn — so it must not surface as a
+			// constructor parameter / host interface either. A module whose
+			// imports are ALL internal disappears from the signature.
+			continue
+		}
 		present[imp.Module] = true
 	}
 	// Emit the known modules first, in the prescribed order, if the wasm uses them.
@@ -1095,9 +1279,13 @@ func (t *translator) emitImportInterfaces() []ast.Decl {
 	if len(t.mod.Imports) == 0 {
 		return nil
 	}
-	// Group imports by module name.
+	// Group imports by module name (internal ones — goroutine-backed
+	// thread-spawn — never surface as interface methods).
 	byMod := map[string][]wasm.Import{}
 	for _, imp := range t.mod.Imports {
+		if importHandledInternally(imp) {
+			continue
+		}
 		byMod[imp.Module] = append(byMod[imp.Module], imp)
 	}
 	var decls []ast.Decl
@@ -1240,11 +1428,72 @@ func (t *translator) emitModuleStruct() ast.Decl {
 	// memory/maxMem/M offsets the generated asm hardcodes (moduleMOffset)
 	// are unaffected.
 	if len(t.mod.Memories) > 0 {
+		// memMu/memSize/threads are pointers: a wasi-threads agent runs on
+		// a struct COPY of the Module (own globals, shared everything else),
+		// and this state must stay shared across the copies.
 		fields = append(fields, &ast.Field{
 			Names: []*ast.Ident{newID(t.fieldName("memMu"))},
-			Type:  &ast.SelectorExpr{X: newID("sync"), Sel: newID("Mutex")},
+			Type:  &ast.StarExpr{X: &ast.SelectorExpr{X: newID("sync"), Sel: newID("Mutex")}},
 		})
 		t.use("sync")
+
+		// memSize is the CURRENT linear-memory size in bytes. For a shared
+		// memory (threads proposal) the slice header is immutable after
+		// New() — len == cap == the declared maximum, reserved once as
+		// virtual address space that only becomes resident as the guest
+		// touches it — so growth is a lone atomic store here and the data
+		// pointer other agents deref through never moves. Size-consulting
+		// helpers read this atomically; the hot load/store path reads
+		// neither (it derefs m.M), so threads cost it nothing.
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("memSize"))},
+			Type:  &ast.StarExpr{X: &ast.SelectorExpr{X: newID("atomic"), Sel: newID("Uint64")}},
+		})
+		t.use("sync/atomic")
+		// dataSegs are the module's PASSIVE data segments (views into the
+		// embedded data blob), indexed by their original data-section index —
+		// memory.init names them by that index. Active segments hold nil (a
+		// memory.init on one traps, same as post-drop). data.drop nils the
+		// entry out.
+		if t.hasPassiveData() {
+			fields = append(fields, &ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("dataSegs"))},
+				Type:  &ast.ArrayType{Elt: &ast.ArrayType{Elt: newID("byte")}},
+			})
+		}
+		// dataEnd is where the data segments stop and BSS begins. The
+		// constructor seeds it from the ACTIVE segments (their extent is known
+		// here, at compile time) and memoryInit raises it for the PASSIVE ones,
+		// whose destinations are wasm constants the host cannot see until the
+		// start section runs them. SharedImage is the consumer: it may share
+		// everything below this line and must zero everything above it.
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("dataEnd"))},
+			Type:  newID("uint32"),
+		})
+		// memShared records whether the memory was declared shared, which
+		// is what makes the reslice-free grow above legal.
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("memShared"))},
+			Type:  newID("bool"),
+		})
+		// threads holds the wasi-threads agents (a wasm thread is a
+		// goroutine) and the wait/notify parking lot. Zero-sized until the
+		// guest actually spawns or blocks.
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("threads"))},
+			Type:  &ast.StarExpr{X: t.threadPoolTypeExpr()},
+		})
+		// threadStart carries the wasi_thread_start export as a function
+		// value: multi-package output emits exports as free functions in the
+		// main package, so base's threadSpawn helper cannot reach them any
+		// other way (no method to assert, no upward import).
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("threadStart"))},
+			Type: &ast.FuncType{Params: &ast.FieldList{List: []*ast.Field{
+				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID("int32")},
+			}}},
+		})
 	}
 
 	return &ast.GenDecl{
@@ -1256,8 +1505,81 @@ func (t *translator) emitModuleStruct() ast.Decl {
 	}
 }
 
-// emitNewFuncs is the underlying constructor emitter; see emitNewFunc.
+// blobSpan is a byte range in the embedded data.bin blob.
+type blobSpan struct {
+	start  int
+	length int
+}
+
+// memIsShared reports whether memory 0 is a threads-proposal SHARED memory.
+// Plain loads/stores against a shared memory are emitted through noinline
+// helpers so cross-agent coherence survives the Go compiler.
+func (t *translator) memIsShared() bool {
+	return len(t.mod.Memories) > 0 && t.mod.Memories[0].Limits.Shared
+}
+
+// hasPassiveData reports whether the module carries passive data segments
+// (LLVM's shared-memory output always does).
+func (t *translator) hasPassiveData() bool {
+	for _, ds := range t.mod.Datas {
+		if ds.Passive {
+			return true
+		}
+	}
+	return false
+}
+
+// newMode selects which constructor emitNewFuncsMode is building.
+type newMode int
+
+const (
+	// newAlloc allocates and initializes the linear memory itself: New,
+	// NewWithWASI, NewWithWASIReserve.
+	newAlloc newMode = iota
+	// newFromMemory takes the memory from the caller (NewWithMemory) and skips
+	// copying the active data segments into it — the caller's memory already
+	// holds them. The start section still runs, because the caller's memory is
+	// an image of the data segments and nothing more.
+	newFromMemory
+	// newFromSnapshot takes the memory AND the wasm globals from the caller
+	// (NewFromSnapshot): a snapshot of an instance that has already been fully
+	// initialized. Nothing is re-run — not the data segments, not the start
+	// section — because everything they would do is already in the snapshot,
+	// and re-running the start section over it would trap on its own
+	// already-ran flag.
+	newFromSnapshot
+)
+
+// emitNewFuncs emits the constructor family: the allocating ones, plus the two
+// that take the linear memory from the caller. Those two are the hook an
+// embedding needs to share memory across instances (map an image copy-on-write
+// and its unwritten pages cost nothing per instance) — NewWithMemory for an
+// image of the data segments, NewFromSnapshot for an image of a whole
+// initialized instance.
 func (t *translator) emitNewFuncs() []ast.Decl {
+	decls := t.emitNewFuncsMode(newAlloc)
+	if len(t.mod.Memories) > 0 {
+		decls = append(decls, t.emitNewFuncsMode(newFromMemory)...)
+		decls = append(decls, t.emitNewFuncsMode(newFromSnapshot)...)
+	}
+	return decls
+}
+
+// memLenExpr is uint64(len(memory)): with a caller-supplied memory the
+// allocation itself is the ceiling, so the wasm's declared maximum does not
+// enter into it.
+func memLenExpr() ast.Expr {
+	return &ast.CallExpr{
+		Fun:  newID("uint64"),
+		Args: []ast.Expr{&ast.CallExpr{Fun: newID("len"), Args: []ast.Expr{newID("memory")}}},
+	}
+}
+
+// emitNewFuncsMode builds the constructors. With memFromArg, it emits ONLY
+// NewWithMemory: the same body, except the linear memory (and the size the
+// guest sees) come from parameters.
+func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
+	memFromArg := mode != newAlloc
 	primaryName := "New"
 	emitNativeWASIWrapper := false
 	wasiIdx := -1
@@ -1298,7 +1620,21 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 	// the thin NewWithWASI / New delegators. The primary gets reserveBytes
 	// appended when emitReserve.
 	modParams := params
-	if emitReserve {
+	if memFromArg {
+		primaryName = "NewWithMemory"
+		emitReserve = false
+		params = append(append([]*ast.Field{}, params...),
+			&ast.Field{Names: []*ast.Ident{newID("memory")}, Type: &ast.ArrayType{Elt: newID("byte")}},
+			&ast.Field{Names: []*ast.Ident{newID("memSize")}, Type: newID("uint64")},
+		)
+		if mode == newFromSnapshot {
+			primaryName = "NewFromSnapshot"
+			params = append(params, &ast.Field{
+				Names: []*ast.Ident{newID("globals")},
+				Type:  &ast.ArrayType{Elt: newID("uint64")},
+			})
+		}
+	} else if emitReserve {
 		params = append(append([]*ast.Field{}, params...), &ast.Field{
 			Names: []*ast.Ident{newID("reserveBytes")},
 			Type:  newID("int"),
@@ -1372,18 +1708,118 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		} else {
 			capArg = uintLit(defaultReserveCap)
 		}
+		// A SHARED memory (threads proposal, which requires a declared
+		// maximum) is allocated at its ceiling LENGTH once: other agents
+		// deref the data pointer concurrently, so the backing array must
+		// never move and the slice must never be re-made. Growth is then a
+		// lone atomic store (memSize), and the hot load/store path stays
+		// lock- and atomic-free.
+		//
+		// The ceiling is a RUNTIME value, not the wasm's declared maximum:
+		// NewWithReserve's caller passes the memory cap it wants to enforce,
+		// and a host that means to allow more than the module declares is
+		// entitled to — the declared max is a property of the binary, not a
+		// policy. Untouched pages of the allocation never become resident
+		// (Go mmaps a large slice; the OS pages it in on demand), so a
+		// generous ceiling costs address space, not memory.
+		lenArg := ast.Expr(uintLit(minBytesU))
+		if memFromArg {
+			// The caller owns the allocation: it may be a copy-on-write map
+			// of a pre-initialized image shared by every instance. Nothing
+			// here may touch it — a write would fault in a private copy of
+			// the page and undo the sharing.
+			lenArg = nil
+			capArg = nil
+		} else if mem.Limits.Shared {
+			ceiling := ast.Expr(uintLit(defaultReserveCap))
+			if mem.Limits.HasMax {
+				ceiling = uintLit(mem.Limits.Max * 65536)
+			}
+			if emitReserve {
+				// __memcap is reserveBytes clamped up to minBytes; for a
+				// shared memory it IS the ceiling, so a caller passing 0
+				// falls back to the declared maximum rather than to a
+				// headroom that could not grow later.
+				body.List = append(body.List, &ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("__memcap"),
+						Op: token.LSS,
+						Y:  ceiling,
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{&ast.AssignStmt{
+						Tok: token.ASSIGN,
+						Lhs: []ast.Expr{newID("__memcap")},
+						Rhs: []ast.Expr{ceiling},
+					}}},
+				})
+				lenArg = newID("__memcap")
+				capArg = newID("__memcap")
+			} else {
+				lenArg = ceiling
+				capArg = ceiling
+			}
+		}
+		memRhs := ast.Expr(&ast.CallExpr{
+			Fun: newID("make"),
+			Args: []ast.Expr{
+				&ast.ArrayType{Elt: newID("byte")},
+				lenArg,
+				capArg,
+			},
+		})
+		if memFromArg {
+			memRhs = newID("memory")
+		}
 		body.List = append(body.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
 			Lhs: []ast.Expr{t.fieldRef("memory")},
-			Rhs: []ast.Expr{&ast.CallExpr{
-				Fun: newID("make"),
-				Args: []ast.Expr{
-					&ast.ArrayType{Elt: newID("byte")},
-					uintLit(minBytesU),
-					capArg,
-				},
-			}},
+			Rhs: []ast.Expr{memRhs},
 		})
+		// memSize is the size the guest sees; for a shared memory it is the
+		// only thing growth changes.
+		// The pointered shared-state fields exist exactly once, on the
+		// PRIMARY module; agent clones copy the pointers and share them.
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{t.fieldRef("memMu")},
+			Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: &ast.CompositeLit{
+				Type: &ast.SelectorExpr{X: newID("sync"), Sel: newID("Mutex")},
+			}}},
+		})
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{t.fieldRef("memSize")},
+			Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: &ast.CompositeLit{
+				Type: &ast.SelectorExpr{X: newID("atomic"), Sel: newID("Uint64")},
+			}}},
+		})
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{t.fieldRef("threads")},
+			Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: &ast.CompositeLit{
+				Type: t.threadPoolTypeExpr(),
+			}}},
+		})
+		sizeArg := ast.Expr(uintLit(minBytesU))
+		if memFromArg {
+			// The image the caller handed us is already initialized; its
+			// grown size travels with it.
+			sizeArg = newID("memSize")
+		}
+		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
+			Fun: &ast.SelectorExpr{
+				X:   &ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName("memSize"))},
+				Sel: newID("Store"),
+			},
+			Args: []ast.Expr{sizeArg},
+		}})
+		if mem.Limits.Shared {
+			body.List = append(body.List, &ast.AssignStmt{
+				Tok: token.ASSIGN,
+				Lhs: []ast.Expr{t.fieldRef("memShared")},
+				Rhs: []ast.Expr{newID("true")},
+			})
+		}
 		// Prime the m.M cache so the first load/store doesn't need a
 		// special-case "is M still nil" check. memoryGrow's reallocate
 		// path keeps M in sync.
@@ -1416,17 +1852,25 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 					}},
 				}}
 			}
+			maxRhs := ast.Expr(uintLit(mem.Limits.Max * 65536))
+			if memFromArg {
+				maxRhs = memLenExpr()
+			}
 			body.List = append(body.List, &ast.AssignStmt{
 				Tok: token.ASSIGN,
 				Lhs: []ast.Expr{t.fieldRef("maxMem")},
-				Rhs: []ast.Expr{uintLit(mem.Limits.Max * 65536)},
+				Rhs: []ast.Expr{maxRhs},
 			})
 		} else {
 			// 4 GiB default cap (wasm32 limit).
+			maxRhs := ast.Expr(uintLit(1 << 32))
+			if memFromArg {
+				maxRhs = memLenExpr()
+			}
 			body.List = append(body.List, &ast.AssignStmt{
 				Tok: token.ASSIGN,
 				Lhs: []ast.Expr{t.fieldRef("maxMem")},
-				Rhs: []ast.Expr{uintLit(1 << 32)},
+				Rhs: []ast.Expr{maxRhs},
 			})
 		}
 	}
@@ -1508,7 +1952,7 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		// helpers that only reference its own Fn<idx> values (zero linkname
 		// forwards from chunk into other chunks). Main calls each helper
 		// via linkname forward — bounded by num_chunks × num_batches.
-		if err := t.emitShardedElementInit(body); err != nil {
+		if err := t.emitShardedElementInit(body, memFromArg); err != nil {
 			return []ast.Decl{&ast.FuncDecl{
 				Name: newID("New"),
 				Type: &ast.FuncType{
@@ -1587,7 +2031,11 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 					Args: []ast.Expr{newID("m")},
 				}})
 			}
-			t.elemInitChunks = append(t.elemInitChunks, chunkDecls...)
+			if !memFromArg {
+				// Emitted once: building the body a second time (for
+				// NewWithMemory) must not redeclare these.
+				t.elemInitChunks = append(t.elemInitChunks, chunkDecls...)
+			}
 		}
 	}
 
@@ -1614,6 +2062,9 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		}
 		raws := make([]rawSeg, 0, len(t.mod.Datas))
 		for i, ds := range t.mod.Datas {
+			if ds.Passive {
+				continue // becomes a dataSegs view below, not a New()-time copy
+			}
 			off, err := evalConstExprI64(ds.Offset, t.mod)
 			if err != nil {
 				body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
@@ -1625,6 +2076,25 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 			raws = append(raws, rawSeg{memOff: off, bytes: ds.Bytes})
 		}
 		sort.Slice(raws, func(i, j int) bool { return raws[i].memOff < raws[j].memOff })
+		// Seed dataEnd with the active segments' extent. Passive segments are
+		// added by memoryInit when the start section installs them; an active
+		// one is copied right here, so its end is known now. Emitted even when
+		// the memory came from the caller (memFromArg) and the copies below are
+		// skipped: the bytes are in that memory already, and dataEnd describes
+		// the memory, not the copying.
+		if len(raws) > 0 {
+			var maxEnd int64
+			for _, r := range raws {
+				if end := r.memOff + int64(len(r.bytes)); end > maxEnd {
+					maxEnd = end
+				}
+			}
+			body.List = append(body.List, &ast.AssignStmt{
+				Lhs: []ast.Expr{t.fieldRef("dataEnd")},
+				Tok: token.ASSIGN,
+				Rhs: []ast.Expr{uintLit(uint64(maxEnd))},
+			})
+		}
 		// Coalescing reorders writes by offset, which is only safe when
 		// no two segments overlap (overlapping active segments must be
 		// applied in data-section order). Real C++→wasm output never
@@ -1664,6 +2134,18 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 			segs = append(segs, segLoc{memOff: spanMemOff, start: spanStart, length: len(concat) - spanStart})
 			i = j
 		}
+		// Passive segments ride in the same blob, after the active spans.
+		// They are NOT copied into memory here — memory.init does that at the
+		// guest's request (for LLVM shared-memory output, from the
+		// __wasm_init_memory start function, exactly once).
+		t.passiveLocs = make(map[int]blobSpan)
+		for i, ds := range t.mod.Datas {
+			if !ds.Passive {
+				continue
+			}
+			t.passiveLocs[i] = blobSpan{start: len(concat), length: len(ds.Bytes)}
+			concat = append(concat, ds.Bytes...)
+		}
 		t.sidecars["data.bin"] = concat
 		blobIdent := newID("wasm2goData_" + sanitizeFilename("data.bin"))
 		const dataChunkSize = 256
@@ -1692,6 +2174,10 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 				}})
 			}
 			chunkName := fmt.Sprintf("initData_%d", c)
+			if memFromArg {
+				// See above: definitions once, calls per constructor.
+				continue
+			}
 			t.elemInitChunks = append(t.elemInitChunks, &ast.FuncDecl{
 				Name: newID(chunkName),
 				Type: &ast.FuncType{
@@ -1709,6 +2195,79 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		}
 	}
 
+	// Passive data segments: register blob views under their ORIGINAL
+	// data-section indices so memory.init can name them. The blob is the same
+	// embedded data.bin the active segments use; passive bytes were appended
+	// after the active spans by the emission above.
+	if t.hasPassiveData() {
+		elts := make([]ast.Expr, len(t.mod.Datas))
+		for i, ds := range t.mod.Datas {
+			if !ds.Passive {
+				elts[i] = newID("nil")
+				continue
+			}
+			loc := t.passiveLocs[i]
+			elts[i] = &ast.SliceExpr{
+				X:    newID("wasm2goData_" + sanitizeFilename("data.bin")),
+				Low:  uintLit(uint64(loc.start)),
+				High: uintLit(uint64(loc.start + loc.length)),
+			}
+		}
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName("dataSegs"))}},
+			Rhs: []ast.Expr{&ast.CompositeLit{
+				Type: &ast.ArrayType{Elt: &ast.ArrayType{Elt: newID("byte")}},
+				Elts: elts,
+			}},
+		})
+	}
+
+	// Wire the wasi_thread_start export into the Module so threadSpawn (in
+	// base) can launch agents without reaching into this package.
+	for _, exp := range t.mod.Exports {
+		if exp.Kind != wasm.ExportFunc || exp.Name != "wasi_thread_start" || !t.funcReachable(exp.Index) {
+			continue
+		}
+		// The export already takes the module as its first parameter, so the
+		// function value itself is what goes in the field — a closure over
+		// the PRIMARY module here would defeat the per-agent clone that
+		// threadSpawn passes in.
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName("threadStart"))}},
+			Rhs: []ast.Expr{t.funcRef(exp.Index)},
+		})
+		break
+	}
+
+	// The wasm start section runs at instantiation, before any export is
+	// callable. Under LLVM's shared-memory scheme this is __wasm_init_memory:
+	// it memory.inits every passive segment exactly once (guarded by an
+	// atomic flag) and data.drops them.
+	//
+	// A snapshot skips it, and must: the snapshot was taken from an instance
+	// that already ran it, so the flag it guards itself with is set in the
+	// snapshotted memory and a second run would trap on it. Everything the
+	// start section does is in the snapshot already.
+	if t.mod.Start != nil && *t.mod.Start >= t.mod.NumImportedFuncs && mode != newFromSnapshot {
+		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
+			Fun:  t.funcRef(*t.mod.Start),
+			Args: []ast.Expr{newID("m")},
+		}})
+	}
+
+	// A snapshot's globals are as load-bearing as its memory: the guest's TLS
+	// base, its shadow-stack pointer, anything else the initialization moved
+	// off its declared value. They live outside linear memory, so the image
+	// cannot carry them — the caller passes them alongside it.
+	if mode == newFromSnapshot {
+		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
+			Fun:  t.helperRef("restoreGlobals"),
+			Args: []ast.Expr{newID("m"), newID("globals")},
+		}})
+	}
+
 	body.List = append(body.List, &ast.ReturnStmt{Results: []ast.Expr{newID("m")}})
 
 	primary := &ast.FuncDecl{
@@ -1718,6 +2277,12 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 			Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}},
 		},
 		Body: body,
+	}
+	if memFromArg {
+		// NewWithMemory only: the delegators (New / NewWithWASI) exist to
+		// pick an allocation for the caller, and this variant's caller has
+		// already made that choice.
+		return []ast.Decl{primary}
 	}
 	if !emitNativeWASIWrapper {
 		return []ast.Decl{primary}
@@ -1883,23 +2448,38 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		return nil, err
 	}
 	insBefore := ssa.CountValues(ssaFn)
+	// WASM2GO_SSA_PASSES_OFF disables individual optimization passes (comma
+	// list of constprop,branchfold,simplify,cse,dce — or "all"). Diagnostic
+	// escape hatch for bisecting a suspected pass miscompile; not a
+	// supported build mode.
+	passesOff := map[string]bool{}
+	if env := os.Getenv("WASM2GO_SSA_PASSES_OFF"); env != "" {
+		for _, p := range strings.Split(env, ",") {
+			passesOff[strings.TrimSpace(strings.ToLower(p))] = true
+		}
+		if passesOff["all"] {
+			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "dce"} {
+				passesOff[p] = true
+			}
+		}
+	}
 	const optFixpointCap = 8
 	fixpointReached := false
 	for i := 0; i < optFixpointCap; i++ {
 		changed := false
-		if pass.ConstProp(ssaFn) {
+		if !passesOff["constprop"] && pass.ConstProp(ssaFn) {
 			changed = true
 		}
-		if pass.BranchFold(ssaFn) {
+		if !passesOff["branchfold"] && pass.BranchFold(ssaFn) {
 			changed = true
 		}
-		if pass.Simplify(ssaFn) {
+		if !passesOff["simplify"] && pass.Simplify(ssaFn) {
 			changed = true
 		}
-		if pass.CSE(ssaFn) {
+		if !passesOff["cse"] && pass.CSE(ssaFn) {
 			changed = true
 		}
-		if pass.DCE(ssaFn) {
+		if !passesOff["dce"] && pass.DCE(ssaFn) {
 			changed = true
 		}
 		if !changed {
@@ -2035,7 +2615,12 @@ func shardInitElemName(chunkIdx, batch int) string {
 //
 // initBody is the statement list of New()'s body; helper-call statements
 // are appended in chunk-order, batch-order.
-func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt) error {
+// defsEmitted: the constructor body is built twice (New* and NewWithMemory),
+// and the per-chunk InitElemSeg_* helpers must be DEFINED once while both
+// bodies CALL them. The element segments populate the function table — a Go
+// slice, not linear memory — so even an instance whose memory came from the
+// shared image has to run them.
+func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt, defsEmitted bool) error {
 	// Per-chunk slot writes: chunkIdx -> []slotWrite (one entry per slot
 	// whose funcIdx is owned by that chunk).
 	type slotWrite struct {
@@ -2105,15 +2690,18 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt) error {
 				})
 			}
 			helperName := shardInitElemName(ck, b)
-			t.addChunkExtraDecl(ck, &ast.FuncDecl{
-				Name: newID(helperName),
-				Type: helperSig,
-				Body: helperBody,
-			})
+			if !defsEmitted {
+				t.addChunkExtraDecl(ck, &ast.FuncDecl{
+					Name: newID(helperName),
+					Type: helperSig,
+					Body: helperBody,
+				})
+				t.registerLinknameSymbol(-1, helperName, ck, helperSig)
+			}
 			t.currentChunk = prev
 
-			// Main: register linkname forward + emit call.
-			t.registerLinknameSymbol(-1, helperName, ck, helperSig)
+			// The CALL goes into every constructor body; the definition above
+			// is emitted once (see the doc comment).
 			initBody.List = append(initBody.List, &ast.ExprStmt{X: &ast.CallExpr{
 				Fun:  newID(helperName),
 				Args: []ast.Expr{newID("m")},
@@ -2479,6 +3067,14 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 				t.use("runtime")
 			case "unsafe":
 				t.use("unsafe")
+			case "atomic":
+				t.use("sync/atomic")
+			case "time":
+				t.use("time")
+			case "bytes":
+				t.use("bytes")
+			case "sync":
+				t.use("sync")
 			}
 			return true
 		})
@@ -2497,6 +3093,12 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 				rewriteNames[k] = true
 			}
 			rewriteNames["wasmExc"] = true
+			// The threads types live in base and are exported there
+			// (ThreadPool/WasiThreadStarter); helper bodies that name them
+			// (threadSpawn's interface assertion, the pool methods) must
+			// follow, or base won't compile.
+			rewriteNames["threadPool"] = true
+			rewriteNames["wasiThreadStarter"] = true
 			renamed := *fn
 			renamed.Name = newID(capitalize(fn.Name.Name))
 			// Only rebuild the signature when it actually references a rewritten
@@ -2516,6 +3118,60 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 	// must be exported (WasmExc) so chunk packages can name it; single-package
 	// keeps it unexported (wasmExc). Field names (Tag, Vals) are already
 	// exported, so only the type name needs capitalizing.
+	// Memory-bearing modules always carry the threads types: the Module struct
+	// embeds threadPool (memSize/memShared/threads are declared together), and
+	// threadSpawn asserts the module against wasiThreadStarter. Both are
+	// zero-cost when the guest never spawns.
+	if len(t.mod.Memories) > 0 {
+		for _, decl := range t.helpersFile.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok || (ts.Name.Name != "threadPool" && ts.Name.Name != "wasiThreadStarter") {
+					continue
+				}
+				emitted := ts
+				if t.multiPackage {
+					renamed := *ts
+					renamed.Name = newID(capitalize(ts.Name.Name))
+					emitted = &renamed
+				}
+				out = append(out, &ast.GenDecl{Tok: token.TYPE, Specs: []ast.Spec{emitted}})
+			}
+		}
+		// threadPool's methods (wake) ride along with the type.
+		for _, decl := range t.helpersFile.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || len(fn.Recv.List) == 0 {
+				continue
+			}
+			star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+			if !ok {
+				continue
+			}
+			id, ok := star.X.(*ast.Ident)
+			if !ok || id.Name != "threadPool" {
+				continue
+			}
+			if t.multiPackage {
+				// The receiver type was exported above; the methods must
+				// follow it (and their bodies may name other helpers).
+				renamed := *fn
+				recv := *fn.Recv.List[0]
+				recv.Type = &ast.StarExpr{X: newID("ThreadPool")}
+				renamed.Recv = &ast.FieldList{List: []*ast.Field{&recv}}
+				renamed.Body = rewriteHelperBody(fn.Body, map[string]bool{
+					"threadPool": true, "wasiThreadStarter": true,
+				})
+				out = append(out, &renamed)
+				continue
+			}
+			out = append(out, fn)
+		}
+	}
 	if t.usesWasmExc {
 		for _, decl := range t.helpersFile.Decls {
 			gd, ok := decl.(*ast.GenDecl)
@@ -2536,6 +3192,43 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 				out = append(out, &ast.GenDecl{Tok: token.TYPE, Specs: []ast.Spec{emitted}})
 			}
 		}
+	}
+	// One stdlib scan over EVERYTHING emitHelpers emits — functions, type
+	// decls, methods. The per-function scan above misses types: ThreadPool
+	// carries atomic.Int32/sync.WaitGroup fields, and emitting it into base
+	// without registering sync/atomic left the base package uncompilable
+	// (the base import snapshot is taken before the Module struct's own
+	// use() calls run).
+	for _, decl := range out {
+		ast.Inspect(decl, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			id, ok := sel.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			switch id.Name {
+			case "math":
+				t.use("math")
+			case "bits":
+				t.use("math/bits")
+			case "binary":
+				t.use("encoding/binary")
+			case "runtime":
+				t.use("runtime")
+			case "unsafe":
+				t.use("unsafe")
+			case "atomic":
+				t.use("sync/atomic")
+			case "time":
+				t.use("time")
+			case "sync":
+				t.use("sync")
+			}
+			return true
+		})
 	}
 	return out, nil
 }
@@ -2564,209 +3257,54 @@ func capitalizeModuleFieldRefs(body *ast.BlockStmt) *ast.BlockStmt {
 	return rewriteHelperBody(body, nil)
 }
 
-// rewriteHelperBody rewrites a helper-function body for emission in
-// multi-package mode. Two changes are applied recursively across the
-// AST:
+// rewriteHelperBody rewrites a helper body for multi-package output, IN
+// PLACE: `m.<field>` selectors get exported field names, and bare identifiers
+// in the rename set (helper functions, the wasmExc/threads types) get
+// capitalized. A previous version hand-walked the AST node by node and
+// silently skipped every node type it didn't enumerate — helpers using
+// select/go/defer (the atomics wait/park helpers) kept lowercase references
+// and broke the base package. ast.Inspect visits everything.
 //
-//  1. `m.<lowercase>` selectors become `m.<Capitalized>` so helper code
-//     keeps referencing the (now-exported) Module fields.
-//  2. Bare-ident calls whose name matches another helper get
-//     capitalized (e.g. i32_div_u_s's body calls i32_div_u → I32_div_u)
-//     so the helper-to-helper edges resolve inside the base package.
-//
-// Returns a fresh AST so the shared helpersFile isn't mutated across
-// calls.
+// Two passes: the first records every SelectorExpr.Sel identifier so the
+// second never confuses a field/method selector with a bare name — `x.wake`
+// must not become `x.Wake` just because a helper is named wake.
 func rewriteHelperBody(body *ast.BlockStmt, helperNames map[string]bool) *ast.BlockStmt {
-	return rewriteHelperNode(body, helperNames).(*ast.BlockStmt)
+	rewriteHelperInPlace(body, helperNames)
+	return body
 }
 
-// rewriteHelperNode is the recursive worker for rewriteHelperBody.
+// rewriteHelperNode applies the same rewrite to any node (used for helper
+// signatures whose types name wasmExc etc.); returns the node for
+// call-site convenience.
 func rewriteHelperNode(n ast.Node, helperNames map[string]bool) ast.Node {
-	if n == nil {
-		return nil
-	}
-	switch v := n.(type) {
-	case *ast.Ident:
-		// Bare ident inside an expression — capitalize iff it's a
-		// helper name. (Call sites are handled in CallExpr below, but
-		// helpers may also pass other helpers as values; treat both.)
-		if helperNames[v.Name] {
-			return newID(capitalize(v.Name))
-		}
-		return v
-	case *ast.SelectorExpr:
-		if id, ok := v.X.(*ast.Ident); ok && id.Name == "m" {
-			if len(v.Sel.Name) > 0 && v.Sel.Name[0] >= 'a' && v.Sel.Name[0] <= 'z' {
-				return &ast.SelectorExpr{X: id, Sel: newID(capitalize(v.Sel.Name))}
-			}
-		}
-		return &ast.SelectorExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr), Sel: v.Sel}
-	case *ast.CallExpr:
-		// Recurse into Fun so a bare-ident helper call gets renamed.
-		fun := rewriteHelperNode(v.Fun, helperNames).(ast.Expr)
-		args := make([]ast.Expr, len(v.Args))
-		for i, a := range v.Args {
-			args[i] = rewriteHelperNode(a, helperNames).(ast.Expr)
-		}
-		return &ast.CallExpr{Fun: fun, Args: args, Ellipsis: v.Ellipsis}
-	case *ast.IndexExpr:
-		return &ast.IndexExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr), Index: rewriteHelperNode(v.Index, helperNames).(ast.Expr)}
-	case *ast.SliceExpr:
-		out := &ast.SliceExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr), Slice3: v.Slice3}
-		if v.Low != nil {
-			out.Low = rewriteHelperNode(v.Low, helperNames).(ast.Expr)
-		}
-		if v.High != nil {
-			out.High = rewriteHelperNode(v.High, helperNames).(ast.Expr)
-		}
-		if v.Max != nil {
-			out.Max = rewriteHelperNode(v.Max, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.BinaryExpr:
-		return &ast.BinaryExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr), Op: v.Op, Y: rewriteHelperNode(v.Y, helperNames).(ast.Expr)}
-	case *ast.UnaryExpr:
-		return &ast.UnaryExpr{Op: v.Op, X: rewriteHelperNode(v.X, helperNames).(ast.Expr)}
-	case *ast.ParenExpr:
-		return &ast.ParenExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr)}
-	case *ast.AssignStmt:
-		out := &ast.AssignStmt{Tok: v.Tok, Lhs: make([]ast.Expr, len(v.Lhs)), Rhs: make([]ast.Expr, len(v.Rhs))}
-		for i, e := range v.Lhs {
-			out.Lhs[i] = rewriteHelperNode(e, helperNames).(ast.Expr)
-		}
-		for i, e := range v.Rhs {
-			out.Rhs[i] = rewriteHelperNode(e, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.ExprStmt:
-		return &ast.ExprStmt{X: rewriteHelperNode(v.X, helperNames).(ast.Expr)}
-	case *ast.ReturnStmt:
-		out := &ast.ReturnStmt{Results: make([]ast.Expr, len(v.Results))}
-		for i, e := range v.Results {
-			out.Results[i] = rewriteHelperNode(e, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.IfStmt:
-		out := &ast.IfStmt{Cond: rewriteHelperNode(v.Cond, helperNames).(ast.Expr)}
-		if v.Init != nil {
-			out.Init = rewriteHelperNode(v.Init, helperNames).(ast.Stmt)
-		}
-		out.Body = rewriteHelperNode(v.Body, helperNames).(*ast.BlockStmt)
-		if v.Else != nil {
-			out.Else = rewriteHelperNode(v.Else, helperNames).(ast.Stmt)
-		}
-		return out
-	case *ast.ForStmt:
-		out := &ast.ForStmt{Body: rewriteHelperNode(v.Body, helperNames).(*ast.BlockStmt)}
-		if v.Init != nil {
-			out.Init = rewriteHelperNode(v.Init, helperNames).(ast.Stmt)
-		}
-		if v.Cond != nil {
-			out.Cond = rewriteHelperNode(v.Cond, helperNames).(ast.Expr)
-		}
-		if v.Post != nil {
-			out.Post = rewriteHelperNode(v.Post, helperNames).(ast.Stmt)
-		}
-		return out
-	case *ast.RangeStmt:
-		out := &ast.RangeStmt{
-			Tok:  v.Tok,
-			X:    rewriteHelperNode(v.X, helperNames).(ast.Expr),
-			Body: rewriteHelperNode(v.Body, helperNames).(*ast.BlockStmt),
-		}
-		if v.Key != nil {
-			out.Key = rewriteHelperNode(v.Key, helperNames).(ast.Expr)
-		}
-		if v.Value != nil {
-			out.Value = rewriteHelperNode(v.Value, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.BlockStmt:
-		out := &ast.BlockStmt{List: make([]ast.Stmt, len(v.List))}
-		for i, s := range v.List {
-			out.List[i] = rewriteHelperNode(s, helperNames).(ast.Stmt)
-		}
-		return out
-	case *ast.IncDecStmt:
-		return &ast.IncDecStmt{Tok: v.Tok, X: rewriteHelperNode(v.X, helperNames).(ast.Expr)}
-	case *ast.DeclStmt:
-		return v
-	case *ast.SwitchStmt:
-		out := &ast.SwitchStmt{Body: rewriteHelperNode(v.Body, helperNames).(*ast.BlockStmt)}
-		if v.Init != nil {
-			out.Init = rewriteHelperNode(v.Init, helperNames).(ast.Stmt)
-		}
-		if v.Tag != nil {
-			out.Tag = rewriteHelperNode(v.Tag, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.CaseClause:
-		out := &ast.CaseClause{Body: make([]ast.Stmt, len(v.Body))}
-		if v.List != nil {
-			out.List = make([]ast.Expr, len(v.List))
-			for i, e := range v.List {
-				out.List[i] = rewriteHelperNode(e, helperNames).(ast.Expr)
-			}
-		}
-		for i, s := range v.Body {
-			out.Body[i] = rewriteHelperNode(s, helperNames).(ast.Stmt)
-		}
-		return out
-	case *ast.TypeAssertExpr:
-		out := &ast.TypeAssertExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr)}
-		if v.Type != nil {
-			out.Type = rewriteHelperNode(v.Type, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.DeferStmt:
-		return &ast.DeferStmt{Call: rewriteHelperNode(v.Call, helperNames).(*ast.CallExpr)}
-	case *ast.BranchStmt:
-		return v
-	case *ast.LabeledStmt:
-		return &ast.LabeledStmt{Label: v.Label, Stmt: rewriteHelperNode(v.Stmt, helperNames).(ast.Stmt)}
-	case *ast.StarExpr:
-		return &ast.StarExpr{X: rewriteHelperNode(v.X, helperNames).(ast.Expr)}
-	case *ast.CompositeLit:
-		out := &ast.CompositeLit{Elts: make([]ast.Expr, len(v.Elts))}
-		if v.Type != nil {
-			out.Type = rewriteHelperNode(v.Type, helperNames).(ast.Expr)
-		}
-		for i, e := range v.Elts {
-			out.Elts[i] = rewriteHelperNode(e, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.KeyValueExpr:
-		return &ast.KeyValueExpr{Key: rewriteHelperNode(v.Key, helperNames).(ast.Expr), Value: rewriteHelperNode(v.Value, helperNames).(ast.Expr)}
-	case *ast.Ellipsis:
-		out := &ast.Ellipsis{}
-		if v.Elt != nil {
-			out.Elt = rewriteHelperNode(v.Elt, helperNames).(ast.Expr)
-		}
-		return out
-	case *ast.FuncType:
-		// Rewrite parameter/result type references (e.g. a helper whose
-		// signature names wasmExc) so a renamed type stays consistent between
-		// the declaration and its uses. Params/Results are FieldLists.
-		out := &ast.FuncType{}
-		if v.Params != nil {
-			out.Params = rewriteHelperNode(v.Params, helperNames).(*ast.FieldList)
-		}
-		if v.Results != nil {
-			out.Results = rewriteHelperNode(v.Results, helperNames).(*ast.FieldList)
-		}
-		return out
-	case *ast.FieldList:
-		out := &ast.FieldList{List: make([]*ast.Field, len(v.List))}
-		for i, f := range v.List {
-			out.List[i] = rewriteHelperNode(f, helperNames).(*ast.Field)
-		}
-		return out
-	case *ast.Field:
-		out := &ast.Field{Names: v.Names, Tag: v.Tag}
-		if v.Type != nil {
-			out.Type = rewriteHelperNode(v.Type, helperNames).(ast.Expr)
-		}
-		return out
-	}
+	rewriteHelperInPlace(n, helperNames)
 	return n
+}
+
+func rewriteHelperInPlace(n ast.Node, helperNames map[string]bool) {
+	if n == nil {
+		return
+	}
+	sels := map[*ast.Ident]bool{}
+	ast.Inspect(n, func(c ast.Node) bool {
+		if se, ok := c.(*ast.SelectorExpr); ok {
+			sels[se.Sel] = true
+		}
+		return true
+	})
+	ast.Inspect(n, func(c ast.Node) bool {
+		switch v := c.(type) {
+		case *ast.SelectorExpr:
+			if id, ok := v.X.(*ast.Ident); ok && id.Name == "m" {
+				if len(v.Sel.Name) > 0 && v.Sel.Name[0] >= 'a' && v.Sel.Name[0] <= 'z' {
+					v.Sel.Name = capitalize(v.Sel.Name)
+				}
+			}
+		case *ast.Ident:
+			if !sels[v] && helperNames[v.Name] {
+				v.Name = capitalize(v.Name)
+			}
+		}
+		return true
+	})
 }

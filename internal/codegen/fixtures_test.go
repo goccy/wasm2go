@@ -12,6 +12,7 @@ import (
 	"github.com/goccy/wasm2go/internal/wasm"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
 )
 
 // u32 packs a signed int32 into the low bits of a uint64 (wazero call ABI).
@@ -30,6 +31,9 @@ type call struct {
 type fixture struct {
 	name  string
 	calls []call
+	// threads enables wazero's experimental threads feature for the
+	// reference run (shared memories + atomics).
+	threads bool
 }
 
 var fixtures = []fixture{
@@ -130,6 +134,35 @@ var fixtures = []fixture{
 		},
 	},
 	{
+		// Passive data segments (the shape LLVM emits for every shared-memory
+		// build): a start function memory.inits them, data.drop discards, a
+		// dropped segment traps on re-init but tolerates n == 0.
+		name:    "cg_passive_data.wasm",
+		threads: true,
+		calls: []call{
+			{export: "read_at", args: []uint64{16}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "read_at", args: []uint64{21}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "read_at", args: []uint64{27}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "reinit_zero_len"},
+		},
+	},
+	{
+		// Threads-proposal atomics in a single agent: loads/stores, every
+		// RMW family incl. subword lanes, cmpxchg, fence, wait/notify.
+		name:    "cg_atomics.wasm",
+		threads: true,
+		calls: []call{
+			{export: "rmw32", resType: wasm.ValI32},
+			{export: "rmw64", resType: wasm.ValI64},
+			{export: "xchg", resType: wasm.ValI32},
+			{export: "cmpxchg", resType: wasm.ValI32},
+			{export: "subword", resType: wasm.ValI32},
+			{export: "subword_cmpxchg", resType: wasm.ValI32},
+			{export: "wait_notify", resType: wasm.ValI32},
+			{export: "fenced_load", resType: wasm.ValI32},
+		},
+	},
+	{
 		// br_table selecting on a comparison result (SSA type bool): must
 		// verify and route 0/1 correctly. Mirrors SpiderMonkey's Intl build.
 		name: "cg_brtable_bool.wasm",
@@ -172,7 +205,11 @@ func runFixture(t *testing.T, fx fixture) {
 
 	// Reference: wazero.
 	ctx := context.Background()
-	r := wazero.NewRuntime(ctx)
+	cfg := wazero.NewRuntimeConfig()
+	if fx.threads {
+		cfg = cfg.WithCoreFeatures(api.CoreFeaturesV2 | experimental.CoreFeaturesThreads)
+	}
+	r := wazero.NewRuntimeWithConfig(ctx, cfg)
 	t.Cleanup(func() {
 		if err := r.Close(ctx); err != nil {
 			t.Errorf("wazero runtime close: %v", err)

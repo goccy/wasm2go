@@ -16,7 +16,7 @@ import (
 // live array or is carried into the next one by the relocation copy.
 func TestAccessMemoryConcurrentGrow(t *testing.T) {
 	const flagAddr = 64 // low static-region word, always < initial len
-	m := &Module{memory: make([]byte, 1<<16, 1<<17)}
+	m := newTestModule(make([]byte, 1<<16, 1<<17))
 	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
 
 	var wg sync.WaitGroup
@@ -63,7 +63,7 @@ func TestAccessMemoryConcurrentGrow(t *testing.T) {
 func TestMemoryFillPaths(t *testing.T) {
 	for _, n := range []int32{1, 2, 3, 7, 8, 9, 1000, 4096, 65537} {
 		for _, val := range []int32{0, 0xA5} {
-			m := &Module{memory: make([]byte, 70000)}
+			m := newTestModule(make([]byte, 70000))
 			for i := range m.memory {
 				m.memory[i] = 0xEE
 			}
@@ -80,7 +80,7 @@ func TestMemoryFillPaths(t *testing.T) {
 		}
 	}
 	// Out-of-bounds still panics.
-	m := &Module{memory: make([]byte, 64)}
+	m := newTestModule(make([]byte, 64))
 	func() {
 		defer func() {
 			if recover() == nil {

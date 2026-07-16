@@ -71,7 +71,10 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// that ever relocate the backing array — re-read it. The refresh
 	// statements are inserted by both block emitters right after each
 	// such value; see maybeMemBaseRefresh.
-	em.memBaseHoisted = funcTouchesMemory(f)
+	// Shared memories route plain accesses through module-aware helpers
+	// (no raw base pointer at the access site), so hoisting mBase would
+	// only leave an unused local behind.
+	em.memBaseHoisted = funcTouchesMemory(f) && (em.t == nil || !em.t.memIsShared())
 
 	// EH in multi-package output: the wasmExc type + wasm_catch helper live in
 	// the base package (exported as WasmExc / Wasm_catch); the generated body
@@ -1034,6 +1037,23 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		return em.emitCallIndirect(v, emit)
 	case ssa.OpHelperCall:
 		return em.emitHelperCall(v, emit)
+	case ssa.OpAtomicCall:
+		// Module-aware helper: helper(m, args...). The helpers live with
+		// memoryCopy et al and go through useHelper/helperRef.
+		name, ok := v.Aux.(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("ssa emit: OpAtomicCall without name aux")
+		}
+		em.useHelper(name)
+		args := []ast.Expr{newID("m")}
+		for _, a := range v.Args {
+			e, err := emit(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, e)
+		}
+		return &ast.CallExpr{Fun: em.helperRef(name), Args: args}, nil
 	case ssa.OpMemSize:
 		em.useHelper("memorySize")
 		return &ast.CallExpr{Fun: em.helperRef("memorySize"), Args: []ast.Expr{newID("m")}}, nil
@@ -1156,14 +1176,29 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 			Fun:  em.helperRef("memoryFill"),
 			Args: []ast.Expr{newID("m"), dst, val, n},
 		}}, nil
-	case ssa.OpMemoryInit, ssa.OpDataDrop:
-		// Bulk-memory data-segment ops are not yet implemented; the
-		// generator emits a panic-stub so any caller hitting this at
-		// runtime fails loudly rather than silently producing wrong
-		// behaviour.
+	case ssa.OpMemoryInit:
+		em.useHelper("memoryInit")
+		dst, err := emit(v.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		src, err := emit(v.Args[1])
+		if err != nil {
+			return nil, err
+		}
+		n, err := emit(v.Args[2])
+		if err != nil {
+			return nil, err
+		}
 		return &ast.ExprStmt{X: &ast.CallExpr{
-			Fun:  newID("panic"),
-			Args: []ast.Expr{stringLit(fmt.Sprintf("wasm2go: %v not implemented", v.Op))},
+			Fun:  em.helperRef("memoryInit"),
+			Args: []ast.Expr{newID("m"), intLit(v.AuxInt), dst, src, n},
+		}}, nil
+	case ssa.OpDataDrop:
+		em.useHelper("dataDrop")
+		return &ast.ExprStmt{X: &ast.CallExpr{
+			Fun:  em.helperRef("dataDrop"),
+			Args: []ast.Expr{newID("m"), intLit(v.AuxInt)},
 		}}, nil
 	}
 	expr, err := em.emitOp(v, emit)
@@ -1223,6 +1258,23 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 		return nil, fmt.Errorf("ssa emit: CallImport needs translator binding")
 	}
 	imp := em.t.Module().Imports[v.AuxInt]
+	// wasi-threads: thread-spawn is not a host call at all — a wasm thread is
+	// a goroutine, so it lowers to the threadSpawn helper, which starts the
+	// guest's own wasi_thread_start on one. Keeping it out of the host
+	// interface means an embedder gets threads without implementing anything.
+	if imp.Module == "wasi" && imp.Name == "thread-spawn" ||
+		imp.Module == "wasi_snapshot_preview1" && imp.Name == "thread_spawn" {
+		em.useHelper("threadSpawn")
+		args := []ast.Expr{newID("m")}
+		for _, a := range v.Args {
+			ae, err := emit(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, ae)
+		}
+		return &ast.CallExpr{Fun: em.helperRef("threadSpawn"), Args: args}, nil
+	}
 	args := []ast.Expr{newID("m")}
 	for _, a := range v.Args {
 		ae, err := emit(a)

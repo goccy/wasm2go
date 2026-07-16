@@ -100,6 +100,7 @@ var allFixtures = []string{
 	"cg_indirect.wasm",
 	"cg_specialfp.wasm",
 	"cg_negzero.wasm",
+	"cg_atomics.wasm",
 	"cg_globals.wasm",
 	"cg_globals_nan.wasm",
 	"cg_misc.wasm",

@@ -1,14 +1,33 @@
 package helpers
 
-import "testing"
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
 
 // TestMemoryGrowGeometric is the regression test for the O(n^2) startup
 // stall: a C++ heap issues a long run of small memory.grow calls during
 // static initialization. The old memoryGrow did make+copy of the whole
 // linear memory on every call, so N grows copied O(N^2) bytes. With
 // geometric backing-array growth, N grows must reallocate O(log N) times.
+// newTestModule mirrors what generated New() does for a plain (non-shared)
+// memory: memSize — the single source of truth for sizes and bounds since the
+// shared-memory work — starts at len(memory). Hand-built Modules that skip it
+// see size 0 and every helper traps.
+func newTestModule(memory []byte) *Module {
+	m := &Module{
+		memory:  memory,
+		memMu:   &sync.Mutex{},
+		memSize: &atomic.Uint64{},
+		threads: &threadPool{},
+	}
+	m.memSize.Store(uint64(len(memory)))
+	return m
+}
+
 func TestMemoryGrowGeometric(t *testing.T) {
-	m := &Module{memory: make([]byte, 65536)} // 1 page
+	m := newTestModule(make([]byte, 65536)) // 1 page
 
 	reallocs := 0
 	prevCap := cap(m.memory)
@@ -41,7 +60,7 @@ func TestMemoryGrowGeometric(t *testing.T) {
 // TestMemoryGrowCorrectness checks the wasm semantics memoryGrow must
 // preserve regardless of the backing-array strategy.
 func TestMemoryGrowCorrectness(t *testing.T) {
-	m := &Module{memory: make([]byte, 65536)}
+	m := newTestModule(make([]byte, 65536))
 	m.memory[0] = 0xAB
 	m.memory[65535] = 0xCD
 
@@ -81,7 +100,8 @@ func TestMemoryGrowCorrectness(t *testing.T) {
 		t.Fatalf("n<0: %d, want -1", got)
 	}
 
-	lim := &Module{memory: make([]byte, 65536), maxMem: 2 * 65536}
+	lim := newTestModule(make([]byte, 65536))
+	lim.maxMem = 2 * 65536
 	if got := memoryGrow(lim, 5); got != -1 {
 		t.Fatalf("grow past maxMem: %d, want -1", got)
 	}
