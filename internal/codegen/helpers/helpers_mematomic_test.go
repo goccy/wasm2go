@@ -14,10 +14,10 @@ import (
 // unguarded against regression. These tests exercise each one against a
 // hand-built Module, exactly as generated New() sets one up.
 
-// newMemModuleM builds a Module whose M (the unsafe base pointer the memLoad/
-// memStore family dereferences) points at its memory, the way generated New()
-// initialises it. newTestModule alone leaves M nil, which the atomic helpers
-// tolerate (they index m.memory) but the mem-access helpers do not.
+// newMemModuleM builds a Module whose M (the unsafe base pointer the
+// mem-access and atomic helpers dereference) points at its memory, the way
+// generated New() initialises it. newTestModule alone leaves M nil, which
+// these helpers dereference through, so tests that touch memory must use this.
 func newMemModuleM(size int) *Module {
 	m := newTestModule(make([]byte, size))
 	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))

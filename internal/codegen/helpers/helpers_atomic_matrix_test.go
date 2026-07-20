@@ -67,13 +67,22 @@ func TestAtomicRmw32Matrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newMemModuleM(64)
-			seedLane(m, tc.bits, tc.old)
-			if old := int64(tc.fn(m, 0, 0, int32(tc.v))); old != tc.old {
-				t.Errorf("%s old = %d, want %d", tc.name, old, tc.old)
-			}
-			if got := readLane(m, tc.bits); got != tc.newLo {
-				t.Errorf("%s new = %d, want %d", tc.name, got, tc.newLo)
+			// Run both the uncontended (nextTID==0 → plain read-modify-write
+			// fast path) and contended (nextTID>0 → real atomic CAS path)
+			// branches; both must return the same old value and leave the
+			// same result behind.
+			for _, contended := range []bool{false, true} {
+				m := newMemModuleM(64)
+				if contended {
+					m.threads.nextTID.Store(1)
+				}
+				seedLane(m, tc.bits, tc.old)
+				if old := int64(tc.fn(m, 0, 0, int32(tc.v))); old != tc.old {
+					t.Errorf("%s[contended=%v] old = %d, want %d", tc.name, contended, old, tc.old)
+				}
+				if got := readLane(m, tc.bits); got != tc.newLo {
+					t.Errorf("%s[contended=%v] new = %d, want %d", tc.name, contended, got, tc.newLo)
+				}
 			}
 		})
 	}
@@ -115,13 +124,18 @@ func TestAtomicRmw64Matrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newMemModuleM(64)
-			seedLane(m, tc.bits, tc.old)
-			if old := tc.fn(m, 0, 0, tc.v); old != tc.old {
-				t.Errorf("%s old = %d, want %d", tc.name, old, tc.old)
-			}
-			if got := readLane(m, tc.bits); got != tc.newLo {
-				t.Errorf("%s new = %d, want %d", tc.name, got, tc.newLo)
+			for _, contended := range []bool{false, true} {
+				m := newMemModuleM(64)
+				if contended {
+					m.threads.nextTID.Store(1)
+				}
+				seedLane(m, tc.bits, tc.old)
+				if old := tc.fn(m, 0, 0, tc.v); old != tc.old {
+					t.Errorf("%s[contended=%v] old = %d, want %d", tc.name, contended, old, tc.old)
+				}
+				if got := readLane(m, tc.bits); got != tc.newLo {
+					t.Errorf("%s[contended=%v] new = %d, want %d", tc.name, contended, got, tc.newLo)
+				}
 			}
 		})
 	}
@@ -143,14 +157,19 @@ func TestAtomicCmpxchgMatrix(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				m := newMemModuleM(64)
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
-					t.Errorf("%s match: old %d new %d, want 42/99", tc.name, old, readLane(m, tc.bits))
-				}
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
-					t.Errorf("%s mismatch: old %d new %d, want 42/42", tc.name, old, readLane(m, tc.bits))
+				for _, contended := range []bool{false, true} {
+					m := newMemModuleM(64)
+					if contended {
+						m.threads.nextTID.Store(1)
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
+						t.Errorf("%s[contended=%v] match: old %d new %d, want 42/99", tc.name, contended, old, readLane(m, tc.bits))
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
+						t.Errorf("%s[contended=%v] mismatch: old %d new %d, want 42/42", tc.name, contended, old, readLane(m, tc.bits))
+					}
 				}
 			})
 		}
@@ -168,14 +187,19 @@ func TestAtomicCmpxchgMatrix(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				m := newMemModuleM(64)
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
-					t.Errorf("%s match: old %d new %d, want 42/99", tc.name, old, readLane(m, tc.bits))
-				}
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
-					t.Errorf("%s mismatch: old %d new %d, want 42/42", tc.name, old, readLane(m, tc.bits))
+				for _, contended := range []bool{false, true} {
+					m := newMemModuleM(64)
+					if contended {
+						m.threads.nextTID.Store(1)
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
+						t.Errorf("%s[contended=%v] match: old %d new %d, want 42/99", tc.name, contended, old, readLane(m, tc.bits))
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
+						t.Errorf("%s[contended=%v] mismatch: old %d new %d, want 42/42", tc.name, contended, old, readLane(m, tc.bits))
+					}
 				}
 			})
 		}
