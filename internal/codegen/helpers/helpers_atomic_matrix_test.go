@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"encoding/binary"
 	"runtime"
 	"testing"
 )
@@ -12,32 +13,32 @@ import (
 // links them — and gives them regression coverage.
 
 // seedLane writes val into the low `bits`-wide lane at offset 0 of a cleared
-// word, and readLane reads it back. Both go through the mem-access helpers, so
-// the atomic helpers under test are checked against an independent path.
+// word, and readLane reads it back. Both go straight through the memory slice
+// (little-endian), an independent path from the atomic helpers under test.
 func seedLane(m *Module, bits int, val int64) {
-	memStore64(m, 0, 0)
+	binary.LittleEndian.PutUint64(m.memory[0:8], 0)
 	switch bits {
 	case 8:
-		memStore8(m, 0, uint32(val))
+		m.memory[0] = byte(val)
 	case 16:
-		memStore16(m, 0, uint32(val))
+		binary.LittleEndian.PutUint16(m.memory[0:2], uint16(val))
 	case 32:
-		memStore32(m, 0, int32(val))
+		binary.LittleEndian.PutUint32(m.memory[0:4], uint32(val))
 	case 64:
-		memStore64(m, 0, val)
+		binary.LittleEndian.PutUint64(m.memory[0:8], uint64(val))
 	}
 }
 
 func readLane(m *Module, bits int) int64 {
 	switch bits {
 	case 8:
-		return int64(memLoad8(m, 0))
+		return int64(m.memory[0])
 	case 16:
-		return int64(memLoad16(m, 0))
+		return int64(binary.LittleEndian.Uint16(m.memory[0:2]))
 	case 32:
-		return int64(memLoad32U(m, 0))
+		return int64(binary.LittleEndian.Uint32(m.memory[0:4]))
 	default:
-		return memLoad64(m, 0)
+		return int64(binary.LittleEndian.Uint64(m.memory[0:8]))
 	}
 }
 
@@ -67,13 +68,22 @@ func TestAtomicRmw32Matrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newMemModuleM(64)
-			seedLane(m, tc.bits, tc.old)
-			if old := int64(tc.fn(m, 0, 0, int32(tc.v))); old != tc.old {
-				t.Errorf("%s old = %d, want %d", tc.name, old, tc.old)
-			}
-			if got := readLane(m, tc.bits); got != tc.newLo {
-				t.Errorf("%s new = %d, want %d", tc.name, got, tc.newLo)
+			// Run both the uncontended (nextTID==0 → plain read-modify-write
+			// fast path) and contended (nextTID>0 → real atomic CAS path)
+			// branches; both must return the same old value and leave the
+			// same result behind.
+			for _, contended := range []bool{false, true} {
+				m := newMemModuleM(64)
+				if contended {
+					m.threads.nextTID.Store(1)
+				}
+				seedLane(m, tc.bits, tc.old)
+				if old := int64(tc.fn(m, 0, 0, int32(tc.v))); old != tc.old {
+					t.Errorf("%s[contended=%v] old = %d, want %d", tc.name, contended, old, tc.old)
+				}
+				if got := readLane(m, tc.bits); got != tc.newLo {
+					t.Errorf("%s[contended=%v] new = %d, want %d", tc.name, contended, got, tc.newLo)
+				}
 			}
 		})
 	}
@@ -115,13 +125,18 @@ func TestAtomicRmw64Matrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := newMemModuleM(64)
-			seedLane(m, tc.bits, tc.old)
-			if old := tc.fn(m, 0, 0, tc.v); old != tc.old {
-				t.Errorf("%s old = %d, want %d", tc.name, old, tc.old)
-			}
-			if got := readLane(m, tc.bits); got != tc.newLo {
-				t.Errorf("%s new = %d, want %d", tc.name, got, tc.newLo)
+			for _, contended := range []bool{false, true} {
+				m := newMemModuleM(64)
+				if contended {
+					m.threads.nextTID.Store(1)
+				}
+				seedLane(m, tc.bits, tc.old)
+				if old := tc.fn(m, 0, 0, tc.v); old != tc.old {
+					t.Errorf("%s[contended=%v] old = %d, want %d", tc.name, contended, old, tc.old)
+				}
+				if got := readLane(m, tc.bits); got != tc.newLo {
+					t.Errorf("%s[contended=%v] new = %d, want %d", tc.name, contended, got, tc.newLo)
+				}
 			}
 		})
 	}
@@ -143,14 +158,19 @@ func TestAtomicCmpxchgMatrix(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				m := newMemModuleM(64)
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
-					t.Errorf("%s match: old %d new %d, want 42/99", tc.name, old, readLane(m, tc.bits))
-				}
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
-					t.Errorf("%s mismatch: old %d new %d, want 42/42", tc.name, old, readLane(m, tc.bits))
+				for _, contended := range []bool{false, true} {
+					m := newMemModuleM(64)
+					if contended {
+						m.threads.nextTID.Store(1)
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
+						t.Errorf("%s[contended=%v] match: old %d new %d, want 42/99", tc.name, contended, old, readLane(m, tc.bits))
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
+						t.Errorf("%s[contended=%v] mismatch: old %d new %d, want 42/42", tc.name, contended, old, readLane(m, tc.bits))
+					}
 				}
 			})
 		}
@@ -168,14 +188,19 @@ func TestAtomicCmpxchgMatrix(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				m := newMemModuleM(64)
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
-					t.Errorf("%s match: old %d new %d, want 42/99", tc.name, old, readLane(m, tc.bits))
-				}
-				seedLane(m, tc.bits, 42)
-				if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
-					t.Errorf("%s mismatch: old %d new %d, want 42/42", tc.name, old, readLane(m, tc.bits))
+				for _, contended := range []bool{false, true} {
+					m := newMemModuleM(64)
+					if contended {
+						m.threads.nextTID.Store(1)
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 42, 99); old != 42 || readLane(m, tc.bits) != 99 {
+						t.Errorf("%s[contended=%v] match: old %d new %d, want 42/99", tc.name, contended, old, readLane(m, tc.bits))
+					}
+					seedLane(m, tc.bits, 42)
+					if old := tc.fn(m, 0, 0, 7, 99); old != 42 || readLane(m, tc.bits) != 42 {
+						t.Errorf("%s[contended=%v] mismatch: old %d new %d, want 42/42", tc.name, contended, old, readLane(m, tc.bits))
+					}
 				}
 			})
 		}

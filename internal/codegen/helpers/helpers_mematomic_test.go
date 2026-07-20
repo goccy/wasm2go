@@ -1,7 +1,7 @@
 package helpers
 
 import (
-	"math"
+	"encoding/binary"
 	"sync"
 	"testing"
 	"unsafe"
@@ -14,73 +14,14 @@ import (
 // unguarded against regression. These tests exercise each one against a
 // hand-built Module, exactly as generated New() sets one up.
 
-// newMemModuleM builds a Module whose M (the unsafe base pointer the memLoad/
-// memStore family dereferences) points at its memory, the way generated New()
-// initialises it. newTestModule alone leaves M nil, which the atomic helpers
-// tolerate (they index m.memory) but the mem-access helpers do not.
+// newMemModuleM builds a Module whose M (the unsafe base pointer the
+// mem-access and atomic helpers dereference) points at its memory, the way
+// generated New() initialises it. newTestModule alone leaves M nil, which
+// these helpers dereference through, so tests that touch memory must use this.
 func newMemModuleM(size int) *Module {
 	m := newTestModule(make([]byte, size))
 	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
 	return m
-}
-
-func TestMemLoadStoreRoundTrip(t *testing.T) {
-	m := newMemModuleM(64)
-
-	// 8-bit: store the byte, read it zero- and sign-extended.
-	memStore8(m, 0, 0xFF)
-	if got := memLoad8(m, 0); got != 0xFF {
-		t.Errorf("memLoad8 = %#x, want 0xFF", got)
-	}
-	if got := memLoad8S(m, 0); got != -1 {
-		t.Errorf("memLoad8S(0xFF) = %d, want -1", got)
-	}
-
-	// 16-bit: little-endian byte order, then zero/sign extension.
-	memStore16(m, 4, 0x1234)
-	if memLoad8(m, 4) != 0x34 || memLoad8(m, 5) != 0x12 {
-		t.Errorf("memStore16 is not little-endian: [%#x %#x]", memLoad8(m, 4), memLoad8(m, 5))
-	}
-	if got := memLoad16(m, 4); got != 0x1234 {
-		t.Errorf("memLoad16 = %#x, want 0x1234", got)
-	}
-	memStore16(m, 6, 0xFFFF)
-	if got := memLoad16S(m, 6); got != -1 {
-		t.Errorf("memLoad16S(0xFFFF) = %d, want -1", got)
-	}
-
-	// 32-bit signed / unsigned.
-	memStore32(m, 8, -2)
-	if got := memLoad32(m, 8); got != -2 {
-		t.Errorf("memLoad32 = %d, want -2", got)
-	}
-	if got := memLoad32U(m, 8); got != 0xFFFFFFFE {
-		t.Errorf("memLoad32U = %#x, want 0xFFFFFFFE", got)
-	}
-	memStore32U(m, 12, 0xDEADBEEF)
-	if got := memLoad32U(m, 12); got != 0xDEADBEEF {
-		t.Errorf("memStore32U/memLoad32U = %#x, want 0xDEADBEEF", got)
-	}
-
-	// 64-bit.
-	memStore64(m, 16, -3)
-	if got := memLoad64(m, 16); got != -3 {
-		t.Errorf("memLoad64 = %d, want -3", got)
-	}
-
-	// Floats: value round-trip and exact bit pattern (little-endian).
-	memStoreF32(m, 24, 3.5)
-	if got := memLoadF32(m, 24); got != 3.5 {
-		t.Errorf("memLoadF32 = %v, want 3.5", got)
-	}
-	memStoreF64(m, 32, 2.5)
-	if got := memLoadF64(m, 32); got != 2.5 {
-		t.Errorf("memLoadF64 = %v, want 2.5", got)
-	}
-	memStoreF32(m, 40, math.Float32frombits(0x40490FDB)) // ~pi
-	if got := memLoad32U(m, 40); got != 0x40490FDB {
-		t.Errorf("memStoreF32 bit pattern = %#x, want 0x40490FDB", got)
-	}
 }
 
 func TestMemoryInitAndDataDrop(t *testing.T) {
@@ -206,7 +147,7 @@ func TestThreadSpawnRunsThreadStart(t *testing.T) {
 		mu.Unlock()
 		// The agent runs on a struct COPY that shares the memory: a write here
 		// must be visible through the parent Module.
-		memStore32(child, 0, arg*2)
+		binary.LittleEndian.PutUint32(child.memory[0:4], uint32(arg*2))
 	}
 
 	tid := threadSpawn(m, 21)
@@ -220,7 +161,7 @@ func TestThreadSpawnRunsThreadStart(t *testing.T) {
 	if gotTID != 1 || gotArg != 21 {
 		t.Errorf("threadStart saw tid=%d arg=%d, want 1/21", gotTID, gotArg)
 	}
-	if got := memLoad32(m, 0); got != 42 {
+	if got := int32(binary.LittleEndian.Uint32(m.memory[0:4])); got != 42 {
 		t.Errorf("agent's write not visible through shared memory: %d, want 42", got)
 	}
 

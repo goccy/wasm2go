@@ -74,7 +74,7 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// Shared memories route plain accesses through module-aware helpers
 	// (no raw base pointer at the access site), so hoisting mBase would
 	// only leave an unused local behind.
-	em.memBaseHoisted = funcTouchesMemory(f) && (em.t == nil || !em.t.memIsShared())
+	em.memBaseHoisted = funcTouchesMemory(f)
 
 	// EH in multi-package output: the wasmExc type + wasm_catch helper live in
 	// the base package (exported as WasmExc / Wasm_catch); the generated body

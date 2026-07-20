@@ -24,7 +24,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/goccy/wasm2go/internal/codegen"
 	"github.com/goccy/wasm2go/internal/gcasm"
@@ -103,61 +102,7 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	if _, err := w.Write(mainBuf.Bytes()); err != nil {
 		return res, err
 	}
-
-	// Weave a `purego` escape into every generated build constraint so the
-	// pure-Go fallback can be selected on ANY GOARCH with `-tags purego`.
-	// This is a no-op for normal builds (purego is off by default, so the
-	// constraints behave exactly as before) and exists so the asm path can be
-	// differentially compared against / bisected for codegen bugs.
-	addPuregoBuildTagEscape(res.Files)
 	return res, nil
-}
-
-// addPuregoBuildTagEscape rewrites the leading //go:build constraint of every
-// generated file so that:
-//   - the pure-Go fallback ("!amd64 && !arm64") additionally activates under
-//     the `purego` tag: "(!amd64 && !arm64) || purego"
-//   - every asm-side constraint (e.g. "amd64", "arm64", "amd64 || arm64")
-//     additionally deactivates under `purego`: "(<expr>) && !purego"
-//
-// With `purego` unset (the default) these are semantically identical to the
-// originals; with `-tags purego` the pure path replaces the asm path.
-func addPuregoBuildTagEscape(files map[string][]byte) {
-	for name, content := range files {
-		files[name] = rewriteLeadingBuildConstraint(content)
-	}
-}
-
-func rewriteLeadingBuildConstraint(src []byte) []byte {
-	lines := bytes.Split(src, []byte("\n"))
-	for i, ln := range lines {
-		t := strings.TrimSpace(string(ln))
-		if t == "" || strings.HasPrefix(t, "//") {
-			if !strings.HasPrefix(t, "//go:build ") {
-				continue // blank or non-build comment: keep scanning the header
-			}
-		} else {
-			break // reached a non-comment line; constraints must precede it
-		}
-		expr := strings.TrimSpace(strings.TrimPrefix(t, "//go:build "))
-		if strings.Contains(expr, "purego") {
-			return src // already escaped
-		}
-		var ne string
-		switch expr {
-		case "!amd64 && !arm64":
-			ne = "(!amd64 && !arm64) || purego"
-		case "!amd64":
-			// gcasm-mode pure guard: pure serves every non-amd64
-			// GOARCH, plus amd64 under -tags purego.
-			ne = "!amd64 || purego"
-		default:
-			ne = "(" + expr + ") && !purego"
-		}
-		lines[i] = []byte("//go:build " + ne)
-		return bytes.Join(lines, []byte("\n"))
-	}
-	return src
 }
 
 // Transpile is the one-shot convenience wrapper that runs Parse followed

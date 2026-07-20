@@ -1511,13 +1511,6 @@ type blobSpan struct {
 	length int
 }
 
-// memIsShared reports whether memory 0 is a threads-proposal SHARED memory.
-// Plain loads/stores against a shared memory are emitted through noinline
-// helpers so cross-agent coherence survives the Go compiler.
-func (t *translator) memIsShared() bool {
-	return len(t.mod.Memories) > 0 && t.mod.Memories[0].Limits.Shared
-}
-
 // hasPassiveData reports whether the module carries passive data segments
 // (LLVM's shared-memory output always does).
 func (t *translator) hasPassiveData() bool {

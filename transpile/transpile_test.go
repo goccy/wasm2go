@@ -119,7 +119,7 @@ func realAddWasm() []byte {
 // the gcasm-emitted asm supplies the function bodies (the pure bodies are
 // dormant), so a successful `go run` exercises the real shipped path end
 // to end: codegen.Translate, gcasm.Build (capture + transform + emit),
-// the purego build-tag weaving, and the assembled output itself.
+// and the assembled output itself.
 func TestTranspileEndToEnd(t *testing.T) {
 	m, err := transpile.Parse(bytes.NewReader(realAddWasm()))
 	if err != nil {
@@ -228,9 +228,9 @@ func main() {
 }
 `))
 
-	// Run both the default (gcasm, EH functions fall back to pure) and the
-	// -tags purego build; both must catch the thrown 42.
-	for _, tags := range [][]string{nil, {"-tags", "purego"}} {
+	// Run the default (gcasm, EH functions fall back to pure) build; it must
+	// catch the thrown 42.
+	for _, tags := range [][]string{nil} {
 		args := append([]string{"run"}, tags...)
 		args = append(args, ".")
 		cmd := exec.Command("go", args...)
@@ -296,9 +296,9 @@ func main() {
 }
 `))
 
-	// gcasm default (EH functions fall back to pure) and -tags purego; both
-	// must yield the delegated operand, 42.
-	for _, tags := range [][]string{nil, {"-tags", "purego"}} {
+	// gcasm default (EH functions fall back to pure) must yield the
+	// delegated operand, 42.
+	for _, tags := range [][]string{nil} {
 		args := append([]string{"run"}, tags...)
 		args = append(args, ".")
 		cmd := exec.Command("go", args...)
@@ -695,7 +695,7 @@ func main() {
 }
 `))
 
-	for _, tags := range [][]string{nil, {"-tags", "purego"}} {
+	for _, tags := range [][]string{nil} {
 		args := append([]string{"run"}, tags...)
 		args = append(args, ".")
 		cmd := exec.Command("go", args...)
