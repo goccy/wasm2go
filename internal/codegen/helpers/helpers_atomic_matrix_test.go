@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"encoding/binary"
 	"runtime"
 	"testing"
 )
@@ -12,32 +13,32 @@ import (
 // links them — and gives them regression coverage.
 
 // seedLane writes val into the low `bits`-wide lane at offset 0 of a cleared
-// word, and readLane reads it back. Both go through the mem-access helpers, so
-// the atomic helpers under test are checked against an independent path.
+// word, and readLane reads it back. Both go straight through the memory slice
+// (little-endian), an independent path from the atomic helpers under test.
 func seedLane(m *Module, bits int, val int64) {
-	memStore64(m, 0, 0)
+	binary.LittleEndian.PutUint64(m.memory[0:8], 0)
 	switch bits {
 	case 8:
-		memStore8(m, 0, uint32(val))
+		m.memory[0] = byte(val)
 	case 16:
-		memStore16(m, 0, uint32(val))
+		binary.LittleEndian.PutUint16(m.memory[0:2], uint16(val))
 	case 32:
-		memStore32(m, 0, int32(val))
+		binary.LittleEndian.PutUint32(m.memory[0:4], uint32(val))
 	case 64:
-		memStore64(m, 0, val)
+		binary.LittleEndian.PutUint64(m.memory[0:8], uint64(val))
 	}
 }
 
 func readLane(m *Module, bits int) int64 {
 	switch bits {
 	case 8:
-		return int64(memLoad8(m, 0))
+		return int64(m.memory[0])
 	case 16:
-		return int64(memLoad16(m, 0))
+		return int64(binary.LittleEndian.Uint16(m.memory[0:2]))
 	case 32:
-		return int64(memLoad32U(m, 0))
+		return int64(binary.LittleEndian.Uint32(m.memory[0:4]))
 	default:
-		return memLoad64(m, 0)
+		return int64(binary.LittleEndian.Uint64(m.memory[0:8]))
 	}
 }
 
