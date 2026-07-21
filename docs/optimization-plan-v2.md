@@ -3,6 +3,72 @@
 （v1 = `docs/ssa-memopt-plan.md`。v1 の「Cranelift ミッドエンド移植」という前提は
 今回の実測で否定された。本 v2 がそれを置き換える。）
 
+---
+## ★ 引き継ぎメモ（2026-07-21 時点。次の担当者はここから読む）
+
+**ブランチ**: `feat/ssa-memopt-licm-gvn`（origin に push 済み）。
+
+**コミット済み（d4b6ca3）**: memopt(Phase A) + PureOnly(`-pure`) + 1e(eqz融合) +
+1b(リーフインライナ) + gcasm 2修正(ssaConstBase / jump-table フラグ replay)。
+全コンシューマ検証済み（wasm2go 9pkg / go-python / go-spidermonkey +race /
+googlesqlite 35pkg、すべて exit 0）。ベンチ: **spidermonkey cpubench gcasm
+−12.9%(≈−14%)、pure −5.3%。wasmtime ギャップ 1.91× → ~1.66×。** これが確定成果。
+
+**depth-2 インライン: 試行 → REVERT 済み（tree は committed d4b6ca3 と一致）。**
+bounded depth-2（非リーフ callee も深さ上限2 + サイクルガード + サイズ上限で splice、
+callee のコールは depth+1 で再帰）を実装し wasm2go 9pkg green・e2e(TestInlineDepth2)
+PASS まで到達したが、**spidermonkey 生成で新しい arm64 リテラルプールエラーを露出**して
+revert した（理由は下記 follow-up バグ + 予想 ROI の低さ）。判断根拠:
+  - **予想 ROI ≤1-2%**: 1b 後の pprof で残りホット時間の ~80% は
+    Fn1083(53712行,61.5%flat)/Fn2121(3865行,9.5%)/Fn1098(1453行,5.8%)/
+    Fn1467(1702行,4.6%) の4巨大関数の**自身処理**で、すべてサイズ上限超でインライン不可。
+    小非リーフ(Fn3504 237行/Fn3505 568行、≈計3.6%flat)だけが候補。さらに Fn1083 に
+    折り込むと gc regalloc 悪化で**ネット negative**のリスク。
+  - **露出した follow-up バグ(下記)の堅牢修正が emit の非自明改修を要する。**
+depth-2 を再挑戦するなら、まず下記バグを直し、A/B（baseline=`/tmp/cpu_gcasm_fix.test`
+の leaf-only、5ペア交互）で中立/negative でないことを確認してから。中立なら leaf-only
+を最終形に据える。
+
+### FOLLOW-UP バグ: 大定数アドレス加数が arm64 リテラルプールを溢れさせる（潜在・要修正）
+
+depth-2 が露出させたが **leaf-only や非インラインコードでも理論上起こりうる潜在バグ**。
+症状: `p3_pure.go: LDPSW 27325896(R2): constant is not in pool`（arm64 capture の
+go build 失敗）。原因: メモリアクセスのベースが `OpAdd32(runtimeX, OpConst32[大])`
+の形のとき、`emit_memops.go` の `memOffsetExpr` は `constInt32(baseExpr)` も
+`ssaConstBase(baseVal)`（純粋定数ベースのみ検出）も外し、runtime パスで
+`uint32(baseExpr)` をそのまま出す → baseExpr 内に `int32(27325896)` が加数として残り、
+gc がアドレッシング即値に折り込む。`_consts` テーブル routing は AuxInt オフセットと
+純粋定数ベースしかカバーせず、**「runtime + 大定数」ベースを取りこぼす**。
+修正案: `ssaConstBase` を「ベースを (runtimeVal, 大定数加数) に分解」するヘルパに拡張し、
+大定数加数があれば `uint32(emit(runtimeVal)) + uint32(_consts[加数+offset])` を出す。
+ただし memOffsetExpr は emitExpr を持たないので、emitMemLoadExpr/emitMemStoreStmt 側で
+runtime 部を別途 emit して渡す必要がある（非自明）。回帰テスト用 fixture:
+「定数アドレス + ランタイム index」で 27MB 級の加数を作る形。
+**注意: committed の leaf-only はこのバグを踏んでいない（全コンシューマ green）が、
+入力次第で踏みうる。優先度は中（アセンブラ失敗＝ビルド不能なので踏めば即分かる）。**
+
+**depth-2 が空振りの場合の次の方向**（残りギャップは gc コード生成品質＝構造的天井）:
+  - (a) gcasm ABI0 マーシャリング/`gcasmFwd` トランポリンの削減。ホット callee を
+    Fn1083 と**同一チャンク**に配置すればクロスチャンク forwarder が消える(チャンク
+    レイアウト最適化、インラインより低リスク)。
+  - (b) Fn1083 の emit 形改善で gc の regalloc を助ける（P1 の mBase hoist 型。ただし
+    P1 は実施済み。call 後の mBase refresh を「grow 不能な callee では省略」できるか
+    ＝ HelperIsInline の一般化）。高難度・不確実。
+  - (c) −14% を最終形として受容し、backend 追求を打ち切る判断。
+
+**検証規律(厳守)**: コード生成変更のたびに wasmify 正規パイプラインで A/B。直接
+`wasm2go` CLI 生成は**ホスト import を持つモジュールでは無効**（bridge を欠く。import
+無しマイクロベンチのみ CLI 可）。googlesqlite はメモリ/regalloc 系変更の必須バリデータ、
+go-spidermonkey は共有メモリ`-race`必須。ディスク注意: gcasm capture は数GB必要。
+go-build キャッシュが肥大化(186GB になっていた)したら `go clean -cache`、
+`/tmp` の debug バンドルも随時削除。
+
+**保存済み資産**: `/tmp/cpu_{gcasm,pure}_{1e,fix}.test`(A/B baseline)、
+`/tmp/sm_fix_pure/bundle`(committed inline+fix の pure ソース、コール解析用)。
+bench-metrics.md に全数値、本ファイルに設計。**注意: docs/consumer-verification.md と
+docs/pure-vs-asm-benchmarks.md は意図的 untracked のローカル文書 — コミットしないこと。**
+---
+
 ## 0. v1 で確定した事実（再計画の出発点）
 
 Phase A（ブロック内 RLE + store-to-load forwarding、Cranelift の
