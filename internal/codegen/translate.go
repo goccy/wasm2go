@@ -134,6 +134,16 @@ type Options struct {
 	// promotion report (JSON: per-function frame/rodata/slab
 	// classification) to this path.
 	PromotionReportPath string
+	// PureOnly emits the pure-Go backend only: function bodies are
+	// written without the `!amd64 && !arm64` build gate (so they compile
+	// on every GOARCH) and the caller (transpile.Translate) skips the
+	// gcasm asm bundle entirely. The result is ABIInternal everywhere —
+	// slower to compile / heavier on tooling for large modules, but the
+	// reference backend for benchmarking codegen quality without the
+	// gcasm ABI0 marshalling. Subprocess invocations (e.g. the wasmify
+	// protoc plugin) can enable it through the WASM2GO_PURE environment
+	// variable.
+	PureOnly bool
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.
@@ -173,6 +183,14 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	}
 	if opts.OutputImportPath == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.OutputImportPath is required")
+	}
+	// WASM2GO_PURE is the subprocess-reachable form of Options.PureOnly
+	// (same pattern as WASM2GO_MULTIPACKAGE_THRESHOLD): the wasmify
+	// protoc plugin cannot thread new CLI options through buf.gen.yaml,
+	// so the env var lets a benchmarking run flip the backend without a
+	// wasmify change.
+	if os.Getenv("WASM2GO_PURE") != "" {
+		opts.PureOnly = true
 	}
 
 	// Auto-derive the multi-package decision from the total wasm
@@ -555,7 +573,7 @@ func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
 // into Result.Files. On asm-target GOARCHs the pure file is dormant
 // and the asm bodies in `<pkg>/amd64.s` (and arm64.s) take over.
 func finalizeSinglePkgWithAsm(m *wasm.Module, opts Options, w io.Writer, goSrc []byte, sidecars map[string][]byte, auxFiles map[string][]byte) (Result, error) {
-	shared, fallback, err := splitForAsm(goSrc, opts.Package)
+	shared, fallback, err := splitForAsm(goSrc, opts.Package, pureFallbackTag(opts))
 	if err != nil {
 		return Result{}, fmt.Errorf("asm-bundle split: %w", err)
 	}
@@ -573,6 +591,16 @@ func finalizeSinglePkgWithAsm(m *wasm.Module, opts Options, w io.Writer, goSrc [
 		Sidecars: sidecars,
 		AuxFiles: auxFiles,
 	}, nil
+}
+
+// pureFallbackTag returns the `//go:build` directive for the pure
+// function-body files: the asm-dormancy gate normally, empty (compile
+// everywhere) in PureOnly mode where no asm bundle will exist.
+func pureFallbackTag(opts Options) string {
+	if opts.PureOnly {
+		return ""
+	}
+	return "//go:build !amd64 && !arm64"
 }
 
 // emitSidecarDecls returns //go:embed var decls for each registered sidecar.
@@ -2434,6 +2462,24 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 //
 // then Compact sweeps the values marked dead. The before/after live-
 // value counts feed the optimization metrics.
+// memoryIsShared reports whether this module's linear memory is declared
+// shared (threads proposal, limits flag 0x02) — as a defined memory or an
+// imported one. Memory-optimization passes that assume single-writer
+// semantics must be skipped for such modules.
+func (t *translator) memoryIsShared() bool {
+	for _, m := range t.mod.Memories {
+		if m.Limits.Shared {
+			return true
+		}
+	}
+	for _, imp := range t.mod.Imports {
+		if imp.Kind == wasm.ImportMemory && imp.Memory.Limits.Shared {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.BlockStmt, error) {
 	_ = fn // body bytes live on the *wasm.Module; kept for API symmetry.
 	ssaFn, err := lower.LowerFunction(t.mod, funcIdx, t.funcName(funcIdx))
@@ -2446,12 +2492,28 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// escape hatch for bisecting a suspected pass miscompile; not a
 	// supported build mode.
 	passesOff := map[string]bool{}
+	// MemOpt (redundant-load elimination + store-to-load forwarding) is
+	// UNSOUND on a shared linear memory: it assumes this agent is the only
+	// writer between two accesses, but the threads proposal lets another
+	// agent store to the same address at any point. wasm2go's non-atomic
+	// loads deliberately re-read memory on every access so a peer's store
+	// stays visible (see emitMemLoadExpr); eliding or forwarding a load
+	// would drop that read. Disable the pass whole-module when the memory
+	// is shared. (Atomic ops are OpAtomicCall — MemOpt already treats them
+	// as barriers and never touches them.)
+	//
+	// WASM2GO_MEMOPT_ON_SHARED forces MemOpt to run even on a shared memory
+	// — a diagnostic escape used only to reproduce the unsoundness (it
+	// generates KNOWINGLY-BROKEN code); never a supported build mode.
+	if t.memoryIsShared() && os.Getenv("WASM2GO_MEMOPT_ON_SHARED") == "" {
+		passesOff["memopt"] = true
+	}
 	if env := os.Getenv("WASM2GO_SSA_PASSES_OFF"); env != "" {
 		for _, p := range strings.Split(env, ",") {
 			passesOff[strings.TrimSpace(strings.ToLower(p))] = true
 		}
 		if passesOff["all"] {
-			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "dce"} {
+			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "memopt", "dce"} {
 				passesOff[p] = true
 			}
 		}
@@ -2470,6 +2532,9 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 			changed = true
 		}
 		if !passesOff["cse"] && pass.CSE(ssaFn) {
+			changed = true
+		}
+		if !passesOff["memopt"] && pass.MemOpt(ssaFn) {
 			changed = true
 		}
 		if !passesOff["dce"] && pass.DCE(ssaFn) {

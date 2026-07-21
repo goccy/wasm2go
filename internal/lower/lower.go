@@ -122,6 +122,8 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 		localTypes:    localTypes,
 		incoming:      map[*ssa.Block][]incomingEdge{},
 		mutableLocals: mutableLocals,
+		inlineInfo:    analyzeModuleForInline(mod),
+		callerIdx:     funcIdx,
 	}
 
 	r := wasm.NewInstrReader(fn.Body)
@@ -208,6 +210,16 @@ type lowerState struct {
 	// OpLocalSet (mutable Go vars) instead of SSA values, and locals are
 	// not threaded through block phis.
 	mutableLocals bool
+
+	// inlineInfo is the module-wide summary the wasm-level inliner
+	// consults (see inline.go); inlineFrames tracks in-progress inline
+	// expansions (`return` inside one branches to its frame instead of
+	// sealing a BlockRet); inlinedBytes is the per-caller growth budget
+	// spent so far.
+	inlineInfo   *inlineAnalysis
+	inlineFrames []inlineFrame
+	inlinedBytes int
+	callerIdx    uint32 // absolute funcIdx of the function being lowered
 }
 
 // ctrlFrame is one entry on the wasm control stack.
@@ -281,6 +293,16 @@ type incomingEdge struct {
 
 // lowerBody walks the wasm bytecode r and emits SSA into ls.b.
 func (ls *lowerState) lowerBody(r *wasm.InstrReader) error {
+	return ls.lowerBodyUntil(r, -1)
+}
+
+// lowerBodyUntil is lowerBody parametrised for inline expansion:
+// baseCtrl < 0 is the top-level function body (terminates when the
+// function-level End fires); baseCtrl >= 0 lowers an inlined callee
+// body, terminating as soon as an `end` pops the control stack back
+// down to baseCtrl (the callee's implicit function-level end popping
+// the inline frame pushed by lowerInlineCall).
+func (ls *lowerState) lowerBodyUntil(r *wasm.InstrReader, baseCtrl int) error {
 	// depth tracks the open structured-control nesting. The function
 	// body itself is depth 0; the implicit function-level End terminates
 	// at depth 0.
@@ -342,6 +364,11 @@ func (ls *lowerState) lowerBody(r *wasm.InstrReader) error {
 				if done {
 					return nil
 				}
+				if baseCtrl >= 0 && len(ls.ctrl) == baseCtrl {
+					// Inline body finished: its function-level end
+					// popped the inline frame.
+					return nil
+				}
 			default:
 				if err := r.SkipImmediates(op); err != nil {
 					return fmt.Errorf("%w: skipping unreachable opcode 0x%02x: %w", ErrSSAUnsupported, op, err)
@@ -357,6 +384,11 @@ func (ls *lowerState) lowerBody(r *wasm.InstrReader) error {
 				return err
 			}
 			if done {
+				return nil
+			}
+			if baseCtrl >= 0 && len(ls.ctrl) == baseCtrl {
+				// Inline body finished (see the unreachable-path twin
+				// above).
 				return nil
 			}
 			continue
@@ -572,6 +604,25 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		}
 		spec := helperBinarySpec(op)
 		ls.push(ls.b.NewValueAux(ssa.OpHelperCall, spec.resType, spec.helper, lhs, rhs))
+		return nil
+	case op == wasm.OpI32Eqz || op == wasm.OpI64Eqz:
+		// eqz is a first-class comparison against zero, not a helper
+		// call: OpEq{32,64}(x, 0) with a TypeBool result. This lets a
+		// branch on the result fuse into a direct Go comparison
+		// (`x == 0`) via emitBoolCond instead of the historical
+		// `I32_eqz(x) != 0` helper round-trip — measured at ~10% of
+		// the SpiderMonkey interpreter's hot loop — and enrolls eqz
+		// in ConstProp/CSE like every other comparison. Value uses
+		// render as b2i32(x == 0), matching wasm's i32 0/1 result.
+		x, err := ls.pop()
+		if err != nil {
+			return err
+		}
+		if op == wasm.OpI32Eqz {
+			ls.push(ls.b.NewValue(ssa.OpEq32, ssa.TypeBool, x, ls.b.Const32(0)))
+		} else {
+			ls.push(ls.b.NewValue(ssa.OpEq64, ssa.TypeBool, x, ls.b.Const64(0)))
+		}
 		return nil
 	case isHelperUnary(op):
 		x, err := ls.pop()
@@ -1374,6 +1425,11 @@ func (ls *lowerState) tagOperandParams(tagIdx uint32) ([]wasm.ValType, error) {
 }
 
 func (ls *lowerState) handleReturn() error {
+	// Inside an inlined callee body, `return` is a branch to the inline
+	// frame's join block, not a caller return.
+	if len(ls.inlineFrames) > 0 {
+		return ls.returnAsInlineBr()
+	}
 	nRes := len(ls.ft.Results)
 	if len(ls.stack) < nRes {
 		return fmt.Errorf("return with %d stack values, expected %d", len(ls.stack), nRes)
@@ -1511,6 +1567,12 @@ func (ls *lowerState) handleCall(r *wasm.InstrReader) error {
 	ft := ls.mod.FuncTypeOf(funcIdx)
 	if len(ft.Results) > 1 {
 		return fmt.Errorf("%w: multi-result call (%d results)", ErrSSAUnsupported, len(ft.Results))
+	}
+	// Small leaf callees are spliced in instead of called (see
+	// inline.go): the call — and on gcasm its ABI0 marshalling and any
+	// cross-chunk forwarder — disappears entirely.
+	if ls.shouldInline(funcIdx, ft) {
+		return ls.lowerInlineCall(funcIdx, ft)
 	}
 	// Pop args from stack in reverse order.
 	if len(ls.stack) < len(ft.Params) {
@@ -2404,8 +2466,10 @@ func helperBinarySpec(op byte) helperBinary {
 
 func isHelperUnary(op byte) bool {
 	switch op {
-	case wasm.OpI32Eqz, wasm.OpI64Eqz,
-		wasm.OpI32Clz, wasm.OpI32Ctz, wasm.OpI32Popcnt,
+	// i32.eqz / i64.eqz are NOT here: they lower to first-class
+	// OpEq{32,64}-against-zero comparisons (see the dedicated case in
+	// lowerOp) so branches on them fuse instead of calling a helper.
+	case wasm.OpI32Clz, wasm.OpI32Ctz, wasm.OpI32Popcnt,
 		wasm.OpI64Clz, wasm.OpI64Ctz, wasm.OpI64Popcnt,
 		wasm.OpF32Abs, wasm.OpF32Neg, wasm.OpF32Ceil, wasm.OpF32Floor, wasm.OpF32Trunc, wasm.OpF32Nearest, wasm.OpF32Sqrt,
 		wasm.OpF64Abs, wasm.OpF64Neg, wasm.OpF64Ceil, wasm.OpF64Floor, wasm.OpF64Trunc, wasm.OpF64Nearest, wasm.OpF64Sqrt,
@@ -2427,10 +2491,6 @@ func isHelperUnary(op byte) bool {
 
 func helperUnarySpec(op byte) helperUnary {
 	switch op {
-	case wasm.OpI32Eqz:
-		return helperUnary{"i32_eqz", ssa.TypeI32}
-	case wasm.OpI64Eqz:
-		return helperUnary{"i64_eqz", ssa.TypeI32}
 	case wasm.OpI32Clz:
 		return helperUnary{"i32_clz", ssa.TypeI32}
 	case wasm.OpI32Ctz:

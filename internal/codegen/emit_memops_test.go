@@ -330,7 +330,7 @@ func constArgExpr(v *ssa.Value) ast.Expr {
 func TestMemOffsetExpr_RuntimeBaseLargeOffset(t *testing.T) {
 	em := newSSAEmitter(&translator{})
 
-	large := formatExpr(t, em.memOffsetExpr(newID("v160"), 33571920))
+	large := formatExpr(t, em.memOffsetExpr(newID("v160"), 33571920, nil))
 	if !strings.Contains(large, "_consts[") {
 		t.Errorf("large runtime-base offset must route through _consts, got: %s", large)
 	}
@@ -338,7 +338,7 @@ func TestMemOffsetExpr_RuntimeBaseLargeOffset(t *testing.T) {
 		t.Errorf("large offset must not appear as a bare immediate, got: %s", large)
 	}
 
-	small := formatExpr(t, em.memOffsetExpr(newID("v160"), 8))
+	small := formatExpr(t, em.memOffsetExpr(newID("v160"), 8, nil))
 	if strings.Contains(small, "_consts") {
 		t.Errorf("small runtime-base offset must stay inline, got: %s", small)
 	}

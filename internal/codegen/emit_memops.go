@@ -76,7 +76,7 @@ func (em *ssaEmitter) emitMemLoadExpr(v *ssa.Value, emitExpr func(*ssa.Value) (a
 	// module, shared or not. wasm gives non-atomic accesses hardware-like
 	// coherence and the CPU keeps another agent's stores visible; only the
 	// explicit atomic ops (lowered to OpAtomicCall helpers) need ordering.
-	expr := em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt))
+	expr := em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt), v.Args[0])
 	if spec.outerCast != "" {
 		expr = &ast.CallExpr{Fun: newID(spec.outerCast), Args: []ast.Expr{expr}}
 	}
@@ -109,7 +109,7 @@ func (em *ssaEmitter) emitMemStoreStmt(v *ssa.Value, emitExpr func(*ssa.Value) (
 	if err != nil {
 		return nil, err
 	}
-	dst := em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt))
+	dst := em.unsafeDerefExpr(spec, baseExpr, uint64(v.AuxInt), v.Args[0])
 	rhs := valExpr
 	if spec.elemType != spec.valSrcType {
 		rhs = &ast.CallExpr{Fun: newID(spec.elemType), Args: []ast.Expr{valExpr}}
@@ -145,11 +145,11 @@ func (em *ssaEmitter) emitMemStoreStmt(v *ssa.Value, emitExpr func(*ssa.Value) (
 //
 // Registers "unsafe" with the translator so the generated file picks
 // up the import.
-func (em *ssaEmitter) unsafeDerefExpr(spec memOpSpec, baseExpr ast.Expr, offset uint64) ast.Expr {
+func (em *ssaEmitter) unsafeDerefExpr(spec memOpSpec, baseExpr ast.Expr, offset uint64, baseVal *ssa.Value) ast.Expr {
 	em.useImport("unsafe")
 	added := &ast.CallExpr{
 		Fun:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Add")},
-		Args: []ast.Expr{em.memBasePtrExpr(), em.memOffsetExpr(baseExpr, offset)},
+		Args: []ast.Expr{em.memBasePtrExpr(), em.memOffsetExpr(baseExpr, offset, baseVal)},
 	}
 	castFn := &ast.ParenExpr{X: &ast.StarExpr{X: newID(spec.elemType)}}
 	cast := &ast.CallExpr{Fun: castFn, Args: []ast.Expr{added}}
@@ -190,8 +190,23 @@ func (em *ssaEmitter) memBasePtrExpr() ast.Expr {
 //     already hold the full uintptr bit pattern).
 //   - Runtime int32 baseExprs are wrapped in uint32(...) for the same
 //     zero-extension guarantee.
-func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64) ast.Expr {
+func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *ssa.Value) ast.Expr {
 	n, ok := constInt32(baseExpr)
+	if !ok {
+		// The AST shape check misses a constant base that was HOISTED
+		// into a local (usage ≥ 2 — e.g. an inlined callee whose
+		// address parameter was a constant at the call site): baseExpr
+		// is then just `vN`, but gc's own constant propagation sees
+		// through the local and re-materialises the total as a huge
+		// addressing-mode immediate, reproducing the exact literal-pool
+		// failure the _consts table exists to prevent ("LDPSW ...:
+		// constant is not in pool" on arm64). Detect constness on the
+		// SSA value instead of the AST shape.
+		if c := ssaConstBase(baseVal); c != nil {
+			n = int32(c.AuxInt)
+			ok = true
+		}
+	}
 	if !ok {
 		// baseExpr is not a compile-time int32 constant — fall back to
 		// the runtime cast path with an explicit uint32 wrap so wasm's
@@ -230,6 +245,19 @@ func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64) ast.Expr {
 		return uintLit(total)
 	}
 	return &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{uintLit(total)}}
+}
+
+// ssaConstBase peels OpCopy chains and returns the OpConst32 value a
+// memory-access base resolves to, or nil when the base is not a
+// compile-time constant at the SSA level.
+func ssaConstBase(v *ssa.Value) *ssa.Value {
+	for v != nil && v.Op == ssa.OpCopy && len(v.Args) == 1 {
+		v = v.Args[0]
+	}
+	if v != nil && v.Op == ssa.OpConst32 {
+		return v
+	}
+	return nil
 }
 
 // constsIndexExpr returns `_consts[<idx>]` for the given constant

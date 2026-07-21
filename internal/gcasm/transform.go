@@ -324,51 +324,76 @@ func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map
 		for k, in2 := range insns {
 			offIndex[in2.Off] = k
 		}
-		consumes := false
-		for _, r := range site.runs {
-			k, ok := offIndex[r.target]
-			if !ok {
-				continue
+		// The compare tree the transform emits CLOBBERS EFLAGS, whereas
+		// gc's captured LEAQ+indirect-JMP dispatch PRESERVES them — and
+		// gc exploits that by letting a dispatch target consume flags set
+		// before the dispatch (typically the `CMP idx,$max` of the bounds
+		// check gc emits just ahead of the table jump). So at every tree
+		// leaf we must RESTORE the exact pre-dispatch flag state.
+		//
+		// Rather than try to PROVE which targets consume flags — a
+		// forward linear scan cannot do that soundly (a target may reach
+		// flag-consuming code across an unconditional JMP, or via an
+		// offset the capture never recorded), and the old "detect
+		// consumption, else skip" logic had exactly those false-negative
+		// holes: an undetected flag-consuming target got no replay, the
+		// tree's leftover flags leaked in, and a downstream branch went
+		// the wrong way (surfacing as a wild-pointer SIGSEGV once inlining
+		// enlarged a dispatch-heavy function enough to expose it) — we
+		// take the robust route: if a CLEAN, replayable flag-setter sits
+		// immediately before the dispatch, ALWAYS replay it at the leaves.
+		// Replaying a compare no target reads is harmless (it only
+		// recomputes flags; no register or memory is touched), so this is
+		// unconditionally correct and detection-free. Only when the
+		// nearest pre-dispatch flag-writer is NOT cleanly replayable do we
+		// need to know whether any target actually consumes flags; there
+		// we keep the conservative scan and fall back to pure if it might.
+		replay, replayClean := "", false
+		for k := i - 1; k >= 0 && i-k <= 8; k-- {
+			t := insns[k].Text
+			if writesFlags(t) {
+				// Only pure register compares replay verbatim — memory
+				// operands would need the frame-shift rewrite, which
+				// does not apply at the leaves.
+				if (strings.HasPrefix(t, "CMP") || strings.HasPrefix(t, "TEST")) &&
+					!strings.Contains(t, "(SP)") && !strings.Contains(t, "(SB)") {
+					replay, replayClean = t, true
+				}
+				break
 			}
-			for ; k < len(insns); k++ {
-				t := insns[k].Text
-				if readsFlags(t) {
+			if strings.HasPrefix(t, "CALL") || strings.HasPrefix(t, "RET") {
+				break
+			}
+		}
+		if replayClean {
+			// Always safe: restore the dispatch-entry flags at every leaf.
+			site.replay = replay
+		} else {
+			// No cleanly-replayable flag-setter. Fall back to pure unless
+			// we can prove NO target consumes flags (conservative: any
+			// unverifiable target counts as consuming).
+			consumes := false
+			for _, r := range site.runs {
+				k, ok := offIndex[r.target]
+				if !ok {
 					consumes = true
 					break
 				}
-				if writesFlags(t) || strings.HasPrefix(t, "CALL") || strings.HasPrefix(t, "RET") || strings.HasPrefix(t, "JMP") {
+				for ; k < len(insns); k++ {
+					t := insns[k].Text
+					if readsFlags(t) {
+						consumes = true
+						break
+					}
+					if writesFlags(t) || strings.HasPrefix(t, "CALL") || strings.HasPrefix(t, "RET") || strings.HasPrefix(t, "JMP") {
+						break
+					}
+				}
+				if consumes {
 					break
 				}
 			}
 			if consumes {
-				break
-			}
-		}
-		if consumes {
-			// Nearest preceding flag-writer; only pure reg/mem-read
-			// compares are replayable, and no branch target may sit
-			// between it and the dispatch (a join would make the
-			// flag state path-dependent).
-			found := false
-			for k := i - 1; k >= 0 && i-k <= 8; k-- {
-				t := insns[k].Text
-				if writesFlags(t) {
-					// Only pure register compares replay verbatim —
-					// memory operands would need the frame-shift
-					// rewrite, which does not apply at the leaves.
-					if (!strings.HasPrefix(t, "CMP") && !strings.HasPrefix(t, "TEST")) ||
-						strings.Contains(t, "(SP)") || strings.Contains(t, "(SB)") {
-						return nil, fmt.Errorf("%w: jump table at +%d: flags consumed by targets but preceding writer %q", errUnsupportedJumpTable, in.Off, t)
-					}
-					site.replay = t
-					found = true
-					break
-				}
-				if strings.HasPrefix(t, "CALL") || strings.HasPrefix(t, "RET") {
-					break
-				}
-			}
-			if !found {
 				return nil, fmt.Errorf("%w: jump table at +%d: flags consumed by targets but no replayable flag-setter found", errUnsupportedJumpTable, in.Off)
 			}
 		}

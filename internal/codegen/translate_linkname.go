@@ -294,7 +294,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		if !ok {
 			return Result{}, fmt.Errorf("missing %s after chunk serialization", origPath)
 		}
-		shared, fallback, err := splitForAsm(orig, fmt.Sprintf("p%d", chunkIdx))
+		shared, fallback, err := splitForAsm(orig, fmt.Sprintf("p%d", chunkIdx), pureFallbackTag(t.opts))
 		if err != nil {
 			return Result{}, fmt.Errorf("split %s: %w", origPath, err)
 		}
@@ -378,7 +378,11 @@ func (t *translator) emitChunkAliasFiles(pkgName string, callerChunk int, dir st
 	files := map[string][]byte{}
 	named := t.emitNamedSymbolForwards(callerChunk)
 
-	if callerChunk == chunkMain {
+	// The main file has no asm caller, so bare aliases with no build
+	// tag serve every arch. PureOnly mode is the same situation for
+	// EVERY chunk — no asm bundle will exist anywhere — so the chunks
+	// collapse to the same single untagged bare-alias shape.
+	if callerChunk == chunkMain || t.opts.PureOnly {
 		bare := t.emitWasmFnForwards(callerChunk, linknameForwardBare)
 		decls := append([]ast.Decl{}, bare...)
 		decls = append(decls, named...)
