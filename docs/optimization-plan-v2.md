@@ -8,10 +8,19 @@
 
 **FOLLOW-UP バグ（下記）は修正・コミット済み。さらに修正の副産物として
 arm64 gcasm の未知の miscompile（ジャンプテーブル flag-replay の arm64 未移植）を
-発見・修正した。ベンチは想定外の大幅改善: cpubench gcasm 127.8→97.1ms（−24.0%,
-5/5ペア）、pure 100.4→82.4ms（−18.0%, 3/3ペア）、同セッション wasmtime 77.5ms
-→ ギャップ gcasm 1.66×→**1.25×**、pure 1.30×→**1.06×**。詳細は bench-metrics.md
-の memaddr エントリ。**残作業: ユーザーによる push/PR 判断のみ**（コミットは
+発見・修正した。**
+
+**【訂正 — 同日第3便】当初この節に記した「cpubench gcasm −24.0% / pure −18.0% /
+ギャップ 1.66×→1.25×」は誤り（撤回）。** 保存ベースラインバイナリが x86_64
+（Rosetta 実行）で、NEW(arm64 native) とのクロスアーキ比較だった。wasm sha 固定・
+同一アーキの正規 A/B では **memaddr / a64 replay とも実行時間中立**（gcasm +0.9% /
+pure −0.8%、ノイズ内。pure 計算のソース形状改善は gc と冗長 — 4度目の確認）。
+本当の発見は計測系の方: **arm64 native の真のギャップは d4b6ca3 時点で既に
+gcasm ~1.24× / pure ~1.05×**（gcasm ~96.8ms / pure ~83.1ms / wasmtime 78.3ms）。
+従来記録の 1.91×→1.66× というギャップ史は Rosetta 混入で系統的に過大だった
+（1b の −14.3% は Rosetta 同士の相対値なので示唆としては残るが native 未確認）。
+詳細・再発防止則は bench-metrics.md の CORRECTION エントリ。
+**残作業: ユーザーによる push/PR 判断のみ**（コミットは
 feat/ssa-memopt-licm-gvn に積んである）。**旧引き継ぎメモは下記に残す（歴史）。**
 
 ### 今回入った変更（3コミット）
@@ -48,30 +57,37 @@ wasm2go: `go test ./...` 9pkg / `make lint` 0 issues / `make test-cover` 85.4%�
 - googlesqlite: amd64 -race 35pkg ok, arm64 -race 35pkg ok
 - go-googlesql スモーク: exit 0
 
-### ベンチ（cpubench, arm64 native, 交互 A/B, idle, wasmtime 46.0.1）
+### ベンチ（cpubench）【訂正済み — 当初の −24%/−18% は撤回】
 
-- gcasm: BASE(=d4b6ca3 の /tmp/cpu_gcasm_fix.test) 126.1/127.6/125.9/127.6/131.7
-  → NEW 97.6/98.0/97.0/97.3/95.8 ms。**−24.0%、5/5、レンジ非重複。**
-- pure: BASE 98.7/105.6/97.0 → NEW 83.1/81.9/82.1 ms。**−18.0%、3/3。**
-- 同セッション wasmtime コントロール: 77.5 ms/op（前セッション 78.6 と整合）。
-- 値検証: cpubench の計算結果 9335250 を amd64/arm64 両方で確認（miscompile で
-  速くなった可能性を排除）。
-- **帰属の仮説**（未分離）: pure レーンは memaddr のみ含む → memaddr 単独で
-  −18%。gcasm の追加 −6% は a64 replay 修正で「フラグ消費 dispatch を持つ関数が
-  pure fallback 化」した効果の可能性（pure は ABIInternal で呼び出し密コードに
-  速い）。なぜ memaddr が −18% も出るかは未解明（仮説: 大定数の
-  マテリアライズ/アドレッシング形状が gc の巨大関数 regalloc・命令選択を
-  改善）。**0c 型の pprof 帰属をやる価値あり。**
-- **注意**: BASE の arm64 gcasm バイナリは flag-replay バグを内包した世代
-  （cpubench 経路で誤計算していた証拠はないが、厳密には「バグ入り世代との差」）。
+- **当初の A/B はクロスアーキで無効**: BASE(/tmp/cpu_{gcasm,pure}_fix.test) は
+  x86_64（Rosetta）、NEW は arm64 native だった。差分は Rosetta アーティファクト。
+- **正規 A/B（wasm sha dd3a1307 固定・両者 arm64 native・wasm2go のみ差替・
+  交互5ペア・idle）**: gcasm BASE 96.82ms vs FIX 97.66ms（+0.9%）、
+  pure BASE 83.12ms vs FIX 82.44ms（−0.8%）— **どちらもノイズ内で中立**。
+  pprof diff（同一 wasm、Fn インデックス整合）も interpreter −0.17s ↔ 呼び出し先
+  +0.17s の相殺のみで正味ゼロ。
+- **真の現状（arm64 native, wasmtime 78.3ms 同セッション）**:
+  gcasm ~96.8ms = **1.24×**、pure ~83.1ms = **1.05×**。この水準は d4b6ca3 時点で
+  既に達成されていた。従来のギャップ史（1.91×→1.66×）は Rosetta 混入で過大。
+- 値検証: cpubench 結果 9335250 を amd64/arm64 で確認済み。
+- 方法論則（bench-metrics の CORRECTION エントリに詳細）: ベンチ前に `file` で
+  バイナリのアーキ確認・記録を必須化; A/B 用生成の前後で wasm の sha256 を固定
+  確認（本セッション中に spidermonkey.wasm が原因不明で再ビルドされ Fn 番号が
+  ~13 ずれた — 跨いだ比較・pprof diff は無効）。
 
-### 次の候補（更新）
+### 次の候補（第3便で全面更新 — 真のギャップが小さいことを踏まえる）
 
-1. **なぜ memaddr で −18% 出たかの pprof 帰属**（新しい主要ホットスポットの把握。
-   ギャップ 1.06×(pure)/1.25×(gcasm) まで来たので、残りの構造も見える）
-2. depth-2 インライン再挑戦（前提だった FOLLOW-UP バグは解消済み。ただし予想
-   ROI ≤1-2% は据え置き。A/B は新しい NEW バイナリを baseline に）
-3. gcasm ABI0 マーシャリング/チャンクレイアウト（残ギャップ 1.25× の主成分候補）
+真の残ギャップは **gcasm 1.24× / pure 1.05×**（native）。pure は実質 wasmtime
+パリティ。gcasm の 1.24× は M1 計測の知見どおり ABI0 コールマーシャリングが主成分。
+
+1. **§0 の「(c) 受容して打ち切り」の再評価が筆頭。** pure 1.05× に対しミッドエンド
+   投資の余地はほぼ無い。gcasm 1.24× を詰める手は ABI0 境界の削減のみ
+   （17k の轍に注意）で、期待値は最大でも −19%。
+2. depth-2 インライン再挑戦は ROI 見込みをさらに下方修正（前提バグは解消済みだが、
+   真のベースラインが既に速い）。A/B baseline は /tmp/cpu_{gcasm,pure}_base_a64.test
+   系（arm64 native・wasm sha 記録必須）。
+3. 過去ギャップ史の native 再計測（1b の −14.3% が native でも成立するかは未確認。
+   成立しないなら 1b 自体の効果も再評価）。
 
 **旧メモ（第1便）**:
 
