@@ -2488,9 +2488,9 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	}
 	insBefore := ssa.CountValues(ssaFn)
 	// WASM2GO_SSA_PASSES_OFF disables individual optimization passes (comma
-	// list of constprop,branchfold,simplify,cse,dce — or "all"). Diagnostic
-	// escape hatch for bisecting a suspected pass miscompile; not a
-	// supported build mode.
+	// list of constprop,branchfold,simplify,cse,memopt,dce,memaddr — or
+	// "all"). Diagnostic escape hatch for bisecting a suspected pass
+	// miscompile; not a supported build mode.
 	passesOff := map[string]bool{}
 	// MemOpt (redundant-load elimination + store-to-load forwarding) is
 	// UNSOUND on a shared linear memory: it assumes this agent is the only
@@ -2513,7 +2513,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 			passesOff[strings.TrimSpace(strings.ToLower(p))] = true
 		}
 		if passesOff["all"] {
-			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "memopt", "dce"} {
+			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "memopt", "dce", "memaddr"} {
 				passesOff[p] = true
 			}
 		}
@@ -2551,6 +2551,16 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		// silently shipping a sub-optimal SSA. Cosmetic — the body
 		// emits correctly either way.
 		fmt.Fprintf(os.Stderr, "wasm2go: SSA fixpoint cap reached at function %s\n", t.funcName(funcIdx))
+	}
+	// FoldMemAddend runs ONCE after the fixpoint, never inside it: it
+	// requires that no later ConstProp can constify the base it leaves
+	// behind (see the pass doc for the wraparound hazard). It moves
+	// large constant addends of access bases into the AuxInt offset so
+	// the emitter's _consts-table guard sees them — a constant that
+	// stays in the base sum bypasses the guard and can fail to
+	// assemble on arm64 ("constant is not in pool").
+	if !passesOff["memaddr"] && pass.FoldMemAddend(ssaFn, largeConstThreshold) && !passesOff["dce"] {
+		pass.DCE(ssaFn)
 	}
 	ssa.Compact(ssaFn)
 	insAfter := ssa.CountValues(ssaFn)
