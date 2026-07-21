@@ -4,7 +4,76 @@
 今回の実測で否定された。本 v2 がそれを置き換える。）
 
 ---
-## ★ 引き継ぎメモ（2026-07-21 時点。次の担当者はここから読む）
+## ★ 引き継ぎメモ（2026-07-21 第2便。次の担当者はここから読む）
+
+**FOLLOW-UP バグ（下記）は修正・コミット済み。さらに修正の副産物として
+arm64 gcasm の未知の miscompile（ジャンプテーブル flag-replay の arm64 未移植）を
+発見・修正した。ベンチは想定外の大幅改善: cpubench gcasm 127.8→97.1ms（−24.0%,
+5/5ペア）、pure 100.4→82.4ms（−18.0%, 3/3ペア）、同セッション wasmtime 77.5ms
+→ ギャップ gcasm 1.66×→**1.25×**、pure 1.30×→**1.06×**。詳細は bench-metrics.md
+の memaddr エントリ。**残作業: ユーザーによる push/PR 判断のみ**（コミットは
+feat/ssa-memopt-licm-gvn に積んである）。**旧引き継ぎメモは下記に残す（歴史）。**
+
+### 今回入った変更（3コミット）
+
+1. **memaddr パス（FOLLOW-UP バグの恒久修正）**: `pass.FoldMemAddend`
+   （internal/ssa/pass/memaddr.go）。`Load/Store(base=Add32(x, 大定数c))` の
+   c を AuxInt オフセットへ畳み込み、既存の `_consts` テーブルガードに乗せる。
+   emit 改修不要。**fixpoint ループの後に1回だけ**実行（fold 後の constprop が
+   base を定数化すると emit の非ラップ u33 純定数経路と衝突し、i32 ラップに依存
+   する加算で誤アドレスになるハザードを構造的に排除）。負の大加数も uint32 ビット
+   パターンで fold（runtime 経路は uint32 ラップなので正確）。小加数は不変
+   （テーブルロードで common case を悪化させない）。python.wasm で `_consts`
+   サイト ~2,700 増 = 従来リテラルプール危険地帯だった母集団。
+2. **arm64 ジャンプテーブル flag-replay 移植（新発見の重大 miscompile 修正）**:
+   amd64 の Bug B 修正（d4b6ca3）が arm64 に未移植だった。`a64EmitJumpTree` の
+   CMPW/BHS が NZCV を破壊したまま、pre-dispatch の bounds-check フラグを消費する
+   ターゲットへ飛ぶ → 分岐誤り → メモリ破損。**症状: go-python arm64 gcasm が
+   ベースライン(d4b6ca3)で SIGSEGV**（Fn3705 のディスパッチが破損源、Fn3708 が
+   被害者。pure/arm64 は green、[0,5114) fallback で green の切り分け済み）。
+   修正: `a64FindJumpTables` に replay 検出を移植 + 厳密化（テーブルベース/
+   ターゲットレジスタを読む compare は replay 不可として pure fallback）、
+   `a64EmitJumpTree` の全リーフに replay 注入。
+3. **docs**: 本ファイルの引き継ぎ更新。
+
+### 検証（すべて本セッションで exit 0 観測、修正版バンドル）
+
+wasm2go: `go test ./...` 9pkg / `make lint` 0 issues / `make test-cover` 85.4%。
+`GOARCH=arm64 go test ./...` は gcasm gate 9件が FAIL するが**ベースラインでも
+同一の9件が FAIL**（amd64 capture フィクスチャに GOARCH が漏れる既存の環境問題、
+変更起因ではない）。コンシューマ（wasmify 正規パイプライン、buf generate 再生成）:
+- go-python: amd64±race, arm64±race 全て exit 0（**arm64 はベースラインで
+  SIGSEGV だったものが修正で green 化**）
+- go-spidermonkey: amd64±race, arm64±race 全て exit 0
+- googlesqlite: amd64 -race 35pkg ok, arm64 -race 35pkg ok
+- go-googlesql スモーク: exit 0
+
+### ベンチ（cpubench, arm64 native, 交互 A/B, idle, wasmtime 46.0.1）
+
+- gcasm: BASE(=d4b6ca3 の /tmp/cpu_gcasm_fix.test) 126.1/127.6/125.9/127.6/131.7
+  → NEW 97.6/98.0/97.0/97.3/95.8 ms。**−24.0%、5/5、レンジ非重複。**
+- pure: BASE 98.7/105.6/97.0 → NEW 83.1/81.9/82.1 ms。**−18.0%、3/3。**
+- 同セッション wasmtime コントロール: 77.5 ms/op（前セッション 78.6 と整合）。
+- 値検証: cpubench の計算結果 9335250 を amd64/arm64 両方で確認（miscompile で
+  速くなった可能性を排除）。
+- **帰属の仮説**（未分離）: pure レーンは memaddr のみ含む → memaddr 単独で
+  −18%。gcasm の追加 −6% は a64 replay 修正で「フラグ消費 dispatch を持つ関数が
+  pure fallback 化」した効果の可能性（pure は ABIInternal で呼び出し密コードに
+  速い）。なぜ memaddr が −18% も出るかは未解明（仮説: 大定数の
+  マテリアライズ/アドレッシング形状が gc の巨大関数 regalloc・命令選択を
+  改善）。**0c 型の pprof 帰属をやる価値あり。**
+- **注意**: BASE の arm64 gcasm バイナリは flag-replay バグを内包した世代
+  （cpubench 経路で誤計算していた証拠はないが、厳密には「バグ入り世代との差」）。
+
+### 次の候補（更新）
+
+1. **なぜ memaddr で −18% 出たかの pprof 帰属**（新しい主要ホットスポットの把握。
+   ギャップ 1.06×(pure)/1.25×(gcasm) まで来たので、残りの構造も見える）
+2. depth-2 インライン再挑戦（前提だった FOLLOW-UP バグは解消済み。ただし予想
+   ROI ≤1-2% は据え置き。A/B は新しい NEW バイナリを baseline に）
+3. gcasm ABI0 マーシャリング/チャンクレイアウト（残ギャップ 1.25× の主成分候補）
+
+**旧メモ（第1便）**:
 
 **ブランチ**: `feat/ssa-memopt-licm-gvn`（origin に push 済み）。
 
