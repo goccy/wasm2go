@@ -103,10 +103,12 @@ func isLinknameTrampolineBody(body *ast.BlockStmt) bool {
 // splitForAsm parses the Go source the translator produced,
 // partitions its top-level declarations into shared vs body, and
 // re-emits each half as a self-contained Go file with the right
-// build tag and minimum-required imports. The body file's tag
-// (!amd64 && !arm64) makes it dormant on the asm-target GOARCHs,
-// where the asm files supply the function bodies instead.
-func splitForAsm(src []byte, pkg string) (shared, fallback []byte, err error) {
+// build tag and minimum-required imports. fallbackTag is the
+// `//go:build` directive for the body file: normally
+// `//go:build !amd64 && !arm64` so it is dormant on the asm-target
+// GOARCHs (where the asm files supply the bodies); in PureOnly mode
+// the empty string, so the pure bodies compile everywhere.
+func splitForAsm(src []byte, pkg string, fallbackTag string) (shared, fallback []byte, err error) {
 	fset := token.NewFileSet()
 	// SkipObjectResolution: this split only reshuffles top-level decls
 	// and never inspects ident.Obj / file.Scope, so the parser's
@@ -164,7 +166,7 @@ func splitForAsm(src []byte, pkg string) (shared, fallback []byte, err error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("render shared: %w", err)
 	}
-	fallbackSrc, err := renderFile(fset, pkg, "//go:build !amd64 && !arm64", bodyDecls, imports)
+	fallbackSrc, err := renderFile(fset, pkg, fallbackTag, bodyDecls, imports)
 	if err != nil {
 		return nil, nil, fmt.Errorf("render fallback: %w", err)
 	}

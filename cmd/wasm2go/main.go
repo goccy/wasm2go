@@ -37,6 +37,7 @@ func main() {
 	keepDeadFuncs := flag.Bool("keep-dead-funcs", false, "disable whole-function dead-code elimination (useful for diffing)")
 	entryExports := flag.String("entry-exports", "", "comma-separated list of export names that are DCE roots; the literal value \"NONE\" means no export is a root")
 	promotionReport := flag.String("promotion-report", "", "write the SSA memory-promotion report (JSON: per-function frame/rodata/slab classification) to this path")
+	pureOnly := flag.Bool("pure", false, "emit the pure-Go backend only (no asm bundle, no arch build tags); the ABIInternal reference for benchmarking")
 	flag.Parse()
 
 	var r io.Reader
@@ -87,6 +88,7 @@ func main() {
 		KeepDeadFuncs:       *keepDeadFuncs,
 		EntryExports:        parseEntryExports(*entryExports),
 		PromotionReportPath: *promotionReport,
+		PureOnly:            *pureOnly,
 	}
 
 	if wantsMulti {

@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/goccy/wasm2go/internal/codegen"
 	"github.com/goccy/wasm2go/internal/gcasm"
@@ -75,6 +76,17 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	res, err := codegen.Translate(&mainBuf, m, opts)
 	if err != nil {
 		return res, err
+	}
+
+	// PureOnly (or its subprocess form WASM2GO_PURE, honored inside
+	// codegen.Translate): the pure bodies were emitted untagged, so
+	// they compile on every GOARCH and no asm bundle is wanted. This
+	// is the ABIInternal reference backend for benchmarking.
+	if opts.PureOnly || os.Getenv("WASM2GO_PURE") != "" {
+		if _, err := w.Write(mainBuf.Bytes()); err != nil {
+			return res, err
+		}
+		return res, nil
 	}
 
 	// gcasm backend: replace the own-emitter asm bundle.
