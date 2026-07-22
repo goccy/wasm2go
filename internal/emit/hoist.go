@@ -80,11 +80,19 @@ func ComputeHoist(f *ssa.Func, usage map[ssa.ValueID]int) map[ssa.ValueID]bool {
 	}
 	for _, blk := range f.Blocks {
 		for _, v := range blk.Values {
-			if !IsNarrowingStore(v) {
+			if IsNarrowingStore(v) {
+				if len(v.Args) >= 2 && v.Args[1] != nil {
+					hoist[v.Args[1].ID] = true
+				}
 				continue
 			}
-			if len(v.Args) >= 2 && v.Args[1] != nil {
-				hoist[v.Args[1].ID] = true
+			// Atomic stores render as `atomic.StoreUint32(ptr, uint32(vN))`;
+			// the unsigned cast needs a typed-variable operand for the same
+			// constant-overflow reason as narrowing stores (uint32 of a
+			// negative constant is a compile-time error, uint32 of a typed
+			// local is a runtime conversion).
+			if IsVoidAtomicStore(v) && len(v.Args) >= 3 && v.Args[2] != nil {
+				hoist[v.Args[2].ID] = true
 			}
 		}
 	}

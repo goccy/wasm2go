@@ -160,6 +160,7 @@ var fixtures = []fixture{
 			{export: "subword_cmpxchg", resType: wasm.ValI32},
 			{export: "wait_notify", resType: wasm.ValI32},
 			{export: "fenced_load", resType: wasm.ValI32},
+			{export: "store_neg", resType: wasm.ValI32},
 		},
 	},
 	{
