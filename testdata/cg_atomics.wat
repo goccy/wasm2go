@@ -47,4 +47,14 @@
     (i32.atomic.store (i32.const 72) (i32.const 42))
     (atomic.fence)
     (i32.atomic.load (i32.const 72)))
+  (func (export "store_neg") (result i32)
+    ;; Negative constant operands: the inline-atomic emitter renders the
+    ;; store value through an unsigned cast, which must be a runtime
+    ;; conversion — `uint32(-1)` as a constant expression fails to
+    ;; compile. Locks the force-hoist of atomic-store value operands.
+    (i32.atomic.store (i32.const 80) (i32.const -1))
+    (i64.atomic.store (i32.const 88) (i64.const -0x8000000000000000))
+    (i32.add
+      (i32.atomic.load (i32.const 80))
+      (i32.wrap_i64 (i64.atomic.load (i32.const 88)))))
 )

@@ -9,6 +9,8 @@
 package emit
 
 import (
+	"strings"
+
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -66,7 +68,7 @@ func ComputeHoist(f *ssa.Func, usage map[ssa.ValueID]int) map[ssa.ValueID]bool {
 			case v.Op == ssa.OpParam:
 				// never hoisted
 			case v.HasSideEffect():
-				if IsScalarType(v.Type) {
+				if IsScalarType(v.Type) && !IsVoidAtomicStore(v) {
 					hoist[v.ID] = true
 				}
 			case IsLoadOp(v.Op):
@@ -78,11 +80,19 @@ func ComputeHoist(f *ssa.Func, usage map[ssa.ValueID]int) map[ssa.ValueID]bool {
 	}
 	for _, blk := range f.Blocks {
 		for _, v := range blk.Values {
-			if !IsNarrowingStore(v) {
+			if IsNarrowingStore(v) {
+				if len(v.Args) >= 2 && v.Args[1] != nil {
+					hoist[v.Args[1].ID] = true
+				}
 				continue
 			}
-			if len(v.Args) >= 2 && v.Args[1] != nil {
-				hoist[v.Args[1].ID] = true
+			// Atomic stores render as `atomic.StoreUint32(ptr, uint32(vN))`;
+			// the unsigned cast needs a typed-variable operand for the same
+			// constant-overflow reason as narrowing stores (uint32 of a
+			// negative constant is a compile-time error, uint32 of a typed
+			// local is a runtime conversion).
+			if IsVoidAtomicStore(v) && len(v.Args) >= 3 && v.Args[2] != nil {
+				hoist[v.Args[2].ID] = true
 			}
 		}
 	}
@@ -206,6 +216,22 @@ func IsLoadOp(op ssa.Op) bool {
 		return true
 	}
 	return false
+}
+
+// IsVoidAtomicStore reports whether v is an OpAtomicCall atomic store.
+// The lowering never pushes a store's result (wasm atomic stores leave
+// nothing on the operand stack), so the value only ever appears in
+// statement position. It must NOT be hoisted: the Go emitter renders
+// the full-width forms as sync/atomic Store intrinsics, which yield no
+// value, so a hoisted `vN = <store>` would not compile. (The remaining
+// sub-word store helpers still return a dummy scalar; discarding it in
+// an expression statement is fine.)
+func IsVoidAtomicStore(v *ssa.Value) bool {
+	if v == nil || v.Op != ssa.OpAtomicCall {
+		return false
+	}
+	name, _ := v.Aux.(string)
+	return strings.HasPrefix(name, "atomicStore")
 }
 
 // IsNarrowingStore reports whether v is a memory store that writes

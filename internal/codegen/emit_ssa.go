@@ -1044,6 +1044,13 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		if !ok || name == "" {
 			return nil, fmt.Errorf("ssa emit: OpAtomicCall without name aux")
 		}
+		// Full-width aligned loads/stores skip the helper chain and
+		// emit sync/atomic intrinsics directly; see emit_memops.go.
+		if expr, done, err := em.emitAtomicInline(v, name, emit); err != nil {
+			return nil, err
+		} else if done {
+			return expr, nil
+		}
 		em.useHelper(name)
 		args := []ast.Expr{newID("m")}
 		for _, a := range v.Args {

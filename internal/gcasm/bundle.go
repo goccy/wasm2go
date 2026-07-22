@@ -706,7 +706,7 @@ func buildPkg(
 	// unsafe is always imported: gcasmTypePtr needs it, and the
 	// //go:linkname forwards require it in scope. Chunk packages
 	// reference the shared Module type as base.Module.
-	mathUsed, bitsUsed := false, false
+	mathUsed, bitsUsed, atomicUsed := false, false, false
 	for k := range stdlibUsed {
 		if strings.HasPrefix(k, "math/bits.") {
 			bitsUsed = true
@@ -715,13 +715,18 @@ func buildPkg(
 		}
 	}
 	// Extracted fallback bodies may reference math/bits directly
-	// (float NaN/Inf constants, rotate helpers inlined by gofmt).
+	// (float NaN/Inf constants, rotate helpers inlined by gofmt) and
+	// sync/atomic (the inline full-width atomic loads/stores, see
+	// codegen/emit_memops.go).
 	for _, body := range fallbackBodies {
 		if strings.Contains(body, "math.") {
 			mathUsed = true
 		}
 		if strings.Contains(body, "bits.") {
 			bitsUsed = true
+		}
+		if strings.Contains(body, "atomic.") {
+			atomicUsed = true
 		}
 	}
 	decl.WriteString("import (\n")
@@ -730,6 +735,9 @@ func buildPkg(
 	}
 	if bitsUsed {
 		decl.WriteString("\t\"math/bits\"\n")
+	}
+	if atomicUsed {
+		decl.WriteString("\t\"sync/atomic\"\n")
 	}
 	decl.WriteString("\t\"unsafe\"\n")
 	if rel != "" && rel != "base" {
