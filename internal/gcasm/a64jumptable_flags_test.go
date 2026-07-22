@@ -151,15 +151,37 @@ func TestA64JumpTableFlagReplayRun(t *testing.T) {
 	for _, d := range datas {
 		dm[d.Name] = d
 	}
-	body, err := TransformARM64(disp, TransformOptions{
-		SymName:   "fdispatchAsm",
-		CalleeSig: func(string) ([]ArgKind, bool, ArgKind, string, bool) { return nil, false, 0, "", false },
-		Params:    []ArgKind{ArgI32, ArgI32},
-		HasResult: true,
-		Result:    ArgI32,
-		ArgNames:  []string{"sel", "v0"},
-		Datas:     dm,
-	})
+	xform := func() (string, error) {
+		return TransformARM64(disp, TransformOptions{
+			SymName:   "fdispatchAsm",
+			CalleeSig: func(string) ([]ArgKind, bool, ArgKind, string, bool) { return nil, false, 0, "", false },
+			Params:    []ArgKind{ArgI32, ArgI32},
+			HasResult: true,
+			Result:    ArgI32,
+			ArgNames:  []string{"sel", "v0"},
+			Datas:     dm,
+		})
+	}
+
+	// The 48-case fixture crosses the large-table fallback threshold, so
+	// under the default policy the arm64 transform must route to the pure
+	// fallback — this pins the arm64 policy wiring.
+	body, err := xform()
+	switch {
+	case errors.Is(err, errLargeJumpTable):
+		// Expected: policy fired. Disable it below to pin the tree itself.
+	case err == nil && (!strings.Contains(body, "jt") || strings.Contains(body, ".jump")):
+		t.Skipf("gc did not emit a jump table for FDispatch on this toolchain")
+	case err != nil && strings.Contains(err.Error(), "jump"):
+		t.Skipf("no jump table emitted for this fixture on this toolchain: %v", err)
+	case err != nil:
+		t.Fatal(err)
+	default:
+		t.Fatal("default policy: transform succeeded with a jump table, want errLargeJumpTable")
+	}
+
+	t.Setenv("GCASM_JT_FALLBACK", "off")
+	body, err = xform()
 	if err != nil {
 		if strings.Contains(err.Error(), "jump") {
 			t.Skipf("no jump table emitted for this fixture on this toolchain: %v", err)

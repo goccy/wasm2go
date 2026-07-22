@@ -39,6 +39,11 @@ func flagDispatchSrc(fnName string) string {
 // false-negative holes and some leaves got no replay, so the tree's
 // leftover flags leaked into the arms and picked the wrong branch.
 func TestJumpTableFlagReplayRun(t *testing.T) {
+	// The 48-case fixture crosses the large-table fallback threshold;
+	// this gate pins the compare-tree flag replay itself, so disable
+	// the policy (covered by TestJumpTableFallbackPolicy and the
+	// jumptable gate).
+	t.Setenv("GCASM_JT_FALLBACK", "off")
 	dir := t.TempDir()
 	src := "package lib\n\n//go:noinline\n" + flagDispatchSrc("FDispatch")
 	for name, content := range map[string]string{

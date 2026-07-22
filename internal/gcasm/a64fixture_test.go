@@ -22,6 +22,10 @@ import (
 // transformed vs pure over an input sweep on GOARCH=arm64 (native on
 // Apple Silicon).
 func a64FixtureGate(t *testing.T, fixture string) {
+	// Like fixtureGate: Transform is called directly (no Build), so the
+	// large-jump-table fallback policy cannot route to a pure body, and
+	// the gate exists to pin the compare-tree rewrite itself. Disable it.
+	t.Setenv("GCASM_JT_FALLBACK", "off")
 	bin := testfixture.Wasm(t, fixture)
 	mod, err := wasm.Parse(bytes.NewReader(bin))
 	if err != nil {

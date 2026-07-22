@@ -150,6 +150,12 @@ func goTypeOfKind(k ArgKind) string {
 // outcomes must agree). Determinism is asserted by capturing the same
 // tree from two different directories.
 func fixtureGate(t *testing.T, fixture string) {
+	// The gate calls Transform directly (no Build), so the large-jump-
+	// table fallback policy cannot route to a pure body here — and the
+	// gate's job is to pin the compare-tree rewrite itself (e.g.
+	// cg_bigdispatch, cg_brtable64). Disable the policy; it is pinned by
+	// TestJumpTableFallbackPolicy and the jumptable gates.
+	t.Setenv("GCASM_JT_FALLBACK", "off")
 	bin := testfixture.Wasm(t, fixture)
 	mod, err := wasm.Parse(bytes.NewReader(bin))
 	if err != nil {

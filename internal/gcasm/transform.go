@@ -563,6 +563,9 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", fn.Name, err)
 	}
+	if err := jumpTableFallbackErr(jtSites); err != nil {
+		return "", fmt.Errorf("%s: %w", fn.Name, err)
+	}
 
 	// Const pool (shared across the file when the caller provides
 	// one) and the in-package symbol operand rewrite.

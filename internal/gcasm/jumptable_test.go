@@ -1,6 +1,7 @@
 package gcasm
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -49,7 +50,7 @@ func TestJumpTableTransformRun(t *testing.T) {
 		}
 	}
 
-	transformOnce := func() string {
+	transformOnce := func() (string, error) {
 		fns, datas, err := Capture(dir, "jtgate/lib")
 		if err != nil {
 			t.Fatal(err)
@@ -67,7 +68,7 @@ func TestJumpTableTransformRun(t *testing.T) {
 		for _, d := range datas {
 			dm[d.Name] = d
 		}
-		body, err := Transform(disp, TransformOptions{
+		return Transform(disp, TransformOptions{
 			SymName:   "dispatchAsm",
 			CalleeSig: func(string) ([]ArgKind, bool, ArgKind, string, bool) { return nil, false, 0, "", false },
 			Params:    []ArgKind{ArgI32, ArgI32},
@@ -76,13 +77,26 @@ func TestJumpTableTransformRun(t *testing.T) {
 			ArgNames:  []string{"sel", "v0"},
 			Datas:     dm,
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return body
 	}
-	body := transformOnce()
-	if body2 := transformOnce(); body2 != body {
+
+	// Under the default policy a 64-case dispatch (≥ jtFallbackMinRuns
+	// runs) must route to the pure fallback, not transform.
+	if _, err := transformOnce(); !errors.Is(err, errLargeJumpTable) {
+		t.Fatalf("default policy: got %v, want errLargeJumpTable", err)
+	}
+
+	// The rest of the gate exercises the compare-tree rewrite itself,
+	// so disable the large-table fallback policy.
+	t.Setenv("GCASM_JT_FALLBACK", "off")
+	body, err := transformOnce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, err := transformOnce()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body2 != body {
 		t.Fatalf("transform not deterministic:\n--- run1\n%s\n--- run2\n%s", body, body2)
 	}
 	if !strings.Contains(body, "jt") || strings.Contains(body, ".jump") {

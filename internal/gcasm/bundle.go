@@ -620,10 +620,11 @@ func buildPkg(
 			Types:     types,
 		})
 		if terr != nil {
-			// A duff body, or a jump table whose flag state cannot be replayed
-			// at the leaf asm, falls back to the pure Go body (transparent to
-			// callers) rather than aborting the whole bundle.
-			if errors.Is(terr, errUnsupportedDuff) || errors.Is(terr, errUnsupportedJumpTable) {
+			// A duff body, a jump table whose flag state cannot be replayed
+			// at the leaf asm, or a jump table too large for the compare-tree
+			// rewrite falls back to the pure Go body (transparent to callers)
+			// rather than aborting the whole bundle.
+			if errors.Is(terr, errUnsupportedDuff) || errors.Is(terr, errUnsupportedJumpTable) || errors.Is(terr, errLargeJumpTable) {
 				fallbackNames[name] = true
 				stats.Fallback++
 				continue

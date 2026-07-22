@@ -118,6 +118,9 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", fn.Name, err)
 	}
+	if err := jumpTableFallbackErr(jtSites); err != nil {
+		return "", fmt.Errorf("%s: %w", fn.Name, err)
+	}
 
 	pool := opts.Consts
 	ownPool := false
