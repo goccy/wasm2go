@@ -2,7 +2,6 @@ package gcasm
 
 import (
 	"fmt"
-	"hash/fnv"
 	"strings"
 )
 
@@ -80,9 +79,13 @@ func (jt *JTTable) fn(sym string) *JTFn {
 // jtSig derives the deterministic signature for one dispatch target.
 // bits selects the architecture's signature width.
 func jtSig(fnSym string, siteOff, target, bits int) uint64 {
-	h := fnv.New64a()
-	_, _ = fmt.Fprintf(h, "%s+%d>%d", fnSym, siteOff, target)
-	s := h.Sum64() & (1<<bits - 1)
+	key := fmt.Sprintf("%s+%d>%d", fnSym, siteOff, target)
+	h := uint64(14695981039346656037) // FNV-1a 64
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	s := h & (1<<bits - 1)
 	// All-zero / all-one signatures resemble alignment padding; nudge.
 	if s == 0 || s == 1<<bits-1 {
 		s = 0x5A5A5A5A & (1<<bits - 1)
