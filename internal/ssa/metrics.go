@@ -25,6 +25,12 @@ type MemMetrics struct {
 	FuncsWithFrame int // functions with a detected stack frame
 	FuncsFrameKept int // ... whose frame did not escape (promotable)
 
+	// Slot-granular measurement over ESCAPED frames (see
+	// MemClass.SlotPromotable): how much frame traffic a per-slot
+	// escape analysis would additionally recover.
+	EscapedFrameAccesses int // fp-derived accesses in escaped-frame fns
+	SlotPromotable       int // ... provably below every escaped offset
+
 	// PerFunc keeps a one-line record per analysed function for the
 	// sidecar report. Keyed insertion order is preserved via the
 	// parallel funcOrder slice.
@@ -55,6 +61,13 @@ type FuncMemRecord struct {
 	FrameSize    int64  `json:"frame_size"`
 	FrameEscaped bool   `json:"frame_escaped"`
 	EscapeReason string `json:"escape_reason,omitempty"`
+	// Slot-granular measurement, set when the frame escaped: accesses
+	// through fp-derived addresses, the subset a per-slot analysis
+	// would keep private, and the lowest escaped fp offset (-1 =
+	// whole-frame poison).
+	FrameAccesses  int   `json:"frame_accesses,omitempty"`
+	SlotPromotable int   `json:"slot_promotable,omitempty"`
+	EscapeMinOff   int64 `json:"escape_min_off,omitempty"`
 }
 
 // NewMemMetrics returns an empty accumulator.
@@ -84,6 +97,12 @@ func (m *MemMetrics) Add(f *Func, mc *MemClass) {
 		rec.EscapeReason = mc.EscapeReason
 		if !mc.FrameEscapes {
 			m.FuncsFrameKept++
+		} else {
+			rec.FrameAccesses = mc.FrameAccesses
+			rec.SlotPromotable = mc.SlotPromotable
+			rec.EscapeMinOff = mc.EscapeMinOff
+			m.EscapedFrameAccesses += mc.FrameAccesses
+			m.SlotPromotable += mc.SlotPromotable
 		}
 	}
 	m.Total += rec.Total
@@ -149,6 +168,11 @@ func (m *MemMetrics) Summary() string {
 	s += fmt.Sprintf("    frame:                 %8d  (%s)\n", m.Frame, pct(m.Frame))
 	s += fmt.Sprintf("    rodata:                %8d  (%s)\n", m.Rodata, pct(m.Rodata))
 	s += fmt.Sprintf("  slab (not promoted):     %8d  (%s)\n", m.Slab, pct(m.Slab))
+	if m.EscapedFrameAccesses > 0 {
+		s += fmt.Sprintf("  slot-promotable (escaped frames): %8d / %d  (%.1f%%)\n",
+			m.SlotPromotable, m.EscapedFrameAccesses,
+			100*float64(m.SlotPromotable)/float64(m.EscapedFrameAccesses))
+	}
 	return s
 }
 
@@ -178,28 +202,32 @@ func (m *MemMetrics) TopSlabFunctions(n int) []FuncMemRecord {
 // `-promotion-report` sidecar.
 func (m *MemMetrics) JSON() ([]byte, error) {
 	type doc struct {
-		SSAFunctions   int             `json:"ssa_functions"`
-		FuncsWithFrame int             `json:"funcs_with_frame"`
-		FuncsFrameKept int             `json:"funcs_frame_non_escaping"`
-		Total          int             `json:"total_accesses"`
-		Promoted       int             `json:"promoted"`
-		Frame          int             `json:"frame"`
-		Rodata         int             `json:"rodata"`
-		Slab           int             `json:"slab"`
-		Rate           float64         `json:"promotion_rate"`
-		Functions      []FuncMemRecord `json:"functions"`
+		SSAFunctions         int             `json:"ssa_functions"`
+		FuncsWithFrame       int             `json:"funcs_with_frame"`
+		FuncsFrameKept       int             `json:"funcs_frame_non_escaping"`
+		Total                int             `json:"total_accesses"`
+		Promoted             int             `json:"promoted"`
+		Frame                int             `json:"frame"`
+		Rodata               int             `json:"rodata"`
+		Slab                 int             `json:"slab"`
+		Rate                 float64         `json:"promotion_rate"`
+		EscapedFrameAccesses int             `json:"escaped_frame_accesses"`
+		SlotPromotable       int             `json:"slot_promotable"`
+		Functions            []FuncMemRecord `json:"functions"`
 	}
 	d := doc{
-		SSAFunctions:   m.SSAFunctions,
-		FuncsWithFrame: m.FuncsWithFrame,
-		FuncsFrameKept: m.FuncsFrameKept,
-		Total:          m.Total,
-		Promoted:       m.Promoted(),
-		Frame:          m.Frame,
-		Rodata:         m.Rodata,
-		Slab:           m.Slab,
-		Rate:           m.Rate(),
-		Functions:      m.FuncRecords(),
+		SSAFunctions:         m.SSAFunctions,
+		FuncsWithFrame:       m.FuncsWithFrame,
+		FuncsFrameKept:       m.FuncsFrameKept,
+		Total:                m.Total,
+		Promoted:             m.Promoted(),
+		Frame:                m.Frame,
+		Rodata:               m.Rodata,
+		Slab:                 m.Slab,
+		Rate:                 m.Rate(),
+		EscapedFrameAccesses: m.EscapedFrameAccesses,
+		SlotPromotable:       m.SlotPromotable,
+		Functions:            m.FuncRecords(),
 	}
 	return json.MarshalIndent(d, "", "  ")
 }

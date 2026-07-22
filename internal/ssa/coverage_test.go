@@ -1043,24 +1043,24 @@ func TestConstFoldAddrCopy(t *testing.T) {
 	}
 }
 
-func TestIsFrameOffsetSub32NonConst(t *testing.T) {
+func TestFrameOffsetOfSub32NonConst(t *testing.T) {
 	// fp - dynamicValue (not const) should NOT be frame-derived.
 	fp := &Value{ID: 1, Op: OpSub32}
 	dyn := &Value{ID: 2, Op: OpAdd32} // not a const
 	sub := &Value{Op: OpSub32, Args: []*Value{fp, dyn}}
-	fd := map[ValueID]bool{fp.ID: true}
-	if isFrameOffset(sub, fd) {
+	fd := map[ValueID]int64{fp.ID: 0}
+	if _, ok := frameOffsetOf(sub, fd); ok {
 		t.Error("sub with non-const should not be frame offset")
 	}
 }
 
-func TestIsFrameOffsetAdd32BothConst(t *testing.T) {
+func TestFrameOffsetOfAdd32BothConst(t *testing.T) {
 	// Two non-frame-derived constants: Add32 of them is not a frame offset.
 	c1 := &Value{ID: 10, Op: OpConst32, AuxInt: 4}
 	c2 := &Value{ID: 11, Op: OpConst32, AuxInt: 8}
 	add := &Value{Op: OpAdd32, Args: []*Value{c1, c2}}
-	fd := map[ValueID]bool{}
-	if isFrameOffset(add, fd) {
+	fd := map[ValueID]int64{}
+	if _, ok := frameOffsetOf(add, fd); ok {
 		t.Error("add of two unrelated consts should not be a frame offset")
 	}
 }

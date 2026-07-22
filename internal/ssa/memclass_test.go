@@ -69,6 +69,63 @@ func TestClassifyMemoryFrameEscaping(t *testing.T) {
 	}
 }
 
+// buildSlotFrameFunc builds an escaping-frame function with mixed slot
+// traffic: a 64-byte frame where fp+32 is passed to a call (the escape
+// root), fp+0/fp+8 hold private i64 slots (below the root), and fp+40
+// is a store above the root.
+func buildSlotFrameFunc(escapeOff int32) *Func {
+	b := NewFuncBuilder("slottest", FuncSig{Params: []Type{TypeI64}, Results: []Type{TypeI64}})
+	entry := b.NewBlock(BlockPlain)
+	b.SetEntry(entry)
+	b.SetCurrent(entry)
+
+	p0 := b.Param(0, TypeI64)
+	g0 := b.NewValueAuxInt(OpGlobalGet, TypeI32, 0)
+	fp := b.NewValue(OpSub32, TypeI32, g0, b.Const32(64))
+	b.NewValueAuxInt(OpGlobalSet, TypeMem, 0, fp)
+	b.NewValueAuxInt(OpStore64, TypeMem, 0, fp, p0)  // [fp+0]  private
+	b.NewValueAuxInt(OpStore64, TypeMem, 8, fp, p0)  // [fp+8]  private
+	ld := b.NewValueAuxInt(OpLoad64, TypeI64, 0, fp) // [fp+0]  private
+	esc := b.NewValue(OpAdd32, TypeI32, fp, b.Const32(escapeOff))
+	b.NewValueAux(OpCallDirect, TypeI32, nil, esc)   // fp+escapeOff escapes
+	b.NewValueAuxInt(OpStore64, TypeMem, 40, fp, p0) // [fp+40] above the root
+	restore := b.NewValue(OpAdd32, TypeI32, fp, b.Const32(64))
+	b.NewValueAuxInt(OpGlobalSet, TypeMem, 0, restore)
+	b.FinishRet(ld)
+	return b.Func()
+}
+
+func TestClassifyMemorySlotGranular(t *testing.T) {
+	f := buildSlotFrameFunc(32)
+	mc := ClassifyMemory(f)
+	if !mc.FrameEscapes {
+		t.Fatal("frame should escape (fp+32 passed to a call)")
+	}
+	if mc.EscapeMinOff != 32 {
+		t.Errorf("EscapeMinOff = %d, want 32", mc.EscapeMinOff)
+	}
+	if mc.FrameAccesses != 4 {
+		t.Errorf("FrameAccesses = %d, want 4", mc.FrameAccesses)
+	}
+	// [fp+0]x2 + [fp+8] end at 8/16 <= 32 → promotable; [fp+40] is not.
+	if mc.SlotPromotable != 3 {
+		t.Errorf("SlotPromotable = %d, want 3", mc.SlotPromotable)
+	}
+}
+
+func TestClassifyMemorySlotBoundary(t *testing.T) {
+	// Escape root at fp+8: the i64 store/load pair at [fp+0] ends
+	// exactly at the root (8 <= 8 → private); [fp+8] overlaps it.
+	f := buildSlotFrameFunc(8)
+	mc := ClassifyMemory(f)
+	if mc.EscapeMinOff != 8 {
+		t.Fatalf("EscapeMinOff = %d, want 8", mc.EscapeMinOff)
+	}
+	if mc.SlotPromotable != 2 {
+		t.Errorf("SlotPromotable = %d, want 2 ([fp+0] store+load only)", mc.SlotPromotable)
+	}
+}
+
 func TestMemMetricsAggregate(t *testing.T) {
 	m := NewMemMetrics()
 	f1 := buildFrameFunc(false) // 2 frame accesses

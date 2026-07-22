@@ -1,5 +1,7 @@
 package ssa
 
+import "math"
+
 // AliasClass classifies where a memory access lands. It is the
 // observability backbone of memory promotion: every wasm
 // load / store is tagged so the transpiler can report — and act on —
@@ -53,6 +55,26 @@ type MemClass struct {
 	// EscapeReason, when FrameEscapes, names why (for the JSON / debug
 	// report).
 	EscapeReason string
+
+	// Slot-granular measurement (observability only — nothing rewrites
+	// on these yet). The whole-frame escape analysis above is
+	// all-or-nothing: one escaping pointer demotes EVERY frame access.
+	// These fields measure what a per-slot analysis would recover under
+	// the upward-extent model: an escaped pointer `fp+e` grants the
+	// callee/store access to [e, frameSize) — the C object the pointer
+	// names and everything above it — while slots strictly below every
+	// escaped offset remain provably private to the function.
+	//
+	// FrameAccesses counts every access through an fp-derived address
+	// (whether or not the frame escapes). SlotPromotable, meaningful
+	// only when FrameEscapes, counts the subset whose byte range lies
+	// entirely below EscapeMinOff. EscapeMinOff is the lowest
+	// fp-relative offset that escapes; -1 means an escape with no
+	// attributable offset (dynamic pointer arithmetic, an opaque use)
+	// poisons the whole frame.
+	FrameAccesses  int
+	SlotPromotable int
+	EscapeMinOff   int64
 }
 
 // ClassifyMemory analyses one SSA function and classifies every memory
@@ -74,22 +96,26 @@ func ClassifyMemory(f *Func) *MemClass {
 	// 1. Locate the frame pointer.
 	mc.FramePtr, mc.FrameSize = findFramePointer(f)
 
-	// 2. Compute the set of frame-pointer-derived values: fp itself,
-	// plus fp+const (any number of constant offsets), plus copies.
-	frameDerived := map[ValueID]bool{}
+	// 2. Compute the set of frame-pointer-derived values — fp itself,
+	// plus fp+const (any number of constant offsets), plus copies —
+	// each with its constant fp-relative offset.
+	frameOff := map[ValueID]int64{}
 	if mc.FramePtr != nil {
-		frameDerived[mc.FramePtr.ID] = true
+		frameOff[mc.FramePtr.ID] = 0
 		// Fixpoint: a value is frame-derived if it is OpAdd32 /
 		// OpSub32 of a frame-derived value and a constant, or a copy.
 		changed := true
 		for changed {
 			changed = false
 			for _, v := range f.Values {
-				if v == nil || frameDerived[v.ID] {
+				if v == nil {
 					continue
 				}
-				if isFrameOffset(v, frameDerived) {
-					frameDerived[v.ID] = true
+				if _, seen := frameOff[v.ID]; seen {
+					continue
+				}
+				if off, ok := frameOffsetOf(v, frameOff); ok {
+					frameOff[v.ID] = off
 					changed = true
 				}
 			}
@@ -97,9 +123,14 @@ func ClassifyMemory(f *Func) *MemClass {
 	}
 
 	// 3. Escape analysis: walk every use of every frame-derived value.
+	minEsc := int64(math.MaxInt64)
 	if mc.FramePtr != nil {
 		users := buildUseMap(f)
-		mc.FrameEscapes, mc.EscapeReason = frameEscapes(f, frameDerived, users)
+		mc.FrameEscapes, mc.EscapeReason, minEsc = frameEscapes(f, frameOff, users)
+		mc.EscapeMinOff = minEsc
+		if minEsc == math.MinInt64 {
+			mc.EscapeMinOff = -1
+		}
 	}
 
 	// 4. Classify each memory op.
@@ -108,8 +139,12 @@ func ClassifyMemory(f *Func) *MemClass {
 			continue
 		}
 		addr := constFoldAddr(memAddr(v))
+		off, isFrameAddr := int64(0), false
+		if addr != nil {
+			off, isFrameAddr = frameOff[addr.ID]
+		}
 		switch {
-		case mc.FramePtr != nil && addr != nil && frameDerived[addr.ID] && !mc.FrameEscapes:
+		case mc.FramePtr != nil && isFrameAddr && !mc.FrameEscapes:
 			mc.Class[v.ID] = AliasFrame
 		case addr != nil && addr.Op == OpConst32 && isLoadOp(v.Op):
 			// A load from a compile-time-constant linear-memory address
@@ -122,8 +157,29 @@ func ClassifyMemory(f *Func) *MemClass {
 		default:
 			mc.Class[v.ID] = AliasSlab
 		}
+		// Slot-granular measurement: the access's byte range is
+		// [off + AuxInt, off + AuxInt + width) relative to fp.
+		if mc.FramePtr != nil && isFrameAddr {
+			mc.FrameAccesses++
+			if mc.FrameEscapes && off+v.AuxInt+accessWidth(v.Op) <= minEsc {
+				mc.SlotPromotable++
+			}
+		}
 	}
 	return mc
+}
+
+// accessWidth returns the byte width a load/store touches.
+func accessWidth(op Op) int64 {
+	switch op {
+	case OpLoad8U, OpLoad8S, OpStore8:
+		return 1
+	case OpLoad16U, OpLoad16S, OpStore16:
+		return 2
+	case OpLoad32, OpLoad32U, OpLoad32S, OpLoadF32, OpStore32, OpStoreF32:
+		return 4
+	}
+	return 8
 }
 
 // isLoadOp reports whether op is a memory load (as opposed to a store).
@@ -177,26 +233,35 @@ func findFramePointer(f *Func) (*Value, int64) {
 	return nil, 0
 }
 
-// isFrameOffset reports whether v is `frameDerived ± const` or a copy
-// of a frame-derived value.
-func isFrameOffset(v *Value, frameDerived map[ValueID]bool) bool {
+// frameOffsetOf reports whether v is `frameDerived ± const` or a copy
+// of a frame-derived value, and if so its fp-relative offset.
+func frameOffsetOf(v *Value, frameOff map[ValueID]int64) (int64, bool) {
 	switch v.Op {
 	case OpCopy:
-		return len(v.Args) == 1 && v.Args[0] != nil && frameDerived[v.Args[0].ID]
+		if len(v.Args) == 1 && v.Args[0] != nil {
+			if o, ok := frameOff[v.Args[0].ID]; ok {
+				return o, true
+			}
+		}
 	case OpAdd32, OpSub32:
 		if len(v.Args) != 2 || v.Args[0] == nil || v.Args[1] == nil {
-			return false
+			return 0, false
 		}
 		a, b := v.Args[0], v.Args[1]
 		// frameDerived + const  (or const + frameDerived for Add)
-		if frameDerived[a.ID] && b.Op == OpConst32 {
-			return true
+		if o, ok := frameOff[a.ID]; ok && b.Op == OpConst32 {
+			if v.Op == OpAdd32 {
+				return o + b.AuxInt, true
+			}
+			return o - b.AuxInt, true
 		}
-		if v.Op == OpAdd32 && frameDerived[b.ID] && a.Op == OpConst32 {
-			return true
+		if v.Op == OpAdd32 {
+			if o, ok := frameOff[b.ID]; ok && a.Op == OpConst32 {
+				return o + a.AuxInt, true
+			}
 		}
 	}
-	return false
+	return 0, false
 }
 
 // buildUseMap returns, per value ID, the list of values that reference
@@ -217,10 +282,27 @@ func buildUseMap(f *Func) map[ValueID][]*Value {
 }
 
 // frameEscapes returns whether any frame-derived value is used in a way
-// that lets the frame escape the function.
-func frameEscapes(f *Func, frameDerived map[ValueID]bool, users map[ValueID][]*Value) (bool, string) {
+// that lets the frame escape the function, the first reason found, and
+// the minimum escaped fp-relative offset (math.MaxInt64 when nothing
+// escapes; math.MinInt64 when an escape has no attributable offset and
+// poisons the whole frame under the upward-extent model).
+func frameEscapes(f *Func, frameOff map[ValueID]int64, users map[ValueID][]*Value) (bool, string, int64) {
+	escaped, reason := false, ""
+	minOff := int64(math.MaxInt64)
+	escape := func(off int64, why string) {
+		if !escaped {
+			escaped, reason = true, why
+		}
+		if off < minOff {
+			minOff = off
+		}
+	}
 	for _, v := range f.Values {
-		if v == nil || !frameDerived[v.ID] {
+		if v == nil {
+			continue
+		}
+		off, ok := frameOff[v.ID]
+		if !ok {
 			continue
 		}
 		for _, u := range users[v.ID] {
@@ -229,31 +311,38 @@ func frameEscapes(f *Func, frameDerived map[ValueID]bool, users map[ValueID][]*V
 				// Frame management (prologue set / epilogue restore).
 			case OpAdd32, OpSub32:
 				// `fp ± const` stays frame-derived; non-const operands
-				// were already excluded from frameDerived, but a use
-				// of fp as `fp - dynamicValue` is opaque → escape.
-				if !frameDerived[u.ID] {
-					return true, "frame pointer used in non-constant arithmetic"
+				// were already excluded from frameOff, but a use of fp
+				// as `fp - dynamicValue` is opaque → the derived
+				// pointer can reach any slot: whole-frame poison.
+				if _, derived := frameOff[u.ID]; !derived {
+					escape(math.MinInt64, "frame pointer used in non-constant arithmetic")
 				}
 			case OpCopy:
 				// A copy of a frame value is itself frame-derived.
 			case OpStore8, OpStore16, OpStore32, OpStore64, OpStoreF32, OpStoreF64:
 				// Address operand (Args[0]) is fine — a frame store.
 				// Value operand (Args[1]) means the pointer itself is
-				// written into memory → escape.
+				// written into memory → escape at its offset.
 				if len(u.Args) >= 2 && u.Args[1] == v {
-					return true, "frame pointer stored to memory"
+					escape(off, "frame pointer stored to memory")
 				}
 			case OpLoad8U, OpLoad8S, OpLoad16U, OpLoad16S, OpLoad32,
 				OpLoad32U, OpLoad32S, OpLoad64, OpLoadF32, OpLoadF64:
 				// Address operand — a frame load. Fine.
+			case OpEq32, OpNe32, OpLtS32, OpLtU32, OpLeS32, OpLeU32:
+				// Comparing the frame pointer (stack-limit checks,
+				// pointer equality) consumes it as a NUMBER — no alias
+				// is created and no frame memory becomes reachable.
 			case OpCallDirect, OpCallIndirect, OpCallImport:
-				return true, "frame pointer passed to a call"
+				escape(off, "frame pointer passed to a call")
 			default:
-				return true, "frame pointer used by " + u.Op.String()
+				// Bulk-memory ops, selects, comparisons, … — no offset
+				// attribution attempted: whole-frame poison.
+				escape(math.MinInt64, "frame pointer used by "+u.Op.String())
 			}
 		}
 	}
-	return false, ""
+	return escaped, reason, minOff
 }
 
 // isMemoryAccess reports whether op is a load or store.
