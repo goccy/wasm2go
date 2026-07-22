@@ -402,3 +402,102 @@ func storeSpec(v *ssa.Value) (memOpSpec, bool) {
 	}
 	return memOpSpec{}, false
 }
+
+// Inline atomics
+//
+// The four full-width aligned atomic accesses (i32/i64 atomic
+// load/store) are emitted inline as sync/atomic intrinsics instead of
+// the base.AtomicLoad*/AtomicStore* helper calls:
+//
+//	int32(atomic.LoadUint32((*uint32)(unsafe.Add(mBase, <off>))))
+//	atomic.StoreUint32((*uint32)(unsafe.Add(mBase, <off>)), uint32(vN))
+//
+// The helper chain is three //go:noinline calls deep (AtomicLoad32 →
+// AtomicPtr32 → AtomicEA — noinline so the closure-taking RMW helpers
+// stay representable in the gcasm bundler, see helpers.go), which is
+// what a wasm engine emits as ONE machine instruction. Interpreter-style
+// guests hit an atomic load on every dispatch (interrupt-flag checks),
+// so the call chain shows up as tens of percent of runtime.
+// sync/atomic Load/Store are Go compiler intrinsics — a plain MOV /
+// LDAR / STLR-class instruction, no CALL — and give exactly the
+// seq-cst ordering the wasm threads proposal requires.
+//
+// Alignment and bounds checks are dropped, mirroring the plain
+// load/store rationale at the top of this file: validated wasm from a
+// C/C++/Rust toolchain only issues ABI-aligned atomics, so a
+// misaligned or out-of-bounds atomic indicates a bug in the input, not
+// a runtime condition. (A misaligned inline atomic fails loudly anyway:
+// LDAR/STLR fault, and Go's race-free unaligned 64-bit atomics panic on
+// 32-bit-aligned addresses.)
+//
+// Everything else — sub-word loads/stores (CAS-loop lane math), RMW
+// families, cmpxchg, wait/notify, fence — keeps the helper form; those
+// either take closures or are far off any hot path.
+
+// atomicInlineSpec describes one inlineable atomic helper: the
+// sync/atomic function stem, the unsigned element type, the load
+// result cast, and where the value operand sits for stores.
+type atomicInlineSpec struct {
+	elemType string // uint32 / uint64: deref target and atomic operand type
+	fn       string // sync/atomic function name
+	loadCast string // int32 / int64 wrap on load results; "" for stores
+	isStore  bool
+}
+
+// atomicInlineSpecs maps OpAtomicCall helper names (lower.go feAtomics)
+// to their inline form. Only the four full-width aligned accesses
+// appear here; absence means "keep the helper call".
+var atomicInlineSpecs = map[string]atomicInlineSpec{
+	"atomicLoad32":  {elemType: "uint32", fn: "LoadUint32", loadCast: "int32"},
+	"atomicLoad64":  {elemType: "uint64", fn: "LoadUint64", loadCast: "int64"},
+	"atomicStore32": {elemType: "uint32", fn: "StoreUint32", isStore: true},
+	"atomicStore64": {elemType: "uint64", fn: "StoreUint64", isStore: true},
+}
+
+// emitAtomicInline renders an OpAtomicCall as an inline sync/atomic
+// expression when the helper has an entry in atomicInlineSpecs and the
+// op's static offset operand is the OpConst32 the lowering built
+// (anything else — e.g. a future pass rewriting the operand — falls
+// back to the helper call). Loads return the value expression; stores
+// return the atomic.Store call expression, which the side-effect
+// statement path wraps in an ExprStmt.
+func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, name string, emitExpr func(*ssa.Value) (ast.Expr, error)) (ast.Expr, bool, error) {
+	spec, ok := atomicInlineSpecs[name]
+	if !ok {
+		return nil, false, nil
+	}
+	off := ssaConstBase(v.Args[1])
+	if off == nil {
+		return nil, false, nil
+	}
+	baseExpr, err := emitExpr(v.Args[0])
+	if err != nil {
+		return nil, false, err
+	}
+	em.useImport("unsafe")
+	em.useImport("sync/atomic")
+	added := &ast.CallExpr{
+		Fun: &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Add")},
+		Args: []ast.Expr{
+			em.memBasePtrExpr(),
+			em.memOffsetExpr(baseExpr, uint64(uint32(off.AuxInt)), v.Args[0]),
+		},
+	}
+	ptr := &ast.CallExpr{
+		Fun:  &ast.ParenExpr{X: &ast.StarExpr{X: newID(spec.elemType)}},
+		Args: []ast.Expr{added},
+	}
+	atomicFn := &ast.SelectorExpr{X: newID("atomic"), Sel: newID(spec.fn)}
+	if spec.isStore {
+		valExpr, err := emitExpr(v.Args[2])
+		if err != nil {
+			return nil, false, err
+		}
+		return &ast.CallExpr{
+			Fun:  atomicFn,
+			Args: []ast.Expr{ptr, &ast.CallExpr{Fun: newID(spec.elemType), Args: []ast.Expr{valExpr}}},
+		}, true, nil
+	}
+	loaded := &ast.CallExpr{Fun: atomicFn, Args: []ast.Expr{ptr}}
+	return &ast.CallExpr{Fun: newID(spec.loadCast), Args: []ast.Expr{loaded}}, true, nil
+}
