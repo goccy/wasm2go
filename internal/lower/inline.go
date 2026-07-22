@@ -73,7 +73,9 @@ func envIdxSet(name string) map[uint32]bool {
 	}
 	out := map[uint32]bool{}
 	for _, part := range strings.Split(v, ",") {
-		n, err := strconv.Atoi(strings.TrimSpace(part))
+		// ParseUint with bitSize 32 both rejects negatives and bounds
+		// the value to uint32, so the conversion below cannot truncate.
+		n, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "wasm2go: invalid %s entry %q: %v\n", name, part, err)
 			continue
