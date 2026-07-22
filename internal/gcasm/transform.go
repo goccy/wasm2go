@@ -47,6 +47,12 @@ type TransformOptions struct {
 	// the type's descriptor pointer (extracted from an eface). nil ⇒
 	// type references are a transform error.
 	Types *TypeTable
+	// JT, when non-nil, selects the O(1) jump-pad dispatch for gc jump
+	// tables (see jumppad.go) and accumulates the table metadata the
+	// caller must render: EmitAsm() into the same .s file and EmitGo()
+	// into the same package's arch-tagged Go file (the generated init
+	// fills the tables). nil ⇒ the legacy O(log n) compare tree.
+	JT *JTTable
 }
 
 // TypeTable accumulates runtime-type references for one output file.
@@ -222,9 +228,16 @@ type jtSite struct {
 	idx    int
 	jmpIdx int
 	idxReg string
+	// baseReg is the captured table-base register (the LEAQ/MOVD
+	// destination) — dead after the dispatch, so the O(1) jump pad may
+	// clobber it (amd64 only; arm64 uses the R16/R17 scratch pair).
+	baseReg string
+	// entryCount is the table's total selector count (len(Relocs)).
+	entryCount int
 	// replay is the captured flag-setting instruction to re-execute
-	// on every tree leaf, when some dispatch target consumes EFLAGS
-	// (see findJumpTables). Empty when no target reads flags.
+	// on every tree leaf / pad stub, when some dispatch target
+	// consumes EFLAGS (see findJumpTables). Empty when no target
+	// reads flags.
 	replay string
 	runs   []jtRun
 }
@@ -276,7 +289,12 @@ func readsFlags(txt string) bool {
 
 // findJumpTables detects gc jump-table dispatch pairs and resolves
 // their tables to run-compressed target lists.
-func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map[int]*jtSite, error) {
+//
+// flagTransparent declares that the dispatch REWRITE preserves EFLAGS
+// (the O(1) jump pad — LEAQ + memory-operand JMP, like gc's original),
+// making the flag-liveness analysis moot: no replay is captured and no
+// site can fail as unreplayable. The compare tree passes false.
+func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym, flagTransparent bool) (map[int]*jtSite, error) {
 	sites := map[int]*jtSite{}
 	for i, in := range insns {
 		lm := jtLeaqRe.FindStringSubmatch(in.Text)
@@ -303,7 +321,7 @@ func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map
 		if len(tab.Relocs) == 0 || len(tab.Relocs)*8 != tab.Size {
 			return nil, fmt.Errorf("jump table %s: %d relocs for size %d", lm[1], len(tab.Relocs), tab.Size)
 		}
-		site := &jtSite{idx: i, jmpIdx: j, idxReg: jm[2]}
+		site := &jtSite{idx: i, jmpIdx: j, idxReg: jm[2], baseReg: lm[2], entryCount: len(tab.Relocs)}
 		for k, r := range tab.Relocs {
 			if r.Off != k*8 {
 				return nil, fmt.Errorf("jump table %s: reloc %d at offset %d", lm[1], k, r.Off)
@@ -348,6 +366,10 @@ func findJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map
 		// nearest pre-dispatch flag-writer is NOT cleanly replayable do we
 		// need to know whether any target actually consumes flags; there
 		// we keep the conservative scan and fall back to pure if it might.
+		if flagTransparent {
+			sites[i] = site
+			continue
+		}
 		replay, replayClean := "", false
 		for k := i - 1; k >= 0 && i-k <= 8; k-- {
 			t := insns[k].Text
@@ -559,7 +581,7 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 
 	// Jump-table dispatch sites: LEAQ+JMP pairs replaced by binary
 	// search trees over the table's captured target offsets.
-	jtSites, err := findJumpTables(fn.Name, insns, opts.Datas)
+	jtSites, err := findJumpTables(fn.Name, insns, opts.Datas, opts.JT != nil)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", fn.Name, err)
 	}
@@ -615,7 +637,11 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 		in := insns[idx]
 		emitPending(in.Off)
 		if site, ok := jtSites[idx]; ok {
-			emitJumpTree(&b, site, in.Off)
+			if opts.JT != nil {
+				emitJumpPad(&b, opts.JT, opts.SymName, site, in.Off)
+			} else {
+				emitJumpTree(&b, site, in.Off)
+			}
 			idx = site.jmpIdx // swallow padding NOPs + the indirect JMP
 			continue
 		}

@@ -46,7 +46,7 @@ func a64JtDatas() map[string]*DataSym {
 // went the wrong way, corrupting linear memory).
 func TestA64JumpTableFlagReplayDetect(t *testing.T) {
 	t.Run("clean setter replayed at leaves", func(t *testing.T) {
-		sites, err := a64FindJumpTables("lib.FDispatch", a64JtInsns("CMPW\t$40, R1"), a64JtDatas())
+		sites, err := a64FindJumpTables("lib.FDispatch", a64JtInsns("CMPW\t$40, R1"), a64JtDatas(), false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -81,7 +81,7 @@ func TestA64JumpTableFlagReplayDetect(t *testing.T) {
 		// Replace the compare with a flag-neutral instruction: the
 		// backward scan finds no clean setter, and target 100 (BLT)
 		// consumes flags → errUnsupportedJumpTable → pure fallback.
-		_, err := a64FindJumpTables("lib.FDispatch", a64JtInsns("MOVD\t$40, R3"), a64JtDatas())
+		_, err := a64FindJumpTables("lib.FDispatch", a64JtInsns("MOVD\t$40, R3"), a64JtDatas(), false)
 		if !errors.Is(err, errUnsupportedJumpTable) {
 			t.Fatalf("err = %v, want errUnsupportedJumpTable", err)
 		}
@@ -92,7 +92,7 @@ func TestA64JumpTableFlagReplayDetect(t *testing.T) {
 		// the dispatch clobbers both. With target 100 consuming flags
 		// the site must fall back rather than replay a clobbered
 		// operand.
-		_, err := a64FindJumpTables("lib.FDispatch", a64JtInsns("CMPW\t$40, R17"), a64JtDatas())
+		_, err := a64FindJumpTables("lib.FDispatch", a64JtInsns("CMPW\t$40, R17"), a64JtDatas(), false)
 		if !errors.Is(err, errUnsupportedJumpTable) {
 			t.Fatalf("err = %v, want errUnsupportedJumpTable (replay operand clobbered)", err)
 		}
@@ -101,7 +101,7 @@ func TestA64JumpTableFlagReplayDetect(t *testing.T) {
 	t.Run("no setter, flag-neutral targets stay transformed", func(t *testing.T) {
 		insns := a64JtInsns("MOVD\t$40, R3")
 		insns[5].Text = "MOVD\t$3, R0" // target 100 no longer reads flags
-		sites, err := a64FindJumpTables("lib.FDispatch", insns, a64JtDatas())
+		sites, err := a64FindJumpTables("lib.FDispatch", insns, a64JtDatas(), false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,6 +151,7 @@ func TestA64JumpTableFlagReplayRun(t *testing.T) {
 	for _, d := range datas {
 		dm[d.Name] = d
 	}
+	jt := &JTTable{}
 	body, err := TransformARM64(disp, TransformOptions{
 		SymName:   "fdispatchAsm",
 		CalleeSig: func(string) ([]ArgKind, bool, ArgKind, string, bool) { return nil, false, 0, "", false },
@@ -159,6 +160,7 @@ func TestA64JumpTableFlagReplayRun(t *testing.T) {
 		Result:    ArgI32,
 		ArgNames:  []string{"sel", "v0"},
 		Datas:     dm,
+		JT:        jt,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "jump") {
@@ -166,15 +168,16 @@ func TestA64JumpTableFlagReplayRun(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	if !strings.Contains(body, "jt") || strings.Contains(body, ".jump") {
+	if !strings.Contains(body, "_jt") || strings.Contains(body, ".jump") {
 		t.Skipf("gc did not emit a jump table for FDispatch on this toolchain")
 	}
+	body += jt.EmitAsm("arm64")
 
 	run := t.TempDir()
 	files := map[string]string{
 		"go.mod": "module fjtrun\n\ngo 1.25.0\n",
-		"decl.go": "//go:build arm64\n\npackage fjtrun\n\nfunc fdispatchAsm(sel int32, v0 int32) (r0 int32)\n\n//go:noinline\n" +
-			flagDispatchSrc("fdispatchRef"),
+		"decl.go": "//go:build arm64\n\npackage fjtrun\n\nimport \"unsafe\"\n\nvar _ unsafe.Pointer\n\nfunc fdispatchAsm(sel int32, v0 int32) (r0 int32)\n\n//go:noinline\n" +
+			flagDispatchSrc("fdispatchRef") + "\n" + jt.EmitGo("arm64"),
 		"body_arm64.s": "#include \"textflag.h\"\n#include \"funcdata.h\"\n\n" + body,
 		"run_test.go": `package fjtrun
 
