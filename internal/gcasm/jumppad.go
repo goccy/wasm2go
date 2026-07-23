@@ -18,9 +18,10 @@ import (
 //
 //     amd64:  LEAQ ·tab(SB), base           (RIP-relative, PIE-safe)
 //             JMP  (base)(idx*8)
-//     arm64:  MOVD $·tab(SB), R16
-//             MOVD (R16)(idx<<3), R17
-//             JMP  (R17)
+//     arm64:  MOVD  $·tab(SB), base
+//             MOVWU idx, t                  (uxtw — see a64EmitJumpPad)
+//             MOVD  (base)(t<<3), t
+//             JMP   (t)
 //
 //     Exactly the registers gc's own dispatch clobbered, and — like
 //     gc's dispatch — NO flag-register writes: the pre-dispatch flag
@@ -45,8 +46,9 @@ import (
 //
 //	amd64: two long NOPs `0F 1F 80 <sig32>` + `0F 1F 80 <^sig32>`
 //	       (14 bytes; the complement pair rules out accidental matches)
-//	arm64: MOVZ/MOVK/MOVK into R17 (a dispatch scratch) carrying a
-//	       48-bit signature across three fixed-form instructions.
+//	arm64: MOVZ/MOVK/MOVK into the dispatch's dead target register,
+//	       carrying a 48-bit signature across three fixed-form
+//	       instructions (the scanner ignores the Rd bits).
 
 // JTTable accumulates jump-table dispatch sites for one output .s
 // file, like ConstPool/TypeTable. The caller appends EmitAsm() to the
@@ -153,23 +155,45 @@ func a64EmitJumpPad(b *strings.Builder, jt *JTTable, symName string, site *jtSit
 	tab := fmt.Sprintf("%s_jt%d", symName, siteOff)
 	entries, targets := jtExpandEntries(site)
 
-	fmt.Fprintf(b, "\tMOVD $·%s(SB), R16\n", tab)
-	fmt.Fprintf(b, "\tMOVD (R16)(%s<<3), R17\n", site.idxReg)
-	fmt.Fprintf(b, "\tJMP (R17)\n")
+	// Register discipline: gc's arm64 allocator may keep LIVE values in
+	// any register (R16/R17 included), so the pad clobbers exactly what
+	// the ORIGINAL dispatch clobbered — the captured table-base and
+	// jump-target registers — and nothing else.
+	//
+	// The captured `(Rb)(Ri<<3)` text is also LOSSY: gc's original
+	// load is `ldr xt,[xb,w_i,uxtw #3]` — a 32-BIT index,
+	// zero-extended — but Plan9 `<<3` re-assembles as the 64-bit
+	// X-form, so garbage in the selector's high bits (legal under gc's
+	// original!) would poison the address. Re-establish uxtw
+	// explicitly: br_table selectors are wasm i32, so MOVWU is exact.
+	fmt.Fprintf(b, "\tMOVD $·%s(SB), %s\n", tab, site.baseReg)
+	fmt.Fprintf(b, "\tMOVWU %s, %s\n", site.idxReg, site.tReg)
+	fmt.Fprintf(b, "\tMOVD (%s)(%s<<3), %s\n", site.baseReg, site.tReg, site.tReg)
+	fmt.Fprintf(b, "\tJMP (%s)\n", site.tReg)
 
 	sigs := make([]uint64, len(targets))
 	for i, t := range targets {
 		sig := jtSig(symName, siteOff, t, 48)
 		sigs[i] = sig
-		// MOVZ x17,#lo / MOVK x17,#mid,lsl16 / MOVK x17,#hi,lsl32 —
-		// three fixed-form writes to the R17 scratch the dispatch
-		// already clobbers, carrying the 48-bit signature.
-		fmt.Fprintf(b, "\tWORD $0x%08X\n", 0xD2800011|uint32(sig&0xFFFF)<<5)
-		fmt.Fprintf(b, "\tWORD $0x%08X\n", 0xF2A00011|uint32(sig>>16&0xFFFF)<<5)
-		fmt.Fprintf(b, "\tWORD $0x%08X\n", 0xF2C00011|uint32(sig>>32&0xFFFF)<<5)
+		// MOVZ/MOVK/MOVK into the captured target register (already
+		// clobbered by the dispatch that landed here), carrying the
+		// 48-bit signature. The scanner masks the Rd bits out.
+		rd := a64RegNum(site.tReg)
+		fmt.Fprintf(b, "\tWORD $0x%08X\n", 0xD2800000|uint32(sig&0xFFFF)<<5|rd)
+		fmt.Fprintf(b, "\tWORD $0x%08X\n", 0xF2A00000|uint32(sig>>16&0xFFFF)<<5|rd)
+		fmt.Fprintf(b, "\tWORD $0x%08X\n", 0xF2C00000|uint32(sig>>32&0xFFFF)<<5|rd)
 		fmt.Fprintf(b, "\tJMP pc%d\n", t)
 	}
 	fn.Sites = append(fn.Sites, JTSite{TabVar: tab, Entries: entries, Sigs: sigs})
+}
+
+// a64RegNum parses "R17" → 17 for instruction encoding.
+func a64RegNum(reg string) uint32 {
+	n := 0
+	for i := 1; i < len(reg); i++ {
+		n = n*10 + int(reg[i]-'0')
+	}
+	return uint32(n & 31)
 }
 
 // EmitAsm renders the per-function address helpers (`<Sym>_jtpc`) the
@@ -231,6 +255,12 @@ func gcasmJTInit(pc unsafe.Pointer, specs []gcasmJTSpec) {
 	for _, s := range specs {
 		need += len(s.sigs)
 	}
+	expected := make(map[uint64]bool, need)
+	for _, s := range specs {
+		for _, sig := range s.sigs {
+			expected[sig] = true
+		}
+	}
 	found := make(map[uint64]unsafe.Pointer, need)
 	const maxScan = 1 << 26
 	for off, n := 0, 0; n < need; off++ {
@@ -243,7 +273,7 @@ func gcasmJTInit(pc unsafe.Pointer, specs []gcasmJTSpec) {
 		}
 		sig := uint32(p[3]) | uint32(p[4])<<8 | uint32(p[5])<<16 | uint32(p[6])<<24
 		inv := uint32(p[10]) | uint32(p[11])<<8 | uint32(p[12])<<16 | uint32(p[13])<<24
-		if inv != ^sig {
+		if inv != ^sig || !expected[uint64(sig)] {
 			continue
 		}
 		if _, dup := found[uint64(sig)]; !dup {
@@ -275,6 +305,12 @@ func gcasmJTInit(pc unsafe.Pointer, specs []gcasmJTSpec) {
 	for _, s := range specs {
 		need += len(s.sigs)
 	}
+	expected := make(map[uint64]bool, need)
+	for _, s := range specs {
+		for _, sig := range s.sigs {
+			expected[sig] = true
+		}
+	}
 	found := make(map[uint64]unsafe.Pointer, need)
 	const maxScan = 1 << 26
 	for off, n := 0, 0; n < need; off += 4 {
@@ -282,10 +318,13 @@ func gcasmJTInit(pc unsafe.Pointer, specs []gcasmJTSpec) {
 			panic("gcasm: jump-table signature scan overflow")
 		}
 		w := (*[3]uint32)(unsafe.Add(pc, off))
-		if w[0]&0xFFE0001F != 0xD2800011 || w[1]&0xFFE0001F != 0xF2A00011 || w[2]&0xFFE0001F != 0xF2C00011 {
+		if w[0]&0xFFE00000 != 0xD2800000 || w[1]&0xFFE00000 != 0xF2A00000 || w[2]&0xFFE00000 != 0xF2C00000 {
 			continue
 		}
 		sig := uint64(w[0]>>5&0xFFFF) | uint64(w[1]>>5&0xFFFF)<<16 | uint64(w[2]>>5&0xFFFF)<<32
+		if !expected[sig] {
+			continue
+		}
 		if _, dup := found[sig]; !dup {
 			found[sig] = unsafe.Add(pc, off)
 			n++

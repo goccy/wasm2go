@@ -177,7 +177,7 @@ func a64FindJumpTables(fnName string, insns []Insn, datas map[string]*DataSym, f
 		if len(tab.Relocs) == 0 || len(tab.Relocs)*8 != tab.Size {
 			return nil, fmt.Errorf("jump table %s: %d relocs for size %d", lm[1], len(tab.Relocs), tab.Size)
 		}
-		site := &jtSite{idx: i, jmpIdx: k, idxReg: idxReg, baseReg: lm[2], entryCount: len(tab.Relocs)}
+		site := &jtSite{idx: i, jmpIdx: k, idxReg: idxReg, baseReg: lm[2], tReg: tReg, entryCount: len(tab.Relocs)}
 		for ri, r := range tab.Relocs {
 			if r.Off != ri*8 {
 				return nil, fmt.Errorf("jump table %s: reloc %d at offset %d", lm[1], ri, r.Off)

@@ -229,9 +229,11 @@ type jtSite struct {
 	jmpIdx int
 	idxReg string
 	// baseReg is the captured table-base register (the LEAQ/MOVD
-	// destination) — dead after the dispatch, so the O(1) jump pad may
-	// clobber it (amd64 only; arm64 uses the R16/R17 scratch pair).
+	// destination) and tReg (arm64) the captured jump-target register —
+	// both dead after the dispatch, so the O(1) jump pad clobbers
+	// exactly these and nothing else.
 	baseReg string
+	tReg    string
 	// entryCount is the table's total selector count (len(Relocs)).
 	entryCount int
 	// replay is the captured flag-setting instruction to re-execute
