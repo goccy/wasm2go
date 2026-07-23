@@ -245,21 +245,27 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 		t.Fatalf("Sock_socket returned bad fd %d", fd)
 	}
 
+	// Resolve the loopback host first so Sock_connect can hand the dial hook the
+	// host name that was looked up for this IP (host+port matched jointly).
+	hoff, hln := putPath(m, 512, "127.0.0.1")
+	if rc := w.Sock_getaddrinfo(m, hoff, hln, 600); rc != _wasiESUCCESS {
+		t.Fatalf("getaddrinfo for dial-hook host: rc=%d", rc)
+	}
 	// Whitelist denies first.
 	var dialed []string
-	w.SetDialHook(func(network, ip string, p int) bool {
-		dialed = append(dialed, fmt.Sprintf("%s/%s:%d", network, ip, p))
+	w.SetDialHook(func(network, host, ip string, p int) bool {
+		dialed = append(dialed, fmt.Sprintf("%s/%s/%s:%d", network, host, ip, p))
 		return false
 	})
 	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != -_wasiEACCES {
 		t.Fatalf("denied connect: want -EACCES, got %d", rc)
 	}
-	if len(dialed) != 1 || dialed[0] != fmt.Sprintf("tcp/127.0.0.1:%d", port) {
-		t.Fatalf("dial hook saw %v, want tcp/127.0.0.1:%d", dialed, port)
+	if len(dialed) != 1 || dialed[0] != fmt.Sprintf("tcp/127.0.0.1/127.0.0.1:%d", port) {
+		t.Fatalf("dial hook saw %v, want tcp/127.0.0.1/127.0.0.1:%d", dialed, port)
 	}
 
 	// Allow → connect succeeds and attaches the conn.
-	w.SetDialHook(func(network, ip string, p int) bool { return true })
+	w.SetDialHook(func(network, host, ip string, p int) bool { return true })
 	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != _wasiESUCCESS {
 		t.Fatalf("allowed connect: want SUCCESS, got %d", rc)
 	}
