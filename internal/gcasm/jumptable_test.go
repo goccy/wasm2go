@@ -49,7 +49,7 @@ func TestJumpTableTransformRun(t *testing.T) {
 		}
 	}
 
-	transformOnce := func() string {
+	transformOnce := func() (string, string) {
 		fns, datas, err := Capture(dir, "jtgate/lib")
 		if err != nil {
 			t.Fatal(err)
@@ -67,6 +67,7 @@ func TestJumpTableTransformRun(t *testing.T) {
 		for _, d := range datas {
 			dm[d.Name] = d
 		}
+		jt := &JTTable{}
 		body, err := Transform(disp, TransformOptions{
 			SymName:   "dispatchAsm",
 			CalleeSig: func(string) ([]ArgKind, bool, ArgKind, string, bool) { return nil, false, 0, "", false },
@@ -75,25 +76,26 @@ func TestJumpTableTransformRun(t *testing.T) {
 			Result:    ArgI32,
 			ArgNames:  []string{"sel", "v0"},
 			Datas:     dm,
+			JT:        jt,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return body
+		return body + jt.EmitAsm("amd64"), jt.EmitGo("amd64")
 	}
-	body := transformOnce()
-	if body2 := transformOnce(); body2 != body {
+	body, jtGo := transformOnce()
+	if body2, jtGo2 := transformOnce(); body2 != body || jtGo2 != jtGo {
 		t.Fatalf("transform not deterministic:\n--- run1\n%s\n--- run2\n%s", body, body2)
 	}
-	if !strings.Contains(body, "jt") || strings.Contains(body, ".jump") {
-		t.Fatalf("jump table not rewritten to a tree:\n%s", body)
+	if !strings.Contains(body, "_jt") || strings.Contains(body, ".jump") {
+		t.Fatalf("jump table not rewritten to an O(1) pad:\n%s", body)
 	}
 
 	run := t.TempDir()
 	files := map[string]string{
 		"go.mod": "module jtrun\n\ngo 1.25.0\n",
-		"decl.go": "package jtrun\n\nfunc dispatchAsm(sel int32, v0 int32) (r0 int32)\n\n//go:noinline\n" +
-			dispatchSrc("dispatchRef"),
+		"decl.go": "package jtrun\n\nimport \"unsafe\"\n\nvar _ unsafe.Pointer\n\nfunc dispatchAsm(sel int32, v0 int32) (r0 int32)\n\n//go:noinline\n" +
+			dispatchSrc("dispatchRef") + "\n" + jtGo,
 		"body_amd64.s": "#include \"textflag.h\"\n#include \"funcdata.h\"\n\n" + body,
 		"run_test.go": `package jtrun
 

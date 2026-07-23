@@ -296,6 +296,7 @@ func gcasmBitsTrailingZeros64(x uint64) int  { return bits.TrailingZeros64(x) }
 		declB.WriteString("\n")
 		pool := &ConstPool{}
 		types := &TypeTable{}
+		jt := &JTTable{}
 		for _, f := range fns {
 			m := fnIdxRe.FindStringSubmatch(f.Name)
 			if m == nil {
@@ -335,6 +336,7 @@ func gcasmBitsTrailingZeros64(x uint64) int  { return bits.TrailingZeros64(x) }
 				Datas:     dm,
 				Consts:    pool,
 				Types:     types,
+				JT:        jt,
 			})
 			if err != nil {
 				t.Fatalf("transform %s: %v", f.Name, err)
@@ -352,6 +354,9 @@ func gcasmBitsTrailingZeros64(x uint64) int  { return bits.TrailingZeros64(x) }
 			t.Fatalf("unresolved in-module callees (silent ABI mismatch): %v", unresolved)
 		}
 		asmB.WriteString(pool.Emit())
+		asmB.WriteString(jt.EmitAsm("amd64"))
+		declB.WriteString("\n")
+		declB.WriteString(jt.EmitGo("amd64"))
 		// Type descriptor vars: initialise each from an eface's type
 		// word — the same descriptor `LEAQ type:F(SB)` would produce.
 		// The captured spelling qualifies identifiers with the import

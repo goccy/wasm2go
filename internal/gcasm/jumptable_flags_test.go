@@ -71,6 +71,7 @@ func TestJumpTableFlagReplayRun(t *testing.T) {
 	for _, d := range datas {
 		dm[d.Name] = d
 	}
+	jt := &JTTable{}
 	body, err := Transform(disp, TransformOptions{
 		SymName:   "fdispatchAsm",
 		CalleeSig: func(string) ([]ArgKind, bool, ArgKind, string, bool) { return nil, false, 0, "", false },
@@ -79,6 +80,7 @@ func TestJumpTableFlagReplayRun(t *testing.T) {
 		Result:    ArgI32,
 		ArgNames:  []string{"sel", "v0"},
 		Datas:     dm,
+		JT:        jt,
 	})
 	if err != nil {
 		// If gc chose NOT to emit a jump table (compiler-version
@@ -89,15 +91,16 @@ func TestJumpTableFlagReplayRun(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	if !strings.Contains(body, "jt") || strings.Contains(body, ".jump") {
+	if !strings.Contains(body, "_jt") || strings.Contains(body, ".jump") {
 		t.Skipf("gc did not emit a jump table for FDispatch on this toolchain")
 	}
+	body += jt.EmitAsm("amd64")
 
 	run := t.TempDir()
 	files := map[string]string{
 		"go.mod": "module fjtrun\n\ngo 1.25.0\n",
-		"decl.go": "package fjtrun\n\nfunc fdispatchAsm(sel int32, v0 int32) (r0 int32)\n\n//go:noinline\n" +
-			flagDispatchSrc("fdispatchRef"),
+		"decl.go": "package fjtrun\n\nimport \"unsafe\"\n\nvar _ unsafe.Pointer\n\nfunc fdispatchAsm(sel int32, v0 int32) (r0 int32)\n\n//go:noinline\n" +
+			flagDispatchSrc("fdispatchRef") + "\n" + jt.EmitGo("amd64"),
 		"body_amd64.s": "#include \"textflag.h\"\n#include \"funcdata.h\"\n\n" + body,
 		"run_test.go": `package fjtrun
 

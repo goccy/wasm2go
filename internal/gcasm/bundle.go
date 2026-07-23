@@ -503,8 +503,8 @@ type archSpec struct {
 }
 
 var archSpecs = []archSpec{
-	{name: "amd64", transform: Transform, jtMarker: "\tJCC jt"},
-	{name: "arm64", transform: TransformARM64, jtMarker: "\tBHS jt"},
+	{name: "amd64", transform: Transform, jtMarker: "_jt"},
+	{name: "arm64", transform: TransformARM64, jtMarker: "_jt"},
 }
 
 func buildPkg(
@@ -534,6 +534,7 @@ func buildPkg(
 	fallbackNames := map[string]bool{}
 	pool := &ConstPool{}
 	types := &TypeTable{}
+	jt := &JTTable{}
 	var asmB strings.Builder
 	// The build tag pins GOARCH explicitly: the bundle uses bare
 	// arch filenames (amd64.s/arm64.s), which — having no prefix
@@ -618,6 +619,7 @@ func buildPkg(
 			Datas:     dm,
 			Consts:    pool,
 			Types:     types,
+			JT:        jt,
 		})
 		if terr != nil {
 			// A duff body, or a jump table whose flag state cannot be replayed
@@ -697,6 +699,7 @@ func buildPkg(
 	}
 
 	asmB.WriteString(pool.Emit())
+	asmB.WriteString(jt.EmitAsm(arch.name))
 
 	// Decls file.
 	var decl strings.Builder
@@ -865,6 +868,13 @@ var (
 			decl.WriteString(body)
 			decl.WriteString("\n\n")
 		}
+	}
+
+	// O(1) jump-table support: table vars + the init that fills them
+	// by scanning for the pad signatures (see jumppad.go).
+	if jtGo := jt.EmitGo(arch.name); jtGo != "" {
+		decl.WriteString("\n// Jump-table dispatch tables, filled at init by signature scan.\n\n")
+		decl.WriteString(jtGo)
 	}
 
 	prefix := ""

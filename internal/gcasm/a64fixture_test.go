@@ -100,6 +100,7 @@ func a64FixtureGate(t *testing.T, fixture string) {
 	}
 	pool := &ConstPool{}
 	types := &TypeTable{}
+	jt := &JTTable{}
 	var asmB, declB strings.Builder
 	asmB.WriteString("//go:build arm64\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
 	declB.WriteString("//go:build arm64\n\npackage pkg\n")
@@ -145,6 +146,7 @@ func a64FixtureGate(t *testing.T, fixture string) {
 			Datas:     dm,
 			Consts:    pool,
 			Types:     types,
+			JT:        jt,
 		})
 		if err != nil {
 			t.Fatalf("transform %s: %v", f.Name, err)
@@ -162,6 +164,9 @@ func a64FixtureGate(t *testing.T, fixture string) {
 		t.Fatalf("unresolved callees: %v", unresolved)
 	}
 	asmB.WriteString(pool.Emit())
+	asmB.WriteString(jt.EmitAsm("arm64"))
+	declB.WriteString("\n")
+	declB.WriteString(jt.EmitGo("arm64"))
 	if len(types.Names) > 0 {
 		t.Skipf("type refs present (%d) — arm64 type-desc wiring TODO", len(types.Names))
 	}

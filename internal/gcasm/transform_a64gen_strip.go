@@ -136,7 +136,12 @@ func a64StripPrologueEpilogue(insns []Insn) ([]Insn, error) {
 // a64FindJumpTables detects gc arm64 jump-table dispatch triples
 // (`MOVD $tab(SB),Rb; MOVD (Rb)(Ri<<3),Rt; JMP (Rt)`) and resolves the
 // table's R_ADDR relocs to run-compressed target lists.
-func a64FindJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (map[int]*jtSite, error) {
+//
+// flagTransparent declares that the dispatch REWRITE preserves NZCV
+// (the O(1) jump pad — arm64 ADD writes no flags), making the whole
+// flag-liveness analysis moot: no replay is captured and no site can
+// fail as unreplayable. The compare tree passes false.
+func a64FindJumpTables(fnName string, insns []Insn, datas map[string]*DataSym, flagTransparent bool) (map[int]*jtSite, error) {
 	sites := map[int]*jtSite{}
 	for i, in := range insns {
 		lm := a64JtLeaqRe.FindStringSubmatch(in.Text)
@@ -172,7 +177,7 @@ func a64FindJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (
 		if len(tab.Relocs) == 0 || len(tab.Relocs)*8 != tab.Size {
 			return nil, fmt.Errorf("jump table %s: %d relocs for size %d", lm[1], len(tab.Relocs), tab.Size)
 		}
-		site := &jtSite{idx: i, jmpIdx: k, idxReg: idxReg}
+		site := &jtSite{idx: i, jmpIdx: k, idxReg: idxReg, baseReg: lm[2], tReg: tReg, entryCount: len(tab.Relocs)}
 		for ri, r := range tab.Relocs {
 			if r.Off != ri*8 {
 				return nil, fmt.Errorf("jump table %s: reloc %d at offset %d", lm[1], ri, r.Off)
@@ -207,6 +212,10 @@ func a64FindJumpTables(fnName string, insns []Insn, datas map[string]*DataSym) (
 		// operands exclude the table-base and target registers, which
 		// the captured dispatch clobbers between the compare and the
 		// leaf (the tree itself only READS the selector register).
+		if flagTransparent {
+			sites[i] = site
+			continue
+		}
 		replay, replayClean := "", false
 		for k2 := i - 1; k2 >= 0 && i-k2 <= 8; k2-- {
 			t := insns[k2].Text

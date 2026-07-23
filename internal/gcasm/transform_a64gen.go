@@ -114,7 +114,7 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 		fmt.Fprintf(&b, "\t%s %s+%d(FP), %s\n", loadForARM64(a.Kind), opts.argName(i), a.StackOf, a.Reg)
 	}
 
-	jtSites, err := a64FindJumpTables(fn.Name, insns, opts.Datas)
+	jtSites, err := a64FindJumpTables(fn.Name, insns, opts.Datas, opts.JT != nil)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", fn.Name, err)
 	}
@@ -160,7 +160,11 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 		in := insns[idx]
 		emitPending(in.Off)
 		if site, ok := jtSites[idx]; ok {
-			a64EmitJumpTree(&b, site, in.Off)
+			if opts.JT != nil {
+				a64EmitJumpPad(&b, opts.JT, opts.SymName, site, in.Off)
+			} else {
+				a64EmitJumpTree(&b, site, in.Off)
+			}
 			idx = site.jmpIdx
 			continue
 		}
