@@ -88,6 +88,12 @@ type structEmitter struct {
 	// recursive region() call for the protected body does not re-trigger the
 	// try wrapper on its own entry block.
 	tryOpened map[ssa.BlockID]bool
+	// tryStack is the stack of try regions whose protected BODY is being
+	// emitted, innermost last. It answers "where does a re-panic from here
+	// land": the innermost stack entry with handlers. Handler bodies are
+	// emitted with their own region popped (a throw inside a catch handler
+	// propagates out of that try, not back into it).
+	tryStack []*ssa.TryRegion
 	// emitCount counts block emissions; dupCap bounds duplication of shared
 	// forward-join blocks (see the re-entry handling in region). Exceeding it
 	// aborts structured emission (fall back to the goto emitter) rather than
@@ -365,12 +371,69 @@ func (se *structEmitter) emitTryRegion(tr *ssa.TryRegion) ([]ast.Stmt, bool) {
 	}
 	excVar := fmt.Sprintf("__exc%d", tr.Entry.ID)
 
+	// A delegate region forwards its exceptions to a specific outer try,
+	// skipping any try nested in between. Structured emission expresses
+	// forwarding as a plain re-panic, which always lands at the INNERMOST
+	// enclosing region with handlers — so it can only represent a delegate
+	// whose resolved target IS that region (enclosing delegate regions are
+	// transparent: they re-panic onward, and each verified its own target
+	// when it was emitted). Anything else routes the function to the
+	// trampoline, whose flag-based dispatch can skip regions.
+	if tr.Delegate {
+		var natural *ssa.TryRegion
+		for i := len(se.tryStack) - 1; i >= 0; i-- {
+			if len(se.tryStack[i].Handlers) > 0 {
+				natural = se.tryStack[i]
+				break
+			}
+		}
+		if tr.DelegateTarget != natural {
+			return nil, false
+		}
+	}
+	if len(tr.Handlers) > 0 {
+		if se.em.excVarOfRegion == nil {
+			se.em.excVarOfRegion = map[*ssa.TryRegion]string{}
+		}
+		if se.em.excVarOfHandlerBlock == nil {
+			se.em.excVarOfHandlerBlock = map[ssa.BlockID]string{}
+		}
+		se.em.excVarOfRegion[tr] = excVar
+		for _, h := range tr.Handlers {
+			se.em.excVarOfHandlerBlock[h.Block.ID] = excVar
+		}
+	}
+
+	// The closure must contain exactly the PROTECTED body. region() walks
+	// every reachable block until Post, so a br that exits the try early
+	// would get its continuation duplicated INSIDE the closure — code that
+	// must run unprotected would run under this try's recover. Bail to the
+	// trampoline (whose per-edge flag clears express the early exit) when
+	// any body block escapes to something other than Post. Membership comes
+	// from the lowering's structural record (tr.Body), not reachability —
+	// the escaped continuation IS reachable from the body.
+	{
+		bodySet := map[ssa.BlockID]bool{}
+		for _, b := range tr.Body {
+			bodySet[b.ID] = true
+		}
+		for _, b := range tr.Body {
+			for _, e := range b.Succs {
+				if !bodySet[e.Block.ID] && e.Block.ID != tr.Post.ID {
+					return nil, false
+				}
+			}
+		}
+	}
+
 	// Body region, emitted inside the closure. A function return reached inside
 	// the body cannot be represented in the *wasmExc closure (see inTryDepth);
 	// region() bails when it hits one, routing the whole function to the
 	// trampoline.
 	se.inTryDepth++
+	se.tryStack = append(se.tryStack, tr)
 	bodyStmts, ok := se.region(tr.Entry, tr.Post)
+	se.tryStack = se.tryStack[:len(se.tryStack)-1]
 	se.inTryDepth--
 	if !ok {
 		return nil, false
@@ -477,6 +540,16 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			if tr.Post != nil && len(tr.Post.Preds) > 0 {
 				b = tr.Post
 			} else {
+				// No path falls out of this try: the body always throws (a
+				// return or br out bails to the trampoline instead), and
+				// every handler terminates too. Go's termination analysis
+				// cannot see that through the closure + dispatch, so close
+				// the region the same way the flat emitter renders
+				// unreachable code.
+				se.em.useHelper("wasm_trap_unreachable")
+				out = append(out,
+					&ast.ExprStmt{X: &ast.CallExpr{Fun: se.em.helperRef("wasm_trap_unreachable")}},
+					&ast.ForStmt{Body: &ast.BlockStmt{}})
 				b = nil
 			}
 			continue

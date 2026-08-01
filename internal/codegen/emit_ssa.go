@@ -29,6 +29,20 @@ type ssaEmitter struct {
 	// region so OpCatchArg can read its operand slots. Empty outside a
 	// handler.
 	catchExcVar string
+
+	// excVarOfRegion maps a try region to the Go variable holding its caught
+	// *wasmExc. Handlers nest, so a `rethrow l` can name an OUTER region's
+	// exception while an inner handler's catchExcVar is current; throwStmt
+	// resolves Block.RethrowRegion through this map. Both emit paths register
+	// their per-region variables here (structured: __exc<entryID>; trampoline:
+	// __excR<entryID>). Reset per function.
+	excVarOfRegion map[*ssa.TryRegion]string
+
+	// excVarOfHandlerBlock maps a handler landing-pad block to the exception
+	// variable its OpCatchArg values read. Set alongside excVarOfRegion; used
+	// by the trampoline path, whose handler blocks are emitted flat (outside
+	// any per-region lexical context). Reset per function.
+	excVarOfHandlerBlock map[ssa.BlockID]string
 }
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
@@ -334,24 +348,31 @@ type emitCtx struct {
 
 // trampCtx is the recover-trampoline protocol (see emitTrampoline): a BlockRet
 // records the function return in flags and exits the closure with `return nil`;
-// entering a try body sets its __inTryN flag; an edge to a try's Post clears it.
+// entering a try body sets its __inTryN flag; any edge LEAVING a try's body
+// clears it. Exit edges — not just edges to the try's Post — matter: a br out
+// of a protected body (a break crossing the try, which is exactly what routes
+// a function to the trampoline) must drop the flag, or a later unrelated
+// throw would misroute into this try's handler.
 type trampCtx struct {
-	retVar    string
-	rvVars    []string
-	entrySet  map[ssa.BlockID]string // try-entry block → __inTryN var to set true
-	postClear map[ssa.BlockID]string // try Post block → __inTryN var to clear on entry
+	retVar   string
+	rvVars   []string
+	entrySet map[ssa.BlockID]string // try-entry block → __inTryN var to set true
+	// edgeClears returns the __inTryN vars to clear on the pred→succ edge
+	// (the trys whose body contains pred but not succ). Nil outside
+	// emitTrampoline.
+	edgeClears func(pred, succ ssa.BlockID) []string
 }
 
-// edge emits the pred→succ transition: phi edge-copies, an optional __inTryN
-// clear when succ is a try Post (trampoline), then the goto.
+// edge emits the pred→succ transition: phi edge-copies, the __inTryN clears
+// for every try body this edge leaves (trampoline), then the goto.
 func (ec *emitCtx) edge(pred, succ *ssa.Block, predIdx int) ([]ast.Stmt, error) {
 	tmp := &ast.BlockStmt{}
 	if err := emitPhiAssignsFor(tmp, pred, succ, predIdx, ec.emitExpr, ec.stagedPhi); err != nil {
 		return nil, err
 	}
 	out := tmp.List
-	if ec.tramp != nil {
-		if v := ec.tramp.postClear[succ.ID]; v != "" {
+	if ec.tramp != nil && ec.tramp.edgeClears != nil {
+		for _, v := range ec.tramp.edgeClears(pred.ID, succ.ID) {
 			out = append(out, assignBool(v, false))
 		}
 	}
@@ -549,48 +570,85 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 // __inTryN tracks — dynamically, as control flows — whether execution is inside
 // try N's body, so a caught panic routes to the right handler even when a loop
 // re-enters "body" blocks after the try has exited (the block runs with
-// __inTryN=false then). Only non-nested handler trys are supported; anything
-// else returns an error (the function then cannot be emitted, as before).
+// __inTryN=false then). Every region gets a flag, including delegate regions:
+// a delegate's dispatch arm clears the flags of every try nested between it
+// and its resolved target, so the fall-through skips their handlers — the
+// wasm `delegate l` semantics. Each region also keeps its caught exception in
+// its own __excR<N> variable, so nested handlers and outer-targeting rethrows
+// see the right exception.
 func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *emitCtx, gotoTargets map[ssa.BlockID]bool) (*ast.BlockStmt, error) {
 	byID := map[ssa.BlockID]*ssa.Block{}
 	for _, b := range f.Blocks {
 		byID[b.ID] = b
 	}
 	type htPlan struct {
-		tr      *ssa.TryRegion
-		inTry   string
-		handler *ssa.Block // first (only supported) handler landing pad
+		tr     *ssa.TryRegion
+		inTry  string
+		excVar string // per-region caught-exception variable ("" for delegates)
 	}
 	var plans []*htPlan
 	bodySets := map[*ssa.TryRegion]map[ssa.BlockID]bool{}
 	for _, tr := range f.TryRegions {
-		if len(tr.Handlers) == 0 {
-			continue // delegate — throws propagate to the enclosing recover
-		}
-		if tr.Entry == nil || tr.Post == nil || tr.Handlers[0].Block == nil {
+		if tr.Entry == nil || tr.Post == nil {
 			return nil, fmt.Errorf("ssa emit: malformed try region")
 		}
-		// The single-handler restriction keeps the catch dispatch a plain
-		// tag check; multi-tag catch cascades are not needed by clang SjLj.
-		if len(tr.Handlers) != 1 || tr.Handlers[0].CatchAll {
-			return nil, fmt.Errorf("ssa emit: trampoline supports a single non-catch_all handler")
-		}
-		stop := map[ssa.BlockID]bool{tr.Post.ID: true, tr.Handlers[0].Block.ID: true}
-		bodySet := map[ssa.BlockID]bool{}
-		work := []*ssa.Block{tr.Entry}
-		for len(work) > 0 {
-			b := work[len(work)-1]
-			work = work[:len(work)-1]
-			if b == nil || bodySet[b.ID] || stop[b.ID] {
-				continue
+		for _, h := range tr.Handlers {
+			if h.Block == nil {
+				return nil, fmt.Errorf("ssa emit: malformed try region")
 			}
-			bodySet[b.ID] = true
-			for _, e := range b.Succs {
-				work = append(work, e.Block)
+		}
+		// Protected-body membership comes from the lowering's structural
+		// record, NOT a CFG walk: a br that exits the try early makes its
+		// (unprotected) continuation reachable from inside the body.
+		bodySet := map[ssa.BlockID]bool{}
+		if tr.Body != nil {
+			for _, b := range tr.Body {
+				bodySet[b.ID] = true
+			}
+		} else {
+			// Hand-built SSA (unit tests) has no structural record; fall
+			// back to reachability, stopping at Post and the landing pads.
+			stop := map[ssa.BlockID]bool{tr.Post.ID: true}
+			for _, h := range tr.Handlers {
+				stop[h.Block.ID] = true
+			}
+			work := []*ssa.Block{tr.Entry}
+			for len(work) > 0 {
+				b := work[len(work)-1]
+				work = work[:len(work)-1]
+				if b == nil || bodySet[b.ID] || stop[b.ID] {
+					continue
+				}
+				bodySet[b.ID] = true
+				for _, e := range b.Succs {
+					work = append(work, e.Block)
+				}
 			}
 		}
 		bodySets[tr] = bodySet
-		plans = append(plans, &htPlan{tr: tr, inTry: fmt.Sprintf("__inTry%d", tr.Entry.ID), handler: tr.Handlers[0].Block})
+		p := &htPlan{tr: tr, inTry: fmt.Sprintf("__inTry%d", tr.Entry.ID)}
+		if len(tr.Handlers) > 0 {
+			p.excVar = fmt.Sprintf("__excR%d", tr.Entry.ID)
+		}
+		plans = append(plans, p)
+	}
+	// Register the per-region exception variables so OpCatchArg (in flat-
+	// emitted landing pads) and rethrow (possibly targeting an outer region)
+	// resolve to the right one.
+	if em.excVarOfRegion == nil {
+		em.excVarOfRegion = map[*ssa.TryRegion]string{}
+	}
+	if em.excVarOfHandlerBlock == nil {
+		em.excVarOfHandlerBlock = map[ssa.BlockID]string{}
+	}
+	for _, p := range plans {
+		if p.excVar == "" {
+			continue
+		}
+		em.excVarOfRegion[p.tr] = p.excVar
+		for _, h := range p.tr.Handlers {
+			em.excVarOfHandlerBlock[h.Block.ID] = p.excVar
+		}
 	}
 	// Nested handler trys are supported: each has its own __inTry flag, and a
 	// caught panic routes to the INNERMOST active try. Order the catch dispatch
@@ -615,11 +673,22 @@ func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *e
 	}
 	labels[f.Entry.ID] = true
 	entrySet := map[ssa.BlockID]string{}
-	postClear := map[ssa.BlockID]string{}
 	for _, p := range plans {
-		labels[p.handler.ID] = true
+		for _, h := range p.tr.Handlers {
+			labels[h.Block.ID] = true
+		}
 		entrySet[p.tr.Entry.ID] = p.inTry
-		postClear[p.tr.Post.ID] = p.inTry
+	}
+	// A try's flag drops on every edge that leaves its protected body — the
+	// fall-through to Post, but also any br out of the region.
+	edgeClears := func(pred, succ ssa.BlockID) []string {
+		var vars []string
+		for _, p := range plans {
+			if bodySets[p.tr][pred] && !bodySets[p.tr][succ] {
+				vars = append(vars, p.inTry)
+			}
+		}
+		return vars
 	}
 
 	const pcVar, retVar, excVar = "__pc", "__ret", "__exc"
@@ -647,6 +716,9 @@ func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *e
 	}
 	for _, p := range plans {
 		decl(p.inTry, newID("bool"), "")
+		if p.excVar != "" {
+			decl(p.excVar, &ast.StarExpr{X: em.wasmExcType()}, "")
+		}
 	}
 	if em.t != nil {
 		em.t.usesWasmExc = true
@@ -657,7 +729,7 @@ func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *e
 	trampEc := &emitCtx{
 		f: f, hoist: flatEc.hoist, stagedPhi: flatEc.stagedPhi, emitExpr: flatEc.emitExpr,
 		labelSet: labels,
-		tramp:    &trampCtx{retVar: retVar, rvVars: rvVars, entrySet: entrySet, postClear: postClear},
+		tramp:    &trampCtx{retVar: retVar, rvVars: rvVars, entrySet: entrySet, edgeClears: edgeClears},
 	}
 	deferStmt := &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
 		Type: &ast.FuncType{Params: &ast.FieldList{}},
@@ -672,10 +744,12 @@ func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *e
 		Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(f.Entry))}},
 	})
 	for _, p := range plans {
-		pcCases = append(pcCases, &ast.CaseClause{
-			List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(p.handler.ID)}},
-			Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(p.handler))}},
-		})
+		for _, h := range p.tr.Handlers {
+			pcCases = append(pcCases, &ast.CaseClause{
+				List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.Block.ID)}},
+				Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(h.Block))}},
+			})
+		}
 	}
 	closureBody := []ast.Stmt{deferStmt, &ast.SwitchStmt{Tag: newID(pcVar), Body: &ast.BlockStmt{List: pcCases}}}
 	// Catch landing pads read their exception via em.catchExcVar (the function-
@@ -709,24 +783,59 @@ func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *e
 		Cond: newID(retVar),
 		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: retExprs}}},
 	})
-	// Dispatch the caught exception to the innermost active try's handler, else
-	// re-panic (uncaught / propagates out of this function).
+	// Dispatch the caught exception. The arms run innermost-first as an
+	// if-chain: the innermost ACTIVE try gets the exception; if none of its
+	// clauses matches the tag, control falls through to the next enclosing
+	// active try (wasm propagation), and past the last arm the exception
+	// re-panics out of the function. A delegate arm clears the flags of every
+	// try nested between it and its resolved target and falls through, so
+	// the skipped trys' arms see a false flag — `delegate l` semantics.
+	takeHandler := func(p *htPlan, h ssa.TryHandler) []ast.Stmt {
+		return []ast.Stmt{
+			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(p.excVar)}, Rhs: []ast.Expr{newID(excVar)}},
+			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(pcVar)},
+				Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.Block.ID)}}},
+			&ast.BranchStmt{Tok: token.CONTINUE},
+		}
+	}
 	var dispatch []ast.Stmt
 	for _, p := range plans {
-		dispatch = append(dispatch, &ast.CaseClause{
-			List: []ast.Expr{newID(p.inTry)},
-			Body: []ast.Stmt{
-				assignBool(p.inTry, false),
-				&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(pcVar)},
-					Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(p.handler.ID)}}},
-				&ast.BranchStmt{Tok: token.CONTINUE},
-			},
-		})
+		arm := []ast.Stmt{assignBool(p.inTry, false)}
+		if p.tr.Delegate {
+			// Clear every try between this delegate and its target (all of
+			// them for a to-caller delegate), then fall through.
+			for _, q := range plans {
+				if q == p || q.tr == p.tr.DelegateTarget {
+					continue
+				}
+				if !bodySets[q.tr][p.tr.Entry.ID] {
+					continue // q does not enclose the delegate
+				}
+				if p.tr.DelegateTarget != nil && !bodySets[p.tr.DelegateTarget][q.tr.Entry.ID] {
+					continue // q is outside the target — still eligible to catch
+				}
+				arm = append(arm, assignBool(q.inTry, false))
+			}
+		} else {
+			for _, h := range p.tr.Handlers {
+				if h.CatchAll {
+					arm = append(arm, takeHandler(p, h)...)
+					break // clauses after catch_all are unreachable
+				}
+				arm = append(arm, &ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  &ast.SelectorExpr{X: newID(excVar), Sel: newID("Tag")},
+						Op: token.EQL,
+						Y:  &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.TagIndex)},
+					},
+					Body: &ast.BlockStmt{List: takeHandler(p, h)},
+				})
+			}
+		}
+		dispatch = append(dispatch, &ast.IfStmt{Cond: newID(p.inTry), Body: &ast.BlockStmt{List: arm}})
 	}
-	dispatch = append(dispatch, &ast.CaseClause{Body: []ast.Stmt{
-		&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(excVar)}}},
-	}})
-	loopBody = append(loopBody, &ast.SwitchStmt{Body: &ast.BlockStmt{List: dispatch}})
+	dispatch = append(dispatch, &ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(excVar)}}})
+	loopBody = append(loopBody, dispatch...)
 
 	body.List = append(body.List, &ast.ForStmt{Body: &ast.BlockStmt{List: loopBody}})
 	return body, nil
@@ -871,13 +980,23 @@ func (em *ssaEmitter) throwStmt(blk *ssa.Block, emitExpr func(*ssa.Value) (ast.E
 	if em.t != nil {
 		em.t.usesWasmExc = true
 	}
-	// rethrow: re-raise the exception currently held by the enclosing catch
-	// handler. panic(<catch exc>) — no fresh wasmExc is built.
+	// rethrow: re-raise the exception caught by the handler the rethrow's
+	// label resolved to. panic(<caught exc>) — no fresh wasmExc is built.
+	// RethrowRegion picks the right exception when handlers nest (`rethrow 1`
+	// inside an inner catch re-raises the OUTER try's exception); a nil
+	// region falls back to the lexically-current handler variable.
 	if blk.IsRethrow {
-		if em.catchExcVar == "" {
+		excVar := ""
+		if blk.RethrowRegion != nil {
+			excVar = em.excVarOfRegion[blk.RethrowRegion]
+		}
+		if excVar == "" {
+			excVar = em.catchExcVar
+		}
+		if excVar == "" {
 			return nil, fmt.Errorf("ssa emit: rethrow outside a catch handler")
 		}
-		return &ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(em.catchExcVar)}}}, nil
+		return &ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(excVar)}}}, nil
 	}
 	n := blk.ThrowArgc
 	if len(blk.Values) < n {
@@ -1016,12 +1135,19 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		return newID(fmt.Sprintf("l%d", v.AuxInt)), nil
 	case ssa.OpCatchArg:
 		// The i-th operand of the exception being handled, narrowed from its
-		// uint64 slot back to the operand's wasm type.
-		if em.catchExcVar == "" {
+		// uint64 slot back to the operand's wasm type. The exception variable
+		// is the landing pad's own (trampoline path: handler blocks are
+		// emitted flat, each region has its own variable), falling back to
+		// the lexically-current handler variable (structured path).
+		excVar := em.excVarOfHandlerBlock[v.Block.ID]
+		if excVar == "" {
+			excVar = em.catchExcVar
+		}
+		if excVar == "" {
 			return nil, fmt.Errorf("ssa emit: OpCatchArg outside a catch handler")
 		}
 		slot := &ast.IndexExpr{
-			X:     &ast.SelectorExpr{X: newID(em.catchExcVar), Sel: newID("Vals")},
+			X:     &ast.SelectorExpr{X: newID(excVar), Sel: newID("Vals")},
 			Index: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(v.AuxInt)},
 		}
 		return em.narrowExcSlot(slot, v.Type), nil

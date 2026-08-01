@@ -64,6 +64,25 @@ type TryRegion struct {
 	Entry    *Block // first block of the protected (try) body
 	Post     *Block // continuation after the try's `end`
 	Handlers []TryHandler
+
+	// Body is the protected-body block set, recorded by the lowering when
+	// the body closes (first catch, delegate, or a handler-less end):
+	// Entry plus every block created while the try was open, nested
+	// regions included, minus Post. The emit passes use this instead of a
+	// CFG reachability walk — a br that exits the try early makes its
+	// continuation reachable FROM the body, but that continuation is not
+	// protected by it. May contain blocks later emptied by optimization;
+	// consumers treat it purely as a membership set.
+	Body []*Block
+
+	// Delegate marks a `try ... delegate l` region: it has no handlers and
+	// forwards any exception thrown in its body to DelegateTarget's catching
+	// context, skipping every try nested between the two. A nil
+	// DelegateTarget with Delegate set forwards out of the function (to the
+	// caller). The wasm label operand is resolved to the region at lowering
+	// time, so the emit passes never see label depths.
+	Delegate       bool
+	DelegateTarget *TryRegion
 }
 
 // TryHandler is one catch / catch_all clause of a TryRegion.
@@ -150,8 +169,16 @@ type Block struct {
 	// IsRethrow marks a BlockThrow that re-raises the exception caught by the
 	// enclosing catch handler (the wasm `rethrow` op) instead of constructing a
 	// fresh one. Such a block has ThrowArgc == 0; the emit pass renders it as
-	// panic(<current catch exc>).
+	// panic(<caught exc>).
 	IsRethrow bool
+
+	// RethrowRegion, for an IsRethrow block, is the try region whose caught
+	// exception is re-raised — the region the wasm `rethrow l` label resolved
+	// to at lowering time. Handlers can nest, so this is not always the
+	// innermost enclosing catch: `rethrow 1` inside an inner catch re-raises
+	// the OUTER try's exception. Nil means the innermost enclosing handler
+	// (the pre-resolution behaviour, kept for builder-level callers).
+	RethrowRegion *TryRegion
 
 	f *Func
 }
