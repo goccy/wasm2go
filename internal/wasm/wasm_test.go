@@ -1746,3 +1746,37 @@ func TestReadS32OverflowAboveSignBit(t *testing.T) {
 		t.Fatal("expected overflow for 5-byte SLEB128 with stray bit above i32 sign bit, got nil")
 	}
 }
+
+// TestMemory64Limits pins the memory64 limits decoding: flag 0x04 marks
+// a 64-bit index space, 0x05 adds a maximum, and Module.Memory64
+// reflects defined and imported memories alike.
+func TestMemory64Limits(t *testing.T) {
+	// (module (memory i64 2 16))
+	mod := []byte{
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic+version
+		0x05, 0x04, // memory section, 4 bytes
+		0x01,             // one memory
+		0x05, 0x02, 0x10, // flags=0x05 (max+mem64), min=2, max=16
+	}
+	m, err := wasm.Parse(bytes.NewReader(mod))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(m.Memories) != 1 || !m.Memories[0].Is64 {
+		t.Fatalf("memory64 flag not decoded: %+v", m.Memories)
+	}
+	lim := m.Memories[0].Limits
+	if lim.Min != 2 || !lim.HasMax || lim.Max != 16 || lim.Shared {
+		t.Errorf("limits: %+v", lim)
+	}
+	if !m.Memory64() {
+		t.Error("Module.Memory64 false for a memory64 module")
+	}
+
+	// Unknown flag bits must be rejected, not silently ignored.
+	bad := append([]byte{}, mod...)
+	bad[11] = 0x09
+	if _, err := wasm.Parse(bytes.NewReader(bad)); err == nil {
+		t.Error("unknown limits flags accepted")
+	}
+}

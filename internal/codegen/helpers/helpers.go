@@ -2552,3 +2552,379 @@ func simd_p_v128_store32_lane(m *Module, addr int32, offset int32, lane int32, v
 func simd_p_v128_store64_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) int32 {
 	return simd_v128_store64_lane(m, addr, offset, lane, [2]uint64{v0, v1})
 }
+
+// ----- Memory64 -------------------------------------------------------------
+//
+// The 64-bit twins of the size/grow/bulk/SIMD memory helpers, selected
+// by codegen when the module's memory is a memory64. Addresses and
+// page counts are u64/i64; effective-address arithmetic is u64 with
+// explicit overflow traps (there is no benign wrap at 2^64). Plain
+// scalar loads/stores never come through here — the emitter derefs
+// them inline with a uint64 cast, exactly like the uint32 form.
+
+// mem64HardCap bounds a memory64's linear memory. Far above any real
+// host, it exists so effective-address arithmetic in the checked
+// helpers keeps a comfortable non-overflow margin below 2^64.
+func mem64HardCap() uint64 { return 1 << 48 }
+
+// memorySize64 returns the current size in wasm pages as i64.
+func memorySize64(m *Module) int64 {
+	return int64(m.memSize.Load() >> 16)
+}
+
+// memoryGrow64 is memoryGrow for a memory64: i64 page delta, i64
+// previous-page-count result, -1 on failure. Growth uses the same
+// geometric-capacity scheme; the wasm32 hard cap does not apply.
+func memoryGrow64(m *Module, n int64) int64 {
+	m.memMu.Lock()
+	defer m.memMu.Unlock()
+	cur := m.memSize.Load()
+	prev := int64(cur >> 16)
+	if n == 0 {
+		return prev
+	}
+	if n < 0 {
+		return -1
+	}
+	if uint64(n) > mem64HardCap()>>16 {
+		return -1
+	}
+	want := cur + uint64(n)*65536
+	if want < cur || want > mem64HardCap() {
+		return -1
+	}
+	if m.maxMem != 0 && want > m.maxMem {
+		return -1
+	}
+	if want <= uint64(cap(m.memory)) {
+		m.memory = m.memory[:want]
+		m.memSize.Store(want)
+		return prev
+	}
+	newCap := uint64(cap(m.memory)) * 2
+	if newCap < want {
+		newCap = want
+	}
+	if m.maxMem != 0 && newCap > m.maxMem {
+		newCap = m.maxMem
+	}
+	if newCap > mem64HardCap() {
+		newCap = mem64HardCap()
+	}
+	grown := make([]byte, want, newCap)
+	copy(grown, m.memory)
+	m.memory = grown
+	m.memSize.Store(want)
+	// Reallocate moved the backing array; refresh the cached pointer
+	// (reslice grows above leave it valid).
+	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
+	return prev
+}
+
+//go:noinline
+func memoryFill64(m *Module, dst int64, val int32, n int64) {
+	if n == 0 {
+		return
+	}
+	end := uint64(dst) + uint64(n)
+	if n < 0 || end < uint64(dst) || end > m.memSize.Load() {
+		wasm_trap_memfill_oob()
+	}
+	b := m.memory[uint64(dst):end]
+	v := byte(val)
+	if v == 0 {
+		for k := range b {
+			b[k] = 0
+		}
+		return
+	}
+	b[0] = v
+	for filled := 1; filled < len(b); filled *= 2 {
+		copy(b[filled:], b[:filled])
+	}
+}
+
+//go:noinline
+func memoryCopy64(m *Module, dst int64, src int64, n int64) {
+	if n == 0 {
+		return
+	}
+	srcEnd := uint64(src) + uint64(n)
+	dstEnd := uint64(dst) + uint64(n)
+	size := m.memSize.Load()
+	if n < 0 || srcEnd < uint64(src) || dstEnd < uint64(dst) || srcEnd > size || dstEnd > size {
+		wasm_trap_memcopy_oob()
+	}
+	copy(m.memory[uint64(dst):dstEnd], m.memory[uint64(src):srcEnd])
+}
+
+//go:noinline
+func memoryInit64(m *Module, seg int, dst int64, src int32, n int32) {
+	data := m.dataSegs[seg]
+	if n == 0 {
+		return
+	}
+	dstEnd := uint64(dst) + uint64(uint32(n))
+	if data == nil || n < 0 ||
+		uint64(uint32(src))+uint64(uint32(n)) > uint64(len(data)) ||
+		dstEnd < uint64(dst) || dstEnd > m.memSize.Load() {
+		wasm_trap_meminit_oob()
+	}
+	if dstEnd > uint64(m.dataEnd) {
+		// dataEnd is 32-bit bookkeeping for shared-image embeddings;
+		// memory64 images are not shareable yet, so saturate rather
+		// than truncate.
+		m.dataEnd = ^uint32(0)
+	}
+	copy(m.memory[uint64(dst):dstEnd], data[uint32(src):uint32(src)+uint32(n)])
+}
+
+// simdEA64 is simdEA for 64-bit addresses: u64 effective address with
+// an overflow-safe range check.
+func simdEA64(m *Module, addr int64, offset int64, size uint64) uint64 {
+	ea := uint64(addr) + uint64(offset)
+	end := ea + size
+	if ea < uint64(addr) || end < ea || end > m.memSize.Load() {
+		wasm_trap_simd_oob()
+	}
+	return ea
+}
+
+// The simd_m64_* family: the OpSimdMemCall helpers for a memory64
+// module. Same lane semantics as the simd_v128_* family, u64
+// addressing, always called (never rewritten to the pair/splice
+// forms, which assume 32-bit addresses).
+
+//go:noinline
+func simd_m64_v128_load(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 16)
+	p := unsafe.Add(m.M, uintptr(ea))
+	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
+}
+
+//go:noinline
+func simd_m64_v128_store(m *Module, addr int64, offset int64, v [2]uint64) int32 {
+	ea := simdEA64(m, addr, offset, 16)
+	p := unsafe.Add(m.M, uintptr(ea))
+	*(*uint64)(p) = v[0]
+	*(*uint64)(unsafe.Add(p, 8)) = v[1]
+	return 0
+}
+
+//go:noinline
+func simd_m64_v128_load32_zero(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 4)
+	return [2]uint64{uint64(*(*uint32)(unsafe.Add(m.M, uintptr(ea)))), 0}
+}
+
+//go:noinline
+func simd_m64_v128_load64_zero(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 8)
+	return [2]uint64{*(*uint64)(unsafe.Add(m.M, uintptr(ea))), 0}
+}
+
+//go:noinline
+func simd_m64_v128_load8_splat(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 1)
+	b := uint64(*(*uint8)(unsafe.Add(m.M, uintptr(ea))))
+	w := b * 0x0101010101010101
+	return [2]uint64{w, w}
+}
+
+//go:noinline
+func simd_m64_v128_load16_splat(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 2)
+	h := uint64(*(*uint16)(unsafe.Add(m.M, uintptr(ea))))
+	w := h * 0x0001000100010001
+	return [2]uint64{w, w}
+}
+
+//go:noinline
+func simd_m64_v128_load32_splat(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 4)
+	x := uint64(*(*uint32)(unsafe.Add(m.M, uintptr(ea))))
+	w := x | x<<32
+	return [2]uint64{w, w}
+}
+
+//go:noinline
+func simd_m64_v128_load64_splat(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 8)
+	x := *(*uint64)(unsafe.Add(m.M, uintptr(ea)))
+	return [2]uint64{x, x}
+}
+
+// widenLoad64 reads 8 bytes and widens each source lane to the next
+// width, signed or unsigned — the shared body of the load8x8/16x4/32x2
+// family.
+func simd_m64_widen(m *Module, addr int64, offset int64, elemBits int, signed bool) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 8)
+	x := *(*uint64)(unsafe.Add(m.M, uintptr(ea)))
+	var v [2]uint64
+	switch elemBits {
+	case 8:
+		for i := 0; i < 8; i++ {
+			b := byte(x >> (8 * uint(i)))
+			var w uint16
+			if signed {
+				w = uint16(int16(int8(b)))
+			} else {
+				w = uint16(b)
+			}
+			v[i/4] |= uint64(w) << (16 * uint(i%4))
+		}
+	case 16:
+		for i := 0; i < 4; i++ {
+			h := uint16(x >> (16 * uint(i)))
+			var w uint32
+			if signed {
+				w = uint32(int32(int16(h)))
+			} else {
+				w = uint32(h)
+			}
+			v[i/2] |= uint64(w) << (32 * uint(i%2))
+		}
+	default: // 32
+		for i := 0; i < 2; i++ {
+			q := uint32(x >> (32 * uint(i)))
+			var w uint64
+			if signed {
+				w = uint64(int64(int32(q)))
+			} else {
+				w = uint64(q)
+			}
+			v[i] = w
+		}
+	}
+	return v
+}
+
+//go:noinline
+func simd_m64_v128_load8x8_s(m *Module, addr int64, offset int64) [2]uint64 {
+	return simd_m64_widen(m, addr, offset, 8, true)
+}
+
+//go:noinline
+func simd_m64_v128_load8x8_u(m *Module, addr int64, offset int64) [2]uint64 {
+	return simd_m64_widen(m, addr, offset, 8, false)
+}
+
+//go:noinline
+func simd_m64_v128_load16x4_s(m *Module, addr int64, offset int64) [2]uint64 {
+	return simd_m64_widen(m, addr, offset, 16, true)
+}
+
+//go:noinline
+func simd_m64_v128_load16x4_u(m *Module, addr int64, offset int64) [2]uint64 {
+	return simd_m64_widen(m, addr, offset, 16, false)
+}
+
+//go:noinline
+func simd_m64_v128_load32x2_s(m *Module, addr int64, offset int64) [2]uint64 {
+	return simd_m64_widen(m, addr, offset, 32, true)
+}
+
+//go:noinline
+func simd_m64_v128_load32x2_u(m *Module, addr int64, offset int64) [2]uint64 {
+	return simd_m64_widen(m, addr, offset, 32, false)
+}
+
+//go:noinline
+func simd_m64_v128_load8_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 1)
+	x := *(*uint8)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 8 * uint(lane) % 64
+	i := int(lane) * 8 / 64
+	v[i] = v[i]&^(uint64(0xff)<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_m64_v128_load16_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 2)
+	x := *(*uint16)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 16 * uint(lane) % 64
+	i := int(lane) * 16 / 64
+	v[i] = v[i]&^(uint64(0xffff)<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_m64_v128_load32_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 4)
+	x := *(*uint32)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 32 * uint(lane) % 64
+	i := int(lane) * 32 / 64
+	v[i] = v[i]&^(uint64(^uint32(0))<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_m64_v128_load64_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA64(m, addr, offset, 8)
+	v[lane] = *(*uint64)(unsafe.Add(m.M, uintptr(ea)))
+	return v
+}
+
+//go:noinline
+func simd_m64_v128_store8_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) int32 {
+	ea := simdEA64(m, addr, offset, 1)
+	sh := 8 * uint(lane) % 64
+	*(*uint8)(unsafe.Add(m.M, uintptr(ea))) = uint8(v[int(lane)*8/64] >> sh)
+	return 0
+}
+
+//go:noinline
+func simd_m64_v128_store16_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) int32 {
+	ea := simdEA64(m, addr, offset, 2)
+	sh := 16 * uint(lane) % 64
+	*(*uint16)(unsafe.Add(m.M, uintptr(ea))) = uint16(v[int(lane)*16/64] >> sh)
+	return 0
+}
+
+//go:noinline
+func simd_m64_v128_store32_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) int32 {
+	ea := simdEA64(m, addr, offset, 4)
+	sh := 32 * uint(lane) % 64
+	*(*uint32)(unsafe.Add(m.M, uintptr(ea))) = uint32(v[int(lane)*32/64] >> sh)
+	return 0
+}
+
+//go:noinline
+func simd_m64_v128_store64_lane(m *Module, addr int64, offset int64, lane int32, v [2]uint64) int32 {
+	ea := simdEA64(m, addr, offset, 8)
+	*(*uint64)(unsafe.Add(m.M, uintptr(ea))) = v[lane]
+	return 0
+}
+
+// Referenced only from generated memory64 module code; the blank
+// uses keep the analyzer quiet.
+var (
+	_ = memorySize64
+	_ = memoryGrow64
+	_ = memoryFill64
+	_ = memoryCopy64
+	_ = memoryInit64
+	_ = simd_m64_v128_load
+	_ = simd_m64_v128_store
+	_ = simd_m64_v128_load32_zero
+	_ = simd_m64_v128_load64_zero
+	_ = simd_m64_v128_load8_splat
+	_ = simd_m64_v128_load16_splat
+	_ = simd_m64_v128_load32_splat
+	_ = simd_m64_v128_load64_splat
+	_ = simd_m64_v128_load8x8_s
+	_ = simd_m64_v128_load8x8_u
+	_ = simd_m64_v128_load16x4_s
+	_ = simd_m64_v128_load16x4_u
+	_ = simd_m64_v128_load32x2_s
+	_ = simd_m64_v128_load32x2_u
+	_ = simd_m64_v128_load8_lane
+	_ = simd_m64_v128_load16_lane
+	_ = simd_m64_v128_load32_lane
+	_ = simd_m64_v128_load64_lane
+	_ = simd_m64_v128_store8_lane
+	_ = simd_m64_v128_store16_lane
+	_ = simd_m64_v128_store32_lane
+	_ = simd_m64_v128_store64_lane
+)

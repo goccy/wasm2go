@@ -1,6 +1,8 @@
 package lower
 
 import (
+	"strings"
+
 	"fmt"
 
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -300,7 +302,7 @@ func (ls *lowerState) handleFDOp(r *wasm.InstrReader) error {
 		if _, err := r.ReadU32(); err != nil { // align (validated upstream)
 			return err
 		}
-		offset, err := r.ReadU32()
+		offset, err := r.ReadU64()
 		if err != nil {
 			return err
 		}
@@ -322,7 +324,18 @@ func (ls *lowerState) handleFDOp(r *wasm.InstrReader) error {
 		if err != nil {
 			return err
 		}
-		args := []*ssa.Value{addr, ls.b.Const32(int32(offset))}
+		helper := spec.helper
+		var offVal *ssa.Value
+		if ls.mem64 {
+			// memory64: i64 address and offset; the m64 helper family
+			// takes uint64 operands and is never rewritten to the
+			// pair/splice forms (those assume 32-bit addressing).
+			helper = "simd_m64" + strings.TrimPrefix(spec.helper, "simd")
+			offVal = ls.b.Const64(int64(offset))
+		} else {
+			offVal = ls.b.Const32(int32(offset))
+		}
+		args := []*ssa.Value{addr, offVal}
 		if spec.lane {
 			args = append(args, ls.b.Const32(int32(lane)))
 		}
@@ -333,7 +346,7 @@ func (ls *lowerState) handleFDOp(r *wasm.InstrReader) error {
 		if res == ssa.TypeInvalid {
 			res = ssa.TypeI32 // dummy; stores push nothing
 		}
-		val := ls.b.NewValueAux(ssa.OpSimdMemCall, res, spec.helper, args...)
+		val := ls.b.NewValueAux(ssa.OpSimdMemCall, res, helper, args...)
 		if spec.res != ssa.TypeInvalid {
 			ls.push(val)
 		}

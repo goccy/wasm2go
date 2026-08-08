@@ -45,12 +45,29 @@ type Limits struct {
 	Max    uint64
 	HasMax bool
 	Shared bool // threads proposal: memory declared shared (limits flag 0x02)
+	Is64   bool // memory64 proposal: 64-bit index space (limits flag 0x04)
 }
 
 // TableType describes a table.
 type TableType struct {
 	ElemType ValType
 	Limits   Limits
+}
+
+// Memory64 reports whether the module's memory (defined or imported)
+// uses the memory64 proposal's 64-bit index space.
+func (m *Module) Memory64() bool {
+	for _, mem := range m.Memories {
+		if mem.Is64 {
+			return true
+		}
+	}
+	for _, imp := range m.Imports {
+		if imp.Kind == ImportMemory && imp.Memory.Is64 {
+			return true
+		}
+	}
+	return false
 }
 
 // MemoryType describes a memory.

@@ -201,6 +201,9 @@ func readLimits(r byteReader) (Limits, error) {
 	if err != nil {
 		return Limits{}, err
 	}
+	if flags > 0x07 {
+		return Limits{}, fmt.Errorf("limits: unknown flags 0x%02x", flags)
+	}
 	min, err := readU64(r)
 	if err != nil {
 		return Limits{}, err
@@ -209,6 +212,10 @@ func readLimits(r byteReader) (Limits, error) {
 	if flags&0x02 != 0 {
 		// Threads proposal: shared memories must also declare a maximum.
 		lim.Shared = true
+	}
+	if flags&0x04 != 0 {
+		// Memory64 proposal: the memory is indexed by i64 addresses.
+		lim.Is64 = true
 	}
 	if flags&0x01 != 0 {
 		max, err := readU64(r)
@@ -265,7 +272,7 @@ func parseImportSection(m *Module, r byteReader) error {
 			if err != nil {
 				return err
 			}
-			imp.Memory = MemoryType{Limits: lim}
+			imp.Memory = MemoryType{Limits: lim, Is64: lim.Is64}
 		case ImportGlobal:
 			vt, err := r.ReadByte()
 			if err != nil {
@@ -376,7 +383,7 @@ func parseMemorySection(m *Module, r byteReader) error {
 		if err != nil {
 			return err
 		}
-		m.Memories[i] = MemoryType{Limits: lim}
+		m.Memories[i] = MemoryType{Limits: lim, Is64: lim.Is64}
 	}
 	return nil
 }

@@ -216,6 +216,13 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if opts.Package == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.Package is required")
 	}
+	if m.Memory64() {
+		for _, mem := range m.Memories {
+			if mem.Limits.Shared {
+				return Result{}, fmt.Errorf("wasm2go: shared memory64 is not supported")
+			}
+		}
+	}
 	if opts.OutputImportPath == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.OutputImportPath is required")
 	}
@@ -1388,6 +1395,12 @@ const wasmMemHardCapBytes = (1 << 32) - (1 << 17)
 // constructor rejects oversized images, so only a declared MINIMUM
 // past the cap (65535/65536 pages) disqualifies a module.
 func (t *translator) simdBoundsMemOK() bool {
+	if t.mod.Memory64() {
+		// The coalesced check's exactness argument is written against
+		// the wasm32 hard cap; memory64 modules keep per-op checks in
+		// their (helper-called) SIMD memory ops.
+		return false
+	}
 	for _, mem := range t.mod.Memories {
 		if uint64(mem.Limits.Min)*65536 > wasmMemHardCapBytes {
 			return false
@@ -1884,19 +1897,23 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// Memory init.
 	if len(t.mod.Memories) > 0 {
 		mem := t.mod.Memories[0]
-		// wasm32 caps linear memory at 65536 pages × 64 KiB = 4 GiB.
-		// A malformed module that declares a Min larger than this
+		// wasm32 caps linear memory at 65536 pages × 64 KiB = 4 GiB;
+		// a memory64's declared minimum is capped by the mem64 hard
+		// cap instead. A malformed module that declares a larger Min
 		// would otherwise have us emit `make([]byte, huge)` and
 		// either panic at init time or quietly succeed and OOM.
-		const wasm32MaxPages = 1 << 16
-		if mem.Limits.Min > wasm32MaxPages {
+		maxPages := uint64(1) << 16
+		if mem.Is64 {
+			maxPages = 1 << 32 // mem64HardCap >> 16
+		}
+		if mem.Limits.Min > maxPages {
 			return []ast.Decl{&ast.FuncDecl{
 				Name: newID("New"),
 				Type: &ast.FuncType{Params: &ast.FieldList{List: params},
 					Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}}},
 				Body: &ast.BlockStmt{List: []ast.Stmt{
 					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-						stringLit(fmt.Sprintf("wasm2go: memory min %d exceeds wasm32 maximum (%d) pages", mem.Limits.Min, wasm32MaxPages)),
+						stringLit(fmt.Sprintf("wasm2go: memory min %d exceeds the %d-page maximum", mem.Limits.Min, maxPages)),
 					}}},
 				}},
 			}}
@@ -2024,17 +2041,22 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			// The image the caller handed us is already initialized; its
 			// grown size travels with it. It must respect the same
 			// implementation limit memoryGrow enforces — the coalesced
-			// SIMD bounds check is only exact below it.
+			// SIMD bounds check is only exact below it. A memory64 uses
+			// the mem64 hard cap instead.
+			capBytes := uint64(wasmMemHardCapBytes)
+			if mem.Is64 {
+				capBytes = 1 << 48 // mem64HardCap
+			}
 			sizeArg = newID("memSize")
 			body.List = append(body.List, &ast.IfStmt{
 				Cond: &ast.BinaryExpr{
 					X:  newID("memSize"),
 					Op: token.GTR,
-					Y:  uintLit(wasmMemHardCapBytes),
+					Y:  uintLit(capBytes),
 				},
 				Body: &ast.BlockStmt{List: []ast.Stmt{
 					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", wasmMemHardCapBytes)),
+						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
 					}}},
 				}},
 			})
@@ -2073,14 +2095,14 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			// don't make sense and the uint64 multiplication
 			// (Max*65536) could overflow at uint64 itself for
 			// extreme attacker-supplied values.
-			if mem.Limits.Max > wasm32MaxPages {
+			if mem.Limits.Max > maxPages {
 				return []ast.Decl{&ast.FuncDecl{
 					Name: newID("New"),
 					Type: &ast.FuncType{Params: &ast.FieldList{List: params},
 						Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}}},
 					Body: &ast.BlockStmt{List: []ast.Stmt{
 						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-							stringLit(fmt.Sprintf("wasm2go: memory max %d exceeds wasm32 maximum (%d) pages", mem.Limits.Max, wasm32MaxPages)),
+							stringLit(fmt.Sprintf("wasm2go: memory max %d exceeds the %d-page maximum", mem.Limits.Max, maxPages)),
 						}}},
 					}},
 				}}
@@ -2095,8 +2117,13 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				Rhs: []ast.Expr{maxRhs},
 			})
 		} else {
-			// 4 GiB default cap (wasm32 limit).
+			// No declared maximum: cap at the wasm32 4 GiB limit; a
+			// memory64 is unlimited here (memoryGrow64 applies the
+			// mem64 hard cap), which is the entire point of memory64.
 			maxRhs := ast.Expr(uintLit(1 << 32))
+			if mem.Is64 {
+				maxRhs = uintLit(0)
+			}
 			if memFromArg {
 				maxRhs = memLenExpr()
 			}

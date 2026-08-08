@@ -137,13 +137,15 @@ func (r *InstrReader) ReadF64() (float64, error) {
 	return math.Float64frombits(bits), nil
 }
 
-// ReadMemArg reads (align: u32, offset: u32). Both are unsigned LEB128.
-func (r *InstrReader) ReadMemArg() (align, offset uint32, err error) {
+// ReadMemArg reads (align: u32, offset: u64). Both are unsigned
+// LEB128; the offset is 64-bit so memory64 memargs decode losslessly
+// (wasm32 offsets simply never exceed 32 bits).
+func (r *InstrReader) ReadMemArg() (align uint32, offset uint64, err error) {
 	align, err = r.ReadU32()
 	if err != nil {
 		return
 	}
-	offset, err = r.ReadU32()
+	offset, err = r.ReadU64()
 	return
 }
 

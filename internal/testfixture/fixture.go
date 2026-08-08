@@ -49,7 +49,7 @@ func Wasm(t testing.TB, name string) []byte {
 
 	// --enable-exceptions lets EH fixtures (try/catch/throw/tag) compile; it
 	// only enables the feature, so non-EH fixtures are unaffected.
-	cmd := exec.Command("wat2wasm", "--enable-exceptions", "--enable-threads", "--output=-", watPath)
+	cmd := exec.Command("wat2wasm", "--enable-exceptions", "--enable-threads", "--enable-memory64", "--output=-", watPath)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
