@@ -374,3 +374,33 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// TestPromotionReport writes the SSA memory-promotion JSON next to
+// the generated code. The report only appears for modules with
+// memory traffic, so use the memory-heavy loop fixture.
+func TestPromotionReport(t *testing.T) {
+	dir := t.TempDir()
+	rep := filepath.Join(dir, "prom.json")
+	out := filepath.Join(dir, "out.go")
+	runMain(t, "-i", testfixture.WasmPath(t, "cg_simd_loop.wasm"), "-import", "example.com/test/pkg", "-o", out, "-promotion-report", rep)
+	b, err := os.ReadFile(rep)
+	if err != nil {
+		t.Fatalf("report not written: %v", err)
+	}
+	if !strings.Contains(string(b), "{") {
+		t.Fatalf("report not JSON-shaped: %.120s", b)
+	}
+}
+
+// TestPureOnlyFlag emits the pure-Go backend without an asm bundle.
+func TestPureOnlyFlag(t *testing.T) {
+	out := captureStdout(t, func() {
+		runMain(t, "-i", arithWasm(t), "-import", "example.com/test/pkg", "-pure")
+	})
+	if !strings.Contains(out, "package wasm2go") {
+		t.Fatalf("pure output missing package clause:\n%.200s", out)
+	}
+	if strings.Contains(out, "//go:build arm64") {
+		t.Fatal("pure mode must not emit arch-tagged asm bodies")
+	}
+}

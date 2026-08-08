@@ -43,7 +43,7 @@ func TestLowerIfElseMax(t *testing.T) {
 	if idx == ^uint32(0) {
 		t.Fatalf("control.wasm: missing max export")
 	}
-	fn, err := lower.LowerFunction(mod, idx, "max")
+	fn, err := lower.LowerFunction(mod, idx, "max", nil)
 	if err != nil {
 		t.Fatalf("lower max: %v", err)
 	}

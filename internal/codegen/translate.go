@@ -18,6 +18,7 @@ import (
 
 	"github.com/goccy/wasm2go/internal/codegen/sharedimage"
 	"github.com/goccy/wasm2go/internal/lower"
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/ssa/pass"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -38,30 +39,14 @@ const defaultMultiPackageThreshold = 1 << 20 // 1 MiB
 // memory tuning, and exercising the multi-package path on small
 // fixtures in tests, the override is a supported escape hatch.
 //
-// Modify in-process via SetMultiPackageThreshold; from a subprocess
-// (e.g. a wasm2go-using protoc plugin invoked by buf generate), set
-// the WASM2GO_MULTIPACKAGE_THRESHOLD environment variable. The
-// in-process override takes priority when both are set.
+// Modify via SetMultiPackageThreshold.
 var multiPackageThresholdOverride = -1
 
-// currentMultiPackageThreshold resolves the active byte budget. The
-// in-process override wins; otherwise the env-var fallback is parsed;
-// otherwise the production default is used.
+// currentMultiPackageThreshold resolves the active byte budget: the
+// in-process override when set, the production default otherwise.
 func currentMultiPackageThreshold() int {
 	if multiPackageThresholdOverride >= 0 {
 		return multiPackageThresholdOverride
-	}
-	if env := os.Getenv("WASM2GO_MULTIPACKAGE_THRESHOLD"); env != "" {
-		b, err := strconv.Atoi(env)
-		if err != nil || b < 0 {
-			// Malformed env var. Surface so the user sees why their
-			// override was ignored, then fall back to the default.
-			fmt.Fprintf(os.Stderr,
-				"wasm2go: invalid WASM2GO_MULTIPACKAGE_THRESHOLD=%q (using default %d): %v\n",
-				env, defaultMultiPackageThreshold, err)
-		} else {
-			return b
-		}
 	}
 	return defaultMultiPackageThreshold
 }
@@ -140,10 +125,39 @@ type Options struct {
 	// gcasm asm bundle entirely. The result is ABIInternal everywhere —
 	// slower to compile / heavier on tooling for large modules, but the
 	// reference backend for benchmarking codegen quality without the
-	// gcasm ABI0 marshalling. Subprocess invocations (e.g. the wasmify
-	// protoc plugin) can enable it through the WASM2GO_PURE environment
-	// variable.
+	// gcasm ABI0 marshalling.
 	PureOnly bool
+
+	// OutlineMinValues enables outlining of large loops into their own
+	// functions and sets the minimum loop body size (in SSA values)
+	// worth extracting. 0 disables outlining. Modules whose hot
+	// functions exceed gc's pattern-matching appetite (llama.cpp-sized)
+	// want a low threshold like 100; small modules gain nothing.
+	OutlineMinValues int
+	// SIMDUnroll unrolls eligible SIMD loops by this factor before
+	// scalarization, with exact trip routing. 0 disables.
+	SIMDUnroll int
+	// FuseLoops fuses whole countdown loops around fused SIMD regions
+	// into single asm splices; FuseLoopUnroll adds an in-splice unroll
+	// lane by that factor (0 = no in-splice unroll).
+	FuseLoops      bool
+	FuseLoopUnroll int
+	// F16TableAddr asserts the linear-memory base address of a
+	// runtime-built IEEE f16->f32 lookup table (ggml computes its
+	// table in an init function, so the data segment holds only zeros
+	// and the static byte-for-byte verification cannot see it). The
+	// assertion is a build-input contract, not a guess — a wrong
+	// address changes numeric results. 0 asserts nothing; statically
+	// verifiable tables are recognized regardless.
+	F16TableAddr uint32
+	// FastMath opts asm splice synthesis out of wasm bit-exactness:
+	// SDOT lane grouping without the TBL permutation, fused
+	// multiply-adds, dual accumulators, and the SMMLA tile kernel for
+	// paired q8_0 rows. The output no longer matches the wasm program
+	// bit for bit (like a native build vs the wasm), so integrators
+	// gate it and validate with token-level equivalence instead of
+	// byte-equality probes.
+	FastMath bool
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.
@@ -160,6 +174,27 @@ type Result struct {
 	// (unlike Sidecars). The WASI runtime uses this for the per-platform
 	// wasip1_native_*.go companions whose //go:build tags are load-bearing.
 	AuxFiles map[string][]byte
+	// FusedLoops maps synthetic fused-LOOP helper names to their loop
+	// descriptors.
+	FusedLoops map[string]*simdfuse.Loop
+	// FusedSimd maps synthetic fused-SIMD helper names to their region
+	// descriptors, for the gcasm backend to synthesize inline bodies
+	// from. Nil when the scalarizer fused nothing. See internal/simdfuse.
+	FusedSimd map[string]*simdfuse.Tree
+	// Outlined maps chunk dir ("" single-package) to the names of loop
+	// functions extracted there (see internal/ssa/outline.go). The asm
+	// bundle keeps their pure-Go bodies on every GOARCH.
+	Outlined map[string][]string
+	// Nrc2VecDot / Nrc2Companion name the ggml q8_0 vec_dot and its
+	// paired-tile companion when the row/column pairing rewrite fired
+	// (see nrc2.go); empty when off. The asm bundle may retarget the
+	// fast-math feature body's companion call to a native tile kernel.
+	Nrc2VecDot    string
+	Nrc2Companion string
+	// OutlinedSigs maps each extracted function name to its signature,
+	// letting the asm bundle transform its body like a translated
+	// function.
+	OutlinedSigs map[string]OutlinedSig
 }
 
 // Translate parses helpers, walks the module, and emits Go source for
@@ -184,15 +219,6 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if opts.OutputImportPath == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.OutputImportPath is required")
 	}
-	// WASM2GO_PURE is the subprocess-reachable form of Options.PureOnly
-	// (same pattern as WASM2GO_MULTIPACKAGE_THRESHOLD): the wasmify
-	// protoc plugin cannot thread new CLI options through buf.gen.yaml,
-	// so the env var lets a benchmarking run flip the backend without a
-	// wasmify change.
-	if os.Getenv("WASM2GO_PURE") != "" {
-		opts.PureOnly = true
-	}
-
 	// Auto-derive the multi-package decision from the total wasm
 	// function-body byte size. Anything strictly above the threshold
 	// goes through the multi-package + linkname-split layout; anything
@@ -269,6 +295,29 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	}
 	t.callees = callees
 
+	// Widest exception-tag arity in the module: the operand-slot count the
+	// Module's exception state needs. Zero when the module declares no
+	// tags, which also switches the whole EH machinery off.
+	t.excSlots = maxTagArity(m)
+	if t.excSlots > 0 {
+		// Which functions can leave an exception pending — the set the
+		// lowering consults to decide where a post-call check is needed.
+		abs := map[uint32][]uint32{}
+		for i, cs := range callees {
+			idx := m.NumImportedFuncs + uint32(i)
+			out := make([]uint32, 0, len(cs))
+			for _, c := range cs {
+				out = append(out, m.NumImportedFuncs+c)
+			}
+			abs[idx] = out
+		}
+		ts, err := lower.ComputeThrowSet(m, abs)
+		if err != nil {
+			return Result{}, fmt.Errorf("throw analysis: %w", err)
+		}
+		t.throwSet = ts
+	}
+
 	// Whole-function dead-code elimination: compute which functions are
 	// reachable from the module's entry points, so the dead ones (a
 	// C++→wasm build leaves thousands) are never emitted.
@@ -296,6 +345,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		}
 	}
 	t.collectImportModules()
+	t.scanGgmlNrc2()
 
 	// BulkExportPrefix with zero matches is almost always a typo;
 	// surface a warning so the caller can fix it instead of silently
@@ -427,7 +477,50 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		}
 		t.auxFiles[name] = content
 	}
-	return finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
+	res, err := finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
+	if err != nil {
+		return res, err
+	}
+	t.appendSimdHelperFiles(res.Files)
+	res.FusedSimd = t.FusedTrees()
+	res.FusedLoops = t.FusedLoops()
+	res.Outlined = t.outlinedByChunk
+	res.OutlinedSigs = t.outlinedSigs
+	if t.nrc2 != nil {
+		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
+		res.Nrc2Companion = t.nrc2CompanionName()
+	}
+	t.warnStaleF16Table()
+	return res, nil
+}
+
+// maxTagArity returns the largest operand count over every tag the module
+// declares or imports, or 0 when it has none.
+func maxTagArity(m *wasm.Module) int {
+	n := 0
+	consider := func(typeIdx uint32) {
+		if int(typeIdx) >= len(m.Types) {
+			return
+		}
+		if c := len(m.Types[typeIdx].Params); c > n {
+			n = c
+		}
+	}
+	for _, imp := range m.Imports {
+		if imp.Kind == wasm.ImportTag {
+			consider(imp.Tag.TypeIdx)
+		}
+	}
+	for _, tg := range m.Tags {
+		consider(tg.TypeIdx)
+	}
+	// A module can declare a tag with no operands (`(tag)`), which still
+	// needs the flag and tag fields — give it a single unused slot rather
+	// than special-casing an empty array type.
+	if n == 0 && (m.NumImportedTags > 0 || len(m.Tags) > 0) {
+		n = 1
+	}
+	return n
 }
 
 // emitGlobalsSnapshot emits SaveGlobals/RestoreGlobals over the module's
@@ -600,7 +693,9 @@ func pureFallbackTag(opts Options) string {
 	if opts.PureOnly {
 		return ""
 	}
-	return "//go:build !amd64 && !arm64"
+	// The asm bundle covers arm64 and amd64/v2 (its SIMD splices are
+	// SSE4.1); every other target — including GOAMD64=v1 — runs pure.
+	return "//go:build !arm64 && (!amd64 || !amd64.v2)"
 }
 
 // emitSidecarDecls returns //go:embed var decls for each registered sidecar.
@@ -663,6 +758,23 @@ type translator struct {
 	opts Options
 	fset *token.FileSet
 
+	// f16TablesOK caches per-base verification of module-resident
+	// f16->f32 tables (see hasIEEEF16TableAt / the gather rewrite).
+	f16TablesOK map[uint32]bool
+
+	// pendingOutlined holds loops extracted from the function being
+	// compiled, emitted as sibling decls in the same chunk.
+	pendingOutlined []ssa.OutlinedFunc
+	// outlinedByChunk records extracted-function names per chunk dir
+	// ("" single-package) so the asm bundle can register them as
+	// pure-Go fallbacks on the asm GOARCHs.
+	outlinedByChunk map[string][]string
+	// curOutlineFunc is the wasm index of the function currently in
+	// compileBodyViaSSA (chunk lookup for the extraction bookkeeping).
+	curOutlineFunc uint32
+	// outlinedSigs collects extraction signatures for Result.OutlinedSigs.
+	outlinedSigs map[string]OutlinedSig
+
 	// multiPackage records the auto-derived decision to emit the
 	// chunked, linkname-split layout. Set in Translate based on the
 	// total wasm function-body byte size; chunk packages, helper
@@ -693,6 +805,21 @@ type translator struct {
 	// wasmExc) or a try/catch: the wasmExc type declaration must then be
 	// pulled into the output even if no func helper is used.
 	usesWasmExc bool
+	// usesSimd is set when any simd_* helper is referenced; it pulls the
+	// whole-file SIMD helper set (simd_scalar.go + per-arch asm) into the
+	// output tree. See appendSimdHelperFiles.
+	usesSimd bool
+	// fusedShapes interns the fused SIMD regions the scalarizer
+	// creates; see simd_fuse.go and internal/simdfuse.
+	fusedShapes *fusedShapeState
+	fusedLoops  *fusedLoopState
+	// excSlots is the operand-slot count the module's exception state
+	// needs: the widest tag arity, or 0 when the module has no EH (the
+	// state fields are then omitted entirely). See emitModuleStruct.
+	excSlots int
+	// throwSet answers "can a call to this function leave an exception
+	// pending?" for the EH lowering. Nil when the module has no tags.
+	throwSet *lower.ThrowSet
 
 	// helpersFile is parsed lazily by emitHelpers.
 	helpersFile *ast.File
@@ -770,6 +897,10 @@ type translator struct {
 	// function is reachable from an entry point. nil ⇒ keep every
 	// function (KeepDeadFuncs, or no module parsed yet).
 	reachable map[uint32]bool
+
+	// nrc2 is the verified ggml q8_0 traits entry when the row/column
+	// pairing rewrite is active (see nrc2.go); nil ⇒ feature off.
+	nrc2 *nrc2Info
 }
 
 // funcReachable reports whether the function at the given global index
@@ -1244,11 +1375,43 @@ func (t *translator) addChunkExtraDecl(chunkIdx int, decl ast.Decl) {
 	t.chunkExtraDecls[chunkIdx] = append(t.chunkExtraDecls[chunkIdx], decl)
 }
 
+// wasmMemHardCapBytes mirrors the helpers' wasmMemHardCap: the
+// implementation limit memoryGrow enforces on linear-memory size,
+// 65534 pages. The two must stay equal — the bounds-coalescing gate
+// below and the memFromArg constructor guard both reason with this
+// value about a cap the runtime side enforces.
+const wasmMemHardCapBytes = (1 << 32) - (1 << 17)
+
+// simdBoundsMemOK reports whether the module's memory can never exceed
+// wasmMemHardCapBytes, which the coalesced SIMD bounds check requires
+// for exactness. Growth is capped by memoryGrow and the memFromArg
+// constructor rejects oversized images, so only a declared MINIMUM
+// past the cap (65535/65536 pages) disqualifies a module.
+func (t *translator) simdBoundsMemOK() bool {
+	for _, mem := range t.mod.Memories {
+		if uint64(mem.Limits.Min)*65536 > wasmMemHardCapBytes {
+			return false
+		}
+	}
+	return true
+}
+
 // use marks a stdlib package as needed by the output.
 func (t *translator) use(pkg string) { t.imports[pkg] = "" }
 
 // useHelper marks a helper as needed.
-func (t *translator) useHelper(name string) { t.helpers[name] = true }
+func (t *translator) useHelper(name string) {
+	t.helpers[name] = true
+	if strings.HasPrefix(name, "simd_") {
+		// The pure lane ops live in the whole-file SIMD set (scalar
+		// reference + per-arch asm), shipped by appendSimdHelperFiles;
+		// emitHelpers ignores their names.
+		t.usesSimd = true
+		// The gcasm memory-op splices need the Module field offsets,
+		// which they extract from this probe's captured assembly.
+		t.helpers["gcasmMemProbe"] = true
+	}
+}
 
 // importHandledInternally reports whether a wasm import never surfaces to the
 // host because the code generator implements it inline (today: wasi-threads'
@@ -1429,6 +1592,18 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		})
 		t.use("unsafe")
 	}
+	if t.opts.OutlineMinValues > 0 {
+		// Boundary scratch for packed outlined-loop calls: the caller
+		// fills, the callee prologue drains, so one per-module array
+		// suffices at any nesting depth.
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("outlinePack"))},
+			Type: &ast.ArrayType{
+				Len: &ast.BasicLit{Kind: token.INT, Value: "128"},
+				Elt: newID("uint64"),
+			},
+		})
+	}
 
 	for i := range t.mod.Tables {
 		fields = append(fields, &ast.Field{
@@ -1522,6 +1697,29 @@ func (t *translator) emitModuleStruct() ast.Decl {
 				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID("int32")},
 			}}},
 		})
+	}
+
+	// The propagating-exception state, when the module uses EH. A wasm
+	// exception travels as module state plus a check-and-branch after every
+	// call that may raise one, so EH code stays ordinary straight-line Go.
+	// Value fields on purpose: a wasi-threads agent runs on a struct COPY,
+	// which makes the state per-execution-context for free (an exception
+	// belongs to one thread, exactly like a global). Declared LAST, after
+	// every pre-existing field, per the layout convention above.
+	if t.excSlots > 0 {
+		fields = append(fields,
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excPending"))},
+				Type:  newID("int32"),
+			},
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excTag"))},
+				Type:  newID("uint32"),
+			},
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excVals"))},
+				Type:  &ast.ArrayType{Len: intLit(int64(t.excSlots)), Elt: newID("uint64")},
+			})
 	}
 
 	return &ast.GenDecl{
@@ -1824,8 +2022,22 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		sizeArg := ast.Expr(uintLit(minBytesU))
 		if memFromArg {
 			// The image the caller handed us is already initialized; its
-			// grown size travels with it.
+			// grown size travels with it. It must respect the same
+			// implementation limit memoryGrow enforces — the coalesced
+			// SIMD bounds check is only exact below it.
 			sizeArg = newID("memSize")
+			body.List = append(body.List, &ast.IfStmt{
+				Cond: &ast.BinaryExpr{
+					X:  newID("memSize"),
+					Op: token.GTR,
+					Y:  uintLit(wasmMemHardCapBytes),
+				},
+				Body: &ast.BlockStmt{List: []ast.Stmt{
+					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", wasmMemHardCapBytes)),
+					}}},
+				}},
+			})
 		}
 		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
 			Fun: &ast.SelectorExpr{
@@ -2094,7 +2306,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				}})
 				continue
 			}
-			raws = append(raws, rawSeg{memOff: off, bytes: ds.Bytes})
+			raws = append(raws, rawSeg{memOff: off, bytes: t.nrc2SegBytes(i, ds.Bytes)})
 		}
 		sort.Slice(raws, func(i, j int) bool { return raws[i].memOff < raws[j].memOff })
 		// Seed dataEnd with the active segments' extent. Passive segments are
@@ -2438,11 +2650,23 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 	// the splitter does not yet recognise, so this is a no-op until
 	// that gap is closed (either by emitting a Go switch from the
 	// chain or by introducing a BlockSwitch SSA op).
+	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
+		// The paired-tile prelude and its companion (see nrc2.go).
+		body.List = append([]ast.Stmt{t.nrc2Prelude()}, body.List...)
+	}
 	out := []ast.Decl{&ast.FuncDecl{
 		Name: newID(fnName),
 		Type: t.funcSignature(ft, true /*withModuleParam*/),
 		Body: body,
 	}}
+	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
+		out = append(out, t.nrc2Companion())
+	}
+	outlined, err := t.emitOutlinedDecls()
+	if err != nil {
+		return nil, fmt.Errorf("ssa: function %d (%s): %w", funcIdx, fnName, err)
+	}
+	out = append(out, outlined...)
 	return out, nil
 }
 
@@ -2482,16 +2706,11 @@ func (t *translator) memoryIsShared() bool {
 
 func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.BlockStmt, error) {
 	_ = fn // body bytes live on the *wasm.Module; kept for API symmetry.
-	ssaFn, err := lower.LowerFunction(t.mod, funcIdx, t.funcName(funcIdx))
+	ssaFn, err := lower.LowerFunction(t.mod, funcIdx, t.funcName(funcIdx), t.throwSet)
 	if err != nil {
 		return nil, err
 	}
 	insBefore := ssa.CountValues(ssaFn)
-	// WASM2GO_SSA_PASSES_OFF disables individual optimization passes (comma
-	// list of constprop,branchfold,simplify,cse,memopt,dce,memaddr — or
-	// "all"). Diagnostic escape hatch for bisecting a suspected pass
-	// miscompile; not a supported build mode.
-	passesOff := map[string]bool{}
 	// MemOpt (redundant-load elimination + store-to-load forwarding) is
 	// UNSOUND on a shared linear memory: it assumes this agent is the only
 	// writer between two accesses, but the threads proposal lets another
@@ -2501,43 +2720,43 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// would drop that read. Disable the pass whole-module when the memory
 	// is shared. (Atomic ops are OpAtomicCall — MemOpt already treats them
 	// as barriers and never touches them.)
-	//
-	// WASM2GO_MEMOPT_ON_SHARED forces MemOpt to run even on a shared memory
-	// — a diagnostic escape used only to reproduce the unsoundness (it
-	// generates KNOWINGLY-BROKEN code); never a supported build mode.
-	if t.memoryIsShared() && os.Getenv("WASM2GO_MEMOPT_ON_SHARED") == "" {
-		passesOff["memopt"] = true
-	}
-	if env := os.Getenv("WASM2GO_SSA_PASSES_OFF"); env != "" {
-		for _, p := range strings.Split(env, ",") {
-			passesOff[strings.TrimSpace(strings.ToLower(p))] = true
+	memOptOK := !t.memoryIsShared()
+	// SIMD loop unrolling runs BEFORE the fixpoint so its cloned
+	// pointer-bump chains constant-fold and the bounds/window passes
+	// see the unrolled straight-line body. OPT-IN via Options.SIMDUnroll:
+	// the guard CFG it builds still pushes hot functions from the
+	// structured emitter to the goto form, whose flattened statements
+	// defeat tree fusion — a net loss until the structurer accepts the
+	// shape.
+	if k := t.opts.SIMDUnroll; k >= 2 {
+		if k > 8 {
+			k = 8
 		}
-		if passesOff["all"] {
-			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "memopt", "dce", "memaddr"} {
-				passesOff[p] = true
-			}
-		}
+		pass.UnrollSimdLoops(ssaFn, k)
 	}
 	const optFixpointCap = 8
 	fixpointReached := false
 	for i := 0; i < optFixpointCap; i++ {
 		changed := false
-		if !passesOff["constprop"] && pass.ConstProp(ssaFn) {
+		if pass.ConstProp(ssaFn) {
 			changed = true
 		}
-		if !passesOff["branchfold"] && pass.BranchFold(ssaFn) {
+		if pass.BranchFold(ssaFn) {
 			changed = true
 		}
-		if !passesOff["simplify"] && pass.Simplify(ssaFn) {
+		if pass.ReassocConstAdds(ssaFn) {
 			changed = true
 		}
-		if !passesOff["cse"] && pass.CSE(ssaFn) {
+		if pass.Simplify(ssaFn) {
 			changed = true
 		}
-		if !passesOff["memopt"] && pass.MemOpt(ssaFn) {
+		if pass.CSE(ssaFn) {
 			changed = true
 		}
-		if !passesOff["dce"] && pass.DCE(ssaFn) {
+		if memOptOK && pass.MemOpt(ssaFn) {
+			changed = true
+		}
+		if pass.DCE(ssaFn) {
 			changed = true
 		}
 		if !changed {
@@ -2559,10 +2778,58 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// the emitter's _consts-table guard sees them — a constant that
 	// stays in the base sum bypasses the guard and can fail to
 	// assemble on arm64 ("constant is not in pool").
-	if !passesOff["memaddr"] && pass.FoldMemAddend(ssaFn, largeConstThreshold) && !passesOff["dce"] {
+	if pass.FoldMemAddend(ssaFn, largeConstThreshold) {
+		pass.DCE(ssaFn)
+	}
+	// Bounds-check coalescing for v128 load groups. After the fixpoint
+	// and FoldMemAddend so the address expressions it groups on are in
+	// their final constant-folded shape. The coalesced check is exact
+	// only while memSize stays below the wasmMemHardCap margin under
+	// 2^32 (see the helper's doc); growth is capped there by
+	// memoryGrow, but a module whose declared MINIMUM already exceeds
+	// the cap would start out past it, so such modules keep per-load
+	// checks.
+	if t.simdBoundsMemOK() && pass.CoalesceSimdBounds(ssaFn) {
+		t.useHelper("simd_v128_load_rng")
+		t.useHelper("simd_v128_load_nc")
+	}
+	// f16 table-gather idiom -> pure lane conversion (bit-exact only
+	// against a verified IEEE table; see pass.RecognizeF16Gather).
+	if pass.RecognizeF16Gather(ssaFn, t.f16TableOK) {
+		pass.DCE(ssaFn)
+	}
+	// f16 store-side idiom -> one packed conversion per four lanes
+	// (bit-exact: the packed op reproduces the idiom's rounding and
+	// NaN forcing; see pass.RecognizeF16Store). Default ON since the
+	// empty-diamond fold below landed: the rewrite alone measured a
+	// ~2% tg regression (the emptied NaN-select diamonds kept
+	// evaluating their conditions), and folding them flips it to a
+	// measured ~1% gain on the llama module.
+	if pass.RecognizeF16Store(ssaFn) {
+		pass.DCE(ssaFn)
+	}
+	// Idiom rewrites above delete the phis that justified their branch
+	// diamonds; fold the emptied control structure so the conditions
+	// die too. Fixpoint with DCE: an inner fold empties the enclosing
+	// arm for the next round.
+	for pass.FoldEmptyDiamonds(ssaFn) {
+		pass.DCE(ssaFn)
+	}
+	// With the diamonds gone the packed store groups sit on straight
+	// lines; collapse each into one 64-bit store of the packed word,
+	// then fuse the conversion INTO the store so both ride inside the
+	// fused region (no vector -> GPR-pair round trip at the boundary).
+	if pass.MergeF16Stores(ssaFn) {
+		pass.DCE(ssaFn)
+	}
+	if pass.FuseF16CvtStores(ssaFn) {
 		pass.DCE(ssaFn)
 	}
 	ssa.Compact(ssaFn)
+	t.curOutlineFunc = funcIdx
+	if err := t.maybeOutline(ssaFn); err != nil {
+		return nil, fmt.Errorf("outline: %w", err)
+	}
 	insAfter := ssa.CountValues(ssaFn)
 	// A pass bug that produced a malformed CFG must not reach emit;
 	// surface the verify failure so the SSA bug is fixed at its source.
@@ -3058,6 +3325,12 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse embedded helpers: %w", err)
 		}
+		// Synthetic fused-SIMD helpers (simd_fuse.go) join the embedded
+		// set here so name resolution, transitive dependency closure,
+		// and the multi-package export rename all treat them like any
+		// other helper. All shapes are interned by now: emitHelpers
+		// runs after every function body has been emitted.
+		f.Decls = append(f.Decls, t.fusedHelperDecls()...)
 		t.helpersFile = f
 	}
 	// Build the set of helper-function names defined in helpers.go so

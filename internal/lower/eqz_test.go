@@ -25,7 +25,7 @@ func TestLowerEqzIsComparison(t *testing.T) {
 		1: "OpEq32", // value32: i32.eqz as the return value
 		2: "OpEq64", // value64: i64.eqz as the return value
 	} {
-		fn, err := LowerFunction(mod, fnIdx, "fn")
+		fn, err := LowerFunction(mod, fnIdx, "fn", testThrowSet(mod))
 		if err != nil {
 			t.Fatalf("lower fn%d: %v", fnIdx, err)
 		}

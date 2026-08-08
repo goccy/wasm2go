@@ -53,14 +53,3 @@ func TestMemOptSkippedOnSharedMemory(t *testing.T) {
 		t.Errorf("shared memory: expected both loads preserved (2 derefs), got %d", n)
 	}
 }
-
-// TestMemOptRunsWhenForcedOnShared confirms the gate — not some unrelated
-// reason — is what preserves the second load: with WASM2GO_MEMOPT_ON_SHARED
-// set, MemOpt runs even on shared memory and collapses the redundant load
-// to a single deref. (This is the KNOWINGLY-UNSOUND diagnostic path.)
-func TestMemOptRunsWhenForcedOnShared(t *testing.T) {
-	t.Setenv("WASM2GO_MEMOPT_ON_SHARED", "1")
-	if n := loadCount(fn0Body(t)); n != 1 {
-		t.Errorf("forced MemOpt on shared: expected the redundant load merged (1 deref), got %d", n)
-	}
-}

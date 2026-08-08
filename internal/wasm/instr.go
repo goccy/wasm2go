@@ -191,6 +191,48 @@ func (r *InstrReader) SkipImmediates(op byte) error {
 		}
 		return fmt.Errorf("unknown 0xfe sub-opcode 0x%02x", sub)
 	}
+	// 0xfd-prefixed SIMD ops. Immediate shapes by sub-opcode range:
+	// loads/stores take a memarg, v128.const and i8x16.shuffle take 16 raw
+	// bytes, extract/replace_lane take one lane byte, the load/store_lane
+	// family takes memarg + lane byte; every other op has no immediates.
+	if op == OpPrefixFD {
+		sub, err := r.ReadU32()
+		if err != nil {
+			return err
+		}
+		skipMemarg := func() error {
+			if _, err := r.ReadU32(); err != nil {
+				return err
+			}
+			_, err := r.ReadU32()
+			return err
+		}
+		switch {
+		case sub <= 0x0b: // v128.load*, v128.store
+			return skipMemarg()
+		case sub == 0x0c || sub == 0x0d: // v128.const, i8x16.shuffle
+			for i := 0; i < 16; i++ {
+				if _, err := r.ReadByte(); err != nil {
+					return err
+				}
+			}
+			return nil
+		case sub >= 0x15 && sub <= 0x22: // extract_lane / replace_lane
+			_, err := r.ReadByte()
+			return err
+		case sub >= 0x54 && sub <= 0x5b: // v128.load/store N_lane
+			if err := skipMemarg(); err != nil {
+				return err
+			}
+			_, err := r.ReadByte()
+			return err
+		case sub == 0x5c || sub == 0x5d: // v128.load32_zero / load64_zero
+			return skipMemarg()
+		case sub <= 0xff: // plain lane / arithmetic ops
+			return nil
+		}
+		return fmt.Errorf("unknown 0xfd sub-opcode 0x%02x", sub)
+	}
 	// 0xfc-prefixed extended ops.
 	if op == OpPrefixFC {
 		sub, err := r.ReadU32()

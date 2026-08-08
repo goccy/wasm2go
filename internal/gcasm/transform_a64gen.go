@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -69,6 +70,13 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 		}
 		return nil, false, 0, "", false
 	}
+	fnResultReg := ""
+	if opts.HasResult {
+		if _, r0 := assignARM64(nil, true, opts.Result); r0 != nil {
+			fnResultReg = r0.Reg
+		}
+	}
+	insns = a64F16Peephole(insns, resolveCallee, fnResultReg)
 
 	// Outgoing ABI0 argument scratch: max over marshalled callees.
 	maxOut := 0
@@ -156,6 +164,9 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 		}
 	}
 
+	// trapCallee, once set, marks that at least one memory splice
+	// branched to the shared out-of-bounds stub, emitted after the body.
+	trapCallee := ""
 	for idx := 0; idx < len(insns); idx++ {
 		in := insns[idx]
 		emitPending(in.Off)
@@ -175,11 +186,123 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 		}
 		txt = a64RewriteSlots(txt, local, maxOut, args, opts)
 		if m := a64CallRe.FindStringSubmatch(txt); m != nil {
+			// Pair-form SIMD calls splice BEFORE callee resolution:
+			// their two-result signatures have no marshalling, by the
+			// simdPairOps contract. See simdsplice_pair_a64.go.
+			if pop, isPair := a64SplicePairOp(m[1]); isPair {
+				var spliced, wantsTrap bool
+				var perr error
+				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop {
+					spliced, wantsTrap, perr = a64SpliceLoop(&b, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), opts.PortableSIMD)
+				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused {
+					spliced, wantsTrap, perr = a64SpliceFused(&b, tree, pool, opts.ModOffsets, opts.PortableSIMD)
+				} else {
+					spliced, wantsTrap, perr = a64SplicePair(&b, pop, pool, opts.ModOffsets)
+				}
+				if perr != nil {
+					return "", fmt.Errorf("%s at +%d: %w", m[1], in.Off, perr)
+				}
+				if spliced {
+					if wantsTrap && trapCallee == "" {
+						trapSym := m[1][:strings.LastIndex(m[1], ".")+1] + "Wasm_trap_simd_oob"
+						if strings.Contains(m[1], ".simd_") {
+							trapSym = m[1][:strings.LastIndex(m[1], ".")+1] + "wasm_trap_simd_oob"
+						}
+						if _, _, _, localSym, ok := resolveCallee(trapSym); ok {
+							trapCallee = localSym
+						} else {
+							return "", fmt.Errorf("simd mem splice: cannot resolve %s", trapSym)
+						}
+					}
+					if opts.SpliceStats != nil {
+						opts.SpliceStats.Spliced++
+					}
+					continue
+				}
+			}
 			if params, hasRes, res2, localSym, ok := resolveCallee(m[1]); ok {
 				// arm64 ABI0 outgoing args start at RSP+8 (RSP+0 holds
 				// the saved LR), so every marshalled slot is offset +8.
 				cargs, cres := assignARM64(params, hasRes, res2)
+				// A SIMD helper call is spliced inline instead of
+				// marshalled: the op body replaces the call entirely.
+				// See simdsplice_a64.go.
+				if _, isSimd := simdSpliceOp(m[1]); isSimd {
+					if ok, wantsTrap := a64SpliceSimd(&b, m[1], cargs, cres, hasRes, 8+maxOut, pool, opts.ModOffsets); ok {
+						if wantsTrap && trapCallee == "" {
+							// Resolve the oob trap through the same
+							// package the helper lives in; the stub is
+							// emitted after the last instruction.
+							trapSym := m[1][:strings.LastIndex(m[1], ".")+1] + "Wasm_trap_simd_oob"
+							if strings.Contains(m[1], ".simd_") {
+								trapSym = m[1][:strings.LastIndex(m[1], ".")+1] + "wasm_trap_simd_oob"
+							}
+							if _, _, _, localSym, ok := resolveCallee(trapSym); ok {
+								trapCallee = localSym
+							} else {
+								return "", fmt.Errorf("simd mem splice: cannot resolve %s", trapSym)
+							}
+						}
+						if opts.SpliceStats != nil {
+							opts.SpliceStats.Spliced++
+						}
+						continue
+					}
+					if opts.SpliceStats != nil {
+						opts.SpliceStats.Kept++
+					}
+				}
+				// Software fp32→fp16 conversion: this helper is only
+				// injected where the SSA idiom pass proved the NaN
+				// case is handled by a surrounding branch, so the
+				// whole marshalled call collapses to one native
+				// convert. Writing the H view zeroes the rest of the
+				// vector register, so the S-view move reads the
+				// zero-extended binary16 bits.
+				if a64F16CvtOp(m[1]) && hasRes && len(cargs) == 1 &&
+					cargs[0].Reg != "" && cres.Reg != "" {
+					fmt.Fprintf(&b, "\tFCVTSH %s, %s\n", cargs[0].Reg, cargs[0].Reg)
+					fmt.Fprintf(&b, "\tFMOVS %s, %s\n", cargs[0].Reg, cres.Reg)
+					continue
+				}
+				// Wasm integer division: the marshalled helper call
+				// (spill args, ABI0 wrapper, reload result) costs tens of
+				// cycles for a one-instruction operation. Emit the divide
+				// inline and keep the helper call as the slow path for
+				// the inputs that need the trap checks (divisor 0, and
+				// -1 for the signed overflow case). ggml index math hits
+				// the fast path essentially always.
+				divSpliced := false
+				if dk, isDiv := a64DivOp(m[1]); isDiv && hasRes &&
+					len(cargs) == 2 && cargs[0].Reg != "" && cargs[1].Reg != "" && cres.Reg != "" {
+					site := strconv.Itoa(in.Off)
+					x, y := cargs[0].Reg, cargs[1].Reg
+					cbz, cmn, div := "CBZW", "CMNW", "UDIVW"
+					if dk.wide {
+						cbz, cmn, div = "CBZ", "CMN", "UDIV"
+					}
+					fmt.Fprintf(&b, "\t%s %s, gcasmdivs%s\n", cbz, y, site)
+					if dk.signed {
+						div = "SDIVW"
+						if dk.wide {
+							div = "SDIV"
+						}
+						fmt.Fprintf(&b, "\t%s $1, %s\n", cmn, y)
+						fmt.Fprintf(&b, "\tBEQ gcasmdivs%s\n", site)
+					}
+					fmt.Fprintf(&b, "\t%s %s, %s, %s\n", div, y, x, cres.Reg)
+					fmt.Fprintf(&b, "\tB gcasmdivd%s\n", site)
+					fmt.Fprintf(&b, "gcasmdivs%s:\n", site)
+					divSpliced = true
+				}
 				for _, ca := range cargs {
+					if ca.Kind == ArgV128 {
+						fmt.Fprintf(&b, "\tMOVD %d(RSP), R27\n", ca.SeqOf+8+maxOut)
+						fmt.Fprintf(&b, "\tMOVD R27, %d(RSP)\n", ca.StackOf+8)
+						fmt.Fprintf(&b, "\tMOVD %d(RSP), R27\n", ca.SeqOf+8+maxOut+8)
+						fmt.Fprintf(&b, "\tMOVD R27, %d(RSP)\n", ca.StackOf+8+8)
+						continue
+					}
 					if ca.Reg != "" {
 						fmt.Fprintf(&b, "\t%s %s, %d(RSP)\n", storeForARM64(ca.Kind), ca.Reg, ca.StackOf+8)
 						continue
@@ -193,7 +316,17 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 				}
 				fmt.Fprintf(&b, "\tCALL %s(SB)\n", localSym)
 				if hasRes {
-					fmt.Fprintf(&b, "\t%s %d(RSP), %s\n", loadForARM64(cres.Kind), cres.StackOf+8, cres.Reg)
+					if cres.Kind == ArgV128 {
+						fmt.Fprintf(&b, "\tMOVD %d(RSP), R27\n", cres.StackOf+8)
+						fmt.Fprintf(&b, "\tMOVD R27, %d(RSP)\n", cres.SeqOf+8+maxOut)
+						fmt.Fprintf(&b, "\tMOVD %d(RSP), R27\n", cres.StackOf+8+8)
+						fmt.Fprintf(&b, "\tMOVD R27, %d(RSP)\n", cres.SeqOf+8+maxOut+8)
+					} else {
+						fmt.Fprintf(&b, "\t%s %d(RSP), %s\n", loadForARM64(cres.Kind), cres.StackOf+8, cres.Reg)
+					}
+				}
+				if divSpliced {
+					fmt.Fprintf(&b, "gcasmdivd%d:\n", in.Off)
 				}
 				continue
 			}
@@ -207,6 +340,13 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 				}
 			} else {
 				return "", fmt.Errorf("unmarshalled direct call %q at +%d", m[1], in.Off)
+			}
+		}
+		// gc static-temp rodata (see the amd64 twin).
+		if strings.Contains(txt, "..stmp_") {
+			var serr error
+			if txt, serr = rewriteStmpRefs(txt, opts.Datas, pool); serr != nil {
+				return "", fmt.Errorf("%w at +%d", serr, in.Off)
 			}
 		}
 		// Type descriptor loads.
@@ -237,11 +377,97 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 	if tptr < len(targetList) {
 		return "", fmt.Errorf("branch target +%d beyond last surviving instruction", targetList[tptr])
 	}
+	if trapCallee != "" {
+		// The shared out-of-bounds stub. The trap helper panics, so
+		// control never returns; the RET only satisfies the assembler.
+		fmt.Fprintf(&b, "%s:\n", a64SimdMemTrapLabel)
+		fmt.Fprintf(&b, "\tCALL %s(SB)\n", trapCallee)
+		b.WriteString("\tRET\n")
+	}
 	if ownPool && len(pool.names) > 0 {
 		b.WriteString("\n")
 		b.WriteString(pool.Emit())
 	}
-	return b.String(), nil
+	// Forward v128 values across the stack slots gc still routes them
+	// through — see simdforward_a64.go. A body with no FMOVQ has no
+	// v128 traffic and skips the pass outright.
+	body := b.String()
+	if strings.Contains(body, "FMOVQ") {
+		body = a64ForwardSimdSlots(body)
+		body = a64DeadArgStores(body)
+	}
+	// Pair-form splices: drop GPR→V rebuilds of values the V register
+	// still holds. See simdforward_pair_a64.go.
+	if strings.Contains(body, "// fmov d") {
+		body = a64ForwardPairTransfers(body)
+	}
+	body = a64GuardLeafLR(body, frame)
+	return body, nil
+}
+
+// a64GuardLeafLR protects the link register in call-free bodies. Under
+// register pressure gc allocates R30 as an ordinary scratch (its own
+// prologue saved LR, which the transform strips). The Go assembler
+// reloads LR at RET only for bodies that contain a CALL; a fully
+// spliced body is a leaf to the assembler, so a clobbered R30 becomes
+// the return target — a jump into data. Give such bodies an explicit
+// LR spill slot: save on entry, reload before every RET.
+func a64GuardLeafLR(body string, frame int) string {
+	if strings.Contains(body, "\tCALL\t") || strings.Contains(body, "\tCALL ") {
+		return body
+	}
+	clobbers := false
+	for _, l := range strings.Split(body, "\n") {
+		if a64WritesR30(l) {
+			clobbers = true
+			break
+		}
+	}
+	if !clobbers {
+		return body
+	}
+	slot := frame
+	lines := strings.Split(body, "\n")
+	var out []string
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "TEXT ") {
+			// Grow the declared frame by one aligned slot for the LR
+			// save; existing offsets are below it and stay put.
+			l = a64FrameRe.ReplaceAllString(l, fmt.Sprintf("$$%d-", frame+16))
+			out = append(out, l)
+			continue
+		}
+		if strings.HasPrefix(t, "NO_LOCAL_POINTERS") {
+			out = append(out, l, fmt.Sprintf("\tMOVD R30, %d(RSP)", slot))
+			continue
+		}
+		if strings.HasPrefix(t, "RET") {
+			out = append(out, fmt.Sprintf("\tMOVD %d(RSP), R30", slot), l)
+			continue
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
+}
+
+// a64FrameRe matches the declared frame size in a TEXT line.
+var a64FrameRe = regexp.MustCompile(`\$\d+-`)
+
+// a64WritesR30 reports whether an instruction line writes R30 (final
+// destination operand, or an LDP destination pair member).
+func a64WritesR30(l string) bool {
+	t := strings.TrimSpace(l)
+	if t == "" || strings.HasPrefix(t, "//") || strings.HasPrefix(t, "TEXT") {
+		return false
+	}
+	if strings.HasSuffix(t, ", R30") {
+		return strings.Contains(t, "\t") // an instruction, not a label
+	}
+	if strings.HasPrefix(t, "LDP") && (strings.Contains(t, ", R30)") || strings.Contains(t, "(R30,")) {
+		return true
+	}
+	return false
 }
 
 // a64RewriteSlots rewrites arm64 stack operands. arm64 addresses locals
@@ -305,4 +531,44 @@ func a64RewriteSlots(txt string, local, delta int, args []RegAssignment, opts Tr
 		return fmt.Sprintf("%d(RSP)", off+local+8+delta)
 	})
 	return txt
+}
+
+// a64DivKind describes an inlineable wasm integer division helper.
+type a64DivKind struct {
+	signed bool
+	wide   bool
+}
+
+// a64DivOp matches the base-package division helpers whose calls the
+// transform inlines with a fast sdiv/udiv path (see the call site).
+// Remainder ops stay marshalled: they never show up hot.
+func a64DivOp(sym string) (a64DivKind, bool) {
+	i := strings.LastIndex(sym, ".")
+	if i < 0 || !strings.HasSuffix(sym[:i], "/base") && !strings.HasSuffix(sym[:i], ".base") {
+		return a64DivKind{}, false
+	}
+	switch sym[i+1:] {
+	case "I32_div_s":
+		return a64DivKind{signed: true}, true
+	case "I64_div_s":
+		return a64DivKind{signed: true, wide: true}, true
+	case "I32_div_u":
+		return a64DivKind{}, true
+	case "I64_div_u":
+		return a64DivKind{wide: true}, true
+	}
+	return a64DivKind{}, false
+}
+
+// a64F16CvtOp matches the base-package fp32→fp16 conversion helper
+// whose call the transform replaces entirely with a native FCVT (see
+// the call site). The helper's NaN convention differs from FCVT's
+// payload propagation, but every injection site guards NaN out before
+// the call, so the fast path is bit-exact where its result is live.
+func a64F16CvtOp(sym string) bool {
+	i := strings.LastIndex(sym, ".")
+	if i < 0 || !strings.HasSuffix(sym[:i], "/base") && !strings.HasSuffix(sym[:i], ".base") {
+		return false
+	}
+	return sym[i+1:] == "F32_to_f16_bits"
 }

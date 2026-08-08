@@ -143,16 +143,10 @@ func TestInlineConstBaseLargeOffsetViaConstsTable(t *testing.T) {
 	}
 }
 
-// TestInlineOffEnvEscape confirms WASM2GO_INLINE=off restores the call
-// (the bisection kill-switch must actually work). Note: the inliner
-// reads the env at package init, so this test drives the CLI binary
-// path instead... simpler: assert the default DID inline (covered
-// above) and that the analysis respects leaf-only by checking a
-// non-leaf caller is never inlined — fn2 calls fn0/fn1 so it is
-// non-leaf; if something inlined fn2 anywhere it would be a bug, but
-// nothing calls fn2, so instead pin the exported-shape invariant:
-// fn0/fn1 bodies are still emitted (table/export references may need
-// them; whole-function DCE decides, not the inliner).
+// TestInlineKeepsCalleeBodies pins the exported-shape invariant:
+// fn0/fn1 bodies are still emitted even when inlined into callers
+// (table/export references may need them; whole-function DCE
+// decides, not the inliner).
 func TestInlineKeepsCalleeBodies(t *testing.T) {
 	bin := testfixture.Wasm(t, "inline_leaf")
 	m, err := transpile.Parse(bytes.NewReader(bin))

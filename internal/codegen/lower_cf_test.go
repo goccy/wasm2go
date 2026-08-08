@@ -32,7 +32,7 @@ func TestLowerGcd(t *testing.T) {
 	if idx == ^uint32(0) {
 		t.Skip("gcd not in control.wasm exports")
 	}
-	fn, err := lower.LowerFunction(mod, idx, "gcd")
+	fn, err := lower.LowerFunction(mod, idx, "gcd", nil)
 	if err != nil {
 		t.Fatalf("lower gcd: %v", err)
 	}

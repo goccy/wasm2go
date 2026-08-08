@@ -177,6 +177,56 @@ const (
 	// i-th value. Impure (its value comes from the caught exception, not a
 	// pure computation), so it must not be CSE'd or hoisted.
 	OpCatchArg
+
+	// The branch-based exception-handling ops. A wasm exception is
+	// signalled through per-execution-context module state rather than a
+	// Go panic, so an EH function stays ordinary straight-line code that
+	// the asm backend can transform (a panic-based lowering pins every
+	// such function to a compiled-Go fallback body).
+	//
+	// OpExcPending reads the "an exception is propagating" flag (i32 0/1);
+	// it is the control value of the check-and-branch emitted after every
+	// call that may throw.
+	OpExcPending
+	// OpExcTag reads the propagating exception's tag index (i32). Only
+	// meaningful while the flag is set.
+	OpExcTag
+	// OpExcVal reads the propagating exception's AuxInt-th operand slot,
+	// narrowed to the value's type.
+	OpExcVal
+	// OpExcRaise stores an exception into the module state and sets the
+	// flag. Args[0] is the tag index as a VALUE (a constant for `throw`,
+	// the saved tag for `rethrow`, whose tag is only known at run time);
+	// Args[1:] are the operand slots to write, in slot order. The block
+	// holding it branches straight to a handler or to a propagating
+	// return.
+	OpExcRaise
+	// OpExcRearm sets the flag without touching the tag or operands: the
+	// "no clause matched, keep propagating" edge out of a dispatch, where
+	// the state is still exactly as the raiser left it.
+	OpExcRearm
+	// OpExcClear clears the flag — a catch handler's first act, so code
+	// running inside the handler is no longer "propagating".
+	OpExcClear
+
+	// OpSimdConst is a v128 constant (v128.const, and the pattern operand
+	// of i8x16.shuffle). Aux is a [2]uint64 holding the little-endian
+	// lane bytes; emitted as a [2]uint64 composite literal.
+	OpSimdConst
+
+	// OpSimdCall delegates a PURE SIMD lane/arithmetic op to a helper
+	// (emitted as helper(args...), no module argument). Aux is the helper
+	// name; args and result are v128 or scalars (extract_lane, bitmask,
+	// any_true/all_true return scalars). Pure: freely CSE-able, dead when
+	// unused.
+	OpSimdCall
+
+	// OpSimdMemCall delegates a SIMD memory op (v128.load*/store*, the
+	// lane and splat and zero-extending load variants) to a MODULE-AWARE
+	// helper, emitted as helper(m, args...). Always side-effecting so
+	// loads and stores keep their statement order (the IR has no Mem
+	// token on these).
+	OpSimdMemCall
 )
 
 // String renders the op name. Used by IR dumps and golden tests.
@@ -293,6 +343,17 @@ var opNames = [...]string{
 	OpCatchArg:   "OpCatchArg",
 	OpMemoryInit: "OpMemoryInit",
 	OpDataDrop:   "OpDataDrop",
+
+	OpExcPending: "OpExcPending",
+	OpExcTag:     "OpExcTag",
+	OpExcVal:     "OpExcVal",
+	OpExcRaise:   "OpExcRaise",
+	OpExcRearm:   "OpExcRearm",
+	OpExcClear:   "OpExcClear",
+
+	OpSimdConst:   "OpSimdConst",
+	OpSimdCall:    "OpSimdCall",
+	OpSimdMemCall: "OpSimdMemCall",
 }
 
 // IsConstant reports whether op produces a compile-time-known value.
@@ -332,7 +393,7 @@ func (op Op) UsesAuxInt() bool {
 		OpLocalGet, OpLocalSet,
 		OpSelect,
 		OpMemoryInit, OpDataDrop,
-		OpCatchArg:
+		OpCatchArg, OpExcVal:
 		return true
 	}
 	return false
@@ -359,8 +420,10 @@ func (op Op) HasSideEffect() bool {
 		OpGlobalSet,
 		OpLocalSet, // writes a mutable local var (EH mutable-locals mode)
 		OpCallDirect, OpCallIndirect, OpCallImport,
-		OpHelperCall, // may trap (div, rem, non-saturating trunc-to-int)
-		OpAtomicCall, // synchronizes with other agents; never removable
+		OpHelperCall,                       // may trap (div, rem, non-saturating trunc-to-int)
+		OpAtomicCall,                       // synchronizes with other agents; never removable
+		OpSimdMemCall,                      // v128 loads/stores: keep statement order, may trap OOB
+		OpExcRaise, OpExcRearm, OpExcClear, // write the module's exception state
 		OpUnreachable,
 		OpMemGrow, OpMemoryCopy, OpMemoryFill, OpMemoryInit, OpDataDrop:
 		return true

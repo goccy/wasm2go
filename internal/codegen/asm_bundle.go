@@ -61,7 +61,9 @@ func isPlan9AsmSafe(path string) bool {
 // single-package mode. Anything else (export wrappers, helpers,
 // New, init functions) keeps its name unchanged and falls through
 // to the shared file.
-var wasmFuncBodyName = regexp.MustCompile(`^[Ff]n\d+$`)
+// The `l<blockID>` suffix names a loop outlined from that function
+// (see internal/ssa/outline.go); those bodies route with their parent.
+var wasmFuncBodyName = regexp.MustCompile(`^[Ff]n\d+(l\d+)?$`)
 
 // isLinknameTrampolineBody reports whether body is the single-stmt
 // forwarding pattern emitLinknameForwards emits for cross-chunk

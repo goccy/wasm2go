@@ -28,7 +28,7 @@ func TestLowerSwitch3(t *testing.T) {
 	if idx == ^uint32(0) {
 		t.Skip("switch3 not exported")
 	}
-	if _, err := LowerFunction(mod, idx, "switch3"); err != nil {
+	if _, err := LowerFunction(mod, idx, "switch3", testThrowSet(mod)); err != nil {
 		t.Fatalf("lower switch3: %v", err)
 	}
 }
@@ -80,7 +80,7 @@ func TestLowerBrTableLoopArity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if _, err := LowerFunction(mod, 0, "f"); err != nil {
+	if _, err := LowerFunction(mod, 0, "f", testThrowSet(mod)); err != nil {
 		t.Fatalf("lower br_table-loop-arity func: %v", err)
 	}
 }
@@ -120,7 +120,7 @@ func TestLowerBrTableBlockKind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	f, err := LowerFunction(mod, 0, "f")
+	f, err := LowerFunction(mod, 0, "f", testThrowSet(mod))
 	if err != nil {
 		t.Fatalf("lower: %v", err)
 	}

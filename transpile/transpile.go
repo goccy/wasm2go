@@ -78,11 +78,10 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		return res, err
 	}
 
-	// PureOnly (or its subprocess form WASM2GO_PURE, honored inside
-	// codegen.Translate): the pure bodies were emitted untagged, so
-	// they compile on every GOARCH and no asm bundle is wanted. This
-	// is the ABIInternal reference backend for benchmarking.
-	if opts.PureOnly || os.Getenv("WASM2GO_PURE") != "" {
+	// PureOnly: the pure bodies were emitted untagged, so they compile
+	// on every GOARCH and no asm bundle is wanted. This is the
+	// ABIInternal reference backend for benchmarking.
+	if opts.PureOnly {
 		if _, err := w.Write(mainBuf.Bytes()); err != nil {
 			return res, err
 		}
@@ -97,9 +96,24 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	for name, data := range res.Files {
 		treeIn[name] = data
 	}
-	gcasmFiles, _, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath)
+	synthSigs := map[string]gcasm.SynthSig{}
+	for name, sig := range res.OutlinedSigs {
+		synthSigs[name] = gcasm.SynthSig{Params: sig.Params, Result: sig.Result, Packed: sig.Packed}
+	}
+	var nrc2 *gcasm.Nrc2Spec
+	if res.Nrc2VecDot != "" {
+		nrc2 = &gcasm.Nrc2Spec{VecDot: res.Nrc2VecDot, Companion: res.Nrc2Companion}
+	}
+	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
+		FastMath:       opts.FastMath,
+		FuseLoopUnroll: opts.FuseLoopUnroll,
+	})
 	if err != nil {
 		return res, fmt.Errorf("gcasm backend: %w", err)
+	}
+	if n := gstats.SimdSpliced + gstats.SimdKept; n > 0 {
+		fmt.Fprintf(os.Stderr, "wasm2go: gcasm SIMD splice: %d call sites inlined, %d kept as calls\n",
+			gstats.SimdSpliced, gstats.SimdKept)
 	}
 	if res.Files == nil {
 		res.Files = map[string][]byte{}
@@ -138,11 +152,7 @@ func Transpile(r io.Reader, w io.Writer, opts Options) (Result, error) {
 //
 //	defer transpile.SetMultiPackageThreshold(0)()
 //
-// Subprocess invocations of wasm2go (e.g. a wasm2go-using protoc
-// plugin spawned by buf generate) can override the threshold through
-// the WASM2GO_MULTIPACKAGE_THRESHOLD environment variable; the
-// in-process override takes priority when both are set.
-//
+// //
 // The defaults are auto-derived from wasm size and most callers
 // should not touch this. The override is supported for diagnostics,
 // build-time memory tuning, and exercising the multi-package path on

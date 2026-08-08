@@ -24,41 +24,17 @@ var errUnsupportedDuff = errors.New("gcasm: DUFFZERO/DUFFCOPY pseudo-op unsuppor
 // the jump table fine) rather than aborting the whole bundle.
 var errUnsupportedJumpTable = errors.New("gcasm: jump-table flag state not replayable in hand-written asm")
 
+// errSimdPairUnspliced routes a function containing a pair-form SIMD
+// call to the pure fallback on an architecture whose pair splice is not
+// implemented yet (amd64). The two-result pair signature has no
+// marshalling, so the call cannot be kept — but the pure Go body runs
+// the wrapper directly and stays correct.
+var errSimdPairUnspliced = errors.New("gcasm: pair-form SIMD call without a pair splice on this arch")
+
 // hasDuffPseudo reports whether any instruction is a DUFFZERO/DUFFCOPY.
 func hasDuffPseudo(insns []Insn) bool {
 	for _, in := range insns {
 		if strings.HasPrefix(in.Text, "DUFFZERO") || strings.HasPrefix(in.Text, "DUFFCOPY") {
-			return true
-		}
-	}
-	return false
-}
-
-// ehRuntimeCalls are the runtime symbols emitted by exception-handling /
-// defer-recover Go bodies (a wasm try/catch or throw). A function that calls
-// any of them cannot be lowered to leaf asm and must use the pure fallback.
-var ehRuntimeCalls = []string{
-	"runtime.newobject",      // &wasmExc{...} heap allocation
-	"runtime.gopanic",        // panic(...)
-	"runtime.gorecover",      // recover()
-	"runtime.deferreturn",    // deferred recover
-	"runtime.deferprocStack", // defer setup
-	"runtime.deferproc",      // defer setup
-}
-
-func hasEHRuntimeCall(insns []Insn) bool {
-	for _, in := range insns {
-		for _, rc := range ehRuntimeCalls {
-			if strings.Contains(in.Text, rc) {
-				return true
-			}
-		}
-		// A structured-EH function wraps its try body in a func literal and
-		// calls it (`__exc := func() *wasmExc { ... }()`). The OUTER function
-		// need not call any panic/recover runtime symbol itself — the defer /
-		// recover lives inside the closure — so detect the closure call: gc
-		// names function literals "<outer>.funcN".
-		if strings.Contains(in.Text, "CALL") && strings.Contains(in.Text, ".func") {
 			return true
 		}
 	}

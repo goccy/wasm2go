@@ -21,6 +21,10 @@ const (
 	ArgI64
 	ArgF32
 	ArgF64
+	// ArgV128 is a [2]uint64 (a wasm v128 value). ABIInternal never
+	// register-assigns arrays, so v128 params and results are always
+	// stack-assigned on both sides — the call marshal copies 16 bytes.
+	ArgV128
 )
 
 // amd64 ABIInternal register sequences (go/src/cmd/compile/abi-internal.md).
@@ -58,11 +62,19 @@ func AssignABIInternal(params []ArgKind, hasResult bool, result ArgKind) (args [
 		var ra RegAssignment
 		ra.Kind = k
 		sz, al := 8, 8
-		if k == ArgI32 || k == ArgU32 || k == ArgF32 {
+		switch k {
+		case ArgI32, ArgU32, ArgF32:
 			sz, al = 4, 4
+		case ArgV128:
+			sz = 16
 		}
 		isFloat := k == ArgF32 || k == ArgF64
 		switch {
+		case k == ArgV128:
+			// Never register-assigned; always the stack sequence.
+			seqOff = align(seqOff, al)
+			ra.SeqOf = seqOff
+			seqOff += sz
 		case isFloat && fltN < len(amd64FloatArgRegs):
 			ra.Reg = amd64FloatArgRegs[fltN]
 			fltN++
@@ -90,6 +102,10 @@ func AssignABIInternal(params []ArgKind, hasResult bool, result ArgKind) (args [
 		stackOff = align(stackOff, 8)
 		r.StackOf = stackOff
 		switch result {
+		case ArgV128:
+			// Stack result on both sides: the ABIInternal caller reads
+			// it from its outgoing sequence right after the stack args.
+			r.SeqOf = align(seqOff, 8)
 		case ArgF32, ArgF64:
 			r.Reg = "X0"
 		default:

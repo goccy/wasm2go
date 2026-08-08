@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
 // TransformOptions parameterize one function's transform.
@@ -53,6 +55,34 @@ type TransformOptions struct {
 	// into the same package's arch-tagged Go file (the generated init
 	// fills the tables). nil ⇒ the legacy O(log n) compare tree.
 	JT *JTTable
+	// SpliceStats, when non-nil, counts SIMD helper calls that were
+	// spliced inline vs left as marshalled calls (table gaps). Purely
+	// observability — the build summary reports the ratio.
+	SpliceStats *SpliceStats
+	// ModOffsets are the Module field offsets the SIMD memory-op
+	// splices hardcode, extracted from the captured probe (see
+	// FindModuleOffsets). nil keeps memory ops on the call path.
+	ModOffsets *ModuleOffsets
+	// FusedSimd resolves synthetic fused-region helper names
+	// (simd_p_fx*) to their tree descriptors; the pair splicers
+	// synthesize the inline body from the tree (see the
+	// simdsplice_fuse files). A fused call with no entry here is a
+	// build error, like any pair-table miss.
+	FusedSimd map[string]*simdfuse.Tree
+	// FusedLoops resolves synthetic fused-LOOP helper names.
+	FusedLoops map[string]*simdfuse.Loop
+	// PortableSIMD restricts splice synthesis to the architecture's
+	// baseline instruction set (no FEAT_DotProd on arm64). Build uses
+	// it to emit the portable twin of a feature-gated body; the
+	// generated Go wrapper picks a body at runtime from the CPU
+	// feature vars in the base package.
+	PortableSIMD bool
+}
+
+// SpliceStats counts SIMD call-site outcomes across one build.
+type SpliceStats struct {
+	Spliced int // helper calls replaced by inline op bodies
+	Kept    int // Simd_* calls left marshalled (no table entry)
 }
 
 // TypeTable accumulates runtime-type references for one output file.
@@ -85,6 +115,10 @@ type ConstPool struct {
 type constEntry struct {
 	size int
 	bits string // hex, as embedded in gc's symbol name
+	// blob holds the literal bytes for a captured rodata constant
+	// (gc's `..stmp_N` statics, e.g. the 16-byte v128 literals the
+	// SIMD lowering emits). When set, bits is unused.
+	blob []byte
 }
 
 func (p *ConstPool) add(width, bits string) string {
@@ -103,16 +137,80 @@ func (p *ConstPool) add(width, bits string) string {
 	return name
 }
 
+// addBlob interns a captured rodata constant by CONTENT (so identical
+// literals from different packages/functions share one symbol) and
+// returns the pool-local name to reference it by.
+func (p *ConstPool) addBlob(blob []byte) string {
+	name := fmt.Sprintf("gcb%d_%x", len(blob), blob)
+	if p.seen == nil {
+		p.seen = map[string]constEntry{}
+	}
+	if _, ok := p.seen[name]; !ok {
+		p.seen[name] = constEntry{size: len(blob), blob: blob}
+		p.names = append(p.names, name)
+	}
+	return name
+}
+
 // Emit renders the pool's DATA/GLOBL trailer (deterministic:
 // first-reference order).
 func (p *ConstPool) Emit() string {
 	var b strings.Builder
 	for _, name := range p.names {
 		e := p.seen[name]
+		if e.blob != nil {
+			// 8-byte DATA chunks, zero-padded to the declared size.
+			for off := 0; off < e.size; off += 8 {
+				end := off + 8
+				if end > e.size {
+					end = e.size
+				}
+				var w uint64
+				for i := end - 1; i >= off; i-- {
+					w = w<<8 | uint64(e.blob[i])
+				}
+				fmt.Fprintf(&b, "DATA ·%s+%d(SB)/%d, $0x%016x\n", name, off, end-off, w)
+			}
+			fmt.Fprintf(&b, "GLOBL ·%s(SB), RODATA|NOPTR, $%d\n", name, e.size)
+			continue
+		}
 		fmt.Fprintf(&b, "DATA ·%s+0(SB)/%d, $0x%s\n", name, e.size, e.bits)
 		fmt.Fprintf(&b, "GLOBL ·%s(SB), RODATA|NOPTR, $%d\n", name, e.size)
 	}
 	return b.String()
+}
+
+// stmpRe matches a reference to one of gc's static-temp rodata symbols
+// (`<pkgpath>..stmp_N`, optionally with a byte offset). Plan9 asm
+// cannot name them, so the transform re-materialises their captured
+// bytes in the const pool.
+var stmpRe = regexp.MustCompile(`([A-Za-z0-9_./\-]+)\.\.stmp_(\d+)((?:[+\-]\d+)?)\(SB\)`)
+
+// rewriteStmpRefs replaces every `..stmp_N(SB)` operand with a const-pool
+// symbol carrying the same bytes. Returns an error when the symbol was
+// not captured or no pool is available (silently keeping the reference
+// would emit unassemblable asm).
+func rewriteStmpRefs(txt string, datas map[string]*DataSym, pool *ConstPool) (string, error) {
+	var err error
+	out := stmpRe.ReplaceAllStringFunc(txt, func(m string) string {
+		sub := stmpRe.FindStringSubmatch(m)
+		sym := sub[1] + "..stmp_" + sub[2]
+		d := datas[sym]
+		if d == nil || pool == nil {
+			if err == nil {
+				err = fmt.Errorf("rodata constant %s not captured", sym)
+			}
+			return m
+		}
+		if len(d.Relocs) > 0 {
+			if err == nil {
+				err = fmt.Errorf("rodata constant %s carries relocations", sym)
+			}
+			return m
+		}
+		return "·" + pool.addBlob(d.Bytes) + sub[3] + "(SB)"
+	})
+	return out, err
 }
 
 func (o *TransformOptions) argName(i int) string {
@@ -264,8 +362,12 @@ func writesFlags(txt string) bool {
 	if strings.HasPrefix(mn, "CMOV") || strings.HasPrefix(mn, "SET") {
 		return false
 	}
-	// BMI2 shifts (SARX/SHRX/SHLX) do not touch flags.
-	if strings.HasSuffix(mn, "X") && (strings.HasPrefix(mn, "SARX") || strings.HasPrefix(mn, "SHRX") || strings.HasPrefix(mn, "SHLX")) {
+	// BMI2 shifts (SARX/SHRX/SHLX, spelled SARXQ/SARXL etc. with the
+	// size suffix LAST) do not touch flags. Misclassifying them as
+	// writers would let the jump-table flag-liveness analysis treat
+	// live flags as clobbered — an unsafe rewrite, not a conservative
+	// one.
+	if strings.HasPrefix(mn, "SARX") || strings.HasPrefix(mn, "SHRX") || strings.HasPrefix(mn, "SHLX") {
 		return false
 	}
 	for _, p := range flagWriterPrefixes {
@@ -635,6 +737,9 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 			tptr++
 		}
 	}
+	// trapCallee, once set, marks that at least one memory splice
+	// branched to the shared out-of-bounds stub, emitted after the body.
+	trapCallee := ""
 	for idx := 0; idx < len(insns); idx++ {
 		in := insns[idx]
 		emitPending(in.Off)
@@ -662,6 +767,40 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 		// inside the frame shift up by the new outgoing-arg area.
 		txt = rewriteSPOffsets(txt, fn.FrameSize, maxOut, args, opts)
 		if m := callRe.FindStringSubmatch(txt); m != nil {
+			// Pair-form SIMD calls splice BEFORE callee resolution:
+			// their two-result signatures have no marshalling, by the
+			// simdPairOps contract. See simdsplice_pair_amd64.go.
+			if pop, isPair := a64SplicePairOp(m[1]); isPair {
+				var spliced, wantsTrap bool
+				var perr error
+				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop {
+					spliced, wantsTrap, perr = x64SpliceLoop(&b, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), maxOut)
+				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused {
+					spliced, wantsTrap, perr = x64SpliceFused(&b, tree, pool, opts.ModOffsets, maxOut)
+				} else {
+					spliced, wantsTrap, perr = x64SplicePair(&b, pop, pool, opts.ModOffsets)
+				}
+				if perr != nil {
+					return "", fmt.Errorf("%s at +%d: %w", m[1], in.Off, perr)
+				}
+				if spliced {
+					if wantsTrap && trapCallee == "" {
+						trapSym := m[1][:strings.LastIndex(m[1], ".")+1] + "Wasm_trap_simd_oob"
+						if strings.Contains(m[1], ".simd_") {
+							trapSym = m[1][:strings.LastIndex(m[1], ".")+1] + "wasm_trap_simd_oob"
+						}
+						if _, _, _, localSym, ok := resolveCallee(trapSym); ok {
+							trapCallee = localSym
+						} else {
+							return "", fmt.Errorf("simd mem splice: cannot resolve %s", trapSym)
+						}
+					}
+					if opts.SpliceStats != nil {
+						opts.SpliceStats.Spliced++
+					}
+					continue
+				}
+			}
 			if params, hasRes, res2, localSym, ok := resolveCallee(m[1]); ok {
 				// Marshal ABIInternal registers to the callee's ABI0
 				// outgoing stack slots, call, then load the result.
@@ -670,6 +809,14 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 					return "", aerr
 				}
 				for _, ca := range cargs {
+					if ca.Kind == ArgV128 {
+						// 16-byte stack-to-stack copy through R12.
+						fmt.Fprintf(&b, "\tMOVQ %d(SP), R12\n", ca.SeqOf+maxOut)
+						fmt.Fprintf(&b, "\tMOVQ R12, %d(SP)\n", ca.StackOf)
+						fmt.Fprintf(&b, "\tMOVQ %d(SP), R12\n", ca.SeqOf+maxOut+8)
+						fmt.Fprintf(&b, "\tMOVQ R12, %d(SP)\n", ca.StackOf+8)
+						continue
+					}
 					if ca.Reg != "" {
 						fmt.Fprintf(&b, "\t%s %s, %d(SP)\n", StoreFor(ca.Kind), ca.Reg, ca.StackOf)
 						continue
@@ -690,7 +837,17 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 				}
 				fmt.Fprintf(&b, "\tCALL %s(SB)\n", localSym)
 				if hasRes {
-					fmt.Fprintf(&b, "\t%s %d(SP), %s\n", LoadFor(cres.Kind), cres.StackOf, cres.Reg)
+					if cres.Kind == ArgV128 {
+						// Stack result: copy it back to where the captured
+						// ABIInternal caller reads it (its outgoing
+						// sequence, shifted like every in-frame offset).
+						fmt.Fprintf(&b, "\tMOVQ %d(SP), R12\n", cres.StackOf)
+						fmt.Fprintf(&b, "\tMOVQ R12, %d(SP)\n", cres.SeqOf+maxOut)
+						fmt.Fprintf(&b, "\tMOVQ %d(SP), R12\n", cres.StackOf+8)
+						fmt.Fprintf(&b, "\tMOVQ R12, %d(SP)\n", cres.SeqOf+maxOut+8)
+					} else {
+						fmt.Fprintf(&b, "\t%s %d(SP), %s\n", LoadFor(cres.Kind), cres.StackOf, cres.Reg)
+					}
 				}
 				continue
 			}
@@ -727,6 +884,15 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 			txt = fmt.Sprintf("MOVQ\t·gcasmType%d(SB), %s", opts.Types.add(m[1]), m[2])
 		} else if strings.Contains(txt, "type:") {
 			return "", fmt.Errorf("unhandled type-descriptor operand %q at +%d", txt, in.Off)
+		}
+		// gc static-temp rodata (composite-literal constants, e.g. the
+		// 16-byte v128 literals) cannot be named from user asm — the
+		// pool re-materialises their captured bytes.
+		if strings.Contains(txt, "..stmp_") {
+			var serr error
+			if txt, serr = rewriteStmpRefs(txt, opts.Datas, pool); serr != nil {
+				return "", fmt.Errorf("%w at +%d", serr, in.Off)
+			}
 		}
 		// Float-constant rodata operands ($f32.<bits>(SB)) cannot be
 		// named from user asm — route them through the const pool.
@@ -793,6 +959,13 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 	if tptr < len(targetList) {
 		return "", fmt.Errorf("branch target +%d beyond last surviving instruction", targetList[tptr])
 	}
+	if trapCallee != "" {
+		// The shared out-of-bounds stub. The trap helper panics, so
+		// control never returns; the RET only satisfies the assembler.
+		fmt.Fprintf(&b, "%s:\n", x64SimdMemTrapLabel)
+		fmt.Fprintf(&b, "\tCALL %s(SB)\n", trapCallee)
+		b.WriteString("\tRET\n")
+	}
 	// No raw SP arithmetic may survive: a missed prologue/epilogue
 	// variant corrupts SP (and marks the function SPWRITE, which the
 	// runtime refuses to unwind through). Our own adjustments use
@@ -818,6 +991,8 @@ func abi0ArgSize(params []ArgKind, hasRes bool, res ArgKind) int {
 		switch k {
 		case ArgI32, ArgU32, ArgF32:
 			return 4, 4
+		case ArgV128:
+			return 16, 8
 		default:
 			return 8, 8
 		}

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
@@ -35,6 +36,10 @@ type BuildStats struct {
 	Transformed int
 	Fallback    int
 	JumpTables  int
+	// SimdSpliced / SimdKept count Simd_* helper call sites: spliced
+	// inline vs left as marshalled calls (no table entry for the op).
+	SimdSpliced int
+	SimdKept    int
 }
 
 // fnSym matches generated function symbols: fn0 (single-package,
@@ -50,7 +55,18 @@ type bundlePkg struct {
 // (multi-package mode leaves the root writer empty). The returned map
 // contains ONLY files gcasm adds or replaces; a nil entry value means
 // "delete this file from the tree".
-func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string) (map[string][]byte, *BuildStats, error) {
+// SynthSig is the wasm-typed signature of a synthetic (outlined)
+// function, keyed by bare name. Bodies with a listed signature are
+// transformed exactly like translated FnN bodies.
+type SynthSig struct {
+	Params []wasm.ValType
+	Result *wasm.ValType
+	// Packed: the caller passes (m, *[len(Params)]uint64) and the
+	// body unpacks — the register ABI carries any boundary width.
+	Packed bool
+}
+
+func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string, fused map[string]*simdfuse.Tree, fusedLoops map[string]*simdfuse.Loop, outlined map[string][]string, synth map[string]SynthSig, nrc2 *Nrc2Spec, cfg Config) (map[string][]byte, *BuildStats, error) {
 	all := map[string][]byte{}
 	if len(mainSrc) > 0 {
 		all["gen.go"] = mainSrc
@@ -142,32 +158,15 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		}
 		return
 	}
-	// GCASM_FALLBACK_RANGE=lo-hi forces fn indices in [lo,hi) to the
-	// pure fallback - a debugging knob for bisecting a miscompiled
-	// function by halving the transformed set (fallback is fully
-	// transparent to callers).
-	bisectLo, bisectHi := -1, -1
-	if r := os.Getenv("GCASM_FALLBACK_RANGE"); r != "" {
-		if _, err := fmt.Sscanf(r, "%d-%d", &bisectLo, &bisectHi); err != nil {
-			return nil, nil, fmt.Errorf("bad GCASM_FALLBACK_RANGE %q: %w", r, err)
-		}
-	}
 	// DUFFZERO/DUFFCOPY functions fall back to pure (see errUnsupportedDuff).
 	// Whether gc emits a duff sequence is toolchain- AND arch-dependent, so
 	// take the UNION across every captured arch — a function that duffs on
 	// one arch falls back on all of them, keeping the fallback set
 	// arch-consistent (the pure guard and cross-package wiring assume it).
 	duffIdx := map[uint32]bool{}
-	// ehIdx: functions whose bodies use exception-handling / defer-recover
-	// runtime machinery (panic/recover, &wasmExc heap alloc, defer). Those
-	// bodies are not representable as leaf asm, so — like duff — they run
-	// through the pure Go fallback on every arch.
-	ehIdx := map[uint32]bool{}
 	for _, spec := range archSpecs {
 		for _, f := range caps[spec.name].fns {
-			duff := hasDuffPseudo(f.Insns)
-			eh := hasEHRuntimeCall(f.Insns)
-			if !duff && !eh {
+			if !hasDuffPseudo(f.Insns) {
 				continue
 			}
 			i := strings.LastIndex(f.Name, ".")
@@ -179,20 +178,12 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 				continue
 			}
 			if idx64, perr := strconv.ParseUint(m[1], 10, 32); perr == nil {
-				if duff {
-					duffIdx[uint32(idx64)] = true
-				}
-				if eh {
-					ehIdx[uint32(idx64)] = true
-				}
+				duffIdx[uint32(idx64)] = true
 			}
 		}
 	}
 	isFallbackSig := func(idx uint32) bool {
-		if duffIdx[idx] || ehIdx[idx] {
-			return true
-		}
-		if bisectLo >= 0 && int(idx) >= bisectLo && int(idx) < bisectHi {
+		if duffIdx[idx] {
 			return true
 		}
 		ft := mod.FuncTypeOf(idx)
@@ -229,7 +220,10 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		ac.byPkg = map[string][]*Fn{}
 		for _, f := range ac.fns {
 			i := strings.LastIndex(f.Name, ".")
-			if i < 0 || !fnSymRe.MatchString(f.Name[i+1:]) {
+			if i < 0 {
+				continue
+			}
+			if _, isSynth := synth[f.Name[i+1:]]; !isSynth && !fnSymRe.MatchString(f.Name[i+1:]) {
 				continue
 			}
 			fpkg := f.Name[:i]
@@ -247,18 +241,33 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		if spec.name != "amd64" {
 			archStats = &BuildStats{}
 		}
+		// The Module field offsets for the SIMD memory-op splices,
+		// read from this arch's captured probe. nil (no probe in the
+		// capture — a module with no SIMD) keeps memory ops on the
+		// marshalled path.
+		modOffs := FindModuleOffsets(ac.fns, spec.name)
+		if modOffs != nil {
+			modOffs.Cfg = cfg
+		}
 		for _, rel := range pkgList {
 			pfns := ac.byPkg[rel]
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
 			for k, v := range files {
 				out[k] = v
 			}
+		}
+		// The SIMD splice counters are per-arch work (each arch
+		// transforms every body), so they are summed across arches
+		// rather than sampled from amd64 like the fn-set counters.
+		if archStats != stats {
+			stats.SimdSpliced += archStats.SimdSpliced
+			stats.SimdKept += archStats.SimdKept
 		}
 	}
 
@@ -311,7 +320,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		// linked binary, i.e. per arch).
 		for _, spec := range archSpecs {
 			var kb strings.Builder
-			kb.WriteString("//go:build " + spec.name + "\n\n")
+			kb.WriteString("//go:build " + spec.buildTag + "\n\n")
 			kb.WriteString("// Code generated by wasm2go (gcasm backend). DO NOT EDIT.\n//\n")
 			kb.WriteString("// Import calls live in assembly, invisible to the linker's\n")
 			kb.WriteString("// method pruning, which would fill every itab slot with\n")
@@ -333,6 +342,12 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	// so the pure guards stay `!amd64 && !arm64` (the pure fallback for
 	// other arches + the `-tags purego` escape).
 	for name, data := range all {
+		if strings.HasPrefix(filepath.Base(name), "simd_") {
+			// The SIMD helper set (scalar reference + its own per-arch
+			// asm + fallback aliases) is arch-complete on its own and
+			// independent of the gcasm bundle — leave it untouched.
+			continue
+		}
 		switch {
 		case strings.HasSuffix(name, ".s"):
 			out[name] = nil // delete
@@ -439,6 +454,13 @@ func parseSigsAST(src []byte, out map[string]goSigB) error {
 
 func exprKind(e ast.Expr) (ArgKind, bool) {
 	switch t := e.(type) {
+	case *ast.ArrayType:
+		// [2]uint64 — a wasm v128 value (the SIMD helpers' currency).
+		if l, ok := t.Len.(*ast.BasicLit); ok && l.Value == "2" {
+			if id, ok := t.Elt.(*ast.Ident); ok && id.Name == "uint64" {
+				return ArgV128, true
+			}
+		}
 	case *ast.StarExpr:
 		return ArgPtr, true
 	case *ast.SelectorExpr:
@@ -498,13 +520,46 @@ var stdlibWrapperTable = map[string]struct {
 // code path.
 type archSpec struct {
 	name      string // "amd64" / "arm64"
+	buildTag  string // //go:build expression for the emitted asm + decls
 	transform func(*Fn, TransformOptions) (string, error)
 	jtMarker  string // jump-tree marker for the stats counter
+	// Feature-gated ISA dispatch: a transformed body containing
+	// gatedMarker used instructions past the architecture baseline.
+	// Build then emits the body twice — a <sym><gatedSuffix> feature
+	// body and a <sym><portableSuffix> baseline twin (transformed with
+	// PortableSIMD) — plus a NOSPLIT tail-jump stub under the original
+	// name that branches on a package-local mirror of featureVar (a
+	// bool in the base package). The stub keeps the caller's frame, so
+	// dispatch costs one predicted branch, not an extra call layer.
+	// Empty gatedMarker disables the mechanism for the arch.
+	gatedMarker    string
+	gatedSuffix    string
+	portableSuffix string
+	featureVar     string
+	// dispatchStub renders the stub body. argBytes is the argument
+	// area size from the transformed body's TEXT header.
+	dispatchStub func(sym, featSym, portSym, mirrorVar, argBytes string) string
 }
 
 var archSpecs = []archSpec{
-	{name: "amd64", transform: Transform, jtMarker: "_jt"},
-	{name: "arm64", transform: TransformARM64, jtMarker: "_jt"},
+	// amd64 requires x86-64-v2: the SIMD splices use SSE4.1
+	// (PINSRQ/PEXTRQ/PMOVSX...), same baseline as the helper asm.
+	// GOAMD64=v1 builds compile the pure tree instead.
+	{name: "amd64", buildTag: "amd64 && amd64.v2", transform: Transform, jtMarker: "_jt"},
+	{name: "arm64", buildTag: "arm64", transform: TransformARM64, jtMarker: "_jt",
+		gatedMarker: "// sdot v", gatedSuffix: "dotprod", portableSuffix: "generic",
+		featureVar: "CPUDotProd", dispatchStub: a64DispatchStub},
+}
+
+// a64DispatchStub is the arm64 feature-dispatch stub: read the mirror
+// bool, tail-jump to the portable twin when it is clear. Same frame,
+// same FP layout — the targets see the original caller's arguments.
+func a64DispatchStub(sym, featSym, portSym, mirrorVar, argBytes string) string {
+	return "TEXT ·" + sym + "(SB), NOSPLIT, $0-" + argBytes + "\n" +
+		"\tMOVBU ·" + mirrorVar + "(SB), R27\n" +
+		"\tCBZ R27, 2(PC)\n" +
+		"\tJMP ·" + featSym + "(SB)\n" +
+		"\tJMP ·" + portSym + "(SB)\n"
 }
 
 func buildPkg(
@@ -519,6 +574,12 @@ func buildPkg(
 	pure map[string][]byte,
 	stats *BuildStats,
 	arch archSpec,
+	modOffs *ModuleOffsets,
+	fused map[string]*simdfuse.Tree,
+	fusedLoops map[string]*simdfuse.Loop,
+	outlinedNames []string,
+	synth map[string]SynthSig,
+	nrc2 *Nrc2Spec,
 ) (map[string][]byte, error) {
 	selfPath := importPath
 	if rel != "" {
@@ -543,8 +604,9 @@ func buildPkg(
 	// This is exactly the header the own-asm backend emitted, and
 	// matches the plain `//go:build <arch>` tag on the decls and
 	// keepalive files below.
-	asmB.WriteString("//go:build " + arch.name + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
+	asmB.WriteString("//go:build " + arch.buildTag + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
 	var declFns strings.Builder
+	mirrorVars := map[string]bool{} // feature mirrors already declared in this package
 
 	calleeSig := func(sym string) ([]ArgKind, bool, ArgKind, string, bool) {
 		if std, ok := stdlibWrapperTable[sym]; ok {
@@ -595,42 +657,180 @@ func buildPkg(
 	}
 
 	sort.Slice(pfns, func(i, j int) bool { return pfns[i].Name < pfns[j].Name })
+	var splices SpliceStats
+	seenSynth := map[string]bool{}
 	for _, f := range pfns {
 		name := f.Name[strings.LastIndex(f.Name, ".")+1:]
-		m := fnSymRe.FindStringSubmatch(name)
-		idx64, err := strconv.ParseUint(m[1], 10, 32)
-		if err != nil {
-			return nil, err
+		var params []ArgKind
+		var names []string
+		var hasRes bool
+		var res ArgKind
+		var declParams []wasm.ValType
+		if ss, isSynth := synth[name]; isSynth {
+			seenSynth[name] = true
+			if ss.Packed {
+				// The boundary rides the per-module scratch; only m
+				// crosses the call.
+				params, names = []ArgKind{ArgPtr}, []string{"m"}
+			} else {
+				params, names = []ArgKind{ArgPtr}, []string{"m"}
+				for i, p := range ss.Params {
+					params = append(params, wasmKind(p))
+					names = append(names, fmt.Sprintf("l%d", i))
+				}
+			}
+			if ss.Result != nil {
+				hasRes, res = true, wasmKind(*ss.Result)
+			}
+			declParams = ss.Params
+			// Pure-Go bodies are forbidden on the asm GOARCHs, so a
+			// boundary the register marshalling cannot carry is a hard
+			// error — the outline eligibility caps should have kept
+			// this shape from ever being extracted.
+			args, _, err := AssignABIInternal(params, hasRes, res)
+			if err != nil {
+				return nil, fmt.Errorf("outlined %s: %w", name, err)
+			}
+			for _, a := range args {
+				if a.Reg == "" {
+					return nil, fmt.Errorf("outlined %s: argument beyond the register ABI", name)
+				}
+			}
+		} else {
+			m := fnSymRe.FindStringSubmatch(name)
+			idx64, err := strconv.ParseUint(m[1], 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			idx := uint32(idx64)
+			if isFallbackSig(idx) {
+				fallbackNames[name] = true
+				stats.Fallback++
+				continue
+			}
+			params, names, hasRes, res = fnKinds(idx)
+			declParams = mod.FuncTypeOf(idx).Params
 		}
-		idx := uint32(idx64)
-		if isFallbackSig(idx) {
-			fallbackNames[name] = true
-			stats.Fallback++
-			continue
-		}
-		params, names, hasRes, res := fnKinds(idx)
 		body, terr := arch.transform(f, TransformOptions{
-			SymName:   name,
-			CalleeSig: calleeSig,
-			Params:    params,
-			HasResult: hasRes,
-			Result:    res,
-			ArgNames:  names,
-			Datas:     dm,
-			Consts:    pool,
-			Types:     types,
-			JT:        jt,
+			SymName:     name,
+			CalleeSig:   calleeSig,
+			Params:      params,
+			HasResult:   hasRes,
+			Result:      res,
+			ArgNames:    names,
+			Datas:       dm,
+			Consts:      pool,
+			Types:       types,
+			JT:          jt,
+			SpliceStats: &splices,
+			ModOffsets:  modOffs,
+			FusedSimd:   fused,
+			FusedLoops:  fusedLoops,
 		})
 		if terr != nil {
 			// A duff body, or a jump table whose flag state cannot be replayed
 			// at the leaf asm, falls back to the pure Go body (transparent to
-			// callers) rather than aborting the whole bundle.
-			if errors.Is(terr, errUnsupportedDuff) || errors.Is(terr, errUnsupportedJumpTable) {
+			// callers) rather than aborting the whole bundle. Outlined
+			// bodies are the exception: they must not exist as pure Go
+			// on the asm GOARCHs, so nothing may quietly degrade.
+			if _, isSynth := synth[name]; !isSynth &&
+				(errors.Is(terr, errUnsupportedDuff) || errors.Is(terr, errUnsupportedJumpTable) || errors.Is(terr, errSimdPairUnspliced)) {
 				fallbackNames[name] = true
 				stats.Fallback++
 				continue
 			}
 			return nil, fmt.Errorf("transform %s: %w", f.Name, terr)
+		}
+		// Declaration signature, shared by the plain decl and the gated
+		// stub decls. Packed boundaries carry only the module pointer;
+		// their values ride the per-module scratch.
+		var sigB strings.Builder
+		fmt.Fprintf(&sigB, "(m %s", moduleTypeName(rel))
+		if ss, isSynth := synth[name]; !isSynth || !ss.Packed {
+			for i, p := range declParams {
+				fmt.Fprintf(&sigB, ", l%d %s", i, goTypeName(wasmKind(p)))
+			}
+		}
+		sigB.WriteString(")")
+		if hasRes {
+			fmt.Fprintf(&sigB, " (r0 %s)", goTypeName(res))
+		}
+		sig := sigB.String()
+		_, isSynthFn := synth[name]
+		if arch.gatedMarker != "" && !isSynthFn &&
+			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {
+			// Feature-gated body: the feature symbol keeps this body, a
+			// baseline twin is transformed with PortableSIMD, and a
+			// NOSPLIT tail-jump stub under the original name dispatches
+			// at runtime on a package-local mirror of the base package's
+			// CPU feature var.
+			featSym, portSym := name+arch.gatedSuffix, name+arch.portableSuffix
+			featBody := strings.Replace(body, "TEXT ·"+name+"(SB)", "TEXT ·"+featSym+"(SB)", 1)
+			portBody, perr := arch.transform(f, TransformOptions{
+				SymName:      portSym,
+				CalleeSig:    calleeSig,
+				Params:       params,
+				HasResult:    hasRes,
+				Result:       res,
+				ArgNames:     names,
+				Datas:        dm,
+				Consts:       pool,
+				Types:        types,
+				JT:           jt,
+				SpliceStats:  &splices,
+				ModOffsets:   modOffs,
+				FusedSimd:    fused,
+				FusedLoops:   fusedLoops,
+				PortableSIMD: true,
+			})
+			if perr != nil {
+				return nil, fmt.Errorf("transform %s (portable twin): %w", f.Name, perr)
+			}
+			if strings.Contains(portBody, arch.gatedMarker) {
+				return nil, fmt.Errorf("transform %s: portable twin still contains gated instructions", f.Name)
+			}
+			m := regexp.MustCompile(`^TEXT [^,]+, \$\d+-(\d+)`).FindStringSubmatch(featBody)
+			if m == nil {
+				return nil, fmt.Errorf("transform %s: no arg size in the TEXT header", f.Name)
+			}
+			// ggml q8_0 row/column pairing: under fast-math the arm64
+			// FEATURE body's companion call goes to the native 2x2
+			// SMMLA tile kernel; the portable twin and every other
+			// backend keep the bit-exact Go companion.
+			if nrc2 != nil && name == nrc2.VecDot && arch.name == "arm64" && modOffs != nil && modOffs.Cfg.FastMath {
+				fastSym := nrc2.Companion + "fast"
+				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
+				if retargeted == featBody {
+					return nil, fmt.Errorf("transform %s: companion call %s not found in the feature body", f.Name, nrc2.Companion)
+				}
+				featBody = retargeted
+				trapSym := "wasm_trap_simd_oob"
+				if rel != "" && rel != "base" {
+					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
+				}
+				asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs))
+				asmB.WriteString("\n")
+				fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 int32, l2 int32, l3 int32, l4 int32, l5 int32, l6 int32)\n", fastSym, moduleTypeName(rel))
+			}
+			mirrorVar := "gcasm" + arch.featureVar
+			asmB.WriteString(arch.dispatchStub(name, featSym, portSym, mirrorVar, m[1]))
+			asmB.WriteString("\n")
+			asmB.WriteString(featBody)
+			asmB.WriteString("\n")
+			asmB.WriteString(portBody)
+			asmB.WriteString("\n")
+			stats.Transformed++
+			if !mirrorVars[mirrorVar] {
+				mirrorVars[mirrorVar] = true
+				featureRef := arch.featureVar
+				if rel != "" && rel != "base" {
+					featureRef = "base." + featureRef
+				}
+				fmt.Fprintf(&declFns, "// %s mirrors %s for the feature-dispatch stubs\n// (asm reads package-local data only).\nvar %s = %s\n\n",
+					mirrorVar, featureRef, mirrorVar, featureRef)
+			}
+			fmt.Fprintf(&declFns, "func %s%s\nfunc %s%s\nfunc %s%s\n", name, sig, featSym, sig, portSym, sig)
+			continue
 		}
 		asmB.WriteString(body)
 		asmB.WriteString("\n")
@@ -638,18 +838,17 @@ func buildPkg(
 			stats.JumpTables++
 		}
 		stats.Transformed++
-		// Bodyless Go declaration.
-		ft := mod.FuncTypeOf(idx)
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "func %s(m %s", name, moduleTypeName(rel))
-		for i, p := range ft.Params {
-			fmt.Fprintf(&sb, ", l%d %s", i, goTypeName(wasmKind(p)))
+		declFns.WriteString("func " + name + sig + "\n")
+	}
+	stats.SimdSpliced += splices.Spliced
+	stats.SimdKept += splices.Kept
+	// Every outlined function must have surfaced in the capture and
+	// been transformed; a missing one would silently keep a pure-Go
+	// body on an asm GOARCH.
+	for _, n := range outlinedNames {
+		if !seenSynth[n] {
+			return nil, fmt.Errorf("outlined %s: not present in the %s capture", n, arch.name)
 		}
-		sb.WriteString(")")
-		if hasRes {
-			fmt.Fprintf(&sb, " (r0 %s)", goTypeName(res))
-		}
-		declFns.WriteString(sb.String() + "\n")
 	}
 
 	// Fallback bodies (extracted early: their Go-level FnN references
@@ -703,7 +902,7 @@ func buildPkg(
 
 	// Decls file.
 	var decl strings.Builder
-	decl.WriteString("//go:build " + arch.name + "\n\n")
+	decl.WriteString("//go:build " + arch.buildTag + "\n\n")
 	decl.WriteString("// Code generated by wasm2go (gcasm backend). DO NOT EDIT.\n\n")
 	decl.WriteString("package " + pkgNameOf(rel, pure) + "\n\n")
 	// unsafe is always imported: gcasmTypePtr needs it, and the
@@ -899,6 +1098,8 @@ func moduleTypeName(rel string) string {
 
 func goTypeName(k ArgKind) string {
 	switch k {
+	case ArgV128:
+		return "[2]uint64"
 	case ArgI64:
 		return "int64"
 	case ArgF32:
