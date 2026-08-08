@@ -171,7 +171,80 @@ func TestMem64BeyondFourGiB(t *testing.T) {
 //		return 0;
 //	}
 func TestMem64Wasip1Hello(t *testing.T) {
-	bin, err := os.ReadFile("../testdata/wasip1_mem64_hello.wasm")
+	got := runMem64Wasip1(t, "../testdata/wasip1_mem64_hello.wasm",
+		"m := pkg.NewWithWASI(pkg.DefaultWASI())\n\tm.Start()")
+	want := "hello wasm64: sizeof(void*)=8 sizeof(size_t)=8\nmalloc(67108864) ok, p[last]=-91"
+	if got != want {
+		t.Errorf("wasip1 mem64 output:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// TestMem64Wasip1CppException runs C++ compiled for wasm64-wasip1 with
+// -fwasm-exceptions against the wasm64 libc++/libc++abi/libunwind
+// runtimes: typed catches (std::runtime_error, a user struct), a
+// catch-all, and unwinding through std::string/vector/unique_ptr — the
+// exception-handling surface llama.cpp's loader depends on.
+//
+// testdata/wasip1_mem64_cpp_eh.wasm is checked in because building it
+// needs the wasm64 sysroot + EH runtimes; its source:
+//
+//	#include <cstdio>
+//	#include <stdexcept>
+//	#include <string>
+//	#include <vector>
+//	#include <memory>
+//	struct Custom { int code; };
+//	static int work(int mode) {
+//		try {
+//			if (mode == 0) throw std::runtime_error("gguf load failed");
+//			if (mode == 1) throw Custom{42};
+//			if (mode == 2) throw std::string("plain");
+//			return 7;
+//		} catch (const std::runtime_error &e) {
+//			std::printf("runtime_error: %s\n", e.what());
+//			return 1;
+//		} catch (const Custom &c) {
+//			std::printf("custom: %d\n", c.code);
+//			return 2;
+//		} catch (...) {
+//			std::puts("catch-all");
+//			return 3;
+//		}
+//	}
+//	int main() {
+//		std::vector<std::unique_ptr<std::string>> v;
+//		for (int i = 0; i < 4; i++) {
+//			v.emplace_back(std::make_unique<std::string>("iter " + std::to_string(work(i))));
+//		}
+//		for (auto &s : v) std::printf("%s\n", s->c_str());
+//		std::printf("sizeof(void*)=%zu\n", sizeof(void *));
+//		return 0;
+//	}
+func TestMem64Wasip1CppException(t *testing.T) {
+	// The wasm imports the env.__cpp_exception tag alongside wasi, so
+	// the constructor takes an (unused, tag-only) env interface too.
+	got := runMem64Wasip1(t, "../testdata/wasip1_mem64_cpp_eh.wasm",
+		"m := pkg.NewWithWASI(pkg.DefaultWASI(), nil)\n\tm.Start()")
+	want := strings.Join([]string{
+		"runtime_error: gguf load failed",
+		"custom: 42",
+		"catch-all",
+		"iter 1",
+		"iter 2",
+		"iter 3",
+		"iter 7",
+		"sizeof(void*)=8",
+	}, "\n")
+	if got != want {
+		t.Errorf("wasip1 mem64 C++ EH output:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// runMem64Wasip1 transpiles a checked-in wasm64-wasip1 fixture and runs
+// it with the given constructor statement(s) as the main body.
+func runMem64Wasip1(t *testing.T, fixture, mainBody string) string {
+	t.Helper()
+	bin, err := os.ReadFile(fixture)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,18 +279,6 @@ func TestMem64Wasip1Hello(t *testing.T) {
 			w("pkg/"+name, data)
 		}
 	}
-	w("main.go", []byte(`package main
-
-import "m64wasi/pkg"
-
-func main() {
-	m := pkg.NewWithWASI(pkg.DefaultWASI())
-	m.Start()
-}
-`))
-	got := runMem64(t, dir)
-	want := "hello wasm64: sizeof(void*)=8 sizeof(size_t)=8\nmalloc(67108864) ok, p[last]=-91"
-	if got != want {
-		t.Errorf("wasip1 mem64 output:\ngot:  %q\nwant: %q", got, want)
-	}
+	w("main.go", []byte("package main\n\nimport \"m64wasi/pkg\"\n\nfunc main() {\n\t"+mainBody+"\n}\n"))
+	return runMem64(t, dir)
 }
