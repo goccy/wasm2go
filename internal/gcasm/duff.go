@@ -53,6 +53,14 @@ func hasEHRuntimeCall(insns []Insn) bool {
 				return true
 			}
 		}
+		// A structured-EH function wraps its try body in a func literal and
+		// calls it (`__exc := func() *wasmExc { ... }()`). The OUTER function
+		// need not call any panic/recover runtime symbol itself — the defer /
+		// recover lives inside the closure — so detect the closure call: gc
+		// names function literals "<outer>.funcN".
+		if strings.Contains(in.Text, "CALL") && strings.Contains(in.Text, ".func") {
+			return true
+		}
 	}
 	return false
 }

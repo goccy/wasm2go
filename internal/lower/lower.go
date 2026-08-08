@@ -256,6 +256,12 @@ type ctrlFrame struct {
 	// and Post are set when the frame opens; each catch / catch_all
 	// appends a handler. target / fallthrough_ both point at Post.
 	tryRegion *ssa.TryRegion
+	// inHandler, for ctrlTry frames, is true once the first catch /
+	// catch_all has been seen: lowering is inside a handler, not the
+	// protected body. `rethrow l` labels must resolve to such a frame, and
+	// `delegate l` targeting one keeps searching outward (a try whose
+	// handler is already running cannot catch again).
+	inHandler bool
 }
 
 type ctrlKind uint8
@@ -350,6 +356,22 @@ func (ls *lowerState) lowerBodyUntil(r *wasm.InstrReader, baseCtrl int) error {
 						return err
 					}
 				} else if err := ls.handleCatchAll(); err != nil {
+					return err
+				}
+			case wasm.OpDelegate:
+				// `delegate` closes its try like an `end` does: a
+				// dead-region-opened try just drops the depth count; a
+				// delegate at the live frame's depth must pop the open
+				// ctrlTry frame (handleDelegate re-establishes a
+				// reachable cursor at Post when it has incoming edges).
+				if ls.unreachableDepth > 0 {
+					ls.unreachableDepth--
+					if err := r.SkipImmediates(op); err != nil {
+						return err
+					}
+					break
+				}
+				if err := ls.handleDelegate(r); err != nil {
 					return err
 				}
 			case wasm.OpEnd:
@@ -1018,17 +1040,17 @@ func (ls *lowerState) handleTry(r *wasm.InstrReader) error {
 }
 
 // handleDelegate closes a `try ... delegate N` — a try whose protected body
-// forwards any exception to the N-th enclosing label instead of catching it.
-// We close the body into post with NO handler; emitTryRegion turns a
-// handler-less TryRegion into `body-closure; if exc != nil { panic(exc) }`,
-// i.e. it recovers and re-panics, which IS delegate's forward-to-enclosing-
-// handler behaviour under Go's panic propagation (the re-panic unwinds to the
-// nearest enclosing recover, matching the target for the tag the SjLj runtime
-// uses). The label operand is consumed but not otherwise needed: Go propagation
-// reaches the enclosing handler without an explicit target. Mirrors the ctrlTry
-// arm of handleEnd, minus any handler.
+// forwards any exception to the catching context of the N-th enclosing label,
+// skipping every try nested between the two. We close the body into post with
+// NO handler and record the resolved forwarding target on the region:
+// label depth N (relative to the context enclosing the try) is walked on the
+// control stack, and the catching context is the nearest enclosing try that is
+// still in its protected body at or outside that label (a try whose handler is
+// already running cannot catch again). No frame at all means the exception
+// leaves the function. Mirrors the ctrlTry arm of handleEnd, minus any handler.
 func (ls *lowerState) handleDelegate(r *wasm.InstrReader) error {
-	if _, err := r.ReadU32(); err != nil { // labelidx (relative depth)
+	depth, err := r.ReadU32() // labelidx, relative to the try's outer context
+	if err != nil {
 		return err
 	}
 	if len(ls.ctrl) == 0 || ls.ctrl[len(ls.ctrl)-1].kind != ctrlTry {
@@ -1036,6 +1058,21 @@ func (ls *lowerState) handleDelegate(r *wasm.InstrReader) error {
 	}
 	f := ls.ctrl[len(ls.ctrl)-1]
 	ls.ctrl = ls.ctrl[:len(ls.ctrl)-1]
+
+	ls.captureTryBody(f)
+	f.tryRegion.Delegate = true
+	// Resolve the label to its catching context. The label indexes the
+	// control stack with the delegate's own try frame already popped; depth
+	// == len(ls.ctrl) names the function body (forward to the caller).
+	if int(depth) < len(ls.ctrl) {
+		for i := len(ls.ctrl) - 1 - int(depth); i >= 0; i-- {
+			fr := ls.ctrl[i]
+			if fr.kind == ctrlTry && !fr.inHandler && fr.tryRegion != nil {
+				f.tryRegion.DelegateTarget = fr.tryRegion
+				break
+			}
+		}
+	}
 
 	if !ls.unreachable {
 		ls.recordIncoming(f.target, f.resultCount)
@@ -1053,13 +1090,55 @@ func (ls *lowerState) handleDelegate(r *wasm.InstrReader) error {
 	return nil
 }
 
+// captureTryBody records, once, a try region's protected-body block set:
+// Entry plus every block created while the try was open (nested regions
+// included), minus Post. Called when the body closes — at the first catch /
+// catch_all, at delegate, or at a handler-less end. The CFG alone cannot
+// delimit the body (a br exiting the try early makes its continuation
+// reachable from inside), so the emit passes rely on this structural record.
+func (ls *lowerState) captureTryBody(f *ctrlFrame) {
+	tr := f.tryRegion
+	if tr == nil || tr.Body != nil {
+		return
+	}
+	blocks := ls.b.Func().Blocks
+	start := -1
+	for i, b := range blocks {
+		if b == tr.Entry {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return
+	}
+	body := []*ssa.Block{tr.Entry}
+	for _, b := range blocks[start+1:] {
+		if b != tr.Post {
+			body = append(body, b)
+		}
+	}
+	tr.Body = body
+}
+
 // handleRethrow implements `rethrow N` — re-raise the exception caught by the
-// N-th enclosing catch. It terminates the current block by re-panicking the
-// in-scope caught exception (the emit pass renders it as panic(<catch exc>)).
+// catch handler the N-th enclosing label resolves to. Handlers nest, so the
+// label does not always name the innermost catch: `rethrow 1` inside an inner
+// catch re-raises the OUTER try's exception. The label is resolved to its try
+// region here so the emit pass panics the right region's caught exception.
 func (ls *lowerState) handleRethrow(r *wasm.InstrReader) error {
-	if _, err := r.ReadU32(); err != nil { // labelidx (relative depth to a try's catch)
+	depth, err := r.ReadU32() // labelidx; must name a try frame in handler state
+	if err != nil {
 		return err
 	}
+	if int(depth) >= len(ls.ctrl) {
+		return fmt.Errorf("%w: rethrow depth %d exceeds control stack", ErrSSAUnsupported, depth)
+	}
+	fr := ls.ctrl[len(ls.ctrl)-1-int(depth)]
+	if fr.kind != ctrlTry || !fr.inHandler || fr.tryRegion == nil {
+		return fmt.Errorf("%w: rethrow label does not name a catch handler", ErrSSAUnsupported)
+	}
+	ls.b.Current().RethrowRegion = fr.tryRegion
 	ls.b.FinishRethrow()
 	ls.unreachable = true
 	return nil
@@ -1089,6 +1168,8 @@ func (ls *lowerState) beginHandler(catchAll bool, tagIdx uint32) error {
 		return fmt.Errorf("%w: catch/catch_all with no open try", ErrSSAUnsupported)
 	}
 	f := ls.ctrl[len(ls.ctrl)-1]
+	ls.captureTryBody(f) // no-op after the first handler
+	f.inHandler = true
 
 	// Close the current sub-region into post (skip if it threw/branched away).
 	if !ls.unreachable {
@@ -1924,6 +2005,7 @@ func (ls *lowerState) handleEnd() (bool, error) {
 		// post (the body and earlier handlers were closed at each catch).
 		// Every sub-region — body and handlers — is a pred of post; the
 		// handler entry blocks are landing pads with no CFG pred.
+		ls.captureTryBody(f) // no-op unless this is a handler-less try..end
 		if !ls.unreachable {
 			ls.recordIncoming(f.target, f.resultCount)
 			cur := ls.b.Current()

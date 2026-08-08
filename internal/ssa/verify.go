@@ -282,7 +282,31 @@ func verifyUseDominance(f *Func) error {
 // computeDominators returns the immediate-dominator map (idom) and a
 // reverse-postorder numbering, using the Cooper-Harvey-Kennedy
 // iterative algorithm. idom[entry] == entry.
+//
+// EH catch landing pads have no CFG predecessors (they are entered by
+// unwinding), so the plain CFG leaves them — and every block only they
+// reach — outside the dominator tree, and any use of a pre-try value in a
+// handler would fail verification. The runtime guarantee is that a
+// handler runs only after its try's Entry was reached, so dominance is
+// computed over the CFG augmented with a virtual edge Entry → handler
+// for every catch clause: a handler is then dominated by whatever
+// dominates its try's Entry.
 func computeDominators(f *Func) (idom map[BlockID]*Block, rpoNum map[BlockID]int) {
+	// Virtual Entry → handler edges per try region (see doc comment).
+	virtSuccs := map[BlockID][]*Block{}
+	virtPred := map[BlockID]*Block{}
+	for _, tr := range f.TryRegions {
+		if tr.Entry == nil {
+			continue
+		}
+		for _, h := range tr.Handlers {
+			if h.Block == nil {
+				continue
+			}
+			virtSuccs[tr.Entry.ID] = append(virtSuccs[tr.Entry.ID], h.Block)
+			virtPred[h.Block.ID] = tr.Entry
+		}
+	}
 	// Reverse-postorder via iterative DFS.
 	var post []*Block
 	seen := map[BlockID]bool{}
@@ -294,8 +318,14 @@ func computeDominators(f *Func) (idom map[BlockID]*Block, rpoNum map[BlockID]int
 	seen[f.Entry.ID] = true
 	for len(stack) > 0 {
 		top := &stack[len(stack)-1]
-		if top.i < len(top.b.Succs) {
-			s := top.b.Succs[top.i].Block
+		succs := top.b.Succs
+		if top.i < len(succs)+len(virtSuccs[top.b.ID]) {
+			var s *Block
+			if top.i < len(succs) {
+				s = succs[top.i].Block
+			} else {
+				s = virtSuccs[top.b.ID][top.i-len(succs)]
+			}
 			top.i++
 			if !seen[s.ID] {
 				seen[s.ID] = true
@@ -339,8 +369,14 @@ func computeDominators(f *Func) (idom map[BlockID]*Block, rpoNum map[BlockID]int
 				continue
 			}
 			var newIdom *Block
+			preds := make([]*Block, 0, len(b.Preds)+1)
 			for _, pe := range b.Preds {
-				p := pe.Block
+				preds = append(preds, pe.Block)
+			}
+			if vp := virtPred[b.ID]; vp != nil {
+				preds = append(preds, vp)
+			}
+			for _, p := range preds {
 				if idom[p.ID] == nil {
 					continue // pred not yet processed
 				}
