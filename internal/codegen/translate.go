@@ -39,30 +39,14 @@ const defaultMultiPackageThreshold = 1 << 20 // 1 MiB
 // memory tuning, and exercising the multi-package path on small
 // fixtures in tests, the override is a supported escape hatch.
 //
-// Modify in-process via SetMultiPackageThreshold; from a subprocess
-// (e.g. a wasm2go-using protoc plugin invoked by buf generate), set
-// the WASM2GO_MULTIPACKAGE_THRESHOLD environment variable. The
-// in-process override takes priority when both are set.
+// Modify via SetMultiPackageThreshold.
 var multiPackageThresholdOverride = -1
 
-// currentMultiPackageThreshold resolves the active byte budget. The
-// in-process override wins; otherwise the env-var fallback is parsed;
-// otherwise the production default is used.
+// currentMultiPackageThreshold resolves the active byte budget: the
+// in-process override when set, the production default otherwise.
 func currentMultiPackageThreshold() int {
 	if multiPackageThresholdOverride >= 0 {
 		return multiPackageThresholdOverride
-	}
-	if env := os.Getenv("WASM2GO_MULTIPACKAGE_THRESHOLD"); env != "" {
-		b, err := strconv.Atoi(env)
-		if err != nil || b < 0 {
-			// Malformed env var. Surface so the user sees why their
-			// override was ignored, then fall back to the default.
-			fmt.Fprintf(os.Stderr,
-				"wasm2go: invalid WASM2GO_MULTIPACKAGE_THRESHOLD=%q (using default %d): %v\n",
-				env, defaultMultiPackageThreshold, err)
-		} else {
-			return b
-		}
 	}
 	return defaultMultiPackageThreshold
 }
@@ -141,10 +125,39 @@ type Options struct {
 	// gcasm asm bundle entirely. The result is ABIInternal everywhere —
 	// slower to compile / heavier on tooling for large modules, but the
 	// reference backend for benchmarking codegen quality without the
-	// gcasm ABI0 marshalling. Subprocess invocations (e.g. the wasmify
-	// protoc plugin) can enable it through the WASM2GO_PURE environment
-	// variable.
+	// gcasm ABI0 marshalling.
 	PureOnly bool
+
+	// OutlineMinValues enables outlining of large loops into their own
+	// functions and sets the minimum loop body size (in SSA values)
+	// worth extracting. 0 disables outlining. Modules whose hot
+	// functions exceed gc's pattern-matching appetite (llama.cpp-sized)
+	// want a low threshold like 100; small modules gain nothing.
+	OutlineMinValues int
+	// SIMDUnroll unrolls eligible SIMD loops by this factor before
+	// scalarization, with exact trip routing. 0 disables.
+	SIMDUnroll int
+	// FuseLoops fuses whole countdown loops around fused SIMD regions
+	// into single asm splices; FuseLoopUnroll adds an in-splice unroll
+	// lane by that factor (0 = no in-splice unroll).
+	FuseLoops      bool
+	FuseLoopUnroll int
+	// F16TableAddr asserts the linear-memory base address of a
+	// runtime-built IEEE f16->f32 lookup table (ggml computes its
+	// table in an init function, so the data segment holds only zeros
+	// and the static byte-for-byte verification cannot see it). The
+	// assertion is a build-input contract, not a guess — a wrong
+	// address changes numeric results. 0 asserts nothing; statically
+	// verifiable tables are recognized regardless.
+	F16TableAddr uint32
+	// FastMath opts asm splice synthesis out of wasm bit-exactness:
+	// SDOT lane grouping without the TBL permutation, fused
+	// multiply-adds, dual accumulators, and the SMMLA tile kernel for
+	// paired q8_0 rows. The output no longer matches the wasm program
+	// bit for bit (like a native build vs the wasm), so integrators
+	// gate it and validate with token-level equivalence instead of
+	// byte-equality probes.
+	FastMath bool
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.
@@ -206,15 +219,6 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if opts.OutputImportPath == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.OutputImportPath is required")
 	}
-	// WASM2GO_PURE is the subprocess-reachable form of Options.PureOnly
-	// (same pattern as WASM2GO_MULTIPACKAGE_THRESHOLD): the wasmify
-	// protoc plugin cannot thread new CLI options through buf.gen.yaml,
-	// so the env var lets a benchmarking run flip the backend without a
-	// wasmify change.
-	if os.Getenv("WASM2GO_PURE") != "" {
-		opts.PureOnly = true
-	}
-
 	// Auto-derive the multi-package decision from the total wasm
 	// function-body byte size. Anything strictly above the threshold
 	// goes through the multi-package + linkname-split layout; anything
@@ -809,9 +813,6 @@ type translator struct {
 	// creates; see simd_fuse.go and internal/simdfuse.
 	fusedShapes *fusedShapeState
 	fusedLoops  *fusedLoopState
-	// windowFuseCount counts committed multi-root windows, for the
-	// WASM2GO_FUSE_WINDOW_MAX bisection aid.
-	windowFuseCount int
 	// excSlots is the operand-slot count the module's exception state
 	// needs: the widest tag arity, or 0 when the module has no EH (the
 	// state fields are then omitted entirely). See emitModuleStruct.
@@ -1591,7 +1592,7 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		})
 		t.use("unsafe")
 	}
-	if _, on := outlineMinValues(); on {
+	if t.opts.OutlineMinValues > 0 {
 		// Boundary scratch for packed outlined-loop calls: the caller
 		// fills, the callee prologue drains, so one per-module array
 		// suffices at any nesting depth.
@@ -2710,11 +2711,6 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		return nil, err
 	}
 	insBefore := ssa.CountValues(ssaFn)
-	// WASM2GO_SSA_PASSES_OFF disables individual optimization passes (comma
-	// list of constprop,branchfold,simplify,cse,memopt,dce,memaddr — or
-	// "all"). Diagnostic escape hatch for bisecting a suspected pass
-	// miscompile; not a supported build mode.
-	passesOff := map[string]bool{}
 	// MemOpt (redundant-load elimination + store-to-load forwarding) is
 	// UNSOUND on a shared linear memory: it assumes this agent is the only
 	// writer between two accesses, but the threads proposal lets another
@@ -2724,33 +2720,17 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// would drop that read. Disable the pass whole-module when the memory
 	// is shared. (Atomic ops are OpAtomicCall — MemOpt already treats them
 	// as barriers and never touches them.)
-	//
-	// WASM2GO_MEMOPT_ON_SHARED forces MemOpt to run even on a shared memory
-	// — a diagnostic escape used only to reproduce the unsoundness (it
-	// generates KNOWINGLY-BROKEN code); never a supported build mode.
-	if t.memoryIsShared() && os.Getenv("WASM2GO_MEMOPT_ON_SHARED") == "" {
-		passesOff["memopt"] = true
-	}
-	if env := os.Getenv("WASM2GO_SSA_PASSES_OFF"); env != "" {
-		for _, p := range strings.Split(env, ",") {
-			passesOff[strings.TrimSpace(strings.ToLower(p))] = true
-		}
-		if passesOff["all"] {
-			for _, p := range []string{"constprop", "branchfold", "simplify", "cse", "memopt", "dce", "memaddr"} {
-				passesOff[p] = true
-			}
-		}
-	}
+	memOptOK := !t.memoryIsShared()
 	// SIMD loop unrolling runs BEFORE the fixpoint so its cloned
 	// pointer-bump chains constant-fold and the bounds/window passes
-	// see the unrolled straight-line body. OPT-IN for now: the guard
-	// CFG it builds still pushes hot functions from the structured
-	// emitter to the goto form, whose flattened statements defeat tree
-	// fusion — a net loss until the structurer accepts the shape.
-	if uv := os.Getenv("WASM2GO_UNROLL"); uv != "" && !passesOff["unroll"] {
-		k := 4
-		if n, err := strconv.Atoi(uv); err == nil && n >= 2 && n <= 8 {
-			k = n
+	// see the unrolled straight-line body. OPT-IN via Options.SIMDUnroll:
+	// the guard CFG it builds still pushes hot functions from the
+	// structured emitter to the goto form, whose flattened statements
+	// defeat tree fusion — a net loss until the structurer accepts the
+	// shape.
+	if k := t.opts.SIMDUnroll; k >= 2 {
+		if k > 8 {
+			k = 8
 		}
 		pass.UnrollSimdLoops(ssaFn, k)
 	}
@@ -2758,25 +2738,25 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	fixpointReached := false
 	for i := 0; i < optFixpointCap; i++ {
 		changed := false
-		if !passesOff["constprop"] && pass.ConstProp(ssaFn) {
+		if pass.ConstProp(ssaFn) {
 			changed = true
 		}
-		if !passesOff["branchfold"] && pass.BranchFold(ssaFn) {
+		if pass.BranchFold(ssaFn) {
 			changed = true
 		}
-		if !passesOff["reassoc"] && pass.ReassocConstAdds(ssaFn) {
+		if pass.ReassocConstAdds(ssaFn) {
 			changed = true
 		}
-		if !passesOff["simplify"] && pass.Simplify(ssaFn) {
+		if pass.Simplify(ssaFn) {
 			changed = true
 		}
-		if !passesOff["cse"] && pass.CSE(ssaFn) {
+		if pass.CSE(ssaFn) {
 			changed = true
 		}
-		if !passesOff["memopt"] && pass.MemOpt(ssaFn) {
+		if memOptOK && pass.MemOpt(ssaFn) {
 			changed = true
 		}
-		if !passesOff["dce"] && pass.DCE(ssaFn) {
+		if pass.DCE(ssaFn) {
 			changed = true
 		}
 		if !changed {
@@ -2798,7 +2778,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// the emitter's _consts-table guard sees them — a constant that
 	// stays in the base sum bypasses the guard and can fail to
 	// assemble on arm64 ("constant is not in pool").
-	if !passesOff["memaddr"] && pass.FoldMemAddend(ssaFn, largeConstThreshold) && !passesOff["dce"] {
+	if pass.FoldMemAddend(ssaFn, largeConstThreshold) {
 		pass.DCE(ssaFn)
 	}
 	// Bounds-check coalescing for v128 load groups. After the fixpoint
@@ -2809,25 +2789,13 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// memoryGrow, but a module whose declared MINIMUM already exceeds
 	// the cap would start out past it, so such modules keep per-load
 	// checks.
-	if !passesOff["simdbounds"] && t.simdBoundsMemOK() && pass.CoalesceSimdBounds(ssaFn) {
+	if t.simdBoundsMemOK() && pass.CoalesceSimdBounds(ssaFn) {
 		t.useHelper("simd_v128_load_rng")
 		t.useHelper("simd_v128_load_nc")
 	}
-	// Software fp32→fp16 idiom → native-convertible helper call.
-	// OPT-IN: the helper call makes gc spill caller-saved values
-	// around every site, which eats most of the win on the asm
-	// GOARCHs — there the gcasm peephole rewrites the compiled idiom
-	// in place instead (see gcasm's f16 peephole), and it needs the
-	// UNREWRITTEN shape. This SSA route remains useful where no asm
-	// backend exists.
-	if os.Getenv("WASM2GO_F16CVT_SSA") != "" && !passesOff["f16cvt"] &&
-		pass.RecognizeF32ToF16(ssaFn) && !passesOff["dce"] {
-		pass.DCE(ssaFn)
-	}
 	// f16 table-gather idiom -> pure lane conversion (bit-exact only
 	// against a verified IEEE table; see pass.RecognizeF16Gather).
-	if os.Getenv("WASM2GO_NO_F16LOAD") == "" && !passesOff["f16load"] &&
-		pass.RecognizeF16Gather(ssaFn, t.f16TableOK) && !passesOff["dce"] {
+	if pass.RecognizeF16Gather(ssaFn, t.f16TableOK) {
 		pass.DCE(ssaFn)
 	}
 	// f16 store-side idiom -> one packed conversion per four lanes
@@ -2837,32 +2805,24 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// ~2% tg regression (the emptied NaN-select diamonds kept
 	// evaluating their conditions), and folding them flips it to a
 	// measured ~1% gain on the llama module.
-	if os.Getenv("WASM2GO_NO_F16STORE") == "" && !passesOff["f16store"] &&
-		pass.RecognizeF16Store(ssaFn) && !passesOff["dce"] {
+	if pass.RecognizeF16Store(ssaFn) {
 		pass.DCE(ssaFn)
 	}
 	// Idiom rewrites above delete the phis that justified their branch
 	// diamonds; fold the emptied control structure so the conditions
 	// die too. Fixpoint with DCE: an inner fold empties the enclosing
 	// arm for the next round.
-	if os.Getenv("WASM2GO_NO_DIAMONDFOLD") == "" && !passesOff["diamondfold"] {
-		for pass.FoldEmptyDiamonds(ssaFn) {
-			if passesOff["dce"] {
-				break
-			}
-			pass.DCE(ssaFn)
-		}
+	for pass.FoldEmptyDiamonds(ssaFn) {
+		pass.DCE(ssaFn)
 	}
 	// With the diamonds gone the packed store groups sit on straight
 	// lines; collapse each into one 64-bit store of the packed word,
 	// then fuse the conversion INTO the store so both ride inside the
 	// fused region (no vector -> GPR-pair round trip at the boundary).
-	if os.Getenv("WASM2GO_NO_F16STORE") == "" && !passesOff["f16store"] &&
-		pass.MergeF16Stores(ssaFn) && !passesOff["dce"] {
+	if pass.MergeF16Stores(ssaFn) {
 		pass.DCE(ssaFn)
 	}
-	if os.Getenv("WASM2GO_NO_F16STORE") == "" && !passesOff["f16store"] &&
-		pass.FuseF16CvtStores(ssaFn) && !passesOff["dce"] {
+	if pass.FuseF16CvtStores(ssaFn) {
 		pass.DCE(ssaFn)
 	}
 	ssa.Compact(ssaFn)
@@ -2889,7 +2849,6 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	if t.memMetrics != nil {
 		t.memMetrics.Add(ssaFn, ssa.ClassifyMemory(ssaFn))
 	}
-	reportOutlineStats(ssaFn)
 	return body, nil
 }
 

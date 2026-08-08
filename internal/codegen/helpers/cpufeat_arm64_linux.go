@@ -9,14 +9,10 @@ import (
 
 // CPUDotProd reports FEAT_DotProd (the SDOT/UDOT instructions).
 // Feature-gated splice bodies dispatch on it at runtime; the
-// portable twin body runs when it is false. WASM2GO_CPU_PORTABLE
-// forces the portable bodies everywhere (testing aid).
+// portable twin body runs when it is false.
 var CPUDotProd = detectDotProd()
 
 func detectDotProd() bool {
-	if os.Getenv("WASM2GO_CPU_PORTABLE") != "" {
-		return false
-	}
 	// AT_HWCAP (16), HWCAP_ASIMDDP (bit 20), from the auxiliary
 	// vector: unswappable 8-byte key/value pairs.
 	auxv, err := os.ReadFile("/proc/self/auxv")

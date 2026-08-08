@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"os"
 	"strconv"
 	"strings"
 
@@ -1004,9 +1003,6 @@ func intConstValue(e ast.Expr) (int32, bool) {
 // region. On success it returns the rewritten fused call (result in
 // pair form, like rewriteCall's output).
 func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast.CallExpr, bool) {
-	if os.Getenv("WASM2GO_NO_FUSE") != "" {
-		return nil, false
-	}
 	m := sc.em.simdCalls[call]
 	if !m.resV128 || !fusableOp(m) {
 		return nil, false
@@ -1082,15 +1078,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 	// below) because the loop context guarantees each duplicate reads
 	// its own same-iteration definition.
 	loopMode := allowLeading
-	if os.Getenv("WASM2GO_NO_FUSE") != "" || os.Getenv("WASM2GO_NO_FUSE_WINDOW") != "" {
-		return nil, 0, false
-	}
-	// Bisection aid: fuse only the first N windows module-wide.
-	if maxs := os.Getenv("WASM2GO_FUSE_WINDOW_MAX"); maxs != "" && sc.em.t != nil {
-		if max, err := strconv.Atoi(maxs); err == nil && sc.em.t.windowFuseCount >= max {
-			return nil, 0, false
-		}
-	}
 	// Collect the candidate run. ggml kernels interleave the fusable
 	// statements with pure scalar work (scale loads, float math), so a
 	// bounded number of provably safe statements may sit BETWEEN
@@ -1151,10 +1138,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		pendingInter = append(pendingInter, st)
 		nInter++
-	}
-	fuseDebug := os.Getenv("WASM2GO_FUSE_DEBUG") != "" && len(cands) >= 8
-	if fuseDebug {
-		fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s: %d candidates\n", sc.em.fuseDebugName, len(cands))
 	}
 	// Try the longest window first; the walk is a pure analysis, so a
 	// failed length just retries shorter on a fresh builder.
@@ -1219,9 +1202,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			}
 		}
 		if !ok || fb.varEdges == 0 || fb.readsCandVar {
-			if fuseDebug {
-				fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s w=%d: walkOK=%v why=%q edges=%d readsCand=%v nodes=%d ints=%d floats=%d\n", sc.em.fuseDebugName, w, ok, fb.failWhy, fb.varEdges, fb.readsCandVar, len(fb.nodes), fb.intRegsUsed(), len(fb.floats))
-			}
 			continue
 		}
 		// A window variable is INTERNAL when the region consumes every
@@ -1254,10 +1234,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			if lastCand[name] != ci {
 				continue // superseded by a later reassignment
 			}
-			if fuseDebug {
-				fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s w=%d cand %s: count=%d hits=%d\n", sc.em.fuseDebugName, w, name, sc.identCount[name], fb.varNodeHits[name])
-			}
-			cloneInternal := loopMode && os.Getenv("WASM2GO_NO_CLONE_INTERNAL") == "" &&
+			cloneInternal := loopMode &&
 				fb.varNodeHits[name] > 0 && sc.readCount[name] == sc.carryLoopReads[name]
 			if _, pairArg := fb.pairDedup[name]; sc.identCount[name] == 1+fb.varNodeHits[name] ||
 				(cloneInternal && !pairArg) {
@@ -1279,16 +1256,10 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			rootVars = append(rootVars, name)
 		}
 		if rootsOverCap || (len(roots) == 0 && !hasStore) {
-			if fuseDebug {
-				fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s w=%d: roots over cap or none\n", sc.em.fuseDebugName, w)
-			}
 			continue // over the root cap, or a window with no live output
 		}
 		roots = fb.scheduleNodes(roots)
 		if pl := fb.peakLive(roots); pl > fusedPoolBudget-floatPoolCost(len(fb.floats)) {
-			if fuseDebug {
-				fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s w=%d: peakLive=%d roots=%d\n", sc.em.fuseDebugName, w, pl, len(roots))
-			}
 			continue // would exhaust the splice synthesizers' vector pool
 		}
 		if hasStore {
@@ -1323,9 +1294,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 				}
 			}
 			if bad {
-				if fuseDebug {
-					fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s w=%d: intervener memory read after a store\n", sc.em.fuseDebugName, w)
-				}
 				continue
 			}
 		}
@@ -1356,9 +1324,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			}
 		}
 		if !chaseOK {
-			if fuseDebug {
-				fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s w=%d: remaining intervener writes a chased read\n", sc.em.fuseDebugName, w)
-			}
 			continue
 		}
 		if len(consumedInter) > 0 {
@@ -1435,7 +1400,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			lo, hi := sc.pairExprs(pa, prelude)
 			fusedArgs = append(fusedArgs, lo, hi)
 		}
-		sc.em.t.windowFuseCount++
 		fusedCall := &ast.CallExpr{Fun: sc.em.helperRef(tree.Name), Args: fusedArgs}
 		if len(rootVars) == 0 {
 			return &ast.ExprStmt{X: fusedCall}, cands[w-1].span, true

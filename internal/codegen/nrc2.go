@@ -38,7 +38,7 @@ import (
 // public ggml ABI value), self-typed (vec_dot_type == 8), unpaired
 // (nrows == 1), with a defined vec_dot of the ggml_vec_dot_t shape
 // (eight i32 parameters, no results). Any mismatch leaves the module
-// untouched. WASM2GO_NO_NRC2 is the kill switch.
+// untouched.
 
 const (
 	nrc2TraitsRowSize = 24
@@ -100,10 +100,6 @@ func nrc2RowOK(b []byte, tab map[uint32]uint32) bool {
 // must be self-typed 0. Exactly one candidate may survive; ambiguity
 // leaves the feature off. On success t.nrc2 is set.
 func (t *translator) scanGgmlNrc2() {
-	if os.Getenv("WASM2GO_NO_NRC2") != "" {
-		return
-	}
-	debug := os.Getenv("WASM2GO_NRC2_DEBUG") != ""
 	tab := nrc2TableSet(t.mod)
 	if len(tab) == 0 {
 		return
@@ -152,9 +148,6 @@ func (t *translator) scanGgmlNrc2() {
 				}
 			}
 			if !okRun {
-				if debug {
-					fmt.Fprintf(os.Stderr, "wasm2go: nrc2 candidate at seg %d +%d: neighborhood parse failed\n", segIdx, entry)
-				}
 				continue
 			}
 			// Entry 0 must be the REAL F32 row — self-typed 0 with a
@@ -166,10 +159,6 @@ func (t *translator) scanGgmlNrc2() {
 			f32vd := binary.LittleEndian.Uint32(img[4:])
 			f32vdt := binary.LittleEndian.Uint32(img[8:])
 			if f32vdt != 0 || f32ff == 0 || f32vd == 0 {
-				if debug {
-					fmt.Fprintf(os.Stderr, "wasm2go: nrc2 candidate at seg %d +%d: entry0 not the F32 row (ff=%d vd=%d vdt=%d)\n",
-						segIdx, entry, f32ff, f32vd, f32vdt)
-				}
 				continue
 			}
 			fn := t.mod.Functions[funcIdx-t.mod.NumImportedFuncs]
@@ -179,15 +168,9 @@ func (t *translator) scanGgmlNrc2() {
 				sigOK = sigOK && p == wasm.ValI32
 			}
 			if !sigOK {
-				if debug {
-					fmt.Fprintf(os.Stderr, "wasm2go: nrc2 candidate at seg %d +%d: vec_dot signature mismatch\n", segIdx, entry)
-				}
 				continue
 			}
 			if t.reachable != nil && !t.reachable[funcIdx-t.mod.NumImportedFuncs] {
-				if debug {
-					fmt.Fprintf(os.Stderr, "wasm2go: nrc2 candidate at seg %d +%d: vec_dot unreachable\n", segIdx, entry)
-				}
 				continue
 			}
 			if found != nil {
@@ -198,9 +181,6 @@ func (t *translator) scanGgmlNrc2() {
 		}
 	}
 	if found == nil {
-		if debug {
-			fmt.Fprintf(os.Stderr, "wasm2go: no ggml q8_0 traits row found\n")
-		}
 		return
 	}
 	t.nrc2 = found

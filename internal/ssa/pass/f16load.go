@@ -1,19 +1,6 @@
 package pass
 
-import (
-	"fmt"
-	"os"
-
-	"github.com/goccy/wasm2go/internal/ssa"
-)
-
-var f16GatherDebug = os.Getenv("WASM2GO_F16LOAD_DEBUG") != ""
-
-func f16dbg(format string, args ...any) {
-	if f16GatherDebug {
-		fmt.Fprintf(os.Stderr, "wasm2go: f16gather: "+format+"\n", args...)
-	}
-}
+import "github.com/goccy/wasm2go/internal/ssa"
 
 // RecognizeF16Gather rewrites the ggml f16->f32 table-gather idiom.
 // The wasm loads four contiguous f16 values widened into i32x4 lanes,
@@ -91,12 +78,6 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 	offs[3] = tOff
 	s3, ok := matchF16LaneAddr(tail.Args[0], 3)
 	if !ok {
-		a := tail.Args[0]
-		if a.Op == ssa.OpAdd32 && len(a.Args) == 2 {
-			f16dbg("lane3 add no-match in %s: [%s aux=%d] + [%s aux=%d]", f.Name, a.Args[0].Op, a.Args[0].AuxInt, a.Args[1].Op, a.Args[1].AuxInt)
-		} else {
-			f16dbg("lane3 addr no-match: %s", a.Op)
-		}
 		return false
 	}
 	srcs[3] = s3
@@ -104,7 +85,6 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 	for lane := int64(2); lane >= 1; lane-- {
 		if !isSimdMem(cur, "simd_v128_load32_lane") || len(cur.Args) != 4 ||
 			!isConst32(cur.Args[2], lane) || uses[cur] != 1 {
-			f16dbg("chain lane%d no-match: %s %v uses=%d", lane, cur.Op, cur.Aux, uses[cur])
 			return false
 		}
 		if offs[lane], ok = constOf(cur.Args[1]); !ok {
@@ -112,7 +92,6 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 		}
 		sk, ok := matchF16LaneAddr(cur.Args[0], lane)
 		if !ok {
-			f16dbg("lane%d addr no-match: %s", lane, cur.Args[0].Op)
 			return false
 		}
 		srcs[lane] = sk
@@ -120,12 +99,10 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 		cur = cur.Args[3]
 	}
 	if !isSimdMem(cur, "simd_v128_load32_zero") || len(cur.Args) != 2 || uses[cur] != 1 {
-		f16dbg("zero head no-match: %s uses=%d", cur.Op, uses[cur])
 		return false
 	}
 	s0, ok := matchF16LaneAddr(cur.Args[0], 0)
 	if !ok {
-		f16dbg("lane0 addr no-match: %s", cur.Args[0].Op)
 		return false
 	}
 	if offs[0], ok = constOf(cur.Args[1]); !ok {
@@ -142,12 +119,10 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 	}
 	for k := 0; k < 4; k++ {
 		if srcs[k].table+offs[k] != table {
-			f16dbg("lane%d table mismatch: %d+%d != %d", k, srcs[k].table, offs[k], table)
 			return false
 		}
 	}
 	if table < 0 || !tableOK(uint32(table)) {
-		f16dbg("table %d not verified", table)
 		return false
 	}
 	var V *ssa.Value
@@ -168,12 +143,10 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 		for k := int64(0); k < 4; k++ {
 			ld := srcs[k].ld
 			if ld == nil {
-				f16dbg("scalar ld%d nil (mixed variants)", k)
 				return false
 			}
 			rk, ck := memRoot(ld)
 			if rk != root0 || ck != c+2*k || ld.Block != blk || uses[ld] != 1 {
-				f16dbg("scalar ld%d: sameRoot=%v off=%d want=%d sameBlk=%v uses=%d", k, rk == root0, ck, c+2*k, ld.Block == blk, uses[ld])
 				return false
 			}
 		}
@@ -190,7 +163,6 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 		for i := first; i < tailIdx; i++ {
 			v := blk.Values[i]
 			if !involved[v] && f16Effectful(v) {
-				f16dbg("effectful between: %s %v", v.Op, v.Aux)
 				return false
 			}
 		}
@@ -218,7 +190,6 @@ func rewriteF16Gather(f *ssa.Func, blk *ssa.Block, tailIdx int, uses map[*ssa.Va
 		l.Aux = [2]uint64{0, 0}
 		l.Args = nil
 	}
-	f16dbg("rewrote gather in %s (table %d)", f.Name, table)
 	return true
 }
 

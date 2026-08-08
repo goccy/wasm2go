@@ -62,17 +62,16 @@ func main() {
 	fmt.Println()
 }
 `
-	build := func(t *testing.T, env map[string]string, wantChase bool) string {
+	build := func(t *testing.T, opts transpile.Options, wantChase bool) string {
 		t.Helper()
-		for k, v := range env {
-			t.Setenv(k, v)
-		}
 		m, err := transpile.Parse(bytes.NewReader(bin))
 		if err != nil {
 			t.Fatal(err)
 		}
+		opts.Package = "pkg"
+		opts.OutputImportPath = "simdlooptest/pkg"
 		var buf bytes.Buffer
-		res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "simdlooptest/pkg"})
+		res, err := transpile.Translate(&buf, m, opts)
 		if err != nil {
 			t.Fatalf("translate: %v", err)
 		}
@@ -306,25 +305,23 @@ func main() {
 
 	configs := []struct {
 		name      string
-		env       map[string]string
+		opts      transpile.Options
 		wantChase bool
 	}{
-		{"unroll+fuse", map[string]string{"WASM2GO_UNROLL": "1"}, true},
-		{"loopfuse", map[string]string{"WASM2GO_FUSE_LOOP": "1"}, false},
-		{"unroll+loopfuse", map[string]string{"WASM2GO_UNROLL": "1", "WASM2GO_FUSE_LOOP": "1"}, true},
-		{"unroll+loopfuse2", map[string]string{"WASM2GO_UNROLL": "1", "WASM2GO_FUSE_LOOP": "1", "WASM2GO_FUSE_LOOP_UNROLL": "2"}, true},
-		{"nounroll", nil, false},
-		{"nofuse", map[string]string{"WASM2GO_UNROLL": "1", "WASM2GO_NO_FUSE": "1"}, false},
-		{"plain", map[string]string{"WASM2GO_NO_FUSE": "1"}, false},
+		{"unroll+fuse", transpile.Options{SIMDUnroll: 4}, true},
+		{"loopfuse", transpile.Options{FuseLoops: true}, false},
+		{"unroll+loopfuse", transpile.Options{SIMDUnroll: 4, FuseLoops: true}, true},
+		{"unroll+loopfuse2", transpile.Options{SIMDUnroll: 4, FuseLoops: true, FuseLoopUnroll: 2}, true},
+		{"nounroll", transpile.Options{}, false},
 		// Loop outlining (threshold 2 = outline every eligible loop),
 		// alone and combined with unroll + loop fusion the way the
 		// production pipeline stacks them.
-		{"outline", map[string]string{"WASM2GO_OUTLINE": "2"}, false},
-		{"outline+unroll+loopfuse", map[string]string{"WASM2GO_OUTLINE": "2", "WASM2GO_UNROLL": "1", "WASM2GO_FUSE_LOOP": "1"}, false},
+		{"outline", transpile.Options{OutlineMinValues: 2}, false},
+		{"outline+unroll+loopfuse", transpile.Options{OutlineMinValues: 2, SIMDUnroll: 4, FuseLoops: true}, false},
 	}
 	for _, cfg := range configs {
 		t.Run(cfg.name, func(t *testing.T) {
-			got := build(t, cfg.env, cfg.wantChase)
+			got := build(t, cfg.opts, cfg.wantChase)
 			if got != strings.TrimSpace(want.String()) {
 				t.Errorf("got  %q\nwant %q", got, strings.TrimSpace(want.String()))
 			}

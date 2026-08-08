@@ -21,11 +21,41 @@ import (
 	"strings"
 )
 
+// Config is the build configuration the splice emitters consult.
+type Config struct {
+	// FastMath opts splice synthesis out of wasm bit-exactness: SDOT
+	// lane grouping without the TBL permutation, and fused
+	// multiply-adds. The output no longer matches the wasm program
+	// bit-for-bit (like a native build vs the wasm), so integrators
+	// gate it and validate with token-level equivalence instead of
+	// the byte-equality probe.
+	FastMath bool
+	// FuseLoopUnroll is the in-splice unroll factor: how many
+	// iteration steps a fused loop's fast lane emits per branch.
+	// 0 or 1 means no in-splice unrolling; 2..8 unroll.
+	FuseLoopUnroll int
+}
+
 // ModuleOffsets are the *Module field offsets the memory-op splices
-// hardcode, extracted per architecture from the captured probe.
+// hardcode, extracted per architecture from the captured probe, plus
+// the build configuration they emit under.
 type ModuleOffsets struct {
 	M       int // unsafe.Pointer to linear memory (backing array)
 	MemSize int // *atomic.Uint64 holding the current memory size
+	Cfg     Config
+}
+
+// fastMath is the nil-safe read of Cfg.FastMath: error paths probe
+// splice emitters with a nil ModuleOffsets.
+func (o *ModuleOffsets) fastMath() bool { return o != nil && o.Cfg.FastMath }
+
+// fuseLoopUnroll is the nil-safe, range-clamped in-splice unroll
+// factor (1 = no unrolling).
+func (o *ModuleOffsets) fuseLoopUnroll() int {
+	if o == nil || o.Cfg.FuseLoopUnroll < 2 || o.Cfg.FuseLoopUnroll > 8 {
+		return 1
+	}
+	return o.Cfg.FuseLoopUnroll
 }
 
 var (

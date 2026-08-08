@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 )
 
 // The f16 load-convert selection (see the scalarizer's gather rewrite)
@@ -80,15 +79,15 @@ func (t *translator) hasIEEEF16TableAt(base uint32) bool {
 	return true
 }
 
-// warnStaleF16Table reports, once translation is done, a
-// WASM2GO_F16_TABLE assertion that no gather site ever queried: the
-// module's data layout has shifted and the asserted address no
+// warnStaleF16Table reports, once translation is done, an
+// Options.F16TableAddr assertion that no gather site ever queried:
+// the module's data layout has shifted and the asserted address no
 // longer matches the table, so the f16 gather rewrite silently
 // stayed off — a pure performance loss that is otherwise invisible.
 // The bases that WERE queried and failed verification are the
 // candidates the integrator should re-point the assertion at.
 func (t *translator) warnStaleF16Table() {
-	if msg := staleF16TableMsg(os.Getenv("WASM2GO_F16_TABLE"), t.f16TablesOK); msg != "" {
+	if msg := staleF16TableMsg(t.opts.F16TableAddr, t.f16TablesOK); msg != "" {
 		fmt.Fprintln(os.Stderr, msg)
 	}
 }
@@ -96,15 +95,11 @@ func (t *translator) warnStaleF16Table() {
 // staleF16TableMsg is warnStaleF16Table's decision: empty means the
 // assertion is unset or was queried by some gather site (matched or
 // not — being queried means the address still appears in code).
-func staleF16TableMsg(env string, tables map[uint32]bool) string {
-	if env == "" {
+func staleF16TableMsg(addr uint32, tables map[uint32]bool) string {
+	if addr == 0 {
 		return ""
 	}
-	n, err := strconv.ParseUint(env, 0, 32)
-	if err != nil {
-		return fmt.Sprintf("wasm2go: WASM2GO_F16_TABLE=%q is not a valid address", env)
-	}
-	if _, seen := tables[uint32(n)]; seen {
+	if _, seen := tables[addr]; seen {
 		return ""
 	}
 	var cands []uint32
@@ -115,8 +110,8 @@ func staleF16TableMsg(env string, tables map[uint32]bool) string {
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
 	return fmt.Sprintf(
-		"wasm2go: WASM2GO_F16_TABLE=%s matches no f16 gather site — the table has likely moved and the gather rewrite stayed OFF; unverified gather bases seen: %v",
-		env, cands)
+		"wasm2go: F16TableAddr %d matches no f16 gather site — the table has likely moved and the gather rewrite stayed OFF; unverified gather bases seen: %v",
+		addr, cands)
 }
 
 func max64(a, b int64) int64 {
@@ -138,8 +133,8 @@ func min64(a, b int64) int64 {
 //
 //   - the module's initial data image holds the IEEE map at base
 //     (verified byte-for-byte), or
-//   - the integrator asserted it: WASM2GO_F16_TABLE names the base of
-//     a table the module BUILDS AT RUNTIME (ggml computes its
+//   - the integrator asserted it: Options.F16TableAddr names the
+//     base of a table the module BUILDS AT RUNTIME (ggml computes its
 //     f16->f32 table in an init function, so the data segment holds
 //     only zeros and no static check can see it). The assertion is a
 //     build-input contract, not a guess — a wrong address changes
@@ -153,14 +148,7 @@ func (t *translator) f16TableOK(base uint32) bool {
 	if seen {
 		return ok
 	}
-	ok = t.hasIEEEF16TableAt(base)
-	if !ok {
-		if v := os.Getenv("WASM2GO_F16_TABLE"); v != "" {
-			if n, err := strconv.ParseUint(v, 0, 32); err == nil && uint32(n) == base {
-				ok = true
-			}
-		}
-	}
+	ok = t.hasIEEEF16TableAt(base) || (t.opts.F16TableAddr != 0 && t.opts.F16TableAddr == base)
 	t.f16TablesOK[base] = ok
 	return ok
 }

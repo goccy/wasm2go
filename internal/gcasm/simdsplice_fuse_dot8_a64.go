@@ -1,8 +1,6 @@
 package gcasm
 
 import (
-	"os"
-
 	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
@@ -63,22 +61,6 @@ const (
 	a64OpElided   = "fused_elided"
 )
 
-// a64FastMath opts splice synthesis out of wasm bit-exactness: SDOT
-// lane grouping without the TBL permutation, and fused
-// multiply-adds. The output no longer matches the wasm program
-// bit-for-bit (like a native build vs the wasm), so integrators gate
-// it and validate with token-level equivalence instead of the
-// byte-equality probe. "0" and "false" mean off, like unset — a
-// feature toggle is set to explicit values, unlike the WASM2GO_NO_*
-// kill switches whose mere presence means on.
-func a64FastMath() bool {
-	switch os.Getenv("WASM2GO_FAST_MATH") {
-	case "", "0", "false":
-		return false
-	}
-	return true
-}
-
 // a64Dot8Src reports whether an extend input can feed the synthetic
 // dot directly: a member's register-resident result or a pair input.
 func a64Dot8Src(a simdfuse.Arg) bool {
@@ -89,10 +71,7 @@ func a64Dot8Src(a simdfuse.Arg) bool {
 // collapsed into synthetic 8-bit dot ops, or the tree itself when
 // nothing matches (or the rewrite is disabled). portable suppresses
 // the SDOT upgrade (baseline-ISA twin bodies).
-func a64Dot8Rewrite(tree *simdfuse.Tree, portable bool) *simdfuse.Tree {
-	if os.Getenv("WASM2GO_NO_DOT8") != "" {
-		return tree
-	}
+func a64Dot8Rewrite(tree *simdfuse.Tree, portable, fastMath bool) *simdfuse.Tree {
 	uses := make([]int, len(tree.Nodes))
 	for _, n := range tree.Nodes {
 		for _, a := range n.Args {
@@ -151,7 +130,7 @@ func a64Dot8Rewrite(tree *simdfuse.Tree, portable bool) *simdfuse.Tree {
 			a64SdotRewrite(nodes)
 		}
 	}
-	if rewrote && a64FastMath() {
+	if rewrote && fastMath {
 		// Scope the fast-math accumulate to the dot kernels (trees the
 		// 8-bit dot rewrite touched): the measured win lives there, and
 		// blanket application churned other trees' pools for a loss.
@@ -201,8 +180,8 @@ func a64FmlaRewrite(nodes []simdfuse.Node, uses []int, isRoot []bool) bool {
 // (used by loop callers to hoist the TBL index constant). The dot
 // rewrite is deterministic and idempotent, so probing a rewritten
 // copy always agrees with the splice-time rewrite.
-func a64TreeHasSdot(tree *simdfuse.Tree, portable bool) bool {
-	for _, n := range a64Dot8Rewrite(tree, portable).Nodes {
+func a64TreeHasSdot(tree *simdfuse.Tree, portable, fastMath bool) bool {
+	for _, n := range a64Dot8Rewrite(tree, portable, fastMath).Nodes {
 		if n.Op == a64OpSdot16 || n.Op == a64OpSdotAcc {
 			return true
 		}
@@ -215,9 +194,6 @@ func a64TreeHasSdot(tree *simdfuse.Tree, portable bool) bool {
 // full 16-byte dot (see a64OpSdot16). Chains whose leaves do not
 // pair up cleanly keep the sadalp form.
 func a64SdotRewrite(nodes []simdfuse.Node) {
-	if os.Getenv("WASM2GO_NO_SDOT") != "" {
-		return
-	}
 	// Collect maximal chains: head is a Dot8Low/High, links are the
 	// Acc nodes threaded through arg0.
 	prevOf := make(map[int]int) // acc node -> arg0 (previous link)
@@ -450,9 +426,9 @@ func sortInts(s []int) {
 // a64TreeFmlaCount reports how many fused multiply-adds splicing tree
 // will emit (fast math only; zero otherwise). Deterministic like
 // a64TreeHasSdot.
-func a64TreeFmlaCount(tree *simdfuse.Tree, portable bool) int {
+func a64TreeFmlaCount(tree *simdfuse.Tree, portable, fastMath bool) int {
 	n := 0
-	for _, nd := range a64Dot8Rewrite(tree, portable).Nodes {
+	for _, nd := range a64Dot8Rewrite(tree, portable, fastMath).Nodes {
 		if nd.Op == a64OpFmlaLane {
 			n++
 		}

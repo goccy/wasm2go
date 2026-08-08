@@ -38,6 +38,12 @@ func main() {
 	entryExports := flag.String("entry-exports", "", "comma-separated list of export names that are DCE roots; the literal value \"NONE\" means no export is a root")
 	promotionReport := flag.String("promotion-report", "", "write the SSA memory-promotion report (JSON: per-function frame/rodata/slab classification) to this path")
 	pureOnly := flag.Bool("pure", false, "emit the pure-Go backend only (no asm bundle, no arch build tags); the ABIInternal reference for benchmarking")
+	outlineMin := flag.Int("outline", 0, "outline large loops into their own functions; the value is the minimum loop body size in SSA values (0 disables)")
+	simdUnroll := flag.Int("simd-unroll", 0, "unroll eligible SIMD loops by this factor (2..8; 0 disables)")
+	fuseLoops := flag.Bool("fuse-loops", false, "fuse whole countdown loops around fused SIMD regions into single asm splices")
+	fuseLoopUnroll := flag.Int("fuse-loop-unroll", 0, "in-splice unroll factor for fused loops (2..8; 0 disables)")
+	f16Table := flag.Uint("f16-table", 0, "linear-memory base address of a runtime-built IEEE f16->f32 table (asserted, not verified; 0 asserts nothing)")
+	fastMath := flag.Bool("fast-math", false, "allow asm splices that trade wasm bit-exactness for native-style rounding (SDOT raw grouping, FMA, SMMLA pairing)")
 	flag.Parse()
 
 	var r io.Reader
@@ -89,6 +95,12 @@ func main() {
 		EntryExports:        parseEntryExports(*entryExports),
 		PromotionReportPath: *promotionReport,
 		PureOnly:            *pureOnly,
+		OutlineMinValues:    *outlineMin,
+		SIMDUnroll:          *simdUnroll,
+		FuseLoops:           *fuseLoops,
+		FuseLoopUnroll:      *fuseLoopUnroll,
+		F16TableAddr:        uint32(*f16Table),
+		FastMath:            *fastMath,
 	}
 
 	if wantsMulti {

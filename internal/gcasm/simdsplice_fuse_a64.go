@@ -21,8 +21,6 @@ package gcasm
 
 import (
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -191,7 +189,7 @@ func a64EmitSdotIdx(b *strings.Builder, reg int) {
 // once, outside the loop).
 func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets,
 	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, lutBase map[int]string, sdotIdx int, portable bool, dual *a64DualAcc) ([]fusedLoc, bool, error) {
-	tree = a64Dot8Rewrite(tree, portable)
+	tree = a64Dot8Rewrite(tree, portable, offs.fastMath())
 	if !skipProlog {
 		if err := a64FusedProlog(b, tree, offs); err != nil {
 			return nil, false, err
@@ -607,7 +605,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 				}
 			}
 			dotN, dotM := 1, 2
-			if a64FastMath() {
+			if offs.fastMath() {
 				// Lane grouping is unobservable without bit-exactness:
 				// feed SDOT the raw byte sources (the native selection).
 				dotN, dotM = srcs[0], srcs[1]
@@ -1160,7 +1158,7 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// implausibly deep, fall back to lazy in-body materialization.
 	// Fast math feeds SDOT raw sources — no permutation constant.
 	sdotIdx := -1
-	if r := 30 - len(loop.CarriedPairs); r >= 16 && !a64FastMath() && a64TreeHasSdot(tree, portable) {
+	if r := 30 - len(loop.CarriedPairs); r >= 16 && !offs.fastMath() && a64TreeHasSdot(tree, portable, false) {
 		sdotIdx = r
 		reserve = append(reserve, r)
 		a64EmitSdotIdx(b, r)
@@ -1170,8 +1168,8 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// shape qualifies; the partner register takes the slot the SDOT
 	// constant would have used.
 	var dual *a64DualAcc
-	if r := 30 - len(loop.CarriedPairs); r >= 16 && a64FastMath() &&
-		len(loop.CarriedPairs) == 1 && a64TreeFmlaCount(tree, portable) >= 2 {
+	if r := 30 - len(loop.CarriedPairs); r >= 16 && offs.fastMath() &&
+		len(loop.CarriedPairs) == 1 && a64TreeFmlaCount(tree, portable, true) >= 2 {
 		dual = &a64DualAcc{primary: 30, second: r}
 		reserve = append(reserve, r)
 		fmt.Fprintf(b, "\tWORD $0x%08x // movi v%d.4s, #0 (dual acc)\n", 0x4F000400|uint32(r), r)
@@ -1240,7 +1238,7 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		fmt.Fprintf(b, "\t%s $%d, %s, %s\n", subOp, loop.Dec, counterReg, counterReg)
 		return nil
 	}
-	unroll := fusedLoopUnroll()
+	unroll := offs.fuseLoopUnroll()
 	loopLabel := "gcasmfxl" + site
 	exitLabel := "gcasmfxlx" + site
 	if unroll > 1 && loop.Dec < 4096/int32(unroll) {
@@ -1337,22 +1335,6 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		fmt.Fprintf(b, "\tVMOV V%d.D[1], R%d\n", src, 2*k+1)
 	}
 	return true, needsTrap, nil
-}
-
-// fusedLoopUnroll reads the in-splice unroll factor: how many
-// iteration steps a fused loop's fast lane emits per branch.
-// Default 1 (no in-splice unrolling); WASM2GO_FUSE_LOOP_UNROLL picks
-// 2..8.
-func fusedLoopUnroll() int {
-	v := os.Getenv("WASM2GO_FUSE_LOOP_UNROLL")
-	if v == "" {
-		return 1
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 || n > 8 {
-		return 1
-	}
-	return n
 }
 
 // emitParallelMoves realizes a register permutation/shuffle without

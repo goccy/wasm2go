@@ -32,19 +32,16 @@ import (
 func TestGcasmSimdDifferential(t *testing.T) {
 	bin := testfixture.Wasm(t, "cg_simd.wasm")
 
-	build := func(t *testing.T, fuse bool) string {
+	build := func(t *testing.T, pure bool) string {
 		t.Helper()
-		if !fuse {
-			t.Setenv("WASM2GO_NO_FUSE", "1")
-		}
 		m, err := transpile.Parse(bytes.NewReader(bin))
 		if err != nil {
 			t.Fatal(err)
 		}
 		var buf bytes.Buffer
-		res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "simdtest/pkg"})
+		res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "simdtest/pkg", PureOnly: pure})
 		if err != nil {
-			t.Fatalf("translate (fuse=%v): %v", fuse, err)
+			t.Fatalf("translate (pure=%v): %v", pure, err)
 		}
 		dir := t.TempDir()
 		w := func(rel string, data []byte) {
@@ -100,15 +97,17 @@ func main() {
 	// fixture test; every configuration must reproduce them.
 	const want = "1646524174 2147451134 437725748 176 131342"
 
-	for _, fuse := range []bool{true, false} {
-		name := "fused"
-		if !fuse {
-			name = "unfused"
+	// Two backends over the same fixed expectations: the gcasm asm
+	// bundle (with fused splices) and the pure ABIInternal reference.
+	for _, pure := range []bool{false, true} {
+		name := "gcasm"
+		if pure {
+			name = "pure"
 		}
 		t.Run(name, func(t *testing.T) {
-			dir := build(t, fuse)
+			dir := build(t, pure)
 			envs := [][]string{nil}
-			if runtime.GOARCH == "amd64" {
+			if !pure && runtime.GOARCH == "amd64" {
 				// v2 executes the gcasm splices, v1 the pure fallback.
 				envs = [][]string{{"GOAMD64=v2"}, {"GOAMD64=v1"}}
 			}

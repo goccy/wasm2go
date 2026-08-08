@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"os"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -71,17 +70,14 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		}
 		counter, ok := matchUiLt(ifs.Cond)
 		if !ok {
-			loopFuseDebug(sc, "header: guard shape")
 			return nil, false
 		}
 		blk, ok := ifs.Else.(*ast.BlockStmt)
 		if !ok || len(blk.List) < 2 {
-			loopFuseDebug(sc, "header: else shape")
 			return nil, false
 		}
 		cl := &countdownLoop{counter: counter}
 		if !cl.splitTail(sc, blk.List, counter) {
-			loopFuseDebug(sc, "header: tail peel failed (bumps=%d carries=%d consts=%d)", len(cl.bumps), len(cl.carries), len(cl.consts))
 			return nil, false
 		}
 		return cl, true
@@ -96,12 +92,10 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	}
 	ifs, ok := list[len(list)-2].(*ast.IfStmt)
 	if !ok || ifs.Else == nil {
-		loopFuseDebug(sc, "dowhile: trailing if shape (else=%v)", ok && ifs.Else != nil)
 		return nil, false
 	}
 	dec, ok := list[len(list)-3].(*ast.AssignStmt)
 	if !ok || len(dec.Lhs) != 1 || len(dec.Rhs) != 1 {
-		loopFuseDebug(sc, "dowhile: no counter decrement before the if")
 		return nil, false
 	}
 	decVar, ok := dec.Lhs[0].(*ast.Ident)
@@ -110,7 +104,6 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	}
 	bin, ok := dec.Rhs[0].(*ast.BinaryExpr)
 	if !ok || bin.Op != token.SUB {
-		loopFuseDebug(sc, "dowhile: decrement is not a SUB")
 		return nil, false
 	}
 	counter, ok := bin.X.(*ast.Ident)
@@ -121,22 +114,18 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	if _, cok, w := loopConstValue(bin.Y); cok {
 		wide = w
 	} else if _, iok := bin.Y.(*ast.Ident); !iok {
-		loopFuseDebug(sc, "dowhile: decrement step is neither const nor ident")
 		return nil, false
 	}
 	// Condition `decVar != 0 { tail; continue } else { break }` or the
 	// inverted `decVar == 0 { break } else { tail; continue }`.
 	cond, ok := ifs.Cond.(*ast.BinaryExpr)
 	if !ok || (cond.Op != token.NEQ && cond.Op != token.EQL) {
-		loopFuseDebug(sc, "dowhile: exit cond not ==/!= binary")
 		return nil, false
 	}
 	if id, ok := cond.X.(*ast.Ident); !ok || id.Name != decVar.Name {
-		loopFuseDebug(sc, "dowhile: exit cond var is not the decremented counter")
 		return nil, false
 	}
 	if c, ok, w := loopConstValue(cond.Y); !ok || c != 0 {
-		loopFuseDebug(sc, "dowhile: exit compare is not against 0")
 		return nil, false
 	} else if w {
 		wide = true
@@ -153,7 +142,6 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		brkBlk = ifs.Body
 	}
 	if brkBlk == nil || len(brkBlk.List) != 1 {
-		loopFuseDebug(sc, "dowhile: break arm shape")
 		return nil, false
 	}
 	if br, ok := brkBlk.List[0].(*ast.BranchStmt); !ok || br.Tok != token.BREAK {
@@ -173,16 +161,13 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	for _, st := range arm[:len(arm)-1] {
 		as, ok := st.(*ast.AssignStmt)
 		if !ok {
-			loopFuseDebug(sc, "dowhile: non-assign in continue arm: %T", st)
 			return nil, false
 		}
 		if err := cl.classifyTailAssign(sc, as, counter, decVar, &sawReset); err != nil {
-			loopFuseDebug(sc, "dowhile: %v: %s = %s", err, exprDebugString(as.Lhs[0]), exprDebugString(as.Rhs[0]))
 			return nil, false
 		}
 	}
 	if !sawReset {
-		loopFuseDebug(sc, "dowhile: no counter reset")
 		return nil, false
 	}
 	return cl, true
@@ -355,13 +340,6 @@ func constishExpr(e ast.Expr) bool {
 	return ok
 }
 
-// loopFuseDebug reports upgrade refusals under WASM2GO_FUSE_DEBUG.
-func loopFuseDebug(sc *simdScalarizer, format string, args ...interface{}) {
-	if os.Getenv("WASM2GO_FUSE_DEBUG") != "" {
-		fmt.Fprintf(os.Stderr, "wasm2go: fuse loop %s: %s\n", sc.em.fuseDebugName, fmt.Sprintf(format, args...))
-	}
-}
-
 // identWrites collects every identifier the statements assign.
 func identWrites(stmts []ast.Stmt) map[string]bool {
 	w := map[string]bool{}
@@ -410,33 +388,18 @@ func identUses(stmts []ast.Stmt) map[string]int {
 func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.Stmt, bool) {
 	// Opt-in while the splicer support matures; the retranspile
 	// pipeline enables it explicitly.
-	if os.Getenv("WASM2GO_FUSE_LOOP") == "" || os.Getenv("WASM2GO_NO_FUSE") != "" {
+	if sc.em.t == nil || !sc.em.t.opts.FuseLoops {
 		return nil, false
 	}
 	cl, ok := matchCountdownLoop(sc, f)
 	if !ok {
-		if os.Getenv("WASM2GO_FUSE_DEBUG") != "" {
-			var kinds []string
-			for _, st := range f.Body.List {
-				kinds = append(kinds, fmt.Sprintf("%T", st))
-			}
-			extra := ""
-			if len(f.Body.List) >= 1 {
-				if ifs, iok := f.Body.List[0].(*ast.IfStmt); iok {
-					extra = fmt.Sprintf(" if0{cond=%s body=%d else=%v}", exprDebugString(ifs.Cond), len(ifs.Body.List), ifs.Else != nil)
-				}
-			}
-			loopFuseDebug(sc, "no match (%v)%s", kinds, extra)
-		}
 		return nil, false
 	}
-	loopFuseDebug(sc, "matched: body=%d bumps=%d carries=%d pretest=%v", len(cl.body), len(cl.bumps), len(cl.carries), cl.decVar == nil)
 	// Fuse the whole body into one region. Leading interveners join
 	// the window; the trial must consume every statement.
 	var wpre []ast.Stmt
 	stmt, span, ok := sc.tryFuseWindowEx(cl.body, 0, &wpre, true)
 	if !ok {
-		loopFuseDebug(sc, "window fusion failed on body")
 		return nil, false
 	}
 	for _, st := range cl.body[span:] {
@@ -449,11 +412,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				cl.consts = append(cl.consts, as)
 				continue
 			}
-			loopFuseDebug(sc, "unconsumed: %s = %s", exprDebugString(as.Lhs[0]), exprDebugString(as.Rhs[0]))
-		} else {
-			loopFuseDebug(sc, "unconsumed stmt %T", st)
 		}
-		loopFuseDebug(sc, "body not fully consumed: %d of %d", span, len(cl.body))
 		return nil, false
 	}
 	call, rootVars, ok := fusedCallParts(stmt)
@@ -468,7 +427,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	}
 	tree := sc.em.t.FusedTrees()[fxName]
 	if tree == nil {
-		loopFuseDebug(sc, "no interned tree for %s", fxName)
 		return nil, false
 	}
 	// Locate argument slots by name: scalars start after m, pairs
@@ -525,7 +483,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, t := range cl.decEx {
 		c, cok := resolveC(t)
 		if !cok {
-			loopFuseDebug(sc, "counter decrement not const")
 			return nil, false
 		}
 		dec += c
@@ -546,7 +503,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		next := ca.Rhs[0].(*ast.Ident).Name
 		ri, rok := rootIdx[next]
 		if !rok {
-			loopFuseDebug(sc, "carry %s=%s: source not a root", prev, next)
 			return nil, false
 		}
 		if pi, pok := pairSlot[prev]; pok {
@@ -639,14 +595,9 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		y := b.Rhs[0].(*ast.BinaryExpr).Y
 		if si, sok := scalarSlot[name]; sok {
 			if !addBump(si, name, y) {
-				loopFuseDebug(sc, "bump %s delta not const or invariant", name)
 				return nil, false
 			}
 			continue
-		}
-		if os.Getenv("WASM2GO_NO_BUMP_REASSOC") != "" {
-			loopFuseDebug(sc, "bump %s not a scalar arg (reassoc disabled)", name)
-			return nil, false
 		}
 		// Reassociation: bump every scalar slot whose argument (or
 		// hoisted defining statement) is `name + invariant` instead.
@@ -675,21 +626,11 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				bumpFixes = append(bumpFixes, bumpFix{target: name, temp: lhsName, addend: addend})
 			}
 			if !addBump(i, lhsName, y) {
-				loopFuseDebug(sc, "bump %s delta not const or invariant", name)
 				return nil, false
 			}
 			matched++
 		}
 		if matched == 0 {
-			if os.Getenv("WASM2GO_FUSE_DEBUG") != "" {
-				var args []string
-				for i := 0; i < tree.NumScalars; i++ {
-					args = append(args, exprDebugString(call.Args[1+i]))
-				}
-				loopFuseDebug(sc, "bump %s not a scalar arg (scalar args: %s)", name, strings.Join(args, " | "))
-			} else {
-				loopFuseDebug(sc, "bump %s not a scalar arg", name)
-			}
 			return nil, false
 		}
 		droppedBump[name] = true
@@ -706,7 +647,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	if 1+tree.NumScalars+1+loop.NumDeltas > fusedMaxIntRegs ||
 		1+tree.NumScalars+1+loop.NumDeltas+2*tree.NumPairs > fusedMaxIntSlots ||
 		2*len(roots)+len(loop.ExitScalars) > fusedMaxIntSlots {
-		loopFuseDebug(sc, "signature over caps")
 		return nil, false
 	}
 	// Escape checks: values the loop produces per-iteration but does
@@ -721,9 +661,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		// bodies (this loop and its emitter-duplicated copies) can
 		// never observe the eliminated per-iteration state from
 		// outside any copy.
-		if os.Getenv("WASM2GO_NO_CLONE_ESCAPE") != "" {
-			return true
-		}
 		return sc.readCount[name] > sc.carryLoopReads[name]
 	}
 	exitCopied := map[string]bool{}
@@ -745,12 +682,10 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				exitCopied[name] = true
 				continue
 			}
-			loopFuseDebug(sc, "carry target %s escapes", name)
 			return nil, false
 		}
 	}
 	if cl.decVar != nil && escape(cl.decVar.Name) {
-		loopFuseDebug(sc, "dec var escapes")
 		return nil, false
 	}
 	// Remaining interveners hoist above the loop: they must be
@@ -768,7 +703,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, st := range wpre {
 		as, ok := st.(*ast.AssignStmt)
 		if !ok {
-			loopFuseDebug(sc, "non-assign leftover intervener")
 			return nil, false
 		}
 		bad := false
@@ -781,16 +715,13 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 			})
 		}
 		if bad {
-			loopFuseDebug(sc, "leftover intervener not loop-invariant")
 			return nil, false
 		}
 	}
 	name, ok := sc.em.t.internFusedLoop(loop)
 	if !ok {
-		loopFuseDebug(sc, "loop intern failed")
 		return nil, false
 	}
-	loopFuseDebug(sc, "UPGRADED as %s (carried=%d bumps=%d exits=%d dec=%d)", name, len(loop.CarriedPairs), len(loop.Bumps), len(loop.ExitScalars), loop.Dec)
 	sc.em.useHelper(name)
 	// Assemble the replacement: hoisted interveners, then one call.
 	// Arguments: the window call's args with the counter's initial
@@ -813,7 +744,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		lhs = append(lhs, newID(bn))
 	}
 	lhs = append(lhs, newID(cl.counter.Name))
-	sc.em.t.windowFuseCount++
 	callStmt := &ast.AssignStmt{
 		Tok: token.ASSIGN,
 		Lhs: lhs,

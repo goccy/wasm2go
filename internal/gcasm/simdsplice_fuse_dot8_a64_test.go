@@ -47,9 +47,10 @@ func fuseDot8Tree(extraRoot bool) *simdfuse.Tree {
 }
 
 func TestA64Dot8Rewrite(t *testing.T) {
-	t.Setenv("WASM2GO_NO_SDOT", "1")
+	// The portable twin keeps the smull/sadalp form (no SDOT upgrade),
+	// which is the shape this test pins.
 	tree := fuseDot8Tree(false)
-	rt := a64Dot8Rewrite(tree, false)
+	rt := a64Dot8Rewrite(tree, true, false)
 	if rt == tree {
 		t.Fatal("eligible tree not rewritten")
 	}
@@ -84,7 +85,7 @@ func TestA64Dot8Rewrite(t *testing.T) {
 	if tree.Nodes[2].Op != "i16x8_extend_low_i8x16_s" {
 		t.Error("rewrite mutated the shared tree")
 	}
-	if same := a64Dot8Rewrite(fuseDot8Tree(true), false); same != nil && same.Nodes[2].Op != "i16x8_extend_low_i8x16_s" {
+	if same := a64Dot8Rewrite(fuseDot8Tree(true), false, false); same != nil && same.Nodes[2].Op != "i16x8_extend_low_i8x16_s" {
 		t.Error("root extend rewritten away")
 	}
 }
@@ -93,7 +94,7 @@ func TestA64Dot8Rewrite(t *testing.T) {
 // into one full 16-byte SDOT at the chain tail.
 func TestA64SdotRewrite(t *testing.T) {
 	tree := fuseDot8Tree(false)
-	rt := a64Dot8Rewrite(tree, false)
+	rt := a64Dot8Rewrite(tree, false, false)
 	if rt == tree {
 		t.Fatal("eligible tree not rewritten")
 	}
@@ -109,10 +110,10 @@ func TestA64SdotRewrite(t *testing.T) {
 		args[0].Kind != simdfuse.ArgNode || args[1].Kind != simdfuse.ArgNode {
 		t.Errorf("node 8 args: %+v, want the byte loads", rt.Nodes[8].Args)
 	}
-	if a64TreeHasSdot(fuseDot8Tree(false), false) != true {
+	if a64TreeHasSdot(fuseDot8Tree(false), false, false) != true {
 		t.Error("a64TreeHasSdot disagrees with the rewrite")
 	}
-	if a64TreeHasSdot(fuseDot8Tree(true), false) {
+	if a64TreeHasSdot(fuseDot8Tree(true), false, false) {
 		t.Error("a64TreeHasSdot true for the unrewritable root-extend shape")
 	}
 }
@@ -171,7 +172,7 @@ func fuseDot8ChainTree() *simdfuse.Tree {
 
 func TestA64SdotRewriteChain(t *testing.T) {
 	tree := fuseDot8ChainTree()
-	rt := a64Dot8Rewrite(tree, false)
+	rt := a64Dot8Rewrite(tree, false, false)
 	if rt == tree {
 		t.Fatal("eligible tree not rewritten")
 	}
@@ -199,9 +200,9 @@ func TestA64SdotRewriteChain(t *testing.T) {
 }
 
 func TestA64SpliceFusedDot8(t *testing.T) {
-	t.Setenv("WASM2GO_NO_SDOT", "1")
+	// The portable twin keeps the smull/sadalp form (no SDOT upgrade).
 	var b strings.Builder
-	spliced, needsTrap, err := a64SpliceFused(&b, fuseDot8Tree(false), nil, fuseTestOffs, false)
+	spliced, needsTrap, err := a64SpliceFused(&b, fuseDot8Tree(false), nil, fuseTestOffs, true)
 	if err != nil || !spliced || !needsTrap {
 		t.Fatalf("spliced=%v trap=%v err=%v", spliced, needsTrap, err)
 	}
@@ -262,30 +263,11 @@ func TestA64SpliceFusedDot8RootExtend(t *testing.T) {
 	}
 }
 
-// The fast-math toggle is set to explicit values ("1"/"0"), so the
-// off spellings a caller would naturally write must all mean off —
-// "0" silently enabling it cost a full pipeline round trip once.
-func TestA64FastMathEnvParsing(t *testing.T) {
-	for _, tc := range []struct {
-		val  string
-		want bool
-	}{
-		{"", false}, {"0", false}, {"false", false},
-		{"1", true}, {"true", true},
-	} {
-		t.Setenv("WASM2GO_FAST_MATH", tc.val)
-		if got := a64FastMath(); got != tc.want {
-			t.Errorf("WASM2GO_FAST_MATH=%q: got %v, want %v", tc.val, got, tc.want)
-		}
-	}
-}
-
 // Fast-math mode: SDOT feeds on raw byte sources (no TBL) and the
 // mul-by-lane + add pair fuses into FMLA.
 func TestA64SpliceFusedFastMath(t *testing.T) {
-	t.Setenv("WASM2GO_FAST_MATH", "1")
 	var b strings.Builder
-	spliced, _, err := a64SpliceFused(&b, fuseDot8ChainTree(), nil, fuseTestOffs, false)
+	spliced, _, err := a64SpliceFused(&b, fuseDot8ChainTree(), nil, fastTestOffs, false)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}
@@ -299,7 +281,6 @@ func TestA64SpliceFusedFastMath(t *testing.T) {
 }
 
 func TestA64FmlaRewriteFast(t *testing.T) {
-	t.Setenv("WASM2GO_FAST_MATH", "1")
 	// mul_lane feeding an add: splat(f) * v + acc
 	tree := &simdfuse.Tree{
 		Name:      "simd_p_fxfma",
@@ -317,7 +298,7 @@ func TestA64FmlaRewriteFast(t *testing.T) {
 		Roots: []int{2},
 	}
 	var b strings.Builder
-	spliced, _, err := a64SpliceFused(&b, tree, nil, fuseTestOffs, false)
+	spliced, _, err := a64SpliceFused(&b, tree, nil, fastTestOffs, false)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}
@@ -332,7 +313,6 @@ func TestA64FmlaRewriteFast(t *testing.T) {
 // A dot tree with the scale tail: the mul-by-lane + add pair fuses
 // into FMLA under fast math.
 func TestA64FmlaRewriteDotTree(t *testing.T) {
-	t.Setenv("WASM2GO_FAST_MATH", "1")
 	base := fuseDot8ChainTree()
 	n := len(base.Nodes)
 	base.NumFloats = 1
@@ -347,7 +327,7 @@ func TestA64FmlaRewriteDotTree(t *testing.T) {
 	)
 	base.Roots = []int{n + 3}
 	var b strings.Builder
-	spliced, _, err := a64SpliceFused(&b, base, nil, fuseTestOffs, false)
+	spliced, _, err := a64SpliceFused(&b, base, nil, fastTestOffs, false)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}

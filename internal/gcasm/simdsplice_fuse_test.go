@@ -16,6 +16,9 @@ import (
 
 var fuseTestOffs = &ModuleOffsets{M: 32, MemSize: 128}
 
+// fastTestOffs is fuseTestOffs with fast-math splice synthesis on.
+var fastTestOffs = &ModuleOffsets{M: 32, MemSize: 128, Cfg: Config{FastMath: true}}
+
 // fuseChainTree is add(extend_low(load(s0)), p0): one load, one chain,
 // one pair input.
 func fuseChainTree() *simdfuse.Tree {

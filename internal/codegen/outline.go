@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"os"
 	"strconv"
-	"strings"
 
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -42,48 +40,14 @@ func ssaValType(t ssa.Type) (wasm.ValType, bool) {
 }
 
 // Loop-outlining integration (see internal/ssa/outline.go for the
-// extraction itself). Gated by WASM2GO_OUTLINE: unset/empty disables;
-// "1" uses the default minimum loop size; any other integer sets the
-// minimum body size in SSA values.
-
-const outlineDefaultMin = 300
-
-func outlineMinValues() (int, bool) {
-	v := os.Getenv("WASM2GO_OUTLINE")
-	if v == "" {
-		return 0, false
-	}
-	if n, err := strconv.Atoi(v); err == nil && n > 1 {
-		return n, true
-	}
-	return outlineDefaultMin, true
-}
-
-// outlineOnly optionally restricts outlining to named parent
-// functions (comma list) — a bisection aid for isolating a
-// miscompiled extraction, not a supported build mode.
-func outlineOnly() map[string]bool {
-	v := os.Getenv("WASM2GO_OUTLINE_ONLY")
-	if v == "" {
-		return nil
-	}
-	m := map[string]bool{}
-	for _, n := range strings.Split(v, ",") {
-		if n = strings.TrimSpace(n); n != "" {
-			m[n] = true
-		}
-	}
-	return m
-}
+// extraction itself). Gated by Options.OutlineMinValues: 0 disables;
+// otherwise the minimum loop body size in SSA values.
 
 // maybeOutline extracts eligible loops of ssaFn, queueing the new
 // functions for emission next to their parent.
 func (t *translator) maybeOutline(ssaFn *ssa.Func) error {
-	min, on := outlineMinValues()
-	if !on {
-		return nil
-	}
-	if only := outlineOnly(); only != nil && !only[ssaFn.Name] {
+	min := t.opts.OutlineMinValues
+	if min <= 0 {
 		return nil
 	}
 	outs, err := ssa.OutlineLoops(ssaFn, func(h ssa.BlockID) string {

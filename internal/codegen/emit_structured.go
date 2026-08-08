@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"os"
-	"sort"
 
 	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -31,11 +29,6 @@ type loopInfo struct {
 	// follow is the single block control flows to on loop exit, or
 	// nil when the loop is left only by `return` from inside.
 	follow *ssa.Block
-	// exits holds the exit targets of a MULTI-exit loop (sorted by
-	// block ID; follow is nil then): each exiting branch sets a
-	// dispatch variable and breaks, and the emitter dispatches to the
-	// per-exit regions after the loop.
-	exits []*ssa.Block
 	// bad marks a loop the structured emitter cannot handle.
 	bad bool
 }
@@ -59,11 +52,6 @@ type loopFrame struct {
 	// it, so one loop header can be emitted more than once in a function, and
 	// two `for`s carrying the same label do not compile.
 	label string
-	// exitOf maps a MULTI-exit loop's exit targets to their dispatch
-	// indexes; exitVar is the dispatch variable a jump assigns before
-	// breaking. Nil/empty for single-exit loops.
-	exitOf  map[ssa.BlockID]int
-	exitVar string
 }
 
 // structEmitter holds the per-function state for structured emission.
@@ -142,30 +130,15 @@ func (em *ssaEmitter) emitStructured(f *ssa.Func) (body *ast.BlockStmt, ok bool)
 		nestCap: 200,
 	}
 	for _, li := range se.loops {
-		if len(li.exits) > 0 {
-			// Multi-exit support newly structures functions the goto
-			// path used to own; giant CFGs among them can balloon
-			// through forward-join duplication (a 2x module was
-			// measured). Keep them structured only when emission stays
-			// near the block count — the rest fall back to goto form,
-			// exactly as before.
-			se.dupCap = 2*len(f.Blocks) + 64
-			break
-		}
-	}
-	for _, li := range se.loops {
 		if li.bad {
-			structDebug(f, "multi-exit loop @b%d", int(li.header.ID))
 			return nil, false // multi-exit loop — let the goto path handle it
 		}
 	}
 	stmts, regionOK := se.region(f.Entry, nil)
 	if !regionOK {
-		structDebug(f, "region abort (dup/nest cap or unhandled shape)")
 		return nil, false
 	}
 	if len(se.emitted) != len(f.Blocks) {
-		structDebug(f, "join mis-identified: emitted %d of %d blocks", len(se.emitted), len(f.Blocks))
 		return nil, false // a join was mis-identified; output incomplete
 	}
 
@@ -206,16 +179,6 @@ func blocksReachingRet(f *ssa.Func) map[ssa.BlockID]bool {
 }
 
 // analyzeLoops computes the natural loop for every loop header.
-// structDebug reports structured-emission aborts when
-// WASM2GO_STRUCT_DEBUG is set — a diagnosis aid for CFG shapes that
-// unexpectedly fall back to the goto emitter.
-func structDebug(f *ssa.Func, format string, args ...interface{}) {
-	if os.Getenv("WASM2GO_STRUCT_DEBUG") == "" {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "wasm2go: structured abort %s: "+format+"\n", append([]interface{}{f.Name}, args...)...)
-}
-
 func analyzeLoops(f *ssa.Func) map[ssa.BlockID]*loopInfo {
 	loops := map[ssa.BlockID]*loopInfo{}
 	reachRet := blocksReachingRet(f)
@@ -269,21 +232,11 @@ func analyzeLoops(f *ssa.Func) map[ssa.BlockID]*loopInfo {
 				li.follow = b
 			}
 		default:
-			// Multi-exit structuring is correctness-proven (node
-			// byte-equality holds across the ~700 functions it
-			// restructures) but measurably SLOWER today: the
-			// newly-structured giants pay exit-dispatch branches and
-			// forward-join duplication that the goto form avoids.
-			// Opt-in until it is paired with something that profits
-			// from the structure (loop fusion inside those bodies).
-			if os.Getenv("WASM2GO_STRUCT_MULTIEXIT") == "" {
-				li.bad = true
-				break
-			}
-			for _, b := range exits {
-				li.exits = append(li.exits, b)
-			}
-			sort.Slice(li.exits, func(i, j int) bool { return li.exits[i].ID < li.exits[j].ID })
+			// Multi-exit loops are unstructurable here; the goto
+			// emitter owns them. (A dispatch-variable structuring was
+			// tried and measured slower: exit-dispatch branches plus
+			// forward-join duplication cost more than the goto form.)
+			li.bad = true
 		}
 	}
 	return loops
@@ -312,14 +265,6 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 		// Open a `for {}` when b heads a loop we are not already in.
 		if li := se.loops[b.ID]; li != nil && !se.insideLoop(b) {
 			fr := loopFrame{header: b, follow: li.follow, switchDepth: se.switchDepth}
-			if len(li.exits) > 0 {
-				fr.exitOf = map[ssa.BlockID]int{}
-				for i, x := range li.exits {
-					fr.exitOf[x.ID] = i
-				}
-				se.labelSeq++
-				fr.exitVar = fmt.Sprintf("wx%d", se.labelSeq)
-			}
 			se.ctx = append(se.ctx, fr)
 			forBody, ok := se.region(b, nil)
 			// Read the frame back before popping: jump() names the loop lazily,
@@ -333,56 +278,8 @@ func (se *structEmitter) region(b, stop *ssa.Block) ([]ast.Stmt, bool) {
 			if label != "" {
 				loop = &ast.LabeledStmt{Label: newID(label), Stmt: loop}
 			}
-			if len(li.exits) == 0 {
-				out = append(out, loop)
-				b = li.follow
-				continue
-			}
-			// Multi-exit: declare the dispatch variable, run the loop,
-			// then branch to the per-exit regions, which reconverge at
-			// the exits' common postdominator (nil when they only
-			// return — each arm then runs to completion).
-			out = append(out, &ast.AssignStmt{
-				Tok: token.DEFINE,
-				Lhs: []ast.Expr{newID(fr.exitVar)},
-				Rhs: []ast.Expr{intLit(0)},
-			})
 			out = append(out, loop)
-			join := se.commonPostdom(li.exits)
-			// Exhaustive if/else chain (the last arm is a bare else, so
-			// a result-bearing function does not need an unreachable
-			// trailing return when every arm returns).
-			var first *ast.IfStmt
-			var last *ast.IfStmt
-			for i := 0; i < len(li.exits); i++ {
-				arm, ok := se.region(li.exits[i], join)
-				if !ok {
-					return nil, false
-				}
-				if i == len(li.exits)-1 {
-					blk := &ast.BlockStmt{List: arm}
-					if last == nil {
-						out = append(out, arm...)
-					} else {
-						last.Else = blk
-					}
-					break
-				}
-				ifs := &ast.IfStmt{
-					Cond: &ast.BinaryExpr{X: newID(fr.exitVar), Op: token.EQL, Y: intLit(int64(i))},
-					Body: &ast.BlockStmt{List: arm},
-				}
-				if last == nil {
-					first = ifs
-				} else {
-					last.Else = ifs
-				}
-				last = ifs
-			}
-			if first != nil {
-				out = append(out, first)
-			}
-			b = join
+			b = li.follow
 			continue
 		}
 		// A block re-entered here is a shared FORWARD join: two branches (e.g.
@@ -625,27 +522,12 @@ func (se *structEmitter) frameLabel(fr *loopFrame) {
 	}
 }
 
-// frameBreak emits the break (plus the exit-dispatch assignment for a
-// multi-exit frame) when target is one of fr's exit destinations.
+// frameBreak emits the break when target is fr's exit destination.
 // forceLabel names the loop unconditionally (required for non-
 // innermost frames).
 func (se *structEmitter) frameBreak(fr *loopFrame, target *ssa.Block, forceLabel bool) ([]ast.Stmt, bool) {
 	var pre []ast.Stmt
-	switch {
-	case fr.follow != nil && target == fr.follow:
-	case fr.exitOf != nil:
-		i, ok := fr.exitOf[target.ID]
-		if !ok {
-			return nil, false
-		}
-		if i != 0 {
-			pre = append(pre, &ast.AssignStmt{
-				Tok: token.ASSIGN,
-				Lhs: []ast.Expr{newID(fr.exitVar)},
-				Rhs: []ast.Expr{intLit(int64(i))},
-			})
-		}
-	default:
+	if fr.follow == nil || target != fr.follow {
 		return nil, false
 	}
 	br := &ast.BranchStmt{Tok: token.BREAK}
@@ -783,50 +665,4 @@ func (se *structEmitter) decls() []ast.Stmt {
 		}
 	}
 	return out
-}
-
-// commonPostdom returns the nearest block every exit postdominates
-// into, or nil when the exits only converge at function exit.
-func (se *structEmitter) commonPostdom(exits []*ssa.Block) *ssa.Block {
-	chain := func(b *ssa.Block) []*ssa.Block {
-		var c []*ssa.Block
-		for x := se.postdom[b.ID]; x != nil; x = se.postdom[x.ID] {
-			c = append(c, x)
-		}
-		return c
-	}
-	if len(exits) == 0 {
-		return nil
-	}
-	base := chain(exits[0])
-	inBase := map[ssa.BlockID]int{}
-	for i, x := range base {
-		inBase[x.ID] = i
-	}
-	best := -1
-	for _, e := range exits[:0] {
-		_ = e
-	}
-	for _, e := range exits[1:] {
-		found := -1
-		for x := se.postdom[e.ID]; x != nil; x = se.postdom[x.ID] {
-			if i, ok := inBase[x.ID]; ok {
-				found = i
-				break
-			}
-		}
-		if found < 0 {
-			return nil
-		}
-		if found > best {
-			best = found
-		}
-	}
-	if best < 0 {
-		best = 0
-	}
-	if best >= len(base) {
-		return nil
-	}
-	return base[best]
 }

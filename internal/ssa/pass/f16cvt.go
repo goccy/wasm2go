@@ -4,72 +4,6 @@ import (
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
-// RecognizeF32ToF16 rewrites the software float32→float16 rounding
-// idiom (ggml's inlined fp32→fp16 conversion, the Giesen algorithm)
-// so the expensive arithmetic arm becomes one helper call that the
-// asm backend can lower to a native convert instruction.
-//
-// The wasm idiom arrives as two branch diamonds:
-//
-//	w     = i32_reinterpret_f32(f)
-//	shl1  = w << 1
-//	bias  = phi(0x71000000, shl1)          // shl1 <= 0x71000000 ?
-//	v     = i32_reinterpret_f32(
-//	          f32_abs(f)*0x1p+112*0x1p-110 +
-//	          f32_reinterpret_i32((bias>>1)&0x7F800000 + 0x07800000))
-//	nons  = phi(0x7E00,                    // 0xFF000000 < shl1 (NaN)
-//	            (v>>13)&0x7C00 + v&0xFFF)
-//	res   = nons | (w>>16)&0x8000
-//
-// Only the non-NaN phi arm is replaced — with
-// f32_to_f16_bits(f) & 0x7FFF — so the rewrite is bit-exact for
-// every input: non-NaN values get the hardware-identical conversion
-// (the helper and FCVT agree on all of them, denormals and infinity
-// included), and NaN keeps taking the untouched 0x7E00 arm, where
-// the helper's result is dead. The sign OR in the tail is untouched.
-// The orphaned arithmetic chain and the bias diamond die in DCE.
-func RecognizeF32ToF16(f *ssa.Func) bool {
-	changed := false
-	for _, b := range f.Blocks {
-		for _, v := range b.Values {
-			if v.Op != ssa.OpOr32 || len(v.Args) != 2 {
-				continue
-			}
-			for i := 0; i < 2; i++ {
-				phi, signChain := v.Args[i], v.Args[1-i]
-				if rewriteF16Phi(f, phi, signChain) {
-					changed = true
-					break
-				}
-			}
-		}
-	}
-	return changed
-}
-
-// rewriteF16Phi checks one Or32 operand pair (phi candidate + sign
-// chain) and performs the arm replacement when the whole idiom
-// matches. Conservative: any shape deviation means no rewrite.
-func rewriteF16Phi(f *ssa.Func, phi, signChain *ssa.Value) bool {
-	fv, ok := matchF16Idiom(phi, signChain)
-	if !ok {
-		return false
-	}
-	return rewriteF16NonNaNArm(f, phi, fv)
-}
-
-// matchF16Idiom checks one Or32 operand pair (phi candidate + sign
-// chain) against the software fp32->fp16 idiom and returns the f32
-// input value. Check-only: the f16 store vectorizer reuses it to
-// find whole converted lanes.
-func matchF16Idiom(phi, signChain *ssa.Value) (*ssa.Value, bool) {
-	fv, _, ok := matchF16IdiomBits(phi, signChain)
-	if !ok || fv == nil {
-		return nil, false
-	}
-	return fv, true
-}
-
 // matchF16IdiomBits is the general matcher: the sign chain's source w
 // is either i32_reinterpret_f32(f) — then fv = f — or the raw i32
 // bits value itself (the wasm commonly extracts float lanes as i32
@@ -187,38 +121,6 @@ func matchF16IdiomBits(phi, signChain *ssa.Value) (fvOut, wOut *ssa.Value, ok bo
 		return nil, nil, false
 	}
 	return fv, w, true
-}
-
-// rewriteF16NonNaNArm replaces the matched idiom's non-NaN arm with
-// f32_to_f16_bits(f)&0x7FFF, inserted right before the old arm value
-// so dominance holds.
-func rewriteF16NonNaNArm(f *ssa.Func, phi, fv *ssa.Value) bool {
-	nanIdx := -1
-	for i, a := range phi.Args {
-		if isConst32(a, 0x7E00) {
-			nanIdx = i
-		}
-	}
-	if nanIdx == -1 {
-		return false
-	}
-	nonsign := phi.Args[1-nanIdx]
-	nb := nonsign.Block
-	at := -1
-	for i, bv := range nb.Values {
-		if bv == nonsign {
-			at = i
-			break
-		}
-	}
-	if at == -1 {
-		return false
-	}
-	h := nb.NewValueBefore(f, at, ssa.OpHelperCall, ssa.TypeI32, 0, "f32_to_f16_bits", fv)
-	mask := nb.NewValueBefore(f, at+1, ssa.OpConst32, ssa.TypeI32, 0x7FFF, nil)
-	and := nb.NewValueBefore(f, at+2, ssa.OpAnd32, ssa.TypeI32, 0, nil, h, mask)
-	phi.Args[1-nanIdx] = and
-	return true
 }
 
 func isConstF32(v *ssa.Value, bits int64) bool {

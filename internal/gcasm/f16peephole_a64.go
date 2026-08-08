@@ -2,7 +2,6 @@ package gcasm
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -32,15 +31,6 @@ import (
 // This runs on the raw -S capture BEFORE the transform's main loop,
 // so branch offsets are still numeric and float constants still use
 // the $f32.<bits>(SB) spelling.
-
-// f16Debug enables near-miss reporting on stderr: candidates that
-// matched past the first float-constant anchor but failed later print
-// the failing step and instruction. Diagnostic aid only.
-var f16Debug = os.Getenv("WASM2GO_F16_DEBUG") != ""
-
-// f16Blocker records, under f16Debug, the instruction that defeated
-// the last deadness scan.
-var f16Blocker string
 
 var (
 	f16IntRegRe = regexp.MustCompile(`^R(?:[0-9]|1[0-9]|2[0-9]|30)$`)
@@ -90,9 +80,6 @@ func a64F16Peephole(insns []Insn, resolve func(string) ([]ArgKind, bool, ArgKind
 	replAt := map[int][]string{}
 	for _, s := range sites {
 		if !f16SiteSafe(insns, s, resolve, resultReg) {
-			if f16Debug {
-				fmt.Fprintf(os.Stderr, "f16-reject at +%d: unsafe (interleave, inbound branch, or scratch not provably dead)\n", insns[s.idxs[0]].Off)
-			}
 			continue
 		}
 		for _, idx := range s.idxs {
@@ -180,10 +167,6 @@ func a64F16Peephole(insns []Insn, resolve func(string) ([]ArgKind, bool, ArgKind
 			}
 		}
 		if !ledgerOK {
-			if f16Debug {
-				fmt.Fprintf(os.Stderr, "f16-reject at +%d: ledger %v w=%s s=%s a=%s x=%s n=%s r=%s res=%s tmp=%s\n",
-					insns[s.idxs[0]].Off, s.lastWrite, s.w, s.s, s.a, s.x, s.n, s.r, s.res, tmp)
-			}
 			for _, idx := range s.idxs {
 				delete(drop, idx)
 			}
@@ -248,13 +231,6 @@ func f16Match(insns []Insn, start int) (f16Site, bool) {
 	pos := start
 	steps := 0
 	fail := func(why string) (f16Site, bool) {
-		if f16Debug && steps > 1 {
-			got := ""
-			if pos-1 >= 0 && pos-1 < len(insns) {
-				got = insns[pos-1].Text
-			}
-			fmt.Fprintf(os.Stderr, "f16-miss at +%d: step %d (%s) got %q\n", insns[start].Off, steps, why, got)
-		}
 		return s, false
 	}
 	next := func() (string, bool) {
@@ -555,18 +531,12 @@ func f16SiteSafe(insns []Insn, s f16Site, resolve func(string) ([]ArgKind, bool,
 			continue
 		}
 		if !skippedOK[i] || !f16Skippable(t) {
-			if f16Debug {
-				fmt.Fprintf(os.Stderr, "f16-interleave at +%d: unexpected %q\n", insns[first].Off, t)
-			}
 			return false
 		}
 		// The kept interleaved instruction must not touch any bound
 		// register (whole-token match, both namespaces).
 		for reg := range bound {
 			if reads, writes, ok := f16RegRoles(t, reg); !ok || reads || writes {
-				if f16Debug {
-					fmt.Fprintf(os.Stderr, "f16-interleave at +%d: %q touches bound %s\n", insns[first].Off, t, reg)
-				}
 				return false
 			}
 		}
@@ -591,9 +561,6 @@ func f16SiteSafe(insns []Insn, s f16Site, resolve func(string) ([]ArgKind, bool,
 			continue
 		}
 		if !f16DeadAfter(insns, last, reg, resolve, resultReg) {
-			if f16Debug {
-				fmt.Fprintf(os.Stderr, "f16-unsafe at +%d: %s not provably dead (blocked by %q)\n", insns[first].Off, reg, f16Blocker)
-			}
 			return false
 		}
 	}
@@ -630,9 +597,6 @@ func f16DeadAfter(insns []Insn, from int, reg string, resolve func(string) ([]Ar
 			return false
 		}
 		t := insns[i].Text
-		if f16Debug {
-			f16Blocker = t
-		}
 		if t == "NOP" || strings.HasPrefix(t, "HINT\t") {
 			work = append(work, i+1)
 			continue
@@ -713,9 +677,6 @@ func f16DeadAfter(insns []Insn, from int, reg string, resolve func(string) ([]Ar
 						work = append(work, i+1)
 					}
 					continue
-				}
-				if f16Debug {
-					fmt.Fprintf(os.Stderr, "f16-target-miss: %q -> %d (next %q)\n", t, tgt, next)
 				}
 				return false
 			}

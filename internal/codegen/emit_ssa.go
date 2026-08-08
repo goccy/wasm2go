@@ -17,8 +17,6 @@ import (
 // single-package qualifier choice, etc).
 type ssaEmitter struct {
 	t *translator
-	// fuseDebugName labels WASM2GO_FUSE_DEBUG output.
-	fuseDebugName string
 	// packedPrologue, when set, holds the packed-boundary unpack
 	// statements of an outlined function; emitFuncBody prepends them
 	// BEFORE scalarization and clears the field.
@@ -189,7 +187,6 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 		body.List = append(append([]ast.Stmt{}, em.packedPrologue...), body.List...)
 		em.packedPrologue = nil
 	}
-	em.fuseDebugName = f.Name
 	em.scalarizeSimd(body, paramsV128)
 	return body, nil
 }

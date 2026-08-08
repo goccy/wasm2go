@@ -27,7 +27,6 @@ import (
 	"go/ast"
 	"go/printer"
 	"go/token"
-	"os"
 	"strings"
 	"sync/atomic"
 
@@ -50,9 +49,6 @@ func (fb *fusedTreeBuilder) chaseSplatFloat(e ast.Expr) (simdfuse.Arg, bool) {
 	snap := fb.snapshotChase()
 	idx, ok := fb.chaseF32(e)
 	if !ok {
-		if os.Getenv("WASM2GO_FUSE_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "wasm2go: chase failed on %s (interDef=%d)\n", exprDebugString(e), len(fb.interDef))
-		}
 		fb.restoreChase(snap)
 		return simdfuse.Arg{}, false
 	}
@@ -147,12 +143,10 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 		}
 		def, ok := fb.interDef[x.Name]
 		if !ok {
-			chaseTrace("no interdef", x)
 			return 0, false
 		}
 		idx, ok := fb.chaseF32(def.Rhs[0])
 		if !ok {
-			chaseTrace("f32 ident", x)
 			return 0, false
 		}
 		if fb.chaseUses == nil {
@@ -161,7 +155,6 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 		fb.chaseUses[x.Name]++
 		return idx, true
 	}
-	chaseTrace("f32 shape", e)
 	return 0, false
 }
 
@@ -219,7 +212,6 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		case token.SHL:
 			s, sok := matchShiftConst(x.Y, fb)
 			if !sok {
-				chaseTrace("shift const", x.Y)
 				return simdfuse.Arg{}, false
 			}
 			v, vok := fb.chaseI32(x.X)
@@ -367,13 +359,6 @@ func (fb *fusedTreeBuilder) noteChaseRead(e ast.Expr) {
 		}
 		return true
 	})
-}
-
-// chaseTrace reports a chase dead-end under WASM2GO_FUSE_DEBUG.
-func chaseTrace(where string, e ast.Expr) {
-	if os.Getenv("WASM2GO_FUSE_DEBUG") != "" {
-		fmt.Fprintf(os.Stderr, "wasm2go: chase dead-end at %s: %s\n", where, exprDebugString(e))
-	}
 }
 
 // helperName extracts the bare helper name from `F32_mul` or

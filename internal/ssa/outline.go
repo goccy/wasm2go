@@ -2,9 +2,7 @@ package ssa
 
 import (
 	"fmt"
-	"os"
 	"sort"
-	"strconv"
 )
 
 // Loop outlining.
@@ -52,17 +50,7 @@ type OutlinedFunc struct {
 const outlinePackedMax = 128
 
 // outlineV128MinBody is the minimum body size for a v128-boundary loop.
-// WASM2GO_OUTLINE_V128MIN overrides it (measurement knob).
 const outlineV128MinBody = 600
-
-func outlineV128Min() int {
-	if v := os.Getenv("WASM2GO_OUTLINE_V128MIN"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return outlineV128MinBody
-}
 
 // outlineMaxShare rejects a body covering most of the function (the
 // giant driver loop): outlining it would just move the problem, and
@@ -70,17 +58,7 @@ func outlineV128Min() int {
 // never re-scanned. Measured on the llama module: extracting drained
 // drivers (rejecting them only while a nested eligible loop remained)
 // was a consistent ~0.6% tg regression, so the hard cap stays.
-// WASM2GO_OUTLINE_SHARE overrides the cap (measurement knob).
 const outlineMaxShare = 0.8
-
-func outlineShareCap() float64 {
-	if v := os.Getenv("WASM2GO_OUTLINE_SHARE"); v != "" {
-		if x, err := strconv.ParseFloat(v, 64); err == nil && x > 0 && x <= 1 {
-			return x
-		}
-	}
-	return outlineMaxShare
-}
 
 // OutlineLoops extracts eligible loops of at least minValues values
 // from f. name generates the extracted function's name from the loop
@@ -98,20 +76,11 @@ func OutlineLoops(f *Func, name func(header BlockID) string, minValues int) ([]O
 	if total < minValues {
 		return nil, nil
 	}
-	// WASM2GO_OUTLINE_LIMIT caps extractions per function — a
-	// bisection aid for isolating a miscompiled extraction, not a
-	// supported build mode.
-	limit := -1
-	if v := os.Getenv("WASM2GO_OUTLINE_LIMIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			limit = n
-		}
-	}
 	var out []OutlinedFunc
 	taken := map[BlockID]bool{} // blocks already extracted (stale IDs guarded by re-detection)
 	// Re-detect after each extraction: the surgery invalidates block
 	// sets, and one extraction can make an enclosing loop eligible.
-	for limit < 0 || len(out) < limit {
+	for {
 		cand := findOutlineCandidate(f, minValues, taken)
 		if cand == nil {
 			break
@@ -230,11 +199,9 @@ func findOutlineCandidate(f *Func, minValues int, taken map[BlockID]bool) *outli
 			n += len(blockOf[id].Values)
 		}
 		if n < minValues {
-			outlineDebugf(f, headers[hid], n, "size gate: %d values (min %d)", n, minValues)
 			continue
 		}
-		if float64(n) > outlineShareCap()*float64(total) {
-			outlineDebugf(f, headers[hid], n, "share gate: %d values > %.0f%% of %d", n, outlineShareCap()*100, total)
+		if float64(n) > outlineMaxShare*float64(total) {
 			continue
 		}
 		c := checkOutlineCand(f, headers[hid], body, minValues, dominates)
@@ -256,25 +223,12 @@ func findOutlineCandidate(f *Func, minValues int, taken map[BlockID]bool) *outli
 	return best
 }
 
-// outlineDebugTarget names a function whose candidate rejections are
-// reported on stderr ("1" matches every function). Diagnostic aid for
-// answering "why was this loop not outlined", not a build mode.
-var outlineDebugTarget = os.Getenv("WASM2GO_OUTLINE_DEBUG")
-
-func outlineDebugf(f *Func, h *Block, nBody int, format string, args ...any) {
-	if outlineDebugTarget == "" || (outlineDebugTarget != "1" && outlineDebugTarget != f.Name) {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "outline-reject %s L%d (values=%d): %s\n", f.Name, h.ID, nBody, fmt.Sprintf(format, args...))
-}
-
 // checkOutlineCand tests eligibility and computes the boundary. Size
 // and share policy live in findOutlineCandidate; this checks only the
 // boundary shape.
 func checkOutlineCand(f *Func, h *Block, body map[BlockID]bool, minValues int, dominates func(a, b *Block) bool) *outlineCand {
 	c := &outlineCand{header: h, body: body}
 	reject := func(format string, args ...any) *outlineCand {
-		outlineDebugf(f, h, c.nBody, format, args...)
 		return nil
 	}
 	blockOf := map[BlockID]*Block{}
@@ -402,8 +356,8 @@ func checkOutlineCand(f *Func, h *Block, body map[BlockID]bool, minValues int, d
 			ints++
 		}
 	}
-	if vecs > 0 && c.nBody < outlineV128Min() {
-		return reject("v128 boundary needs %d+ values to amortize (have %d)", outlineV128Min(), c.nBody)
+	if vecs > 0 && c.nBody < outlineV128MinBody {
+		return reject("v128 boundary needs %d+ values to amortize (have %d)", outlineV128MinBody, c.nBody)
 	}
 	if ints > outlineIntArgBudget || floats > outlineFloatArgBudget || vecs > 0 {
 		if ints+floats+2*vecs > outlinePackedMax {

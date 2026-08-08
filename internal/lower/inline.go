@@ -2,9 +2,6 @@ package lower
 
 import (
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -43,60 +40,22 @@ import (
 //   - ≤1 result (same limit as handleCall);
 //   - size caps, all env-tunable for experiments (see below).
 
-// inline policy knobs. Defaults chosen from the SpiderMonkey cpubench
-// hot set (Fn1466: ~60 B × 36 sites; Fn2120: ~1 KiB × 16 sites).
-var (
-	// WASM2GO_INLINE=off disables the inliner entirely.
-	inlineOff = os.Getenv("WASM2GO_INLINE") == "off"
+// inline policy caps. Chosen from the SpiderMonkey cpubench hot set
+// (Fn1466: ~60 B x 36 sites; Fn2120: ~1 KiB x 16 sites).
+const (
 	// Max callee body size in wasm bytes.
-	inlineMaxBody = envInt("WASM2GO_INLINE_MAXBODY", 4096)
-	// Max bodyBytes × staticCallSites product: bounds the total code
+	inlineMaxBody = 4096
+	// Max bodyBytes x staticCallSites product: bounds the total code
 	// growth any single callee can cause module-wide.
-	inlineMaxProduct = envInt("WASM2GO_INLINE_MAXPRODUCT", 131072)
+	inlineMaxProduct = 131072
 	// Max total wasm bytes inlined into one caller.
-	inlineCallerBudget = envInt("WASM2GO_INLINE_CALLER_BUDGET", 65536)
-	// Bisection gate (mirrors WASM2GO_SSA_MINFUNC/MAXFUNC): inlining
-	// only happens in CALLERS whose absolute funcIdx is in
-	// [MINFN, MAXFN). MAXFN < 0 means no upper bound. Diagnostic only.
-	inlineMinFn = envInt("WASM2GO_INLINE_MINFN", 0)
-	inlineMaxFn = envInt("WASM2GO_INLINE_MAXFN", -1)
-	// WASM2GO_INLINE_ONLY_CALLEES: comma-separated absolute callee
-	// funcIdx allowlist — when non-empty only these callees inline.
-	// Diagnostic only (callee-level bisection).
-	inlineOnlyCallees = envIdxSet("WASM2GO_INLINE_ONLY_CALLEES")
+	inlineCallerBudget = 65536
+	// Non-leaf callees qualify only when SMALL (the expf/erf class of
+	// math kernels with cold error-path calls) — opening this wider
+	// inflates module-wide code growth and compile time out of
+	// proportion.
+	inlineNonLeafMaxBody = 512
 )
-
-func envIdxSet(name string) map[uint32]bool {
-	v := os.Getenv(name)
-	if v == "" {
-		return nil
-	}
-	out := map[uint32]bool{}
-	for _, part := range strings.Split(v, ",") {
-		// ParseUint with bitSize 32 both rejects negatives and bounds
-		// the value to uint32, so the conversion below cannot truncate.
-		n, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "wasm2go: invalid %s entry %q: %v\n", name, part, err)
-			continue
-		}
-		out[uint32(n)] = true
-	}
-	return out
-}
-
-func envInt(name string, def int) int {
-	v := os.Getenv(name)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "wasm2go: invalid %s=%q (using default %d): %v\n", name, v, def, err)
-		return def
-	}
-	return n
-}
 
 // fnInlineInfo is the per-defined-function summary the inline decision
 // consults. Keyed by ABSOLUTE function index (imports first).
@@ -205,19 +164,10 @@ func scanBodyForInline(body []byte, a *inlineAnalysis, info *fnInlineInfo) error
 // shouldInline reports whether the direct call to funcIdx should be
 // inlined at this call site.
 func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
-	if inlineOff {
-		return false
-	}
 	// Depth 1 only: a call inside an inline frame stays a call. This
 	// is what makes non-leaf inlining terminate — without it, two
 	// small functions calling each other expand forever.
 	if len(ls.inlineFrames) > 0 {
-		return false
-	}
-	if int(ls.callerIdx) < inlineMinFn || (inlineMaxFn >= 0 && int(ls.callerIdx) >= inlineMaxFn) {
-		return false
-	}
-	if inlineOnlyCallees != nil && !inlineOnlyCallees[funcIdx] {
 		return false
 	}
 	if funcIdx < ls.mod.NumImportedFuncs {
@@ -229,9 +179,6 @@ func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
 	// Refusing such callees also keeps the check-and-branch out of spliced
 	// bodies entirely.
 	if ls.mayThrowCall(funcIdx) {
-		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: may throw\n", funcIdx)
-		}
 		return false
 	}
 	if len(ft.Results) > 1 {
@@ -242,9 +189,6 @@ func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
 	}
 	info, ok := ls.inlineInfo.fns[funcIdx]
 	if !ok || info.hasTry {
-		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: ok=%v hasTry=%v\n", funcIdx, ok, ok && info.hasTry)
-		}
 		return false
 	}
 	// A non-leaf body may inline when every inner call is direct,
@@ -257,34 +201,22 @@ func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
 		// (the expf/erf class of math kernels with cold error-path
 		// calls) qualify — opening it wider inflates module-wide
 		// code growth and compile time out of proportion.
-		if info.bodyBytes > envInt("WASM2GO_INLINE_NONLEAF_MAXBODY", 512) {
+		if info.bodyBytes > inlineNonLeafMaxBody {
 			return false
 		}
 		if info.hasIndirect {
-			if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
-				fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: indirect call inside\n", funcIdx)
-			}
 			return false
 		}
 		for _, c := range info.innerCalls {
 			if c < ls.mod.NumImportedFuncs || ls.mayThrowCall(c) {
-				if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
-					fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: inner call fn%d import/throwing\n", funcIdx, c)
-				}
 				return false
 			}
 		}
 	}
 	if info.bodyBytes > inlineMaxBody {
-		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: body %d\n", funcIdx, info.bodyBytes)
-		}
 		return false
 	}
 	if info.bodyBytes*info.sites > inlineMaxProduct {
-		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: product %d\n", funcIdx, info.bodyBytes*info.sites)
-		}
 		return false
 	}
 	if ls.inlinedBytes+info.bodyBytes > inlineCallerBudget {

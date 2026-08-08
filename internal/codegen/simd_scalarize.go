@@ -30,7 +30,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
-	"os"
 )
 
 // pairName returns the identifier of the high half of a scalarized
@@ -93,9 +92,7 @@ func (em *ssaEmitter) scalarizeSimd(body *ast.BlockStmt, paramsV128 map[string]b
 	sc := &simdScalarizer{em: em, pairs: map[string]bool{}, arrays: map[string]bool{}}
 	sc.identCount = countSemanticIdents(body)
 	sc.readCount, sc.carryLoopReads = countCarryLoopReads(body)
-	if os.Getenv("WASM2GO_NO_CONSTBIND") == "" {
-		sc.constBind = collectConstBindings(body)
-	}
+	sc.constBind = collectConstBindings(body)
 	sc.collect(body)
 	sc.audit(body)
 	body.List = sc.rewriteStmts(body.List)

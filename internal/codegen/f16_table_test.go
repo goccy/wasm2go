@@ -134,7 +134,7 @@ func TestHasIEEEF16TableAt(t *testing.T) {
 	}
 }
 
-func TestF16TableOKCacheAndEnvAssertion(t *testing.T) {
+func TestF16TableOKCacheAndAssertion(t *testing.T) {
 	const base = 8192
 	tr := &translator{mod: &wasm.Module{Datas: []wasm.DataSegment{
 		{Offset: i32ConstExpr(base), Bytes: ieeeF16TableBytes()},
@@ -151,8 +151,7 @@ func TestF16TableOKCacheAndEnvAssertion(t *testing.T) {
 
 	// The integrator assertion admits a runtime-built table at exactly
 	// the asserted base, nothing else.
-	t.Setenv("WASM2GO_F16_TABLE", "9013200")
-	tr = &translator{mod: &wasm.Module{}}
+	tr = &translator{mod: &wasm.Module{}, opts: Options{F16TableAddr: 9013200}}
 	if !tr.f16TableOK(9013200) {
 		t.Fatal("asserted base rejected")
 	}
@@ -164,25 +163,24 @@ func TestF16TableOKCacheAndEnvAssertion(t *testing.T) {
 func TestStaleF16TableMsg(t *testing.T) {
 	queried := map[uint32]bool{9013200: true, 4096: false}
 	for _, tc := range []struct {
-		env    string
+		addr   uint32
 		tables map[uint32]bool
 		warn   bool
 	}{
-		{"", nil, false},                // unset: nothing to check
-		{"9013200", queried, false},     // queried (and matched)
-		{"4096", queried, false},        // queried, even if unverified
-		{"9013472", queried, true},      // never queried: stale
-		{"not-a-number", queried, true}, // unparseable
-		{"9013472", nil, true},          // no gather sites at all
+		{0, nil, false},           // unset: nothing to check
+		{9013200, queried, false}, // queried (and matched)
+		{4096, queried, false},    // queried, even if unverified
+		{9013472, queried, true},  // never queried: stale
+		{9013472, nil, true},      // no gather sites at all
 	} {
-		msg := staleF16TableMsg(tc.env, tc.tables)
+		msg := staleF16TableMsg(tc.addr, tc.tables)
 		if got := msg != ""; got != tc.warn {
-			t.Errorf("staleF16TableMsg(%q): warn=%v, want %v (msg %q)", tc.env, got, tc.warn, msg)
+			t.Errorf("staleF16TableMsg(%d): warn=%v, want %v (msg %q)", tc.addr, got, tc.warn, msg)
 		}
 	}
 	// The stale warning names the unverified bases so the integrator
 	// can re-point the assertion.
-	if msg := staleF16TableMsg("9013472", queried); !strings.Contains(msg, "4096") {
+	if msg := staleF16TableMsg(9013472, queried); !strings.Contains(msg, "4096") {
 		t.Errorf("stale message should list unverified candidate bases: %q", msg)
 	}
 }

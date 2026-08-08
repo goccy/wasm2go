@@ -106,15 +106,6 @@ func TestScanGgmlNrc2Rejections(t *testing.T) {
 	}
 }
 
-func TestScanGgmlNrc2KillSwitch(t *testing.T) {
-	t.Setenv("WASM2GO_NO_NRC2", "1")
-	tr := &translator{mod: nrc2TestModule(t, nil)}
-	tr.scanGgmlNrc2()
-	if tr.nrc2 != nil {
-		t.Fatal("kill switch ignored")
-	}
-}
-
 func TestScanGgmlNrc2WrongSignature(t *testing.T) {
 	m := nrc2TestModule(t, nil)
 	m.Types = append(m.Types, wasm.FuncType{Params: []wasm.ValType{wasm.ValI32}})

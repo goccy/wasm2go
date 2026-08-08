@@ -4,43 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
-
-// ssaDebug is true when WASM2GO_SSA_DEBUG is set in the environment.
-// When on, LowerFunction prints the constructed IR to stderr — the
-// primary tool for debugging multi-block lowering correctness.
-var ssaDebug = os.Getenv("WASM2GO_SSA_DEBUG") != ""
-
-// ssaMaxFunc, when set via WASM2GO_SSA_MAXFUNC, caps which function
-// indices are eligible for SSA lowering: a function with funcIdx >=
-// ssaMaxFunc returns ErrSSAUnsupported and Translate fails the build.
-// This is the bisection knob for hunting behavioural lowering bugs —
-// set it to the midpoint, rebuild, and see whether the failure
-// persists. A value of -1 (the default / unset) means "no cap".
-var ssaMaxFunc = parseEnvInt("WASM2GO_SSA_MAXFUNC", -1)
-
-// ssaMinFunc is the lower bound counterpart of ssaMaxFunc. Together
-// they restrict SSA lowering to funcIdx in [ssaMinFunc, ssaMaxFunc).
-var ssaMinFunc = parseEnvInt("WASM2GO_SSA_MINFUNC", 0)
-
-// parseEnvInt reads an integer env var, returning def when unset or
-// unparseable.
-func parseEnvInt(name string, def int) int {
-	s := os.Getenv(name)
-	if s == "" {
-		return def
-	}
-	var v int
-	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
-		return def
-	}
-	return v
-}
 
 // ssaFuncString re-exports ssa.FuncString without forcing test files
 // to import the internal/ssa package.
@@ -75,17 +43,6 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string, throwSet *Thro
 		}
 	}()
 
-	// Bisection gate (WASM2GO_SSA_MINFUNC / WASM2GO_SSA_MAXFUNC):
-	// restrict SSA lowering to a funcIdx window so a behavioural bug
-	// can be binary-searched. Outside the window we deliberately fail
-	// — Translate aborts with the unsupported error, which is exactly
-	// what the bisection caller is looking for.
-	if int(funcIdx) < ssaMinFunc {
-		return nil, fmt.Errorf("%w: fn%d below SSA bisection window", ErrSSAUnsupported, funcIdx)
-	}
-	if ssaMaxFunc >= 0 && int(funcIdx) >= ssaMaxFunc {
-		return nil, fmt.Errorf("%w: fn%d above SSA bisection window", ErrSSAUnsupported, funcIdx)
-	}
 	localIdx := funcIdx - mod.NumImportedFuncs
 	fn := mod.Functions[localIdx]
 	ft := mod.Types[fn.TypeIdx]
@@ -154,19 +111,11 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string, throwSet *Thro
 	// through. Done before verification so they don't trip the
 	// reachability / terminator checks.
 	ssa.PruneDeadBlocks(b.Func())
-	if ssaDebug {
-		fmt.Fprintf(os.Stderr, "=== SSA IR for fn%d (%s) ===\n%s\n", funcIdx, name, ssa.FuncString(b.Func()))
-	}
 	// Structural verification: a malformed CFG (mismatched edges, bad
 	// phi arity, unreachable block, ...) is a lowering bug. Surface it
 	// as ErrSSAUnsupported so Translate aborts with a clear error
-	// instead of emitting wrong Go. With WASM2GO_SSA_DEBUG set, the
-	// offending IR is also dumped.
+	// instead of emitting wrong Go.
 	if err := ssa.Verify(b.Func()); err != nil {
-		if ssaDebug {
-			fmt.Fprintf(os.Stderr, "=== VERIFY FAILED fn%d (%s): %v ===\n%s\n",
-				funcIdx, name, err, ssa.FuncString(b.Func()))
-		}
 		return nil, fmt.Errorf("%w: verify fn%d: %w", ErrSSAUnsupported, funcIdx, err)
 	}
 	return b.Func(), nil

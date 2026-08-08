@@ -66,12 +66,6 @@ func captureArch(pkgDir, pkgPath, arch string) ([]*Fn, []*DataSym, error) {
 	cmd.Env = append(os.Environ(), "GOARCH="+arch)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		if dump := os.Getenv("WASM2GO_CAPTURE_RAWERR"); dump != "" {
-			name := dump + "-" + strings.ReplaceAll(pkgPath, "/", "_") + "-" + arch + ".log"
-			if werr := os.WriteFile(name, out, 0o644); werr != nil {
-				fmt.Fprintf(os.Stderr, "wasm2go: capture dump %s: %v\n", name, werr)
-			}
-		}
 		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, diagnostics(out))
 	}
 	return ParseListing(string(out))
@@ -211,9 +205,6 @@ func diagnostics(b []byte) string {
 		}
 	}
 	out := strings.Join(diag, "\n")
-	if os.Getenv("WASM2GO_CAPTURE_RAWERR") != "" {
-		return out + "\n---raw tail---\n" + clip(b[max(0, len(b)-4000):])
-	}
 	if out == "" {
 		// Nothing error-shaped: fall back to the raw tail rather than hiding
 		// everything.

@@ -45,7 +45,6 @@ func RecognizeF16Store(f *ssa.Func) bool {
 			}
 			or := v.Args[1]
 			if or.Op != ssa.OpOr32 || len(or.Args) != 2 || uses[or] != 1 {
-				f16dbg("store16 value: %s uses=%d", or.Op, uses[or])
 				continue
 			}
 			var fv, w *ssa.Value
@@ -56,7 +55,6 @@ func RecognizeF16Store(f *ssa.Func) bool {
 				}
 			}
 			if w == nil {
-				f16dbg("or32 idiom no-match: [%s | %s]", or.Args[0].Op, or.Args[1].Op)
 				continue
 			}
 			// The lane arrives as an f32 extract, an i32 bits extract
@@ -72,11 +70,9 @@ func RecognizeF16Store(f *ssa.Func) bool {
 				}
 			}
 			if ex.Op != ssa.OpSimdCall || len(ex.Args) != 2 {
-				f16dbg("fv not extract call: %s aux=%v args=%d", ex.Op, ex.Aux, len(ex.Args))
 				continue
 			}
 			if n, _ := ex.Aux.(string); n != "simd_f32x4_extract_lane" && n != "simd_i32x4_extract_lane" {
-				f16dbg("fv helper name: %q", n)
 				continue
 			}
 			fv = ex
@@ -147,7 +143,6 @@ func RecognizeF16Store(f *ssa.Func) bool {
 			}
 		}
 		if !ok || anchor == -1 {
-			f16dbg("store group incomplete or no dominating anchor")
 			continue
 		}
 		b, first := g[anchor].blk, g[anchor].idx
@@ -278,7 +273,6 @@ func mergeF16StoreGroup(g *[4]lane16, bits *ssa.Value) bool {
 	for k := 1; k < 4; k++ {
 		r, o := f16StoreAddr(g[k].store)
 		if r != root0 || o != off0+int64(2*k) {
-			f16dbg("store merge: lane %d addr root=%v off=%d vs lane0 root=%v off=%d", k, r, o, root0, off0)
 			return false
 		}
 	}
@@ -322,7 +316,6 @@ func mergeF16StoreGroup(g *[4]lane16, bits *ssa.Value) bool {
 				}
 				if f16MemLike(v, nil, nil) {
 					if seen > 0 {
-						f16dbg("store merge: intervening %s after %d/4 stores", v.Op, seen)
 						return false
 					}
 					bail = true
@@ -341,7 +334,6 @@ func mergeF16StoreGroup(g *[4]lane16, bits *ssa.Value) bool {
 			cur, i = cur.Succs[0].Block, 0
 		}
 	}
-	f16dbg("store merge: no straight-line order found")
 	return false
 }
 

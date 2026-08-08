@@ -66,7 +66,7 @@ type SynthSig struct {
 	Packed bool
 }
 
-func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string, fused map[string]*simdfuse.Tree, fusedLoops map[string]*simdfuse.Loop, outlined map[string][]string, synth map[string]SynthSig, nrc2 *Nrc2Spec) (map[string][]byte, *BuildStats, error) {
+func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string, fused map[string]*simdfuse.Tree, fusedLoops map[string]*simdfuse.Loop, outlined map[string][]string, synth map[string]SynthSig, nrc2 *Nrc2Spec, cfg Config) (map[string][]byte, *BuildStats, error) {
 	all := map[string][]byte{}
 	if len(mainSrc) > 0 {
 		all["gen.go"] = mainSrc
@@ -78,18 +78,10 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 
 	// Capture tree.
 	dir, err := os.MkdirTemp("", "gcasm-capture-*")
-	if os.Getenv("WASM2GO_KEEP_CAPTURE") != "" {
-		// Debug aid: keep the capture tree (and print where it is) so a
-		// generated-code compile error can be inspected in place.
-		fmt.Fprintf(os.Stderr, "wasm2go: keeping capture tree at %s\n", dir)
-	}
 	if err != nil {
 		return nil, nil, err
 	}
 	defer func() {
-		if os.Getenv("WASM2GO_KEEP_CAPTURE") != "" {
-			return
-		}
 		if rerr := os.RemoveAll(dir); rerr != nil {
 			// Best-effort temp cleanup; the OS reaps the rest.
 			_ = rerr
@@ -166,16 +158,6 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		}
 		return
 	}
-	// GCASM_FALLBACK_RANGE=lo-hi forces fn indices in [lo,hi) to the
-	// pure fallback - a debugging knob for bisecting a miscompiled
-	// function by halving the transformed set (fallback is fully
-	// transparent to callers).
-	bisectLo, bisectHi := -1, -1
-	if r := os.Getenv("GCASM_FALLBACK_RANGE"); r != "" {
-		if _, err := fmt.Sscanf(r, "%d-%d", &bisectLo, &bisectHi); err != nil {
-			return nil, nil, fmt.Errorf("bad GCASM_FALLBACK_RANGE %q: %w", r, err)
-		}
-	}
 	// DUFFZERO/DUFFCOPY functions fall back to pure (see errUnsupportedDuff).
 	// Whether gc emits a duff sequence is toolchain- AND arch-dependent, so
 	// take the UNION across every captured arch — a function that duffs on
@@ -202,9 +184,6 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	}
 	isFallbackSig := func(idx uint32) bool {
 		if duffIdx[idx] {
-			return true
-		}
-		if bisectLo >= 0 && int(idx) >= bisectLo && int(idx) < bisectHi {
 			return true
 		}
 		ft := mod.FuncTypeOf(idx)
@@ -267,6 +246,9 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		// capture — a module with no SIMD) keeps memory ops on the
 		// marshalled path.
 		modOffs := FindModuleOffsets(ac.fns, spec.name)
+		if modOffs != nil {
+			modOffs.Cfg = cfg
+		}
 		for _, rel := range pkgList {
 			pfns := ac.byPkg[rel]
 			if len(pfns) == 0 {
@@ -815,7 +797,7 @@ func buildPkg(
 			// FEATURE body's companion call goes to the native 2x2
 			// SMMLA tile kernel; the portable twin and every other
 			// backend keep the bit-exact Go companion.
-			if nrc2 != nil && name == nrc2.VecDot && arch.name == "arm64" && a64FastMath() {
+			if nrc2 != nil && name == nrc2.VecDot && arch.name == "arm64" && modOffs != nil && modOffs.Cfg.FastMath {
 				fastSym := nrc2.Companion + "fast"
 				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
 				if retargeted == featBody {
