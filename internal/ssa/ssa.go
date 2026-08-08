@@ -75,6 +75,12 @@ type TryRegion struct {
 	// consumers treat it purely as a membership set.
 	Body []*Block
 
+	// Dispatch is the block the protected body's check-and-branches target
+	// when an exception arrives: it clears the pending flag, reads the tag
+	// and runs the clause chain. Nil for regions built by hand-written
+	// tests that predate the branch-based lowering.
+	Dispatch *Block
+
 	// Delegate marks a `try ... delegate l` region: it has no handlers and
 	// forwards any exception thrown in its body to DelegateTarget's catching
 	// context, skipping every try nested between the two. A nil
@@ -136,6 +142,26 @@ func (f *Func) newValue(op Op, typ Type, args []*Value, block *Block, auxInt int
 	}
 	f.nextValueID++
 	f.Values = append(f.Values, v)
+	return v
+}
+
+// NewValueBefore allocates a value and inserts it into b.Values
+// immediately before the value at index idx (append when idx is past
+// the end). Optimization passes use it to materialise new work — e.g.
+// a coalesced bounds check — at a precise point in the block's
+// execution order.
+func (b *Block) NewValueBefore(f *Func, idx int, op Op, typ Type, auxInt int64, aux interface{}, args ...*Value) *Value {
+	v := f.newValue(op, typ, args, b, auxInt, aux)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(b.Values) {
+		b.Values = append(b.Values, v)
+		return v
+	}
+	b.Values = append(b.Values, nil)
+	copy(b.Values[idx+1:], b.Values[idx:])
+	b.Values[idx] = v
 	return v
 }
 

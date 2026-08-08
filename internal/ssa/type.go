@@ -13,6 +13,7 @@ const (
 	TypeMem          // memory state token (threading load/store dependencies)
 	TypeBool         // boolean (only result of comparison ops; lowers to i32 at emit time)
 	TypeTuple        // multi-value return from a call; accessed via OpSelect{0,1,...}
+	TypeV128         // wasm v128 (SIMD); lowers to [2]uint64 at emit time
 )
 
 // String renders the canonical short type name used in IR dumps.
@@ -34,6 +35,8 @@ func (t Type) String() string {
 		return "bool"
 	case TypeTuple:
 		return "tuple"
+	case TypeV128:
+		return "v128"
 	}
 	return "<?>"
 }

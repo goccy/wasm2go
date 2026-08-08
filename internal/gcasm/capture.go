@@ -66,6 +66,12 @@ func captureArch(pkgDir, pkgPath, arch string) ([]*Fn, []*DataSym, error) {
 	cmd.Env = append(os.Environ(), "GOARCH="+arch)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if dump := os.Getenv("WASM2GO_CAPTURE_RAWERR"); dump != "" {
+			name := dump + "-" + strings.ReplaceAll(pkgPath, "/", "_") + "-" + arch + ".log"
+			if werr := os.WriteFile(name, out, 0o644); werr != nil {
+				fmt.Fprintf(os.Stderr, "wasm2go: capture dump %s: %v\n", name, werr)
+			}
+		}
 		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, diagnostics(out))
 	}
 	return ParseListing(string(out))
@@ -197,11 +203,17 @@ func diagnostics(b []byte) string {
 		case strings.HasPrefix(ln, "# "),
 			strings.HasPrefix(ln, "go: "),
 			strings.HasPrefix(ln, "go build"),
+			strings.HasPrefix(ln, "compile: "),
+			strings.HasPrefix(ln, "asm: "),
+			strings.HasPrefix(ln, "link: "),
 			errLine.MatchString(ln):
 			diag = append(diag, ln)
 		}
 	}
 	out := strings.Join(diag, "\n")
+	if os.Getenv("WASM2GO_CAPTURE_RAWERR") != "" {
+		return out + "\n---raw tail---\n" + clip(b[max(0, len(b)-4000):])
+	}
 	if out == "" {
 		// Nothing error-shaped: fall back to the raw tail rather than hiding
 		// everything.
@@ -228,6 +240,23 @@ func clip(b []byte) string {
 // arches are dropped; the pure-guard build tag is stripped. Files
 // without a build tag (go.mod, sidecar binaries, shared sources)
 // pass through unchanged.
+// buildDirective returns the //go:build line found before the package
+// clause, plus its byte offset ("" if none).
+func buildDirective(src string) (string, int) {
+	off := 0
+	for _, line := range strings.SplitAfter(src, "\n") {
+		trimmed := strings.TrimRight(line, "\n")
+		if strings.HasPrefix(trimmed, "//go:build") {
+			return trimmed, off
+		}
+		if strings.HasPrefix(trimmed, "package ") {
+			return "", 0
+		}
+		off += len(line)
+	}
+	return "", 0
+}
+
 func PureFilter(files map[string][]byte) map[string][]byte {
 	out := make(map[string][]byte, len(files))
 	for name, data := range files {
@@ -235,22 +264,24 @@ func PureFilter(files map[string][]byte) map[string][]byte {
 			continue
 		}
 		s := string(data)
-		if strings.HasPrefix(s, "//go:build") {
-			line := s
-			if idx := strings.Index(s, "\n"); idx >= 0 {
-				line = s[:idx]
-			}
+		// The build directive may sit below a generated-file header
+		// comment, so scan the pre-package header for it rather than
+		// only the first line.
+		if line, at := buildDirective(s); line != "" {
 			expr := strings.TrimSpace(strings.TrimPrefix(line, "//go:build"))
 			switch {
-			case strings.Contains(expr, "!amd64"):
-				// Pure body: strip the guard (plus the blank line
-				// conventionally following it).
-				rest := s[len(line):]
+			case strings.Contains(expr, "!amd64") || strings.Contains(expr, "!arm64"):
+				// Pure body (or an arch-fallback alias set like the SIMD
+				// helpers' simd_fallback.go): strip the guard (plus the
+				// blank line conventionally following it) so the capture
+				// tree compiles it on every arch.
+				rest := s[at+len(line):]
 				rest = strings.TrimPrefix(rest, "\n")
 				rest = strings.TrimPrefix(rest, "\n")
-				s = rest
-			case strings.Contains(expr, "amd64"):
-				// Asm-mode-only source (decls, aliases).
+				s = s[:at] + rest
+			case strings.Contains(expr, "amd64") || strings.Contains(expr, "arm64"):
+				// Asm-mode-only source (decls, aliases): its bodies live
+				// in .s files, which the pure capture tree drops.
 				continue
 			}
 		}
@@ -262,6 +293,17 @@ func PureFilter(files map[string][]byte) map[string][]byte {
 			// express. As out-of-line calls they are zero-argument and
 			// ABI-agnostic.
 			s = strings.ReplaceAll(s, "\nfunc wasm_trap_", "\n//go:noinline\nfunc wasm_trap_")
+			// The SIMD fallback aliases (`func simd_x(...) { return
+			// simd_x_scalar(...) }`) exist only so the capture tree — which
+			// has no .s files — compiles. Inlined, they make captured
+			// bodies CALL the _scalar symbol, which the shipped asm arches
+			// do not define (their scalar reference is tagged out). Keeping
+			// them out of line means the captured call names the real entry
+			// point, which the shipped tree provides as assembly.
+			if strings.Contains(name, "simd_fallback.go") {
+				s = strings.ReplaceAll(s, "\nfunc Simd_", "\n//go:noinline\nfunc Simd_")
+				s = strings.ReplaceAll(s, "\nfunc simd_", "\n//go:noinline\nfunc simd_")
+			}
 		}
 		out[name] = []byte(s)
 	}

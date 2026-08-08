@@ -17,6 +17,12 @@ import (
 // single-package qualifier choice, etc).
 type ssaEmitter struct {
 	t *translator
+	// fuseDebugName labels WASM2GO_FUSE_DEBUG output.
+	fuseDebugName string
+	// packedPrologue, when set, holds the packed-boundary unpack
+	// statements of an outlined function; emitFuncBody prepends them
+	// BEFORE scalarization and clears the field.
+	packedPrologue []ast.Stmt
 	// memBaseHoisted is set (per function) when the function contains
 	// wasm memory loads/stores: memBasePtrExpr then resolves to the
 	// hoisted `mBase` local instead of the `m.M` field, and the
@@ -38,11 +44,21 @@ type ssaEmitter struct {
 	// __excR<entryID>). Reset per function.
 	excVarOfRegion map[*ssa.TryRegion]string
 
-	// excVarOfHandlerBlock maps a handler landing-pad block to the exception
-	// variable its OpCatchArg values read. Set alongside excVarOfRegion; used
-	// by the trampoline path, whose handler blocks are emitted flat (outside
-	// any per-region lexical context). Reset per function.
-	excVarOfHandlerBlock map[ssa.BlockID]string
+	// simdCalls / simdConsts mark the AST nodes carrying v128 values for
+	// the scalarization pass (simd_scalarize.go). Recorded from the SSA
+	// types at emission — the pass itself never guesses from names.
+	// Reset per function.
+	simdCalls  map[*ast.CallExpr]simdCallMark
+	simdConsts map[*ast.CompositeLit]bool
+}
+
+// simdCallMark records, for one emitted SIMD helper call, which
+// argument positions carry a v128 value and whether the result does.
+type simdCallMark struct {
+	name    string // helper name as emitted (simd_<op>)
+	resV128 bool
+	mem     bool // OpSimdMemCall: touches linear memory (load/store/lane)
+	args    []bool
 }
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
@@ -75,6 +91,9 @@ func emitSSAFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 // Callers pass t so helper registrations (e.g. mload32) propagate to
 // the output's import / helper list.
 func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
+	// The SIMD marks are per-function state for the scalarization pass.
+	em.simdCalls = nil
+	em.simdConsts = nil
 	// Hoist the linear-memory base pointer into a function-level local
 	// when the function touches memory at all. `m.M` is a Module FIELD,
 	// so the Go compiler must conservatively reload it after every
@@ -121,7 +140,15 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 			Lhs: []ast.Expr{newID(memBaseLocal)},
 			Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID("M")}},
 		}
-		body.List = append([]ast.Stmt{decl}, body.List...)
+		// The scalarizer's chases may consume EVERY inline access (a
+		// fused loop internalizes whole scale chains), leaving the
+		// hoisted base otherwise unused.
+		keep := &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID("_")},
+			Rhs: []ast.Expr{newID(memBaseLocal)},
+		}
+		body.List = append([]ast.Stmt{decl, keep}, body.List...)
 	}
 	// In mutable-locals mode (try functions), declared (non-param) locals are
 	// mutable Go vars `lN`, zero-initialised to match wasm's zeroed locals.
@@ -148,6 +175,22 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 		}
 		body.List = append(decls, body.List...)
 	}
+	// Carry v128 values as scalar pairs so they ride the register ABI —
+	// see simd_scalarize.go. Function parameters of v128 type (fallback
+	// functions only) stay arrays and are bridged at each use.
+	paramsV128 := map[string]bool{}
+	if em.packedPrologue == nil {
+		for i, p := range f.Sig.Params {
+			if p == ssa.TypeV128 {
+				paramsV128[fmt.Sprintf("l%d", i)] = true
+			}
+		}
+	} else {
+		body.List = append(append([]ast.Stmt{}, em.packedPrologue...), body.List...)
+		em.packedPrologue = nil
+	}
+	em.fuseDebugName = f.Name
+	em.scalarizeSimd(body, paramsV128)
 	return body, nil
 }
 
@@ -318,13 +361,6 @@ func (em *ssaEmitter) emitMultiBlock(f *ssa.Func) (*ast.BlockStmt, error) {
 		emitExpr: emitExpr, labelSet: gotoTargets,
 	}
 
-	// A function with EH try regions cannot be laid out flat (catch landing pads
-	// are entered by unwinding, not a CFG edge). Emit it as a recover-trampoline
-	// instead. Non-EH functions keep the proven flat layout below.
-	if len(f.TryRegions) > 0 {
-		return em.emitTrampoline(f, body, flatEc, gotoTargets)
-	}
-
 	for _, blk := range f.Blocks {
 		if err := em.emitBlockInto(blk, &body.List, flatEc); err != nil {
 			return nil, err
@@ -451,6 +487,11 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 		if v.Op == ssa.OpPhi {
 			continue
 		}
+		if pre, err := em.callPrelude(v, ec.emitExpr); err != nil {
+			return err
+		} else if len(pre) > 0 {
+			*out = append(*out, pre...)
+		}
 		if ec.hoist[v.ID] {
 			rhs, err := em.emitOp(v, ec.emitExpr)
 			if err != nil {
@@ -547,298 +588,6 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 		return fmt.Errorf("ssa emit: unknown block kind %v on b%d", blk.Kind, blk.ID)
 	}
 	return nil
-}
-
-// emitTrampoline emits an EH function as a recover-trampoline: the whole
-// function body runs inside a closure, so loops (even ones that span a try
-// region) and catch-handler resume are expressed as re-entry via a program
-// counter, not gotos across a closure boundary.
-//
-//	var __pc int32 = <entry>
-//	for {
-//	    __exc = func() (c *wasmExc) {
-//	        defer func() { c = wasm_catch(recover()) }()
-//	        switch __pc { case <entry>: goto L<entry>; case <handler>: goto L<handler> }
-//	        <all blocks: Ret ⇒ __ret/__rvN + return nil; throw ⇒ panic; a try body's
-//	         entry sets __inTryN=true, an edge to its Post clears it>
-//	        return nil
-//	    }()
-//	    if __ret { return __rvN… }
-//	    switch { case __inTryN: __inTryN=false; __pc=<handlerN>; continue; …; default: panic(__exc) }
-//	}
-//
-// __inTryN tracks — dynamically, as control flows — whether execution is inside
-// try N's body, so a caught panic routes to the right handler even when a loop
-// re-enters "body" blocks after the try has exited (the block runs with
-// __inTryN=false then). Every region gets a flag, including delegate regions:
-// a delegate's dispatch arm clears the flags of every try nested between it
-// and its resolved target, so the fall-through skips their handlers — the
-// wasm `delegate l` semantics. Each region also keeps its caught exception in
-// its own __excR<N> variable, so nested handlers and outer-targeting rethrows
-// see the right exception.
-func (em *ssaEmitter) emitTrampoline(f *ssa.Func, body *ast.BlockStmt, flatEc *emitCtx, gotoTargets map[ssa.BlockID]bool) (*ast.BlockStmt, error) {
-	byID := map[ssa.BlockID]*ssa.Block{}
-	for _, b := range f.Blocks {
-		byID[b.ID] = b
-	}
-	type htPlan struct {
-		tr     *ssa.TryRegion
-		inTry  string
-		excVar string // per-region caught-exception variable ("" for delegates)
-	}
-	var plans []*htPlan
-	bodySets := map[*ssa.TryRegion]map[ssa.BlockID]bool{}
-	for _, tr := range f.TryRegions {
-		if tr.Entry == nil || tr.Post == nil {
-			return nil, fmt.Errorf("ssa emit: malformed try region")
-		}
-		for _, h := range tr.Handlers {
-			if h.Block == nil {
-				return nil, fmt.Errorf("ssa emit: malformed try region")
-			}
-		}
-		// Protected-body membership comes from the lowering's structural
-		// record, NOT a CFG walk: a br that exits the try early makes its
-		// (unprotected) continuation reachable from inside the body.
-		bodySet := map[ssa.BlockID]bool{}
-		if tr.Body != nil {
-			for _, b := range tr.Body {
-				bodySet[b.ID] = true
-			}
-		} else {
-			// Hand-built SSA (unit tests) has no structural record; fall
-			// back to reachability, stopping at Post and the landing pads.
-			stop := map[ssa.BlockID]bool{tr.Post.ID: true}
-			for _, h := range tr.Handlers {
-				stop[h.Block.ID] = true
-			}
-			work := []*ssa.Block{tr.Entry}
-			for len(work) > 0 {
-				b := work[len(work)-1]
-				work = work[:len(work)-1]
-				if b == nil || bodySet[b.ID] || stop[b.ID] {
-					continue
-				}
-				bodySet[b.ID] = true
-				for _, e := range b.Succs {
-					work = append(work, e.Block)
-				}
-			}
-		}
-		bodySets[tr] = bodySet
-		p := &htPlan{tr: tr, inTry: fmt.Sprintf("__inTry%d", tr.Entry.ID)}
-		if len(tr.Handlers) > 0 {
-			p.excVar = fmt.Sprintf("__excR%d", tr.Entry.ID)
-		}
-		plans = append(plans, p)
-	}
-	// Register the per-region exception variables so OpCatchArg (in flat-
-	// emitted landing pads) and rethrow (possibly targeting an outer region)
-	// resolve to the right one.
-	if em.excVarOfRegion == nil {
-		em.excVarOfRegion = map[*ssa.TryRegion]string{}
-	}
-	if em.excVarOfHandlerBlock == nil {
-		em.excVarOfHandlerBlock = map[ssa.BlockID]string{}
-	}
-	for _, p := range plans {
-		if p.excVar == "" {
-			continue
-		}
-		em.excVarOfRegion[p.tr] = p.excVar
-		for _, h := range p.tr.Handlers {
-			em.excVarOfHandlerBlock[h.Block.ID] = p.excVar
-		}
-	}
-	// Nested handler trys are supported: each has its own __inTry flag, and a
-	// caught panic routes to the INNERMOST active try. Order the catch dispatch
-	// innermost-first — depth = how many other trys' bodies contain this try's
-	// entry — so the first matching __inTry in the dispatch switch is the
-	// innermost one.
-	depth := map[*htPlan]int{}
-	for _, p := range plans {
-		for _, q := range plans {
-			if p != q && bodySets[q.tr][p.tr.Entry.ID] {
-				depth[p]++
-			}
-		}
-	}
-	sort.SliceStable(plans, func(i, j int) bool { return depth[plans[i]] > depth[plans[j]] })
-
-	// Label set: goto targets plus the switch resume targets (function entry and
-	// each handler landing pad).
-	labels := map[ssa.BlockID]bool{}
-	for k := range gotoTargets {
-		labels[k] = true
-	}
-	labels[f.Entry.ID] = true
-	entrySet := map[ssa.BlockID]string{}
-	for _, p := range plans {
-		for _, h := range p.tr.Handlers {
-			labels[h.Block.ID] = true
-		}
-		entrySet[p.tr.Entry.ID] = p.inTry
-	}
-	// A try's flag drops on every edge that leaves its protected body — the
-	// fall-through to Post, but also any br out of the region.
-	edgeClears := func(pred, succ ssa.BlockID) []string {
-		var vars []string
-		for _, p := range plans {
-			if bodySets[p.tr][pred] && !bodySets[p.tr][succ] {
-				vars = append(vars, p.inTry)
-			}
-		}
-		return vars
-	}
-
-	const pcVar, retVar, excVar = "__pc", "__ret", "__exc"
-	rvVars := make([]string, len(f.Sig.Results))
-	for i := range f.Sig.Results {
-		rvVars[i] = fmt.Sprintf("__rv%d", i)
-	}
-
-	// State declarations (after the hoisted-value decls already in body).
-	decl := func(name string, typ ast.Expr, zero string) {
-		body.List = append(body.List,
-			&ast.DeclStmt{Decl: &ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{&ast.ValueSpec{
-				Names: []*ast.Ident{newID(name)}, Type: typ,
-			}}}},
-			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID("_")}, Rhs: []ast.Expr{newID(name)}},
-		)
-	}
-	decl(pcVar, newID("int32"), "")
-	body.List = append(body.List, &ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(pcVar)},
-		Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(f.Entry.ID)}}})
-	decl(retVar, newID("bool"), "")
-	decl(excVar, &ast.StarExpr{X: em.wasmExcType()}, "")
-	for i, rv := range rvVars {
-		decl(rv, goTypeForSSAType(f.Sig.Results[i]), "")
-	}
-	for _, p := range plans {
-		decl(p.inTry, newID("bool"), "")
-		if p.excVar != "" {
-			decl(p.excVar, &ast.StarExpr{X: em.wasmExcType()}, "")
-		}
-	}
-	if em.t != nil {
-		em.t.usesWasmExc = true
-	}
-	em.useHelper("wasm_catch")
-
-	// Closure body: defer/recover, the PC-dispatch switch, then every block.
-	trampEc := &emitCtx{
-		f: f, hoist: flatEc.hoist, stagedPhi: flatEc.stagedPhi, emitExpr: flatEc.emitExpr,
-		labelSet: labels,
-		tramp:    &trampCtx{retVar: retVar, rvVars: rvVars, entrySet: entrySet, edgeClears: edgeClears},
-	}
-	deferStmt := &ast.DeferStmt{Call: &ast.CallExpr{Fun: &ast.FuncLit{
-		Type: &ast.FuncType{Params: &ast.FieldList{}},
-		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.AssignStmt{
-			Tok: token.ASSIGN, Lhs: []ast.Expr{newID("c")},
-			Rhs: []ast.Expr{&ast.CallExpr{Fun: em.helperRef("wasm_catch"), Args: []ast.Expr{&ast.CallExpr{Fun: newID("recover")}}}},
-		}}},
-	}}}
-	var pcCases []ast.Stmt
-	pcCases = append(pcCases, &ast.CaseClause{
-		List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(f.Entry.ID)}},
-		Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(f.Entry))}},
-	})
-	for _, p := range plans {
-		for _, h := range p.tr.Handlers {
-			pcCases = append(pcCases, &ast.CaseClause{
-				List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.Block.ID)}},
-				Body: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(labelForBlock(h.Block))}},
-			})
-		}
-	}
-	closureBody := []ast.Stmt{deferStmt, &ast.SwitchStmt{Tag: newID(pcVar), Body: &ast.BlockStmt{List: pcCases}}}
-	// Catch landing pads read their exception via em.catchExcVar (the function-
-	// level __exc set by the previous closure return).
-	prevCatch := em.catchExcVar
-	em.catchExcVar = excVar
-	for _, blk := range f.Blocks {
-		if err := em.emitBlockInto(blk, &closureBody, trampEc); err != nil {
-			em.catchExcVar = prevCatch
-			return nil, err
-		}
-	}
-	em.catchExcVar = prevCatch
-	closureBody = append(closureBody, &ast.ReturnStmt{Results: []ast.Expr{newID("nil")}})
-	closure := &ast.FuncLit{
-		Type: &ast.FuncType{Params: &ast.FieldList{}, Results: &ast.FieldList{List: []*ast.Field{{
-			Names: []*ast.Ident{newID("c")}, Type: &ast.StarExpr{X: em.wasmExcType()},
-		}}}},
-		Body: &ast.BlockStmt{List: closureBody},
-	}
-
-	// The trampoline loop.
-	loopBody := []ast.Stmt{&ast.AssignStmt{
-		Tok: token.ASSIGN, Lhs: []ast.Expr{newID(excVar)}, Rhs: []ast.Expr{&ast.CallExpr{Fun: closure}},
-	}}
-	retExprs := make([]ast.Expr, len(rvVars))
-	for i, rv := range rvVars {
-		retExprs[i] = newID(rv)
-	}
-	loopBody = append(loopBody, &ast.IfStmt{
-		Cond: newID(retVar),
-		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: retExprs}}},
-	})
-	// Dispatch the caught exception. The arms run innermost-first as an
-	// if-chain: the innermost ACTIVE try gets the exception; if none of its
-	// clauses matches the tag, control falls through to the next enclosing
-	// active try (wasm propagation), and past the last arm the exception
-	// re-panics out of the function. A delegate arm clears the flags of every
-	// try nested between it and its resolved target and falls through, so
-	// the skipped trys' arms see a false flag — `delegate l` semantics.
-	takeHandler := func(p *htPlan, h ssa.TryHandler) []ast.Stmt {
-		return []ast.Stmt{
-			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(p.excVar)}, Rhs: []ast.Expr{newID(excVar)}},
-			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{newID(pcVar)},
-				Rhs: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.Block.ID)}}},
-			&ast.BranchStmt{Tok: token.CONTINUE},
-		}
-	}
-	var dispatch []ast.Stmt
-	for _, p := range plans {
-		arm := []ast.Stmt{assignBool(p.inTry, false)}
-		if p.tr.Delegate {
-			// Clear every try between this delegate and its target (all of
-			// them for a to-caller delegate), then fall through.
-			for _, q := range plans {
-				if q == p || q.tr == p.tr.DelegateTarget {
-					continue
-				}
-				if !bodySets[q.tr][p.tr.Entry.ID] {
-					continue // q does not enclose the delegate
-				}
-				if p.tr.DelegateTarget != nil && !bodySets[p.tr.DelegateTarget][q.tr.Entry.ID] {
-					continue // q is outside the target — still eligible to catch
-				}
-				arm = append(arm, assignBool(q.inTry, false))
-			}
-		} else {
-			for _, h := range p.tr.Handlers {
-				if h.CatchAll {
-					arm = append(arm, takeHandler(p, h)...)
-					break // clauses after catch_all are unreachable
-				}
-				arm = append(arm, &ast.IfStmt{
-					Cond: &ast.BinaryExpr{
-						X:  &ast.SelectorExpr{X: newID(excVar), Sel: newID("Tag")},
-						Op: token.EQL,
-						Y:  &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(h.TagIndex)},
-					},
-					Body: &ast.BlockStmt{List: takeHandler(p, h)},
-				})
-			}
-		}
-		dispatch = append(dispatch, &ast.IfStmt{Cond: newID(p.inTry), Body: &ast.BlockStmt{List: arm}})
-	}
-	dispatch = append(dispatch, &ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{newID(excVar)}}})
-	loopBody = append(loopBody, dispatch...)
-
-	body.List = append(body.List, &ast.ForStmt{Body: &ast.BlockStmt{List: loopBody}})
-	return body, nil
 }
 
 // emitPhiAssignsFor appends, at the end of predecessor block `pred`,
@@ -1096,6 +845,9 @@ func goTypeForSSAType(t ssa.Type) ast.Expr {
 		// Bool values are stored as i32(0/1) when hoisted (matches
 		// wasm comparison result semantics).
 		return newID("int32")
+	case ssa.TypeV128:
+		// v128 lanes, little-endian: [0] = lanes 0-7, [1] = lanes 8-15.
+		return &ast.ArrayType{Len: intLit(2), Elt: newID("uint64")}
 	}
 	return newID("int32")
 }
@@ -1113,6 +865,22 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		return goConstI32(int32(v.AuxInt)), nil
 	case ssa.OpConst64:
 		return goConstI64(v.AuxInt), nil
+	case ssa.OpTrunc64To32:
+		// wasm i32.wrap_i64 semantics: low 32 bits.
+		a, err := emit(v.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{
+			&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{
+				&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{a}}}}}}, nil
+	case ssa.OpExtend32To64U:
+		a, err := emit(v.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		return &ast.CallExpr{Fun: newID("int64"), Args: []ast.Expr{
+			&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{a}}}}, nil
 	case ssa.OpConstF32:
 		f := math.Float32frombits(uint32(v.AuxInt))
 		if floatNeedsBitsEmission(float64(f)) && em.t != nil {
@@ -1134,21 +902,14 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		// declared locals share the same naming).
 		return newID(fmt.Sprintf("l%d", v.AuxInt)), nil
 	case ssa.OpCatchArg:
-		// The i-th operand of the exception being handled, narrowed from its
-		// uint64 slot back to the operand's wasm type. The exception variable
-		// is the landing pad's own (trampoline path: handler blocks are
-		// emitted flat, each region has its own variable), falling back to
-		// the lexically-current handler variable (structured path).
-		excVar := em.excVarOfHandlerBlock[v.Block.ID]
-		if excVar == "" {
-			excVar = em.catchExcVar
+		// The i-th operand of the exception this handler caught: a copy of
+		// the value the dispatch snapshotted, narrowed to the operand type.
+		if len(v.Args) != 1 {
+			return nil, fmt.Errorf("ssa emit: OpCatchArg without its saved slot")
 		}
-		if excVar == "" {
-			return nil, fmt.Errorf("ssa emit: OpCatchArg outside a catch handler")
-		}
-		slot := &ast.IndexExpr{
-			X:     &ast.SelectorExpr{X: newID(excVar), Sel: newID("Vals")},
-			Index: &ast.BasicLit{Kind: token.INT, Value: fmt.Sprint(v.AuxInt)},
+		slot, err := emit(v.Args[0])
+		if err != nil {
+			return nil, err
 		}
 		return em.narrowExcSlot(slot, v.Type), nil
 	}
@@ -1187,6 +948,63 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 			args = append(args, e)
 		}
 		return &ast.CallExpr{Fun: em.helperRef(name), Args: args}, nil
+	case ssa.OpExcPending:
+		return em.fieldRef("excPending"), nil
+	case ssa.OpExcTag:
+		return &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{em.fieldRef("excTag")}}, nil
+	case ssa.OpExcVal:
+		slot := &ast.IndexExpr{X: em.fieldRef("excVals"), Index: intLit(v.AuxInt)}
+		return em.narrowExcSlot(slot, v.Type), nil
+	case ssa.OpSimdConst:
+		lanes, ok := v.Aux.([2]uint64)
+		if !ok {
+			return nil, fmt.Errorf("ssa emit: OpSimdConst without [2]uint64 aux")
+		}
+		lit := &ast.CompositeLit{
+			Type: &ast.ArrayType{Len: intLit(2), Elt: newID("uint64")},
+			Elts: []ast.Expr{
+				&ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("0x%x", lanes[0])},
+				&ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("0x%x", lanes[1])},
+			},
+		}
+		em.markSimdConst(lit)
+		return lit, nil
+	case ssa.OpSimdCall:
+		// Pure SIMD helper: helper(args...).
+		name, ok := v.Aux.(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("ssa emit: OpSimdCall without name aux")
+		}
+		em.useHelper(name)
+		var args []ast.Expr
+		for _, a := range v.Args {
+			e, err := emit(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, e)
+		}
+		call := &ast.CallExpr{Fun: em.helperRef(name), Args: args}
+		em.markSimdCall(call, name, v, 0)
+		return call, nil
+	case ssa.OpSimdMemCall:
+		// Module-aware SIMD memory helper: helper(m, args...).
+		name, ok := v.Aux.(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("ssa emit: OpSimdMemCall without name aux")
+		}
+		em.useHelper(name)
+		args := []ast.Expr{newID("m")}
+		for _, a := range v.Args {
+			e, err := emit(a)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, e)
+		}
+		call := &ast.CallExpr{Fun: em.helperRef(name), Args: args}
+		em.markSimdCall(call, name, v, 1)
+		return call, nil
 	case ssa.OpMemSize:
 		em.useHelper("memorySize")
 		return &ast.CallExpr{Fun: em.helperRef("memorySize"), Args: []ast.Expr{newID("m")}}, nil
@@ -1327,6 +1145,50 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 			Fun:  em.helperRef("memoryInit"),
 			Args: []ast.Expr{newID("m"), intLit(v.AuxInt), dst, src, n},
 		}}, nil
+	case ssa.OpExcRaise:
+		// Store tag and operands, then set the flag. The block branches to
+		// a handler or to a propagating return right after.
+		if len(v.Args) == 0 {
+			return nil, fmt.Errorf("ssa emit: OpExcRaise without a tag arg")
+		}
+		tagExpr, err := emit(v.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		stmts := []ast.Stmt{&ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{em.fieldRef("excTag")},
+			Rhs: []ast.Expr{&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{tagExpr}}},
+		}}
+		for i, a := range v.Args[1:] {
+			e, err := emit(a)
+			if err != nil {
+				return nil, err
+			}
+			stmts = append(stmts, &ast.AssignStmt{
+				Tok: token.ASSIGN,
+				Lhs: []ast.Expr{&ast.IndexExpr{X: em.fieldRef("excVals"), Index: intLit(int64(i))}},
+				Rhs: []ast.Expr{em.widenToExcSlot(e, a.Type)},
+			})
+		}
+		stmts = append(stmts, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{em.fieldRef("excPending")},
+			Rhs: []ast.Expr{intLit(1)},
+		})
+		return &ast.BlockStmt{List: stmts}, nil
+	case ssa.OpExcRearm:
+		return &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{em.fieldRef("excPending")},
+			Rhs: []ast.Expr{intLit(1)},
+		}, nil
+	case ssa.OpExcClear:
+		return &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{em.fieldRef("excPending")},
+			Rhs: []ast.Expr{intLit(0)},
+		}, nil
 	case ssa.OpDataDrop:
 		em.useHelper("dataDrop")
 		return &ast.ExprStmt{X: &ast.CallExpr{
@@ -1367,6 +1229,14 @@ func (em *ssaEmitter) fieldRef(field string) ast.Expr {
 // emitCallDirect produces a call expression `Fn<N>(m, args...)` for a
 // direct call to a defined wasm function.
 func (em *ssaEmitter) emitCallDirect(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) (ast.Expr, error) {
+	// A synthetic callee (an outlined loop) with a packed boundary
+	// reads its arguments from the per-module scratch slots that
+	// callPrelude filled right before this statement; the call itself
+	// carries only the module pointer.
+	synthName, _ := v.Aux.(string)
+	if synthName != "" && em.t != nil && em.t.outlinedSigs[synthName].Packed {
+		return &ast.CallExpr{Fun: newID(synthName), Args: []ast.Expr{newID("m")}}, nil
+	}
 	args := []ast.Expr{newID("m")}
 	for _, a := range v.Args {
 		ae, err := emit(a)
@@ -1376,12 +1246,57 @@ func (em *ssaEmitter) emitCallDirect(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 		args = append(args, ae)
 	}
 	var fun ast.Expr
-	if em.t != nil {
+	if synthName != "" {
+		// Same package, called by name; AuxInt carries no function
+		// index then.
+		fun = newID(synthName)
+	} else if em.t != nil {
 		fun = em.t.funcRef(uint32(v.AuxInt))
 	} else {
 		fun = newID(fmt.Sprintf("Fn%d", v.AuxInt))
 	}
 	return &ast.CallExpr{Fun: fun, Args: args}, nil
+}
+
+// callPrelude returns the statements a value's emission must be
+// preceded by: a packed outlined call fills the per-module scratch
+// slots with its boundary values here, immediately before the call
+// statement, so nothing can overwrite them in between.
+func (em *ssaEmitter) callPrelude(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) ([]ast.Stmt, error) {
+	if v.Op != ssa.OpCallDirect || em.t == nil {
+		return nil, nil
+	}
+	name, _ := v.Aux.(string)
+	if name == "" || !em.t.outlinedSigs[name].Packed {
+		return nil, nil
+	}
+	var fills []ast.Stmt
+	slot := 0
+	for _, a := range v.Args {
+		ae, err := emit(a)
+		if err != nil {
+			return nil, err
+		}
+		if a.Type == ssa.TypeV128 {
+			for half := 0; half < 2; half++ {
+				fills = append(fills, &ast.AssignStmt{
+					Tok: token.ASSIGN,
+					Lhs: []ast.Expr{em.t.packSlot(slot)},
+					Rhs: []ast.Expr{&ast.IndexExpr{X: ae, Index: &ast.BasicLit{
+						Kind: token.INT, Value: strconv.Itoa(half)}}},
+				})
+				slot++
+			}
+			continue
+		}
+		fills = append(fills, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{em.t.packSlot(slot)},
+			Rhs: []ast.Expr{em.t.packSlotWrite(ae, a.Type)},
+		})
+		slot++
+	}
+	return fills, nil
 }
 
 // emitCallImport produces `m.<modField>.<MethodName>(m, args...)` for
@@ -1749,3 +1664,25 @@ func (em *ssaEmitter) boolToI32(cond ast.Expr) ast.Expr {
 }
 
 var _ = binaryUnsigned // not yet used; reserved for future ops
+
+// markSimdCall records a SIMD helper call's v128 positions for the
+// scalarization pass. skip counts synthetic leading args (the Module
+// receiver of a memory helper) that are never v128.
+func (em *ssaEmitter) markSimdCall(call *ast.CallExpr, name string, v *ssa.Value, skip int) {
+	if em.simdCalls == nil {
+		em.simdCalls = map[*ast.CallExpr]simdCallMark{}
+	}
+	mark := simdCallMark{name: name, resV128: v.Type == ssa.TypeV128, mem: skip == 1, args: make([]bool, skip+len(v.Args))}
+	for i, a := range v.Args {
+		mark.args[skip+i] = a.Type == ssa.TypeV128
+	}
+	em.simdCalls[call] = mark
+}
+
+// markSimdConst records a v128 constant literal for the scalarization pass.
+func (em *ssaEmitter) markSimdConst(lit *ast.CompositeLit) {
+	if em.simdConsts == nil {
+		em.simdConsts = map[*ast.CompositeLit]bool{}
+	}
+	em.simdConsts[lit] = true
+}

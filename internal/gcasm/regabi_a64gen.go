@@ -27,11 +27,18 @@ func assignARM64(params []ArgKind, hasResult bool, result ArgKind) (args []RegAs
 		var ra RegAssignment
 		ra.Kind = k
 		sz, al := 8, 8
-		if k == ArgI32 || k == ArgU32 || k == ArgF32 {
+		switch k {
+		case ArgI32, ArgU32, ArgF32:
 			sz, al = 4, 4
+		case ArgV128:
+			sz = 16
 		}
 		isFloat := k == ArgF32 || k == ArgF64
 		switch {
+		case k == ArgV128:
+			seqOff = align(seqOff, al)
+			ra.SeqOf = seqOff
+			seqOff += sz
 		case isFloat && fltN < len(arm64FloatArgRegs):
 			ra.Reg = arm64FloatArgRegs[fltN]
 			fltN++
@@ -52,9 +59,13 @@ func assignARM64(params []ArgKind, hasResult bool, result ArgKind) (args []RegAs
 		r := RegAssignment{Kind: result}
 		stackOff = align(stackOff, 8)
 		r.StackOf = stackOff
-		if result == ArgF32 || result == ArgF64 {
+		switch result {
+		case ArgV128:
+			// Stack result on both sides (see the amd64 twin).
+			r.SeqOf = align(seqOff, 8)
+		case ArgF32, ArgF64:
 			r.Reg = "F0"
-		} else {
+		default:
 			r.Reg = "R0"
 		}
 		res = &r

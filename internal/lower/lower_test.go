@@ -14,6 +14,16 @@ import (
 // every exported function lowers cleanly. The dump of one
 // representative function is checked against a golden string so
 // regressions in op selection or value-id assignment show up loudly.
+// testThrowSet gives the lowering the module's real throw analysis, the
+// same one Translate computes.
+func testThrowSet(mod *wasm.Module) *ThrowSet {
+	ts, err := ComputeThrowSet(mod, nil)
+	if err != nil {
+		panic(err)
+	}
+	return ts
+}
+
 func TestLowerArith(t *testing.T) {
 	bin := testfixture.Wasm(t, "arith")
 	mod, err := wasm.Parse(bytes.NewReader(bin))
@@ -33,7 +43,7 @@ func TestLowerArith(t *testing.T) {
 		t.Fatalf("arith.wasm: missing add export")
 	}
 
-	fn, err := LowerFunction(mod, addFnIdx, "add")
+	fn, err := LowerFunction(mod, addFnIdx, "add", testThrowSet(mod))
 	if err != nil {
 		t.Fatalf("lower add: %v", err)
 	}
@@ -66,7 +76,7 @@ func TestLowerArith(t *testing.T) {
 		if idx == ^uint32(0) {
 			t.Fatalf("missing export %q", name)
 		}
-		_, err := LowerFunction(mod, idx, name)
+		_, err := LowerFunction(mod, idx, name, testThrowSet(mod))
 		switch {
 		case err == nil && wantUnsupported:
 			t.Fatalf("%s: expected ErrSSAUnsupported, got nil", name)
@@ -103,8 +113,9 @@ func dumpSSAFunc(f interface{}) string {
 var _ = ssaFuncString // referenced by dumpSSAFunc
 
 // TestLowerThrow lowers the $throwing function of eh_trycatch.wat
-// (`i32.const 7; throw $e`) and checks it seals the block as BlockThrow
-// carrying the tag index and the i32 operand — the EH/SjLj `throw` lowering.
+// (`i32.const 7; throw $e`) and checks the branch-based `throw` lowering:
+// the tag and its operand are written into the module's exception state
+// (OpExcRaise) and the block branches on to a propagating return.
 func TestLowerThrow(t *testing.T) {
 	bin := testfixture.Wasm(t, "eh_trycatch")
 	mod, err := wasm.Parse(bytes.NewReader(bin))
@@ -112,17 +123,18 @@ func TestLowerThrow(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	// $throwing is the first defined function (no imports in the fixture).
-	fn, err := LowerFunction(mod, 0, "throwing")
+	fn, err := LowerFunction(mod, 0, "throwing", testThrowSet(mod))
 	if err != nil {
 		t.Fatalf("lower throwing: %v", err)
 	}
 	dump := dumpSSAFunc(fn)
-	if !bytes.Contains([]byte(dump), []byte("Throw tag=0")) {
-		t.Errorf("expected a `Throw tag=0` terminator, got:\n%s", dump)
+	if !bytes.Contains([]byte(dump), []byte("OpExcRaise")) {
+		t.Errorf("expected an OpExcRaise for the throw, got:\n%s", dump)
 	}
-	// The thrown i32 operand (const 7) must survive as a trailing OpCopy.
-	if !bytes.Contains([]byte(dump), []byte("OpCopy")) {
-		t.Errorf("expected the thrown operand as an OpCopy marker, got:\n%s", dump)
+	// Nothing catches it here, so the function must still return (with the
+	// flag left set for the caller's post-call check).
+	if !bytes.Contains([]byte(dump), []byte("Ret")) {
+		t.Errorf("expected a propagating return after the raise, got:\n%s", dump)
 	}
 }
 
@@ -135,7 +147,7 @@ func TestLowerTryCatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	fn, err := LowerFunction(mod, 1, "catching") // $catching
+	fn, err := LowerFunction(mod, 1, "catching", testThrowSet(mod)) // $catching
 	if err != nil {
 		t.Fatalf("lower catching: %v", err)
 	}
@@ -165,26 +177,27 @@ func TestLowerTryCatch(t *testing.T) {
 	}
 }
 
-// TestLowerMutableLocalsTry lowers $withlocal, a try-function that sets a local
-// before the try and reads it in the body and the catch handler. Try-functions
-// use mutable-locals mode: local.get/set stay as OpLocalGet/OpLocalSet (mutable
-// Go vars) rather than being promoted to SSA + phi'd.
-func TestLowerMutableLocalsTry(t *testing.T) {
+// TestLowerTryLocalsAreSSA lowers $withlocal, a try-function that sets a local
+// before the try and reads it in the body and the catch handler. Under
+// branch-based EH a handler is reached by a real CFG edge, so locals are
+// ordinary SSA values — the de-SSA "mutable locals" mode panic/recover needed
+// (OpLocalGet/OpLocalSet surviving into the IR) is gone.
+func TestLowerTryLocalsAreSSA(t *testing.T) {
 	bin := testfixture.Wasm(t, "eh_trycatch")
 	mod, err := wasm.Parse(bytes.NewReader(bin))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	fn, err := LowerFunction(mod, 4, "withlocal") // $withlocal
+	fn, err := LowerFunction(mod, 4, "withlocal", testThrowSet(mod)) // $withlocal
 	if err != nil {
 		t.Fatalf("lower withlocal: %v", err)
 	}
 	dump := dumpSSAFunc(fn)
-	if !bytes.Contains([]byte(dump), []byte("OpLocalGet")) {
-		t.Errorf("mutable-locals mode should retain OpLocalGet, got:\n%s", dump)
+	if bytes.Contains([]byte(dump), []byte("OpLocalGet")) || bytes.Contains([]byte(dump), []byte("OpLocalSet")) {
+		t.Errorf("locals should be promoted to SSA in an EH function, got:\n%s", dump)
 	}
-	if !bytes.Contains([]byte(dump), []byte("OpLocalSet")) {
-		t.Errorf("mutable-locals mode should retain OpLocalSet, got:\n%s", dump)
+	if fn.MutableLocals {
+		t.Errorf("MutableLocals should stay false")
 	}
 	if len(fn.TryRegions) != 1 {
 		t.Errorf("TryRegions: got %d, want 1", len(fn.TryRegions))

@@ -745,25 +745,28 @@ func TestPruneDeadBlocks(t *testing.T) {
 	}
 }
 
-// A catch landing pad has no predecessors — it is entered by unwinding, not by
-// a CFG edge. One that ends the function (return / unreachable / throw) has no
-// successors either, so the isolation rule would sweep it away while the
-// TryRegion kept pointing at it, leaving the emitters to reference a block that
-// no longer exists.
-func TestPruneDeadBlocksCatchLandingPadKept(t *testing.T) {
-	b := NewFuncBuilder("prune_landingpad", FuncSig{Results: []Type{TypeI32}})
+// Under branch-based exception handling a catch handler is reached by a real
+// CFG edge (the check-and-branch after a call that may raise), so it is an
+// ordinary block: one with no edges at all belongs to a try whose protected
+// body cannot raise, and pruning it — region metadata and all — is correct.
+func TestPruneDeadBlocksUnreachableHandlerRemoved(t *testing.T) {
+	b := NewFuncBuilder("prune_handler", FuncSig{Results: []Type{TypeI32}})
 	entry := b.NewBlock(BlockRet)
-	pad := b.NewBlock(BlockRet) // no preds, no succs — reached only by unwinding
-	dead := b.NewBlock(BlockRet)
+	reached := b.NewBlock(BlockRet) // a handler the body really branches to
+	unreached := b.NewBlock(BlockRet)
 	b.SetEntry(entry)
 	b.SetCurrent(entry)
 	b.FinishRet(b.Const32(1))
-	b.SetCurrent(pad)
+	b.SetCurrent(reached)
 	b.FinishRet(b.Const32(42))
-	b.SetCurrent(dead)
+	b.SetCurrent(unreached)
 	b.FinishRet(b.Const32(0))
+	AddEdge(entry, reached)
 	f := b.Func()
-	f.TryRegions = []*TryRegion{{Entry: entry, Post: entry, Handlers: []TryHandler{{Block: pad}}}}
+	f.TryRegions = []*TryRegion{{
+		Entry: entry, Post: entry,
+		Handlers: []TryHandler{{Block: reached}, {Block: unreached}},
+	}}
 
 	PruneDeadBlocks(f)
 
@@ -774,11 +777,11 @@ func TestPruneDeadBlocksCatchLandingPadKept(t *testing.T) {
 	if !kept[entry] {
 		t.Error("entry block removed by prune")
 	}
-	if !kept[pad] {
-		t.Error("catch landing pad removed by prune")
+	if !kept[reached] {
+		t.Error("handler with a real predecessor removed by prune")
 	}
-	if kept[dead] {
-		t.Error("genuinely isolated block survived prune")
+	if kept[unreached] {
+		t.Error("edge-less handler survived prune")
 	}
 }
 

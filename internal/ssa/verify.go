@@ -156,16 +156,6 @@ func Verify(f *Func) error {
 	// a branch target was created but never wired — a lowering bug.
 	reached := map[BlockID]bool{}
 	stack := []*Block{f.Entry}
-	// EH catch/catch_all handler blocks are landing pads: they are entered by
-	// the runtime unwinding into the try, not by a CFG edge, so they are
-	// legitimate reachability roots even with zero predecessors.
-	for _, tr := range f.TryRegions {
-		for _, h := range tr.Handlers {
-			if h.Block != nil {
-				stack = append(stack, h.Block)
-			}
-		}
-	}
 	for len(stack) > 0 {
 		b := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -283,30 +273,14 @@ func verifyUseDominance(f *Func) error {
 // reverse-postorder numbering, using the Cooper-Harvey-Kennedy
 // iterative algorithm. idom[entry] == entry.
 //
-// EH catch landing pads have no CFG predecessors (they are entered by
-// unwinding), so the plain CFG leaves them — and every block only they
-// reach — outside the dominator tree, and any use of a pre-try value in a
-// handler would fail verification. The runtime guarantee is that a
-// handler runs only after its try's Entry was reached, so dominance is
-// computed over the CFG augmented with a virtual edge Entry → handler
-// for every catch clause: a handler is then dominated by whatever
-// dominates its try's Entry.
+// computeDominators returns the immediate-dominator map (idom) and a
+// reverse-postorder numbering, using the Cooper-Harvey-Kennedy iterative
+// algorithm. idom[entry] == entry.
+//
+// EH needs no special case here: branch-based exception handling reaches
+// every handler through a real CFG edge (the check-and-branch after a call
+// that may raise), so handlers are ordinary blocks.
 func computeDominators(f *Func) (idom map[BlockID]*Block, rpoNum map[BlockID]int) {
-	// Virtual Entry → handler edges per try region (see doc comment).
-	virtSuccs := map[BlockID][]*Block{}
-	virtPred := map[BlockID]*Block{}
-	for _, tr := range f.TryRegions {
-		if tr.Entry == nil {
-			continue
-		}
-		for _, h := range tr.Handlers {
-			if h.Block == nil {
-				continue
-			}
-			virtSuccs[tr.Entry.ID] = append(virtSuccs[tr.Entry.ID], h.Block)
-			virtPred[h.Block.ID] = tr.Entry
-		}
-	}
 	// Reverse-postorder via iterative DFS.
 	var post []*Block
 	seen := map[BlockID]bool{}
@@ -318,14 +292,8 @@ func computeDominators(f *Func) (idom map[BlockID]*Block, rpoNum map[BlockID]int
 	seen[f.Entry.ID] = true
 	for len(stack) > 0 {
 		top := &stack[len(stack)-1]
-		succs := top.b.Succs
-		if top.i < len(succs)+len(virtSuccs[top.b.ID]) {
-			var s *Block
-			if top.i < len(succs) {
-				s = succs[top.i].Block
-			} else {
-				s = virtSuccs[top.b.ID][top.i-len(succs)]
-			}
+		if top.i < len(top.b.Succs) {
+			s := top.b.Succs[top.i].Block
 			top.i++
 			if !seen[s.ID] {
 				seen[s.ID] = true
@@ -369,14 +337,8 @@ func computeDominators(f *Func) (idom map[BlockID]*Block, rpoNum map[BlockID]int
 				continue
 			}
 			var newIdom *Block
-			preds := make([]*Block, 0, len(b.Preds)+1)
 			for _, pe := range b.Preds {
-				preds = append(preds, pe.Block)
-			}
-			if vp := virtPred[b.ID]; vp != nil {
-				preds = append(preds, vp)
-			}
-			for _, p := range preds {
+				p := pe.Block
 				if idom[p.ID] == nil {
 					continue // pred not yet processed
 				}
@@ -431,19 +393,15 @@ func blockID(b *Block) BlockID {
 //
 // Run before Verify.
 func PruneDeadBlocks(f *Func) {
-	roots := map[BlockID]bool{}
-	for _, tr := range f.TryRegions {
-		for _, h := range tr.Handlers {
-			if h.Block != nil {
-				roots[h.Block.ID] = true
-			}
-		}
-	}
+	// Under branch-based EH every handler is reached by a real edge, so
+	// there are no pred-less roots to protect: an edge-less block is dead,
+	// full stop. Dropping the whole region's blocks when the protected body
+	// cannot raise is exactly the point.
 	for {
 		removed := false
 		kept := f.Blocks[:0]
 		for _, b := range f.Blocks {
-			if b != f.Entry && !roots[b.ID] && len(b.Preds) == 0 && len(b.Succs) == 0 {
+			if b != f.Entry && len(b.Preds) == 0 && len(b.Succs) == 0 {
 				removed = true
 				continue
 			}

@@ -64,7 +64,7 @@ var ErrSSAUnsupported = errors.New("ssa lowering: unsupported wasm feature")
 // the function index and the offending opcode; Translate fails the
 // build with that message so the gap can be addressed in the SSA
 // pipeline rather than worked around silently.
-func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Func, resErr error) {
+func LowerFunction(mod *wasm.Module, funcIdx uint32, name string, throwSet *ThrowSet) (resFn *ssa.Func, resErr error) {
 	// Recover from lowering bugs and surface them as ErrSSAUnsupported
 	// with a clear function reference. Without this, a single edge case
 	// anywhere in the lowering would crash the whole codegen run.
@@ -109,10 +109,10 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 	// mode: locals are NOT promoted to SSA but kept as mutable Go variables
 	// (retained OpLocalGet/OpLocalSet), so a Go panic/recover at a catch
 	// landing pad sees each local's throw-time value (wasm EH semantics).
-	mutableLocals, err := bodyHasTry(fn.Body)
-	if err != nil {
-		return nil, err
-	}
+	// Branch-based EH keeps every handler reachable through real CFG edges,
+	// so locals flow through ordinary phis — the de-SSA "mutable locals"
+	// mode that panic/recover needed is gone.
+	mutableLocals := false
 
 	ls := &lowerState{
 		b:             b,
@@ -124,6 +124,8 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 		mutableLocals: mutableLocals,
 		inlineInfo:    analyzeModuleForInline(mod),
 		callerIdx:     funcIdx,
+		throwSet:      throwSet,
+		excSlots:      maxTagArity(mod),
 	}
 
 	r := wasm.NewInstrReader(fn.Body)
@@ -173,6 +175,17 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string) (resFn *ssa.Fu
 // lowerState carries the per-function bookkeeping needed during SSA
 // construction.
 type lowerState struct {
+	// throwSet answers "can a call to this function leave an exception
+	// pending?", so a check-and-branch is emitted only where one is
+	// possible. Nil means "assume every call can" (see ThrowSet).
+	throwSet *ThrowSet
+	// excSlots is the module's exception operand-slot count (the widest tag
+	// arity), matching the Module state array the emitter declares.
+	excSlots int
+	// excPropagate is the function's shared "return, leaving the exception
+	// pending for the caller" block, created on first use.
+	excPropagate *ssa.Block
+
 	b   *ssa.FuncBuilder
 	mod *wasm.Module
 	ft  wasm.FuncType
@@ -252,10 +265,34 @@ type ctrlFrame struct {
 	// start from this snapshot (not the then-branch's mutated state),
 	// and an if-without-else's implicit else edge carries it verbatim.
 	entryLocals []*ssa.Value
+	// (see eh.go for the branch-based EH model these support)
 	// tryRegion, for ctrlTry frames, is the in-progress EH region. Entry
 	// and Post are set when the frame opens; each catch / catch_all
 	// appends a handler. target / fallthrough_ both point at Post.
 	tryRegion *ssa.TryRegion
+	// excChain, for ctrlTry frames, is where the next catch clause's tag
+	// test goes: the dispatch block for the first clause, then the
+	// fall-through of each previous test. Nil once a catch_all has
+	// swallowed the chain (or the chain has been closed).
+	excChain *ssa.Block
+	// excTagVal / excSavedTag / excSavedVals are the dispatch's snapshot of
+	// the arriving exception: the tag the clause chain compares, and the
+	// tag+operands a `rethrow` naming this try reproduces.
+	excTagVal    *ssa.Value
+	excSavedTag  *ssa.Value
+	excSavedVals []*ssa.Value
+	// excDispatchLocals is the local set the dispatch block runs with, so
+	// every clause (and the out-of-line no-match edge) starts from it.
+	excDispatchLocals []*ssa.Value
+	// excHasCatchAll records that a catch_all clause terminated the chain.
+	excHasCatchAll bool
+	// excDead marks a dispatch no check-and-branch can reach (the protected
+	// body cannot raise), so its handlers lower as dead code.
+	excDead bool
+	// excDispatch, for ctrlTry frames, is the block a check-and-branch in
+	// the protected body targets when the flag is set: it clears the flag,
+	// reads the tag and runs the clause chain. See eh.go.
+	excDispatch *ssa.Block
 	// inHandler, for ctrlTry frames, is true once the first catch /
 	// catch_all has been seen: lowering is inside a handler, not the
 	// protected body. `rethrow l` labels must resolve to such a frame, and
@@ -656,6 +693,8 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		return nil
 	case op == wasm.OpPrefixFC:
 		return ls.handleFCOp(r)
+	case op == wasm.OpPrefixFD:
+		return ls.handleFDOp(r)
 	case op == wasm.OpPrefixFE:
 		return ls.handleFEOp(r)
 	}
@@ -1015,27 +1054,7 @@ func (ls *lowerState) handleTry(r *wasm.InstrReader) error {
 	if err != nil {
 		return fmt.Errorf("%w: try blocktype %v: %w", ErrSSAUnsupported, bt, err)
 	}
-	entryBlk := ls.b.NewBlock(ssa.BlockPlain)
-	postBlk := ls.b.NewBlock(ssa.BlockPlain)
-
-	// Fall into the protected body. Single pred, so operands/locals carry
-	// directly (no phi).
-	cur := ls.b.Current()
-	cur.Kind = ssa.BlockPlain
-	ssa.AddEdge(cur, entryBlk)
-	ls.b.SetCurrent(entryBlk)
-
-	region := &ssa.TryRegion{Entry: entryBlk, Post: postBlk}
-	ls.b.Func().TryRegions = append(ls.b.Func().TryRegions, region)
-
-	ls.ctrl = append(ls.ctrl, &ctrlFrame{
-		kind:               ctrlTry,
-		target:             postBlk,
-		fallthrough_:       postBlk,
-		resultCount:        len(results),
-		stackHeightAtEntry: len(ls.stack),
-		tryRegion:          region,
-	})
+	ls.handleTryBranch(len(results))
 	return nil
 }
 
@@ -1061,6 +1080,12 @@ func (ls *lowerState) handleDelegate(r *wasm.InstrReader) error {
 
 	ls.captureTryBody(f)
 	f.tryRegion.Delegate = true
+	// The body's check-and-branches targeted THIS region's dispatch (it was
+	// the innermost). Forward from there: the state is untouched, so the
+	// dispatch just branches on to the resolved target — which the popped
+	// control stack makes currentExcTarget resolve to, except when the
+	// label named a specific outer try.
+	forwardFrom := f.excDispatch
 	// Resolve the label to its catching context. The label indexes the
 	// control stack with the delegate's own try frame already popped; depth
 	// == len(ls.ctrl) names the function body (forward to the caller).
@@ -1080,6 +1105,36 @@ func (ls *lowerState) handleDelegate(r *wasm.InstrReader) error {
 		cur.Kind = ssa.BlockPlain
 		ssa.AddEdge(cur, f.target)
 	}
+
+	// Forward the region's exceptions. The delegate's own frame is popped,
+	// so a label naming the enclosing context resolves through
+	// currentExcTarget; a label naming a specific outer try (skipping trys
+	// nested in between) is honoured by targeting that try's dispatch
+	// directly.
+	if len(forwardFrom.Preds) > 0 {
+		saved := ls.b.Current()
+		savedUnreachable := ls.unreachable
+		ls.b.SetCurrent(forwardFrom)
+		ls.unreachable = false
+		if err := ls.resolveIncoming(forwardFrom, 0, f.stackHeightAtEntry); err != nil {
+			return err
+		}
+		ls.stack = ls.stack[:f.stackHeightAtEntry]
+		if tr := f.tryRegion.DelegateTarget; tr != nil && tr.Dispatch != nil {
+			cur := ls.b.Current()
+			cur.Kind = ssa.BlockPlain
+			ls.recordIncoming(tr.Dispatch, 0)
+			ssa.AddEdge(cur, tr.Dispatch)
+			ls.unreachable = true
+		} else {
+			ls.gotoExcTarget()
+		}
+		ls.b.SetCurrent(saved)
+		ls.unreachable = savedUnreachable
+	}
+
+	sealDeadExcBlocks(f.tryRegion)
+
 	if _, ok := ls.incoming[f.target]; ok {
 		ls.b.SetCurrent(f.target)
 		ls.unreachable = false
@@ -1121,11 +1176,12 @@ func (ls *lowerState) captureTryBody(f *ctrlFrame) {
 	tr.Body = body
 }
 
-// handleRethrow implements `rethrow N` — re-raise the exception caught by the
-// catch handler the N-th enclosing label resolves to. Handlers nest, so the
-// label does not always name the innermost catch: `rethrow 1` inside an inner
-// catch re-raises the OUTER try's exception. The label is resolved to its try
-// region here so the emit pass panics the right region's caught exception.
+// handleRethrow implements `rethrow N` — re-raise the exception caught by
+// the handler the N-th enclosing label resolves to. Handlers nest, so the
+// label does not always name the innermost catch: `rethrow 1` inside an
+// inner catch re-raises the OUTER try's exception. The dispatch snapshotted
+// tag and operands before any handler body ran, so the re-raise reproduces
+// them exactly even if the handler has since called throwing code.
 func (ls *lowerState) handleRethrow(r *wasm.InstrReader) error {
 	depth, err := r.ReadU32() // labelidx; must name a try frame in handler state
 	if err != nil {
@@ -1135,12 +1191,10 @@ func (ls *lowerState) handleRethrow(r *wasm.InstrReader) error {
 		return fmt.Errorf("%w: rethrow depth %d exceeds control stack", ErrSSAUnsupported, depth)
 	}
 	fr := ls.ctrl[len(ls.ctrl)-1-int(depth)]
-	if fr.kind != ctrlTry || !fr.inHandler || fr.tryRegion == nil {
+	if fr.kind != ctrlTry || !fr.inHandler || fr.excSavedTag == nil {
 		return fmt.Errorf("%w: rethrow label does not name a catch handler", ErrSSAUnsupported)
 	}
-	ls.b.Current().RethrowRegion = fr.tryRegion
-	ls.b.FinishRethrow()
-	ls.unreachable = true
+	ls.raiseAndGo(fr.excSavedTag, fr.excSavedVals...)
 	return nil
 }
 
@@ -1156,20 +1210,16 @@ func (ls *lowerState) handleCatchAll() error {
 	return ls.beginHandler(true, 0)
 }
 
-// beginHandler closes the current try sub-region (the body, or the previous
-// handler) with a fall-through edge to post, then opens the next catch /
-// catch_all handler block. The handler block is a landing pad: it has no CFG
-// predecessor (it is entered by the runtime unwinding into the try, emitted as
-// defer/recover), but it falls through to post like any other sub-region. The
-// operand stack is reset to the try-entry base and, for `catch`, the tag's
-// operands are pushed as OpCatchArg values.
+// beginHandler closes the current sub-region (the protected body, or the
+// previous clause) into post, then opens the next catch / catch_all clause
+// on the dispatch's tag-compare chain. For `catch`, the tag's operands are
+// pushed as reads of the snapshotted exception state.
 func (ls *lowerState) beginHandler(catchAll bool, tagIdx uint32) error {
 	if len(ls.ctrl) == 0 || ls.ctrl[len(ls.ctrl)-1].kind != ctrlTry {
 		return fmt.Errorf("%w: catch/catch_all with no open try", ErrSSAUnsupported)
 	}
 	f := ls.ctrl[len(ls.ctrl)-1]
 	ls.captureTryBody(f) // no-op after the first handler
-	f.inHandler = true
 
 	// Close the current sub-region into post (skip if it threw/branched away).
 	if !ls.unreachable {
@@ -1178,18 +1228,12 @@ func (ls *lowerState) beginHandler(catchAll bool, tagIdx uint32) error {
 		cur.Kind = ssa.BlockPlain
 		ssa.AddEdge(cur, f.target)
 	}
+	f.inHandler = true
 
-	// Open the handler landing pad.
-	hBlk := ls.b.NewBlock(ssa.BlockPlain)
-	ls.b.SetCurrent(hBlk)
-	ls.unreachable = false
-
-	// Reset the operand stack to the try-entry base (the values pushed by the
-	// try body are unwound), then push the exception operands for `catch`.
-	if f.stackHeightAtEntry > len(ls.stack) {
-		return fmt.Errorf("%w: catch stack underflow (entry %d, have %d)", ErrSSAUnsupported, f.stackHeightAtEntry, len(ls.stack))
+	hBlk, err := ls.beginClause(f, catchAll, tagIdx)
+	if err != nil {
+		return err
 	}
-	ls.stack = ls.stack[:f.stackHeightAtEntry]
 
 	nArgs := 0
 	if !catchAll {
@@ -1198,7 +1242,11 @@ func (ls *lowerState) beginHandler(catchAll bool, tagIdx uint32) error {
 			return fmt.Errorf("%w: %w", ErrSSAUnsupported, err)
 		}
 		for i, t := range types {
-			ls.push(ls.b.NewValueAuxInt(ssa.OpCatchArg, t, int64(i)))
+			if i >= len(f.excSavedVals) {
+				return fmt.Errorf("%w: tag %d arity %d exceeds the module's %d exception slots",
+					ErrSSAUnsupported, tagIdx, len(types), len(f.excSavedVals))
+			}
+			ls.push(ls.b.NewValueAuxInt(ssa.OpCatchArg, t, int64(i), f.excSavedVals[i]))
 		}
 		nArgs = len(types)
 	}
@@ -1437,10 +1485,10 @@ func (ls *lowerState) handleBrTable(r *wasm.InstrReader) error {
 // of nResults values and routes them as the function result, then
 // marks the cursor unreachable. The function-level End will see the
 // previously-Ret block and not double-emit.
-// handleThrow lowers the EH `throw <tag>` opcode: it pops the tag's operands
-// and seals the current block as BlockThrow (a Go panic at emit time). A throw
-// with no enclosing try in this function propagates out — modelled as a leaf
-// terminator, like return/unreachable.
+// handleThrow lowers `throw <tag>`: it pops the tag's operands, writes them
+// and the tag into the module's exception state, sets the pending flag, and
+// branches to wherever an exception raised here goes — an enclosing try's
+// dispatch, or a return that leaves the flag set for the caller.
 func (ls *lowerState) handleThrow(r *wasm.InstrReader) error {
 	tagIdx, err := r.ReadU32()
 	if err != nil {
@@ -1456,8 +1504,7 @@ func (ls *lowerState) handleThrow(r *wasm.InstrReader) error {
 	operands := make([]*ssa.Value, n)
 	copy(operands, ls.stack[len(ls.stack)-n:])
 	ls.stack = ls.stack[:len(ls.stack)-n]
-	ls.b.FinishThrow(tagIdx, operands...)
-	ls.unreachable = true
+	ls.raiseAndGo(ls.b.Const32(int32(tagIdx)), operands...)
 	return nil
 }
 
@@ -1683,7 +1730,39 @@ func (ls *lowerState) handleCall(r *wasm.InstrReader) error {
 	if len(ft.Results) == 1 {
 		ls.push(v)
 	}
+	// A callee that can leave an exception pending needs the check-and-
+	// branch right here, before the result is consumed: on the exception
+	// path the result is undefined. Host imports never raise.
+	if !isImport && ls.mayThrowCall(funcIdx) {
+		ls.emitExcCheck()
+	}
 	return nil
+}
+
+// maxTagArity mirrors the codegen-side computation: the module's widest
+// exception-tag arity, i.e. how many operand slots the exception state has.
+func maxTagArity(m *wasm.Module) int {
+	n := 0
+	consider := func(typeIdx uint32) {
+		if int(typeIdx) >= len(m.Types) {
+			return
+		}
+		if c := len(m.Types[typeIdx].Params); c > n {
+			n = c
+		}
+	}
+	for _, imp := range m.Imports {
+		if imp.Kind == wasm.ImportTag {
+			consider(imp.Tag.TypeIdx)
+		}
+	}
+	for _, tg := range m.Tags {
+		consider(tg.TypeIdx)
+	}
+	if n == 0 && (m.NumImportedTags > 0 || len(m.Tags) > 0) {
+		n = 1
+	}
+	return n
 }
 
 // handleCallIndirect lowers `call_indirect <typeidx> <tableidx>`. The
@@ -1724,6 +1803,9 @@ func (ls *lowerState) handleCallIndirect(r *wasm.InstrReader) error {
 	v := ls.b.NewValueAuxInt(ssa.OpCallIndirect, resType, int64(typeIdx), args...)
 	if len(ft.Results) == 1 {
 		ls.push(v)
+	}
+	if ls.mayThrowIndirect(typeIdx) {
+		ls.emitExcCheck()
 	}
 	return nil
 }
@@ -2001,11 +2083,13 @@ func (ls *lowerState) handleEnd() (bool, error) {
 			}
 		}
 	case ctrlTry:
-		// The `end` closes the LAST handler sub-region; fall it through to
-		// post (the body and earlier handlers were closed at each catch).
-		// Every sub-region — body and handlers — is a pred of post; the
-		// handler entry blocks are landing pads with no CFG pred.
+		// The `end` closes the LAST clause into post (the body and earlier
+		// clauses were closed at each catch).
 		ls.captureTryBody(f) // no-op unless this is a handler-less try..end
+		// No clause matched ⇒ keep propagating. The frame is already popped,
+		// so this resolves to the ENCLOSING context.
+		ls.closeChain(f)
+		sealDeadExcBlocks(f.tryRegion, f.excChain)
 		if !ls.unreachable {
 			ls.recordIncoming(f.target, f.resultCount)
 			cur := ls.b.Current()
@@ -2018,28 +2102,6 @@ func (ls *lowerState) handleEnd() (bool, error) {
 			if err := ls.resolveIncoming(f.target, f.resultCount, f.stackHeightAtEntry); err != nil {
 				return false, err
 			}
-		}
-	}
-	return false, nil
-}
-
-// bodyHasTry reports whether a function body's instruction stream contains an
-// EH `try` (which selects the mutable-locals lowering mode).
-func bodyHasTry(body []byte) (bool, error) {
-	r := wasm.NewInstrReader(body)
-	if err := skipLocalDecls(r); err != nil {
-		return false, err
-	}
-	for !r.EOF() {
-		op, err := r.ReadByte()
-		if err != nil {
-			return false, err
-		}
-		if op == wasm.OpTry {
-			return true, nil
-		}
-		if err := r.SkipImmediates(op); err != nil {
-			return false, err
 		}
 	}
 	return false, nil
@@ -2193,6 +2255,8 @@ func decodeBlockResults(bt int64) ([]wasm.ValType, error) {
 		return []wasm.ValType{wasm.ValF32}, nil
 	case -0x04:
 		return []wasm.ValType{wasm.ValF64}, nil
+	case -0x05: // v128 (encoded as 0x7b → s33 -5)
+		return []wasm.ValType{wasm.ValV128}, nil
 	}
 	return nil, fmt.Errorf("blocktype %v not supported (function-type-index encoding)", bt)
 }
@@ -2223,6 +2287,8 @@ func zeroValueOf(b *ssa.FuncBuilder, t ssa.Type) *ssa.Value {
 		return b.NewValueAuxInt(ssa.OpConstF32, ssa.TypeF32, 0)
 	case ssa.TypeF64:
 		return b.NewValueAuxInt(ssa.OpConstF64, ssa.TypeF64, 0)
+	case ssa.TypeV128:
+		return b.NewValueAux(ssa.OpSimdConst, ssa.TypeV128, [2]uint64{0, 0})
 	}
 	return b.Const32(0)
 }
@@ -2246,6 +2312,8 @@ func toSSAType(t wasm.ValType) ssa.Type {
 		return ssa.TypeF32
 	case wasm.ValF64:
 		return ssa.TypeF64
+	case wasm.ValV128:
+		return ssa.TypeV128
 	}
 	return ssa.TypeInvalid
 }
@@ -2293,6 +2361,8 @@ func setupLocals(b *ssa.FuncBuilder, fn wasm.Function, ft wasm.FuncType) ([]*ssa
 				zero = b.NewValueAuxInt(ssa.OpConstF32, ssa.TypeF32, 0)
 			case ssa.TypeF64:
 				zero = b.NewValueAuxInt(ssa.OpConstF64, ssa.TypeF64, 0)
+			case ssa.TypeV128:
+				zero = b.NewValueAux(ssa.OpSimdConst, ssa.TypeV128, [2]uint64{0, 0})
 			default:
 				return nil, nil, fmt.Errorf("%w: zero-init local of type %v", ErrSSAUnsupported, st)
 			}

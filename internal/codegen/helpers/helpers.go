@@ -799,9 +799,23 @@ func memorySize(m *Module) int32 {
 	return int32(m.memSize.Load() >> 16)
 }
 
+// wasmMemHardCap is the implementation limit on linear-memory size:
+// 65534 pages, two short of wasm32's architectural 65536. Growth past
+// it fails with -1 like any resource limit (the JS API allows an
+// engine to refuse any grow). Keeping memSize strictly below 2^32
+// minus a 128 KiB margin is what makes the coalesced SIMD bounds check
+// (simd_v128_load_rng) exact: a group whose unwrapped address range
+// reaches past memSize can then never be a group whose members all
+// individually landed in bounds via u32 wraparound.
+//
+// A function rather than a const because the helper extractor carries
+// only function declarations into the output (it must stay in sync
+// with codegen's wasmMemHardCapBytes).
+func wasmMemHardCap() uint64 { return (1 << 32) - (1 << 17) }
+
 // memoryGrow grows m.memory by n wasm pages (64 KiB each). Returns the
-// previous page count, or -1 if the new size would exceed maxMem. n may be 0,
-// which simply returns the current size.
+// previous page count, or -1 if the new size would exceed maxMem or
+// wasmMemHardCap. n may be 0, which simply returns the current size.
 //
 // len(m.memory) must always equal the exact wasm memory size (memory.size
 // and every bounds check depend on it), but the backing array is grown
@@ -827,7 +841,7 @@ func memoryGrow(m *Module, n int32) int32 {
 	if m.maxMem != 0 && want > m.maxMem {
 		return -1
 	}
-	if want > 1<<32 {
+	if want > wasmMemHardCap() {
 		return -1
 	}
 	if m.memShared {
@@ -859,8 +873,8 @@ func memoryGrow(m *Module, n int32) int32 {
 	if m.maxMem != 0 && newCap > m.maxMem {
 		newCap = m.maxMem
 	}
-	if newCap > 1<<32 {
-		newCap = 1 << 32
+	if newCap > wasmMemHardCap() {
+		newCap = wasmMemHardCap()
 	}
 	grown := make([]byte, want, newCap)
 	copy(grown, m.memory)
@@ -918,14 +932,22 @@ func i64_rem_u_s(x, y int64) int64 { return int64(i64_rem_u(uint64(x), uint64(y)
 // optimisation — they exist purely so the SSA emitter has a single
 // pattern for every float binary op (the Go inliner removes the call).
 
-func f32_add(x, y float32) float32 { return x + y }
-func f32_sub(x, y float32) float32 { return x - y }
-func f32_mul(x, y float32) float32 { return x * y }
-func f32_div(x, y float32) float32 { return x / y }
-func f64_add(x, y float64) float64 { return x + y }
-func f64_sub(x, y float64) float64 { return x - y }
-func f64_mul(x, y float64) float64 { return x * y }
-func f64_div(x, y float64) float64 { return x / y }
+// The explicit same-type conversions are NOT redundant: they are
+// rounding points. Once these helpers inline, gc is free to fuse a
+// multiply feeding an add into a single FMA — legal Go, but wasm
+// requires every operation individually rounded, and a fused result
+// diverges from every wasm runtime (bitwise, and observably in greedy
+// sampling). A float conversion forces the intermediate rounding and
+// forbids the fusion (spec: Conversions, "rounds to the precision of
+// the target type"; the same rule math.FMA documents).
+func f32_add(x, y float32) float32 { return float32(x + y) }
+func f32_sub(x, y float32) float32 { return float32(x - y) }
+func f32_mul(x, y float32) float32 { return float32(x * y) }
+func f32_div(x, y float32) float32 { return float32(x / y) }
+func f64_add(x, y float64) float64 { return float64(x + y) }
+func f64_sub(x, y float64) float64 { return float64(x - y) }
+func f64_mul(x, y float64) float64 { return float64(x * y) }
+func f64_div(x, y float64) float64 { return float64(x / y) }
 
 func i32_eqz(x int32) int32 {
 	if x == 0 {
@@ -1069,6 +1091,32 @@ func i32_reinterpret_f32(x float32) int32 { return int32(math.Float32bits(x)) }
 func i64_reinterpret_f64(x float64) int64 { return int64(math.Float64bits(x)) }
 func f32_reinterpret_i32(x int32) float32 { return math.Float32frombits(uint32(x)) }
 func f64_reinterpret_i64(x int64) float64 { return math.Float64frombits(uint64(x)) }
+
+// f32_to_f16_bits converts a float32 to IEEE binary16 bits with
+// round-to-nearest-even. It agrees with the hardware convert
+// instruction (arm64 FCVT h,s) on every non-NaN input, denormals and
+// infinity included; NaN maps to sign|0x7E00. Injected by the SSA
+// pass that recognizes the software fp32→fp16 rounding idiom — at
+// those sites the NaN case is handled by the surrounding branch, so
+// only the non-NaN agreement is load-bearing. The asm backend
+// splices this call into the native convert.
+func f32_to_f16_bits(x float32) int32 {
+	w := math.Float32bits(x)
+	shl1w := w + w
+	sign := w & 0x80000000
+	if shl1w > 0xFF000000 { // NaN
+		return int32((sign >> 16) | 0x7E00)
+	}
+	bias := shl1w & 0xFF000000
+	if bias < 0x71000000 {
+		bias = 0x71000000
+	}
+	f := math.Float32frombits(w&0x7FFFFFFF) * 0x1p+112 * 0x1p-110
+	f += math.Float32frombits((bias >> 1) + 0x07800000)
+	fbits := math.Float32bits(f)
+	nonsign := (fbits>>13)&0x7C00 + fbits&0xFFF
+	return int32((sign >> 16) | nonsign)
+}
 
 // ----- Sign-extension (wasm 1.0 extension) -------------------------------
 
@@ -1944,3 +1992,563 @@ func threadSpawn(m *Module, arg int32) int32 {
 //
 //go:noinline
 func ThreadsWait(m *Module) { m.threads.wg.Wait() }
+
+// ----- SIMD (v128) helpers ------------------------------------------------
+//
+// A v128 value is a [2]uint64: word 0 holds lanes 0-7 with byte lane 0 in
+// its least-significant byte, word 1 holds lanes 8-15 — wasm's little-endian
+// lane order. These are scalar reference implementations of the SIMD
+// proposal's semantics (saturation, NaN propagation, round-to-even, lane
+// masking of shift counts); the per-lane loops are deliberately simple and
+// branch-free where the spec allows. All entry points are //go:noinline so
+// the captured-asm backend sees plain calls it can keep (or fall back on)
+// instead of inlined bodies.
+
+//go:noinline
+func wasm_trap_simd_oob() { panic("wasm: v128 memory access out of bounds") }
+
+// gcasmMemProbe anchors the Module field offsets the gcasm memory-op
+// splices hardcode. The splices read m.M and m.memSize straight off the
+// receiver in generated assembly, and the offsets of those fields
+// depend on the module (the import-interface fields between them vary).
+// Rather than re-deriving Go's struct layout, gcasm extracts the two
+// offsets from THIS function's captured assembly — two loads off R0/AX,
+// M first — so they always come from the same compile that produced the
+// code being spliced. Never called at run time.
+//
+//go:noinline
+func gcasmMemProbe(m *Module) (unsafe.Pointer, *atomic.Uint64) {
+	return m.M, m.memSize
+}
+
+func simdEA(m *Module, addr int32, offset int32, size uint64) uint64 {
+	// Same shape as atomicEA, minus the alignment trap: SIMD memory access
+	// is alignment-hint-only, never trapping on misalignment.
+	ea := uint64(uint32(addr)) + uint64(uint32(offset))
+	if ea+size > m.memSize.Load() {
+		wasm_trap_simd_oob()
+	}
+	return ea
+}
+
+// Lane converters. Each returns lanes in index order (lane 0 first).
+
+// simd_v128_load_rng is the range-checked first load of a coalesced
+// group (pass.CoalesceSimdBounds): one trap decision covers every
+// access in [addr+rlo, addr+rlo+span), then it loads at its own
+// addr+offset. The group's other loads use the unchecked _nc form
+// below — which is only sound BECAUSE this ran first; nothing else may
+// emit either form.
+//
+// rlo is SIGNED: the group minimum may lie below this load's own
+// address when the group's loads appear out of address order, and when
+// a member's u32 address arithmetic wrapped, addr+rlo can go negative
+// — a negative start means some member sits just below 2^32 unwrapped,
+// which the per-load checks would have trapped (memSize can never
+// reach 2^32: memoryGrow stops at wasmMemHardCap), so trapping on
+// start < 0 reproduces the original semantics exactly.
+//
+//go:noinline
+func simd_v128_load_rng(m *Module, addr int32, offset int32, rlo int32, span int32) [2]uint64 {
+	start := int64(uint64(uint32(addr))) + int64(rlo)
+	if start < 0 || uint64(start)+uint64(uint32(span)) > m.memSize.Load() {
+		wasm_trap_simd_oob()
+	}
+	ea := uint64(uint32(addr)) + uint64(uint32(offset))
+	p := unsafe.Add(m.M, uintptr(ea))
+	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
+}
+
+// simd_v128_load_nc is simd_v128_load minus the bounds check; emitted
+// only by the bounds-coalescing pass, always behind a covering
+// simd_v128_load_rng.
+//
+//go:noinline
+func simd_v128_load_nc(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := uint64(uint32(addr)) + uint64(uint32(offset))
+	p := unsafe.Add(m.M, uintptr(ea))
+	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
+}
+
+//go:noinline
+func simd_v128_load(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 16)
+	p := unsafe.Add(m.M, uintptr(ea))
+	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
+}
+
+// The simd_scalar_* helpers are the pure fallback bodies of the
+// scalar-chain vocabulary inside fused regions (see internal/simdfuse):
+// the per-block scale computations ggml kernels run between vector
+// statements. The loads are UNCHECKED on purpose — they replace the
+// emitter's own unchecked scalar derefs (`*(*uint16)(unsafe.Add(mBase,
+// uint32(a)))`), whose safety rests on the same memoryGrow hard cap.
+// The arithmetic wraps mod 2^32 exactly like the wasm ops it lowers.
+
+//go:noinline
+func simd_scalar_i32_load16_u(m *Module, addr int32) int32 {
+	return int32(*(*uint16)(unsafe.Add(m.M, uintptr(uint32(addr)))))
+}
+
+//go:noinline
+func simd_scalar_f32_load(m *Module, addr int32) float32 {
+	return *(*float32)(unsafe.Add(m.M, uintptr(uint32(addr))))
+}
+
+//go:noinline
+func simd_scalar_i32_shl(v int32, s int32) int32 { return v << (uint(s) % 32) }
+
+//go:noinline
+func simd_scalar_i32_add(a int32, b int32) int32 { return a + b }
+
+//go:noinline
+func simd_scalar_f32_mul(a float32, b float32) float32 { return a * b }
+
+//go:noinline
+func simd_v128_f16x4_cvt_store(m *Module, addr int32, offset int32, v [2]uint64) int32 {
+	// Convert four f32 lanes to f16 with the software idiom's exact
+	// semantics (the bias/multiply rounding chain; NaN forced to
+	// sign|0x7E00 — the same contract as simd_f16x4_cvt_bits, inlined
+	// so this helper carries no cross-file symbol dependency) and
+	// store the packed 8-byte word.
+	ea := simdEA(m, addr, offset, 8)
+	var out uint64
+	for i := 0; i < 4; i++ {
+		w := uint32(v[i/2] >> (32 * uint(i) % 64))
+		shl1w := w + w
+		sign := w & 0x80000000
+		var h uint32
+		if shl1w > 0xFF000000 { // NaN
+			h = (sign >> 16) | 0x7E00
+		} else {
+			bias := shl1w & 0xFF000000
+			if bias < 0x71000000 {
+				bias = 0x71000000
+			}
+			f := math.Float32frombits(w&0x7FFFFFFF) * 0x1p+112 * 0x1p-110
+			f += math.Float32frombits((bias >> 1) + 0x07800000)
+			fbits := math.Float32bits(f)
+			h = (sign >> 16) | (fbits>>13)&0x7C00 + fbits&0xFFF
+		}
+		out |= uint64(uint16(h)) << (16 * uint(i))
+	}
+	*(*uint64)(unsafe.Add(m.M, uintptr(ea))) = out
+	return 0
+}
+
+//go:noinline
+func simd_v128_store(m *Module, addr int32, offset int32, v [2]uint64) int32 {
+	ea := simdEA(m, addr, offset, 16)
+	p := unsafe.Add(m.M, uintptr(ea))
+	*(*uint64)(p) = v[0]
+	*(*uint64)(unsafe.Add(p, 8)) = v[1]
+	return 0
+}
+
+//go:noinline
+func simd_v128_load8x8_s(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	p := unsafe.Add(m.M, uintptr(ea))
+	var out [2]uint64
+	for i := 0; i < 8; i++ {
+		x := *(*uint8)(unsafe.Add(p, 1*i))
+		out[i*16/64] |= uint64(uint16(int16(int8(x)))) << (16 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load8x8_u(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	p := unsafe.Add(m.M, uintptr(ea))
+	var out [2]uint64
+	for i := 0; i < 8; i++ {
+		x := *(*uint8)(unsafe.Add(p, 1*i))
+		out[i*16/64] |= uint64(uint16(x)) << (16 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load16x4_s(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	p := unsafe.Add(m.M, uintptr(ea))
+	var out [2]uint64
+	for i := 0; i < 4; i++ {
+		x := *(*uint16)(unsafe.Add(p, 2*i))
+		out[i*32/64] |= uint64(uint32(int32(int16(x)))) << (32 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load16x4_u(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	p := unsafe.Add(m.M, uintptr(ea))
+	var out [2]uint64
+	for i := 0; i < 4; i++ {
+		x := *(*uint16)(unsafe.Add(p, 2*i))
+		out[i*32/64] |= uint64(uint32(x)) << (32 * uint(i) % 64)
+	}
+	return out
+}
+
+// f16BitsToF32Bits is the IEEE binary16 -> binary32 conversion,
+// bit-exact including subnormals, infinities and NaN payloads.
+func f16BitsToF32Bits(h uint16) uint32 {
+	sign := uint32(h>>15) << 31
+	exp := uint32(h>>10) & 0x1F
+	man := uint32(h) & 0x3FF
+	switch exp {
+	case 0:
+		if man == 0 {
+			return sign
+		}
+		e := uint32(113)
+		for man&0x400 == 0 {
+			man <<= 1
+			e--
+		}
+		return sign | e<<23 | (man&0x3FF)<<13
+	case 0x1F:
+		return sign | 0xFF<<23 | man<<13
+	}
+	return sign | (exp+112)<<23 | man<<13
+}
+
+// simd_f16x4_cvt converts four f16 values (widened to the low 16 bits
+// of each i32x4 lane, the v128_load16x4_u result shape) to f32 lanes.
+// Emitted only after the transpiler verified the module's conversion
+// table is the IEEE map, so this computed conversion is bit-identical
+// to the table reads it replaces (and to XTN+FCVTL on arm64).
+//
+//go:noinline
+func simd_f16x4_cvt(v [2]uint64) [2]uint64 {
+	var out [2]uint64
+	for i := 0; i < 4; i++ {
+		bits := uint16(v[i/2] >> (32 * uint(i) % 64))
+		out[i/2] |= uint64(f16BitsToF32Bits(bits)) << (32 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load32x2_s(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	p := unsafe.Add(m.M, uintptr(ea))
+	var out [2]uint64
+	for i := 0; i < 2; i++ {
+		x := *(*uint32)(unsafe.Add(p, 4*i))
+		out[i*64/64] |= uint64(uint64(int64(int32(x)))) << (64 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load32x2_u(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	p := unsafe.Add(m.M, uintptr(ea))
+	var out [2]uint64
+	for i := 0; i < 2; i++ {
+		x := *(*uint32)(unsafe.Add(p, 4*i))
+		out[i*64/64] |= uint64(uint64(x)) << (64 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load8_splat(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 1)
+	x := *(*uint8)(unsafe.Add(m.M, uintptr(ea)))
+	var out [2]uint64
+	for i := 0; i < 16; i++ {
+		out[i*8/64] |= uint64(x) << (8 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load16_splat(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 2)
+	x := *(*uint16)(unsafe.Add(m.M, uintptr(ea)))
+	var out [2]uint64
+	for i := 0; i < 8; i++ {
+		out[i*16/64] |= uint64(x) << (16 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load32_splat(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 4)
+	x := *(*uint32)(unsafe.Add(m.M, uintptr(ea)))
+	var out [2]uint64
+	for i := 0; i < 4; i++ {
+		out[i*32/64] |= uint64(x) << (32 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load64_splat(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	x := *(*uint64)(unsafe.Add(m.M, uintptr(ea)))
+	var out [2]uint64
+	for i := 0; i < 2; i++ {
+		out[i*64/64] |= uint64(x) << (64 * uint(i) % 64)
+	}
+	return out
+}
+
+//go:noinline
+func simd_v128_load32_zero(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 4)
+	return [2]uint64{uint64(*(*uint32)(unsafe.Add(m.M, uintptr(ea)))), 0}
+}
+
+//go:noinline
+func simd_v128_load64_zero(m *Module, addr int32, offset int32) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	return [2]uint64{*(*uint64)(unsafe.Add(m.M, uintptr(ea))), 0}
+}
+
+//go:noinline
+func simd_v128_load8_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA(m, addr, offset, 1)
+	x := *(*uint8)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 8 * uint(lane) % 64
+	i := int(lane) * 8 / 64
+	v[i] = v[i]&^(uint64(uint8(^uint8(0)))<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_v128_load16_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA(m, addr, offset, 2)
+	x := *(*uint16)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 16 * uint(lane) % 64
+	i := int(lane) * 16 / 64
+	v[i] = v[i]&^(uint64(uint16(^uint16(0)))<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_v128_load32_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA(m, addr, offset, 4)
+	x := *(*uint32)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 32 * uint(lane) % 64
+	i := int(lane) * 32 / 64
+	v[i] = v[i]&^(uint64(uint32(^uint32(0)))<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_v128_load64_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) [2]uint64 {
+	ea := simdEA(m, addr, offset, 8)
+	x := *(*uint64)(unsafe.Add(m.M, uintptr(ea)))
+	sh := 64 * uint(lane) % 64
+	i := int(lane) * 64 / 64
+	v[i] = v[i]&^(uint64(uint64(^uint64(0)))<<sh) | uint64(x)<<sh
+	return v
+}
+
+//go:noinline
+func simd_v128_store8_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) int32 {
+	ea := simdEA(m, addr, offset, 1)
+	x := uint8(v[int(lane)*8/64] >> (8 * uint(lane) % 64))
+	*(*uint8)(unsafe.Add(m.M, uintptr(ea))) = x
+	return 0
+}
+
+//go:noinline
+func simd_v128_store16_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) int32 {
+	ea := simdEA(m, addr, offset, 2)
+	x := uint16(v[int(lane)*16/64] >> (16 * uint(lane) % 64))
+	*(*uint16)(unsafe.Add(m.M, uintptr(ea))) = x
+	return 0
+}
+
+//go:noinline
+func simd_v128_store32_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) int32 {
+	ea := simdEA(m, addr, offset, 4)
+	x := uint32(v[int(lane)*32/64] >> (32 * uint(lane) % 64))
+	*(*uint32)(unsafe.Add(m.M, uintptr(ea))) = x
+	return 0
+}
+
+//go:noinline
+func simd_v128_store64_lane(m *Module, addr int32, offset int32, lane int32, v [2]uint64) int32 {
+	ea := simdEA(m, addr, offset, 8)
+	x := uint64(v[int(lane)*64/64] >> (64 * uint(lane) % 64))
+	*(*uint64)(unsafe.Add(m.M, uintptr(ea))) = x
+	return 0
+}
+
+// Scalar-pair forms of the SIMD memory helpers, mirroring the pure
+// ops' simd_p_* wrappers in simd_pair.go: the scalarized emitter
+// carries v128 values as two uint64 locals, which stay in registers
+// where a [2]uint64 array would be stack-assigned. The gcasm
+// backend splices these calls away; elsewhere they inline.
+
+func simd_p_pack(lo, hi uint64) [2]uint64 { return [2]uint64{lo, hi} }
+
+//go:noinline
+func simd_p_v128_load_rng(m *Module, addr int32, offset int32, rlo int32, span int32) (uint64, uint64) {
+	r := simd_v128_load_rng(m, addr, offset, rlo, span)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load_nc(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load_nc(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load8x8_s(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load8x8_s(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load8x8_u(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load8x8_u(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load16x4_s(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load16x4_s(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load16x4_u(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load16x4_u(m, addr, offset)
+	return r[0], r[1]
+}
+
+// Referenced only from generated bundle code; the blank use keeps
+// the analyzer quiet.
+var _ = simd_p_f16x4_cvt
+
+// The packed f16 store conversion is referenced by generated code
+// only; keep the template pair alive for the in-package linter.
+var (
+	_ = simd_v128_f16x4_cvt_store
+	_ = simd_p_v128_f16x4_cvt_store
+)
+
+//go:noinline
+func simd_p_f16x4_cvt(lo uint64, hi uint64) (uint64, uint64) {
+	r := simd_f16x4_cvt([2]uint64{lo, hi})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load32x2_s(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load32x2_s(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load32x2_u(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load32x2_u(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load8_splat(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load8_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load16_splat(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load16_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load32_splat(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load32_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load64_splat(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load64_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load32_zero(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load32_zero(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load64_zero(m *Module, addr int32, offset int32) (uint64, uint64) {
+	r := simd_v128_load64_zero(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load8_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_v128_load8_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load16_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_v128_load16_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load32_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_v128_load32_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_load64_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_v128_load64_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_v128_store(m *Module, addr int32, offset int32, v0, v1 uint64) int32 {
+	return simd_v128_store(m, addr, offset, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_v128_f16x4_cvt_store(m *Module, addr int32, offset int32, v0, v1 uint64) int32 {
+	return simd_v128_f16x4_cvt_store(m, addr, offset, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_v128_store8_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) int32 {
+	return simd_v128_store8_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_v128_store16_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) int32 {
+	return simd_v128_store16_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_v128_store32_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) int32 {
+	return simd_v128_store32_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_v128_store64_lane(m *Module, addr int32, offset int32, lane int32, v0, v1 uint64) int32 {
+	return simd_v128_store64_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}

@@ -189,6 +189,37 @@ var fixtures = []fixture{
 			{export: "f64_nan_payload_bits", resType: wasm.ValI64},
 		},
 	},
+	{
+		// SIMD coverage: every export folds one v128 op family to a scalar
+		// and is diffed against wazero (CoreFeaturesV2 includes SIMD).
+		name: "cg_simd.wasm",
+		calls: []call{
+			{export: "sat8", args: []uint64{100, 100}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "sat8", args: []uint64{u32(-100), 60}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "sat16", args: []uint64{30000, 30000}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "sat16", args: []uint64{u32(-30000), u32(-30000)}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "cmpmask", args: []uint64{u32(-5), 3}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "cmpmask", args: []uint64{7, 7}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "intarith", args: []uint64{u32(-123456), 789}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "intarith", args: []uint64{0x80000000, 0xffffffff}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "widen", args: []uint64{u32(-32768), 32767}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "widen", args: []uint64{257, u32(-2)}, argTypes: []wasm.ValType{wasm.ValI32, wasm.ValI32}, resType: wasm.ValI32},
+			{export: "i64ops", args: []uint64{uint64(0x8000000000000000), 999999999999}, argTypes: []wasm.ValType{wasm.ValI64, wasm.ValI64}, resType: wasm.ValI64},
+			{export: "i64ops", args: []uint64{42, u32(-1)}, argTypes: []wasm.ValType{wasm.ValI64, wasm.ValI64}, resType: wasm.ValI64},
+			{export: "f32ops", args: []uint64{0x40490fdb /* pi */, 0xc02df854 /* -e */}, argTypes: []wasm.ValType{wasm.ValF32, wasm.ValF32}, resType: wasm.ValI32},
+			{export: "f32ops", args: []uint64{0x3f000000 /* 0.5 */, 0x80000000 /* -0 */}, argTypes: []wasm.ValType{wasm.ValF32, wasm.ValF32}, resType: wasm.ValI32},
+			{export: "f64ops", args: []uint64{0x400921fb54442d18 /* pi */, 0xc005bf0a8b145769 /* -e */}, argTypes: []wasm.ValType{wasm.ValF64, wasm.ValF64}, resType: wasm.ValI64},
+			{export: "fcmp", args: []uint64{0x7fc00000 /* NaN */, 0x3f800000 /* 1.0 */}, argTypes: []wasm.ValType{wasm.ValF32, wasm.ValF32}, resType: wasm.ValI32},
+			{export: "fcmp", args: []uint64{0x80000000 /* -0 */, 0x00000000 /* +0 */}, argTypes: []wasm.ValType{wasm.ValF32, wasm.ValF32}, resType: wasm.ValI32},
+			{export: "fcmp", args: []uint64{0x3f800000, 0x40000000}, argTypes: []wasm.ValType{wasm.ValF32, wasm.ValF32}, resType: wasm.ValI32},
+			{export: "conv", args: []uint64{0x4f800000 /* 2^32 */}, argTypes: []wasm.ValType{wasm.ValF32}, resType: wasm.ValI32},
+			{export: "conv", args: []uint64{0xcf000000 /* -2^31 */}, argTypes: []wasm.ValType{wasm.ValF32}, resType: wasm.ValI32},
+			{export: "conv", args: []uint64{0x7fc00000 /* NaN */}, argTypes: []wasm.ValType{wasm.ValF32}, resType: wasm.ValI32},
+			{export: "shuf", args: []uint64{0x55}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "shuf", args: []uint64{u32(-1)}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+			{export: "memv", args: []uint64{0}, argTypes: []wasm.ValType{wasm.ValI32}, resType: wasm.ValI32},
+		},
+	},
 }
 
 func TestFixtures(t *testing.T) {
@@ -272,7 +303,7 @@ func runFixture(t *testing.T, fx fixture) {
 
 	// Synthesize a main.go that calls each export and prints results.
 	var mainSB strings.Builder
-	mainSB.WriteString("package main\n\nimport (\n\t\"fmt\"\n\t\"gentest/pkg\"\n)\n\nfunc main() {\n")
+	mainSB.WriteString("package main\n\nimport (\n\t\"fmt\"\n\t\"math\"\n\t\"gentest/pkg\"\n)\n\nvar _ = math.Float32frombits\n\nfunc main() {\n")
 	mainSB.WriteString("\tm := pkg.New()\n")
 	for _, c := range fx.calls {
 		methodName := codegen.ExportMethodName(c.export)
@@ -283,6 +314,12 @@ func runFixture(t *testing.T, fx fixture) {
 				argList = append(argList, fmt.Sprintf("int32(%d)", int32(a)))
 			case wasm.ValI64:
 				argList = append(argList, fmt.Sprintf("int64(%d)", int64(a)))
+			case wasm.ValF32:
+				// Bit-exact: a decimal round-trip would corrupt NaNs and
+				// is needless for everything else.
+				argList = append(argList, fmt.Sprintf("math.Float32frombits(0x%x)", uint32(a)))
+			case wasm.ValF64:
+				argList = append(argList, fmt.Sprintf("math.Float64frombits(0x%x)", a))
 			default:
 				argList = append(argList, fmt.Sprintf("%d", a))
 			}

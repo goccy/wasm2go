@@ -52,7 +52,7 @@ var (
 	inlineMaxBody = envInt("WASM2GO_INLINE_MAXBODY", 4096)
 	// Max bodyBytes × staticCallSites product: bounds the total code
 	// growth any single callee can cause module-wide.
-	inlineMaxProduct = envInt("WASM2GO_INLINE_MAXPRODUCT", 49152)
+	inlineMaxProduct = envInt("WASM2GO_INLINE_MAXPRODUCT", 131072)
 	// Max total wasm bytes inlined into one caller.
 	inlineCallerBudget = envInt("WASM2GO_INLINE_CALLER_BUDGET", 65536)
 	// Bisection gate (mirrors WASM2GO_SSA_MINFUNC/MAXFUNC): inlining
@@ -105,6 +105,15 @@ type fnInlineInfo struct {
 	leaf      bool // no call / call_indirect anywhere in the body
 	hasTry    bool
 	sites     int // static `call <idx>` sites referencing this function
+	// innerCalls lists the direct callees inside the body (dedup'd);
+	// hasIndirect marks a call_indirect. A non-leaf body may still
+	// inline when every inner call is direct and non-throwing: the
+	// inner calls stay ordinary calls inside the inline frame, which
+	// keeps recursion impossible and code growth capped, and the
+	// non-throwing requirement keeps the post-call exception check
+	// (whose edge would need the CALLER's locals) out of the frame.
+	innerCalls  []uint32
+	hasIndirect bool
 }
 
 type inlineAnalysis struct {
@@ -163,8 +172,19 @@ func scanBodyForInline(body []byte, a *inlineAnalysis, info *fnInlineInfo) error
 			if ci, ok := a.fns[callee]; ok {
 				ci.sites++
 			}
+			seen := false
+			for _, c := range info.innerCalls {
+				if c == callee {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				info.innerCalls = append(info.innerCalls, callee)
+			}
 		case wasm.OpCallIndirect:
 			info.leaf = false
+			info.hasIndirect = true
 			if err := r.SkipImmediates(op); err != nil {
 				return err
 			}
@@ -188,19 +208,31 @@ func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
 	if inlineOff {
 		return false
 	}
+	// Depth 1 only: a call inside an inline frame stays a call. This
+	// is what makes non-leaf inlining terminate — without it, two
+	// small functions calling each other expand forever.
+	if len(ls.inlineFrames) > 0 {
+		return false
+	}
 	if int(ls.callerIdx) < inlineMinFn || (inlineMaxFn >= 0 && int(ls.callerIdx) >= inlineMaxFn) {
 		return false
 	}
 	if inlineOnlyCallees != nil && !inlineOnlyCallees[funcIdx] {
 		return false
 	}
-	// The caller's mutable-locals mode keeps locals as indexed Go vars;
-	// splicing a callee would collide local indices.
-	if ls.mutableLocals {
-		return false
-	}
 	if funcIdx < ls.mod.NumImportedFuncs {
 		return false // imports have no body
+	}
+	// A callee that can leave an exception pending needs a post-call check
+	// whose exception edge carries the CALLER's locals; inside an inline
+	// frame the local set is the callee's, so the edge would be malformed.
+	// Refusing such callees also keeps the check-and-branch out of spliced
+	// bodies entirely.
+	if ls.mayThrowCall(funcIdx) {
+		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: may throw\n", funcIdx)
+		}
+		return false
 	}
 	if len(ft.Results) > 1 {
 		return false
@@ -209,13 +241,50 @@ func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
 		return false
 	}
 	info, ok := ls.inlineInfo.fns[funcIdx]
-	if !ok || !info.leaf || info.hasTry {
+	if !ok || info.hasTry {
+		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: ok=%v hasTry=%v\n", funcIdx, ok, ok && info.hasTry)
+		}
 		return false
 	}
+	// A non-leaf body may inline when every inner call is direct,
+	// defined, and non-throwing: the inner calls stay ordinary calls
+	// inside the inline frame (no recursion, growth still capped by
+	// the body-size products), and no post-call exception check is
+	// needed inside the frame.
+	if !info.leaf {
+		// Bound the relaxation tightly: only SMALL non-leaf bodies
+		// (the expf/erf class of math kernels with cold error-path
+		// calls) qualify — opening it wider inflates module-wide
+		// code growth and compile time out of proportion.
+		if info.bodyBytes > envInt("WASM2GO_INLINE_NONLEAF_MAXBODY", 512) {
+			return false
+		}
+		if info.hasIndirect {
+			if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
+				fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: indirect call inside\n", funcIdx)
+			}
+			return false
+		}
+		for _, c := range info.innerCalls {
+			if c < ls.mod.NumImportedFuncs || ls.mayThrowCall(c) {
+				if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: inner call fn%d import/throwing\n", funcIdx, c)
+				}
+				return false
+			}
+		}
+	}
 	if info.bodyBytes > inlineMaxBody {
+		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: body %d\n", funcIdx, info.bodyBytes)
+		}
 		return false
 	}
 	if info.bodyBytes*info.sites > inlineMaxProduct {
+		if os.Getenv("WASM2GO_INLINE_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "wasm2go: inline reject fn%d: product %d\n", funcIdx, info.bodyBytes*info.sites)
+		}
 		return false
 	}
 	if ls.inlinedBytes+info.bodyBytes > inlineCallerBudget {

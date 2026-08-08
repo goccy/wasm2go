@@ -24,7 +24,7 @@ func runOptPipeline(t *testing.T, mod *wasm.Module, export string) (before, afte
 	if idx == ^uint32(0) {
 		t.Fatalf("export %q not found", export)
 	}
-	fn, err := lower.LowerFunction(mod, idx, export)
+	fn, err := lower.LowerFunction(mod, idx, export, nil)
 	if err != nil {
 		t.Fatalf("lower %s: %v", export, err)
 	}

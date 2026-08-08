@@ -184,7 +184,9 @@ func CollectHoistedRefs(v *ssa.Value, hoist map[ssa.ValueID]bool, out map[ssa.Va
 // (a real Go value, not the Mem state token, Tuple, or Invalid).
 func IsScalarType(t ssa.Type) bool {
 	switch t {
-	case ssa.TypeI32, ssa.TypeI64, ssa.TypeF32, ssa.TypeF64, ssa.TypeBool:
+	case ssa.TypeI32, ssa.TypeI64, ssa.TypeF32, ssa.TypeF64, ssa.TypeBool, ssa.TypeV128:
+		// v128 counts: a [2]uint64 works as a hoisted local exactly like a
+		// scalar does.
 		return true
 	}
 	return false
@@ -205,6 +207,10 @@ func IsScalarType(t ssa.Type) bool {
 // to keep them sound.
 func IsLoadOp(op ssa.Op) bool {
 	switch op {
+	case ssa.OpExcPending, ssa.OpExcTag, ssa.OpExcVal:
+		// Reads of the module's exception state: a call or a raise can
+		// change them, so they must not float across one.
+		return true
 	case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
 		ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
 		ssa.OpLoadF32, ssa.OpLoadF64,
@@ -227,11 +233,19 @@ func IsLoadOp(op ssa.Op) bool {
 // sub-word store helpers still return a dummy scalar; discarding it in
 // an expression statement is fine.)
 func IsVoidAtomicStore(v *ssa.Value) bool {
-	if v == nil || v.Op != ssa.OpAtomicCall {
+	if v == nil {
 		return false
 	}
 	name, _ := v.Aux.(string)
-	return strings.HasPrefix(name, "atomicStore")
+	switch v.Op {
+	case ssa.OpAtomicCall:
+		return strings.HasPrefix(name, "atomicStore")
+	case ssa.OpSimdMemCall:
+		// SIMD stores are void too: they must stay in statement position
+		// rather than being hoisted into a dummy result variable.
+		return strings.HasPrefix(name, "simd_v128_store")
+	}
+	return false
 }
 
 // IsNarrowingStore reports whether v is a memory store that writes

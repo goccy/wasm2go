@@ -47,7 +47,7 @@ func TestStructuredEmit(t *testing.T) {
 		if idx == ^uint32(0) {
 			t.Fatalf("export %q not found", export)
 		}
-		fn, err := lower.LowerFunction(mod, idx, export)
+		fn, err := lower.LowerFunction(mod, idx, export, nil)
 		if err != nil {
 			return "", false, false
 		}

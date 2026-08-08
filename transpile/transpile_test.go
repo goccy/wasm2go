@@ -371,11 +371,13 @@ func main() {
 	}
 }
 
-// TestTranspileEHTrampoline exercises the recover-trampoline goto-EH path: a
-// try/catch inside a multi-exit loop, which the structured emitter cannot
-// handle, so the function is laid out as `for { __exc := func(){…}(); … }`.
+// TestTranspileEHLoopCatch exercises a try/catch inside a multi-exit loop —
+// the shape that used to need the recover-trampoline, and the one clang's
+// setjmp/longjmp lowering produces. Branch-based EH turns the handler into
+// an ordinary block, so this is now plain control flow with no closure, no
+// program-counter dispatch, and no panic on the exception path.
 // run(3) catches 3==x on the 3rd iteration -> 100; run(50) hits i>=10 -> 200.
-func TestTranspileEHTrampoline(t *testing.T) {
+func TestTranspileEHLoopCatch(t *testing.T) {
 	bin := testfixture.Wasm(t, "eh_trampoline")
 	m, err := transpile.Parse(bytes.NewReader(bin))
 	if err != nil {
@@ -386,16 +388,18 @@ func TestTranspileEHTrampoline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Translate: %v", err)
 	}
-	// Confirm the trampoline layout was used (not the flat goto emitter). The
-	// EH function body lands in the pure-fallback file, not the main buf.
-	hasPC := strings.Contains(buf.String(), "__pc")
+	// No panic/recover machinery may survive on the exception path: that is
+	// what keeps EH function bodies transformable by the asm backend.
+	sources := []string{buf.String()}
 	for _, data := range res.Files {
-		if strings.Contains(string(data), "__pc") {
-			hasPC = true
-		}
+		sources = append(sources, string(data))
 	}
-	if !hasPC {
-		t.Fatalf("expected recover-trampoline (__pc) in output; got the flat layout")
+	for _, src := range sources {
+		for _, banned := range []string{"__pc", "wasm_catch", "wasmExc"} {
+			if strings.Contains(src, banned) {
+				t.Fatalf("generated EH code still uses %q", banned)
+			}
+		}
 	}
 
 	dir := t.TempDir()

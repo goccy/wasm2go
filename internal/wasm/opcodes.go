@@ -211,5 +211,6 @@ const (
 	OpRefFunc byte = 0xd2
 
 	OpPrefixFC byte = 0xfc // saturating-trunc, bulk-memory
+	OpPrefixFD byte = 0xfd // SIMD proposal: v128 ops
 	OpPrefixFE byte = 0xfe // threads proposal: atomics
 )

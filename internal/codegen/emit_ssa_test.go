@@ -31,7 +31,7 @@ func TestEmitSSAFuncBody(t *testing.T) {
 	if addIdx == ^uint32(0) {
 		t.Fatalf("missing add export")
 	}
-	ssaFn, err := lower.LowerFunction(mod, addIdx, "add")
+	ssaFn, err := lower.LowerFunction(mod, addIdx, "add", nil)
 	if err != nil {
 		t.Fatalf("lower: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestEmitSSAComparison(t *testing.T) {
 	if idx == ^uint32(0) {
 		t.Skip("lt_u not exported")
 	}
-	ssaFn, err := lower.LowerFunction(mod, idx, "lt_u")
+	ssaFn, err := lower.LowerFunction(mod, idx, "lt_u", nil)
 	if err != nil {
 		t.Fatalf("lower: %v", err)
 	}

@@ -10,41 +10,18 @@ package ssa
 // Entry block itself; every other reachable block maps to its unique
 // immediate dominator.
 func Dominators(f *Func) map[BlockID]*Block {
-	idom, _ := iterativeDom(f.Entry, ehSuccs(f), f.Blocks)
+	idom, _ := iterativeDom(f.Entry, cfgSuccs, f.Blocks)
 	return idom
 }
 
-// ehSuccs returns a successor function that augments the real CFG with the
-// exceptional edges of EH try regions: a catch-handler landing pad has no CFG
-// predecessor (it is entered by the runtime unwinding into the try), so the
-// dominance/back-edge analyses would treat it — and any resume loop whose
-// back-edge originates in the handler (the shape clang emits for
-// setjmp/longjmp) — as unreachable. Modelling `try Entry -> handler` makes the
-// handler dominated by the try body, so the resume back-edge is detected.
-// Functions with no try regions get the plain successor function unchanged.
-// NOTE: this is for dominance analysis only; the emitter walks real b.Succs.
-func ehSuccs(f *Func) func(*Block) []*Block {
-	if len(f.TryRegions) == 0 {
-		return blockSuccs
+// cfgSuccs is the plain successor list. Branch-based exception handling
+// reaches handlers through real edges, so no virtual edges are needed.
+func cfgSuccs(b *Block) []*Block {
+	out := make([]*Block, 0, len(b.Succs))
+	for _, e := range b.Succs {
+		out = append(out, e.Block)
 	}
-	extra := map[BlockID][]*Block{}
-	for _, tr := range f.TryRegions {
-		if tr.Entry == nil {
-			continue
-		}
-		for _, h := range tr.Handlers {
-			if h.Block != nil {
-				extra[tr.Entry.ID] = append(extra[tr.Entry.ID], h.Block)
-			}
-		}
-	}
-	return func(b *Block) []*Block {
-		s := blockSuccs(b)
-		if e, ok := extra[b.ID]; ok {
-			s = append(s, e...)
-		}
-		return s
-	}
+	return out
 }
 
 // PostDominators returns the immediate-post-dominator map: idom of the
@@ -85,14 +62,6 @@ func PostDominators(f *Func) map[BlockID]*Block {
 			continue
 		}
 		out[b.ID] = d
-	}
-	return out
-}
-
-func blockSuccs(b *Block) []*Block {
-	out := make([]*Block, 0, len(b.Succs))
-	for _, e := range b.Succs {
-		out = append(out, e.Block)
 	}
 	return out
 }
