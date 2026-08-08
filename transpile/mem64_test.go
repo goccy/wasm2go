@@ -147,3 +147,77 @@ func TestMem64BeyondFourGiB(t *testing.T) {
 		t.Errorf("read past 4GiB: got %s, want 424242", lines[1])
 	}
 }
+
+// TestMem64Wasip1Hello runs a real wasm64-wasip1 binary — C compiled
+// with clang -target wasm64-wasip1 against the wasm2go-ported
+// wasi-libc (8-byte pointers, widened all-i64 WASI import ABI) — and
+// pins printf/malloc through the *64 wasip1 bindings.
+//
+// testdata/wasip1_mem64_hello.wasm is checked in because building it
+// needs the wasm64 sysroot (not shipped in wasi-sdk); its source:
+//
+//	#include <stdio.h>
+//	#include <stdlib.h>
+//	#include <string.h>
+//	int main(void) {
+//		printf("hello wasm64: sizeof(void*)=%zu sizeof(size_t)=%zu\n",
+//		       sizeof(void *), sizeof(size_t));
+//		size_t n = 64ull * 1024 * 1024;
+//		char *p = malloc(n);
+//		if (!p) { puts("malloc failed"); return 1; }
+//		memset(p, 0xa5, n);
+//		printf("malloc(%zu) ok, p[last]=%d\n", n, p[n-1]);
+//		free(p);
+//		return 0;
+//	}
+func TestMem64Wasip1Hello(t *testing.T) {
+	bin, err := os.ReadFile("../testdata/wasip1_mem64_hello.wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := transpile.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "m64wasi/pkg"})
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	dir := t.TempDir()
+	w := func(rel string, data []byte) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w("go.mod", []byte("module m64wasi\n\ngo 1.25.0\n"))
+	if buf.Len() > 0 {
+		w("pkg/gen.go", buf.Bytes())
+	}
+	for _, set := range []map[string][]byte{res.Files, res.Sidecars, res.AuxFiles} {
+		for name, data := range set {
+			if len(data) == 0 {
+				continue
+			}
+			w("pkg/"+name, data)
+		}
+	}
+	w("main.go", []byte(`package main
+
+import "m64wasi/pkg"
+
+func main() {
+	m := pkg.NewWithWASI(pkg.DefaultWASI())
+	m.Start()
+}
+`))
+	got := runMem64(t, dir)
+	want := "hello wasm64: sizeof(void*)=8 sizeof(size_t)=8\nmalloc(67108864) ok, p[last]=-91"
+	if got != want {
+		t.Errorf("wasip1 mem64 output:\ngot:  %q\nwant: %q", got, want)
+	}
+}

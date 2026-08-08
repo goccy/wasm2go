@@ -994,7 +994,15 @@ func (t *translator) funcName(funcIdx uint32) string {
 // imports). C++ mangled names starting with `_` (e.g. `_ZN4absl...`) get
 // an `X` prefix added by capitalize().
 func (t *translator) importMethodName(imp wasm.Import) string {
-	return capitalize(MangleID(imp.Name))
+	name := capitalize(MangleID(imp.Name))
+	// A memory64 module speaks the widened wasip1 ABI (every import
+	// argument is pointer-width i64), so its imports bind to the *64
+	// variants in the wasip1 shim — the 32-bit methods keep their
+	// signatures for every existing wasm32 module.
+	if imp.Module == "wasi_snapshot_preview1" && t.mod.Memory64() {
+		name += "64"
+	}
+	return name
 }
 
 // importIfaceName returns the Go type name for the interface that represents

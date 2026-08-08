@@ -188,7 +188,7 @@ func (r *InstrReader) SkipImmediates(op byte) error {
 			if _, err := r.ReadU32(); err != nil {
 				return err
 			}
-			_, err := r.ReadU32()
+			_, err := r.ReadU64()
 			return err
 		}
 		return fmt.Errorf("unknown 0xfe sub-opcode 0x%02x", sub)
@@ -206,7 +206,8 @@ func (r *InstrReader) SkipImmediates(op byte) error {
 			if _, err := r.ReadU32(); err != nil {
 				return err
 			}
-			_, err := r.ReadU32()
+			// The offset is u64 so memory64 memargs skip losslessly.
+			_, err := r.ReadU64()
 			return err
 		}
 		switch {
@@ -389,15 +390,16 @@ func (r *InstrReader) SkipImmediates(op byte) error {
 		}
 		return nil
 	}
-	// Memory ops: align (u32) + offset (u32). Range covers 0x28..0x40
-	// (loads, stores, memory.size, memory.grow). The MemSize/MemGrow
-	// cases above handle 0x3f/0x40 explicitly with the single reserved
-	// byte; the switch returns before we reach here for those opcodes.
+	// Memory ops: align (u32) + offset (u64, so memory64 memargs skip
+	// losslessly). Range covers 0x28..0x40 (loads, stores, memory.size,
+	// memory.grow). The MemSize/MemGrow cases above handle 0x3f/0x40
+	// explicitly with the single reserved byte; the switch returns
+	// before we reach here for those opcodes.
 	if op >= 0x28 && op <= 0x3e {
 		if _, err := r.ReadU32(); err != nil {
 			return err
 		}
-		if _, err := r.ReadU32(); err != nil {
+		if _, err := r.ReadU64(); err != nil {
 			return err
 		}
 		return nil

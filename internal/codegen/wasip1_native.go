@@ -1418,6 +1418,13 @@ func (w *WasiStubs) Fd_fdstat_get(m *Module, fd, ptr int32) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
+	return w.fdstatFill(fd, out)
+}
+
+// fdstatFill writes the 24-byte fdstat for fd into out — the shared
+// body of the 32- and 64-bit Fd_fdstat_get bindings (the struct holds
+// no pointers, so the layout is width-independent).
+func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var ftype byte = 4 // regular file
@@ -3172,4 +3179,118 @@ func (t *translator) wasmImportsWasi() bool {
 		}
 	}
 	return false
+}
+
+// ----- wasm64-wasip1 (widened ABI) ------------------------------------------
+//
+// A memory64 module's wasi imports arrive with every argument widened
+// to pointer-width i64 (see the wasm2go wasi-libc port's
+// __wasi_abi_t), and pointer-bearing WASI structs (iovecs, sizes)
+// use the LP64 layout. The *64 methods below are the widened
+// bindings; codegen routes a memory64 module's imports here and
+// every wasm32 module keeps the standard methods above.
+
+// memSlice64 is memSlice for full-range 64-bit guest pointers.
+func (w *WasiStubs) memSlice64(m *Module, off int64, n int64) []byte {
+	mem := m.memory
+	lo := uint64(off)
+	hi := lo + uint64(n)
+	if n < 0 || hi < lo || hi > uint64(len(mem)) {
+		return nil
+	}
+	return mem[lo:hi]
+}
+
+func (w *WasiStubs) Clock_time_get64(m *Module, clockID int64, precision int64, timePtr int64) int32 {
+	out := w.memSlice64(m, timePtr, 8)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	var nanos uint64
+	switch int32(clockID) {
+	case 0: // CLOCK_REALTIME
+		nanos = uint64(time.Now().UnixNano())
+	case 1: // CLOCK_MONOTONIC
+		w.mu.Lock()
+		nanos = uint64(time.Since(w.monoStart).Nanoseconds())
+		w.mu.Unlock()
+	default:
+		return _wasiEINVAL
+	}
+	binary.LittleEndian.PutUint64(out, nanos)
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_close64(m *Module, fd int64) int32 {
+	return w.Fd_close(m, int32(fd))
+}
+
+func (w *WasiStubs) Fd_fdstat_get64(m *Module, fd int64, ptr int64) int32 {
+	// The fdstat struct holds no pointers, so its 24-byte layout is
+	// identical under LP64; only the out-pointer needs the 64-bit
+	// window. Stage through a scratch struct via the 32-bit logic.
+	out := w.memSlice64(m, ptr, 24)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	return w.fdstatFill(int32(fd), out)
+}
+
+func (w *WasiStubs) Fd_seek64(m *Module, fd int64, offset int64, whence int64, newOffPtr int64) int32 {
+	out := w.memSlice64(m, newOffPtr, 8)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	w.mu.Lock()
+	op := w.fdTable[int32(fd)]
+	w.mu.Unlock()
+	if op == nil || op.f == nil {
+		return _wasiEBADF
+	}
+	n, err := op.f.Seek(offset, int(whence))
+	if err != nil {
+		return _wasiEINVAL
+	}
+	binary.LittleEndian.PutUint64(out, uint64(n))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_write64(m *Module, fd int64, iovs int64, iovsLen int64, nwrittenPtr int64) int32 {
+	w.mu.Lock()
+	dst, _ := w.fdDstLocked(int32(fd))
+	w.mu.Unlock()
+	// LP64 ciovec: {u64 buf, u64 len}, 16 bytes per entry; nwritten is
+	// a 64-bit __wasi_size_t.
+	if iovsLen < 0 || iovsLen > 1<<20 {
+		return _wasiEFAULT
+	}
+	iovecs := w.memSlice64(m, iovs, iovsLen*16)
+	nwrittenSlice := w.memSlice64(m, nwrittenPtr, 8)
+	if iovecs == nil || nwrittenSlice == nil {
+		return _wasiEFAULT
+	}
+	if dst == nil {
+		binary.LittleEndian.PutUint64(nwrittenSlice, 0)
+		return _wasiEBADF
+	}
+	var total uint64
+	for i := int64(0); i < iovsLen; i++ {
+		bufPtr := binary.LittleEndian.Uint64(iovecs[i*16:])
+		bufLen := binary.LittleEndian.Uint64(iovecs[i*16+8:])
+		buf := w.memSlice64(m, int64(bufPtr), int64(bufLen))
+		if buf == nil {
+			return _wasiEFAULT
+		}
+		n, err := dst.Write(buf)
+		total += uint64(n)
+		if err != nil {
+			break
+		}
+	}
+	binary.LittleEndian.PutUint64(nwrittenSlice, total)
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Proc_exit64(m *Module, code int64) {
+	panic(&WasiExitError{Code: int32(code)})
 }
