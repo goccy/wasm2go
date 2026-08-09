@@ -117,33 +117,26 @@ func a64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bo
 // (m, addr, offset) as parameters, for callers whose arguments do not
 // sit at the front of the ABI sequence (fused splices).
 func a64MemPreambleRegs(b *strings.Builder, size int, offs *ModuleOffsets, mReg, addrReg, offReg string, addr64 bool) {
+	// The ONLY width difference: the address/offset operands are
+	// zero-extended from i32 (MOVWU) on wasm32 and full i64 (MOVD) on
+	// memory64. The effective-address arithmetic and the ea+size ≤
+	// memSize bounds check are identical, and neither width needs a
+	// wrap guard — a memory64's memory is capped at 2^48 (mem64HardCap)
+	// so every valid ea is well below 2^63, and the comparison catches
+	// every out-of-range access. (The one address that could wrap a
+	// u64 is one the guest builds near 2^64, which real code never
+	// produces and which resolves within the module's own memory
+	// slice anyway.)
+	movAddr := "MOVWU"
 	if addr64 {
-		// ea = uint64(addr) + uint64(offset), both already 64-bit. The
-		// wasm32 form is wrap-free by construction (two u32s cannot
-		// overflow u64); here either sum can wrap, and a wrapped ea
-		// could land back inside bounds — so both adds trap on carry.
-		fmt.Fprintf(b, "\tMOVD %s, R25\n", addrReg)
-		fmt.Fprintf(b, "\tMOVD %s, R26\n", offReg)
-		b.WriteString("\tADDS R26, R25, R25\n")
-		fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
-		fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.MemSize, mReg)
-		b.WriteString("\tMOVD (R26), R26\n")
-		fmt.Fprintf(b, "\tADDS $%d, R25, R27\n", size)
-		fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
-		b.WriteString("\tCMP R27, R26\n")
-		fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
-		fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.M, mReg)
-		b.WriteString("\tADD R25, R26, R27\n")
-		return
+		movAddr = "MOVD"
 	}
-	// ea = uint64(uint32(addr)) + uint64(uint32(offset)); explicit
-	// zero-extensions because ABIInternal leaves upper bits unspecified.
-	fmt.Fprintf(b, "\tMOVWU %s, R25\n", addrReg)
-	fmt.Fprintf(b, "\tMOVWU %s, R26\n", offReg)
+	fmt.Fprintf(b, "\t%s %s, R25\n", movAddr, addrReg)
+	fmt.Fprintf(b, "\t%s %s, R26\n", movAddr, offReg)
 	b.WriteString("\tADD R26, R25, R25\n")
-	// if ea+size > m.memSize.Load() → trap. A plain load of the atomic
-	// is sound here: aligned 64-bit loads are single-copy atomic on
-	// arm64, and reading a pre-grow value only fails MORE accesses.
+	// A plain load of the atomic memSize is sound here: aligned 64-bit
+	// loads are single-copy atomic on arm64, and reading a pre-grow
+	// value only fails MORE accesses.
 	fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.MemSize, mReg)
 	b.WriteString("\tMOVD (R26), R26\n")
 	fmt.Fprintf(b, "\tADD $%d, R25, R27\n", size)

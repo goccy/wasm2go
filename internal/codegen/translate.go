@@ -1404,9 +1404,16 @@ const wasmMemHardCapBytes = (1 << 32) - (1 << 17)
 // past the cap (65535/65536 pages) disqualifies a module.
 func (t *translator) simdBoundsMemOK() bool {
 	if t.mod.Memory64() {
-		// The coalesced check's exactness argument is written against
-		// the wasm32 hard cap; memory64 modules keep per-op checks in
-		// their (helper-called) SIMD memory ops.
+		// memory64 keeps per-load checks. The check itself is now the
+		// SAME structure as wasm32 (only the address load widens
+		// MOVWU→MOVD, no wrap guard — the 2^48 cap makes ea+size ≤
+		// memSize exact), so a single m64 load is as cheap as its
+		// wasm32 twin. Coalescing them, however, was MEASURED to
+		// regress the llama.cpp kernel (~35% on tg) even with the
+		// carry-free forms — the grouping interacts badly with the m64
+		// tree fusion in a way the wasm32 path does not. The m64
+		// load_rng/load_nc splices remain implemented and tested for a
+		// future grouping heuristic, but stay off by default.
 		return false
 	}
 	for _, mem := range t.mod.Memories {
@@ -2825,8 +2832,13 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// the cap would start out past it, so such modules keep per-load
 	// checks.
 	if t.simdBoundsMemOK() && pass.CoalesceSimdBounds(ssaFn) {
-		t.useHelper("simd_v128_load_rng")
-		t.useHelper("simd_v128_load_nc")
+		if t.mod.Memory64() {
+			t.useHelper("simd_m64_v128_load_rng")
+			t.useHelper("simd_m64_v128_load_nc")
+		} else {
+			t.useHelper("simd_v128_load_rng")
+			t.useHelper("simd_v128_load_nc")
+		}
 	}
 	// f16 table-gather idiom -> pure lane conversion (bit-exact only
 	// against a verified IEEE table; see pass.RecognizeF16Gather).

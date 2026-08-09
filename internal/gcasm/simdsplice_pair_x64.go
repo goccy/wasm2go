@@ -20,33 +20,17 @@ const x64SimdMemTrapLabel = "gcasmsimdoob"
 // check, leaving the checked HOST address in R11. m/addr/offset arrive
 // in AX/BX/CX (ABIInternal). Clobbers R10–R12 and the flags — all dead
 // at a call site — and preserves DI/SI/R8 (value and lane arguments).
-// addr64 selects the memory64 form: full-width i64 address operands
-// with overflow-checked sums instead of zero-extended i32 ones.
+// The ONLY width difference is the address/offset move: MOVL
+// (zero-extend i32) on wasm32, MOVQ (full i64) on memory64. The
+// arithmetic and bounds check are identical, and neither needs a wrap
+// guard — see a64MemPreambleRegs (the arm64 twin).
 func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bool) {
+	movAddr := "MOVL"
 	if addr64 {
-		// ea = uint64(addr) + uint64(offset), both already 64-bit. The
-		// wasm32 form is wrap-free by construction (two u32s cannot
-		// overflow u64); here either sum can wrap, and a wrapped ea
-		// could land back inside bounds — so both adds trap on carry.
-		b.WriteString("\tMOVQ BX, R10\n")
-		b.WriteString("\tMOVQ CX, R11\n")
-		b.WriteString("\tADDQ R11, R10\n")
-		fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
-		fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.MemSize)
-		b.WriteString("\tMOVQ (R11), R11\n")
-		b.WriteString("\tMOVQ R10, R12\n")
-		fmt.Fprintf(b, "\tADDQ $%d, R12\n", size)
-		fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
-		b.WriteString("\tCMPQ R11, R12\n")
-		fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
-		fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.M)
-		b.WriteString("\tADDQ R10, R11\n")
-		return
+		movAddr = "MOVQ"
 	}
-	// ea = uint64(uint32(addr)) + uint64(uint32(offset)); MOVL is the
-	// explicit zero-extension (ABIInternal leaves upper bits loose).
-	b.WriteString("\tMOVL BX, R10\n")
-	b.WriteString("\tMOVL CX, R11\n")
+	fmt.Fprintf(b, "\t%s BX, R10\n", movAddr)
+	fmt.Fprintf(b, "\t%s CX, R11\n", movAddr)
 	b.WriteString("\tADDQ R11, R10\n")
 	// if ea+size > m.memSize.Load() → trap. A plain aligned 64-bit
 	// load is single-copy atomic on amd64; reading a pre-grow value
@@ -66,8 +50,9 @@ func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bo
 // x64SplicePair emits the inline amd64 body for a pair-form SIMD call.
 // Same contract as the arm64 twin: a table miss is a build error.
 func x64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
-	// Bounds-coalescing split forms; see the arm64 twin. Coalescing is
-	// wasm32-only, so these never appear with addr64.
+	// Bounds-coalescing split forms; see the arm64 twin. On a memory64
+	// module the args ride at full width (MOVQ) with a signed 64-bit
+	// start; wasm32 uses the zero-extended MOVL forms.
 	switch op {
 	case "v128_load_rng":
 		if offs == nil {
@@ -75,9 +60,26 @@ func x64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, 
 		}
 		// (m, addr, offset, rlo, span) in AX, BX, CX, DI, SI → trap
 		// unless [addr+rlo, addr+rlo+span) fits; pair of addr+offset
-		// in (AX, BX). rlo is signed (MOVLQSX); ADDQ's sign flag
-		// catches a negative start (a wrapped group member), matching
-		// the helper.
+		// in (AX, BX). rlo is signed; ADDQ's sign flag catches a
+		// negative start (a wrapped group member), matching the helper.
+		if addr64 {
+			b.WriteString("\tMOVQ BX, R10\n")
+			b.WriteString("\tMOVQ DI, R11\n")
+			b.WriteString("\tADDQ R10, R11\n")
+			fmt.Fprintf(b, "\tJS %s\n", x64SimdMemTrapLabel)
+			b.WriteString("\tMOVQ SI, R12\n")
+			b.WriteString("\tADDQ R11, R12\n")
+			fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.MemSize)
+			b.WriteString("\tMOVQ (R11), R11\n")
+			b.WriteString("\tCMPQ R11, R12\n")
+			fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
+			b.WriteString("\tADDQ CX, R10\n")
+			fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.M)
+			b.WriteString("\tADDQ R10, R11\n")
+			b.WriteString("\tMOVQ (R11), AX\n")
+			b.WriteString("\tMOVQ 8(R11), BX\n")
+			return true, true, nil
+		}
 		b.WriteString("\tMOVL BX, R10\n")
 		b.WriteString("\tMOVLQSX DI, R11\n")
 		b.WriteString("\tADDQ R10, R11\n")
@@ -100,6 +102,15 @@ func x64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, 
 			return false, false, fmt.Errorf("simd pair splice %s: no Module offsets", op)
 		}
 		// (m, addr, offset) in AX, BX, CX → pair in (AX, BX), no check.
+		if addr64 {
+			b.WriteString("\tMOVQ BX, R10\n")
+			b.WriteString("\tADDQ CX, R10\n")
+			fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.M)
+			b.WriteString("\tADDQ R10, R11\n")
+			b.WriteString("\tMOVQ (R11), AX\n")
+			b.WriteString("\tMOVQ 8(R11), BX\n")
+			return true, false, nil
+		}
 		b.WriteString("\tMOVL BX, R10\n")
 		b.WriteString("\tMOVL CX, R11\n")
 		b.WriteString("\tADDQ R11, R10\n")

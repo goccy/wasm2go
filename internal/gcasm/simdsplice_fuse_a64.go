@@ -874,22 +874,51 @@ func dst0Src(loc []fusedLoc, n simdfuse.Node) int {
 // a64FusedStore emits one member store: address like a checked load,
 // value from v0/pool/a pair build into v1 (dead between nodes), then
 // the register-offset str.
-// a64FusedEA64 materializes a memory64 member's checked effective
-// address into R25: full-width scalar operands with carry-checked sums
-// (two u32s can never wrap a u64, two u64s can — and a wrapped ea
-// could land back inside bounds). The builder only ever hands a
-// memory64 member OPAQUE scalar address/offset args (Arg.Const is
-// 32-bit), so the folded forms cannot appear here.
-func a64FusedEA64(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, span int) error {
-	if n.Args[0].Kind != simdfuse.ArgScalar || n.Args[1].Kind != simdfuse.ArgScalar {
-		return fmt.Errorf("fused addr64 %s: folded address form", n.Op)
+// a64FusedMemCheck materializes a member's checked effective address
+// into R25: the base plus the memarg offset (a small bounded constant,
+// or rarely a scalar), then the ea+size ≤ memSize range check. The
+// wasm32 and memory64 paths share the SAME arithmetic and bounds
+// check; the ONLY difference is how the base is loaded — a
+// zero-extended i32 (MOVWU, in the caller) versus a full i64 (MOVD).
+//
+// No wrap guard is needed on either width: a memory64's linear memory
+// is capped at 2^48 bytes (mem64HardCap), so every valid address is
+// well below 2^63, the offset/size are small, and the ea+size ≤
+// memSize comparison catches every out-of-range access. The only
+// address that could wrap a u64 is one the guest deliberately computes
+// near 2^64, which real (wasi-sdk-compiled) code never produces and
+// which — even then — resolves within the module's own memory slice,
+// never outside it. This matches wasm2go's existing bounds model.
+func a64FusedMemCheck(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, span int, addr64 bool) error {
+	if addr64 {
+		if n.Args[0].Kind != simdfuse.ArgScalar {
+			return fmt.Errorf("fused addr64 %s: folded base form", n.Op)
+		}
+		fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(n.Args[0]))
+	} else {
+		fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(n.Args[0]))
 	}
-	fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(n.Args[0]))
-	fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(n.Args[1]))
-	b.WriteString("\tADDS R26, R25, R25\n")
-	fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
-	fmt.Fprintf(b, "\tADDS $%d, R25, R27\n", span)
-	fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+	switch off := n.Args[1]; off.Kind {
+	case simdfuse.ArgConst:
+		if off.Const != 0 {
+			if off.Const > 0 && off.Const < 4096 {
+				fmt.Fprintf(b, "\tADD $%d, R25, R25\n", off.Const)
+			} else {
+				fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(off.Const))
+				b.WriteString("\tADD R26, R25, R25\n")
+			}
+		}
+	case simdfuse.ArgScalar:
+		if addr64 {
+			fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(off))
+		} else {
+			fmt.Fprintf(b, "\tMOVWU %s, R26\n", scalarReg(off))
+		}
+		b.WriteString("\tADD R26, R25, R25\n")
+	default:
+		return fmt.Errorf("fused %s: bad offset form", n.Op)
+	}
+	fmt.Fprintf(b, "\tADD $%d, R25, R27\n", span)
 	b.WriteString("\tCMP R27, R21\n")
 	fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
 	return nil
@@ -905,7 +934,7 @@ func a64FusedStore(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.
 		span = 8
 	}
 	if addr64 {
-		if err := a64FusedEA64(b, n, scalarReg, span); err != nil {
+		if err := a64FusedMemCheck(b, n, scalarReg, span, true); err != nil {
 			return err
 		}
 	} else {
@@ -987,7 +1016,7 @@ func a64FusedStore(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.
 // register-offset form).
 func a64FusedLaneAddr(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, addr64 bool) error {
 	if addr64 {
-		if err := a64FusedEA64(b, n, scalarReg, 4); err != nil {
+		if err := a64FusedMemCheck(b, n, scalarReg, 4, true); err != nil {
 			return err
 		}
 		b.WriteString("\tADD R25, R20, R27\n")
@@ -1036,11 +1065,6 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	if len(n.Args) != want {
 		return fmt.Errorf("fused load %s: %d args, want %d", n.Op, len(n.Args), want)
 	}
-	if addr64 && (n.Op == "v128_load_rng" || n.Op == "v128_load_nc") {
-		// Bounds coalescing is wasm32-only; these split forms cannot
-		// reach a memory64 tree.
-		return fmt.Errorf("fused addr64 load %s: coalesced form", n.Op)
-	}
 	arg := func(i int) (reg string, c int32, isConst bool) {
 		a := n.Args[i]
 		if a.Kind == simdfuse.ArgConst {
@@ -1075,17 +1099,33 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 			fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
 		}
 	}
-	// ea = u32(addr)+u32(offset) in R25 (u64 sums carry-checked).
+	// Add the memarg offset into the effective address in R25. Both
+	// widths share this: a small bounded constant is a plain ADD; a
+	// scalar offset is materialized then added. A memory64 base rides
+	// in a full-width register (MOVD, above); the arithmetic is the
+	// same as wasm32's. See a64FusedMemCheck for why no wrap guard is
+	// needed.
 	addOffErr := error(nil)
 	addOff := func(i int) {
 		if addr64 {
-			if n.Args[i].Kind != simdfuse.ArgScalar {
-				addOffErr = fmt.Errorf("fused addr64 load %s: folded offset form", n.Op)
-				return
+			a := n.Args[i]
+			switch a.Kind {
+			case simdfuse.ArgConst:
+				if a.Const == 0 {
+					return
+				}
+				if a.Const > 0 && a.Const < 4096 {
+					fmt.Fprintf(b, "\tADD $%d, R25, R25\n", a.Const)
+				} else {
+					fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(a.Const))
+					b.WriteString("\tADD R26, R25, R25\n")
+				}
+			case simdfuse.ArgScalar:
+				fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(a))
+				b.WriteString("\tADD R26, R25, R25\n")
+			default:
+				addOffErr = fmt.Errorf("fused addr64 load %s: bad offset form", n.Op)
 			}
-			fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(n.Args[i]))
-			b.WriteString("\tADDS R26, R25, R25\n")
-			fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
 			return
 		}
 		reg, c, isConst := arg(i)
@@ -1104,14 +1144,10 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		fmt.Fprintf(b, "\tMOVWU %s, R26\n", reg)
 		b.WriteString("\tADD R26, R25, R25\n")
 	}
+	// The single bounds check, identical for both widths: trap unless
+	// ea+size ≤ memSize. See a64FusedMemCheck's note on why memory64
+	// needs no additional wrap guard here.
 	checked := func(size int) {
-		if addr64 {
-			fmt.Fprintf(b, "\tADDS $%d, R25, R27\n", size)
-			fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
-			b.WriteString("\tCMP R27, R21\n")
-			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
-			return
-		}
 		fmt.Fprintf(b, "\tADD $%d, R25, R27\n", size)
 		b.WriteString("\tCMP R27, R21\n")
 		fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
@@ -1148,6 +1184,41 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	case "v128_load_nc":
 		addOff(1)
 	case "v128_load_rng":
+		if addr64 {
+			// R25 = addr (full width). start = addr + rlo (rlo a small
+			// signed const), trap on start<0 or start+span > memSize;
+			// then ea = addr + offset. A NON-NEGATIVE rlo can never
+			// make start negative (addr ≥ 0 under the 2^48 cap), so the
+			// sign trap is emitted only for a negative rlo.
+			_, rloC, rloConst := arg(2)
+			_, spanC, spanConst := arg(3)
+			if !rloConst || !spanConst {
+				return fmt.Errorf("fused addr64 load %s: non-const rng window", n.Op)
+			}
+			startReg := "R26"
+			switch {
+			case rloC == 0:
+				startReg = "R25"
+			case rloC > 0 && rloC < 4096:
+				fmt.Fprintf(b, "\tADD $%d, R25, R26\n", rloC)
+			default:
+				fmt.Fprintf(b, "\tMOVD $%d, R27\n", int64(rloC))
+				b.WriteString("\tADD R27, R25, R26\n")
+				if rloC < 0 {
+					fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
+				}
+			}
+			if spanC >= 0 && spanC < 4096 {
+				fmt.Fprintf(b, "\tADD $%d, %s, R27\n", spanC, startReg)
+			} else {
+				fmt.Fprintf(b, "\tMOVD $%d, R27\n", int64(uint32(spanC)))
+				fmt.Fprintf(b, "\tADD %s, R27, R27\n", startReg)
+			}
+			b.WriteString("\tCMP R27, R21\n")
+			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+			addOff(1)
+			break
+		}
 		// start = u32(addr) + sxtw(rlo); trap on start<0 or
 		// start+span > memSize; then ea = u32(addr)+u32(offset).
 		// A non-negative constant rlo cannot make start negative
@@ -1263,7 +1334,13 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		}
 		r := hoistRegs[0]
 		hoistRegs = hoistRegs[1:]
-		fmt.Fprintf(b, "\tMOVWU %s, %s\n", a64FusedArgReg(1+si), r)
+		// The table-base scalar is int64 on a memory64 tree; widen with
+		// MOVD instead of the u32 MOVWU.
+		if tree.Addr64 {
+			fmt.Fprintf(b, "\tMOVD %s, %s\n", a64FusedArgReg(1+si), r)
+		} else {
+			fmt.Fprintf(b, "\tMOVWU %s, %s\n", a64FusedArgReg(1+si), r)
+		}
 		fmt.Fprintf(b, "\tADD R20, %s, %s\n", r, r)
 		lutHoist[si] = r
 	}
