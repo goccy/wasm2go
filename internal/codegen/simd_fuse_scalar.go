@@ -236,12 +236,22 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		return simdfuse.Arg{}, false
 	case *ast.Ident:
 		if fb.interDef != nil {
-			if def, isDef := fb.interDef[x.Name]; isDef {
+			if def, isDef := fb.interDef[x.Name]; isDef && !fb.chaseVisiting[x.Name] {
 				// No caching across uses: every consumer gets its own
 				// self-contained chain, so no scalar value ever has to
 				// survive across an unrelated vector node body (whose
 				// cores clobber the low scratch registers).
+				//
+				// The visiting mark breaks self-referential definitions
+				// (a loop-carried `v = v + 4`), which would otherwise
+				// recurse without bound; on re-entry the name is not
+				// chaseable and stays an intervener.
+				if fb.chaseVisiting == nil {
+					fb.chaseVisiting = map[string]bool{}
+				}
+				fb.chaseVisiting[x.Name] = true
 				a, aok := fb.chaseI32(def.Rhs[0])
+				delete(fb.chaseVisiting, x.Name)
 				if !aok || a.Kind != simdfuse.ArgNode {
 					// Only node-producing definitions are worth
 					// consuming; a plain alias stays an intervener.

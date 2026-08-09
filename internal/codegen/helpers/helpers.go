@@ -2928,3 +2928,162 @@ var (
 	_ = simd_m64_v128_store32_lane
 	_ = simd_m64_v128_store64_lane
 )
+
+// Pair-form wrappers for the memory64 SIMD family, mirroring the
+// wasm32 simd_p_* set: the scalarizer emits these so v128 values ride
+// the register ABI as uint64 halves, and the gcasm backend splices
+// them with the same vector bodies as the wasm32 twins (only the
+// effective-address glue widens; see gcasm's simdSpliceOp).
+
+//go:noinline
+func simd_p_m64_v128_load(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_store(m *Module, addr int64, offset int64, v0, v1 uint64) int32 {
+	return simd_m64_v128_store(m, addr, offset, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_m64_v128_load32_zero(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load32_zero(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load64_zero(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load64_zero(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load8_splat(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load8_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load16_splat(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load16_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load32_splat(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load32_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load64_splat(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load64_splat(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load8x8_s(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load8x8_s(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load8x8_u(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load8x8_u(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load16x4_s(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load16x4_s(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load16x4_u(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load16x4_u(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load32x2_s(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load32x2_s(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load32x2_u(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load32x2_u(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load8_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_m64_v128_load8_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load16_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_m64_v128_load16_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load32_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_m64_v128_load32_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load64_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) (uint64, uint64) {
+	r := simd_m64_v128_load64_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_store8_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) int32 {
+	return simd_m64_v128_store8_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_m64_v128_store16_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) int32 {
+	return simd_m64_v128_store16_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_m64_v128_store32_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) int32 {
+	return simd_m64_v128_store32_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+//go:noinline
+func simd_p_m64_v128_store64_lane(m *Module, addr int64, offset int64, lane int32, v0, v1 uint64) int32 {
+	return simd_m64_v128_store64_lane(m, addr, offset, lane, [2]uint64{v0, v1})
+}
+
+// Referenced only from generated memory64 module code.
+var (
+	_ = simd_p_m64_v128_load
+	_ = simd_p_m64_v128_store
+	_ = simd_p_m64_v128_load32_zero
+	_ = simd_p_m64_v128_load64_zero
+	_ = simd_p_m64_v128_load8_splat
+	_ = simd_p_m64_v128_load16_splat
+	_ = simd_p_m64_v128_load32_splat
+	_ = simd_p_m64_v128_load64_splat
+	_ = simd_p_m64_v128_load8x8_s
+	_ = simd_p_m64_v128_load8x8_u
+	_ = simd_p_m64_v128_load16x4_s
+	_ = simd_p_m64_v128_load16x4_u
+	_ = simd_p_m64_v128_load32x2_s
+	_ = simd_p_m64_v128_load32x2_u
+	_ = simd_p_m64_v128_load8_lane
+	_ = simd_p_m64_v128_load16_lane
+	_ = simd_p_m64_v128_load32_lane
+	_ = simd_p_m64_v128_load64_lane
+	_ = simd_p_m64_v128_store8_lane
+	_ = simd_p_m64_v128_store16_lane
+	_ = simd_p_m64_v128_store32_lane
+	_ = simd_p_m64_v128_store64_lane
+)

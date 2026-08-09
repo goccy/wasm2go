@@ -107,14 +107,35 @@ const a64SimdMemTrapLabel = "gcasmsimdoob"
 // check, leaving the checked HOST address in R27. m/addr/offset arrive
 // in R0/R1/R2 (ABIInternal; the v128 store/lane params never displace
 // them). Clobbers R25–R27 and the flags — all dead at a call site.
-func a64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets) {
-	a64MemPreambleRegs(b, size, offs, "R0", "R1", "R2")
+// addr64 selects the memory64 form: full-width i64 address operands
+// with overflow-checked sums instead of zero-extended i32 ones.
+func a64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bool) {
+	a64MemPreambleRegs(b, size, offs, "R0", "R1", "R2", addr64)
 }
 
 // a64MemPreambleRegs is a64MemPreamble with the argument registers
 // (m, addr, offset) as parameters, for callers whose arguments do not
 // sit at the front of the ABI sequence (fused splices).
-func a64MemPreambleRegs(b *strings.Builder, size int, offs *ModuleOffsets, mReg, addrReg, offReg string) {
+func a64MemPreambleRegs(b *strings.Builder, size int, offs *ModuleOffsets, mReg, addrReg, offReg string, addr64 bool) {
+	if addr64 {
+		// ea = uint64(addr) + uint64(offset), both already 64-bit. The
+		// wasm32 form is wrap-free by construction (two u32s cannot
+		// overflow u64); here either sum can wrap, and a wrapped ea
+		// could land back inside bounds — so both adds trap on carry.
+		fmt.Fprintf(b, "\tMOVD %s, R25\n", addrReg)
+		fmt.Fprintf(b, "\tMOVD %s, R26\n", offReg)
+		b.WriteString("\tADDS R26, R25, R25\n")
+		fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+		fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.MemSize, mReg)
+		b.WriteString("\tMOVD (R26), R26\n")
+		fmt.Fprintf(b, "\tADDS $%d, R25, R27\n", size)
+		fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+		b.WriteString("\tCMP R27, R26\n")
+		fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+		fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.M, mReg)
+		b.WriteString("\tADD R25, R26, R27\n")
+		return
+	}
 	// ea = uint64(uint32(addr)) + uint64(uint32(offset)); explicit
 	// zero-extensions because ABIInternal leaves upper bits unspecified.
 	fmt.Fprintf(b, "\tMOVWU %s, R25\n", addrReg)
@@ -152,12 +173,13 @@ func a64LaneMemElem(op string) (scale int, load, store string, ok bool) {
 // a64SpliceSimdMem inlines a memory helper call. Reports (spliced,
 // needsTrap): a true needsTrap obliges the caller to emit the trap stub
 // at the end of the function body.
-func a64SpliceSimdMem(b *strings.Builder, op string, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, offs *ModuleOffsets) (bool, bool) {
+func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, offs *ModuleOffsets) (bool, bool) {
 	if offs == nil {
 		return false, false
 	}
-	// Every memory helper starts (m *Module, addr, offset int32, ...):
-	// R0/R1/R2 by construction, but verify rather than assume.
+	// Every memory helper starts (m *Module, addr, offset int32, ...)
+	// — int64 on a memory64 module, same register assignment either
+	// way: R0/R1/R2 by construction, but verify rather than assume.
 	if len(cargs) < 3 || cargs[0].Reg != "R0" || cargs[1].Reg != "R1" || cargs[2].Reg != "R2" {
 		return false, false
 	}
@@ -174,7 +196,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, cargs []RegAssignment, cres
 				return false, false
 			}
 		}
-		a64MemPreamble(b, ent.Size, offs)
+		a64MemPreamble(b, ent.Size, offs, addr64)
 		for _, l := range ent.Lines {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}
@@ -195,7 +217,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, cargs []RegAssignment, cres
 		if !hasRes || cres.Kind != ArgV128 {
 			return false, false
 		}
-		a64MemPreamble(b, 1<<scale, offs)
+		a64MemPreamble(b, 1<<scale, offs, addr64)
 		fmt.Fprintf(b, "\t%s (R27), R24\n", eload)
 		// Copy v into the result slot, then overwrite the lane there.
 		fmt.Fprintf(b, "\tFMOVQ %d(RSP), F16\n", vSeq)
@@ -208,7 +230,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, cargs []RegAssignment, cres
 		fmt.Fprintf(b, "\tADD $%d, RSP, R26\n", vSeq)
 		fmt.Fprintf(b, "\tADD R3<<%d, R26, R26\n", scale)
 		fmt.Fprintf(b, "\t%s (R26), R24\n", eload)
-		a64MemPreamble(b, 1<<scale, offs)
+		a64MemPreamble(b, 1<<scale, offs, addr64)
 		fmt.Fprintf(b, "\t%s R24, (R27)\n", estore)
 		return true, true
 	}

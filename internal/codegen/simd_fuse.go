@@ -260,6 +260,12 @@ type fusedTreeBuilder struct {
 	chaseUses  map[string]int
 	chaseCache map[string]int
 	chaseReads map[string]bool
+	// chaseVisiting guards the definition-chasing recursion against
+	// self-referential definitions (a loop-carried `v = v + 4` in the
+	// goto-form emission): a name already on the chase path is not
+	// chaseable, it stays an intervener. Purely re-entrancy state — no
+	// snapshot needed, entries are removed on unwind.
+	chaseVisiting map[string]bool
 	// failWhy records the walk's first refusal (diagnosis only).
 	failWhy string
 	// owner attributes each scalar/pair parameter to the window

@@ -53,12 +53,29 @@ var simdSpliceConstRe = regexp.MustCompile(`·(simdConst[A-Za-z0-9]+)\(SB\)`)
 // cross-chunk linkname) and simd_-prefixed in single-package mode; only
 // they use either prefix, so the name alone identifies them regardless
 // of the bundle's package layout.
-func simdSpliceOp(sym string) (string, bool) {
+//
+// A memory64 module's memory helpers carry an extra m64_ marker
+// ("Simd_m64_v128_load", pair form "Simd_p_m64_v128_load"); it is
+// stripped here and reported as addr64 so the memory splices widen the
+// i64 address operands instead of zero-extending i32 ones. The op name
+// after stripping indexes the SAME tables — the vector bodies are
+// identical, only the effective-address glue differs.
+func simdSpliceOp(sym string) (op string, addr64, ok bool) {
 	cname := sym[strings.LastIndex(sym, ".")+1:]
-	if op, ok := strings.CutPrefix(cname, "Simd_"); ok {
-		return op, true
+	op, ok = strings.CutPrefix(cname, "Simd_")
+	if !ok {
+		op, ok = strings.CutPrefix(cname, "simd_")
 	}
-	return strings.CutPrefix(cname, "simd_")
+	if !ok {
+		return "", false, false
+	}
+	if rest, m64 := strings.CutPrefix(op, "m64_"); m64 {
+		return rest, true, true
+	}
+	if rest, m64 := strings.CutPrefix(op, "p_m64_"); m64 {
+		return "p_" + rest, true, true
+	}
+	return op, false, true
 }
 
 // simdSpliceRewriteConsts rewrites the helper bodies' ·simdConst*
@@ -96,12 +113,12 @@ func simdSpliceRewriteConsts(lines []string, pool *ConstPool) ([]string, bool) {
 // RSP offset of the caller's outgoing ABIInternal argument area
 // (8+maxOut).
 func a64SpliceSimd(b *strings.Builder, sym string, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, pool *ConstPool, offs *ModuleOffsets) (bool, bool) {
-	op, ok := simdSpliceOp(sym)
+	op, addr64, ok := simdSpliceOp(sym)
 	if !ok {
 		return false, false
 	}
 	if strings.HasPrefix(op, "v128_load") || strings.HasPrefix(op, "v128_store") {
-		return a64SpliceSimdMem(b, op, cargs, cres, hasRes, base, offs)
+		return a64SpliceSimdMem(b, op, addr64, cargs, cres, hasRes, base, offs)
 	}
 	if strings.Contains(op, "extract_lane") {
 		return a64SpliceExtractLane(b, op, cargs, base), false

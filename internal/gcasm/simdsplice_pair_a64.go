@@ -22,22 +22,25 @@ import (
 )
 
 // a64SplicePairOp reports whether sym is a pair-form SIMD helper call
-// and returns the op name ("p_" stripped).
-func a64SplicePairOp(sym string) (string, bool) {
-	op, ok := simdSpliceOp(sym) // strips Simd_/simd_
+// and returns the op name ("p_" stripped) plus the memory64 address
+// width (see simdSpliceOp).
+func a64SplicePairOp(sym string) (op string, addr64, ok bool) {
+	op, addr64, ok = simdSpliceOp(sym) // strips Simd_/simd_ and m64_
 	if !ok {
-		return "", false
+		return "", false, false
 	}
-	return strings.CutPrefix(op, "p_")
+	op, ok = strings.CutPrefix(op, "p_")
+	return op, addr64, ok
 }
 
 // a64SplicePair emits the inline body for a pair-form SIMD call.
 // Returns (spliced, needsTrap, err); a table miss is an error by the
 // contract above.
-func a64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
+func a64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
 	// The bounds-coalescing split forms have dedicated bodies: the
 	// group-leading load carries the whole window's range check, the
-	// other members drop theirs.
+	// other members drop theirs. Bounds coalescing is wasm32-only
+	// (see simdBoundsMemOK), so these never appear with addr64.
 	switch op {
 	case "v128_load_rng":
 		if offs == nil {
@@ -94,7 +97,7 @@ func a64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleO
 		for _, l := range ent.Pre {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}
-		a64MemPreamble(b, ent.Size, offs)
+		a64MemPreamble(b, ent.Size, offs, addr64)
 		for _, l := range ent.Lines {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}

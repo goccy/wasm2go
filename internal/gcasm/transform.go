@@ -770,15 +770,15 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 			// Pair-form SIMD calls splice BEFORE callee resolution:
 			// their two-result signatures have no marshalling, by the
 			// simdPairOps contract. See simdsplice_pair_amd64.go.
-			if pop, isPair := a64SplicePairOp(m[1]); isPair {
+			if pop, addr64, isPair := a64SplicePairOp(m[1]); isPair {
 				var spliced, wantsTrap bool
 				var perr error
-				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop {
+				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop && !addr64 {
 					spliced, wantsTrap, perr = x64SpliceLoop(&b, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), maxOut)
-				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused {
+				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused && !addr64 {
 					spliced, wantsTrap, perr = x64SpliceFused(&b, tree, pool, opts.ModOffsets, maxOut)
 				} else {
-					spliced, wantsTrap, perr = x64SplicePair(&b, pop, pool, opts.ModOffsets)
+					spliced, wantsTrap, perr = x64SplicePair(&b, pop, addr64, pool, opts.ModOffsets)
 				}
 				if perr != nil {
 					return "", fmt.Errorf("%s at +%d: %w", m[1], in.Off, perr)

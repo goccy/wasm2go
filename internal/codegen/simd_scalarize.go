@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"strings"
 )
 
 // pairName returns the identifier of the high half of a scalarized
@@ -523,8 +524,14 @@ func (sc *simdScalarizer) pairExprs(e ast.Expr, prelude *[]ast.Stmt) (lo, hi ast
 // pairable reports whether a marked call's op has a pair-form splice.
 // The scalarizer must not emit a pair call the backend cannot take
 // over: two results cannot be marshalled if the CALL survives.
+// A memory64 helper ("simd_m64_v128_load") shares its wasm32 twin's
+// table entry — the splice bodies are identical, only the
+// effective-address glue widens (the backend strips the m64_ marker
+// the same way; see gcasm's simdSpliceOp).
 func (sc *simdScalarizer) pairable(m simdCallMark) bool {
-	return simdPairOps[m.name[len("simd_"):]]
+	op := m.name[len("simd_"):]
+	op = strings.TrimPrefix(op, "m64_")
+	return simdPairOps[op]
 }
 
 // rewriteCall converts a marked SIMD call to its scalar-pair form:

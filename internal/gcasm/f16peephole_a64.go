@@ -608,7 +608,7 @@ func f16DeadAfter(insns []Insn, from int, reg string, resolve func(string) ([]Ar
 			if strings.HasPrefix(m[1], "runtime.panic") || strings.Contains(m[1], "Wasm_trap") || strings.Contains(m[1], "wasm_trap") {
 				continue // no-return: the value dies with the trap
 			}
-			if _, isPair := a64SplicePairOp(m[1]); isPair {
+			if _, _, isPair := a64SplicePairOp(m[1]); isPair {
 				// Pair-form SIMD helpers carry v128 values as GPR
 				// pairs and never take float arguments; their exact
 				// integer argument set is not tabulated here, so

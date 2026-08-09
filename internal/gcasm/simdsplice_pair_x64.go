@@ -20,7 +20,29 @@ const x64SimdMemTrapLabel = "gcasmsimdoob"
 // check, leaving the checked HOST address in R11. m/addr/offset arrive
 // in AX/BX/CX (ABIInternal). Clobbers R10–R12 and the flags — all dead
 // at a call site — and preserves DI/SI/R8 (value and lane arguments).
-func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets) {
+// addr64 selects the memory64 form: full-width i64 address operands
+// with overflow-checked sums instead of zero-extended i32 ones.
+func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bool) {
+	if addr64 {
+		// ea = uint64(addr) + uint64(offset), both already 64-bit. The
+		// wasm32 form is wrap-free by construction (two u32s cannot
+		// overflow u64); here either sum can wrap, and a wrapped ea
+		// could land back inside bounds — so both adds trap on carry.
+		b.WriteString("\tMOVQ BX, R10\n")
+		b.WriteString("\tMOVQ CX, R11\n")
+		b.WriteString("\tADDQ R11, R10\n")
+		fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
+		fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.MemSize)
+		b.WriteString("\tMOVQ (R11), R11\n")
+		b.WriteString("\tMOVQ R10, R12\n")
+		fmt.Fprintf(b, "\tADDQ $%d, R12\n", size)
+		fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
+		b.WriteString("\tCMPQ R11, R12\n")
+		fmt.Fprintf(b, "\tJCS %s\n", x64SimdMemTrapLabel)
+		fmt.Fprintf(b, "\tMOVQ %d(AX), R11\n", offs.M)
+		b.WriteString("\tADDQ R10, R11\n")
+		return
+	}
 	// ea = uint64(uint32(addr)) + uint64(uint32(offset)); MOVL is the
 	// explicit zero-extension (ABIInternal leaves upper bits loose).
 	b.WriteString("\tMOVL BX, R10\n")
@@ -43,8 +65,9 @@ func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets) {
 
 // x64SplicePair emits the inline amd64 body for a pair-form SIMD call.
 // Same contract as the arm64 twin: a table miss is a build error.
-func x64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
-	// Bounds-coalescing split forms; see the arm64 twin.
+func x64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
+	// Bounds-coalescing split forms; see the arm64 twin. Coalescing is
+	// wasm32-only, so these never appear with addr64.
 	switch op {
 	case "v128_load_rng":
 		if offs == nil {
@@ -103,7 +126,7 @@ func x64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleO
 		for _, l := range ent.Pre {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}
-		x64MemPreamble(b, ent.Size, offs)
+		x64MemPreamble(b, ent.Size, offs, addr64)
 		for _, l := range ent.Lines {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}
