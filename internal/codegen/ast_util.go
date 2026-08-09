@@ -37,6 +37,15 @@ func goTypeOf(v wasm.ValType) ast.Expr {
 		return newID("float32")
 	case wasm.ValF64:
 		return newID("float64")
+	case wasm.ValV128:
+		// A v128 crossing a defined-function boundary uses the same
+		// scalarized pair form the SSA emitter gives every v128
+		// expression, so params and results type-check directly
+		// against the Simd_* helper signatures.
+		return &ast.ArrayType{
+			Len: &ast.BasicLit{Kind: token.INT, Value: "2"},
+			Elt: newID("uint64"),
+		}
 	case wasm.ValFuncref, wasm.ValExternref:
 		return newID("any")
 	}
