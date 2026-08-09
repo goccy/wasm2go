@@ -1289,16 +1289,24 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 			}
 			a64VecCopy(b, 30-j, src)
 		}
+		// Bumps wrap mod 2^32 on wasm32 (W-form adds); an Addr64
+		// loop's pointer scalars advance at full width instead. The
+		// per-iteration bounds checks inside the body keep a runaway
+		// pointer from ever being dereferenced.
+		bumpAdd, bumpImm := "ADDW", "ADDW"
+		if tree.Addr64 {
+			bumpAdd, bumpImm = "ADD", "ADD"
+		}
 		for _, bump := range loop.Bumps {
 			reg := a64FusedArgReg(1 + bump.Scalar)
 			if bump.DeltaScalar >= 0 {
 				dreg := a64FusedArgReg(1 + tree.NumScalars + 1 + bump.DeltaScalar)
-				fmt.Fprintf(b, "\tADDW %s, %s, %s\n", dreg, reg, reg)
+				fmt.Fprintf(b, "\t%s %s, %s, %s\n", bumpAdd, dreg, reg, reg)
 			} else if bump.Delta >= 0 && bump.Delta < 4096 {
-				fmt.Fprintf(b, "\tADDW $%d, %s, %s\n", bump.Delta, reg, reg)
+				fmt.Fprintf(b, "\t%s $%d, %s, %s\n", bumpImm, bump.Delta, reg, reg)
 			} else {
 				fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(uint32(bump.Delta)))
-				fmt.Fprintf(b, "\tADDW R22, %s, %s\n", reg, reg)
+				fmt.Fprintf(b, "\t%s R22, %s, %s\n", bumpAdd, reg, reg)
 			}
 		}
 		fmt.Fprintf(b, "\t%s $%d, %s, %s\n", subOp, loop.Dec, counterReg, counterReg)
@@ -1366,11 +1374,11 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		moves[2*len(roots)+j] = 1 + xs
 	}
 	wideDst := map[int]bool{}
-	if loop.CounterWide {
-		for j, xs := range loop.ExitScalars {
-			if xs == loop.CounterScalar {
-				wideDst[2*len(roots)+j] = true
-			}
+	for j, xs := range loop.ExitScalars {
+		if (xs == loop.CounterScalar && loop.CounterWide) || (tree.Addr64 && xs != loop.CounterScalar) {
+			// Addr64 exit scalars are the int64 pointer parameters
+			// (the counter keeps its own declared width).
+			wideDst[2*len(roots)+j] = true
 		}
 	}
 	movFor := func(dst int) string {

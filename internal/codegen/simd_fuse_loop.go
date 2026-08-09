@@ -490,13 +490,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	if dec <= 0 {
 		return nil, false
 	}
-	if tree.Addr64 {
-		// The loop machinery still assumes u32-wrap pointer bumps and
-		// 32-bit exit-scalar results; a memory64 body keeps the fused
-		// WINDOW form (one region call per iteration) until the bump
-		// arithmetic is widened.
-		return nil, false
-	}
 	loop := &simdfuse.Loop{Tree: tree, Dec: dec, PreTest: cl.decVar == nil, CounterWide: cl.wide}
 	// Carries: `prev = next` with prev a pair argument and next a
 	// root is loop-carried state; prev NOT an argument is an
@@ -768,9 +761,13 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		// The temps need declarations: hoist them as int32 zeros.
 		var names []ast.Expr
 		var zeros []ast.Expr
+		zeroType := "int32"
+		if tree.Addr64 {
+			zeroType = "int64"
+		}
 		for _, bf := range bumpFixes {
 			names = append(names, newID(bf.temp))
-			zeros = append(zeros, &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}}})
+			zeros = append(zeros, &ast.CallExpr{Fun: newID(zeroType), Args: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}}})
 		}
 		*prelude = append(*prelude, &ast.AssignStmt{Tok: token.DEFINE, Lhs: names, Rhs: zeros},
 			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: append([]ast.Expr{}, blankFor(len(names))...), Rhs: names})
@@ -841,9 +838,15 @@ func fusedLoopDecl(name string, loop *simdfuse.Loop, multiPackage bool) *ast.Fun
 		ctrType = "int64"
 	}
 	insertFields := []*ast.Field{{Names: []*ast.Ident{newID(sName(loop.CounterScalar))}, Type: newID(ctrType)}}
+	dType := "int32"
+	if tree.Addr64 {
+		// Addr64 loops bump int64 pointer scalars; the loop-invariant
+		// strides ride at the same width.
+		dType = "int64"
+	}
 	for i := 0; i < loop.NumDeltas; i++ {
 		insertFields = append(insertFields, &ast.Field{
-			Names: []*ast.Ident{newID(fmt.Sprintf("d%d", i))}, Type: newID("int32")})
+			Names: []*ast.Ident{newID(fmt.Sprintf("d%d", i))}, Type: newID(dType)})
 	}
 	insert := 1 + tree.NumScalars
 	params = append(params[:insert:insert], append(insertFields, params[insert:]...)...)
@@ -929,7 +932,12 @@ func fusedLoopDecl(name string, loop *simdfuse.Loop, multiPackage bool) *ast.Fun
 	for _, xs := range loop.ExitScalars {
 		retVals = append(retVals, newID(sName(xs)))
 		rt := "int32"
-		if xs == loop.CounterScalar && loop.CounterWide {
+		if xs == loop.CounterScalar {
+			if loop.CounterWide {
+				rt = "int64"
+			}
+		} else if tree.Addr64 {
+			// Addr64 exit scalars are the int64 pointer parameters.
 			rt = "int64"
 		}
 		results = append(results, &ast.Field{Type: newID(rt)})

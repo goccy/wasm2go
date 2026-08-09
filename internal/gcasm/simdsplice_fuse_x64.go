@@ -771,13 +771,20 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		}
 		x64VecCopy(b, poolTop-j, src)
 	}
+	// Bumps wrap mod 2^32 on wasm32; an Addr64 loop's pointer scalars
+	// advance at full width (the body's per-node bounds checks keep a
+	// runaway pointer from being dereferenced).
+	bumpAdd := "ADDL"
+	if tree.Addr64 {
+		bumpAdd = "ADDQ"
+	}
 	for _, bump := range loop.Bumps {
 		if bump.DeltaScalar >= 0 {
-			fmt.Fprintf(b, "\tADDL %s, %s\n",
+			fmt.Fprintf(b, "\t%s %s, %s\n", bumpAdd,
 				x64FusedArgRegs[1+tree.NumScalars+1+bump.DeltaScalar], x64FusedArgRegs[1+bump.Scalar])
 			continue
 		}
-		fmt.Fprintf(b, "\tADDL $%d, %s\n", bump.Delta, x64FusedArgRegs[1+bump.Scalar])
+		fmt.Fprintf(b, "\t%s $%d, %s\n", bumpAdd, bump.Delta, x64FusedArgRegs[1+bump.Scalar])
 	}
 	fmt.Fprintf(b, "\t%s $%d, %s\n", subOp, loop.Dec, counterReg)
 	if loop.PreTest {
@@ -792,11 +799,11 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		moves[2*len(roots)+j] = 1 + xs
 	}
 	wideDst := map[int]bool{}
-	if loop.CounterWide {
-		for j, xs := range loop.ExitScalars {
-			if xs == loop.CounterScalar {
-				wideDst[2*len(roots)+j] = true
-			}
+	for j, xs := range loop.ExitScalars {
+		if (xs == loop.CounterScalar && loop.CounterWide) || (tree.Addr64 && xs != loop.CounterScalar) {
+			// Addr64 exit scalars are the int64 pointer parameters
+			// (the counter keeps its own declared width).
+			wideDst[2*len(roots)+j] = true
 		}
 	}
 	movFor := func(dst int) string {
