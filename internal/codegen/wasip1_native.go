@@ -1365,19 +1365,28 @@ func (w *WasiStubs) Clock_time_get(m *Module, clockID int32, precision int64, ti
 	if out == nil {
 		return _wasiEFAULT
 	}
-	var nanos uint64
-	switch clockID {
-	case 0: // CLOCK_REALTIME
-		nanos = uint64(time.Now().UnixNano())
-	case 1: // CLOCK_MONOTONIC
-		w.mu.Lock()
-		nanos = uint64(time.Since(w.monoStart).Nanoseconds())
-		w.mu.Unlock()
-	default:
-		return _wasiEINVAL
+	nanos, errno := w.clockNanos(clockID)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	binary.LittleEndian.PutUint64(out, nanos)
 	return _wasiESUCCESS
+}
+
+// clockNanos is the layout-independent body of clock_time_get, shared
+// by the wasm32 and wasm64 bindings.
+func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
+	switch clockID {
+	case 0: // CLOCK_REALTIME
+		return uint64(time.Now().UnixNano()), _wasiESUCCESS
+	case 1: // CLOCK_MONOTONIC
+		w.mu.Lock()
+		nanos := uint64(time.Since(w.monoStart).Nanoseconds())
+		w.mu.Unlock()
+		return nanos, _wasiESUCCESS
+	default:
+		return 0, _wasiEINVAL
+	}
 }
 
 // closeWasiOpen releases every underlying handle held by op and
@@ -1649,42 +1658,71 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	if src == nil {
 		return _wasiEBADF
 	}
-	// The iovec array is iovsLen * 8 bytes (ptr u32 + len u32 each)
-	// and nread is a single u32 — bounds-check both up front. Compute
-	// the array size in uint64 so a pathological iovsLen can't wrap to
-	// negative.
-	iovBytes := uint64(uint32(iovsLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
 	nreadSlice := w.memSlice(m, nreadPtr, 4)
-	if iovecs == nil || nreadSlice == nil {
+	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
 	_ = op
-	var total uint32
+	binary.LittleEndian.PutUint32(nreadSlice, uint32(readVec(src, bufs)))
+	return _wasiESUCCESS
+}
+
+// iovecSlices resolves a wasm32 ciovec/iovec array ({u32 ptr, u32 len}
+// entries at iovs) into the backing memory windows. Every entry is
+// validated before any I/O happens, so a bad iovec faults the whole
+// call instead of after a partial transfer.
+func (w *WasiStubs) iovecSlices(m *Module, iovs, iovsLen int32) ([][]byte, bool) {
+	// Compute the array size in uint64 so a pathological iovsLen can't
+	// wrap to negative.
+	iovBytes := uint64(uint32(iovsLen)) * 8
+	if iovBytes > 0x7fffffff {
+		return nil, false
+	}
+	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	if iovecs == nil {
+		return nil, false
+	}
+	bufs := make([][]byte, 0, iovsLen)
 	for i := int32(0); i < iovsLen; i++ {
 		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
 		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
 		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
 		if buf == nil {
-			return _wasiEFAULT
+			return nil, false
 		}
+		bufs = append(bufs, buf)
+	}
+	return bufs, true
+}
+
+// readVec fills bufs from src in order, stopping at the first error
+// (EOF included) or short read; returns the bytes read. Shared by the
+// wasm32 and wasm64 fd_read bindings — only the iovec layout differs.
+func readVec(src io.Reader, bufs [][]byte) uint64 {
+	var total uint64
+	for _, buf := range bufs {
 		n, err := src.Read(buf)
-		total += uint32(n)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			break
-		}
-		if n < int(bufLen) {
+		total += uint64(n)
+		if err != nil || n < len(buf) {
 			break
 		}
 	}
-	binary.LittleEndian.PutUint32(nreadSlice, total)
-	return _wasiESUCCESS
+	return total
+}
+
+// writeVec drains bufs into dst in order, stopping at the first failed
+// write; returns the bytes written. Shared like readVec.
+func writeVec(dst io.Writer, bufs [][]byte) uint64 {
+	var total uint64
+	for _, buf := range bufs {
+		n, err := dst.Write(buf)
+		total += uint64(n)
+		if err != nil {
+			break
+		}
+	}
+	return total
 }
 
 // fdSrcLocked returns the io.Reader for fd and (when applicable) the
@@ -1812,18 +1850,28 @@ func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr
 	if out == nil {
 		return _wasiEFAULT
 	}
+	n, errno := w.fdSeek(fd, offset, int(whence))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint64(out, uint64(n))
+	return _wasiESUCCESS
+}
+
+// fdSeek is the layout-independent body of fd_seek, shared by the
+// wasm32 and wasm64 bindings.
+func (w *WasiStubs) fdSeek(fd int32, offset int64, whence int) (int64, int32) {
 	w.mu.Lock()
 	op := w.fdTable[fd]
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
-		return _wasiEBADF
+		return 0, _wasiEBADF
 	}
-	n, err := op.f.Seek(offset, int(whence))
+	n, err := op.f.Seek(offset, whence)
 	if err != nil {
-		return _wasiEINVAL
+		return 0, _wasiEINVAL
 	}
-	binary.LittleEndian.PutUint64(out, uint64(n))
-	return _wasiESUCCESS
+	return n, _wasiESUCCESS
 }
 
 func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
@@ -1849,37 +1897,18 @@ func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) in
 	w.mu.Lock()
 	dst, _ := w.fdDstLocked(fd)
 	w.mu.Unlock()
-	iovBytes := uint64(uint32(iovsLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
 	nwrittenSlice := w.memSlice(m, nwrittenPtr, 4)
-	if iovecs == nil || nwrittenSlice == nil {
+	if !ok || nwrittenSlice == nil {
 		return _wasiEFAULT
 	}
 	if dst == nil {
 		binary.LittleEndian.PutUint32(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	var total uint32
-	for i := int32(0); i < iovsLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := dst.Write(buf)
-		total += uint32(n)
-		if err != nil {
-			break
-		}
-	}
-	binary.LittleEndian.PutUint32(nwrittenSlice, total)
+	binary.LittleEndian.PutUint32(nwrittenSlice, uint32(writeVec(dst, bufs)))
 	return _wasiESUCCESS
 }
-
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	op := w.fdTable[fd]
@@ -2928,6 +2957,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"encodeWaitStatus":        true,
 			"totalBytesPlusNul":       true,
 			"putStrVec64":             true,
+			"readVec":                 true,
+			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
 			"Environ_get":             true,
@@ -3229,16 +3260,9 @@ func (w *WasiStubs) Clock_time_get64(m *Module, clockID int64, precision int64, 
 	if out == nil {
 		return _wasiEFAULT
 	}
-	var nanos uint64
-	switch int32(clockID) {
-	case 0: // CLOCK_REALTIME
-		nanos = uint64(time.Now().UnixNano())
-	case 1: // CLOCK_MONOTONIC
-		w.mu.Lock()
-		nanos = uint64(time.Since(w.monoStart).Nanoseconds())
-		w.mu.Unlock()
-	default:
-		return _wasiEINVAL
+	nanos, errno := w.clockNanos(int32(clockID))
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	binary.LittleEndian.PutUint64(out, nanos)
 	return _wasiESUCCESS
@@ -3264,53 +3288,52 @@ func (w *WasiStubs) Fd_seek64(m *Module, fd int64, offset int64, whence int64, n
 	if out == nil {
 		return _wasiEFAULT
 	}
-	w.mu.Lock()
-	op := w.fdTable[int32(fd)]
-	w.mu.Unlock()
-	if op == nil || op.f == nil {
-		return _wasiEBADF
-	}
-	n, err := op.f.Seek(offset, int(whence))
-	if err != nil {
-		return _wasiEINVAL
+	n, errno := w.fdSeek(int32(fd), offset, int(whence))
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
+}
+
+// iovecSlices64 is iovecSlices for the LP64 iovec layout: {u64 buf,
+// u64 len}, 16 bytes per entry.
+func (w *WasiStubs) iovecSlices64(m *Module, iovs, iovsLen int64) ([][]byte, bool) {
+	if iovsLen < 0 || iovsLen > 1<<20 {
+		return nil, false
+	}
+	iovecs := w.memSlice64(m, iovs, iovsLen*16)
+	if iovecs == nil {
+		return nil, false
+	}
+	bufs := make([][]byte, 0, iovsLen)
+	for i := int64(0); i < iovsLen; i++ {
+		bufPtr := binary.LittleEndian.Uint64(iovecs[i*16:])
+		bufLen := binary.LittleEndian.Uint64(iovecs[i*16+8:])
+		buf := w.memSlice64(m, int64(bufPtr), int64(bufLen))
+		if buf == nil {
+			return nil, false
+		}
+		bufs = append(bufs, buf)
+	}
+	return bufs, true
 }
 
 func (w *WasiStubs) Fd_write64(m *Module, fd int64, iovs int64, iovsLen int64, nwrittenPtr int64) int32 {
 	w.mu.Lock()
 	dst, _ := w.fdDstLocked(int32(fd))
 	w.mu.Unlock()
-	// LP64 ciovec: {u64 buf, u64 len}, 16 bytes per entry; nwritten is
-	// a 64-bit __wasi_size_t.
-	if iovsLen < 0 || iovsLen > 1<<20 {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice64(m, iovs, iovsLen*16)
+	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
+	// nwritten is a 64-bit __wasi_size_t.
 	nwrittenSlice := w.memSlice64(m, nwrittenPtr, 8)
-	if iovecs == nil || nwrittenSlice == nil {
+	if !ok || nwrittenSlice == nil {
 		return _wasiEFAULT
 	}
 	if dst == nil {
 		binary.LittleEndian.PutUint64(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	var total uint64
-	for i := int64(0); i < iovsLen; i++ {
-		bufPtr := binary.LittleEndian.Uint64(iovecs[i*16:])
-		bufLen := binary.LittleEndian.Uint64(iovecs[i*16+8:])
-		buf := w.memSlice64(m, int64(bufPtr), int64(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := dst.Write(buf)
-		total += uint64(n)
-		if err != nil {
-			break
-		}
-	}
-	binary.LittleEndian.PutUint64(nwrittenSlice, total)
+	binary.LittleEndian.PutUint64(nwrittenSlice, writeVec(dst, bufs))
 	return _wasiESUCCESS
 }
 
@@ -3447,31 +3470,13 @@ func (w *WasiStubs) Fd_read64(m *Module, fd, iovs, iovsLen, nreadPtr int64) int3
 	if src == nil {
 		return _wasiEBADF
 	}
-	// LP64 iovec: {u64 buf, u64 len}, 16 bytes per entry; nread is a
-	// 64-bit __wasi_size_t.
-	if iovsLen < 0 || iovsLen > 1<<20 {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice64(m, iovs, iovsLen*16)
+	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
+	// nread is a 64-bit __wasi_size_t.
 	nreadSlice := w.memSlice64(m, nreadPtr, 8)
-	if iovecs == nil || nreadSlice == nil {
+	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	var total uint64
-	for i := int64(0); i < iovsLen; i++ {
-		bufPtr := binary.LittleEndian.Uint64(iovecs[i*16:])
-		bufLen := binary.LittleEndian.Uint64(iovecs[i*16+8:])
-		buf := w.memSlice64(m, int64(bufPtr), int64(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := src.Read(buf)
-		total += uint64(n)
-		if err != nil || n < len(buf) {
-			break
-		}
-	}
-	binary.LittleEndian.PutUint64(nreadSlice, total)
+	binary.LittleEndian.PutUint64(nreadSlice, readVec(src, bufs))
 	return _wasiESUCCESS
 }
 
