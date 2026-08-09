@@ -39,8 +39,9 @@ func a64SplicePairOp(sym string) (op string, addr64, ok bool) {
 func a64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
 	// The bounds-coalescing split forms have dedicated bodies: the
 	// group-leading load carries the whole window's range check, the
-	// other members drop theirs. Bounds coalescing is wasm32-only
-	// (see simdBoundsMemOK), so these never appear with addr64.
+	// other members drop theirs. On a memory64 module the args ride at
+	// full width (MOVD) with a signed 64-bit start; wasm32 uses the
+	// zero-extended MOVWU forms.
 	switch op {
 	case "v128_load_rng":
 		if offs == nil {
@@ -48,9 +49,23 @@ func a64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, 
 		}
 		// (m, addr, offset, rlo, span) in R0..R4 → trap unless
 		// [addr+rlo, addr+rlo+span) fits; pair of addr+offset in
-		// (R0, R1). rlo is signed (MOVW sign-extends); a negative
-		// start means a group member wrapped and must trap, matching
-		// the helper.
+		// (R0, R1). rlo is signed; a negative start means a group
+		// member wrapped and must trap, matching the helper.
+		if addr64 {
+			b.WriteString("\tMOVD R1, R25\n")
+			b.WriteString("\tADD R3, R25, R26\n")
+			fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tADD R4, R26, R27\n")
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.MemSize)
+			b.WriteString("\tMOVD (R26), R26\n")
+			b.WriteString("\tCMP R27, R26\n")
+			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tADD R2, R25, R25\n")
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.M)
+			b.WriteString("\tADD R25, R26, R27\n")
+			b.WriteString("\tWORD $0xa9400760 // ldp x0, x1, [x27]\n")
+			return true, true, nil
+		}
 		b.WriteString("\tMOVWU R1, R25\n")
 		b.WriteString("\tMOVW R3, R26\n")
 		b.WriteString("\tADD R26, R25, R26\n")
@@ -72,6 +87,13 @@ func a64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, 
 			return false, false, fmt.Errorf("simd pair splice %s: no Module offsets", op)
 		}
 		// (m, addr, offset) in R0..R2 → pair in (R0, R1), no check.
+		if addr64 {
+			b.WriteString("\tADD R2, R1, R25\n")
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.M)
+			b.WriteString("\tADD R25, R26, R27\n")
+			b.WriteString("\tWORD $0xa9400760 // ldp x0, x1, [x27]\n")
+			return true, false, nil
+		}
 		b.WriteString("\tMOVWU R1, R25\n")
 		b.WriteString("\tMOVWU R2, R26\n")
 		b.WriteString("\tADD R26, R25, R25\n")

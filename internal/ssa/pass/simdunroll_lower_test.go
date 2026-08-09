@@ -20,6 +20,26 @@ func TestUnrollSimdLoopsOnLoweredFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Every function with a countdown SIMD loop must unroll in WIDE
+	// mode — a variable stride unrolls fine (the bump repeats per
+	// copy), and wide additionally admits the i64-countdown variants
+	// (loopsum64, axpy64, gemm4's outer loop): the shape memory64
+	// modules produce, where LP64 promotes the induction variable.
+	mustFire := map[string]bool{
+		"loopsum": true, "dot2": true, "quantnarrow": true,
+		"scaledot": true, "axpy": true, "strideaxpy": true,
+		"gathersum": true, "loopsum64": true, "axpy64": true,
+		"gemm4": true,
+	}
+	// Narrow mode (wasm32) must keep the exact historical set: the
+	// i64-counter loops stay untouched there — admitting them was
+	// measured to cost ~40% prompt throughput on the llama.cpp module
+	// (their bodies do not window-fuse on wasm32).
+	narrowFire := map[string]bool{
+		"loopsum": true, "dot2": true, "quantnarrow": true,
+		"scaledot": true, "axpy": true, "strideaxpy": true,
+		"gathersum": true,
+	}
 	unrolled := 0
 	for _, e := range m.Exports {
 		if e.Kind != wasm.ExportFunc {
@@ -32,21 +52,26 @@ func TestUnrollSimdLoopsOnLoweredFixture(t *testing.T) {
 		if err := ssa.Verify(f); err != nil {
 			t.Fatalf("verify %s pre: %v", e.Name, err)
 		}
-		if UnrollSimdLoops(f, 4) {
+		narrow, err := lower.LowerFunction(m, e.Index, e.Name, nil)
+		if err != nil {
+			t.Fatalf("lower %s: %v", e.Name, err)
+		}
+		if UnrollSimdLoops(narrow, 4, false) != narrowFire[e.Name] {
+			t.Errorf("%s: narrow matcher fired=%v, want %v", e.Name, !narrowFire[e.Name], narrowFire[e.Name])
+		}
+		if UnrollSimdLoops(f, 4, true) {
 			unrolled++
+			if !mustFire[e.Name] {
+				t.Errorf("%s: matcher fired unexpectedly", e.Name)
+			}
 			if err := ssa.Verify(f); err != nil {
 				t.Fatalf("verify %s post-unroll: %v", e.Name, err)
 			}
-		} else if e.Name == "loopsum" || e.Name == "dot2" || e.Name == "quantnarrow" || e.Name == "scaledot" || e.Name == "axpy" || e.Name == "strideaxpy" || e.Name == "gathersum" {
+		} else if mustFire[e.Name] {
 			t.Errorf("%s: matcher did not fire; function:\n%s", e.Name, ssa.FuncString(f))
 		}
 	}
-	// loopsum, dot2, quantnarrow, scaledot, axpy, strideaxpy and
-	// gathersum all contain the countdown SIMD loop (a variable
-	// stride unrolls fine — the bump repeats per copy). The int64-
-	// counter variants (loopsum64, axpy64) stay un-unrolled: the
-	// unroller only recognizes 32-bit countdowns.
-	if unrolled != 7 {
-		t.Fatalf("unrolled %d functions, want 7 (loopsum, dot2, quantnarrow, scaledot, axpy, strideaxpy, gathersum)", unrolled)
+	if unrolled != len(mustFire) {
+		t.Fatalf("unrolled %d functions, want %d", unrolled, len(mustFire))
 	}
 }

@@ -424,10 +424,20 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	// bounds, so every sum traps on carry there).
 	addOffErr := error(nil)
 	if addr64 {
-		if n.Args[0].Kind != simdfuse.ArgScalar {
+		switch a := n.Args[0]; a.Kind {
+		case simdfuse.ArgScalar:
+			fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(a))
+		case simdfuse.ArgSum:
+			// base+const at full width: the descriptor constant is a
+			// small reassociated memarg delta added as i64 — no wrap
+			// semantics needed under the 2^48 memory cap.
+			fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(a))
+			if a.Const != 0 {
+				fmt.Fprintf(b, "\tADDQ $%d, R12\n", int64(a.Const))
+			}
+		default:
 			return fmt.Errorf("fused addr64 load %s: folded address form", n.Op)
 		}
-		fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(n.Args[0]))
 	} else {
 		switch a := n.Args[0]; a.Kind {
 		case simdfuse.ArgConst:
@@ -553,10 +563,18 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 // path; the only difference is the full-width base load. No wrap guard
 // is needed — see a64FusedMemCheck's note (the arm64 twin).
 func x64FusedEA64(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, offs *ModuleOffsets, size int) error {
-	if n.Args[0].Kind != simdfuse.ArgScalar {
+	switch a := n.Args[0]; a.Kind {
+	case simdfuse.ArgScalar:
+		fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(a))
+	case simdfuse.ArgSum:
+		// base+const at full width (see x64FusedLoad's addr64 arm).
+		fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(a))
+		if a.Const != 0 {
+			fmt.Fprintf(b, "\tADDQ $%d, R12\n", int64(a.Const))
+		}
+	default:
 		return fmt.Errorf("fused addr64 %s: folded base form", n.Op)
 	}
-	fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(n.Args[0]))
 	switch off := n.Args[1]; off.Kind {
 	case simdfuse.ArgConst:
 		if off.Const != 0 {
@@ -737,7 +755,8 @@ func x64FusedStoreTail(b *strings.Builder, n simdfuse.Node,
 	}
 	fmt.Fprintf(b, "\tMOVQ %d(R13), AX\n", offs.M)
 	fmt.Fprintf(b, "\tMOVOU X%d, (AX)(R12*1)\n", src)
-	return nil}
+	return nil
+}
 
 // x64SpliceLoop is the amd64 fused-loop synthesizer; see the arm64
 // twin for the structure.

@@ -2104,6 +2104,35 @@ func simd_scalar_i32_add(a int32, b int32) int32 { return a + b }
 //go:noinline
 func simd_scalar_f32_mul(a float32, b float32) float32 { return a * b }
 
+// The simd_m64_scalar_* twins are the memory64 scalar-chain vocabulary:
+// the per-block scale computations become 64-bit address arithmetic
+// (a wasm64 module's pointer math genuinely does not wrap at 32 bits),
+// and the loads index full-width. Only the address-carrying ops change
+// width; f32_mul is a value op and reuses the wasm32 helper.
+
+//go:noinline
+func simd_m64_scalar_i32_load16_u(m *Module, addr int64) int64 {
+	return int64(*(*uint16)(unsafe.Add(m.M, uintptr(uint64(addr)))))
+}
+
+//go:noinline
+func simd_m64_scalar_f32_load(m *Module, addr int64) float32 {
+	return *(*float32)(unsafe.Add(m.M, uintptr(uint64(addr))))
+}
+
+//go:noinline
+func simd_m64_scalar_i32_shl(v int64, s int64) int64 { return v << (uint(s) % 64) }
+
+//go:noinline
+func simd_m64_scalar_i32_add(a int64, b int64) int64 { return a + b }
+
+var (
+	_ = simd_m64_scalar_i32_load16_u
+	_ = simd_m64_scalar_f32_load
+	_ = simd_m64_scalar_i32_shl
+	_ = simd_m64_scalar_i32_add
+)
+
 //go:noinline
 func simd_v128_f16x4_cvt_store(m *Module, addr int32, offset int32, v [2]uint64) int32 {
 	// Convert four f32 lanes to f16 with the software idiom's exact
@@ -2702,6 +2731,33 @@ func simd_m64_v128_load(m *Module, addr int64, offset int64) [2]uint64 {
 	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
 }
 
+// simd_m64_v128_load_rng / _nc are the bounds-coalesced memory64 loads
+// (see internal/ssa/pass CoalesceSimdBounds): the group leader carries
+// one full-width, overflow-safe range check covering the window, the
+// rest load unchecked. rlo/span are the window; all four operands ride
+// at pointer width.
+//
+//go:noinline
+func simd_m64_v128_load_rng(m *Module, addr int64, offset int64, rlo int64, span int64) [2]uint64 {
+	// addr is a valid guest pointer (< the 2^48 hard cap, so
+	// non-negative as int64); rlo is a small signed window start and
+	// span a small positive length, so the signed sum cannot overflow.
+	start := addr + rlo
+	if start < 0 || uint64(start)+uint64(span) > m.memSize.Load() {
+		wasm_trap_simd_oob()
+	}
+	ea := uint64(addr) + uint64(offset)
+	p := unsafe.Add(m.M, uintptr(ea))
+	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
+}
+
+//go:noinline
+func simd_m64_v128_load_nc(m *Module, addr int64, offset int64) [2]uint64 {
+	ea := uint64(addr) + uint64(offset)
+	p := unsafe.Add(m.M, uintptr(ea))
+	return [2]uint64{*(*uint64)(p), *(*uint64)(unsafe.Add(p, 8))}
+}
+
 //go:noinline
 func simd_m64_v128_store(m *Module, addr int64, offset int64, v [2]uint64) int32 {
 	ea := simdEA64(m, addr, offset, 16)
@@ -2906,6 +2962,8 @@ var (
 	_ = memoryCopy64
 	_ = memoryInit64
 	_ = simd_m64_v128_load
+	_ = simd_m64_v128_load_rng
+	_ = simd_m64_v128_load_nc
 	_ = simd_m64_v128_store
 	_ = simd_m64_v128_load32_zero
 	_ = simd_m64_v128_load64_zero
@@ -2938,6 +2996,18 @@ var (
 //go:noinline
 func simd_p_m64_v128_load(m *Module, addr int64, offset int64) (uint64, uint64) {
 	r := simd_m64_v128_load(m, addr, offset)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load_rng(m *Module, addr int64, offset int64, rlo int64, span int64) (uint64, uint64) {
+	r := simd_m64_v128_load_rng(m, addr, offset, rlo, span)
+	return r[0], r[1]
+}
+
+//go:noinline
+func simd_p_m64_v128_load_nc(m *Module, addr int64, offset int64) (uint64, uint64) {
+	r := simd_m64_v128_load_nc(m, addr, offset)
 	return r[0], r[1]
 }
 
@@ -3065,6 +3135,8 @@ func simd_p_m64_v128_store64_lane(m *Module, addr int64, offset int64, lane int3
 // Referenced only from generated memory64 module code.
 var (
 	_ = simd_p_m64_v128_load
+	_ = simd_p_m64_v128_load_rng
+	_ = simd_p_m64_v128_load_nc
 	_ = simd_p_m64_v128_store
 	_ = simd_p_m64_v128_load32_zero
 	_ = simd_p_m64_v128_load64_zero

@@ -96,23 +96,38 @@ func (p *x64ScalarPre) takeGpr(a simdfuse.Arg) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVL %s, %s\n", src, r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVQ %s, %s\n", src, r)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVL %s, %s\n", src, r)
+		}
 		return r, nil
 	case simdfuse.ArgScalar:
 		r, err := p.allocGpr()
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVL %s, %s\n", p.scalarReg(a), r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVQ %s, %s\n", p.scalarReg(a), r)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVL %s, %s\n", p.scalarReg(a), r)
+		}
 		return r, nil
 	case simdfuse.ArgSum:
 		r, err := p.allocGpr()
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVL %s, %s\n", p.scalarReg(a), r)
-		if a.Const != 0 {
-			fmt.Fprintf(p.b, "\tADDL $%d, %s\n", a.Const, r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVQ %s, %s\n", p.scalarReg(a), r)
+			if a.Const != 0 {
+				fmt.Fprintf(p.b, "\tADDQ $%d, %s\n", int64(a.Const), r)
+			}
+		} else {
+			fmt.Fprintf(p.b, "\tMOVL %s, %s\n", p.scalarReg(a), r)
+			if a.Const != 0 {
+				fmt.Fprintf(p.b, "\tADDL $%d, %s\n", a.Const, r)
+			}
 		}
 		return r, nil
 	case simdfuse.ArgConst:
@@ -120,7 +135,11 @@ func (p *x64ScalarPre) takeGpr(a simdfuse.Arg) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVL $%d, %s\n", a.Const, r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVQ $%d, %s\n", int64(a.Const), r)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVL $%d, %s\n", a.Const, r)
+		}
 		return r, nil
 	}
 	return "", fmt.Errorf("fused splice %s: bad scalar operand kind", p.tree.Name)
@@ -162,25 +181,34 @@ func (p *x64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(p.b, "\tSHLL $%d, %s\n", uint32(n.Args[1].Const)%32, g)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tSHLQ $%d, %s\n", uint64(n.Args[1].Const)%64, g)
+		} else {
+			fmt.Fprintf(p.b, "\tSHLL $%d, %s\n", uint32(n.Args[1].Const)%32, g)
+		}
 		p.gprOf[i] = g
 	case "scalar_i32_add":
 		g, err := p.takeGpr(n.Args[0])
 		if err != nil {
 			return err
 		}
+		addOp := "ADDL"
+		imm := int64(n.Args[1].Const)
+		if p.tree.Addr64 {
+			addOp = "ADDQ"
+		}
 		r := n.Args[1]
 		switch r.Kind {
 		case simdfuse.ArgConst:
-			fmt.Fprintf(p.b, "\tADDL $%d, %s\n", r.Const, g)
+			fmt.Fprintf(p.b, "\t%s $%d, %s\n", addOp, imm, g)
 		case simdfuse.ArgScalar:
-			fmt.Fprintf(p.b, "\tADDL %s, %s\n", p.scalarReg(r), g)
+			fmt.Fprintf(p.b, "\t%s %s, %s\n", addOp, p.scalarReg(r), g)
 		case simdfuse.ArgNode:
 			g2, err := p.takeGpr(r)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(p.b, "\tADDL %s, %s\n", g2, g)
+			fmt.Fprintf(p.b, "\t%s %s, %s\n", addOp, g2, g)
 			p.freeGpr = append(p.freeGpr, g2)
 		default:
 			return fmt.Errorf("fused splice %s: bad scalar_i32_add operand", p.tree.Name)

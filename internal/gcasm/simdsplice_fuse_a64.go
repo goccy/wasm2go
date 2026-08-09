@@ -891,10 +891,22 @@ func dst0Src(loc []fusedLoc, n simdfuse.Node) int {
 // never outside it. This matches wasm2go's existing bounds model.
 func a64FusedMemCheck(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, span int, addr64 bool) error {
 	if addr64 {
-		if n.Args[0].Kind != simdfuse.ArgScalar {
+		switch a := n.Args[0]; a.Kind {
+		case simdfuse.ArgScalar:
+			fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(a))
+		case simdfuse.ArgSum:
+			// base+const at full width (see a64FusedLoad's addr64 arm).
+			if a.Const == 0 {
+				fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(a))
+			} else if a.Const > 0 && a.Const < 4096 {
+				fmt.Fprintf(b, "\tADD $%d, %s, R25\n", a.Const, scalarReg(a))
+			} else {
+				fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(a.Const))
+				fmt.Fprintf(b, "\tADD R22, %s, R25\n", scalarReg(a))
+			}
+		default:
 			return fmt.Errorf("fused addr64 %s: folded base form", n.Op)
 		}
-		fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(n.Args[0]))
 	} else {
 		fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(n.Args[0]))
 	}
@@ -1078,10 +1090,25 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	// descriptor constant with one W-form add: ADDW wraps mod 2^32 and
 	// zero-extends, exactly Add32.
 	if addr64 {
-		if n.Args[0].Kind != simdfuse.ArgScalar {
+		switch a := n.Args[0]; a.Kind {
+		case simdfuse.ArgScalar:
+			fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(a))
+		case simdfuse.ArgSum:
+			// base+const at full width: the descriptor constant is a
+			// small reassociated memarg delta added as i64 — no wrap
+			// semantics needed, the sum stays far below 2^63 under
+			// the 2^48 memory cap.
+			if a.Const == 0 {
+				fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(a))
+			} else if a.Const > 0 && a.Const < 4096 {
+				fmt.Fprintf(b, "\tADD $%d, %s, R25\n", a.Const, scalarReg(a))
+			} else {
+				fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(a.Const))
+				fmt.Fprintf(b, "\tADD R22, %s, R25\n", scalarReg(a))
+			}
+		default:
 			return fmt.Errorf("fused addr64 load %s: folded address form", n.Op)
 		}
-		fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(n.Args[0]))
 	} else {
 		switch a := n.Args[0]; a.Kind {
 		case simdfuse.ArgConst:

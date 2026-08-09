@@ -93,7 +93,7 @@ func (em *ssaEmitter) scalarizeSimd(body *ast.BlockStmt, paramsV128 map[string]b
 	sc := &simdScalarizer{em: em, pairs: map[string]bool{}, arrays: map[string]bool{}}
 	sc.identCount = countSemanticIdents(body)
 	sc.readCount, sc.carryLoopReads = countCarryLoopReads(body)
-	sc.constBind = collectConstBindings(body)
+	sc.constBind = collectConstBindings(body, em.mem64)
 	sc.collect(body)
 	sc.audit(body)
 	body.List = sc.rewriteStmts(body.List)
@@ -301,10 +301,27 @@ func countCarryLoopReads(body *ast.BlockStmt) (map[string]int, map[string]int) {
 // value locals (v<n>, its own naming contract) qualify: wasm locals
 // (l<n>) are MUTABLE and default to zero, so a read can legitimately
 // precede their one assignment.
-func collectConstBindings(body *ast.BlockStmt) map[string]int32 {
+func collectConstBindings(body *ast.BlockStmt, wide bool) map[string]int32 {
 	assigns := map[string]int{}
 	val := map[string]int32{}
 	isConst := map[string]bool{}
+	// On a memory64 function the emitter spells its constant locals
+	// int64(...)/uint64(...); bind those too when the value fits the
+	// int32 descriptor width. Every consumer folds by VALUE (memarg
+	// offsets, coalesced windows, shift amounts), so a fitting wide
+	// literal is exactly as safe as a narrow one. wasm32 functions
+	// keep the narrow-only matcher, byte-identical output.
+	constOf := intConstValue
+	if wide {
+		constOf = func(e ast.Expr) (int32, bool) {
+			if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+				if id, ok := c.Fun.(*ast.Ident); ok && (id.Name == "int64" || id.Name == "uint64") {
+					return intConstValue(c.Args[0])
+				}
+			}
+			return intConstValue(e)
+		}
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch st := n.(type) {
 		case *ast.IncDecStmt:
@@ -319,7 +336,7 @@ func collectConstBindings(body *ast.BlockStmt) map[string]int32 {
 				}
 				assigns[id.Name]++
 				if len(st.Lhs) == len(st.Rhs) && st.Tok == token.ASSIGN {
-					if c, ok := intConstValue(st.Rhs[i]); ok {
+					if c, ok := constOf(st.Rhs[i]); ok {
 						val[id.Name] = c
 						isConst[id.Name] = true
 					}

@@ -1404,17 +1404,14 @@ const wasmMemHardCapBytes = (1 << 32) - (1 << 17)
 // past the cap (65535/65536 pages) disqualifies a module.
 func (t *translator) simdBoundsMemOK() bool {
 	if t.mod.Memory64() {
-		// memory64 keeps per-load checks. The check itself is now the
-		// SAME structure as wasm32 (only the address load widens
-		// MOVWU→MOVD, no wrap guard — the 2^48 cap makes ea+size ≤
-		// memSize exact), so a single m64 load is as cheap as its
-		// wasm32 twin. Coalescing them, however, was MEASURED to
-		// regress the llama.cpp kernel (~35% on tg) even with the
-		// carry-free forms — the grouping interacts badly with the m64
-		// tree fusion in a way the wasm32 path does not. The m64
-		// load_rng/load_nc splices remain implemented and tested for a
-		// future grouping heuristic, but stay off by default.
-		return false
+		// The coalesced range check is exact on memory64 without any
+		// size precondition: linear memory is capped at 2^48
+		// (mem64HardCap, enforced by memoryGrow and the constructor),
+		// so ea+span can never wrap a u64 and ea+span ≤ memSize is the
+		// same exact bound the wasm32 form relies on. The m64
+		// load_rng/load_nc splices mirror the wasm32 ones with the
+		// address load widened MOVWU→MOVD.
+		return true
 	}
 	for _, mem := range t.mod.Memories {
 		if uint64(mem.Limits.Min)*65536 > wasmMemHardCapBytes {
@@ -2774,7 +2771,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		if k > 8 {
 			k = 8
 		}
-		pass.UnrollSimdLoops(ssaFn, k)
+		pass.UnrollSimdLoops(ssaFn, k, t.mod.Memory64())
 	}
 	const optFixpointCap = 8
 	fixpointReached := false
@@ -2786,7 +2783,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		if pass.BranchFold(ssaFn) {
 			changed = true
 		}
-		if pass.ReassocConstAdds(ssaFn) {
+		if pass.ReassocConstAdds(ssaFn, t.mod.Memory64()) {
 			changed = true
 		}
 		if pass.Simplify(ssaFn) {

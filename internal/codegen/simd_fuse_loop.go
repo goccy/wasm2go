@@ -68,7 +68,7 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		if _, ok := ifs.Body.List[0].(*ast.BranchStmt); !ok {
 			return nil, false
 		}
-		counter, ok := matchUiLt(ifs.Cond)
+		counter, ok := matchUiLt(ifs.Cond, sc.wideCounters())
 		if !ok {
 			return nil, false
 		}
@@ -173,6 +173,13 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	return cl, true
 }
 
+// wideCounters reports whether the scalarizer's module carries
+// promoted i64 loop counters (memory64). Nil-safe: the matcher tests
+// drive matchCountdownLoop without a scalarizer.
+func (sc *simdScalarizer) wideCounters() bool {
+	return sc != nil && sc.em != nil && sc.em.mem64
+}
+
 // blankFor returns n blank identifiers for a keep-alive assignment.
 func blankFor(n int) []ast.Expr {
 	out := make([]ast.Expr, n)
@@ -201,11 +208,18 @@ func (cl *countdownLoop) splitTail(sc *simdScalarizer, list []ast.Stmt, counter 
 		}
 		if lhs, ok := as.Lhs[0].(*ast.Ident); ok && len(as.Lhs) == 1 && lhs.Name == counter.Name {
 			// `c = c - K` (possibly a reassociated chain of subtractions).
-			terms, ok := matchCounterDec(as, counter)
+			terms, ok := matchCounterDec(as, counter, sc.wideCounters())
 			if !ok {
 				return false
 			}
 			cl.decEx = terms
+			// An int64-spelled decrement marks the promoted i64 counter
+			// a memory64 module's unrolled header carries.
+			for _, term := range terms {
+				if _, cok, w := loopConstValue(term); cok && w {
+					cl.wide = true
+				}
+			}
 			sawDec = true
 			i--
 			continue
@@ -256,7 +270,7 @@ func (cl *countdownLoop) classifyTailAssign(sc *simdScalarizer, as *ast.AssignSt
 	}
 	if bin, ok := as.Rhs[0].(*ast.BinaryExpr); ok && bin.Op == token.ADD {
 		if base, ok := bin.X.(*ast.Ident); ok && base.Name == lhs.Name {
-			if constishExpr(bin.Y) {
+			if constishExpr(bin.Y, sc.wideCounters()) {
 				cl.bumps = append(cl.bumps, as)
 				return nil
 			}
@@ -268,14 +282,20 @@ func (cl *countdownLoop) classifyTailAssign(sc *simdScalarizer, as *ast.AssignSt
 // matchUiLt matches the unrolled header guard
 // `base.Ui32(c) < base.Ui32(int32(K))` (either helper-qualified or
 // plain), returning the counter.
-func matchUiLt(e ast.Expr) (*ast.Ident, bool) {
+func matchUiLt(e ast.Expr, wide bool) (*ast.Ident, bool) {
 	bin, ok := e.(*ast.BinaryExpr)
 	if !ok || bin.Op != token.LSS {
 		return nil, false
 	}
+	// Both counter widths: wasm32 spells the guard Ui32(c) < Ui32(K);
+	// a memory64 module's promoted i64 counter spells it
+	// Ui64(c) < Ui64(int64(K)).
 	unwrap := func(x ast.Expr) ast.Expr {
 		if c, ok := x.(*ast.CallExpr); ok && len(c.Args) == 1 {
-			if strings.HasSuffix(helperName(c.Fun), "i32") || helperName(c.Fun) == "Ui32" || helperName(c.Fun) == "ui32" {
+			switch n := helperName(c.Fun); {
+			case strings.HasSuffix(n, "i32"), n == "Ui32", n == "ui32":
+				return c.Args[0]
+			case wide && (strings.HasSuffix(n, "i64") || n == "Ui64" || n == "ui64"):
 				return c.Args[0]
 			}
 		}
@@ -285,7 +305,12 @@ func matchUiLt(e ast.Expr) (*ast.Ident, bool) {
 	if !ok {
 		return nil, false
 	}
-	if _, ok := intConstValue(unwrap(bin.Y)); !ok {
+	c := unwrap(bin.Y)
+	if wide {
+		if _, ok, _ := loopConstValue(c); !ok {
+			return nil, false
+		}
+	} else if _, ok := intConstValue(c); !ok {
 		return nil, false
 	}
 	return id, ok
@@ -294,7 +319,7 @@ func matchUiLt(e ast.Expr) (*ast.Ident, bool) {
 // matchCounterDec matches `c = c - K` and reassociated chains
 // `c = c - k1 - k2 ...`, returning the decrement terms for later
 // resolution.
-func matchCounterDec(as *ast.AssignStmt, counter *ast.Ident) ([]ast.Expr, bool) {
+func matchCounterDec(as *ast.AssignStmt, counter *ast.Ident, wide bool) ([]ast.Expr, bool) {
 	var terms []ast.Expr
 	e := as.Rhs[0]
 	for {
@@ -302,7 +327,7 @@ func matchCounterDec(as *ast.AssignStmt, counter *ast.Ident) ([]ast.Expr, bool) 
 		if !ok || bin.Op != token.SUB {
 			break
 		}
-		if !constishExpr(bin.Y) {
+		if !constishExpr(bin.Y, wide) {
 			return nil, false
 		}
 		terms = append(terms, bin.Y)
@@ -332,8 +357,12 @@ func loopConstValue(e ast.Expr) (int32, bool, bool) {
 // constishExpr accepts a literal or a plain identifier (a possible
 // constant local, resolved at upgrade time once the hoisted
 // interveners are known).
-func constishExpr(e ast.Expr) bool {
-	if _, ok := intConstValue(e); ok {
+func constishExpr(e ast.Expr, wide bool) bool {
+	if wide {
+		if _, ok, _ := loopConstValue(e); ok {
+			return true
+		}
+	} else if _, ok := intConstValue(e); ok {
 		return true
 	}
 	_, ok := e.(*ast.Ident)

@@ -733,16 +733,24 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// The rng window (rlo, span) must be constants: the splicers
 		// bake them as immediates, which is also what keeps the load's
 		// scratch-register budget at two on amd64. The bounds pass
-		// always emits Const32 windows, so this only rejects exotic
-		// hand-written modules.
-		if lookupName == "simd_v128_load32_lane" && !fb.constResolvable(args[2]) {
+		// always emits constant windows — Const32 on wasm32, Const64
+		// (spelled int64(...)) on memory64 — so the resolvability
+		// check matches the module's width.
+		resolvable := fb.constResolvable
+		if m64 {
+			resolvable = func(e ast.Expr) bool {
+				_, ok := fb.addrConstValue(e)
+				return ok
+			}
+		}
+		if lookupName == "simd_v128_load32_lane" && !resolvable(args[2]) {
 			if fb.failWhy == "" {
 				fb.failWhy = "non-const lane"
 			}
 			return 0, false
 		}
 		if lookupName == "simd_v128_load_rng" {
-			if !fb.constResolvable(args[2]) || !fb.constResolvable(args[3]) {
+			if !resolvable(args[2]) || !resolvable(args[3]) {
 				if fb.failWhy == "" {
 					fb.failWhy = "non-const rng window"
 				}
@@ -842,10 +850,22 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// which the emitter's constant CSE creates for shared memarg
 		// offsets; identical scalar identifiers share one parameter.
 		//
-		// A memory64 member's address/offset must stay OPAQUE scalars:
-		// Arg.Const is 32-bit and the ArgSum fold assumes u32 wrap, so
-		// folding either would silently truncate a 64-bit address.
-		foldOK := !(m64 && isMem && i <= 1)
+		// A memory64 member's ADDRESS (arg 0) never folds to a bare
+		// ArgConst: Arg.Const is 32-bit, so a fully-constant 64-bit
+		// pointer would truncate. The base+const ArgSum fold below IS
+		// open to it — the base stays a full-width runtime scalar and
+		// the constant is a small reassociated memarg delta — and the
+		// small memarg offset / coalesced window (rlo/span) at args ≥ 1
+		// fold as bounded constants via the int64-aware matcher, since
+		// m64 spells them int64(...).
+		foldOK := !m64 || !isMem || i != 0
+		if m64 && isMem && i >= 1 {
+			if c, ok := fb.addrConstValue(a); ok {
+				nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
+				fmt.Fprintf(&fb.key, "c%d,", c)
+				continue
+			}
+		}
 		if c, ok := intConstValue(a); ok && foldOK {
 			nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
 			fmt.Fprintf(&fb.key, "c%d,", c)
@@ -872,9 +892,18 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// const-add reassociation) resolves through its window
 		// definition to the same form, under the chase's consumption
 		// bookkeeping so a fully-internalized definition drops out.
+		// The ArgSum fold applies at BOTH widths: on memory64 the base
+		// rides a full-width scalar register and the emitters
+		// materialize base+const with a full i64 add, so nothing
+		// truncates; only the constant matcher differs (m64 spells the
+		// reassociated deltas int64(...)).
+		addrConstOf := fb.constValueOf
+		if m64 {
+			addrConstOf = fb.addrConstValue
+		}
 		aAddr := a
 		var addrDefName string
-		if id, ok := a.(*ast.Ident); ok && isMem && i == 0 && foldOK && fb.interDef != nil {
+		if id, ok := a.(*ast.Ident); ok && isMem && i == 0 && fb.interDef != nil {
 			if def, dok := fb.interDef[id.Name]; dok {
 				if bin, bok := def.Rhs[0].(*ast.BinaryExpr); bok && bin.Op == token.ADD {
 					aAddr = bin
@@ -882,12 +911,12 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				}
 			}
 		}
-		if bin, ok := aAddr.(*ast.BinaryExpr); ok && bin.Op == token.ADD && isMem && i == 0 && foldOK {
+		if bin, ok := aAddr.(*ast.BinaryExpr); ok && bin.Op == token.ADD && isMem && i == 0 {
 			base, cExpr := bin.X, bin.Y
-			c, cok := fb.constValueOf(cExpr)
+			c, cok := addrConstOf(cExpr)
 			if !cok {
 				base, cExpr = bin.Y, bin.X
-				c, cok = fb.constValueOf(cExpr)
+				c, cok = addrConstOf(cExpr)
 			}
 			if cok {
 				if baseID, ok := base.(*ast.Ident); ok && !fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
@@ -989,6 +1018,24 @@ func (fb *fusedTreeBuilder) pairDebug() string {
 func (fb *fusedTreeBuilder) constResolvable(e ast.Expr) bool {
 	_, ok := fb.constValueOf(e)
 	return ok
+}
+
+// addrConstValue resolves an address-offset constant. Unlike
+// constValueOf it also accepts int64/uint64-wrapped literals (a
+// memory64 offset like `int64(2)`), which the address arithmetic
+// materializes at pointer width — but only when the value fits int32,
+// the width of an ArgSum/ArgConst descriptor field. A larger offset
+// falls back to a full scalar node.
+func (fb *fusedTreeBuilder) addrConstValue(e ast.Expr) (int32, bool) {
+	if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+		if id, ok := c.Fun.(*ast.Ident); ok {
+			switch id.Name {
+			case "int64", "uint64", "int32", "uint32":
+				return fb.addrConstValue(c.Args[0])
+			}
+		}
+	}
+	return fb.constValueOf(e)
 }
 
 // constValueOf resolves a literal or a bound constant local.
@@ -1671,8 +1718,13 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		var callArgs []ast.Expr
 		_, isMem := fusedMemOps[helper]
 		isScalar := n.Class() != simdfuse.ClassV128
-		if tree.Addr64 && (isMem || simdfuse.IsStore(n.Op)) {
-			// The memory64 helper family takes the int64 scalars as-is.
+		// On a memory64 tree the address-carrying members switch to
+		// their int64 m64 twins: the vector loads/stores, and the
+		// scalar-chain address ops (the scale/LUT computations —
+		// everything but the value-only f32_mul).
+		addrM64 := tree.Addr64 && (isMem || simdfuse.IsStore(n.Op) ||
+			(strings.HasPrefix(n.Op, "scalar_") && n.Op != "scalar_f32_mul"))
+		if addrM64 {
 			helper = "simd_m64_" + n.Op
 		}
 		if isMem || simdfuse.ScalarMemOp(n.Op) || simdfuse.IsStore(n.Op) {
@@ -1687,7 +1739,10 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 			// memory ops.
 			helper = capitalize(helper)
 		}
-		narrow := tree.Addr64 && !isMem && !simdfuse.IsStore(n.Op)
+		// A widened scalar reaches a narrowing int32 consumer only when
+		// the node is a pure op that stayed 32-bit; the m64 scalar/
+		// memory members take the int64 scalars raw.
+		narrow := tree.Addr64 && !isMem && !simdfuse.IsStore(n.Op) && !addrM64
 		for _, a := range n.Args {
 			callArgs = append(callArgs, argExpr(a, narrow))
 		}
