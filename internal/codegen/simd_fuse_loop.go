@@ -490,6 +490,13 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	if dec <= 0 {
 		return nil, false
 	}
+	if tree.Addr64 {
+		// The loop machinery still assumes u32-wrap pointer bumps and
+		// 32-bit exit-scalar results; a memory64 body keeps the fused
+		// WINDOW form (one region call per iteration) until the bump
+		// arithmetic is widened.
+		return nil, false
+	}
 	loop := &simdfuse.Loop{Tree: tree, Dec: dec, PreTest: cl.decVar == nil, CounterWide: cl.wide}
 	// Carries: `prev = next` with prev a pair argument and next a
 	// root is loop-carried state; prev NOT an argument is an

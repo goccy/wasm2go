@@ -87,6 +87,24 @@ var fusedStoreOps = map[string]int{
 	"simd_v128_f16x4_cvt_store": 2,
 }
 
+// isMemHelperOp reports whether a normalized node op is one of the
+// vector memory ops (loads; stores are classified by IsStore).
+func isMemHelperOp(op string) bool {
+	_, ok := fusedMemOps["simd_"+op]
+	return ok
+}
+
+// fuseLookupName strips the memory64 marker so the width-independent
+// fusion vocabulary (fusedMemOps, fusedStoreOps, the per-op arity and
+// name comparisons) applies to both helper families; the reported flag
+// makes the builder mark the tree Addr64.
+func fuseLookupName(name string) (string, bool) {
+	if rest, ok := strings.CutPrefix(name, "simd_m64_"); ok {
+		return "simd_" + rest, true
+	}
+	return name, false
+}
+
 // fusableOp reports whether a marked call can be a fused-tree member:
 // the accepted memory loads, or a pure op in the generated
 // simdFusePureOps contract — ops whose BOTH-arch pair bodies stay
@@ -95,10 +113,11 @@ var fusedStoreOps = map[string]int{
 // the same classification the fused splicers apply, so codegen and
 // gcasm can never disagree.
 func fusableOp(m simdCallMark) bool {
-	if _, ok := fusedMemOps[m.name]; ok {
+	name, _ := fuseLookupName(m.name)
+	if _, ok := fusedMemOps[name]; ok {
 		return true
 	}
-	if _, ok := fusedStoreOps[m.name]; ok {
+	if _, ok := fusedStoreOps[name]; ok {
 		return true
 	}
 	if !m.resV128 {
@@ -260,6 +279,9 @@ type fusedTreeBuilder struct {
 	chaseUses  map[string]int
 	chaseCache map[string]int
 	chaseReads map[string]bool
+	// addr64 marks the tree-in-progress as a memory64 one (some member
+	// is a simd_m64_* memory op); see simdfuse.Tree.Addr64.
+	addr64 bool
 	// chaseVisiting guards the definition-chasing recursion against
 	// self-referential definitions (a loop-carried `v = v + 4` in the
 	// goto-form emission): a name already on the chase path is not
@@ -685,18 +707,23 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 		return 0, false
 	}
-	memScalars, isMem := fusedMemOps[m.name]
+	lookupName, m64 := fuseLookupName(m.name)
+	memScalars, isMem := fusedMemOps[lookupName]
 	isStore := false
 	if !isMem {
-		if sc, ok := fusedStoreOps[m.name]; ok {
+		if sc, ok := fusedStoreOps[lookupName]; ok {
 			memScalars, isMem, isStore = sc, true, true
 		}
+	}
+	if m64 {
+		fb.addr64 = true
+		fb.key.WriteString("m64;")
 	}
 	args := call.Args
 	if isMem {
 		// Drop the leading `m`; the fused call passes its own.
 		want := 1 + memScalars
-		if isStore || m.name == "simd_v128_load32_lane" {
+		if isStore || lookupName == "simd_v128_load32_lane" {
 			want++ // the stored / lane-inserted v128 value
 		}
 		if len(args) != want {
@@ -708,13 +735,13 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// scratch-register budget at two on amd64. The bounds pass
 		// always emits Const32 windows, so this only rejects exotic
 		// hand-written modules.
-		if m.name == "simd_v128_load32_lane" && !fb.constResolvable(args[2]) {
+		if lookupName == "simd_v128_load32_lane" && !fb.constResolvable(args[2]) {
 			if fb.failWhy == "" {
 				fb.failWhy = "non-const lane"
 			}
 			return 0, false
 		}
-		if m.name == "simd_v128_load_rng" {
+		if lookupName == "simd_v128_load_rng" {
 			if !fb.constResolvable(args[2]) || !fb.constResolvable(args[3]) {
 				if fb.failWhy == "" {
 					fb.failWhy = "non-const rng window"
@@ -724,7 +751,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 	}
 	var nodeArgs []simdfuse.Arg
-	isFloatSplat := m.name == "simd_f32x4_splat"
+	isFloatSplat := lookupName == "simd_f32x4_splat"
 	for i, a := range args {
 		argIdx := i
 		if isMem {
@@ -752,7 +779,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 			continue
 		}
 		isV128 := argIdx < len(m.args) && m.args[argIdx]
-		if m.name == "simd_v128_load32_lane" {
+		if lookupName == "simd_v128_load32_lane" {
 			// The mark's positions come from the SSA args (addr, value);
 			// the emitted call interleaves literal memarg/lane operands,
 			// so classify by helper position: only the trailing value is
@@ -814,13 +841,18 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// (no ABI slot) — including single-assignment constant LOCALS,
 		// which the emitter's constant CSE creates for shared memarg
 		// offsets; identical scalar identifiers share one parameter.
-		if c, ok := intConstValue(a); ok {
+		//
+		// A memory64 member's address/offset must stay OPAQUE scalars:
+		// Arg.Const is 32-bit and the ArgSum fold assumes u32 wrap, so
+		// folding either would silently truncate a 64-bit address.
+		foldOK := !(m64 && isMem && i <= 1)
+		if c, ok := intConstValue(a); ok && foldOK {
 			nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
 			fmt.Fprintf(&fb.key, "c%d,", c)
 			continue
 		}
 		if id, ok := a.(*ast.Ident); ok {
-			if c, ok := fb.sc.constBind[id.Name]; ok {
+			if c, ok := fb.sc.constBind[id.Name]; ok && foldOK {
 				nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
 				fmt.Fprintf(&fb.key, "c%d,", c)
 				continue
@@ -842,7 +874,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// bookkeeping so a fully-internalized definition drops out.
 		aAddr := a
 		var addrDefName string
-		if id, ok := a.(*ast.Ident); ok && isMem && i == 0 && fb.interDef != nil {
+		if id, ok := a.(*ast.Ident); ok && isMem && i == 0 && foldOK && fb.interDef != nil {
 			if def, dok := fb.interDef[id.Name]; dok {
 				if bin, bok := def.Rhs[0].(*ast.BinaryExpr); bok && bin.Op == token.ADD {
 					aAddr = bin
@@ -850,7 +882,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				}
 			}
 		}
-		if bin, ok := aAddr.(*ast.BinaryExpr); ok && bin.Op == token.ADD && isMem && i == 0 {
+		if bin, ok := aAddr.(*ast.BinaryExpr); ok && bin.Op == token.ADD && isMem && i == 0 && foldOK {
 			base, cExpr := bin.X, bin.Y
 			c, cok := fb.constValueOf(cExpr)
 			if !cok {
@@ -911,7 +943,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
 		fb.noteRead(a)
 	}
-	op := strings.TrimPrefix(m.name, "simd_")
+	op := strings.TrimPrefix(lookupName, "simd_")
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: op, Args: nodeArgs})
 	fmt.Fprintf(&fb.key, "%s;", op)
 	return len(fb.nodes) - 1, true
@@ -1032,6 +1064,7 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 		NumFloats:  len(fb.floats),
 		NumPairs:   len(fb.pairs),
 		NeedsMem:   needsMem,
+		Addr64:     fb.addr64,
 		Nodes:      fb.nodes,
 	})
 	if !ok {
@@ -1041,7 +1074,11 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 	if needsMem {
 		// The synthetic body calls the memory helpers; the splice needs
 		// the Module offsets probe like any mem splice.
-		sc.em.useHelper("simd_v128_load")
+		if fb.addr64 {
+			sc.em.useHelper("simd_m64_v128_load")
+		} else {
+			sc.em.useHelper("simd_v128_load")
+		}
 	}
 	// Materialize the parameter expressions only now that the fuse is
 	// committed: rewriteExpr/pairExprs mutate the AST and emit hoists.
@@ -1049,7 +1086,13 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 	// order, which is the original nested evaluation order.
 	fusedArgs := []ast.Expr{newID("m")}
 	for _, s := range fb.scalars {
-		fusedArgs = append(fusedArgs, sc.rewriteExpr(s, prelude))
+		e := sc.rewriteExpr(s, prelude)
+		if fb.addr64 {
+			// Addr64 signatures take int64 scalars; non-address
+			// scalars (int32-typed in the source) widen losslessly.
+			e = &ast.CallExpr{Fun: newID("int64"), Args: []ast.Expr{e}}
+		}
+		fusedArgs = append(fusedArgs, e)
 	}
 	for _, f := range fb.floats {
 		fusedArgs = append(fusedArgs, sc.rewriteExpr(f, prelude))
@@ -1370,6 +1413,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			NumFloats:  len(fb.floats),
 			NumPairs:   len(fb.pairs),
 			NeedsMem:   needsMem,
+			Addr64:     fb.addr64,
 			Nodes:      fb.nodes,
 			Roots:      roots,
 			NoResult:   len(roots) == 0,
@@ -1379,11 +1423,19 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		sc.em.useHelper(tree.Name)
 		if needsMem {
-			sc.em.useHelper("simd_v128_load")
+			if fb.addr64 {
+				sc.em.useHelper("simd_m64_v128_load")
+			} else {
+				sc.em.useHelper("simd_v128_load")
+			}
 		}
 		for _, n := range fb.nodes {
 			if n.Class() != simdfuse.ClassV128 || simdfuse.IsStore(n.Op) {
-				sc.em.useHelper("simd_" + n.Op)
+				helper := "simd_" + n.Op
+				if fb.addr64 && (isMemHelperOp(n.Op) || simdfuse.IsStore(n.Op)) {
+					helper = "simd_m64_" + n.Op
+				}
+				sc.em.useHelper(helper)
 			}
 		}
 		// Interveners run FIRST: later candidates' parameter
@@ -1397,7 +1449,13 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		fusedArgs := []ast.Expr{newID("m")}
 		for _, sa := range fb.scalars {
-			fusedArgs = append(fusedArgs, sc.rewriteExpr(sa, prelude))
+			e := sc.rewriteExpr(sa, prelude)
+			if fb.addr64 {
+				// Addr64 signatures take int64 scalars; non-address
+				// scalars (int32-typed in the source) widen losslessly.
+				e = &ast.CallExpr{Fun: newID("int64"), Args: []ast.Expr{e}}
+			}
+			fusedArgs = append(fusedArgs, e)
 		}
 		for _, fa := range fb.floats {
 			fusedArgs = append(fusedArgs, sc.rewriteExpr(fa, prelude))
@@ -1552,9 +1610,15 @@ func (t *translator) fusedHelperDecls() []ast.Decl {
 }
 
 func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
+	// Memory64 trees carry every scalar at pointer width; the register
+	// assignment is identical (one integer register either way).
+	scalarType := "int32"
+	if tree.Addr64 {
+		scalarType = "int64"
+	}
 	params := []*ast.Field{{Names: []*ast.Ident{newID("m")}, Type: &ast.StarExpr{X: newID("Module")}}}
 	for i := 0; i < tree.NumScalars; i++ {
-		params = append(params, &ast.Field{Names: []*ast.Ident{newID(fmt.Sprintf("s%d", i))}, Type: newID("int32")})
+		params = append(params, &ast.Field{Names: []*ast.Ident{newID(fmt.Sprintf("s%d", i))}, Type: newID(scalarType)})
 	}
 	for i := 0; i < tree.NumFloats; i++ {
 		params = append(params, &ast.Field{Names: []*ast.Ident{newID(fmt.Sprintf("f%d", i))}, Type: newID("float32")})
@@ -1566,7 +1630,10 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		})
 	}
 	var body []ast.Stmt
-	argExpr := func(a simdfuse.Arg) ast.Expr {
+	// narrow re-types an int64 scalar for an int32-consuming (pure)
+	// node on an Addr64 tree: only memory members consume the widened
+	// scalars raw (their m64 helpers take int64 address/offset).
+	argExpr := func(a simdfuse.Arg, narrow bool) ast.Expr {
 		switch a.Kind {
 		case simdfuse.ArgNode:
 			return newID(fmt.Sprintf("n%d", a.Index))
@@ -1576,16 +1643,25 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 				Elts: []ast.Expr{newID(fmt.Sprintf("p%d", a.Index)), newID(fmt.Sprintf("p%dh", a.Index))},
 			}
 		case simdfuse.ArgScalar:
+			if narrow {
+				return &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{newID(fmt.Sprintf("s%d", a.Index))}}
+			}
 			return newID(fmt.Sprintf("s%d", a.Index))
 		case simdfuse.ArgFloat:
 			return newID(fmt.Sprintf("f%d", a.Index))
 		case simdfuse.ArgSum:
-			// int32 addition wraps mod 2^32, exactly Add32.
-			return &ast.BinaryExpr{
+			// int32 addition wraps mod 2^32, exactly Add32. (Addr64
+			// trees never carry ArgSum — the builder keeps their
+			// memory scalars opaque.)
+			var sum ast.Expr = &ast.BinaryExpr{
 				X:  newID(fmt.Sprintf("s%d", a.Index)),
 				Op: token.ADD,
 				Y:  intLitSigned(int64(a.Const)),
 			}
+			if narrow {
+				sum = &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{sum}}
+			}
+			return sum
 		default: // ArgConst
 			return intLitSigned(int64(a.Const))
 		}
@@ -1595,6 +1671,10 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		var callArgs []ast.Expr
 		_, isMem := fusedMemOps[helper]
 		isScalar := n.Class() != simdfuse.ClassV128
+		if tree.Addr64 && (isMem || simdfuse.IsStore(n.Op)) {
+			// The memory64 helper family takes the int64 scalars as-is.
+			helper = "simd_m64_" + n.Op
+		}
 		if isMem || simdfuse.ScalarMemOp(n.Op) || simdfuse.IsStore(n.Op) {
 			// Memory helpers (vector and scalar) live in the embedded
 			// helper set; the multi-package export rename covers them
@@ -1607,8 +1687,9 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 			// memory ops.
 			helper = capitalize(helper)
 		}
+		narrow := tree.Addr64 && !isMem && !simdfuse.IsStore(n.Op)
 		for _, a := range n.Args {
-			callArgs = append(callArgs, argExpr(a))
+			callArgs = append(callArgs, argExpr(a, narrow))
 		}
 		lhs := ast.Expr(newID(fmt.Sprintf("n%d", i)))
 		tok := token.DEFINE

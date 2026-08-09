@@ -300,7 +300,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 			}
 		}
 		if simdfuse.IsStore(n.Op) {
-			if err := a64FusedStore(b, n, scalarReg, pairRegs, loc, dst0Src(loc, n)); err != nil {
+			if err := a64FusedStore(b, n, scalarReg, pairRegs, loc, dst0Src(loc, n), tree.Addr64); err != nil {
 				return nil, false, err
 			}
 			needsTrap = true
@@ -329,7 +329,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 			if n.Args[2].Kind != simdfuse.ArgConst {
 				return nil, false, fmt.Errorf("fused splice %s: non-constant lane", tree.Name)
 			}
-			if err := a64FusedLaneAddr(b, n, scalarReg); err != nil {
+			if err := a64FusedLaneAddr(b, n, scalarReg, tree.Addr64); err != nil {
 				return nil, false, err
 			}
 			lane := uint32(n.Args[2].Const) & 3
@@ -340,7 +340,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 			continue
 		}
 		if _, isMem := fusedMemOpsA64[n.Op]; isMem {
-			if err := a64FusedLoad(b, n, scalarReg, offs, dst); err != nil {
+			if err := a64FusedLoad(b, n, scalarReg, offs, dst, tree.Addr64); err != nil {
 				return nil, false, err
 			}
 			needsTrap = true
@@ -874,47 +874,74 @@ func dst0Src(loc []fusedLoc, n simdfuse.Node) int {
 // a64FusedStore emits one member store: address like a checked load,
 // value from v0/pool/a pair build into v1 (dead between nodes), then
 // the register-offset str.
+// a64FusedEA64 materializes a memory64 member's checked effective
+// address into R25: full-width scalar operands with carry-checked sums
+// (two u32s can never wrap a u64, two u64s can — and a wrapped ea
+// could land back inside bounds). The builder only ever hands a
+// memory64 member OPAQUE scalar address/offset args (Arg.Const is
+// 32-bit), so the folded forms cannot appear here.
+func a64FusedEA64(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, span int) error {
+	if n.Args[0].Kind != simdfuse.ArgScalar || n.Args[1].Kind != simdfuse.ArgScalar {
+		return fmt.Errorf("fused addr64 %s: folded address form", n.Op)
+	}
+	fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(n.Args[0]))
+	fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(n.Args[1]))
+	b.WriteString("\tADDS R26, R25, R25\n")
+	fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+	fmt.Fprintf(b, "\tADDS $%d, R25, R27\n", span)
+	fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+	b.WriteString("\tCMP R27, R21\n")
+	fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+	return nil
+}
+
 func a64FusedStore(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string,
-	pairRegs func(simdfuse.Arg) (string, string), loc []fusedLoc, src int) error {
+	pairRegs func(simdfuse.Arg) (string, string), loc []fusedLoc, src int, addr64 bool) error {
 	if len(n.Args) != 3 {
 		return fmt.Errorf("fused store: %d args, want 3", len(n.Args))
-	}
-	// Address into R25 (same forms as a64FusedLoad).
-	switch a := n.Args[0]; a.Kind {
-	case simdfuse.ArgConst:
-		fmt.Fprintf(b, "\tMOVD $%d, R25\n", int64(uint32(a.Const)))
-	case simdfuse.ArgSum:
-		if a.Const == 0 {
-			fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
-		} else if a.Const > 0 && a.Const < 4096 {
-			fmt.Fprintf(b, "\tADDW $%d, %s, R25\n", a.Const, scalarReg(a))
-		} else {
-			fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(uint32(a.Const)))
-			fmt.Fprintf(b, "\tADDW R22, %s, R25\n", scalarReg(a))
-		}
-	default:
-		fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
-	}
-	if off := n.Args[1]; off.Kind == simdfuse.ArgConst {
-		if off.Const != 0 {
-			if off.Const > 0 && off.Const < 4096 {
-				fmt.Fprintf(b, "\tADD $%d, R25, R25\n", off.Const)
-			} else {
-				fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(uint32(off.Const)))
-				b.WriteString("\tADD R26, R25, R25\n")
-			}
-		}
-	} else {
-		fmt.Fprintf(b, "\tMOVWU %s, R26\n", scalarReg(n.Args[1]))
-		b.WriteString("\tADD R26, R25, R25\n")
 	}
 	span := 16
 	if n.Op == "v128_f16x4_cvt_store" {
 		span = 8
 	}
-	fmt.Fprintf(b, "\tADD $%d, R25, R27\n", span)
-	b.WriteString("\tCMP R27, R21\n")
-	fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+	if addr64 {
+		if err := a64FusedEA64(b, n, scalarReg, span); err != nil {
+			return err
+		}
+	} else {
+		// Address into R25 (same forms as a64FusedLoad).
+		switch a := n.Args[0]; a.Kind {
+		case simdfuse.ArgConst:
+			fmt.Fprintf(b, "\tMOVD $%d, R25\n", int64(uint32(a.Const)))
+		case simdfuse.ArgSum:
+			if a.Const == 0 {
+				fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
+			} else if a.Const > 0 && a.Const < 4096 {
+				fmt.Fprintf(b, "\tADDW $%d, %s, R25\n", a.Const, scalarReg(a))
+			} else {
+				fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(uint32(a.Const)))
+				fmt.Fprintf(b, "\tADDW R22, %s, R25\n", scalarReg(a))
+			}
+		default:
+			fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
+		}
+		if off := n.Args[1]; off.Kind == simdfuse.ArgConst {
+			if off.Const != 0 {
+				if off.Const > 0 && off.Const < 4096 {
+					fmt.Fprintf(b, "\tADD $%d, R25, R25\n", off.Const)
+				} else {
+					fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(uint32(off.Const)))
+					b.WriteString("\tADD R26, R25, R25\n")
+				}
+			}
+		} else {
+			fmt.Fprintf(b, "\tMOVWU %s, R26\n", scalarReg(n.Args[1]))
+			b.WriteString("\tADD R26, R25, R25\n")
+		}
+		fmt.Fprintf(b, "\tADD $%d, R25, R27\n", span)
+		b.WriteString("\tCMP R27, R21\n")
+		fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+	}
 	if src < 0 {
 		// Pair input: build into v1, which is dead between node bodies.
 		lo, hi := pairRegs(n.Args[2])
@@ -958,7 +985,14 @@ func a64FusedStore(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.
 // R25 = u32 effective address, bounds against a 4-byte window, and
 // R27 = M-base plus address for the structure load (ld1 has no
 // register-offset form).
-func a64FusedLaneAddr(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string) error {
+func a64FusedLaneAddr(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, addr64 bool) error {
+	if addr64 {
+		if err := a64FusedEA64(b, n, scalarReg, 4); err != nil {
+			return err
+		}
+		b.WriteString("\tADD R25, R20, R27\n")
+		return nil
+	}
 	switch a := n.Args[0]; a.Kind {
 	case simdfuse.ArgConst:
 		fmt.Fprintf(b, "\tMOVD $%d, R25\n", int64(uint32(a.Const)))
@@ -997,10 +1031,15 @@ func a64FusedLaneAddr(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfu
 // a64FusedLoad emits one member load, result in v<dst>. The region
 // prologue holds memSize in R21 and the M base in R20; scratch R22,
 // R24–R27.
-func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, offs *ModuleOffsets, dst int) error {
+func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, offs *ModuleOffsets, dst int, addr64 bool) error {
 	want := fusedMemOpsA64[n.Op]
 	if len(n.Args) != want {
 		return fmt.Errorf("fused load %s: %d args, want %d", n.Op, len(n.Args), want)
+	}
+	if addr64 && (n.Op == "v128_load_rng" || n.Op == "v128_load_nc") {
+		// Bounds coalescing is wasm32-only; these split forms cannot
+		// reach a memory64 tree.
+		return fmt.Errorf("fused addr64 load %s: coalesced form", n.Op)
 	}
 	arg := func(i int) (reg string, c int32, isConst bool) {
 		a := n.Args[i]
@@ -1009,26 +1048,46 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		}
 		return scalarReg(a), 0, false
 	}
-	// The address materializes into R25 as u32. An ArgSum folds its
+	// The address materializes into R25 as u32 — or full-width with a
+	// carry-checked sum on a memory64 tree (whose addr/offset are
+	// always opaque scalars; see a64FusedEA64). An ArgSum folds its
 	// descriptor constant with one W-form add: ADDW wraps mod 2^32 and
 	// zero-extends, exactly Add32.
-	switch a := n.Args[0]; a.Kind {
-	case simdfuse.ArgConst:
-		fmt.Fprintf(b, "\tMOVD $%d, R25\n", int64(uint32(a.Const)))
-	case simdfuse.ArgSum:
-		if a.Const == 0 {
-			fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
-		} else if a.Const > 0 && a.Const < 4096 {
-			fmt.Fprintf(b, "\tADDW $%d, %s, R25\n", a.Const, scalarReg(a))
-		} else {
-			fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(uint32(a.Const)))
-			fmt.Fprintf(b, "\tADDW R22, %s, R25\n", scalarReg(a))
+	if addr64 {
+		if n.Args[0].Kind != simdfuse.ArgScalar {
+			return fmt.Errorf("fused addr64 load %s: folded address form", n.Op)
 		}
-	default:
-		fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
+		fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(n.Args[0]))
+	} else {
+		switch a := n.Args[0]; a.Kind {
+		case simdfuse.ArgConst:
+			fmt.Fprintf(b, "\tMOVD $%d, R25\n", int64(uint32(a.Const)))
+		case simdfuse.ArgSum:
+			if a.Const == 0 {
+				fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
+			} else if a.Const > 0 && a.Const < 4096 {
+				fmt.Fprintf(b, "\tADDW $%d, %s, R25\n", a.Const, scalarReg(a))
+			} else {
+				fmt.Fprintf(b, "\tMOVD $%d, R22\n", int64(uint32(a.Const)))
+				fmt.Fprintf(b, "\tADDW R22, %s, R25\n", scalarReg(a))
+			}
+		default:
+			fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
+		}
 	}
-	// ea = u32(addr)+u32(offset) in R25.
+	// ea = u32(addr)+u32(offset) in R25 (u64 sums carry-checked).
+	addOffErr := error(nil)
 	addOff := func(i int) {
+		if addr64 {
+			if n.Args[i].Kind != simdfuse.ArgScalar {
+				addOffErr = fmt.Errorf("fused addr64 load %s: folded offset form", n.Op)
+				return
+			}
+			fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(n.Args[i]))
+			b.WriteString("\tADDS R26, R25, R25\n")
+			fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+			return
+		}
 		reg, c, isConst := arg(i)
 		if isConst {
 			if c == 0 {
@@ -1046,6 +1105,13 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		b.WriteString("\tADD R26, R25, R25\n")
 	}
 	checked := func(size int) {
+		if addr64 {
+			fmt.Fprintf(b, "\tADDS $%d, R25, R27\n", size)
+			fmt.Fprintf(b, "\tBCS %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tCMP R27, R21\n")
+			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+			return
+		}
 		fmt.Fprintf(b, "\tADD $%d, R25, R27\n", size)
 		b.WriteString("\tCMP R27, R21\n")
 		fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
@@ -1060,7 +1126,7 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		addOff(1)
 		checked(4)
 		fmt.Fprintf(b, "\tFMOVS (R20)(R25), F%d\n", dst)
-		return nil
+		return addOffErr
 	case "v128_load32_splat":
 		// 4-byte load broadcast to every lane: ldr s + dup.
 		addOff(1)
@@ -1068,7 +1134,7 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		fmt.Fprintf(b, "\tFMOVS (R20)(R25), F%d\n", dst)
 		enc := 0x4E040400 | uint32(dst)<<5 | uint32(dst)
 		fmt.Fprintf(b, "\tWORD $0x%08x // dup v%d.4s, v%d.s[0]\n", enc, dst, dst)
-		return nil
+		return addOffErr
 	case "v128_load16x4_u":
 		// 8-byte load into the low half, then unsigned widen in place.
 		// immh=0b0010 selects the 4h -> 4s widen (0x2F10A400, matching
@@ -1078,7 +1144,7 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		fmt.Fprintf(b, "\tFMOVD (R20)(R25), F%d\n", dst)
 		enc := 0x2F10A400 | uint32(dst)<<5 | uint32(dst)
 		fmt.Fprintf(b, "\tWORD $0x%08x // ushll v%d.4s, v%d.4h, #0\n", enc, dst, dst)
-		return nil
+		return addOffErr
 	case "v128_load_nc":
 		addOff(1)
 	case "v128_load_rng":
@@ -1124,7 +1190,7 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	// ADD+FMOVQ.
 	enc := 0x3CE06800 | uint32(25)<<16 | uint32(20)<<5 | uint32(dst)
 	fmt.Fprintf(b, "\tWORD $0x%08x // ldr q%d, [x20, x25]\n", enc, dst)
-	return nil
+	return addOffErr
 }
 
 // a64SpliceLoop synthesizes a whole fused countdown loop: prologue,
