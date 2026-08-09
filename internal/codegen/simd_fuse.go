@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 
@@ -1013,6 +1014,19 @@ func (fb *fusedTreeBuilder) pairDebug() string {
 	return out
 }
 
+// fuseDebugEnabled gates the window-trial diagnostics: with
+// WASM2GO_FUSE_DEBUG set, every failed fusion trial of at least four
+// candidates prints its width and first refusal to stderr. This is
+// the histogram workflow that localized both the K=4 unlock and the
+// memory64 window-starvation regressions.
+var fuseDebugEnabled = os.Getenv("WASM2GO_FUSE_DEBUG") != ""
+
+func fuseDebugf(format string, args ...interface{}) {
+	if fuseDebugEnabled {
+		fmt.Fprintf(os.Stderr, "wasm2go: fuse-debug: "+format+"\n", args...)
+	}
+}
+
 // constResolvable reports whether e will become an ArgConst: a
 // literal, or a bound constant local.
 func (fb *fusedTreeBuilder) constResolvable(e ast.Expr) bool {
@@ -1298,6 +1312,9 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			}
 		}
 		if !ok || fb.varEdges == 0 || fb.readsCandVar {
+			if w >= 4 && !ok {
+				fuseDebugf("w=%d walk fail: %s", w, fb.failWhy)
+			}
 			continue
 		}
 		// A window variable is INTERNAL when the region consumes every
@@ -1352,10 +1369,16 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			rootVars = append(rootVars, name)
 		}
 		if rootsOverCap || (len(roots) == 0 && !hasStore) {
+			if w >= 4 {
+				fuseDebugf("w=%d roots=%d overCap=%v", w, len(roots), rootsOverCap)
+			}
 			continue // over the root cap, or a window with no live output
 		}
 		roots = fb.scheduleNodes(roots)
 		if pl := fb.peakLive(roots); pl > fusedPoolBudget-floatPoolCost(len(fb.floats)) {
+			if w >= 4 {
+				fuseDebugf("w=%d peakLive=%d budget=%d floats=%d roots=%d", w, pl, fusedPoolBudget-floatPoolCost(len(fb.floats)), len(fb.floats), len(roots))
+			}
 			continue // would exhaust the splice synthesizers' vector pool
 		}
 		if hasStore {
