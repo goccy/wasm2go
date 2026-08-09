@@ -19,13 +19,17 @@ type Nrc2Spec struct {
 // both rows'/columns' quant halves are zipped into 2x8 matrices, the
 // 2x2 tile accumulates through four SMMLA, and the f16 d-product
 // vector scales it into a single f32 accumulator via vector FMLA.
-// ABI0 stack args mirror the Go companion: m+0, l0(n)+8, l1(s)+12,
-// l2(bs, floats)+16, l3(x)+20, l4(bx)+24, l5(y)+28, l6(by)+32.
+// ABI0 stack args mirror the Go companion. ILP32: m+0, l0(n)+8,
+// l1(s)+12, l2(bs, floats)+16, l3(x)+20, l4(bx)+24, l5(y)+28,
+// l6(by)+32. LP64 (memory64): l1..l6 are int64, 8-aligned — l0+8,
+// l1+16 .. l6+56 — and load with MOVD; the tile arithmetic is
+// identical (registers are 64-bit either way, and every address is
+// bounded by the 2^48 memory cap).
 // Results: s[0]=x0y0 s[1]=x1y0 s[bs]=x0y1 s[bs+1]=x1y1.
 //
 // Requires FEAT_I8MM; callers gate the retarget on the same dotprod
 // feature dispatch that guards the SDOT bodies (see the bundle).
-func a64Nrc2Kernel(sym, trapSym string, offs *ModuleOffsets) string {
+func a64Nrc2Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) string {
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
 	word := func(enc uint32, dis string) { w("\tWORD $0x%08x // %s", enc, dis) }
@@ -60,8 +64,19 @@ func a64Nrc2Kernel(sym, trapSym string, offs *ModuleOffsets) string {
 		word(0x0E003C00|uint32((i<<3)|4)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("mov w%d, v%d.s[%d]", d, n, i))
 	}
 
+	// Argument loader: field offsets and widths per pointer size.
+	argOff := map[string]int{"l1": 12, "l2": 16, "l3": 20, "l4": 24, "l5": 28, "l6": 32}
+	movArg, argBytes := "MOVWU", 36
+	if wide {
+		argOff = map[string]int{"l1": 16, "l2": 24, "l3": 32, "l4": 40, "l5": 48, "l6": 56}
+		movArg, argBytes = "MOVD", 64
+	}
+	arg := func(name string, reg int) {
+		w("\t%s\t%s+%d(FP), R%d", movArg, name, argOff[name], reg)
+	}
+
 	w("// %s: q8_0 vec_dot 2x2 tile (rows x0/x1, cols y0/y1) via SMMLA.", sym)
-	w("TEXT ·%s(SB), $16-36", sym)
+	w("TEXT ·%s(SB), $16-%d", sym, argBytes)
 	w("\tNO_LOCAL_POINTERS")
 	w("\tMOVD\tm+0(FP), R0")
 	w("\tMOVD\t%d(R0), R21", offs.MemSize)
@@ -73,28 +88,28 @@ func a64Nrc2Kernel(sym, trapSym string, offs *ModuleOffsets) string {
 	w("\tLSL\t$5, R8, R27")
 	w("\tADD\tR8<<1, R27, R27")
 	// x0 / x1 spans
-	w("\tMOVWU\tl3+20(FP), R4")
+	arg("l3", 4)
 	w("\tADD\tR4, R27, R26")
 	w("\tCMP\tR26, R21")
 	w("\tBLO\tnrc2oob")
-	w("\tMOVWU\tl4+24(FP), R9")
+	arg("l4", 9)
 	w("\tADD\tR4, R9, R10")
 	w("\tADD\tR10, R27, R26")
 	w("\tCMP\tR26, R21")
 	w("\tBLO\tnrc2oob")
 	// y0 / y1 spans
-	w("\tMOVWU\tl5+28(FP), R6")
+	arg("l5", 6)
 	w("\tADD\tR6, R27, R26")
 	w("\tCMP\tR26, R21")
 	w("\tBLO\tnrc2oob")
-	w("\tMOVWU\tl6+32(FP), R12")
+	arg("l6", 12)
 	w("\tADD\tR6, R12, R13")
 	w("\tADD\tR13, R27, R26")
 	w("\tCMP\tR26, R21")
 	w("\tBLO\tnrc2oob")
 	// s spans: col0 [s, s+8), col1 [s+bs*4, s+bs*4+8)
-	w("\tMOVWU\tl1+12(FP), R11")
-	w("\tMOVWU\tl2+16(FP), R14")
+	arg("l1", 11)
+	arg("l2", 14)
 	w("\tLSL\t$2, R14, R14")
 	w("\tADD\t$8, R11, R26")
 	w("\tCMP\tR26, R21")

@@ -41,10 +41,40 @@ import (
 // untouched.
 
 const (
-	nrc2TraitsRowSize = 24
-	nrc2TraitsMinRun  = 16
-	nrc2Q8Entry       = 8 // GGML_TYPE_Q8_0
+	nrc2TraitsMinRun = 16
+	nrc2Q8Entry      = 8 // GGML_TYPE_Q8_0
 )
+
+// nrc2Layout is the type_traits_cpu row layout at the module's
+// pointer width. ILP32 packs {u32 from_float, u32 vec_dot,
+// u32 vec_dot_type, u32 pad, u64 nrows} into 24 bytes; LP64 widens
+// the two function pointers to u64 (table indices zero-extended),
+// giving {u64, u64, u32, u32 pad, u64} = 32 bytes.
+type nrc2Layout struct {
+	row      int // row stride in bytes
+	vdOff    int // vec_dot field offset
+	vdtOff   int // vec_dot_type field offset
+	padOff   int // alignment padding field offset (must be 0)
+	nrowsOff int // nrows field offset
+	ptr      int // function-pointer field width in bytes
+}
+
+func nrc2LayoutFor(wide bool) nrc2Layout {
+	if wide {
+		return nrc2Layout{row: 32, vdOff: 8, vdtOff: 16, padOff: 20, nrowsOff: 24, ptr: 8}
+	}
+	return nrc2Layout{row: 24, vdOff: 4, vdtOff: 8, padOff: 12, nrowsOff: 16, ptr: 4}
+}
+
+// nrc2Ptr reads a function-pointer field: the stored value is a table
+// index, so an LP64 value with nonzero high bits can never be one.
+func nrc2Ptr(b []byte, l nrc2Layout) (uint32, bool) {
+	if l.ptr == 8 {
+		v := binary.LittleEndian.Uint64(b)
+		return uint32(v), v <= 0xFFFFFFFF
+	}
+	return binary.LittleEndian.Uint32(b), true
+}
 
 // nrc2Info records a verified q8_0 traits entry.
 type nrc2Info struct {
@@ -69,14 +99,15 @@ func nrc2TableSet(m *wasm.Module) map[uint32]uint32 {
 	return tab
 }
 
-// nrc2RowOK reports whether the 24 bytes at b parse as a traits row.
-func nrc2RowOK(b []byte, tab map[uint32]uint32) bool {
-	ff := binary.LittleEndian.Uint32(b)
-	vd := binary.LittleEndian.Uint32(b[4:])
-	vdt := binary.LittleEndian.Uint32(b[8:])
-	pad := binary.LittleEndian.Uint32(b[12:])
-	nrows := binary.LittleEndian.Uint64(b[16:])
-	if pad != 0 || nrows > 2 || vdt >= 64 {
+// nrc2RowOK reports whether the bytes at b parse as a traits row of
+// the given layout.
+func nrc2RowOK(b []byte, tab map[uint32]uint32, l nrc2Layout) bool {
+	ff, ffOK := nrc2Ptr(b, l)
+	vd, vdOK := nrc2Ptr(b[l.vdOff:], l)
+	vdt := binary.LittleEndian.Uint32(b[l.vdtOff:])
+	pad := binary.LittleEndian.Uint32(b[l.padOff:])
+	nrows := binary.LittleEndian.Uint64(b[l.nrowsOff:])
+	if !ffOK || !vdOK || pad != 0 || nrows > 2 || vdt >= 64 {
 		return false
 	}
 	if ff != 0 {
@@ -104,9 +135,10 @@ func (t *translator) scanGgmlNrc2() {
 	if len(tab) == 0 {
 		return
 	}
+	lay := nrc2LayoutFor(t.mod.Memory64())
 	var found *nrc2Info
 	for segIdx, ds := range t.mod.Datas {
-		if ds.Passive || len(ds.Bytes) < nrc2TraitsRowSize {
+		if ds.Passive || len(ds.Bytes) < lay.row {
 			continue
 		}
 		segOff, err := evalConstExprI64(ds.Offset, t.mod)
@@ -114,13 +146,13 @@ func (t *translator) scanGgmlNrc2() {
 			continue
 		}
 		b := ds.Bytes
-		for entry := 0; entry+nrc2TraitsRowSize <= len(b); entry += 4 {
+		for entry := 0; entry+lay.row <= len(b); entry += 4 {
 			row := b[entry:]
-			vd := binary.LittleEndian.Uint32(row[4:])
-			vdt := binary.LittleEndian.Uint32(row[8:])
-			pad := binary.LittleEndian.Uint32(row[12:])
-			nrows := binary.LittleEndian.Uint64(row[16:])
-			if vd == 0 || vdt != nrc2Q8Entry || pad != 0 || nrows != 1 {
+			vd, vdOK := nrc2Ptr(row[lay.vdOff:], lay)
+			vdt := binary.LittleEndian.Uint32(row[lay.vdtOff:])
+			pad := binary.LittleEndian.Uint32(row[lay.padOff:])
+			nrows := binary.LittleEndian.Uint64(row[lay.nrowsOff:])
+			if !vdOK || vd == 0 || vdt != nrc2Q8Entry || pad != 0 || nrows != 1 {
 				continue
 			}
 			funcIdx, ok := tab[vd]
@@ -135,14 +167,14 @@ func (t *translator) scanGgmlNrc2() {
 			// to zero, which parses as an empty row — exactly the
 			// removed-type rows ggml leaves zeroed.
 			addr := segOff + int64(entry)
-			base := addr - nrc2Q8Entry*nrc2TraitsRowSize
+			base := addr - int64(nrc2Q8Entry*lay.row)
 			if base < 0 {
 				continue
 			}
-			img := t.nrc2ImageAt(base, nrc2TraitsMinRun*nrc2TraitsRowSize)
+			img := t.nrc2ImageAt(base, nrc2TraitsMinRun*lay.row)
 			okRun := true
 			for k := 0; k < nrc2TraitsMinRun; k++ {
-				if !nrc2RowOK(img[k*nrc2TraitsRowSize:], tab) {
+				if !nrc2RowOK(img[k*lay.row:], tab, lay) {
 					okRun = false
 					break
 				}
@@ -155,17 +187,24 @@ func (t *translator) scanGgmlNrc2() {
 			// function fields rejects the zero padding that often
 			// precedes the array, which would otherwise let any
 			// vdt==8 row (q4_0, q5_0, ...) pose as the q8_0 entry.
-			f32ff := binary.LittleEndian.Uint32(img)
-			f32vd := binary.LittleEndian.Uint32(img[4:])
-			f32vdt := binary.LittleEndian.Uint32(img[8:])
+			f32ff, _ := nrc2Ptr(img, lay)
+			f32vd, _ := nrc2Ptr(img[lay.vdOff:], lay)
+			f32vdt := binary.LittleEndian.Uint32(img[lay.vdtOff:])
 			if f32vdt != 0 || f32ff == 0 || f32vd == 0 {
 				continue
 			}
 			fn := t.mod.Functions[funcIdx-t.mod.NumImportedFuncs]
 			ft := t.mod.Types[fn.TypeIdx]
-			sigOK := len(ft.Params) == 8 && len(ft.Results) == 0
-			for _, p := range ft.Params {
-				sigOK = sigOK && p == wasm.ValI32
+			// ggml_vec_dot_t: (n i32, s *f32, bs size_t, x *void,
+			// bx size_t, y *void, by size_t, nrc i32) — pointers and
+			// size_t widen to i64 on a memory64 module.
+			want := []wasm.ValType{wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32}
+			if t.mod.Memory64() {
+				want = []wasm.ValType{wasm.ValI32, wasm.ValI64, wasm.ValI64, wasm.ValI64, wasm.ValI64, wasm.ValI64, wasm.ValI64, wasm.ValI32}
+			}
+			sigOK := len(ft.Params) == len(want) && len(ft.Results) == 0
+			for pi, p := range ft.Params {
+				sigOK = sigOK && p == want[pi]
 			}
 			if !sigOK {
 				continue
@@ -177,7 +216,7 @@ func (t *translator) scanGgmlNrc2() {
 				fmt.Fprintf(os.Stderr, "wasm2go: ggml q8_0 traits row ambiguous; row/column pairing disabled\n")
 				return
 			}
-			found = &nrc2Info{funcIdx: funcIdx, segIdx: segIdx, nrowsOff: entry + 16}
+			found = &nrc2Info{funcIdx: funcIdx, segIdx: segIdx, nrowsOff: entry + lay.nrowsOff}
 		}
 	}
 	if found == nil {
@@ -259,9 +298,16 @@ func (t *translator) nrc2Prelude() ast.Stmt {
 func (t *translator) nrc2Companion() *ast.FuncDecl {
 	params := &ast.FieldList{List: []*ast.Field{{Names: []*ast.Ident{newID("m")}, Type: t.moduleType()}}}
 	for i := 0; i < 7; i++ {
+		// l0 is the i32 element count; the pointer and size_t
+		// parameters (l1..l6) widen to int64 on a memory64 module,
+		// matching the vec_dot's own signature.
+		typ := "int32"
+		if t.mod.Memory64() && i >= 1 {
+			typ = "int64"
+		}
 		params.List = append(params.List, &ast.Field{
 			Names: []*ast.Ident{newID(fmt.Sprintf("l%d", i))},
-			Type:  newID("int32"),
+			Type:  newID(typ),
 		})
 	}
 	add := func(x ast.Expr, y ast.Expr) ast.Expr {

@@ -796,7 +796,9 @@ func buildPkg(
 			// ggml q8_0 row/column pairing: under fast-math the arm64
 			// FEATURE body's companion call goes to the native 2x2
 			// SMMLA tile kernel; the portable twin and every other
-			// backend keep the bit-exact Go companion.
+			// backend keep the bit-exact Go companion. The kernel and
+			// its declaration follow the module's pointer width — the
+			// LP64 companion takes i64 pointers and strides.
 			if nrc2 != nil && name == nrc2.VecDot && arch.name == "arm64" && modOffs != nil && modOffs.Cfg.FastMath {
 				fastSym := nrc2.Companion + "fast"
 				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
@@ -808,9 +810,14 @@ func buildPkg(
 				if rel != "" && rel != "base" {
 					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
 				}
-				asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs))
+				wide := mod.Memory64()
+				asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
 				asmB.WriteString("\n")
-				fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 int32, l2 int32, l3 int32, l4 int32, l5 int32, l6 int32)\n", fastSym, moduleTypeName(rel))
+				argType := "int32"
+				if wide {
+					argType = "int64"
+				}
+				fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 %s, l2 %s, l3 %s, l4 %s, l5 %s, l6 %s)\n", fastSym, moduleTypeName(rel), argType, argType, argType, argType, argType, argType)
 			}
 			mirrorVar := "gcasm" + arch.featureVar
 			asmB.WriteString(arch.dispatchStub(name, featSym, portSym, mirrorVar, m[1]))
