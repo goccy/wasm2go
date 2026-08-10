@@ -3,6 +3,7 @@ package transpile_test
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -70,4 +71,46 @@ func TestConvLoopFusesBothWidths(t *testing.T) {
 	}
 	check("cg_simd_conv32.wasm", false)
 	check("cg_mem64_simd_conv.wasm", true)
+}
+
+// Variable+variable addresses (base+stride with no constant side)
+// must CHASE into scalar-node address chains and keep the whole
+// load/splat/mul/store body inside one region on both widths. A mem
+// node with an ArgNode address is the structural witness.
+func TestAddrSumChasesBothWidths(t *testing.T) {
+	check := func(fixture string, wantAddr64 bool) {
+		t.Helper()
+		bin := testfixture.Wasm(t, fixture)
+		m, err := transpile.Parse(bytes.NewReader(bin))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := transpile.Translate(io.Discard, m, transpile.Options{Package: "pkg", OutputImportPath: "sf/pkg"})
+		if err != nil {
+			t.Fatalf("translate: %v", err)
+		}
+		var store, nodeAddr bool
+		for _, tree := range res.FusedSimd {
+			if tree.Addr64 != wantAddr64 {
+				continue
+			}
+			for _, n := range tree.Nodes {
+				mem := simdfuse.IsStore(n.Op) || strings.HasPrefix(n.Op, "v128_load")
+				if simdfuse.IsStore(n.Op) {
+					store = true
+				}
+				if mem && len(n.Args) > 0 && n.Args[0].Kind == simdfuse.ArgNode {
+					nodeAddr = true
+				}
+			}
+		}
+		if !store {
+			t.Errorf("%s: no fused store sink", fixture)
+		}
+		if !nodeAddr {
+			t.Errorf("%s: no mem node carries a chased (ArgNode) address", fixture)
+		}
+	}
+	check("cg_simd_addrsum32.wasm", false)
+	check("cg_mem64_simd_addrsum.wasm", true)
 }

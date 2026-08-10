@@ -180,6 +180,15 @@ func (sc *simdScalarizer) wideCounters() bool {
 	return sc != nil && sc.em != nil && sc.em.mem64
 }
 
+// loopReject logs a fused-loop upgrade refusal under WASM2GO_FUSE_DEBUG
+// (tagged by the rejecting source line) and returns the not-upgraded
+// result. Diagnostics only; the caller emits the loop as the window
+// path would have.
+func (sc *simdScalarizer) loopReject(tag string) (ast.Stmt, bool) {
+	fuseDebugf("FUSELOOP reject %s", tag)
+	return nil, false
+}
+
 // blankFor returns n blank identifiers for a keep-alive assignment.
 func blankFor(n int) []ast.Expr {
 	out := make([]ast.Expr, n)
@@ -418,18 +427,18 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	// Opt-in while the splicer support matures; the retranspile
 	// pipeline enables it explicitly.
 	if sc.em.t == nil || !sc.em.t.opts.FuseLoops {
-		return nil, false
+		return sc.loopReject("L421")
 	}
 	cl, ok := matchCountdownLoop(sc, f)
 	if !ok {
-		return nil, false
+		return sc.loopReject("L425")
 	}
 	// Fuse the whole body into one region. Leading interveners join
 	// the window; the trial must consume every statement.
 	var wpre []ast.Stmt
 	stmt, span, ok := sc.tryFuseWindowEx(cl.body, 0, &wpre, true)
 	if !ok {
-		return nil, false
+		return sc.loopReject("L432")
 	}
 	for _, st := range cl.body[span:] {
 		// Statements after the last candidate: constant defs (bump
@@ -442,11 +451,11 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				continue
 			}
 		}
-		return nil, false
+		return sc.loopReject("L445")
 	}
 	call, rootVars, ok := fusedCallParts(stmt)
 	if !ok {
-		return nil, false
+		return sc.loopReject("L449")
 	}
 	fxName := helperName(call.Fun)
 	if strings.HasPrefix(fxName, "Simd_") {
@@ -456,7 +465,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	}
 	tree := sc.em.t.FusedTrees()[fxName]
 	if tree == nil {
-		return nil, false
+		return sc.loopReject("L459")
 	}
 	// Locate argument slots by name: scalars start after m, pairs
 	// after scalars+floats (two slots each).
@@ -512,12 +521,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, t := range cl.decEx {
 		c, cok := resolveC(t)
 		if !cok {
-			return nil, false
+			return sc.loopReject("L515")
 		}
 		dec += c
 	}
 	if dec <= 0 {
-		return nil, false
+		return sc.loopReject("L520")
 	}
 	loop := &simdfuse.Loop{Tree: tree, Dec: dec, PreTest: cl.decVar == nil, CounterWide: cl.wide}
 	// Carries: `prev = next` with prev a pair argument and next a
@@ -532,7 +541,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		next := ca.Rhs[0].(*ast.Ident).Name
 		ri, rok := rootIdx[next]
 		if !rok {
-			return nil, false
+			return sc.loopReject("L535")
 		}
 		if pi, pok := pairSlot[prev]; pok {
 			loop.CarriedPairs = append(loop.CarriedPairs, [2]int{pi, roots[ri]})
@@ -591,6 +600,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	derivedOf := func(e ast.Expr, target string) (ast.Expr, bool) {
 		bin, ok := e.(*ast.BinaryExpr)
 		if !ok || bin.Op != token.ADD {
+			fuseDebugf("FUSELOOP reject derived-bump-shape")
 			return nil, false
 		}
 		x, y := bin.X, bin.Y
@@ -599,6 +609,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		}
 		id, ok := x.(*ast.Ident)
 		if !ok || id.Name != target {
+			fuseDebugf("FUSELOOP reject derived-bump-target")
 			return nil, false
 		}
 		if _, cok := resolveC(y); cok {
@@ -607,6 +618,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		if yid, ok := y.(*ast.Ident); ok && !bodyWrites[yid.Name] {
 			return y, true
 		}
+		fuseDebugf("FUSELOOP reject derived-bump-delta")
 		return nil, false
 	}
 	wpreDef := func(name string) *ast.AssignStmt {
@@ -624,7 +636,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		y := b.Rhs[0].(*ast.BinaryExpr).Y
 		if si, sok := scalarSlot[name]; sok {
 			if !addBump(si, name, y) {
-				return nil, false
+				return sc.loopReject("L627")
 			}
 			continue
 		}
@@ -655,12 +667,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				bumpFixes = append(bumpFixes, bumpFix{target: name, temp: lhsName, addend: addend})
 			}
 			if !addBump(i, lhsName, y) {
-				return nil, false
+				return sc.loopReject("L658")
 			}
 			matched++
 		}
 		if matched == 0 {
-			return nil, false
+			return sc.loopReject("L663")
 		}
 		droppedBump[name] = true
 	}
@@ -676,7 +688,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	if 1+tree.NumScalars+1+loop.NumDeltas > fusedMaxIntRegs ||
 		1+tree.NumScalars+1+loop.NumDeltas+2*tree.NumPairs > fusedMaxIntSlots ||
 		2*len(roots)+len(loop.ExitScalars) > fusedMaxIntSlots {
-		return nil, false
+		return sc.loopReject("L679")
 	}
 	// Escape checks: values the loop produces per-iteration but does
 	// not return must be dead after the loop. The carried PREVIOUS
@@ -711,11 +723,11 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				exitCopied[name] = true
 				continue
 			}
-			return nil, false
+			return sc.loopReject("L714")
 		}
 	}
 	if cl.decVar != nil && escape(cl.decVar.Name) {
-		return nil, false
+		return sc.loopReject("L718")
 	}
 	// Remaining interveners hoist above the loop: they must be
 	// loop-invariant, reading nothing the loop writes.
@@ -732,7 +744,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, st := range wpre {
 		as, ok := st.(*ast.AssignStmt)
 		if !ok {
-			return nil, false
+			return sc.loopReject("L735")
 		}
 		bad := false
 		for _, r := range as.Rhs {
@@ -744,12 +756,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 			})
 		}
 		if bad {
-			return nil, false
+			return sc.loopReject("L747")
 		}
 	}
 	name, ok := sc.em.t.internFusedLoop(loop)
 	if !ok {
-		return nil, false
+		return sc.loopReject("L752")
 	}
 	sc.em.useHelper(name)
 	// Assemble the replacement: hoisted interveners, then one call.

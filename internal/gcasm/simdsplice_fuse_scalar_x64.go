@@ -46,6 +46,24 @@ func (p *x64ScalarPre) emitNode(i int, n *simdfuse.Node) error {
 	return p.emit(i, n)
 }
 
+// takeAddrSource hands a chain-computed ADDRESS terminal to a memory
+// emitter (GPR analog of takeSplatSource): the vector walk's
+// placement loop already decremented the use, so this only frees the
+// scratch slot on death. The emitters copy the value into R12 as
+// their first instruction, so handing out a register the preamble
+// later clobbers is safe.
+func (p *x64ScalarPre) takeAddrSource(idx int) (string, error) {
+	g, ok := p.gprOf[idx]
+	if !ok {
+		return "", fmt.Errorf("fused splice %s: address source n%d not in a register", p.tree.Name, idx)
+	}
+	if p.uses[idx] == 0 {
+		delete(p.gprOf, idx)
+		p.freeGpr = append(p.freeGpr, g)
+	}
+	return g, nil
+}
+
 // takeSplatSource consumes a ClassF32 node feeding a splat, returning
 // its register and freeing the scratch slot.
 func (p *x64ScalarPre) takeSplatSource(idx int) (int, error) {

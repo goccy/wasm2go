@@ -954,6 +954,28 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 					continue
 				}
 			}
+			if !cok {
+				// No constant side: a variable-stride address
+				// (`base + stride`, possibly three terms). Chase it
+				// into a scalar-node chain — the leaf identifiers
+				// deduplicate by name, so k loads sharing a stride
+				// variable cost ONE slot instead of one whole-expr
+				// slot each. Transactional like every chase: a failed
+				// partway attempt restores the builder state.
+				snap := fb.snapshotChase()
+				if arg, aok := fb.chaseAddr(aAddr); aok && arg.Kind == simdfuse.ArgNode {
+					nodeArgs = append(nodeArgs, arg)
+					fmt.Fprintf(&fb.key, "n%d,", arg.Index)
+					if addrDefName != "" {
+						if fb.chaseUses == nil {
+							fb.chaseUses = map[string]int{}
+						}
+						fb.chaseUses[addrDefName]++
+					}
+					continue
+				}
+				fb.restoreChase(snap)
+			}
 		}
 		// Opaque scalar arguments deduplicate by structural key:
 		// identical expressions across candidates share one slot,

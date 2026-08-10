@@ -114,6 +114,23 @@ func (p *a64ScalarPre) allocFpr() (int, error) {
 	return f, nil
 }
 
+// takeAddrSource hands a chain-computed ADDRESS terminal to a memory
+// emitter: the GPR analog of takeSplatSource. The vector walk's
+// placement loop already decremented the use, so this only frees the
+// scratch slot on death — the caller copies the value into the
+// address register before any clobbering.
+func (p *a64ScalarPre) takeAddrSource(idx int) (string, error) {
+	g, ok := p.gprOf[idx]
+	if !ok {
+		return "", fmt.Errorf("fused splice %s: address source n%d not in a register", p.tree.Name, idx)
+	}
+	if p.uses[idx] == 0 {
+		delete(p.gprOf, idx)
+		p.freeGpr = append(p.freeGpr, g)
+	}
+	return g, nil
+}
+
 // takeGpr consumes an i32 operand and returns a GPR the caller may
 // CLOBBER: the operand's own register when this was its last use, a
 // fresh copy otherwise.
