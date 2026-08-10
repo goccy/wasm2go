@@ -52,3 +52,22 @@ func TestStoreSinkFusesBothWidths(t *testing.T) {
 		t.Error("memory64: store tree not marked Addr64")
 	}
 }
+
+// The variable-stride conversion-loop shape (load + load32_splat +
+// mul + add + store per iteration, pointer bumps by a runtime stride)
+// must fuse its loads INTO the window on both widths — this is the
+// skeleton of ggml's row-scale loops.
+func TestConvLoopFusesBothWidths(t *testing.T) {
+	check := func(fixture string, wantAddr64 bool) {
+		t.Helper()
+		found, addr64 := storeTrees(t, fixture)
+		if !found {
+			t.Errorf("%s: no fused tree contains the store sink", fixture)
+		}
+		if found && addr64 != wantAddr64 {
+			t.Errorf("%s: Addr64 = %v, want %v", fixture, addr64, wantAddr64)
+		}
+	}
+	check("cg_simd_conv32.wasm", false)
+	check("cg_mem64_simd_conv.wasm", true)
+}
