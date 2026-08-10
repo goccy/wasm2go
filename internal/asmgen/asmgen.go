@@ -1928,6 +1928,11 @@ type funcPlan struct {
 	// `mCacheCandidate` decision — only memory-touching functions
 	// need m staged into mCacheReg.
 	hasMem bool
+	// mem64 reports whether the module's linear memory uses 64-bit
+	// addressing. Memory accesses then take i64 bases with no
+	// mod-2^32 wrap, and the mem-size / mem-grow / copy / fill ops
+	// route to the 64-bit helper family.
+	mem64 bool
 	// branchFused holds value IDs for OpHelperCall("i32_eqz" /
 	// "i64_eqz") whose single use is a BlockIf control. The eqz
 	// helper body and slot store are skipped; the BlockIf emits a
@@ -2066,6 +2071,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 		coalescedPhi:    map[ssa.ValueID]string{},
 		unusedResult:    map[ssa.ValueID]bool{},
 	}
+	p.mem64 = opts.Module != nil && opts.Module.Memory64()
 
 	// Pass 1: scan calls (helper + direct), compute the max
 	// callee-arg/ret frame, resolve each direct call's symbol,
@@ -2206,6 +2212,24 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				case ssa.OpMemoryFill:
 					csig = wasm.FuncType{Params: []wasm.ValType{wasm.ValI32, wasm.ValI32, wasm.ValI32}}
 					helperName = "memoryFill"
+				}
+				if p.mem64 {
+					// Memory64 modules route to the 64-bit helper family
+					// (i64 page counts / addresses / lengths). Sig shapes
+					// mirror internal/codegen/helpers: memorySize64() i64,
+					// memoryGrow64(i64) i64, memoryFill64(i64, i32, i64),
+					// memoryCopy64(i64, i64, i64).
+					helperName += "64"
+					switch v.Op {
+					case ssa.OpMemSize:
+						csig = wasm.FuncType{Results: []wasm.ValType{wasm.ValI64}}
+					case ssa.OpMemGrow:
+						csig = wasm.FuncType{Params: []wasm.ValType{wasm.ValI64}, Results: []wasm.ValType{wasm.ValI64}}
+					case ssa.OpMemoryCopy:
+						csig = wasm.FuncType{Params: []wasm.ValType{wasm.ValI64, wasm.ValI64, wasm.ValI64}}
+					case ssa.OpMemoryFill:
+						csig = wasm.FuncType{Params: []wasm.ValType{wasm.ValI64, wasm.ValI32, wasm.ValI64}}
+					}
 				}
 				cframe, err := computeArgFrame(csig)
 				if err != nil {

@@ -908,24 +908,89 @@ func emitCmp64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame,
 	return nil
 }
 
-// emitLoad lowers a wasm linear-memory read. args = [base i32, mem];
+// emitMemAddrAMD64 emits the effective-address computation shared by
+// emitLoad and emitStore and returns the operand string for the
+// access. BX must already hold m.M on entry; the returned operand is
+// either `disp(BX)` (constant base) or `(BX)(SI*1)` / `disp(BX)(SI*1)`
+// (dynamic base through SI). Keeping BX = m.M intact lets follow-on
+// accesses in the same straight-line span reuse the cached pointer
+// (dedupMemMReload strips the redundant preambles). SI is not in the
+// GP regalloc pool, so claiming it for the index has no
+// cross-instruction conflict, and the value-side registers (AX / X0)
+// stay free for the access itself.
+//
+// The two memory widths share this one mechanism and differ only in
+// the effective-address rule, mirroring the pure-Go emitter:
+//
+//   - wasm32: address = uint32(base + off) — the addition wraps mod
+//     2^32, so a negative-int32 base must not escape into the upper
+//     bits. The add happens in 32-bit (ADDL zero-extends per amd64
+//     spec). Non-negative constant offsets fold into the addressing
+//     mode's displacement (sign-extension of a positive disp equals
+//     the zero-extension the wrap rule wants); negative offsets keep
+//     the explicit ADDL.
+//   - memory64: address = base + off in full 64-bit, no wrap (the
+//     pure-Go path is `uint64(base) + offset`). Offsets beyond the
+//     int32 displacement range are materialised through AX — safe as
+//     a temp here because address formation completes before AX
+//     carries the access value.
+func emitMemAddrAMD64(b *strings.Builder, baseArg *ssa.Value, aux int64, plan *funcPlan, frame argFrame) string {
+	if plan.mem64 {
+		if base, ok := inlineableI64(baseArg); ok {
+			total := base + aux
+			if total >= 0 && total <= 0x7fffffff {
+				return fmt.Sprintf("%d(BX)", total)
+			}
+			fmt.Fprintf(b, "\tMOVQ $%d, SI\n", total)
+			return "(BX)(SI*1)"
+		}
+		fmt.Fprintf(b, "\tMOVQ %s, SI\n", operandSrc64(baseArg, plan, frame, "SP"))
+		switch {
+		case aux == 0:
+			return "(BX)(SI*1)"
+		case aux > 0 && aux <= 0x7fffffff:
+			return fmt.Sprintf("%d(BX)(SI*1)", aux)
+		default:
+			fmt.Fprintf(b, "\tMOVQ $%d, AX\n", aux)
+			fmt.Fprintf(b, "\tADDQ AX, SI\n")
+			return "(BX)(SI*1)"
+		}
+	}
+	off := int32(aux)
+	// Constant-base fast path: fold `base + off` at generation time
+	// via int32 add and re-cast — identical low-32-bit behaviour to
+	// the runtime wrap for both negative-int32 bases and very-large
+	// offsets.
+	if base, ok := inlineableI32(baseArg); ok {
+		disp := int32(uint32(base) + uint32(off))
+		return fmt.Sprintf("%d(BX)", disp)
+	}
+	fmt.Fprintf(b, "\tMOVL %s, SI\n", operandSrc32(baseArg, plan, frame, "SP"))
+	if off > 0 {
+		return fmt.Sprintf("%d(BX)(SI*1)", off)
+	} else if off == 0 {
+		return "(BX)(SI*1)"
+	}
+	// Negative off: keep the ADDL so the 32-bit wrap matches
+	// `uint32(base + off)`.
+	fmt.Fprintf(b, "\tADDL $%d, SI\n", off)
+	return "(BX)(SI*1)"
+}
+
+// emitLoad lowers a wasm linear-memory read. args = [base, mem];
 // AuxInt = constant offset. The asm dereferences Module.M (the
 // cached unsafe.Pointer at offset moduleMOffset) and indexes by
-// `base + AuxInt`. The mem token is ignored (it threads ordering
-// dependencies in the IR; the asm is sequentially consistent).
+// `base + AuxInt` (see emitMemAddrAMD64 for the per-width
+// effective-address rules). The mem token is ignored (it threads
+// ordering dependencies in the IR; the asm is sequentially
+// consistent).
 func emitLoad(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
 	if len(v.Args) < 1 || v.Args[0] == nil {
 		return fmt.Errorf("OpLoad needs at least a base arg")
 	}
-	off := int32(v.AuxInt)
 	dst := plan.offsets[v.ID]
-	// BX = m.M + uint32(base + off). wasm semantics: the effective
-	// address is `(base + offset) mod 2^32` — adding base and off
-	// in 64-bit would NOT wrap negative-int32 bases the way the
-	// pure-Go path (`uint32(base + int32(off))`) does, sending the
-	// load out to ~4 GiB above m.M. We do the addition in 32-bit
-	// (ADDL leaves the upper 32 bits of RAX zero per amd64 spec),
-	// then add the zero-extended result to m.M.
+	// BX = m.M; the per-width base+offset rules live in
+	// emitMemAddrAMD64.
 	if plan.mCacheReg != "" {
 		// m is cached in the function-wide reserved register;
 		// dereference it directly for m.M.
@@ -934,50 +999,7 @@ func emitLoad(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) 
 		fmt.Fprintf(b, "\tMOVQ m+0(FP), BX\n")
 		fmt.Fprintf(b, "\tMOVQ %d(BX), BX\n", moduleMOffset)
 	}
-	var addr string
-	// Constant-base fast path: fold `base + off` at generation time
-	// and reference the slot via disp(BX) directly.
-	if base, ok := inlineableI32(v.Args[0]); ok {
-		disp := int32(uint32(base) + uint32(off))
-		addr = fmt.Sprintf("%d(BX)", disp)
-	} else {
-		// Dynamic base: form the address through SI, then access via
-		// (BX)(SI*1) indexed addressing instead of `ADDQ AX, BX` +
-		// `disp(BX)`. The indexed access is the same one MOV at the
-		// load site but leaves BX = m.M intact, so any follow-on
-		// load / store in the same straight-line span can reuse the
-		// cached m.M without re-emitting the 2-line preamble
-		// (dedupMemMReload strips the redundant preambles). SI is
-		// otherwise unused by the asmgen — emit_amd64.go only
-		// writes AX / BX / CX / DX / X0 elsewhere — so claiming it
-		// for the load/store index has no cross-instruction conflict
-		// and the indexed mode keeps the value-side register (AX /
-		// X0) free for the access result. ADDL zero-extends the
-		// upper 32 bits of SI, matching the wasm `(base + offset)
-		// mod 2^32` effective-address rule.
-		fmt.Fprintf(b, "\tMOVL %s, SI\n", operandSrc32(v.Args[0], plan, frame, "SP"))
-		// Fold a non-negative constant offset into the addressing
-		// mode's displacement instead of emitting a separate ADDL.
-		// We restrict the fold to off >= 0 because amd64's
-		// addressing mode sign-extends the displacement to 64
-		// bits, while wasm's effective-address rule wraps
-		// `uint32(base + off)`. The two only diverge when off has
-		// its high (sign) bit set — for positive offsets the sext
-		// is identical to a zext and the result matches the wasm
-		// wrap. The integration corpus loads use struct-field
-		// offsets, all small non-negative constants, so this fires
-		// on every dynamic-base memop in the bundle.
-		if off > 0 {
-			addr = fmt.Sprintf("%d(BX)(SI*1)", off)
-		} else if off == 0 {
-			addr = "(BX)(SI*1)"
-		} else {
-			// Negative off: keep the ADDL so the 32-bit wrap matches
-			// `uint32(base + off)`.
-			fmt.Fprintf(b, "\tADDL $%d, SI\n", off)
-			addr = "(BX)(SI*1)"
-		}
-	}
+	addr := emitMemAddrAMD64(b, v.Args[0], v.AuxInt, plan, frame)
 	// Narrow loads (8/16-bit) produce either i32 or i64 depending
 	// on the wasm op — i32.load8_u vs i64.load8_u both lower to
 	// OpLoad8U, distinguished only by v.Type. The asm has to
@@ -1084,10 +1106,8 @@ func emitStore(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame)
 	if len(v.Args) < 2 || v.Args[0] == nil || v.Args[1] == nil {
 		return fmt.Errorf("OpStore needs base and value args")
 	}
-	off := int32(v.AuxInt)
-	// Same u32 wrap-around story as emitLoad — base+offset is
-	// computed in 32-bit so a negative int32 base lands at the
-	// expected wrapped offset, not 4 GiB above m.M.
+	// BX = m.M; the per-width base+offset rules live in
+	// emitMemAddrAMD64.
 	if plan.mCacheReg != "" {
 		// m is cached in the function-wide reserved register;
 		// dereference it directly for m.M.
@@ -1096,38 +1116,7 @@ func emitStore(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame)
 		fmt.Fprintf(b, "\tMOVQ m+0(FP), BX\n")
 		fmt.Fprintf(b, "\tMOVQ %d(BX), BX\n", moduleMOffset)
 	}
-	var addr string
-	// Fast path: if `base` is a Const32 we can fold `base + off` at
-	// generation time and use a single MOVx disp(BX), <val> store
-	// instead of the 3-instruction MOVL+ADDL+ADDQ address build-up.
-	// The displacement uses the same uint32(base+off) wrap as the
-	// runtime path because we form the constant via int32 add and
-	// re-cast as int32 — that gives identical low-32-bit behaviour
-	// for both negative-int32 bases and very-large offsets.
-	if base, ok := inlineableI32(v.Args[0]); ok {
-		disp := int32(uint32(base) + uint32(off))
-		addr = fmt.Sprintf("%d(BX)", disp)
-	} else {
-		// Dynamic-base store: form the address in SI so the access
-		// uses `(BX)(SI*1)` indexed addressing. Mirror of emitLoad's
-		// SI-as-index strategy — keeps BX = m.M live so the next
-		// store / load in the same straight-line span doesn't need
-		// to re-emit the m.M preamble (dedupMemMReload strips the
-		// redundant copies later).
-		fmt.Fprintf(b, "\tMOVL %s, SI\n", operandSrc32(v.Args[0], plan, frame, "SP"))
-		// See emitLoad for the matching disp-fold rationale —
-		// non-negative offsets fold into the addressing
-		// mode's displacement; negative offsets keep the ADDL so the
-		// 32-bit wrap matches wasm's effective-address semantics.
-		if off > 0 {
-			addr = fmt.Sprintf("%d(BX)(SI*1)", off)
-		} else if off == 0 {
-			addr = "(BX)(SI*1)"
-		} else {
-			fmt.Fprintf(b, "\tADDL $%d, SI\n", off)
-			addr = "(BX)(SI*1)"
-		}
-	}
+	addr := emitMemAddrAMD64(b, v.Args[0], v.AuxInt, plan, frame)
 	// The wasm store-narrow ops truncate the low N bits of the value.
 	// On amd64 the small-store mnemonics (MOVB/MOVW) naturally write
 	// only the low bits of the register, so we just MOV the value

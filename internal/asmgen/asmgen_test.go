@@ -1054,6 +1054,134 @@ func TestEmitMemopsAMD64(t *testing.T) {
 	buildAndRunDriver(t, "cg_memops", exports, driverWithMemory(), cases)
 }
 
+// TestEmitMemopsARM64 runs the same wasm32 memops value checks
+// against the ARM64 emitter, executing natively (see
+// TestEmitControlARM64 for the Rosetta-host detection).
+func TestEmitMemopsARM64(t *testing.T) {
+	if !canExecDarwinARM64() && runtime.GOARCH != "arm64" {
+		t.Skipf("host cannot execute arm64 binaries (GOOS=%s GOARCH=%s)", runtime.GOOS, runtime.GOARCH)
+	}
+	exports := []string{
+		"l_i32", "l_i32_8s", "l_i32_8u", "l_i32_16s", "l_i32_16u",
+		"l_i64", "l_i64_8s", "l_i64_8u", "l_i64_16s", "l_i64_16u", "l_i64_32s", "l_i64_32u",
+		"s_i32", "s_i32_8", "s_i32_16",
+		"s_i64", "s_i64_8", "s_i64_16", "s_i64_32",
+		"l_offset", "s_offset",
+		"mem_size", "mem_grow",
+	}
+	cases := []driverCase{
+		{"l_i32", []string{"0"}, "67305985"},
+		{"l_i32", []string{"4"}, "134678021"},
+		{"l_i32_8u", []string{"7"}, "8"},
+		{"l_i32_8s", []string{"7"}, "8"},
+		{"l_i32_16u", []string{"0"}, "513"},
+		{"l_i32_16s", []string{"0"}, "513"},
+		{"l_i64", []string{"0"}, "578437695752307201"},
+		{"l_i64_8u", []string{"0"}, "1"},
+		{"l_i64_8s", []string{"15"}, "16"},
+		{"l_i64_16u", []string{"0"}, "513"},
+		{"l_i64_16s", []string{"0"}, "513"},
+		{"l_i64_32u", []string{"0"}, "67305985"},
+		{"l_i64_32s", []string{"0"}, "67305985"},
+		{"s_i32", []string{"100", "305419896"}, "305419896"},
+		{"s_i32", []string{"104", "-1"}, "-1"},
+		{"s_i32_8", []string{"100", "255"}, "255"},
+		{"s_i32_16", []string{"100", "65535"}, "65535"},
+		{"s_i64", []string{"200", "1311768467463790320"}, "1311768467463790320"},
+		{"s_i64_8", []string{"200", "255"}, "255"},
+		{"s_i64_16", []string{"200", "65535"}, "65535"},
+		{"s_i64_32", []string{"200", "4294967295"}, "4294967295"},
+		{"l_offset", []string{"0"}, "202050057"},
+		{"s_offset", []string{"300", "42"}, "42"},
+		{"mem_size", []string{}, "2"},
+		{"mem_grow", []string{"3"}, "2"},
+		{"mem_grow", []string{"-1"}, "-1"},
+	}
+	buildAndRunDriverArch(t, "cg_memops", exports, driverWithMemory(), cases, "arm64")
+}
+
+// driverWithMemory64 is driverWithMemory with the 64-bit memory
+// helper family (memorySize64 / memoryGrow64) that asmgen routes
+// OpMemSize / OpMemGrow to on memory64 modules. Module layout is
+// identical — only the addressing width of the wasm side changes.
+func driverWithMemory64() driverModule {
+	d := driverWithMemory()
+	d.moduleSrc = strings.Replace(d.moduleSrc, `func memorySize(m *Module) int32 { return int32(len(m.Memory) / 65536) }
+
+func memoryGrow(m *Module, delta int32) int32 {`, `func memorySize64(m *Module) int64 { return int64(len(m.Memory) / 65536) }
+
+func memoryGrow64(m *Module, delta int64) int64 {`, 1)
+	d.moduleSrc = strings.Replace(d.moduleSrc, `	cur := int32(len(m.Memory) / 65536)`, `	cur := int64(len(m.Memory) / 65536)`, 1)
+	return d
+}
+
+// mem64MemopsCases is the memory64 twin of the TestEmitMemopsAMD64
+// case list: same data segment, same expected values, i64 addresses.
+// mem_size / mem_grow return i64 on a 64-bit memory.
+func mem64MemopsCases() ([]string, []driverCase) {
+	exports := []string{
+		"l_i32", "l_i32_8s", "l_i32_8u", "l_i32_16s", "l_i32_16u",
+		"l_i64", "l_i64_8s", "l_i64_8u", "l_i64_16s", "l_i64_16u", "l_i64_32s", "l_i64_32u",
+		"s_i32", "s_i32_8", "s_i32_16",
+		"s_i64", "s_i64_8", "s_i64_16", "s_i64_32",
+		"l_offset", "s_offset", "l_constbase",
+		"mem_size", "mem_grow",
+	}
+	cases := []driverCase{
+		{"l_i32", []string{"0"}, "67305985"},
+		{"l_i32", []string{"4"}, "134678021"},
+		{"l_i32_8u", []string{"0"}, "1"},
+		{"l_i32_8u", []string{"7"}, "8"},
+		{"l_i32_8s", []string{"0"}, "1"},
+		{"l_i32_8s", []string{"7"}, "8"},
+		{"l_i32_16u", []string{"0"}, "513"},
+		{"l_i32_16s", []string{"0"}, "513"},
+		{"l_i64", []string{"0"}, "578437695752307201"},
+		{"l_i64_8u", []string{"0"}, "1"},
+		{"l_i64_8s", []string{"15"}, "16"},
+		{"l_i64_16u", []string{"0"}, "513"},
+		{"l_i64_16s", []string{"0"}, "513"},
+		{"l_i64_32u", []string{"0"}, "67305985"},
+		{"l_i64_32s", []string{"0"}, "67305985"},
+		{"s_i32", []string{"100", "305419896"}, "305419896"},
+		{"s_i32", []string{"104", "-1"}, "-1"},
+		{"s_i32_8", []string{"100", "255"}, "255"},
+		{"s_i32_16", []string{"100", "65535"}, "65535"},
+		{"s_i64", []string{"200", "1311768467463790320"}, "1311768467463790320"},
+		{"s_i64_8", []string{"200", "255"}, "255"},
+		{"s_i64_16", []string{"200", "65535"}, "65535"},
+		{"s_i64_32", []string{"200", "4294967295"}, "4294967295"},
+		{"l_offset", []string{"0"}, "202050057"},
+		{"s_offset", []string{"300", "42"}, "42"},
+		// constant i64 base folded with the memarg offset at
+		// generation time: bytes [13..16] LE = 0x100F0E0D.
+		{"l_constbase", []string{}, "269422093"},
+		{"mem_size", []string{}, "2"},
+		{"mem_grow", []string{"3"}, "2"},
+		{"mem_grow", []string{"-1"}, "-1"},
+	}
+	return exports, cases
+}
+
+// TestEmitMemopsMem64AMD64 / ...ARM64 run the memory64 twin of the
+// memops value checks: i64 bases with no mod-2^32 wrap, offsets added
+// in full 64-bit, and the 64-bit mem-size/grow helper routing.
+func TestEmitMemopsMem64AMD64(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skipf("amd64-only test (GOARCH=%s)", runtime.GOARCH)
+	}
+	exports, cases := mem64MemopsCases()
+	buildAndRunDriver(t, "cg_mem64_memops", exports, driverWithMemory64(), cases)
+}
+
+func TestEmitMemopsMem64ARM64(t *testing.T) {
+	if !canExecDarwinARM64() && runtime.GOARCH != "arm64" {
+		t.Skipf("host cannot execute arm64 binaries (GOOS=%s GOARCH=%s)", runtime.GOOS, runtime.GOARCH)
+	}
+	exports, cases := mem64MemopsCases()
+	buildAndRunDriverArch(t, "cg_mem64_memops", exports, driverWithMemory64(), cases, "arm64")
+}
+
 // driverHostAdd is the driver for the OpCallImport fixture. The
 // Module carries an interface field `host` (hostImports) whose
 // implementation adds the integer args (i32 and i64 variants) and
@@ -1483,11 +1611,6 @@ func dispatchCase(name string, sig wasm.FuncType, modExpr string) string {
 		fmt.Fprintf(&b, "\tfmt.Println(%s(%s))\n", name, strings.Join(args, ", "))
 	}
 	return b.String()
-}
-
-func writeDriverModule(t *testing.T, dir string, driver driverModule, asm, decls, stubs, wrappers, dispatch string) {
-	t.Helper()
-	writeDriverModuleArch(t, dir, driver, asm, decls, stubs, wrappers, dispatch, "amd64")
 }
 
 func writeDriverModuleArch(t *testing.T, dir string, driver driverModule, asm, decls, stubs, wrappers, dispatch, goarch string) {

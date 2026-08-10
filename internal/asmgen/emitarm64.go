@@ -746,11 +746,41 @@ func emitCmp64ARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 	return nil
 }
 
+// emitMemAddrARM64 emits the effective-address computation shared by
+// emitLoadARM64 and emitStoreARM64. R2 must hold m.M on entry; on
+// return R2 holds the full access address. The two memory widths
+// share this one mechanism and differ only in the effective-address
+// rule, mirroring the pure-Go emitter:
+//
+//   - wasm32: address = uint32(base + off) — computed in 32-bit so a
+//     negative int32 base wraps the way wasm semantics require (the
+//     pure-Go path is `uint32(base + int32(off))`). MOVWU / ADDW
+//     zero-extend the low 32 bits into R3.
+//   - memory64: address = base + off in full 64-bit, no wrap (the
+//     pure-Go path is `uint64(base) + offset`). The Go assembler
+//     materialises out-of-range ADD immediates via REGTMP, so the
+//     shape stays a single ADD regardless of offset size.
+func emitMemAddrARM64(b *strings.Builder, baseArg *ssa.Value, aux int64, plan *funcPlan, frame argFrame) {
+	if plan.mem64 {
+		fmt.Fprintf(b, "\tMOVD %s, R3\n", operandSrc64ARM64(baseArg, plan, frame))
+		if aux != 0 {
+			fmt.Fprintf(b, "\tADD $%d, R3, R3\n", aux)
+		}
+		fmt.Fprintf(b, "\tADD R3, R2, R2\n")
+		return
+	}
+	off := int32(aux)
+	fmt.Fprintf(b, "\tMOVWU %s, R3\n", operandSrc32ARM64(baseArg, plan, frame))
+	if off != 0 {
+		fmt.Fprintf(b, "\tADDW $%d, R3, R3\n", off)
+	}
+	fmt.Fprintf(b, "\tADD R3, R2, R2\n")
+}
+
 func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
 	if len(v.Args) < 1 || v.Args[0] == nil {
 		return fmt.Errorf("OpLoad needs at least a base arg")
 	}
-	off := int32(v.AuxInt)
 	dst := plan.offsets[v.ID]
 	// Compute effective address into R2:
 	//   R2 = *(m + moduleMOffset) + uint32(base) + uint32(off)
@@ -762,15 +792,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 		fmt.Fprintf(b, "\tMOVD m+0(FP), R2\n")
 		fmt.Fprintf(b, "\tMOVD %d(R2), R2\n", moduleMOffset)
 	}
-	// Compute base+off in 32-bit so a negative int32 base wraps
-	// the way wasm semantics require — the pure-Go path uses
-	// `uint32(base + int32(off))`. ADDW writes the low 32 bits and
-	// zero-extends to 64, leaving R3 holding the correct u32.
-	fmt.Fprintf(b, "\tMOVWU %s, R3\n", operandSrc32ARM64(v.Args[0], plan, frame))
-	if off != 0 {
-		fmt.Fprintf(b, "\tADDW $%d, R3, R3\n", off)
-	}
-	fmt.Fprintf(b, "\tADD R3, R2, R2\n")
+	emitMemAddrARM64(b, v.Args[0], v.AuxInt, plan, frame)
 	is64 := v.Type == ssa.TypeI64
 	// Load directly into the destination register when the value
 	// has a regHome. Saves the final `MOVx R0, dst(RSP)` slot
@@ -873,7 +895,6 @@ func emitStoreARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 	if len(v.Args) < 2 || v.Args[0] == nil || v.Args[1] == nil {
 		return fmt.Errorf("OpStore needs base and value args")
 	}
-	off := int32(v.AuxInt)
 	if plan.mCacheReg != "" {
 		// m is in mCacheReg, dereference directly to m.M.
 		fmt.Fprintf(b, "\tMOVD %d(%s), R2\n", moduleMOffset, plan.mCacheReg)
@@ -881,12 +902,7 @@ func emitStoreARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		fmt.Fprintf(b, "\tMOVD m+0(FP), R2\n")
 		fmt.Fprintf(b, "\tMOVD %d(R2), R2\n", moduleMOffset)
 	}
-	// Same u32 wrap-around story as emitLoadARM64.
-	fmt.Fprintf(b, "\tMOVWU %s, R3\n", operandSrc32ARM64(v.Args[0], plan, frame))
-	if off != 0 {
-		fmt.Fprintf(b, "\tADDW $%d, R3, R3\n", off)
-	}
-	fmt.Fprintf(b, "\tADD R3, R2, R2\n")
+	emitMemAddrARM64(b, v.Args[0], v.AuxInt, plan, frame)
 	valIs64 := v.Args[1].Type == ssa.TypeI64
 	val32 := operandSrc32ARM64(v.Args[1], plan, frame)
 	val64 := operandSrc64ARM64(v.Args[1], plan, frame)
