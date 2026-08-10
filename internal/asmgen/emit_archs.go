@@ -1439,6 +1439,11 @@ func emitSimdCallAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 // sequences below match the Go-side base.X helper semantics
 // 1-for-1 (input X → same output).
 func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame, name string) (bool, error) {
+	if divRemHelper(name) && !plan.divRemInline {
+		// Trap helpers unresolved in this package; the inline form
+		// would not link. Keep the marshalled CALL path.
+		return false, nil
+	}
 	dst := plan.offsets[v.ID]
 	switch name {
 	// --- 32-bit integer ---
@@ -1560,17 +1565,28 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 	// rather than silent garbage — matching wasm trap semantics.
 	case "i32_div_s":
 		zeroLbl := fmt.Sprintf("DIVS32_ZERO_%d", v.ID)
+		ovfLbl := fmt.Sprintf("DIVS32_OVF_%d", v.ID)
+		goLbl := fmt.Sprintf("DIVS32_GO_%d", v.ID)
 		doneLbl := fmt.Sprintf("DIVS32_DONE_%d", v.ID)
 		fmt.Fprintf(b, "\tMOVL %s, CX\n", operandSrc32(v.Args[1], plan, frame, "SP"))
 		fmt.Fprintf(b, "\tTESTL CX, CX\n")
 		fmt.Fprintf(b, "\tJE %s\n", zeroLbl)
 		fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(v.Args[0], plan, frame, "SP"))
+		// wasm div_s(INT_MIN, -1) traps as integer OVERFLOW; letting
+		// IDIV raise #DE would panic with the divide-by-zero kind.
+		fmt.Fprintf(b, "\tCMPL CX, $-1\n")
+		fmt.Fprintf(b, "\tJNE %s\n", goLbl)
+		fmt.Fprintf(b, "\tCMPL AX, $-2147483648\n")
+		fmt.Fprintf(b, "\tJE %s\n", ovfLbl)
+		fmt.Fprintf(b, "%s:\n", goLbl)
 		fmt.Fprintf(b, "\tCDQ\n") // sign-extend AX into EDX:EAX
 		fmt.Fprintf(b, "\tIDIVL CX\n")
 		fmt.Fprintf(b, "\tMOVL AX, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
+		fmt.Fprintf(b, "%s:\n", ovfLbl)
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapIntOvf)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n") // wasm: integer divide by zero
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero) // wasm: integer divide by zero
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	case "i32_div_u_s", "i32_div_u":
@@ -1585,7 +1601,7 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 		fmt.Fprintf(b, "\tMOVL AX, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	case "i32_rem_s":
@@ -1608,7 +1624,7 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 		fmt.Fprintf(b, "\tMOVL $0, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	case "i32_rem_u_s", "i32_rem_u":
@@ -1623,23 +1639,34 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 		fmt.Fprintf(b, "\tMOVL DX, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	// --- 64-bit signed division / remainder ---
 	case "i64_div_s":
 		zeroLbl := fmt.Sprintf("DIVS64_ZERO_%d", v.ID)
+		ovfLbl := fmt.Sprintf("DIVS64_OVF_%d", v.ID)
+		goLbl := fmt.Sprintf("DIVS64_GO_%d", v.ID)
 		doneLbl := fmt.Sprintf("DIVS64_DONE_%d", v.ID)
 		fmt.Fprintf(b, "\tMOVQ %s, CX\n", operandSrc64(v.Args[1], plan, frame, "SP"))
 		fmt.Fprintf(b, "\tTESTQ CX, CX\n")
 		fmt.Fprintf(b, "\tJE %s\n", zeroLbl)
 		fmt.Fprintf(b, "\tMOVQ %s, AX\n", operandSrc64(v.Args[0], plan, frame, "SP"))
+		// See the i32 twin: explicit overflow trap kind.
+		fmt.Fprintf(b, "\tCMPQ CX, $-1\n")
+		fmt.Fprintf(b, "\tJNE %s\n", goLbl)
+		fmt.Fprintf(b, "\tMOVQ $-9223372036854775808, DX\n")
+		fmt.Fprintf(b, "\tCMPQ AX, DX\n")
+		fmt.Fprintf(b, "\tJE %s\n", ovfLbl)
+		fmt.Fprintf(b, "%s:\n", goLbl)
 		fmt.Fprintf(b, "\tCQO\n")
 		fmt.Fprintf(b, "\tIDIVQ CX\n")
 		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
+		fmt.Fprintf(b, "%s:\n", ovfLbl)
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapIntOvf)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	case "i64_div_u_s", "i64_div_u":
@@ -1654,7 +1681,7 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	case "i64_rem_s":
@@ -1675,7 +1702,7 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 		fmt.Fprintf(b, "\tMOVQ $0, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	case "i64_rem_u_s", "i64_rem_u":
@@ -1690,7 +1717,7 @@ func emitInlineHelper(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame ar
 		fmt.Fprintf(b, "\tMOVQ DX, %d(SP)\n", dst)
 		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
 		fmt.Fprintf(b, "%s:\n", zeroLbl)
-		fmt.Fprintf(b, "\tCALL ·wasm_trap_div_zero(SB)\n")
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
 		fmt.Fprintf(b, "%s:\n", doneLbl)
 		return true, nil
 	// --- Integer width conversions ---

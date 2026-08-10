@@ -2017,6 +2017,15 @@ type funcPlan struct {
 	// frame slots filled by the pack prologue rather than FP offsets.
 	packed       bool
 	packedParams []ssa.Type
+	// trapDivZero / trapIntOvf are the CALL targets of the inline
+	// div/rem trap branches ("·wasm_trap_div_zero" style, resolved to
+	// forward wrappers in multi-package chunks). divRemInline gates
+	// the inline lowering: false when a resolver was available but
+	// could not resolve the trap helpers — emitting the default
+	// spelling there would fail to link.
+	trapDivZero  string
+	trapIntOvf   string
+	divRemInline bool
 	// mustSplice marks SIMD call values inside register-coalesced
 	// loops: their inline splice is load-bearing (a fallback CALL
 	// would clobber the carry registers), so a splice-table miss
@@ -2205,6 +2214,8 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 		unusedResult:    map[ssa.ValueID]bool{},
 	}
 	p.mem64 = opts.Module != nil && opts.Module.Memory64()
+	p.trapDivZero, p.trapIntOvf = "·wasm_trap_div_zero", "·wasm_trap_int_overflow"
+	p.divRemInline = true
 	p.packed = opts.PackedParams != nil
 	p.packedParams = opts.PackedParams
 
@@ -2240,6 +2251,32 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 					// no ForbidCalls consequence.
 					break
 				}
+				if divRemHelper(name) {
+					// Inline div/rem: native divide plus trap-branch
+					// CALLs (zero-arg, no callee frame). With a
+					// resolver, the trap symbols must resolve for the
+					// inline form to link; unresolved (or resolver-
+					// less) hosts keep the current behavior.
+					p.hasCall = true
+					if opts.MemHelperSymbol != nil {
+						z, ok1 := opts.MemHelperSymbol("wasm_trap_div_zero")
+						ovf, ok2 := opts.MemHelperSymbol("wasm_trap_int_overflow")
+						if ok1 && ok2 {
+							p.trapDivZero, p.trapIntOvf = "·"+z, "·"+ovf
+							break
+						}
+						p.divRemInline = false
+					}
+					p.noteNonSimdCall(v)
+					spec, ok := helperSig(name)
+					if !ok {
+						return nil, fmt.Errorf("OpHelperCall v%d: unknown helper %q", v.ID, name)
+					}
+					if sz := helperCallFrameSize(spec); sz > maxCallee {
+						maxCallee = sz
+					}
+					break
+				}
 				p.hasCall = true
 				p.noteNonSimdCall(v)
 				spec, ok := helperSig(name)
@@ -2253,6 +2290,17 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				p.hasCall = true
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallDirect v%d: FuncOptions.Module is required", v.ID)
+				}
+				if v.AuxInt < 0 {
+					// Synthetic call to an extracted sibling (the
+					// outline pass names the callee in Aux and has no
+					// wasm index). The packed call-site protocol
+					// (staging the boundary through the module's
+					// outline pack) is not emitted here yet — count
+					// it as an unresolvable callee so ForbidCalls
+					// falls the function back to the host's backend.
+					p.noteNonSimdCall(v)
+					break
 				}
 				calleeIdx := uint32(v.AuxInt)
 				csig := opts.Module.FuncTypeOf(calleeIdx)

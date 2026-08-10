@@ -1202,6 +1202,14 @@ func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, fra
 		fmt.Fprintf(b, "\tSCVTFD R0, F0\n")
 		storeF64()
 		return true, nil
+	case "i32_div_s", "i32_div_u_s", "i32_rem_s", "i32_rem_u_s",
+		"i64_div_s", "i64_div_u_s", "i64_rem_s", "i64_rem_u_s":
+		if !plan.divRemInline {
+			// Trap helpers unresolved in this package; the inline
+			// form would not link. Keep the marshalled CALL path.
+			return false, nil
+		}
+		return true, emitInlineDivRemARM64(b, v, plan, frame, name)
 	case "f32_eq", "f32_ne", "f32_lt", "f32_le", "f32_gt", "f32_ge",
 		"f64_eq", "f64_ne", "f64_lt", "f64_le", "f64_gt", "f64_ge":
 		// IEEE compare, wasm semantics: unordered (NaN) yields 0 for
@@ -1224,6 +1232,107 @@ func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, fra
 		return true, nil
 	}
 	return false, nil
+}
+
+// emitInlineDivRemARM64 lowers the integer divide/remainder family:
+// SDIV/UDIV (which never fault on arm64 — traps are explicit
+// branches), MSUB for remainders. wasm semantics:
+//
+//   - every op traps on a zero divisor;
+//   - div_s(INT_MIN, -1) traps as integer overflow (SDIV would
+//     silently wrap to INT_MIN);
+//   - rem_s(INT_MIN, -1) is 0, NO trap — SDIV wraps q to INT_MIN and
+//     MSUB computes x - q*y = 0 with the same wrap, so no check is
+//     needed.
+//
+// The trap CALL targets come from the plan (resolved to forward
+// wrappers in multi-package chunks); the trap helpers panic, so
+// control never returns from those labels.
+func emitInlineDivRemARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame, name string) error {
+	dst := plan.offsets[v.ID]
+	home := plan.regHome[v.ID]
+	wide := strings.HasPrefix(name, "i64")
+	signed := !strings.Contains(name, "_u")
+	isRem := strings.Contains(name, "rem")
+	mov, cbz, div, st := "MOVW", "CBZW", "UDIVW", "MOVW"
+	if signed {
+		div = "SDIVW"
+	}
+	if wide {
+		mov, cbz, st = "MOVD", "CBZ", "MOVD"
+		div = "UDIV"
+		if signed {
+			div = "SDIV"
+		}
+	}
+	// Unsigned operands still load with the plain MOV: the divide
+	// consumes exactly the register width either way.
+	fmt.Fprintf(b, "\t%s %s, R0\n", mov, operandSrcXARM64(v.Args[0], plan, frame, wide))
+	fmt.Fprintf(b, "\t%s %s, R1\n", mov, operandSrcXARM64(v.Args[1], plan, frame, wide))
+	zeroLbl := fmt.Sprintf("DIVREM_ZERO_%d", v.ID)
+	doneLbl := fmt.Sprintf("DIVREM_DONE_%d", v.ID)
+	fmt.Fprintf(b, "\t%s R1, %s\n", cbz, zeroLbl)
+	if signed && !isRem {
+		// div_s overflow check: y == -1 && x == INT_MIN.
+		ovfLbl := fmt.Sprintf("DIVREM_OVF_%d", v.ID)
+		goLbl := fmt.Sprintf("DIVREM_GO_%d", v.ID)
+		if wide {
+			fmt.Fprintf(b, "\tCMP $-1, R1\n")
+			fmt.Fprintf(b, "\tBNE %s\n", goLbl)
+			fmt.Fprintf(b, "\tMOVD $-9223372036854775808, R2\n")
+			fmt.Fprintf(b, "\tCMP R2, R0\n")
+		} else {
+			fmt.Fprintf(b, "\tCMPW $-1, R1\n")
+			fmt.Fprintf(b, "\tBNE %s\n", goLbl)
+			fmt.Fprintf(b, "\tMOVD $-2147483648, R2\n")
+			fmt.Fprintf(b, "\tCMPW R2, R0\n")
+		}
+		fmt.Fprintf(b, "\tBEQ %s\n", ovfLbl)
+		fmt.Fprintf(b, "%s:\n", goLbl)
+		fmt.Fprintf(b, "\t%s R1, R0, R0\n", div)
+		if home != "" {
+			fmt.Fprintf(b, "\t%s R0, %s\n", st, home)
+		} else {
+			fmt.Fprintf(b, "\t%s R0, %d(RSP)\n", st, dst)
+		}
+		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
+		fmt.Fprintf(b, "%s:\n", ovfLbl)
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapIntOvf)
+	} else if isRem {
+		// q = x / y; r = x - q*y (MSUB).
+		fmt.Fprintf(b, "\t%s R1, R0, R2\n", div)
+		if wide {
+			fmt.Fprintf(b, "\tMSUB R1, R0, R2, R0\n")
+		} else {
+			fmt.Fprintf(b, "\tMSUBW R1, R0, R2, R0\n")
+		}
+		if home != "" {
+			fmt.Fprintf(b, "\t%s R0, %s\n", st, home)
+		} else {
+			fmt.Fprintf(b, "\t%s R0, %d(RSP)\n", st, dst)
+		}
+		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
+	} else {
+		fmt.Fprintf(b, "\t%s R1, R0, R0\n", div)
+		if home != "" {
+			fmt.Fprintf(b, "\t%s R0, %s\n", st, home)
+		} else {
+			fmt.Fprintf(b, "\t%s R0, %d(RSP)\n", st, dst)
+		}
+		fmt.Fprintf(b, "\tJMP %s\n", doneLbl)
+	}
+	fmt.Fprintf(b, "%s:\n", zeroLbl)
+	fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.trapDivZero)
+	fmt.Fprintf(b, "%s:\n", doneLbl)
+	return nil
+}
+
+// operandSrcXARM64 picks the 32- or 64-bit operand renderer.
+func operandSrcXARM64(v *ssa.Value, plan *funcPlan, frame argFrame, wide bool) string {
+	if wide {
+		return operandSrc64ARM64(v, plan, frame)
+	}
+	return operandSrc32ARM64(v, plan, frame)
 }
 
 func emitHelperCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {

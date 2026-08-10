@@ -175,6 +175,17 @@ func helperAlwaysInline(name string) bool {
 	return false
 }
 
+// divRemHelper names the integer divide/remainder family lowered
+// inline (native divide + trap-branch CALLs) on both arches.
+func divRemHelper(name string) bool {
+	switch name {
+	case "i32_div_s", "i32_div_u_s", "i32_rem_s", "i32_rem_u_s",
+		"i64_div_s", "i64_div_u_s", "i64_rem_s", "i64_rem_u_s":
+		return true
+	}
+	return false
+}
+
 func helperSig(name string) (helperSpec, bool) {
 	s, ok := helperSigs[name]
 	return s, ok

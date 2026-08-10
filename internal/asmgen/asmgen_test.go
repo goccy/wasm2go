@@ -618,6 +618,30 @@ func TestEmitControlAMD64(t *testing.T) {
 	buildAndRunDriver(t, "control", exports, driverPlaceholder, cases)
 }
 
+// TestEmitArithARM64 runs the arith fixture's value checks against
+// the ARM64 emitter natively — in particular the inline div/rem
+// family (SDIV/UDIV + MSUB with explicit trap branches).
+func TestEmitArithARM64(t *testing.T) {
+	if !canExecDarwinARM64() && runtime.GOARCH != "arm64" {
+		t.Skipf("host cannot execute arm64 binaries (GOOS=%s GOARCH=%s)", runtime.GOOS, runtime.GOARCH)
+	}
+	exports := []string{"add", "sub", "mul64", "div_s", "shifts", "rotl", "lt_s", "lt_u"}
+	cases := []driverCase{
+		{"add", []string{"2", "3"}, "5"},
+		{"sub", []string{"-2147483648", "1"}, "2147483647"},
+		{"mul64", []string{"6", "7"}, "42"},
+		{"div_s", []string{"20", "4"}, "5"},
+		{"div_s", []string{"-20", "4"}, "-5"},
+		{"div_s", []string{"-20", "-4"}, "5"},
+		{"div_s", []string{"-2147483647", "-1"}, "2147483647"},
+		{"shifts", []string{"1", "4"}, "1"},
+		{"rotl", []string{"1", "31"}, "-2147483648"},
+		{"lt_s", []string{"-1", "1"}, "1"},
+		{"lt_u", []string{"-1", "1"}, "0"},
+	}
+	buildAndRunDriverArch(t, "arith", exports, driverPlaceholder, cases, "arm64")
+}
+
 // TestEmitControlARM64 runs the same control-flow value checks against
 // the ARM64 emitter, executing the driver natively (Apple Silicon runs
 // arm64 binaries even when the test process is x86_64 under Rosetta).
