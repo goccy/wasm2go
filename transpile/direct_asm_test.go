@@ -244,3 +244,135 @@ func canExecArm64(t *testing.T) bool {
 	out, err := exec.Command("sysctl", "-n", "sysctl.proc_translated").Output()
 	return err == nil && strings.TrimSpace(string(out)) == "1"
 }
+
+// TestDirectAsmSimdLoop is the register-coalesce-across-splices gate:
+// a SIMD accumulation loop whose scalar carries (pointer, counter)
+// the splice-mode coalesce keeps in the splice-safe registers. The
+// direct-asm output is compared DIFFERENTIALLY against the normal
+// backend across a range of trip counts, on amd64 and natively on
+// arm64.
+func TestDirectAsmSimdLoop(t *testing.T) {
+	bin := testfixture.Wasm(t, "cg_simd_loopsum")
+	m, err := transpile.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	translate := func(importPath string, direct []string) (string, map[string][]byte) {
+		m2, err := transpile.Parse(bytes.NewReader(bin))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		res, err := transpile.Translate(&buf, m2, transpile.Options{
+			Package:          importPath[strings.LastIndex(importPath, "/")+1:],
+			OutputImportPath: importPath,
+			DirectAsmFuncs:   direct,
+		})
+		if err != nil {
+			t.Fatalf("translate %s: %v", importPath, err)
+		}
+		return buf.String(), mergeFiles(res.Files, res.Sidecars)
+	}
+	_ = m
+	refSrc, refFiles := translate("dasl/ref", nil)
+	dirSrc, dirFiles := translate("dasl/dir", []string{"fn0"})
+
+	// The direct bundle's arm64 body must be a spliced, coalesced
+	// loop: the marker proves direct-asm fired, R19 proves a carry
+	// got a splice-safe register home.
+	arm := string(dirFiles["arm64.s"])
+	start := strings.Index(arm, "// direct-asm: fn0")
+	if start < 0 {
+		t.Fatalf("fn0 fell back; no direct-asm body in arm64.s")
+	}
+	if !strings.Contains(arm[start:], "WORD $0x") {
+		t.Errorf("direct-asm fn0 contains no spliced NEON")
+	}
+	if !strings.Contains(arm[start:], "R19") {
+		t.Errorf("direct-asm fn0 coalesced no loop carry into R19")
+	}
+
+	dir := t.TempDir()
+	w := func(rel string, data []byte) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w("go.mod", []byte("module dasl\n\ngo 1.25.0\n"))
+	if refSrc != "" {
+		w("ref/gen.go", []byte(refSrc))
+	}
+	for name, data := range refFiles {
+		w("ref/"+name, data)
+	}
+	if dirSrc != "" {
+		w("dir/gen.go", []byte(dirSrc))
+	}
+	for name, data := range dirFiles {
+		w("dir/"+name, data)
+	}
+	w("main.go", []byte(`package main
+
+import (
+	"fmt"
+	"os"
+
+	"dasl/dir"
+	"dasl/ref"
+)
+
+func main() {
+	for n := int32(0); n <= 32; n++ {
+		r := ref.New()
+		d := dir.New()
+		want, got := r.Loopsum(n), d.Loopsum(n)
+		if want != got {
+			fmt.Printf("n=%d: ref %d, direct %d\n", n, want, got)
+			os.Exit(1)
+		}
+	}
+	fmt.Println("OK")
+}
+`))
+	run := func(env []string, label string) {
+		exe := filepath.Join(dir, "driver_"+label)
+		cb := exec.Command("go", "build", "-o", exe, ".")
+		cb.Dir = dir
+		if env != nil {
+			cb.Env = append(os.Environ(), env...)
+		}
+		if out, err := cb.CombinedOutput(); err != nil {
+			t.Fatalf("%s go build: %v\n%s", label, err, out)
+		}
+		out, err := exec.Command(exe).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s driver: %v\n%s", label, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != "OK" {
+			t.Fatalf("%s: %s", label, got)
+		}
+	}
+	run(nil, "host")
+	if canExecArm64(t) {
+		run([]string{"GOOS=" + runtime.GOOS, "GOARCH=arm64", "CGO_ENABLED=0"}, "arm64")
+	} else {
+		t.Logf("host cannot execute arm64 binaries; arm64 leg skipped")
+	}
+}
+
+// mergeFiles flattens the translate outputs into one relative map.
+func mergeFiles(sets ...map[string][]byte) map[string][]byte {
+	out := map[string][]byte{}
+	for _, set := range sets {
+		for name, data := range set {
+			if len(data) > 0 {
+				out[name] = data
+			}
+		}
+	}
+	return out
+}

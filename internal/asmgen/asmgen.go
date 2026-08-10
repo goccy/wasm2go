@@ -334,6 +334,14 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	//   - regalloc runs iff LO <= index <= HI.
 	// This gives a clean log2(N) bisection over the function-index
 	// space — pin a failing range, halve it, repeat.
+	// Splice-mode arm64: no block-local regalloc (splices clobber
+	// its pool), but loop carries CAN live in the splice-safe
+	// registers — see runSpliceCoalescePass.
+	if plan.spliceMode {
+		if _, isARM64 := a.(archARM64); isARM64 {
+			runSpliceCoalescePass(f, plan)
+		}
+	}
 	if a.SupportsRegHome() && !plan.spliceMode {
 		runRegalloc := true
 		loStr, hiStr := os.Getenv("WASM2GO_REGALLOC_BISECT_LO"), os.Getenv("WASM2GO_REGALLOC_BISECT_HI")
@@ -1800,7 +1808,13 @@ func opEmitsCall(op ssa.Op) bool {
 		ssa.OpCallDirect, ssa.OpCallImport, ssa.OpCallIndirect,
 		ssa.OpGlobalGet, ssa.OpGlobalSet,
 		ssa.OpMemSize, ssa.OpMemGrow,
-		ssa.OpMemoryCopy, ssa.OpMemoryFill:
+		ssa.OpMemoryCopy, ssa.OpMemoryFill,
+		// SIMD helper calls are real CALLs unless a splicer inlines
+		// them; consumers that model call clobbers (m-cache
+		// re-prime, loop-carry coalesce) must treat them as such.
+		// The splice-mode coalesce pass exempts them explicitly and
+		// enforces the splice at emit time (plan.mustSplice).
+		ssa.OpSimdCall, ssa.OpSimdMemCall:
 		return true
 	}
 	return false
@@ -1963,6 +1977,11 @@ type funcPlan struct {
 	spliceMode    bool
 	wantsTrapStub bool
 	splicer       SimdSplicer
+	// mustSplice marks SIMD call values inside register-coalesced
+	// loops: their inline splice is load-bearing (a fallback CALL
+	// would clobber the carry registers), so a splice-table miss
+	// there fails the function to the host's fallback instead.
+	mustSplice map[ssa.ValueID]bool
 	// hasNonSimdCall narrows hasCall to non-SIMD callees (scalar
 	// helpers, direct/indirect/import calls, memory ops, global
 	// wrappers) — the set FuncOptions.ForbidCalls rejects. SIMD

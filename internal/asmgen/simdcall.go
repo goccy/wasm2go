@@ -41,10 +41,12 @@ type SimdSpliceOperand struct {
 // per-function trap stub, which the emitter then appends once at
 // body end via TrapStub.
 //
-// Contract: a splice body may clobber any register EXCEPT the stack
-// pointer — the emitter runs SIMD-containing functions in slot-only
-// mode (no register homes, no m-cache, no loop-carry coalesce) so
-// there is nothing live in registers across a splice.
+// Contract: a splice body confines its register usage to the splice
+// clobber set (arm64: R0–R15 / R25–R27 and the V registers). The
+// emitter runs SIMD-containing functions without block-local register
+// homes or the m-cache (both live in the clobber set), but loop-carry
+// scalars MAY be coalesced into the splice-safe registers (arm64
+// R19–R24, see runSpliceCoalescePass) and survive across splices.
 type SimdSplicer interface {
 	Splice(b *strings.Builder, name string, args []SimdSpliceOperand, ret *SimdSpliceOperand, scratchBase int) (spliced, wantsTrap bool)
 	TrapStub() string
@@ -171,6 +173,9 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 			case ssa.TypeF32, ssa.TypeF64:
 				op.Lo = operandSrcFloat(arg, plan, frame, spName)
 			default:
+				if plan.mustSplice[v.ID] {
+					return false, fmt.Errorf("v%d: %s arg %d type %v not spliceable inside a register-coalesced loop", v.ID, sp.name, i, t)
+				}
 				return false, nil // let the CALL path report it
 			}
 		}
@@ -187,6 +192,11 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 	}
 	spliced, wantsTrap := plan.splicer.Splice(b, sp.name, args, ret, scratchBase)
 	if !spliced {
+		if plan.mustSplice[v.ID] {
+			// A CALL here would clobber the loop-carry registers the
+			// coalesce reserved on the strength of this op splicing.
+			return false, fmt.Errorf("v%d: %s did not splice inside a register-coalesced loop", v.ID, sp.name)
+		}
 		return false, nil
 	}
 	if wantsTrap {

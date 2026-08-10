@@ -216,20 +216,20 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 			return false, false
 		}
 		a64MemPreamble(b, 1<<scale, offs, addr64)
-		fmt.Fprintf(b, "\t%s (R27), R24\n", eload)
+		fmt.Fprintf(b, "\t%s (R27), R4\n", eload)
 		// Copy v into the result slot, then overwrite the lane there.
 		fmt.Fprintf(b, "\tFMOVQ %d(RSP), F16\n", vSeq)
 		fmt.Fprintf(b, "\tFMOVQ F16, %d(RSP) // simd out\n", base+cres.SeqOf)
 		fmt.Fprintf(b, "\tADD $%d, RSP, R26\n", base+cres.SeqOf)
 		fmt.Fprintf(b, "\tADD R3<<%d, R26, R26\n", scale)
-		fmt.Fprintf(b, "\t%s R24, (R26)\n", estore)
+		fmt.Fprintf(b, "\t%s R4, (R26)\n", estore)
 		return true, true
 	case strings.Contains(op, "store"):
 		fmt.Fprintf(b, "\tADD $%d, RSP, R26\n", vSeq)
 		fmt.Fprintf(b, "\tADD R3<<%d, R26, R26\n", scale)
-		fmt.Fprintf(b, "\t%s (R26), R24\n", eload)
+		fmt.Fprintf(b, "\t%s (R26), R4\n", eload)
 		a64MemPreamble(b, 1<<scale, offs, addr64)
-		fmt.Fprintf(b, "\t%s R24, (R27)\n", estore)
+		fmt.Fprintf(b, "\t%s R4, (R27)\n", estore)
 		return true, true
 	}
 	return false, false

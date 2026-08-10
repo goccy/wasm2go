@@ -61,23 +61,29 @@ var coalesceReservedPool = []string{
 	"R12", "R13", "R15",
 }
 
-// runCoalescePass identifies loop-carry phis and reserves a
-// dedicated register for each safe candidate. Must run BEFORE
-// the per-block linear scan (assignBlockRegHomes) so the per-
-// block scans see the reserved registers in plan.reservedRegs.
-func runCoalescePass(f *ssa.Func, plan *funcPlan) {
-	if len(f.Blocks) == 0 {
-		return
-	}
-	backEdges := ssa.BackEdges(f)
-	if len(backEdges) == 0 {
-		return
-	}
+// spliceCoalescePool is the arm64 register set the SPLICE-MODE
+// coalesce draws from. Inline SIMD splice bodies confine themselves
+// to R0–R15 / R25–R27 plus the V registers (the documented splice
+// contract), so R19–R24 survive every splice and can carry loop
+// scalars across them — the reload-traffic lever gc can never pull,
+// since it must assume every call site clobbers everything.
+//
+// CAVEAT for the fused-window follow-up: the fused splices
+// (simdsplice_fuse_a64) additionally claim R20–R23 as window-wide
+// state; when asmgen learns to emit fused windows, this pool must
+// shrink to the disjoint remainder.
+var spliceCoalescePool = []string{
+	"R19", "R20", "R21", "R22", "R23", "R24",
+}
 
-	// Per-block CALL detection. opEmitsCall over-approximates;
-	// branchFused and globalInline subtract the false positives
-	// where the emit was actually short-circuited (no real CALL
-	// reached the asm).
+// coalesceBlockHasCall computes per-block CALL presence for the
+// coalesce safety rule. opEmitsCall over-approximates; branchFused
+// and globalInline subtract the false positives where the emit was
+// actually short-circuited (no real CALL reached the asm). exempt,
+// when non-nil, marks additional values whose CALL will be replaced
+// by an inline splice — the caller is responsible for enforcing that
+// replacement at emit time.
+func coalesceBlockHasCall(f *ssa.Func, plan *funcPlan, exempt func(*ssa.Value) bool) map[ssa.BlockID]bool {
 	blockHasCall := make(map[ssa.BlockID]bool, len(f.Blocks))
 	for _, blk := range f.Blocks {
 		for _, v := range blk.Values {
@@ -90,9 +96,68 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 			if _, ok := plan.globalInline[v.ID]; ok {
 				continue
 			}
+			if exempt != nil && exempt(v) {
+				continue
+			}
 			blockHasCall[blk.ID] = true
 			break
 		}
+	}
+	return blockHasCall
+}
+
+// runCoalescePass identifies loop-carry phis and reserves a
+// dedicated register for each safe candidate. Must run BEFORE
+// the per-block linear scan (assignBlockRegHomes) so the per-
+// block scans see the reserved registers in plan.reservedRegs.
+func runCoalescePass(f *ssa.Func, plan *funcPlan) {
+	runCoalesceWith(f, plan, coalesceReservedPool, coalesceBlockHasCall(f, plan, nil), nil, false)
+}
+
+// runSpliceCoalescePass is the splice-mode arm64 variant: SIMD
+// helper calls inside a loop do NOT bar coalescing (their inline
+// splice bodies leave the pool registers untouched), but every such
+// value in a coalesced loop is recorded in plan.mustSplice — the
+// emitter turns a splice-table miss there into a per-function
+// fallback instead of a CALL that would clobber the carry.
+func runSpliceCoalescePass(f *ssa.Func, plan *funcPlan) {
+	exempt := func(v *ssa.Value) bool {
+		return v.Op == ssa.OpSimdCall || v.Op == ssa.OpSimdMemCall
+	}
+	onCoalesced := func(body map[ssa.BlockID]bool) {
+		for _, blk := range f.Blocks {
+			if !body[blk.ID] {
+				continue
+			}
+			for _, v := range blk.Values {
+				if exempt(v) {
+					if plan.mustSplice == nil {
+						plan.mustSplice = map[ssa.ValueID]bool{}
+					}
+					plan.mustSplice[v.ID] = true
+				}
+			}
+		}
+	}
+	runCoalesceWith(f, plan, spliceCoalescePool, coalesceBlockHasCall(f, plan, exempt), onCoalesced, true)
+}
+
+// runCoalesceWith is the shared mechanism behind the two entry
+// points; pool and call-detection differ, the safety rules do not.
+// onCoalesced fires once per loop that coalesced at least one phi.
+// relaxedUses selects the finer use-safety analysis
+// (coalesceUsesSafe) instead of the original single-use rule. The
+// relaxed rule admits the canonical counter/pointer carries (read by
+// the loop condition or an address user AND by the bump); it is
+// currently enabled for the splice-mode pass only, pending an A/B of
+// the default pass with it.
+func runCoalesceWith(f *ssa.Func, plan *funcPlan, pool []string, blockHasCall map[ssa.BlockID]bool, onCoalesced func(body map[ssa.BlockID]bool), relaxedUses bool) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	backEdges := ssa.BackEdges(f)
+	if len(backEdges) == 0 {
+		return
 	}
 
 	// Index blocks for fast lookup, and identify which block each
@@ -104,7 +169,7 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		}
 	}
 
-	freePool := append([]string{}, coalesceReservedPool...)
+	freePool := append([]string{}, pool...)
 
 	// Process each back edge as one potential loop.
 	for _, e := range backEdges {
@@ -171,6 +236,7 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 		// regHome-eligible value defined inside the loop body is a
 		// candidate. Multiple phis can coalesce per loop — each
 		// gets its own register from freePool.
+		coalescedInLoop := false
 		for _, phi := range hdr.Values {
 			if phi.Op != ssa.OpPhi {
 				continue
@@ -213,20 +279,24 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 				continue
 			}
 			// SAFETY: V's write to the shared register destroys
-			// P's value. So P must have NO uses other than V
-			// itself, anywhere in the function. (V is one of P's
-			// users — phi.ID appears in V.Args, the OpSub32 /
-			// OpAdd32 / etc. that reads the phi.) If P appears
-			// as an arg in some OTHER value besides V, or as a
-			// block control anywhere, the coalesce would silently
-			// hand the new V bytes to that other reader. Deny.
-			if phiUsers[phi.ID] != 1 || phiUsedAsControl[phi.ID] {
+			// P's value; no read of P may observe it. The original
+			// rule demands P have NO user but V anywhere. The
+			// relaxed rule (splice mode) instead proves every read
+			// executes before V's write in each iteration — see
+			// coalesceUsesSafe.
+			if relaxedUses {
+				if !coalesceUsesSafe(f, body, src, phi, actual) {
+					continue
+				}
+			} else if phiUsers[phi.ID] != 1 || phiUsedAsControl[phi.ID] {
 				continue
 			}
-			// Pick a register; bail if the dedicated pool is
-			// drained (nested loops with many carries — rare).
+			// Pick a register; stop coalescing when the dedicated
+			// pool is drained (nested loops with many carries —
+			// rare). Break rather than return so the loops already
+			// coalesced still get their onCoalesced bookkeeping.
 			if len(freePool) == 0 {
-				return
+				break
 			}
 			reg := freePool[0]
 			freePool = freePool[1:]
@@ -245,6 +315,10 @@ func runCoalescePass(f *ssa.Func, plan *funcPlan) {
 				}
 				m[reg] = true
 			}
+			coalescedInLoop = true
+		}
+		if coalescedInLoop && onCoalesced != nil {
+			onCoalesced(body)
 		}
 	}
 }
@@ -292,4 +366,67 @@ func isCoalesceableType(t ssa.Type) bool {
 		return true
 	}
 	return false
+}
+
+// coalesceUsesSafe reports whether every read of phi P is guaranteed
+// to execute BEFORE the carry value V overwrites their shared
+// register within each iteration. Sufficient conditions:
+//
+//   - V is defined in the latch block (the back-edge source). The
+//     latch runs LAST in every iteration: all its successors are the
+//     header (back edge) or exit blocks outside the body, so a use
+//     in any other body block has already executed when V's write
+//     happens.
+//   - Reads of P in the latch itself sit at earlier value indices
+//     than V.
+//   - P has no reads outside the loop body (it would observe V's
+//     final bytes rather than its own), no reads via another phi's
+//     edge copy (those run at latch end, after V), and no use as
+//     the latch's own control (evaluated at latch end).
+//
+// V's own read of P is the carry (`n-1` reads the register it then
+// writes — a single instruction on the emit side) and is exempt.
+func coalesceUsesSafe(f *ssa.Func, body map[ssa.BlockID]bool, latch *ssa.Block, phi, vDef *ssa.Value) bool {
+	vIdx := -1
+	for i, v2 := range latch.Values {
+		if v2 == vDef {
+			vIdx = i
+			break
+		}
+	}
+	if vIdx < 0 {
+		// V lives outside the latch; ordering of later-block reads
+		// relative to V's write is not established. Deny.
+		return false
+	}
+	for _, blk := range f.Blocks {
+		inBody := body[blk.ID]
+		for i, v2 := range blk.Values {
+			reads := false
+			for _, a := range v2.Args {
+				if a != nil && resolveCopy(a) == phi {
+					reads = true
+					break
+				}
+			}
+			if !reads || v2 == vDef {
+				continue
+			}
+			if !inBody {
+				return false // live-out of the loop
+			}
+			if v2.Op == ssa.OpPhi {
+				return false // edge-copy read at block end
+			}
+			if blk == latch && i >= vIdx {
+				return false // reads after V's write
+			}
+		}
+		if blk.Control != nil && resolveCopy(blk.Control) == phi {
+			if !inBody || blk == latch {
+				return false
+			}
+		}
+	}
+	return true
 }
