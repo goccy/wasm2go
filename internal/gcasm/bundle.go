@@ -40,6 +40,12 @@ type BuildStats struct {
 	// inline vs left as marshalled calls (no table entry for the op).
 	SimdSpliced int
 	SimdKept    int
+	// DirectAsm counts functions whose asm body came straight from
+	// the retained SSA (internal/asmgen) instead of the listing
+	// transform; DirectAsmFallback counts retained functions the
+	// direct emitter declined (they took the transform path).
+	DirectAsm         int
+	DirectAsmFallback int
 }
 
 // fnSym matches generated function symbols: fn0 (single-package,
@@ -249,12 +255,15 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		if modOffs != nil {
 			modOffs.Cfg = cfg
 		}
+		// Direct-asm bodies for this arch, emitted once and swapped in
+		// by buildPkg wherever the owning package's loop meets a name.
+		directBodies := buildDirectAsm(mod, cfg.DirectAsm, spec.name, modOffs, archStats)
 		for _, rel := range pkgList {
 			pfns := ac.byPkg[rel]
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, directBodies)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -562,6 +571,25 @@ func a64DispatchStub(sym, featSym, portSym, mirrorVar, argBytes string) string {
 		"\tJMP ·" + portSym + "(SB)\n"
 }
 
+// declSig renders the Go declaration signature shared by the plain
+// decl, the gated stub decls, and the direct-asm path. Packed
+// boundaries carry only the module pointer; their values ride the
+// per-module scratch.
+func declSig(rel, name string, declParams []wasm.ValType, hasRes bool, res ArgKind, synth map[string]SynthSig) string {
+	var sigB strings.Builder
+	fmt.Fprintf(&sigB, "(m %s", moduleTypeName(rel))
+	if ss, isSynth := synth[name]; !isSynth || !ss.Packed {
+		for i, p := range declParams {
+			fmt.Fprintf(&sigB, ", l%d %s", i, goTypeName(wasmKind(p)))
+		}
+	}
+	sigB.WriteString(")")
+	if hasRes {
+		fmt.Fprintf(&sigB, " (r0 %s)", goTypeName(res))
+	}
+	return sigB.String()
+}
+
 func buildPkg(
 	mod *wasm.Module,
 	importPath, rel string,
@@ -580,6 +608,7 @@ func buildPkg(
 	outlinedNames []string,
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
+	directBodies map[string][]byte,
 ) (map[string][]byte, error) {
 	selfPath := importPath
 	if rel != "" {
@@ -711,6 +740,17 @@ func buildPkg(
 			params, names, hasRes, res = fnKinds(idx)
 			declParams = mod.FuncTypeOf(idx).Params
 		}
+		// Direct-asm body: emitted straight from the retained SSA by
+		// internal/asmgen (see buildDirectAsm); replaces the listing
+		// transform for this function. The decl matches the
+		// transformed path's shape, so callers see no difference.
+		if dab := directBodies[name]; len(dab) > 0 {
+			asmB.Write(dab)
+			asmB.WriteString("\n")
+			stats.DirectAsm++
+			declFns.WriteString("func " + name + declSig(rel, name, declParams, hasRes, res, synth) + "\n")
+			continue
+		}
 		body, terr := arch.transform(f, TransformOptions{
 			SymName:     name,
 			CalleeSig:   calleeSig,
@@ -741,21 +781,7 @@ func buildPkg(
 			}
 			return nil, fmt.Errorf("transform %s: %w", f.Name, terr)
 		}
-		// Declaration signature, shared by the plain decl and the gated
-		// stub decls. Packed boundaries carry only the module pointer;
-		// their values ride the per-module scratch.
-		var sigB strings.Builder
-		fmt.Fprintf(&sigB, "(m %s", moduleTypeName(rel))
-		if ss, isSynth := synth[name]; !isSynth || !ss.Packed {
-			for i, p := range declParams {
-				fmt.Fprintf(&sigB, ", l%d %s", i, goTypeName(wasmKind(p)))
-			}
-		}
-		sigB.WriteString(")")
-		if hasRes {
-			fmt.Fprintf(&sigB, " (r0 %s)", goTypeName(res))
-		}
-		sig := sigB.String()
+		sig := declSig(rel, name, declParams, hasRes, res, synth)
 		_, isSynthFn := synth[name]
 		if arch.gatedMarker != "" && !isSynthFn &&
 			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {

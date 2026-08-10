@@ -158,6 +158,23 @@ type Options struct {
 	// gate it and validate with token-level equivalence instead of
 	// byte-equality probes.
 	FastMath bool
+	// DirectAsmFuncs names functions (post-rename FnN / fnN symbols,
+	// or outlined-loop names like Fn1016l13807) whose finalized SSA
+	// should be retained in Result.DirectAsmSSA for the asm bundle to
+	// emit directly via internal/asmgen instead of transforming the
+	// gc-captured listing. Retention is opt-in per function; a name
+	// the direct emitter cannot handle later falls back to the normal
+	// transform path, so listing a function here never breaks the
+	// build. Empty disables retention entirely.
+	DirectAsmFuncs []string
+}
+
+// DirectAsmFn is a function retained for direct-asm emission: its
+// finalized SSA (post optimization fixpoint, idiom rewrites, and
+// outlining) plus the wasm-typed signature the asm frame layout needs.
+type DirectAsmFn struct {
+	Fn  *ssa.Func
+	Sig wasm.FuncType
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.
@@ -195,6 +212,12 @@ type Result struct {
 	// letting the asm bundle transform its body like a translated
 	// function.
 	OutlinedSigs map[string]OutlinedSig
+	// DirectAsmSSA maps function names listed in Options.DirectAsmFuncs
+	// to their retained finalized SSA, for the asm bundle to emit via
+	// internal/asmgen. Names the translator never saw (or whose SSA is
+	// ineligible for retention, e.g. packed outlined boundaries) are
+	// simply absent.
+	DirectAsmSSA map[string]DirectAsmFn
 }
 
 // Translate parses helpers, walks the module, and emits Go source for
@@ -247,6 +270,20 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		helpers:      map[string]bool{},
 		sidecars:     map[string][]byte{},
 		multiPackage: autoMultiPackage,
+	}
+	if len(opts.DirectAsmFuncs) > 0 {
+		t.directAsmSet = make(map[string]bool, len(opts.DirectAsmFuncs))
+		for _, name := range opts.DirectAsmFuncs {
+			t.directAsmSet[name] = true
+		}
+		// Direct-asm bodies hardcode the Module.M field offset; the
+		// bundle verifies it against this probe's captured assembly
+		// before swapping any body in (SIMD modules emit the probe
+		// anyway — this covers scalar-only modules). A module with no
+		// memory has no M field to probe and no memory ops to verify.
+		if len(m.Memories) > 0 {
+			t.helpers["gcasmMemProbe"] = true
+		}
 	}
 	// SSA pipeline is always on; an unsupported wasm feature is a hard
 	// error from Translate (the legacy direct-opcode compiler is gone).
@@ -493,6 +530,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	res.FusedLoops = t.FusedLoops()
 	res.Outlined = t.outlinedByChunk
 	res.OutlinedSigs = t.outlinedSigs
+	res.DirectAsmSSA = t.directAsmSSA
 	if t.nrc2 != nil {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
 		res.Nrc2Companion = t.nrc2CompanionName()
@@ -781,6 +819,10 @@ type translator struct {
 	curOutlineFunc uint32
 	// outlinedSigs collects extraction signatures for Result.OutlinedSigs.
 	outlinedSigs map[string]OutlinedSig
+	// directAsmSet is the Options.DirectAsmFuncs opt-in as a set;
+	// directAsmSSA collects the retained SSA for Result.DirectAsmSSA.
+	directAsmSet map[string]bool
+	directAsmSSA map[string]DirectAsmFn
 
 	// multiPackage records the auto-derived decision to emit the
 	// chunked, linkname-split layout. Set in Translate based on the
@@ -2884,6 +2926,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	if err := ssa.Verify(ssaFn); err != nil {
 		return nil, fmt.Errorf("%w: post-opt verify: %w", lower.ErrSSAUnsupported, err)
 	}
+	t.retainDirectAsm(ssaFn, t.mod.Types[fn.TypeIdx])
 	body, err := newSSAEmitter(t).emitFuncBody(ssaFn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: emit: %w", lower.ErrSSAUnsupported, err)

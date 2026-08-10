@@ -103,6 +103,14 @@ func (t *translator) emitOutlinedDecls() ([]ast.Decl, error) {
 	var out []ast.Decl
 	for _, of := range t.pendingOutlined {
 		g := of.Fn
+		// Direct-asm retention: only unpacked scalar boundaries — the
+		// packed form's prologue reads the per-module scratch, which
+		// the direct emitter does not produce.
+		if !of.Packed {
+			if ft, ok := outlinedWasmSig(g.Sig); ok {
+				t.retainDirectAsm(g, ft)
+			}
+		}
 		em := newSSAEmitter(t)
 		if of.Packed {
 			// Prologue goes through the emitter pre-scalarize so v128

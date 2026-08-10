@@ -34,6 +34,11 @@ type Config struct {
 	// iteration steps a fused loop's fast lane emits per branch.
 	// 0 or 1 means no in-splice unrolling; 2..8 unroll.
 	FuseLoopUnroll int
+	// DirectAsm maps function names to the finalized SSA the
+	// translator retained for direct emission via internal/asmgen;
+	// those functions' asm bodies replace the listing transform per
+	// architecture (see buildDirectAsm). Nil disables the path.
+	DirectAsm map[string]DirectAsmFn
 }
 
 // ModuleOffsets are the *Module field offsets the memory-op splices

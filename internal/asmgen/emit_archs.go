@@ -8,6 +8,11 @@ import (
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
+// ModuleMOffset is the exported alias of moduleMOffset for hosts that
+// must verify a generated Module struct's layout against the offset
+// the emitters hardcode before embedding asmgen bodies.
+const ModuleMOffset = moduleMOffset
+
 // moduleMOffset is the byte offset of the Module.M field
 // (unsafe.Pointer cache of &Memory[0]) within the *Module struct.
 // The codegen translator emits Module as `{ memory []byte; maxMem

@@ -90,6 +90,14 @@ type FuncOptions struct {
 	// caller-side BX clobber that comes with it. ComputeGlobalOffsets
 	// produces a slice with the layout this field expects.
 	GlobalOffsets []int
+	// ForbidCalls makes emission fail for any function that would
+	// CALL another symbol (helpers, direct/indirect/import callees,
+	// memory ops, global wrappers). Hosts that embed asmgen bodies
+	// into a bundle whose callee symbols asmgen cannot resolve (e.g.
+	// the gcasm bundle's per-chunk wrapper scheme) set this so such
+	// functions fall back to the host's own backend instead of
+	// emitting asm that fails to link.
+	ForbidCalls bool
 }
 
 // arch abstracts the per-architecture pieces of asm emission so the
@@ -264,6 +272,9 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	plan, err := planFunc(f, opts, sig, a.CallArgBias(), constsNeedSlot)
 	if err != nil {
 		return "", "", fmt.Errorf("%s: %w", name, err)
+	}
+	if opts.ForbidCalls && plan.hasCall {
+		return "", "", fmt.Errorf("%s: function calls out and ForbidCalls is set", name)
 	}
 	plan.gpRegPool = a.GPRegPool()
 	plan.sseRegPool = a.SSERegPool()
