@@ -2849,33 +2849,29 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// ~2% tg regression (the emptied NaN-select diamonds kept
 	// evaluating their conditions), and folding them flips it to a
 	// measured ~1% gain on the llama module.
-	// The whole f16 store-side idiom chain is wasm32-only: the fused
-	// cvt+store helper takes an i32 address, and the intermediate
-	// packed-conversion forms assume the wasm32 scalarized-v128 typing.
-	// A memory64 module keeps the plain idiom code — its SIMD memory
-	// ops run as m64 helper calls without splicing anyway, so the
-	// rewrite would buy nothing there.
-	if !t.mod.Memory64() {
-		if pass.RecognizeF16Store(ssaFn) {
-			pass.DCE(ssaFn)
-		}
-		// Idiom rewrites above delete the phis that justified their branch
-		// diamonds; fold the emptied control structure so the conditions
-		// die too. Fixpoint with DCE: an inner fold empties the enclosing
-		// arm for the next round.
-		for pass.FoldEmptyDiamonds(ssaFn) {
-			pass.DCE(ssaFn)
-		}
-		// With the diamonds gone the packed store groups sit on straight
-		// lines; collapse each into one 64-bit store of the packed word,
-		// then fuse the conversion INTO the store so both ride inside the
-		// fused region (no vector -> GPR-pair round trip at the boundary).
-		if pass.MergeF16Stores(ssaFn) {
-			pass.DCE(ssaFn)
-		}
-		if pass.FuseF16CvtStores(ssaFn) {
-			pass.DCE(ssaFn)
-		}
+	// The f16 store-side idiom chain runs at both pointer widths: the
+	// value-side recognition and diamond folding are width-neutral,
+	// the store-merge walks Add64 chains, and the fused cvt+store op
+	// takes the module's own address width (simd_m64_* on memory64).
+	if pass.RecognizeF16Store(ssaFn) {
+		pass.DCE(ssaFn)
+	}
+	// Idiom rewrites above delete the phis that justified their branch
+	// diamonds; fold the emptied control structure so the conditions
+	// die too. Fixpoint with DCE: an inner fold empties the enclosing
+	// arm for the next round.
+	for pass.FoldEmptyDiamonds(ssaFn) {
+		pass.DCE(ssaFn)
+	}
+	// With the diamonds gone the packed store groups sit on straight
+	// lines; collapse each into one 64-bit store of the packed word,
+	// then fuse the conversion INTO the store so both ride inside the
+	// fused region (no vector -> GPR-pair round trip at the boundary).
+	if pass.MergeF16Stores(ssaFn) {
+		pass.DCE(ssaFn)
+	}
+	if pass.FuseF16CvtStores(ssaFn, t.mod.Memory64()) {
+		pass.DCE(ssaFn)
 	}
 	ssa.Compact(ssaFn)
 	t.curOutlineFunc = funcIdx

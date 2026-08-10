@@ -2131,6 +2131,8 @@ var (
 	_ = simd_m64_scalar_f32_load
 	_ = simd_m64_scalar_i32_shl
 	_ = simd_m64_scalar_i32_add
+	_ = simd_m64_v128_f16x4_cvt_store
+	_ = simd_p_m64_v128_f16x4_cvt_store
 )
 
 //go:noinline
@@ -2765,6 +2767,41 @@ func simd_m64_v128_store(m *Module, addr int64, offset int64, v [2]uint64) int32
 	*(*uint64)(p) = v[0]
 	*(*uint64)(unsafe.Add(p, 8)) = v[1]
 	return 0
+}
+
+//go:noinline
+func simd_m64_v128_f16x4_cvt_store(m *Module, addr int64, offset int64, v [2]uint64) int32 {
+	// Memory64 twin of simd_v128_f16x4_cvt_store: identical packed
+	// f32->f16 conversion (bias/multiply rounding, NaN forced to
+	// sign|0x7E00), i64 addressing.
+	ea := simdEA64(m, addr, offset, 8)
+	var out uint64
+	for i := 0; i < 4; i++ {
+		w := uint32(v[i/2] >> (32 * uint(i) % 64))
+		shl1w := w + w
+		sign := w & 0x80000000
+		var h uint32
+		if shl1w > 0xFF000000 { // NaN
+			h = (sign >> 16) | 0x7E00
+		} else {
+			bias := shl1w & 0xFF000000
+			if bias < 0x71000000 {
+				bias = 0x71000000
+			}
+			f := math.Float32frombits(w&0x7FFFFFFF) * 0x1p+112 * 0x1p-110
+			f += math.Float32frombits((bias >> 1) + 0x07800000)
+			fbits := math.Float32bits(f)
+			h = (sign >> 16) | (fbits>>13)&0x7C00 + fbits&0xFFF
+		}
+		out |= uint64(uint16(h)) << (16 * uint(i))
+	}
+	*(*uint64)(unsafe.Add(m.M, uintptr(ea))) = out
+	return 0
+}
+
+//go:noinline
+func simd_p_m64_v128_f16x4_cvt_store(m *Module, addr int64, offset int64, v0, v1 uint64) int32 {
+	return simd_m64_v128_f16x4_cvt_store(m, addr, offset, [2]uint64{v0, v1})
 }
 
 //go:noinline
