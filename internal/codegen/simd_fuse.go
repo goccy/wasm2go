@@ -955,6 +955,27 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				}
 			}
 		}
+		// Opaque scalar arguments deduplicate by structural key:
+		// identical expressions across candidates share one slot,
+		// exactly like identical identifiers do. Sound because every
+		// scalar evaluates once at the fused call (side-effecting
+		// values were hoisted into named locals long before this
+		// point, so these expressions are pure), and noteRead records
+		// every contained identifier for the same interference checks
+		// either way. Address forms like `base + stride` recur once
+		// per load in conversion loops; without the dedup each
+		// occurrence burned its own int slot and pushed wide windows
+		// over the cap.
+		exprKey := ""
+		if _, isID := a.(*ast.Ident); !isID {
+			exprKey = "e:" + exprKeyString(a)
+			if idx, ok := fb.scalarDedup[exprKey]; ok {
+				nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: idx})
+				fmt.Fprintf(&fb.key, "s%d,", idx)
+				fb.noteRead(a)
+				continue
+			}
+		}
 		if 1+len(fb.scalars)+1 > fusedMaxIntRegs {
 			if fb.failWhy == "" {
 				fb.failWhy = "int cap (scalar)"
@@ -963,11 +984,13 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 		nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: len(fb.scalars)})
 		fmt.Fprintf(&fb.key, "s%d,", len(fb.scalars))
+		if fb.scalarDedup == nil {
+			fb.scalarDedup = map[string]int{}
+		}
 		if id, ok := a.(*ast.Ident); ok {
-			if fb.scalarDedup == nil {
-				fb.scalarDedup = map[string]int{}
-			}
 			fb.scalarDedup[id.Name] = len(fb.scalars)
+		} else if exprKey != "" {
+			fb.scalarDedup[exprKey] = len(fb.scalars)
 		}
 		fb.scalars = append(fb.scalars, a)
 		fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
