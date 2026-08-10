@@ -96,6 +96,15 @@ type FuncOptions struct {
 	// slot-only mode (no register homes, no m-cache, no loop-carry
 	// coalesce) because splice bodies clobber registers freely.
 	Splicer SimdSplicer
+	// PackedParams, when non-nil, marks the packed outlined-boundary
+	// form: the Go-side signature carries only the module pointer and
+	// the parameter VALUES ride the Module's outline-pack scratch
+	// (one uint64 word per scalar, two per v128), in the order given
+	// here. The emitter loads them into the params' frame slots in a
+	// prologue, and parameter reads resolve to those slots instead of
+	// FP offsets. The sig passed to EmitFunc* must then be
+	// results-only.
+	PackedParams []ssa.Type
 	// ForbidCalls makes emission fail for any function that would
 	// CALL another symbol (helpers, direct/indirect/import callees,
 	// memory ops, global wrappers). Hosts that embed asmgen bodies
@@ -138,6 +147,9 @@ type arch interface {
 	EmitReturn(b *strings.Builder, blk *ssa.Block, sig wasm.FuncType, plan *funcPlan, frame argFrame) error
 	// EmitUnreachable emits a deliberate trap (UD2 / UNDEF).
 	EmitUnreachable(b *strings.Builder)
+	// EmitPackedPrologue loads a packed boundary's parameter values
+	// from the Module's outline-pack scratch into their frame slots.
+	EmitPackedPrologue(b *strings.Builder, f *ssa.Func, plan *funcPlan) error
 	// EmitBrTable emits a BlockBrTable dispatch: materialize the i32
 	// selector once, compare it against each case list's values
 	// branching to that successor's label, and fall to defaultLabel.
@@ -280,7 +292,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 		return "", "", fmt.Errorf("%s: %w", name, err)
 	}
 	if opts.ForbidCalls && plan.hasNonSimdCall {
-		return "", "", fmt.Errorf("%s: function calls out and ForbidCalls is set", name)
+		return "", "", fmt.Errorf("%s: function calls out (%s) and ForbidCalls is set", name, plan.firstCallDesc)
 	}
 	plan.gpRegPool = a.GPRegPool()
 	plan.sseRegPool = a.SSERegPool()
@@ -431,6 +443,18 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	// this same MOV after each opEmitsCall site.
 	if plan.mCacheReg != "" {
 		a.EmitMCachePrime(&b, plan.mCacheReg)
+	}
+
+	// Packed boundary: load the parameter values from the Module's
+	// outline-pack scratch into their frame slots before any block
+	// runs.
+	if plan.packed {
+		if len(sig.Params) != 0 {
+			return "", "", fmt.Errorf("%s: packed emission requires a results-only signature", name)
+		}
+		if err := a.EmitPackedPrologue(&b, f, plan); err != nil {
+			return "", "", fmt.Errorf("%s: packed prologue: %w", name, err)
+		}
 	}
 
 	// Per-block fall-through label. `f.Blocks[i+1]`'s label
@@ -1977,6 +2001,11 @@ type funcPlan struct {
 	spliceMode    bool
 	wantsTrapStub bool
 	splicer       SimdSplicer
+	// packed / packedParams mirror FuncOptions.PackedParams: the
+	// packed outlined-boundary form whose parameter values live in
+	// frame slots filled by the pack prologue rather than FP offsets.
+	packed       bool
+	packedParams []ssa.Type
 	// mustSplice marks SIMD call values inside register-coalesced
 	// loops: their inline splice is load-bearing (a fallback CALL
 	// would clobber the carry registers), so a splice-table miss
@@ -1988,11 +2017,14 @@ type funcPlan struct {
 	// helper symbols ship with every SIMD-using bundle, so their
 	// CALLs stay allowed under ForbidCalls.
 	hasNonSimdCall bool
-	frameSize      int
-	calleeArea     int // bytes reserved at low SP for callee-arg staging
-	helperPfx      string
-	helperRefs     map[ssa.ValueID]string
-	directs        map[ssa.ValueID]*directCall
+	// firstCallDesc names the first non-SIMD callee planFunc saw, for
+	// the ForbidCalls diagnostic ("which call made this fall back").
+	firstCallDesc string
+	frameSize     int
+	calleeArea    int // bytes reserved at low SP for callee-arg staging
+	helperPfx     string
+	helperRefs    map[ssa.ValueID]string
+	directs       map[ssa.ValueID]*directCall
 	// hasMem records whether the function performs at least one
 	// load / store / mem-size / mem-grow op. Drives the
 	// `mCacheCandidate` decision — only memory-touching functions
@@ -2123,6 +2155,19 @@ type globalInlineInfo struct {
 // real reader runs, producing a stale-data read at the consumer.
 // resolveSlotArg honours the flag at use-tracking time so the same
 // allocator code path works for both archs.
+// noteNonSimdCall records a non-SIMD callee for the ForbidCalls
+// diagnostic and sets the flag.
+func (p *funcPlan) noteNonSimdCall(v *ssa.Value) {
+	p.hasNonSimdCall = true
+	if p.firstCallDesc == "" {
+		aux, _ := v.Aux.(string)
+		if aux == "" {
+			aux = fmt.Sprintf("aux=%v", v.Aux)
+		}
+		p.firstCallDesc = fmt.Sprintf("%v %s", v.Op, aux)
+	}
+}
+
 func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int, constsNeedSlot bool) (*funcPlan, error) {
 	p := &funcPlan{
 		offsets:         map[ssa.ValueID]int{},
@@ -2142,6 +2187,8 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 		unusedResult:    map[ssa.ValueID]bool{},
 	}
 	p.mem64 = opts.Module != nil && opts.Module.Memory64()
+	p.packed = opts.PackedParams != nil
+	p.packedParams = opts.PackedParams
 
 	// Pass 1: scan calls (helper + direct), compute the max
 	// callee-arg/ret frame, resolve each direct call's symbol,
@@ -2164,13 +2211,19 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 			}
 			switch v.Op {
 			case ssa.OpHelperCall:
-				p.hasCall = true
-				p.hasNonSimdCall = true
 				name, ok := v.Aux.(string)
 				if !ok {
 					return nil, fmt.Errorf("OpHelperCall v%d has non-string Aux", v.ID)
 				}
 				p.helperRefs[v.ID] = name
+				if helperAlwaysInline(name) {
+					// Both arches emit these as one or two native
+					// instructions — no CALL, no callee frame, and
+					// no ForbidCalls consequence.
+					break
+				}
+				p.hasCall = true
+				p.noteNonSimdCall(v)
 				spec, ok := helperSig(name)
 				if !ok {
 					return nil, fmt.Errorf("OpHelperCall v%d: unknown helper %q", v.ID, name)
@@ -2180,7 +2233,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallDirect:
 				p.hasCall = true
-				p.hasNonSimdCall = true
+				p.noteNonSimdCall(v)
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallDirect v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2206,7 +2259,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallImport:
 				p.hasCall = true
-				p.hasNonSimdCall = true
+				p.noteNonSimdCall(v)
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallImport v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2235,7 +2288,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallIndirect:
 				p.hasCall = true
-				p.hasNonSimdCall = true
+				p.noteNonSimdCall(v)
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallIndirect v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2287,7 +2340,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				// logic. In multi-package mode the helpers live in
 				// base/ and are capitalized for cross-package use.
 				p.hasCall = true
-				p.hasNonSimdCall = true
+				p.noteNonSimdCall(v)
 				var csig wasm.FuncType
 				helperName := ""
 				switch v.Op {
@@ -2362,7 +2415,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 					break
 				}
 				p.hasCall = true
-				p.hasNonSimdCall = true
+				p.noteNonSimdCall(v)
 				var csig wasm.FuncType
 				var sym string
 				if v.Op == ssa.OpGlobalGet {
@@ -2662,6 +2715,11 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 			// where amd64 inlines them (no large-imm ALU on arm64).
 			opEligible := true
 			switch v.Op {
+			// OpParam: FP-resident normally (slot unread), but the
+			// packed prologue writes the slot and every read uses it;
+			// reuse would clobber the parameter. Dedicated always.
+			case ssa.OpParam:
+				opEligible = false
 			case ssa.OpPhi, ssa.OpHelperCall,
 				ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
 				ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,

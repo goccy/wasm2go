@@ -74,17 +74,14 @@ func simdABISize(t ssa.Type) (size, align int) {
 
 // simdCallSpecOf derives the call spec from the SSA value. Errors are
 // per-function fallback triggers, not bundle failures: an arg type
-// the frame cannot carry, a missing Aux name, or a helper prefix the
-// CALL spelling cannot reach (multi-package helpers are capitalized
-// and live in base; the local `·name(SB)` form only resolves in
-// single-package output).
+// the frame cannot carry or a missing Aux name. Whether the CALL
+// spelling can resolve is a call-time question — spliced sites need
+// no symbol at all, so multi-package functions stay eligible as long
+// as every SIMD site splices (the emitters enforce this).
 func simdCallSpecOf(v *ssa.Value, plan *funcPlan) (simdCallSpec, error) {
 	name, _ := v.Aux.(string)
 	if name == "" {
 		return simdCallSpec{}, fmt.Errorf("v%d: %v without a helper name", v.ID, v.Op)
-	}
-	if plan.helperPfx != "" {
-		return simdCallSpec{}, fmt.Errorf("v%d: SIMD helper %s: cross-package helper calls not supported", v.ID, name)
 	}
 	sp := simdCallSpec{name: name, withM: v.Op == ssa.OpSimdMemCall}
 	off := 0
@@ -126,7 +123,7 @@ func simdCallSpecOf(v *ssa.Value, plan *funcPlan) (simdCallSpec, error) {
 // slot path covers them.
 func v128Parts(v *ssa.Value, plan *funcPlan, frame argFrame, spName string) (lo, hi string) {
 	v = resolveCopy(v)
-	if v.Op == ssa.OpParam {
+	if v.Op == ssa.OpParam && !plan.packed {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			base := frame.paramOffsets[idx]

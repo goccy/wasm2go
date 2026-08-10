@@ -172,9 +172,16 @@ type Options struct {
 // DirectAsmFn is a function retained for direct-asm emission: its
 // finalized SSA (post optimization fixpoint, idiom rewrites, and
 // outlining) plus the wasm-typed signature the asm frame layout needs.
+// Packed marks the outlined packed-boundary form: the Go-side
+// signature carries only the module pointer (Sig is then
+// results-only) and the parameter values ride the Module's
+// outline-pack scratch, PackedParams giving their SSA types in slot
+// order (v128 = two slots).
 type DirectAsmFn struct {
-	Fn  *ssa.Func
-	Sig wasm.FuncType
+	Fn           *ssa.Func
+	Sig          wasm.FuncType
+	Packed       bool
+	PackedParams []ssa.Type
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.

@@ -151,6 +151,22 @@ var helperSigs = map[string]helperSpec{
 	"wasm_trap_invalid_conv": {nil, ssa.TypeInvalid},
 }
 
+// helperAlwaysInline names the helpers BOTH per-arch emitters lower
+// to one or two native instructions with no CALL: the sign/zero
+// extends, the 32-bit float/int reinterprets, and f32_abs. planFunc
+// exempts them from hasCall (they impose no callee frame and no
+// ForbidCalls consequence); each arch's emit path must keep inline
+// coverage for exactly this set.
+func helperAlwaysInline(name string) bool {
+	switch name {
+	case "i64_extend_i32_s", "i64_extend_i32_u", "i64_extend32_s",
+		"i32_reinterpret_f32", "f32_reinterpret_i32",
+		"f32_abs":
+		return true
+	}
+	return false
+}
+
 func helperSig(name string) (helperSpec, bool) {
 	s, ok := helperSigs[name]
 	return s, ok

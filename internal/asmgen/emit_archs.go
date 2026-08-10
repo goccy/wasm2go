@@ -258,6 +258,8 @@ func (archAMD64) SkipValue(v *ssa.Value) bool {
 	// Pure-Go's compiler skips the equivalent spill the same way.
 	// Slot reuse may hand this OpParam's slot to a later value;
 	// that value's first store is the slot's first live writer.
+	// (Packed mode changes nothing here: the pack prologue is the
+	// materialization, so the per-value emit stays skipped.)
 	if v.Op == ssa.OpParam {
 		return true
 	}
@@ -657,7 +659,7 @@ func operandSrc32(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) st
 	if v.Op == ssa.OpConst32 {
 		return fmt.Sprintf("$%d", int32(v.AuxInt))
 	}
-	if v.Op == ssa.OpParam {
+	if v.Op == ssa.OpParam && !plan.packed {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
@@ -681,7 +683,7 @@ func operandSrc64(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) st
 			return fmt.Sprintf("$%d", c)
 		}
 	}
-	if v.Op == ssa.OpParam {
+	if v.Op == ssa.OpParam && !plan.packed {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
@@ -701,7 +703,7 @@ func operandSrc64(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) st
 // emission on for archs where SkipValue(OpConst32) returns false.
 func operandSrc32ARM64(v *ssa.Value, plan *funcPlan, frame argFrame) string {
 	v = resolveCopy(v)
-	if v.Op == ssa.OpParam {
+	if v.Op == ssa.OpParam && !plan.packed {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
@@ -720,7 +722,7 @@ func operandSrc32ARM64(v *ssa.Value, plan *funcPlan, frame argFrame) string {
 
 func operandSrc64ARM64(v *ssa.Value, plan *funcPlan, frame argFrame) string {
 	v = resolveCopy(v)
-	if v.Op == ssa.OpParam {
+	if v.Op == ssa.OpParam && !plan.packed {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
@@ -738,7 +740,7 @@ func operandSrc64ARM64(v *ssa.Value, plan *funcPlan, frame argFrame) string {
 // OpConstF32/F64 (those still allocate a slot).
 func operandSrcFloat(v *ssa.Value, plan *funcPlan, frame argFrame, spReg string) string {
 	v = resolveCopy(v)
-	if v.Op == ssa.OpParam {
+	if v.Op == ssa.OpParam && !plan.packed {
 		idx := int(v.AuxInt)
 		if idx >= 0 && idx < len(frame.paramOffsets) {
 			return fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])
@@ -1250,6 +1252,12 @@ func emitHelperCall(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 	} else if done {
 		return nil
 	}
+	if helperAlwaysInline(name) {
+		// planFunc exempted this call from the callee-frame budget on
+		// the strength of the inline lowering above; reaching the
+		// CALL path would clobber a frame that was never reserved.
+		return fmt.Errorf("helper %q: inline lowering missing", name)
+	}
 	// Stage each arg at its callee-frame offset.
 	off := 0
 	for i, arg := range v.Args {
@@ -1343,6 +1351,12 @@ func emitSimdCallAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 	}
 	if done, err := trySpliceSimdCall(b, v, &sp, plan, frame, "SP", 0); err != nil || done {
 		return err
+	}
+	// The CALL fallback spells the helper as a same-package symbol,
+	// which only resolves in single-package output. Multi-package
+	// functions must splice every SIMD site or fall back wholesale.
+	if plan.helperPfx != "" {
+		return fmt.Errorf("%s: SIMD helper CALL cannot resolve cross-package", sp.name)
 	}
 	if sp.withM {
 		if plan.mCacheReg != "" {

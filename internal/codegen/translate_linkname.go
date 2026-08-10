@@ -304,7 +304,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 
 	t.reportMemMetrics()
 	t.appendSimdHelperFiles(files)
-	res := Result{Files: files, Sidecars: sidecars, FusedSimd: t.FusedTrees(), FusedLoops: t.FusedLoops(), Outlined: t.outlinedByChunk, OutlinedSigs: t.outlinedSigs}
+	res := Result{Files: files, Sidecars: sidecars, FusedSimd: t.FusedTrees(), FusedLoops: t.FusedLoops(), Outlined: t.outlinedByChunk, OutlinedSigs: t.outlinedSigs, DirectAsmSSA: t.directAsmSSA}
 	if t.nrc2 != nil {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
 		res.Nrc2Companion = t.nrc2CompanionName()

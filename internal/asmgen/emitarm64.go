@@ -998,6 +998,11 @@ func emitSimdCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 	if done, err := trySpliceSimdCall(b, v, &sp, plan, frame, "RSP", bias); err != nil || done {
 		return err
 	}
+	// See the amd64 twin: the CALL fallback only resolves in
+	// single-package output.
+	if plan.helperPfx != "" {
+		return fmt.Errorf("%s: SIMD helper CALL cannot resolve cross-package", sp.name)
+	}
 	if sp.withM {
 		if plan.mCacheReg != "" {
 			fmt.Fprintf(b, "\tMOVD %s, %d(RSP)\n", plan.mCacheReg, bias+0)
@@ -1060,8 +1065,72 @@ func emitSimdCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 	return nil
 }
 
+// emitInlineHelperARM64 lowers the helperAlwaysInline set natively —
+// no CALL, no ABI bridge. Results honor plan.regHome (OpHelperCall is
+// regHome-eligible on arm64) or land in the value's slot.
+func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame, name string) (bool, error) {
+	dst := plan.offsets[v.ID]
+	home := plan.regHome[v.ID]
+	// storeGP writes the result in R0 to its destination.
+	storeGP := func(mn string) {
+		if home != "" {
+			fmt.Fprintf(b, "\t%s R0, %s\n", mn, home)
+		} else {
+			fmt.Fprintf(b, "\t%s R0, %d(RSP)\n", mn, dst)
+		}
+	}
+	storeF := func() {
+		if home != "" {
+			fmt.Fprintf(b, "\tFMOVS F0, %s\n", home)
+		} else {
+			fmt.Fprintf(b, "\tFMOVS F0, %d(RSP)\n", dst)
+		}
+	}
+	switch name {
+	case "i64_extend_i32_s":
+		// MOVW sign-extends the low 32 bits into the full register.
+		fmt.Fprintf(b, "\tMOVW %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		storeGP("MOVD")
+		return true, nil
+	case "i64_extend_i32_u":
+		fmt.Fprintf(b, "\tMOVWU %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		storeGP("MOVD")
+		return true, nil
+	case "i64_extend32_s":
+		fmt.Fprintf(b, "\tMOVD %s, R0\n", operandSrc64ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tSXTW R0, R0\n")
+		storeGP("MOVD")
+		return true, nil
+	case "i32_reinterpret_f32":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFMOVS F0, R0\n")
+		storeGP("MOVW")
+		return true, nil
+	case "f32_reinterpret_i32":
+		fmt.Fprintf(b, "\tMOVW %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tFMOVS R0, F0\n")
+		storeF()
+		return true, nil
+	case "f32_abs":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFABSS F0, F0\n")
+		storeF()
+		return true, nil
+	}
+	return false, nil
+}
+
 func emitHelperCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
 	name := plan.helperRefs[v.ID]
+	if done, err := emitInlineHelperARM64(b, v, plan, frame, name); done || err != nil {
+		return err
+	}
+	if helperAlwaysInline(name) {
+		// planFunc exempted this call from the callee-frame budget on
+		// the strength of the inline lowering above; reaching the
+		// CALL path would clobber a frame that was never reserved.
+		return fmt.Errorf("helper %q: inline lowering missing", name)
+	}
 	spec, ok := helperSig(name)
 	if !ok {
 		return fmt.Errorf("unknown helper %q", name)

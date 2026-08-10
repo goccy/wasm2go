@@ -109,7 +109,7 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		if directAsm == nil {
 			directAsm = map[string]gcasm.DirectAsmFn{}
 		}
-		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig}
+		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
 	}
 	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
 		FastMath:       opts.FastMath,

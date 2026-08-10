@@ -18,13 +18,48 @@ import (
 // FnN functions the module's own type, for outlined functions the
 // synthetic boundary signature.
 func (t *translator) retainDirectAsm(ssaFn *ssa.Func, sig wasm.FuncType) {
+	t.retainDirectAsmFn(ssaFn.Name, DirectAsmFn{Fn: ssaFn, Sig: sig})
+}
+
+// retainDirectAsmPacked is the packed-boundary variant: the wasm sig
+// is results-only (the caller passes just m) and the parameter types
+// ride along for the pack prologue. A boundary type outside the
+// scalar/v128 set is not retainable.
+func (t *translator) retainDirectAsmPacked(ssaFn *ssa.Func) {
 	if !t.directAsmSet[ssaFn.Name] {
+		return
+	}
+	var ft wasm.FuncType
+	for _, r := range ssaFn.Sig.Results {
+		vt, ok := ssaValType(r)
+		if !ok || vt == wasm.ValV128 {
+			return
+		}
+		ft.Results = append(ft.Results, vt)
+	}
+	for _, p := range ssaFn.Sig.Params {
+		switch p {
+		case ssa.TypeI32, ssa.TypeI64, ssa.TypeF32, ssa.TypeF64, ssa.TypeV128:
+		default:
+			return
+		}
+	}
+	t.retainDirectAsmFn(ssaFn.Name, DirectAsmFn{
+		Fn:           ssaFn,
+		Sig:          ft,
+		Packed:       true,
+		PackedParams: append([]ssa.Type(nil), ssaFn.Sig.Params...),
+	})
+}
+
+func (t *translator) retainDirectAsmFn(name string, df DirectAsmFn) {
+	if !t.directAsmSet[name] {
 		return
 	}
 	if t.directAsmSSA == nil {
 		t.directAsmSSA = map[string]DirectAsmFn{}
 	}
-	t.directAsmSSA[ssaFn.Name] = DirectAsmFn{Fn: ssaFn, Sig: sig}
+	t.directAsmSSA[name] = df
 }
 
 // outlinedWasmSig converts an outlined function's SSA signature into

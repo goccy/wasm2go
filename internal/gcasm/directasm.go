@@ -19,6 +19,11 @@ import (
 type DirectAsmFn struct {
 	Fn  *ssa.Func
 	Sig wasm.FuncType
+	// Packed / PackedParams mirror the codegen retention: the packed
+	// outlined-boundary form whose parameter values ride the Module's
+	// outline-pack scratch (Sig is then results-only).
+	Packed       bool
+	PackedParams []ssa.Type
 }
 
 // emitDirectAsmBody emits one retained function's asm for the given
@@ -35,7 +40,7 @@ type DirectAsmFn struct {
 // from asmgen's same-package CALL spelling yet, and a body that
 // emits but fails to link would break the build instead of falling
 // back.
-func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, modOffs *ModuleOffsets, pool *ConstPool, stats *BuildStats) (string, bool) {
+func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, modOffs *ModuleOffsets, pool *ConstPool, importPath, rel string, calleeSig calleeResolver, stats *BuildStats) (string, bool) {
 	if len(mod.Memories) > 0 && (modOffs == nil || modOffs.M != asmgen.ModuleMOffset) {
 		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: Module layout unverified (probe %v)\n",
 			archName, name, modOffs)
@@ -43,9 +48,32 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	}
 	emit := asmgen.EmitFuncAMD64
 	opts := asmgen.FuncOptions{Module: mod, ForbidCalls: true}
+	if df.Packed {
+		opts.PackedParams = df.PackedParams
+	}
+	if rel != "" {
+		// Multi-package chunk: same-package helper CALL spellings do
+		// not resolve here. Setting the prefix makes the emitters
+		// fail any SIMD site that does not splice (per-function
+		// fallback) instead of emitting an unresolvable CALL.
+		opts.HelperPrefix = "base"
+	}
 	if archName == "arm64" {
+		// The out-of-bounds trap CALL target for spliced memory ops,
+		// resolved through the same machinery the listing transform
+		// uses (registering a chunk-local forward wrapper when the
+		// helper lives in base). Unresolved → the splicer refuses
+		// memory splices rather than emit a dangling branch.
+		trapQualified := importPath + ".wasm_trap_simd_oob"
+		if rel != "" {
+			trapQualified = importPath + "/base.Wasm_trap_simd_oob"
+		}
+		trapSym := ""
+		if _, _, _, localSym, ok := calleeSig(trapQualified); ok {
+			trapSym = localSym
+		}
 		emit = asmgen.EmitFuncARM64
-		opts.Splicer = &directAsmSplicer{pool: pool, offs: modOffs}
+		opts.Splicer = &directAsmSplicer{pool: pool, offs: modOffs, trapSym: trapSym}
 	}
 	asm, _, err := emit(name, df.Sig, df.Fn, opts)
 	if err != nil {
@@ -68,14 +96,23 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 type directAsmSplicer struct {
 	pool *ConstPool
 	offs *ModuleOffsets
+	// trapSym is the resolved local CALL target of the out-of-bounds
+	// trap helper ("·wasm_trap_simd_oob" single-package, a forward
+	// wrapper symbol in chunks). Empty when unresolved — memory
+	// splices are then refused.
+	trapSym string
 }
+
+// calleeResolver is buildPkg's callee-resolution closure: qualified
+// symbol → (param kinds, has-result, result kind, local asm symbol,
+// ok), registering cross-package forward wrappers as a side effect.
+type calleeResolver func(sym string) ([]ArgKind, bool, ArgKind, string, bool)
 
 // TrapStub returns the shared out-of-bounds stub the memory splices
 // branch to. The trap helper panics, so control never returns; the
-// RET only satisfies the assembler. Single-package bundles spell the
-// helper lowercase (multi-package emission is rejected upstream).
+// RET only satisfies the assembler.
 func (s *directAsmSplicer) TrapStub() string {
-	return a64SimdMemTrapLabel + ":\n\tCALL ·wasm_trap_simd_oob(SB)\n\tRET\n"
+	return a64SimdMemTrapLabel + ":\n\tCALL " + s.trapSym + "(SB)\n\tRET\n"
 }
 
 // spliceArgKind maps an asmgen operand to the ABI ArgKind the
@@ -149,6 +186,12 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 	}
 	ok, trap := a64SpliceSimd(&tmp, name, cargs, cres, hasRes, scratchBase, s.pool, s.offs)
 	if !ok {
+		return false, false
+	}
+	if trap && s.trapSym == "" {
+		// A memory splice needs the trap stub, but the trap helper
+		// did not resolve in this package. Discard the staging and
+		// keep the CALL path (or the per-function fallback).
 		return false, false
 	}
 	if hasRes {
