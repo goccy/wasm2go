@@ -52,7 +52,7 @@ func (t *translator) maybeOutline(ssaFn *ssa.Func) error {
 	}
 	outs, err := ssa.OutlineLoops(ssaFn, func(h ssa.BlockID) string {
 		return fmt.Sprintf("%sl%d", ssaFn.Name, h)
-	}, min)
+	}, min, t.mod.Memory64())
 	if err != nil {
 		return err
 	}
