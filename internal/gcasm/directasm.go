@@ -132,6 +132,10 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		// parity gate).
 		asm = a64ForwardSimdSlots(asm)
 		asm = a64SpliceValueCache(asm)
+		asm = a64DeadSimdOutStores(asm)
+	}
+	if archName == "arm64" {
+		asm = a64ScalarSlotForward(asm)
 	}
 	// The marker line identifies direct-asm bodies in the bundle
 	// (tests and humans reading the .s both key off it).
