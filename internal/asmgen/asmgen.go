@@ -273,7 +273,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	if err != nil {
 		return "", "", fmt.Errorf("%s: %w", name, err)
 	}
-	if opts.ForbidCalls && plan.hasCall {
+	if opts.ForbidCalls && plan.hasNonSimdCall {
 		return "", "", fmt.Errorf("%s: function calls out and ForbidCalls is set", name)
 	}
 	plan.gpRegPool = a.GPRegPool()
@@ -1929,11 +1929,17 @@ type funcPlan struct {
 	hasPhi              map[ssa.BlockID]bool
 	staged              map[ssa.BlockID]bool
 	hasCall             bool
-	frameSize           int
-	calleeArea          int // bytes reserved at low SP for callee-arg staging
-	helperPfx           string
-	helperRefs          map[ssa.ValueID]string
-	directs             map[ssa.ValueID]*directCall
+	// hasNonSimdCall narrows hasCall to non-SIMD callees (scalar
+	// helpers, direct/indirect/import calls, memory ops, global
+	// wrappers) — the set FuncOptions.ForbidCalls rejects. SIMD
+	// helper symbols ship with every SIMD-using bundle, so their
+	// CALLs stay allowed under ForbidCalls.
+	hasNonSimdCall bool
+	frameSize      int
+	calleeArea     int // bytes reserved at low SP for callee-arg staging
+	helperPfx      string
+	helperRefs     map[ssa.ValueID]string
+	directs        map[ssa.ValueID]*directCall
 	// hasMem records whether the function performs at least one
 	// load / store / mem-size / mem-grow op. Drives the
 	// `mCacheCandidate` decision — only memory-touching functions
@@ -2097,12 +2103,16 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
 				ssa.OpLoadF32, ssa.OpLoadF64,
 				ssa.OpStore8, ssa.OpStore16, ssa.OpStore32, ssa.OpStore64,
-				ssa.OpStoreF32, ssa.OpStoreF64:
+				ssa.OpStoreF32, ssa.OpStoreF64,
+				// SIMD memory helpers take m; staging it per call
+				// benefits from the m-cache exactly like inline memops.
+				ssa.OpSimdMemCall:
 				p.hasMem = true
 			}
 			switch v.Op {
 			case ssa.OpHelperCall:
 				p.hasCall = true
+				p.hasNonSimdCall = true
 				name, ok := v.Aux.(string)
 				if !ok {
 					return nil, fmt.Errorf("OpHelperCall v%d has non-string Aux", v.ID)
@@ -2117,6 +2127,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallDirect:
 				p.hasCall = true
+				p.hasNonSimdCall = true
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallDirect v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2142,6 +2153,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallImport:
 				p.hasCall = true
+				p.hasNonSimdCall = true
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallImport v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2170,6 +2182,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallIndirect:
 				p.hasCall = true
+				p.hasNonSimdCall = true
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallIndirect v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2198,6 +2211,18 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				if cframe.argSize > maxCallee {
 					maxCallee = cframe.argSize
 				}
+			case ssa.OpSimdCall, ssa.OpSimdMemCall:
+				// SIMD helper CALL: signature derived from the SSA
+				// value itself (see simdCallSpecOf); only the callee
+				// frame size matters at planning time.
+				p.hasCall = true // NOT hasNonSimdCall: allowed under ForbidCalls
+				sp, err := simdCallSpecOf(v, p)
+				if err != nil {
+					return nil, err
+				}
+				if sp.frame > maxCallee {
+					maxCallee = sp.frame
+				}
 			case ssa.OpMemoryCopy, ssa.OpMemoryFill, ssa.OpMemSize, ssa.OpMemGrow:
 				// Route to the codegen-emitted helpers
 				// (memorySize / memoryGrow / memoryCopy /
@@ -2208,6 +2233,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				// logic. In multi-package mode the helpers live in
 				// base/ and are capitalized for cross-package use.
 				p.hasCall = true
+				p.hasNonSimdCall = true
 				var csig wasm.FuncType
 				helperName := ""
 				switch v.Op {
@@ -2282,6 +2308,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 					break
 				}
 				p.hasCall = true
+				p.hasNonSimdCall = true
 				var csig wasm.FuncType
 				var sym string
 				if v.Op == ssa.OpGlobalGet {
@@ -3248,6 +3275,9 @@ func slotSize(t ssa.Type) (int, int) {
 		return 4, 4
 	case ssa.TypeI64, ssa.TypeF64:
 		return 8, 8
+	case ssa.TypeV128:
+		// [2]uint64 pair; 8-byte alignment matches the Go-side value.
+		return 16, 8
 	}
 	return 0, 1
 }

@@ -278,6 +278,16 @@ func (a archARM64) EmitPhiCopyValue(b *strings.Builder, src *ssa.Value, dstOff i
 		srcOp = operandSrc64ARM64(src, plan, frame)
 	case ssa.TypeF32, ssa.TypeF64:
 		srcOp = operandSrcFloat(src, plan, frame, "RSP")
+	case ssa.TypeV128:
+		lo, hi := v128Parts(src, plan, frame, "RSP")
+		if lo == fmt.Sprintf("%d(RSP)", dstOff) {
+			return nil // self-copy
+		}
+		fmt.Fprintf(b, "\tMOVD %s, R0\n", lo)
+		fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dstOff)
+		fmt.Fprintf(b, "\tMOVD %s, R0\n", hi)
+		fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dstOff+8)
+		return nil
 	default:
 		return fmt.Errorf("phi type %v not supported", t)
 	}
@@ -285,6 +295,16 @@ func (a archARM64) EmitPhiCopyValue(b *strings.Builder, src *ssa.Value, dstOff i
 }
 
 func (a archARM64) EmitPhiCopySlot(b *strings.Builder, srcOff, dstOff int, t ssa.Type) error {
+	if t == ssa.TypeV128 {
+		if srcOff == dstOff {
+			return nil
+		}
+		fmt.Fprintf(b, "\tMOVD %d(RSP), R0\n", srcOff)
+		fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dstOff)
+		fmt.Fprintf(b, "\tMOVD %d(RSP), R0\n", srcOff+8)
+		fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dstOff+8)
+		return nil
+	}
 	return a.emitPhiCopyARM64(b, fmt.Sprintf("%d(RSP)", srcOff), dstOff, t)
 }
 
@@ -523,6 +543,12 @@ func emitValueARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		ssa.OpMemSize, ssa.OpMemGrow,
 		ssa.OpMemoryCopy, ssa.OpMemoryFill:
 		return emitCallDirectARM64(b, v, plan, frame)
+
+	// --- SIMD: v128 constants and helper CALLs ---
+	case ssa.OpSimdConst:
+		return emitSimdConstARM64(b, v, plan)
+	case ssa.OpSimdCall, ssa.OpSimdMemCall:
+		return emitSimdCallARM64(b, v, plan, frame)
 	}
 	return fmt.Errorf("op %v not supported by the arm64 emitter", v.Op)
 }
@@ -940,6 +966,93 @@ func emitStoreARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		fmt.Fprintf(b, "\tFMOVD F0, (R2)\n")
 	default:
 		return fmt.Errorf("OpStore variant %v not supported", v.Op)
+	}
+	return nil
+}
+
+// emitSimdConstARM64 materializes an OpSimdConst's [2]uint64 lane
+// payload into the value's 16-byte slot. The Go arm64 assembler
+// materializes arbitrary MOVD immediates via its literal machinery.
+func emitSimdConstARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan) error {
+	c, err := simdConstAux(v)
+	if err != nil {
+		return err
+	}
+	dst := plan.offsets[v.ID]
+	fmt.Fprintf(b, "\tMOVD $%d, R0\n", int64(c[0]))
+	fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
+	fmt.Fprintf(b, "\tMOVD $%d, R0\n", int64(c[1]))
+	fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst+8)
+	return nil
+}
+
+// emitSimdCallARM64 is the arm64 twin of emitSimdCallAMD64: ABI0 CALL
+// of the simd_* helper with the arm64 +8 callee-frame bias (see
+// emitCallDirectARM64), v128 args/results as two 8-byte halves.
+func emitSimdCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
+	sp, err := simdCallSpecOf(v, plan)
+	if err != nil {
+		return err
+	}
+	const bias = 8 // archARM64.CallArgBias()
+	if sp.withM {
+		if plan.mCacheReg != "" {
+			fmt.Fprintf(b, "\tMOVD %s, %d(RSP)\n", plan.mCacheReg, bias+0)
+		} else {
+			fmt.Fprintf(b, "\tMOVD m+0(FP), R0\n")
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", bias+0)
+		}
+	}
+	for i, arg := range v.Args {
+		off := bias + sp.argOffs[i]
+		switch sp.args[i] {
+		case ssa.TypeI32:
+			fmt.Fprintf(b, "\tMOVW %s, R0\n", operandSrc32ARM64(arg, plan, frame))
+			fmt.Fprintf(b, "\tMOVW R0, %d(RSP)\n", off)
+		case ssa.TypeI64:
+			fmt.Fprintf(b, "\tMOVD %s, R0\n", operandSrc64ARM64(arg, plan, frame))
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", off)
+		case ssa.TypeF32:
+			fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(arg, plan, frame, "RSP"))
+			fmt.Fprintf(b, "\tFMOVS F0, %d(RSP)\n", off)
+		case ssa.TypeF64:
+			fmt.Fprintf(b, "\tFMOVD %s, F0\n", operandSrcFloat(arg, plan, frame, "RSP"))
+			fmt.Fprintf(b, "\tFMOVD F0, %d(RSP)\n", off)
+		case ssa.TypeV128:
+			lo, hi := v128Parts(arg, plan, frame, "RSP")
+			fmt.Fprintf(b, "\tMOVD %s, R0\n", lo)
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", off)
+			fmt.Fprintf(b, "\tMOVD %s, R0\n", hi)
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", off+8)
+		default:
+			return fmt.Errorf("%s arg %d type %v not supported", sp.name, i, sp.args[i])
+		}
+	}
+	fmt.Fprintf(b, "\tCALL %s\n", goCallSymbol(plan.helperPfx, sp.name))
+	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
+		dst := plan.offsets[v.ID]
+		retOff := bias + sp.retOff
+		switch sp.ret {
+		case ssa.TypeI32:
+			fmt.Fprintf(b, "\tMOVW %d(RSP), R0\n", retOff)
+			fmt.Fprintf(b, "\tMOVW R0, %d(RSP)\n", dst)
+		case ssa.TypeI64:
+			fmt.Fprintf(b, "\tMOVD %d(RSP), R0\n", retOff)
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
+		case ssa.TypeF32:
+			fmt.Fprintf(b, "\tFMOVS %d(RSP), F0\n", retOff)
+			fmt.Fprintf(b, "\tFMOVS F0, %d(RSP)\n", dst)
+		case ssa.TypeF64:
+			fmt.Fprintf(b, "\tFMOVD %d(RSP), F0\n", retOff)
+			fmt.Fprintf(b, "\tFMOVD F0, %d(RSP)\n", dst)
+		case ssa.TypeV128:
+			fmt.Fprintf(b, "\tMOVD %d(RSP), R0\n", retOff)
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst)
+			fmt.Fprintf(b, "\tMOVD %d(RSP), R0\n", retOff+8)
+			fmt.Fprintf(b, "\tMOVD R0, %d(RSP)\n", dst+8)
+		default:
+			return fmt.Errorf("%s ret type %v not supported", sp.name, sp.ret)
+		}
 	}
 	return nil
 }

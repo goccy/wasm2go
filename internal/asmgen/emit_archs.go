@@ -323,6 +323,16 @@ func (a archAMD64) EmitPhiCopyValue(b *strings.Builder, src *ssa.Value, dstOff i
 		srcOp = operandSrc64(src, plan, frame, "SP")
 	case ssa.TypeF32, ssa.TypeF64:
 		srcOp = operandSrcFloat(src, plan, frame, "SP")
+	case ssa.TypeV128:
+		lo, hi := v128Parts(src, plan, frame, "SP")
+		if lo == fmt.Sprintf("%d(SP)", dstOff) {
+			return nil // self-copy
+		}
+		fmt.Fprintf(b, "\tMOVQ %s, AX\n", lo)
+		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dstOff)
+		fmt.Fprintf(b, "\tMOVQ %s, AX\n", hi)
+		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dstOff+8)
+		return nil
 	default:
 		return fmt.Errorf("phi type %v not supported", t)
 	}
@@ -330,6 +340,16 @@ func (a archAMD64) EmitPhiCopyValue(b *strings.Builder, src *ssa.Value, dstOff i
 }
 
 func (a archAMD64) EmitPhiCopySlot(b *strings.Builder, srcOff, dstOff int, t ssa.Type) error {
+	if t == ssa.TypeV128 {
+		if srcOff == dstOff {
+			return nil
+		}
+		fmt.Fprintf(b, "\tMOVQ %d(SP), AX\n", srcOff)
+		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dstOff)
+		fmt.Fprintf(b, "\tMOVQ %d(SP), AX\n", srcOff+8)
+		fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dstOff+8)
+		return nil
+	}
 	return a.emitPhiCopyAMD64(b, fmt.Sprintf("%d(SP)", srcOff), dstOff, t)
 }
 
@@ -561,6 +581,12 @@ func emitValueAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 	// --- Helper calls (rotl, div_s, eqz, rem_u, ...) ---
 	case ssa.OpHelperCall:
 		return emitHelperCall(b, v, plan, frame)
+
+	// --- SIMD: v128 constants and helper CALLs ---
+	case ssa.OpSimdConst:
+		return emitSimdConstAMD64(b, v, plan)
+	case ssa.OpSimdCall, ssa.OpSimdMemCall:
+		return emitSimdCallAMD64(b, v, plan, frame)
 
 	// --- Direct call to a sibling generated function or to a
 	// host-imports wrapper, plus global accessors. All four go
@@ -1285,6 +1311,100 @@ func emitHelperCall(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 			fmt.Fprintf(b, "\tMOVSD X0, %d(SP)\n", dst)
 		default:
 			return fmt.Errorf("helper %q ret type %v not supported", name, spec.ret)
+		}
+	}
+	return nil
+}
+
+// emitSimdConstAMD64 materializes an OpSimdConst's [2]uint64 lane
+// payload into the value's 16-byte slot.
+func emitSimdConstAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan) error {
+	c, err := simdConstAux(v)
+	if err != nil {
+		return err
+	}
+	dst := plan.offsets[v.ID]
+	fmt.Fprintf(b, "\tMOVQ $%d, AX\n", int64(c[0]))
+	fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst)
+	fmt.Fprintf(b, "\tMOVQ $%d, AX\n", int64(c[1]))
+	fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst+8)
+	return nil
+}
+
+// emitSimdCallAMD64 lowers OpSimdCall / OpSimdMemCall to an ABI0 CALL
+// of the bundle's simd_* helper symbol: stage m (mem calls only) and
+// each arg at its callee-frame offset — v128 args travel as two
+// 8-byte halves — CALL, then read the result back into the value's
+// slot.
+func emitSimdCallAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
+	sp, err := simdCallSpecOf(v, plan)
+	if err != nil {
+		return err
+	}
+	if sp.withM {
+		if plan.mCacheReg != "" {
+			fmt.Fprintf(b, "\tMOVQ %s, 0(SP)\n", plan.mCacheReg)
+		} else {
+			fmt.Fprintf(b, "\tMOVQ m+0(FP), AX\n")
+			fmt.Fprintf(b, "\tMOVQ AX, 0(SP)\n")
+		}
+	}
+	for i, arg := range v.Args {
+		off := sp.argOffs[i]
+		switch sp.args[i] {
+		case ssa.TypeI32:
+			if imm, ok := inlineableI32(arg); ok {
+				fmt.Fprintf(b, "\tMOVL $%d, %d(SP)\n", imm, off)
+			} else {
+				fmt.Fprintf(b, "\tMOVL %s, AX\n", operandSrc32(arg, plan, frame, "SP"))
+				fmt.Fprintf(b, "\tMOVL AX, %d(SP)\n", off)
+			}
+		case ssa.TypeI64:
+			if imm, ok := inlineableI64(arg); ok && imm >= -(1<<31) && imm < (1<<31) {
+				fmt.Fprintf(b, "\tMOVQ $%d, %d(SP)\n", imm, off)
+			} else {
+				fmt.Fprintf(b, "\tMOVQ %s, AX\n", operandSrc64(arg, plan, frame, "SP"))
+				fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", off)
+			}
+		case ssa.TypeF32:
+			fmt.Fprintf(b, "\tMOVSS %s, X0\n", operandSrcFloat(arg, plan, frame, "SP"))
+			fmt.Fprintf(b, "\tMOVSS X0, %d(SP)\n", off)
+		case ssa.TypeF64:
+			fmt.Fprintf(b, "\tMOVSD %s, X0\n", operandSrcFloat(arg, plan, frame, "SP"))
+			fmt.Fprintf(b, "\tMOVSD X0, %d(SP)\n", off)
+		case ssa.TypeV128:
+			lo, hi := v128Parts(arg, plan, frame, "SP")
+			fmt.Fprintf(b, "\tMOVQ %s, AX\n", lo)
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", off)
+			fmt.Fprintf(b, "\tMOVQ %s, AX\n", hi)
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", off+8)
+		default:
+			return fmt.Errorf("%s arg %d type %v not supported", sp.name, i, sp.args[i])
+		}
+	}
+	fmt.Fprintf(b, "\tCALL %s\n", goCallSymbol(plan.helperPfx, sp.name))
+	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
+		dst := plan.offsets[v.ID]
+		switch sp.ret {
+		case ssa.TypeI32:
+			fmt.Fprintf(b, "\tMOVL %d(SP), AX\n", sp.retOff)
+			fmt.Fprintf(b, "\tMOVL AX, %d(SP)\n", dst)
+		case ssa.TypeI64:
+			fmt.Fprintf(b, "\tMOVQ %d(SP), AX\n", sp.retOff)
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst)
+		case ssa.TypeF32:
+			fmt.Fprintf(b, "\tMOVSS %d(SP), X0\n", sp.retOff)
+			fmt.Fprintf(b, "\tMOVSS X0, %d(SP)\n", dst)
+		case ssa.TypeF64:
+			fmt.Fprintf(b, "\tMOVSD %d(SP), X0\n", sp.retOff)
+			fmt.Fprintf(b, "\tMOVSD X0, %d(SP)\n", dst)
+		case ssa.TypeV128:
+			fmt.Fprintf(b, "\tMOVQ %d(SP), AX\n", sp.retOff)
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst)
+			fmt.Fprintf(b, "\tMOVQ %d(SP), AX\n", sp.retOff+8)
+			fmt.Fprintf(b, "\tMOVQ AX, %d(SP)\n", dst+8)
+		default:
+			return fmt.Errorf("%s ret type %v not supported", sp.name, sp.ret)
 		}
 	}
 	return nil

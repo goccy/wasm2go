@@ -2,6 +2,7 @@ package transpile_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -98,6 +99,88 @@ func main() {
 	got := strings.TrimSpace(string(out))
 	// Same values the asmgen driver tests pin for the arith fixture.
 	if want := "5 -2147483648 7 42 1 -2147483648 -5 0"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// TestDirectAsmSimd opts every function of the SIMD fixture into the
+// direct-asm path. SIMD helper calls (OpSimdCall / OpSimdMemCall) are
+// emitted as plain ABI0 CALLs of the bundle's simd_* symbols, v128
+// values travel as [2]uint64 pairs in 16-byte slots, and the values
+// must match the wazero-verified reference the gcasm test pins.
+func TestDirectAsmSimd(t *testing.T) {
+	bin := testfixture.Wasm(t, "cg_simd.wasm")
+	m, err := transpile.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var direct []string
+	for i := 0; i < 32; i++ {
+		direct = append(direct, fmt.Sprintf("fn%d", i))
+	}
+	var buf bytes.Buffer
+	res, err := transpile.Translate(&buf, m, transpile.Options{
+		Package:          "pkg",
+		OutputImportPath: "dasimd/pkg",
+		DirectAsmFuncs:   direct,
+	})
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var asmAll strings.Builder
+	for name, data := range res.Files {
+		if strings.HasSuffix(name, ".s") {
+			asmAll.Write(data)
+		}
+	}
+	if !strings.Contains(asmAll.String(), "// direct-asm: fn") {
+		t.Errorf("no direct-asm bodies in the bundle; every function fell back")
+	}
+
+	dir := t.TempDir()
+	w := func(rel string, data []byte) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w("go.mod", []byte("module dasimd\n\ngo 1.25.0\n"))
+	if buf.Len() > 0 {
+		w("pkg/gen.go", buf.Bytes())
+	}
+	for _, set := range []map[string][]byte{res.Files, res.Sidecars} {
+		for name, data := range set {
+			if len(data) == 0 {
+				continue
+			}
+			w("pkg/"+name, data)
+		}
+	}
+	w("main.go", []byte(`package main
+
+import (
+	"fmt"
+
+	"dasimd/pkg"
+)
+
+func main() {
+	m := pkg.New()
+	fmt.Println(m.Intarith(-123456, 789), m.Widen(-32768, 32767), m.Memv(0), m.Shuf(0x55), m.Cmpmask(-5, 3))
+}
+`))
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go run: %v\n%s", err, out)
+	}
+	got := strings.TrimSpace(string(out))
+	// Values verified against the wazero reference (see TestGcasmSimd).
+	if want := "1646524174 2147451134 437725748 176 131342"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }

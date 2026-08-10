@@ -274,7 +274,19 @@ func isSafeForNewRegalloc(f *ssa.Func) bool {
 	// CFGs the bridge applies all eligible overrides; for merge
 	// CFGs the phiTouched filter (in applyNewRegalloc) is what
 	// keeps the override safe.
-	_ = f
+	//
+	// v128 values are excluded wholesale: the cross-block allocator
+	// predates the 16-byte slot class, and its liveness/stackalloc
+	// model assumes at most 8-byte values. Such functions keep the
+	// block-local allocator, whose pool selection already skips
+	// v128-typed values.
+	for _, blk := range f.Blocks {
+		for _, v := range blk.Values {
+			if v.Type == ssa.TypeV128 {
+				return false
+			}
+		}
+	}
 	return true
 }
 

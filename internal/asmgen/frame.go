@@ -85,6 +85,9 @@ func abiSize(t wasm.ValType) (size, align int, err error) {
 		return 4, 4, nil
 	case wasm.ValI64, wasm.ValF64:
 		return 8, 8, nil
+	case wasm.ValV128:
+		// [2]uint64 by value, mirroring the Go emission's v128 pair.
+		return 16, 8, nil
 	}
 	return 0, 0, fmt.Errorf("unsupported value type %v", t)
 }
