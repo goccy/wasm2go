@@ -319,12 +319,23 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	plan.splicer = opts.Splicer
 	plan.spliceMode = opts.Splicer != nil && plan.hasSimdCall
 	if plan.spliceMode {
-		// Splice bodies clobber the scratch / coalesce / m-cache
-		// register ranges freely (they were written for gc call
-		// sites, where everything is dead). Slot-only mode keeps
-		// every value in its frame slot across them. Clobber-aware
-		// allocation lifts this later.
+		// Splice bodies clobber the default m-cache register and the
+		// block-local pools freely (they were written for gc call
+		// sites, where everything is dead), so the default m-cache is
+		// off. With a hoisting splicer, m and the module state the
+		// splices consume ride the splice-safe registers instead:
+		// R24 = m (the m-cache mechanism with a safe register),
+		// R23/R22 = the splicer's hoist prologue.
 		plan.mCacheCandidate = false
+		if _, isARM64 := a.(archARM64); isARM64 && plan.hasMem {
+			// The hoist prologue reads m off R24, so the two prime
+			// together; memory-less functions need neither (their
+			// splices have no memory preambles).
+			if hoist := opts.Splicer.HoistPrologue(); hoist != "" {
+				plan.spliceHoist = hoist
+				plan.mCacheReg = "R24"
+			}
+		}
 	}
 	if plan.mCacheCandidate {
 		plan.mCacheReg = a.MCacheReg()
@@ -454,6 +465,9 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	// this same MOV after each opEmitsCall site.
 	if plan.mCacheReg != "" {
 		a.EmitMCachePrime(&b, plan.mCacheReg)
+	}
+	if plan.spliceHoist != "" {
+		b.WriteString(plan.spliceHoist)
 	}
 
 	// Packed boundary: load the parameter values from the Module's
@@ -1626,9 +1640,21 @@ func emitBlock(b *strings.Builder, blk *ssa.Block, f *ssa.Func, plan *funcPlan, 
 		// the source site (the BlockIf terminator inlines the
 		// compare). Without these guards every inlined access would
 		// cost the refresh pair it was supposed to save.
-		if plan.mCacheReg != "" && opEmitsCall(v.Op) && !plan.branchFused[v.ID] {
-			if _, inline := plan.globalInline[v.ID]; !inline {
+		// plan.emittedCall is set by exactly the emit paths that
+		// produced a real CALL (marshalled helpers, direct/indirect/
+		// import callees, memory-op helpers, unspliced SIMD calls).
+		// Inline lowerings — spliced SIMD, branch-fused compares,
+		// inlined globals and helpers, the div/rem family (whose trap
+		// CALLs never return) — leave it unset, so the refresh cost
+		// lands only where a callee could actually have clobbered
+		// the cached state.
+		if plan.emittedCall {
+			plan.emittedCall = false
+			if plan.mCacheReg != "" {
 				a.EmitMCachePrime(b, plan.mCacheReg)
+			}
+			if plan.spliceHoist != "" {
+				b.WriteString(plan.spliceHoist)
 			}
 		}
 	}
@@ -2026,6 +2052,12 @@ type funcPlan struct {
 	trapDivZero  string
 	trapIntOvf   string
 	divRemInline bool
+	// spliceHoist is the splicer's module-state staging text (m.M /
+	// memSize pointer into splice-safe registers), emitted at entry
+	// and re-issued after every value that actually emitted a CALL.
+	// emittedCall is the per-value flag those emitters set.
+	spliceHoist string
+	emittedCall bool
 	// mustSplice marks SIMD call values inside register-coalesced
 	// loops: their inline splice is load-bearing (a fallback CALL
 	// would clobber the carry registers), so a splice-table miss

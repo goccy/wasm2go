@@ -1297,6 +1297,7 @@ func emitHelperCall(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 	// CALL.
 	symbol := goCallSymbol(plan.helperPfx, name)
 	fmt.Fprintf(b, "\tCALL %s\n", symbol)
+	plan.emittedCall = true
 
 	// Read return value back into v's slot.
 	// Skip the load+store pair when this value's result has no
@@ -1400,6 +1401,7 @@ func emitSimdCallAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 		}
 	}
 	fmt.Fprintf(b, "\tCALL %s\n", goCallSymbol(plan.helperPfx, sp.name))
+	plan.emittedCall = true
 	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
 		dst := plan.offsets[v.ID]
 		switch sp.ret {
@@ -2210,6 +2212,7 @@ func emitCallDirect(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		}
 	}
 	fmt.Fprintf(b, "\tCALL %s\n", d.symbol)
+	plan.emittedCall = true
 
 	// Read back the single result if there is one. void-returning
 	// calls leave the producing value's type set to TypeMem (the

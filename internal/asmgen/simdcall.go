@@ -50,6 +50,15 @@ type SimdSpliceOperand struct {
 type SimdSplicer interface {
 	Splice(b *strings.Builder, name string, args []SimdSpliceOperand, ret *SimdSpliceOperand, scratchBase int) (spliced, wantsTrap bool)
 	TrapStub() string
+	// HoistPrologue returns instructions staging the module state the
+	// splice bodies consume (the linear-memory data pointer and the
+	// memory-size pointer) into splice-safe registers. The emitter
+	// places it at function entry, right after the m-cache prime, and
+	// re-issues it after every value that actually emitted a CALL
+	// (Go's ABI is caller-save, and a callee may have grown memory).
+	// Empty disables hoisting: splices then reload the state per
+	// site.
+	HoistPrologue() string
 }
 
 // simdCallSpec is one SIMD helper call's ABI0 layout.
@@ -144,9 +153,11 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 	}
 	args := make([]SimdSpliceOperand, 0, len(v.Args)+1)
 	if sp.withM {
-		// Slot-only mode disables the m-cache, so m always reads from
-		// its parameter slot.
-		args = append(args, SimdSpliceOperand{Type: ssa.TypeI64, IsPtr: true, Lo: "m+0(FP)"})
+		mOp := "m+0(FP)"
+		if plan.mCacheReg != "" {
+			mOp = plan.mCacheReg
+		}
+		args = append(args, SimdSpliceOperand{Type: ssa.TypeI64, IsPtr: true, Lo: mOp})
 	}
 	for i, arg := range v.Args {
 		t := sp.args[i]

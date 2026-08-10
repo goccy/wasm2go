@@ -102,7 +102,18 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 			trapSym = localSym
 		}
 		emit = asmgen.EmitFuncARM64
-		opts.Splicer = &directAsmSplicer{pool: pool, offs: modOffs, trapSym: trapSym}
+		spOffs := modOffs
+		if modOffs != nil {
+			// Clone with the hoist registers: the emitter keeps m in
+			// R24 (its splice-safe m-cache), m.M in R23, and the
+			// memSize pointer in R22, re-priming after real CALLs.
+			// The listing-transform path shares modOffs and must not
+			// see these.
+			h := *modOffs
+			h.HoistM, h.HoistMemSizePtr = "R23", "R22"
+			spOffs = &h
+		}
+		opts.Splicer = &directAsmSplicer{pool: pool, offs: spOffs, trapSym: trapSym}
 	}
 	asm, _, err := emit(name, df.Sig, df.Fn, opts)
 	if err != nil {
@@ -136,6 +147,19 @@ type directAsmSplicer struct {
 // symbol → (param kinds, has-result, result kind, local asm symbol,
 // ok), registering cross-package forward wrappers as a side effect.
 type calleeResolver func(sym string) ([]ArgKind, bool, ArgKind, string, bool)
+
+// HoistPrologue stages the module state the splice preambles consume:
+// m.M into R23 and the memSize pointer into R22, both read off the
+// emitter's R24 m-cache. All three live in the splice-safe register
+// range (splice bodies confine themselves to R0–R15 / R25–R27 and
+// the V registers).
+func (s *directAsmSplicer) HoistPrologue() string {
+	if s.offs == nil || s.offs.HoistM == "" {
+		return ""
+	}
+	return fmt.Sprintf("\tMOVD %d(R24), %s\n\tMOVD %d(R24), %s\n",
+		s.offs.M, s.offs.HoistM, s.offs.MemSize, s.offs.HoistMemSizePtr)
+}
 
 // TrapStub returns the shared out-of-bounds stub the memory splices
 // branch to. The trap helper panics, so control never returns; the
@@ -203,6 +227,12 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 			fmt.Fprintf(&tmp, "\tMOVD %s, R26\n", a.Hi)
 			fmt.Fprintf(&tmp, "\tMOVD R26, %d(RSP)\n", scratchBase+ra.SeqOf+8)
 		case ra.Reg != "":
+			if a.IsPtr && s.offs != nil && s.offs.HoistM != "" {
+				// Hoisted module state: the memory preamble reads
+				// R23/R22 directly, so m itself never has to reach
+				// R0 for the splice.
+				continue
+			}
 			// Scalars load straight into their ABIInternal registers
 			// — the convention the splice bodies were generated
 			// against (loadForARM64 gives the extending mnemonic).

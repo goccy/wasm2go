@@ -64,16 +64,18 @@ var coalesceReservedPool = []string{
 // spliceCoalescePool is the arm64 register set the SPLICE-MODE
 // coalesce draws from. Inline SIMD splice bodies confine themselves
 // to R0–R15 / R25–R27 plus the V registers (the documented splice
-// contract), so R19–R24 survive every splice and can carry loop
-// scalars across them — the reload-traffic lever gc can never pull,
-// since it must assume every call site clobbers everything.
+// contract), so R19–R24 survive every splice; R22–R24 are reserved
+// for the hoisted module state (memSize pointer, m.M, m), leaving
+// R19–R21 to carry loop scalars — the reload-traffic lever gc can
+// never pull, since it must assume every call site clobbers
+// everything.
 //
 // CAVEAT for the fused-window follow-up: the fused splices
 // (simdsplice_fuse_a64) additionally claim R20–R23 as window-wide
 // state; when asmgen learns to emit fused windows, this pool must
 // shrink to the disjoint remainder.
 var spliceCoalescePool = []string{
-	"R19", "R20", "R21", "R22", "R23", "R24",
+	"R19", "R20", "R21",
 }
 
 // coalesceBlockHasCall computes per-block CALL presence for the

@@ -1037,6 +1037,7 @@ func emitSimdCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 		}
 	}
 	fmt.Fprintf(b, "\tCALL %s\n", goCallSymbol(plan.helperPfx, sp.name))
+	plan.emittedCall = true
 	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
 		dst := plan.offsets[v.ID]
 		retOff := bias + sp.retOff
@@ -1380,6 +1381,7 @@ func emitHelperCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame
 	retOff := bias + helperRetOffset(spec)
 	symbol := goCallSymbol(plan.helperPfx, name)
 	fmt.Fprintf(b, "\tCALL %s\n", symbol)
+	plan.emittedCall = true
 	// Drop the result load+store pair when nothing reads it (same
 	// rationale as the amd64 helpers).
 	if spec.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
@@ -1536,6 +1538,7 @@ func emitCallDirectARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame
 		}
 	}
 	fmt.Fprintf(b, "\tCALL %s\n", d.symbol)
+	plan.emittedCall = true
 
 	if len(d.sig.Results) == 0 {
 		return nil

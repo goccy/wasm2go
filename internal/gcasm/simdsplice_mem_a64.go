@@ -53,6 +53,14 @@ type ModuleOffsets struct {
 	M       int // unsafe.Pointer to linear memory (backing array)
 	MemSize int // *atomic.Uint64 holding the current memory size
 	Cfg     Config
+	// HoistM / HoistMemSizePtr, when non-empty, name registers the
+	// host keeps m.M and the memSize POINTER in across splices (the
+	// direct-asm emitter re-primes them after real CALLs). The
+	// memory preambles then skip their per-site m-relative loads.
+	// The listing-transform path leaves them empty: at a gc call
+	// site nothing survives in registers to hoist into.
+	HoistM          string
+	HoistMemSizePtr string
 }
 
 // fastMath is the nil-safe read of Cfg.FastMath: error paths probe
@@ -147,13 +155,21 @@ func a64MemPreambleRegs(b *strings.Builder, size int, offs *ModuleOffsets, mReg,
 	// A plain load of the atomic memSize is sound here: aligned 64-bit
 	// loads are single-copy atomic on arm64, and reading a pre-grow
 	// value only fails MORE accesses.
-	fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.MemSize, mReg)
-	b.WriteString("\tMOVD (R26), R26\n")
+	if offs.HoistMemSizePtr != "" {
+		fmt.Fprintf(b, "\tMOVD (%s), R26\n", offs.HoistMemSizePtr)
+	} else {
+		fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.MemSize, mReg)
+		b.WriteString("\tMOVD (R26), R26\n")
+	}
 	fmt.Fprintf(b, "\tADD $%d, R25, R27\n", size)
 	b.WriteString("\tCMP R27, R26\n")
 	fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
-	fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.M, mReg)
-	b.WriteString("\tADD R25, R26, R27\n")
+	if offs.HoistM != "" {
+		fmt.Fprintf(b, "\tADD R25, %s, R27\n", offs.HoistM)
+	} else {
+		fmt.Fprintf(b, "\tMOVD %d(%s), R26\n", offs.M, mReg)
+		b.WriteString("\tADD R25, R26, R27\n")
+	}
 }
 
 // a64LaneMemElem maps a lane memory op to its element size log2 and the
@@ -187,6 +203,87 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 		return false, false
 	}
 
+	// Bounds-coalescing split forms (array-form twins of the pair
+	// splices): the group-leading load carries the whole window's
+	// range check, the other members drop theirs. rlo is SIGNED — a
+	// negative start means a group member wrapped and must trap.
+	memSizeInto26 := func() {
+		if offs.HoistMemSizePtr != "" {
+			fmt.Fprintf(b, "\tMOVD (%s), R26\n", offs.HoistMemSizePtr)
+		} else {
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.MemSize)
+			b.WriteString("\tMOVD (R26), R26\n")
+		}
+	}
+	hostAddrInto27 := func() { // R27 = m.M + R25
+		if offs.HoistM != "" {
+			fmt.Fprintf(b, "\tADD R25, %s, R27\n", offs.HoistM)
+		} else {
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.M)
+			b.WriteString("\tADD R25, R26, R27\n")
+		}
+	}
+	mStaged := offs.HoistM != ""
+	switch op {
+	case "v128_load_rng":
+		// (m, addr, offset, rlo, span) → v128; trap unless
+		// [addr+rlo, addr+rlo+span) fits.
+		if len(cargs) != 5 || cargs[1].Reg != "R1" || cargs[2].Reg != "R2" ||
+			cargs[3].Reg != "R3" || cargs[4].Reg != "R4" ||
+			!hasRes || cres.Kind != ArgV128 {
+			return false, false
+		}
+		if !mStaged && cargs[0].Reg != "R0" {
+			return false, false
+		}
+		if addr64 {
+			b.WriteString("\tMOVD R1, R25\n")
+			b.WriteString("\tADD R3, R25, R26\n")
+			fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tADD R4, R26, R27\n")
+			memSizeInto26()
+			b.WriteString("\tCMP R27, R26\n")
+			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tADD R2, R25, R25\n")
+		} else {
+			b.WriteString("\tMOVWU R1, R25\n")
+			b.WriteString("\tMOVW R3, R26\n")
+			b.WriteString("\tADD R26, R25, R26\n")
+			fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tMOVWU R4, R27\n")
+			b.WriteString("\tADD R27, R26, R27\n")
+			memSizeInto26()
+			b.WriteString("\tCMP R27, R26\n")
+			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tMOVWU R2, R26\n")
+			b.WriteString("\tADD R26, R25, R25\n")
+		}
+		hostAddrInto27()
+		b.WriteString("\tWORD $0x3dc00360 // ldr q0, [x27]\n")
+		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", base+cres.SeqOf)
+		return true, true
+	case "v128_load_nc":
+		// (m, addr, offset) → v128, no check (the group leader
+		// already proved the whole window in-bounds).
+		if len(cargs) != 3 || cargs[1].Reg != "R1" || cargs[2].Reg != "R2" ||
+			!hasRes || cres.Kind != ArgV128 {
+			return false, false
+		}
+		if !mStaged && cargs[0].Reg != "R0" {
+			return false, false
+		}
+		if addr64 {
+			b.WriteString("\tADD R2, R1, R25\n")
+		} else {
+			b.WriteString("\tMOVWU R1, R25\n")
+			b.WriteString("\tMOVWU R2, R26\n")
+			b.WriteString("\tADD R26, R25, R25\n")
+		}
+		hostAddrInto27()
+		b.WriteString("\tWORD $0x3dc00360 // ldr q0, [x27]\n")
+		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", base+cres.SeqOf)
+		return true, false
+	}
 	if ent, ok := a64SimdMemSpliceTab[op]; ok {
 		switch op {
 		case "v128_store":
