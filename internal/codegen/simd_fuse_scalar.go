@@ -273,6 +273,16 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 				return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: a.Index}, true
 			}
 		}
+		// A window-internal value (another candidate's result) must
+		// never leak into a chained scalar argument: after fusion it
+		// has no pre-call definition, so the argument would read
+		// garbage. Address chains hit this shape routinely (an
+		// extract_lane result feeding a load address); refusing here
+		// lets the caller fall back to the pair/opaque forms with the
+		// original semantics.
+		if _, isCand := fb.varNode[x.Name]; isCand {
+			return simdfuse.Arg{}, false
+		}
 		return fb.addChaseScalarArg(x, x.Name)
 	}
 	return simdfuse.Arg{}, false

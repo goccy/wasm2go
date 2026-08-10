@@ -1474,9 +1474,45 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		// intervener may REWRITE a name the chains read: the chains
 		// evaluate at the fused call, after every remaining intervener.
 		consumedInter := map[ast.Stmt]bool{}
+		consumedName := map[string]bool{}
 		for name, uses := range fb.chaseUses {
 			if sc.identCount[name] == uses+1 {
 				consumedInter[fb.interDef[name]] = true
+				consumedName[name] = true
+			}
+		}
+		// A dropped definition must not be read by a KEPT statement.
+		// Nested address chains make this reachable: chasing
+		// `v80 = v67 + s` internalizes v67's read, so v67 counts as
+		// fully consumed — but when v80 itself stays (a loop tail
+		// still reads it), its kept definition would read the dropped
+		// v67. Un-drop such definitions to a fixpoint (keeping one may
+		// expose reads of another).
+		for changedDrop := true; changedDrop; {
+			changedDrop = false
+			for _, st := range inter {
+				if consumedInter[st] {
+					continue
+				}
+				as, aok := st.(*ast.AssignStmt)
+				if !aok {
+					continue
+				}
+				for _, rhs := range as.Rhs {
+					ast.Inspect(rhs, func(n ast.Node) bool {
+						id, ok := n.(*ast.Ident)
+						if !ok || !consumedName[id.Name] {
+							return true
+						}
+						def := fb.interDef[id.Name]
+						if def != nil && consumedInter[def] {
+							delete(consumedInter, def)
+							delete(consumedName, id.Name)
+							changedDrop = true
+						}
+						return true
+					})
+				}
 			}
 		}
 		chaseOK := true
