@@ -279,6 +279,11 @@ func (a archARM64) EmitPhiCopyValue(b *strings.Builder, src *ssa.Value, dstOff i
 	case ssa.TypeF32, ssa.TypeF64:
 		srcOp = operandSrcFloat(src, plan, frame, "RSP")
 	case ssa.TypeV128:
+		if home := plan.regHome[resolveCopy(src).ID]; strings.HasPrefix(home, "V") {
+			// Register-resident source: one 16-byte store.
+			fmt.Fprintf(b, "\tFMOVQ F%s, %d(RSP)\n", strings.TrimPrefix(home, "V"), dstOff)
+			return nil
+		}
 		lo, hi := v128Parts(src, plan, frame, "RSP")
 		if lo == fmt.Sprintf("%d(RSP)", dstOff) {
 			return nil // self-copy
@@ -324,6 +329,14 @@ func (archARM64) EmitPhiCopyValueToReg(b *strings.Builder, src *ssa.Value, dstRe
 		fmt.Fprintf(b, "\tMOVW %s, %s\n", operandSrc32ARM64(src, plan, frame), dstReg)
 	case ssa.TypeI64:
 		fmt.Fprintf(b, "\tMOVD %s, %s\n", operandSrc64ARM64(src, plan, frame), dstReg)
+	case ssa.TypeV128:
+		fReg := "F" + strings.TrimPrefix(dstReg, "V")
+		if home := plan.regHome[resolveCopy(src).ID]; strings.HasPrefix(home, "V") {
+			fmt.Fprintf(b, "\tVORR %s.B16, %s.B16, %s.B16\n", home, home, dstReg)
+		} else {
+			lo, _ := v128Parts(src, plan, frame, "RSP")
+			fmt.Fprintf(b, "\tFMOVQ %s, %s\n", lo, fReg)
+		}
 	default:
 		return fmt.Errorf("phi-copy-to-reg type %v not supported (loop-carry coalesce is GP only)", t)
 	}

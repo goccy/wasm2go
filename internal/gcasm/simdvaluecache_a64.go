@@ -39,7 +39,9 @@ var (
 	svcLabelRe    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*:$`)
 )
 
-const svcSpareLo, svcSpareHi = 17, 31
+// V25–V31 belong to the v128 loop-carry homes (see the asmgen
+// splice-mode coalesce); the cache draws from V17–V24 only.
+const svcSpareLo, svcSpareHi = 17, 24
 
 // a64SpliceValueCache rewrites one TEXT's worth of direct-asm body.
 func a64SpliceValueCache(body string) string {

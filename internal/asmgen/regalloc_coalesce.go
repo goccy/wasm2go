@@ -113,7 +113,21 @@ func coalesceBlockHasCall(f *ssa.Func, plan *funcPlan, exempt func(*ssa.Value) b
 // the per-block linear scan (assignBlockRegHomes) so the per-
 // block scans see the reserved registers in plan.reservedRegs.
 func runCoalescePass(f *ssa.Func, plan *funcPlan) {
-	runCoalesceWith(f, plan, coalesceReservedPool, coalesceBlockHasCall(f, plan, nil), nil, false)
+	runCoalesceWith(f, plan, coalesceReservedPool, coalesceBlockHasCall(f, plan, nil), nil, false,
+		func(op ssa.Op) bool { return planRegHomeEligibleOp(plan, op) }, isCoalesceableType, false)
+}
+
+// spliceCoalesceVPool holds the v128 loop-carry homes: V25–V31 sit
+// above both the splice bodies' registers (V0–V4, F16) and the
+// spare-register cache (V17–V24), so an accumulator parked here
+// survives every splice in the loop. Real CALLs clobber the whole
+// vector file (Go's ABI is caller-save), which the coalesce safety
+// rules already exclude from the loop body; the emitter additionally
+// forces every SIMD site in the function to splice once a v128 phi
+// is coalesced, so no fallback CALL can appear later and clobber a
+// live home.
+var spliceCoalesceVPool = []string{
+	"V25", "V26", "V27", "V28", "V29", "V30", "V31",
 }
 
 // runSpliceCoalescePass is the splice-mode arm64 variant: SIMD
@@ -141,7 +155,33 @@ func runSpliceCoalescePass(f *ssa.Func, plan *funcPlan) {
 			}
 		}
 	}
-	runCoalesceWith(f, plan, spliceCoalescePool, coalesceBlockHasCall(f, plan, exempt), onCoalesced, true)
+	runCoalesceWith(f, plan, spliceCoalescePool, coalesceBlockHasCall(f, plan, exempt), onCoalesced, true,
+		func(op ssa.Op) bool { return planRegHomeEligibleOp(plan, op) }, isCoalesceableType, false)
+
+	// v128 loop carries (accumulators). A home in the vector file is
+	// only safe while nothing CALLs: the function must be free of
+	// non-SIMD callees, and once any phi is coalesced EVERY SIMD site
+	// in the function must splice (a fallback CALL would clobber the
+	// home) — enforced by marking them all mustSplice.
+	if !plan.hasNonSimdCall {
+		coalescedV := false
+		runCoalesceWith(f, plan, spliceCoalesceVPool, coalesceBlockHasCall(f, plan, exempt),
+			func(map[ssa.BlockID]bool) { coalescedV = true }, true,
+			func(op ssa.Op) bool { return op == ssa.OpSimdCall || op == ssa.OpSimdMemCall },
+			func(t ssa.Type) bool { return t == ssa.TypeV128 }, true)
+		if coalescedV {
+			if plan.mustSplice == nil {
+				plan.mustSplice = map[ssa.ValueID]bool{}
+			}
+			for _, blk := range f.Blocks {
+				for _, v := range blk.Values {
+					if exempt(v) {
+						plan.mustSplice[v.ID] = true
+					}
+				}
+			}
+		}
+	}
 }
 
 // runCoalesceWith is the shared mechanism behind the two entry
@@ -153,7 +193,7 @@ func runSpliceCoalescePass(f *ssa.Func, plan *funcPlan) {
 // the loop condition or an address user AND by the bump); it is
 // currently enabled for the splice-mode pass only, pending an A/B of
 // the default pass with it.
-func runCoalesceWith(f *ssa.Func, plan *funcPlan, pool []string, blockHasCall map[ssa.BlockID]bool, onCoalesced func(body map[ssa.BlockID]bool), relaxedUses bool) {
+func runCoalesceWith(f *ssa.Func, plan *funcPlan, pool []string, blockHasCall map[ssa.BlockID]bool, onCoalesced func(body map[ssa.BlockID]bool), relaxedUses bool, opEligibleFn func(ssa.Op) bool, typeOK func(ssa.Type) bool, liveOutOK bool) {
 	if len(f.Blocks) == 0 {
 		return
 	}
@@ -254,7 +294,7 @@ func runCoalesceWith(f *ssa.Func, plan *funcPlan, pool []string, blockHasCall ma
 			if actual == nil {
 				continue
 			}
-			if !planRegHomeEligibleOp(plan, actual.Op) {
+			if !opEligibleFn(actual.Op) {
 				continue
 			}
 			// V must be defined inside the loop body. (If V is
@@ -268,7 +308,7 @@ func runCoalesceWith(f *ssa.Func, plan *funcPlan, pool []string, blockHasCall ma
 			// Phi's destination must be a scalar of a kind GP
 			// registers can hold. Floats use a different pool we
 			// don't tap here yet.
-			if !isCoalesceableType(phi.Type) {
+			if !typeOK(phi.Type) {
 				continue
 			}
 			// Avoid double-coalescing: if either P or V already
@@ -287,7 +327,7 @@ func runCoalesceWith(f *ssa.Func, plan *funcPlan, pool []string, blockHasCall ma
 			// executes before V's write in each iteration — see
 			// coalesceUsesSafe.
 			if relaxedUses {
-				if !coalesceUsesSafe(f, body, src, phi, actual) {
+				if !coalesceUsesSafe(f, body, src, phi, actual, liveOutOK) {
 					continue
 				}
 			} else if phiUsers[phi.ID] != 1 || phiUsedAsControl[phi.ID] {
@@ -388,7 +428,7 @@ func isCoalesceableType(t ssa.Type) bool {
 //
 // V's own read of P is the carry (`n-1` reads the register it then
 // writes — a single instruction on the emit side) and is exempt.
-func coalesceUsesSafe(f *ssa.Func, body map[ssa.BlockID]bool, latch *ssa.Block, phi, vDef *ssa.Value) bool {
+func coalesceUsesSafe(f *ssa.Func, body map[ssa.BlockID]bool, latch *ssa.Block, phi, vDef *ssa.Value, liveOutOK bool) bool {
 	vIdx := -1
 	for i, v2 := range latch.Values {
 		if v2 == vDef {
@@ -415,7 +455,16 @@ func coalesceUsesSafe(f *ssa.Func, body map[ssa.BlockID]bool, latch *ssa.Block, 
 				continue
 			}
 			if !inBody {
-				return false // live-out of the loop
+				// Live-out read. GPR homes die with the loop (the
+				// pool recycles and later calls clobber); a V home
+				// survives to function end — the pool is consumed
+				// once, the function is call-free by gate, and no
+				// splice touches the home range — so consumers may
+				// keep reading it.
+				if liveOutOK {
+					continue
+				}
+				return false
 			}
 			if v2.Op == ssa.OpPhi {
 				return false // edge-copy read at block end

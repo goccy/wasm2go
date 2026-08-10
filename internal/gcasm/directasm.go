@@ -237,14 +237,25 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 	// without a slot (an unpacked FP parameter) still takes the
 	// copy path into the scratch area.
 	slots := &SpliceSlots{Out: -1}
-	if ret != nil && ret.Type == ssa.TypeV128 && ret.InSlot {
-		slots.Out = ret.SlotOff
+	if ret != nil && ret.Type == ssa.TypeV128 {
+		if ret.Reg != "" {
+			slots.OutReg = ret.Reg
+		} else if ret.InSlot {
+			slots.Out = ret.SlotOff
+		}
 	}
 	var tmp strings.Builder
 	for i, a := range args {
 		ra := cargs[i]
 		switch {
 		case ra.Kind == ArgV128:
+			if a.Reg != "" {
+				if slots.ArgRegs == nil {
+					slots.ArgRegs = map[int]string{}
+				}
+				slots.ArgRegs[i] = a.Reg
+				continue
+			}
 			if a.InSlot {
 				if slots.Args == nil {
 					slots.Args = map[int]int{}
@@ -289,8 +300,9 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 	}
 	if hasRes {
 		switch {
-		case cres.Kind == ArgV128 && slots.Out >= 0:
-			// The splice already wrote the value's own slot.
+		case cres.Kind == ArgV128 && (slots.Out >= 0 || slots.OutReg != ""):
+			// The splice already wrote the value's own slot or its
+			// register home.
 		case cres.Kind == ArgV128:
 			fmt.Fprintf(&tmp, "\tMOVD %d(RSP), R26\n", scratchBase+cres.SeqOf)
 			fmt.Fprintf(&tmp, "\tMOVD R26, %s\n", ret.Lo)

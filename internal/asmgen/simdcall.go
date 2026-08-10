@@ -32,6 +32,10 @@ type SimdSpliceOperand struct {
 	// staging copies entirely.
 	InSlot  bool
 	SlotOff int
+	// Reg names a vector register the value is resident in (a v128
+	// loop-carry home). Splicers read the argument from — or write
+	// the result to — the register instead of any slot.
+	Reg string
 }
 
 // SimdSplicer supplies arch-specific inline bodies for SIMD helper
@@ -170,9 +174,14 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 		t := sp.args[i]
 		op := SimdSpliceOperand{Type: t}
 		if t == ssa.TypeV128 {
-			op.Lo, op.Hi = v128Parts(arg, plan, frame, spName)
-			if r := resolveCopy(arg); r.Op != ssa.OpParam || plan.packed {
-				op.InSlot, op.SlotOff = true, plan.offsets[r.ID]
+			r := resolveCopy(arg)
+			if home := plan.regHome[r.ID]; strings.HasPrefix(home, "V") {
+				op.Reg = home
+			} else {
+				op.Lo, op.Hi = v128Parts(arg, plan, frame, spName)
+				if r.Op != ssa.OpParam || plan.packed {
+					op.InSlot, op.SlotOff = true, plan.offsets[r.ID]
+				}
 			}
 		} else {
 			switch t {
@@ -201,13 +210,17 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 	}
 	var ret *SimdSpliceOperand
 	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
-		dst := plan.offsets[v.ID]
-		ret = &SimdSpliceOperand{
-			Type:    sp.ret,
-			Lo:      fmt.Sprintf("%d(%s)", dst, spName),
-			Hi:      fmt.Sprintf("%d(%s)", dst+8, spName),
-			InSlot:  true,
-			SlotOff: dst,
+		if home := plan.regHome[v.ID]; sp.ret == ssa.TypeV128 && strings.HasPrefix(home, "V") {
+			ret = &SimdSpliceOperand{Type: sp.ret, Reg: home}
+		} else {
+			dst := plan.offsets[v.ID]
+			ret = &SimdSpliceOperand{
+				Type:    sp.ret,
+				Lo:      fmt.Sprintf("%d(%s)", dst, spName),
+				Hi:      fmt.Sprintf("%d(%s)", dst+8, spName),
+				InSlot:  true,
+				SlotOff: dst,
+			}
 		}
 	}
 	spliced, wantsTrap := plan.splicer.Splice(b, sp.name, args, ret, scratchBase)
