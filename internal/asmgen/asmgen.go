@@ -90,6 +90,12 @@ type FuncOptions struct {
 	// caller-side BX clobber that comes with it. ComputeGlobalOffsets
 	// produces a slice with the layout this field expects.
 	GlobalOffsets []int
+	// Splicer, when non-nil, supplies inline bodies for SIMD helper
+	// call sites (OpSimdCall / OpSimdMemCall) in place of the
+	// marshalled CALL. Functions containing SIMD calls then emit in
+	// slot-only mode (no register homes, no m-cache, no loop-carry
+	// coalesce) because splice bodies clobber registers freely.
+	Splicer SimdSplicer
 	// ForbidCalls makes emission fail for any function that would
 	// CALL another symbol (helpers, direct/indirect/import callees,
 	// memory ops, global wrappers). Hosts that embed asmgen bodies
@@ -287,6 +293,16 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	// MOV mnemonic, register name, and per-op read shape are all
 	// arch-specific (amd64 stages into R11 via MOVQ, arm64 stages
 	// into R4 via MOVD).
+	plan.splicer = opts.Splicer
+	plan.spliceMode = opts.Splicer != nil && plan.hasSimdCall
+	if plan.spliceMode {
+		// Splice bodies clobber the scratch / coalesce / m-cache
+		// register ranges freely (they were written for gc call
+		// sites, where everything is dead). Slot-only mode keeps
+		// every value in its frame slot across them. Clobber-aware
+		// allocation lifts this later.
+		plan.mCacheCandidate = false
+	}
 	if plan.mCacheCandidate {
 		plan.mCacheReg = a.MCacheReg()
 	}
@@ -318,7 +334,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	//   - regalloc runs iff LO <= index <= HI.
 	// This gives a clean log2(N) bisection over the function-index
 	// space — pin a failing range, halve it, repeat.
-	if a.SupportsRegHome() {
+	if a.SupportsRegHome() && !plan.spliceMode {
 		runRegalloc := true
 		loStr, hiStr := os.Getenv("WASM2GO_REGALLOC_BISECT_LO"), os.Getenv("WASM2GO_REGALLOC_BISECT_HI")
 		if loStr != "" || hiStr != "" {
@@ -423,6 +439,13 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 		if err := emitBlock(&b, blk, f, plan, sig, frame, a, fallthroughLabel); err != nil {
 			return "", "", fmt.Errorf("%s: block %d: %w", name, blk.ID, err)
 		}
+	}
+
+	// Shared out-of-bounds stub for spliced SIMD memory ops: their
+	// bodies branch to the splicer's trap label; the stub is appended
+	// once after the last block (control never returns from it).
+	if plan.wantsTrapStub && opts.Splicer != nil {
+		b.WriteString(opts.Splicer.TrapStub())
 	}
 
 	goDecl = fmt.Sprintf("//go:noescape\nfunc %s%s\n", name, goSignature(sig, opts.ModulePkgRef))
@@ -1929,6 +1952,17 @@ type funcPlan struct {
 	hasPhi              map[ssa.BlockID]bool
 	staged              map[ssa.BlockID]bool
 	hasCall             bool
+	// hasSimdCall / spliceMode / wantsTrapStub drive SIMD splicing:
+	// hasSimdCall marks OpSimdCall / OpSimdMemCall presence,
+	// spliceMode is set when a Splicer is available for them (slot-
+	// only emission), and wantsTrapStub records that some splice
+	// branched to the OOB trap label so the stub must be appended
+	// once at body end. splicer is the FuncOptions.Splicer handle
+	// for the per-op emitters.
+	hasSimdCall   bool
+	spliceMode    bool
+	wantsTrapStub bool
+	splicer       SimdSplicer
 	// hasNonSimdCall narrows hasCall to non-SIMD callees (scalar
 	// helpers, direct/indirect/import calls, memory ops, global
 	// wrappers) — the set FuncOptions.ForbidCalls rejects. SIMD
@@ -2216,6 +2250,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				// value itself (see simdCallSpecOf); only the callee
 				// frame size matters at planning time.
 				p.hasCall = true // NOT hasNonSimdCall: allowed under ForbidCalls
+				p.hasSimdCall = true
 				sp, err := simdCallSpecOf(v, p)
 				if err != nil {
 					return nil, err

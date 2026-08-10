@@ -255,15 +255,12 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		if modOffs != nil {
 			modOffs.Cfg = cfg
 		}
-		// Direct-asm bodies for this arch, emitted once and swapped in
-		// by buildPkg wherever the owning package's loop meets a name.
-		directBodies := buildDirectAsm(mod, cfg.DirectAsm, spec.name, modOffs, archStats)
 		for _, rel := range pkgList {
 			pfns := ac.byPkg[rel]
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, directBodies)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg.DirectAsm)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -608,7 +605,7 @@ func buildPkg(
 	outlinedNames []string,
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
-	directBodies map[string][]byte,
+	directSSA map[string]DirectAsmFn,
 ) (map[string][]byte, error) {
 	selfPath := importPath
 	if rel != "" {
@@ -741,15 +738,20 @@ func buildPkg(
 			declParams = mod.FuncTypeOf(idx).Params
 		}
 		// Direct-asm body: emitted straight from the retained SSA by
-		// internal/asmgen (see buildDirectAsm); replaces the listing
-		// transform for this function. The decl matches the
+		// internal/asmgen (see emitDirectAsmBody); replaces the
+		// listing transform for this function. The decl matches the
 		// transformed path's shape, so callers see no difference.
-		if dab := directBodies[name]; len(dab) > 0 {
-			asmB.Write(dab)
-			asmB.WriteString("\n")
-			stats.DirectAsm++
-			declFns.WriteString("func " + name + declSig(rel, name, declParams, hasRes, res, synth) + "\n")
-			continue
+		// Emission shares this package's ConstPool so spliced bodies'
+		// constants intern alongside the transform's.
+		if df, isDirect := directSSA[name]; isDirect {
+			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, modOffs, pool, stats); ok {
+				asmB.WriteString(dab)
+				asmB.WriteString("\n")
+				stats.DirectAsm++
+				declFns.WriteString("func " + name + declSig(rel, name, declParams, hasRes, res, synth) + "\n")
+				continue
+			}
+			stats.DirectAsmFallback++
 		}
 		body, terr := arch.transform(f, TransformOptions{
 			SymName:     name,

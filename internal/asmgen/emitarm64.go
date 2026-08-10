@@ -995,6 +995,9 @@ func emitSimdCallARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 		return err
 	}
 	const bias = 8 // archARM64.CallArgBias()
+	if done, err := trySpliceSimdCall(b, v, &sp, plan, frame, "RSP", bias); err != nil || done {
+		return err
+	}
 	if sp.withM {
 		if plan.mCacheReg != "" {
 			fmt.Fprintf(b, "\tMOVD %s, %d(RSP)\n", plan.mCacheReg, bias+0)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -136,6 +137,23 @@ func TestDirectAsmSimd(t *testing.T) {
 	if !strings.Contains(asmAll.String(), "// direct-asm: fn") {
 		t.Errorf("no direct-asm bodies in the bundle; every function fell back")
 	}
+	// The arm64 direct-asm bodies must contain SPLICED SIMD ops
+	// (inline WORD-encoded NEON), not marshalled helper CALLs — a
+	// silent all-CALL body would pass the value checks while losing
+	// the entire point of the splice path.
+	if arm := string(res.Files["arm64.s"]); arm != "" {
+		start := strings.Index(arm, "// direct-asm: fn")
+		if start < 0 {
+			t.Errorf("arm64.s has no direct-asm bodies")
+		} else if !strings.Contains(arm[start:], "WORD $0x") {
+			t.Errorf("arm64 direct-asm bodies contain no spliced NEON")
+		}
+		if strings.Contains(arm[start:], "CALL ·simd_") {
+			// Some ops legitimately keep the CALL (no table entry);
+			// log for visibility without failing.
+			t.Logf("arm64 direct-asm bodies still contain some simd helper CALLs (ops without splice-table entries)")
+		}
+	}
 
 	dir := t.TempDir()
 	w := func(rel string, data []byte) {
@@ -180,7 +198,49 @@ func main() {
 	}
 	got := strings.TrimSpace(string(out))
 	// Values verified against the wazero reference (see TestGcasmSimd).
-	if want := "1646524174 2147451134 437725748 176 131342"; got != want {
+	want := "1646524174 2147451134 437725748 176 131342"
+	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
+
+	// arm64 leg: the direct-asm bodies there contain SPLICED SIMD op
+	// bodies (inline NEON via the gcasm tables) rather than helper
+	// CALLs, so they need their own assemble + execute pass. Apple
+	// Silicon runs the arm64 binary natively even when this test
+	// process is x86_64 under Rosetta.
+	if !canExecArm64(t) {
+		t.Logf("host cannot execute arm64 binaries; arm64 leg skipped")
+		return
+	}
+	exe := filepath.Join(dir, "driver_arm64")
+	cb := exec.Command("go", "build", "-o", exe, ".")
+	cb.Dir = dir
+	cb.Env = append(os.Environ(), "GOOS="+runtime.GOOS, "GOARCH=arm64", "CGO_ENABLED=0")
+	if bout, err := cb.CombinedOutput(); err != nil {
+		t.Fatalf("GOARCH=arm64 go build: %v\n%s", err, bout)
+	}
+	out, err = exec.Command(exe).CombinedOutput()
+	if err != nil {
+		t.Fatalf("arm64 driver: %v\n%s", err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != want {
+		t.Fatalf("arm64: got %q, want %q", got, want)
+	}
+}
+
+// canExecArm64 reports whether this darwin host can execute arm64
+// binaries: native arm64, or an x86_64 test process under Rosetta 2
+// (which only exists on arm64 hardware). sysctl.proc_translated is
+// the OS's indicator; the parse is total — anything but a literal
+// "1" means not translated.
+func canExecArm64(t *testing.T) bool {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		return false
+	}
+	if runtime.GOARCH == "arm64" {
+		return true
+	}
+	out, err := exec.Command("sysctl", "-n", "sysctl.proc_translated").Output()
+	return err == nil && strings.TrimSpace(string(out)) == "1"
 }

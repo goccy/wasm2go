@@ -1341,6 +1341,9 @@ func emitSimdCallAMD64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame a
 	if err != nil {
 		return err
 	}
+	if done, err := trySpliceSimdCall(b, v, &sp, plan, frame, "SP", 0); err != nil || done {
+		return err
+	}
 	if sp.withM {
 		if plan.mCacheReg != "" {
 			fmt.Fprintf(b, "\tMOVQ %s, 0(SP)\n", plan.mCacheReg)

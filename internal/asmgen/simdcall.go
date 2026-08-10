@@ -2,6 +2,7 @@ package asmgen
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -14,6 +15,40 @@ import (
 // helper family is large and every signature is fully determined by
 // the SSA value itself (arg types, result type, and whether the
 // module pointer leads the frame), so the spec is derived per call.
+
+// SimdSpliceOperand describes where one SIMD call operand lives in
+// the emitting function's frame: asm operand strings for the value's
+// 8-byte halves (Hi only for v128). IsPtr marks the module pointer
+// that leads an OpSimdMemCall's argument list.
+type SimdSpliceOperand struct {
+	Type  ssa.Type
+	IsPtr bool
+	Lo    string
+	Hi    string
+}
+
+// SimdSplicer supplies arch-specific inline bodies for SIMD helper
+// call sites, replacing the marshalled CALL entirely (the gcasm
+// backend implements it over its splice tables). Splice appends the
+// staging and body for helper `name`: args are the operand locations
+// in call order (module pointer first for memory ops), ret is the
+// destination location or nil when the result is void/unused, and
+// scratchBase is the SP-relative byte offset of the caller-owned
+// scratch area (the callee-argument region — always large enough,
+// since the ABI0 call frame for the same signature is a superset of
+// the splice's stack traffic). It reports whether it spliced (false
+// keeps the CALL path) and whether the body branches to the
+// per-function trap stub, which the emitter then appends once at
+// body end via TrapStub.
+//
+// Contract: a splice body may clobber any register EXCEPT the stack
+// pointer — the emitter runs SIMD-containing functions in slot-only
+// mode (no register homes, no m-cache, no loop-carry coalesce) so
+// there is nothing live in registers across a splice.
+type SimdSplicer interface {
+	Splice(b *strings.Builder, name string, args []SimdSpliceOperand, ret *SimdSpliceOperand, scratchBase int) (spliced, wantsTrap bool)
+	TrapStub() string
+}
 
 // simdCallSpec is one SIMD helper call's ABI0 layout.
 type simdCallSpec struct {
@@ -98,6 +133,66 @@ func v128Parts(v *ssa.Value, plan *funcPlan, frame argFrame, spName string) (lo,
 	}
 	base := plan.offsets[v.ID]
 	return fmt.Sprintf("%d(%s)", base, spName), fmt.Sprintf("%d(%s)", base+8, spName)
+}
+
+// trySpliceSimdCall offers the call site to the plan's SimdSplicer.
+// Returns done=true when the splice replaced the CALL entirely; the
+// caller then emits nothing else for this value. spName / scratchBase
+// are the arch's stack-pointer spelling and callee-area base offset.
+func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan *funcPlan, frame argFrame, spName string, scratchBase int) (bool, error) {
+	if plan.splicer == nil {
+		return false, nil
+	}
+	args := make([]SimdSpliceOperand, 0, len(v.Args)+1)
+	if sp.withM {
+		// Slot-only mode disables the m-cache, so m always reads from
+		// its parameter slot.
+		args = append(args, SimdSpliceOperand{Type: ssa.TypeI64, IsPtr: true, Lo: "m+0(FP)"})
+	}
+	for i, arg := range v.Args {
+		t := sp.args[i]
+		op := SimdSpliceOperand{Type: t}
+		if t == ssa.TypeV128 {
+			op.Lo, op.Hi = v128Parts(arg, plan, frame, spName)
+		} else {
+			switch t {
+			case ssa.TypeI32:
+				if spName == "SP" {
+					op.Lo = operandSrc32(arg, plan, frame, spName)
+				} else {
+					op.Lo = operandSrc32ARM64(arg, plan, frame)
+				}
+			case ssa.TypeI64:
+				if spName == "SP" {
+					op.Lo = operandSrc64(arg, plan, frame, spName)
+				} else {
+					op.Lo = operandSrc64ARM64(arg, plan, frame)
+				}
+			case ssa.TypeF32, ssa.TypeF64:
+				op.Lo = operandSrcFloat(arg, plan, frame, spName)
+			default:
+				return false, nil // let the CALL path report it
+			}
+		}
+		args = append(args, op)
+	}
+	var ret *SimdSpliceOperand
+	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
+		dst := plan.offsets[v.ID]
+		ret = &SimdSpliceOperand{
+			Type: sp.ret,
+			Lo:   fmt.Sprintf("%d(%s)", dst, spName),
+			Hi:   fmt.Sprintf("%d(%s)", dst+8, spName),
+		}
+	}
+	spliced, wantsTrap := plan.splicer.Splice(b, sp.name, args, ret, scratchBase)
+	if !spliced {
+		return false, nil
+	}
+	if wantsTrap {
+		plan.wantsTrapStub = true
+	}
+	return true, nil
 }
 
 // simdConstAux returns the [2]uint64 lane payload of an OpSimdConst.
