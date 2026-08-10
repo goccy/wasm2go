@@ -33,6 +33,7 @@ type countdownLoop struct {
 	decVar  *ast.Ident        // do-while form: `decVar = counter - dec` (nil for header form)
 	decEx   []ast.Expr        // per-iteration decrement terms (const or const-local)
 	wide    bool              // the counter is int64 (constants spelled int64(...))
+	eqHead  bool              // header form tested `c == 0` (valid only for a unit decrement)
 	bumps   []*ast.AssignStmt // `p = p + const`
 	carries []*ast.AssignStmt // `accPrev = accNext` (array form)
 	consts  []*ast.AssignStmt // tail constant defs (bump deltas); hoisted
@@ -69,6 +70,17 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 			return nil, false
 		}
 		counter, ok := matchUiLt(ifs.Cond, sc.wideCounters())
+		eqHead := false
+		if !ok {
+			// Third emitted shape: a head-tested while,
+			// `for { if c == 0 { break } else { body; c = c - 1 } }`.
+			// With a UNIT decrement, `c == 0` and `Ui(c) < Ui(1)` exit
+			// at exactly the same counter values, so the loop reuses
+			// the pre-tested descriptor; tryFuseLoop rejects any other
+			// decrement under this head.
+			counter, ok = matchEqZero(ifs.Cond, sc.wideCounters())
+			eqHead = ok
+		}
 		if !ok {
 			return nil, false
 		}
@@ -76,7 +88,7 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		if !ok || len(blk.List) < 2 {
 			return nil, false
 		}
-		cl := &countdownLoop{counter: counter}
+		cl := &countdownLoop{counter: counter, eqHead: eqHead}
 		if !cl.splitTail(sc, blk.List, counter) {
 			return nil, false
 		}
@@ -171,6 +183,44 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		return nil, false
 	}
 	return cl, true
+}
+
+// unwrapWidth strips the int64()/uint64() conversion the memory64
+// fused-call sites wrap their scalar arguments in, so slot and bump
+// matching sees the same identifiers on both widths.
+func unwrapWidth(e ast.Expr) ast.Expr {
+	if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+		if id, ok := c.Fun.(*ast.Ident); ok && (id.Name == "int64" || id.Name == "uint64") {
+			return c.Args[0]
+		}
+	}
+	return e
+}
+
+// matchEqZero matches the head-tested while's break condition
+// `c == 0` (either operand order; the zero spelled at the counter's
+// width on memory64).
+func matchEqZero(e ast.Expr, wide bool) (*ast.Ident, bool) {
+	bin, ok := e.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.EQL {
+		return nil, false
+	}
+	x, y := bin.X, bin.Y
+	if _, isID := x.(*ast.Ident); !isID {
+		x, y = y, x
+	}
+	id, ok := x.(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	if wide {
+		if c, cok, _ := loopConstValue(y); !cok || c != 0 {
+			return nil, false
+		}
+	} else if c, cok := intConstValue(y); !cok || c != 0 {
+		return nil, false
+	}
+	return id, true
 }
 
 // wideCounters reports whether the scalarizer's module carries
@@ -471,7 +521,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	// after scalars+floats (two slots each).
 	scalarSlot := map[string]int{}
 	for i := 0; i < tree.NumScalars; i++ {
-		if id, ok := call.Args[1+i].(*ast.Ident); ok {
+		if id, ok := unwrapWidth(call.Args[1+i]).(*ast.Ident); ok {
 			scalarSlot[id.Name] = i
 		}
 	}
@@ -527,6 +577,10 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	}
 	if dec <= 0 {
 		return sc.loopReject("L520")
+	}
+	if cl.eqHead && dec != 1 {
+		// `c == 0` only equals the `< dec` pre-test when dec is 1.
+		return sc.loopReject("eq-head-nonunit-dec")
 	}
 	loop := &simdfuse.Loop{Tree: tree, Dec: dec, PreTest: cl.decVar == nil, CounterWide: cl.wide}
 	// Carries: `prev = next` with prev a pair argument and next a
@@ -646,7 +700,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		// so it must be dead after the loop.
 		matched := 0
 		for i := 0; i < tree.NumScalars; i++ {
-			arg := call.Args[1+i]
+			arg := unwrapWidth(call.Args[1+i])
 			addend, ok := derivedOf(arg, name)
 			if !ok {
 				if id, iok := arg.(*ast.Ident); iok {

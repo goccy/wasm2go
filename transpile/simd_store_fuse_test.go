@@ -114,3 +114,25 @@ func TestAddrSumChasesBothWidths(t *testing.T) {
 	check("cg_simd_addrsum32.wasm", false)
 	check("cg_mem64_simd_addrsum.wasm", true)
 }
+
+// The countdown conversion loop must UPGRADE to a fused loop (one
+// splice owning the whole loop) on both widths: the head-tested
+// `c == 0` break with a unit decrement is one of the emitter's own
+// shapes, and the memory64 call sites wrap their scalar arguments in
+// int64() — neither may block the upgrade.
+func TestConvLoopUpgradesBothWidths(t *testing.T) {
+	for _, fx := range []string{"cg_simd_conv32.wasm", "cg_mem64_simd_conv.wasm"} {
+		bin := testfixture.Wasm(t, fx)
+		m, err := transpile.Parse(bytes.NewReader(bin))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := transpile.Translate(io.Discard, m, transpile.Options{Package: "pkg", OutputImportPath: "sf/pkg", FuseLoops: true, FuseLoopUnroll: 4})
+		if err != nil {
+			t.Fatalf("translate %s: %v", fx, err)
+		}
+		if len(res.FusedLoops) == 0 {
+			t.Errorf("%s: countdown conversion loop did not upgrade to a fused loop", fx)
+		}
+	}
+}
