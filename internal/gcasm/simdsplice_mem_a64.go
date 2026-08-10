@@ -192,7 +192,7 @@ func a64LaneMemElem(op string) (scale int, load, store string, ok bool) {
 // a64SpliceSimdMem inlines a memory helper call. Reports (spliced,
 // needsTrap): a true needsTrap obliges the caller to emit the trap stub
 // at the end of the function body.
-func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, offs *ModuleOffsets) (bool, bool) {
+func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, offs *ModuleOffsets, slots *SpliceSlots) (bool, bool) {
 	if offs == nil {
 		return false, false
 	}
@@ -260,7 +260,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 		}
 		hostAddrInto27()
 		b.WriteString("\tWORD $0x3dc00360 // ldr q0, [x27]\n")
-		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", base+cres.SeqOf)
+		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", slots.outOff(base+cres.SeqOf))
 		return true, true
 	case "v128_load_nc":
 		// (m, addr, offset) → v128, no check (the group leader
@@ -281,7 +281,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 		}
 		hostAddrInto27()
 		b.WriteString("\tWORD $0x3dc00360 // ldr q0, [x27]\n")
-		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", base+cres.SeqOf)
+		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", slots.outOff(base+cres.SeqOf))
 		return true, false
 	}
 	if ent, ok := a64SimdMemSpliceTab[op]; ok {
@@ -290,7 +290,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 			if len(cargs) != 4 || cargs[3].Kind != ArgV128 {
 				return false, false
 			}
-			fmt.Fprintf(b, "\tFMOVQ %d(RSP), F0\n", base+cargs[3].SeqOf)
+			fmt.Fprintf(b, "\tFMOVQ %d(RSP), F0\n", slots.argOff(3, base+cargs[3].SeqOf))
 		default:
 			if len(cargs) != 3 || !hasRes || cres.Kind != ArgV128 {
 				return false, false
@@ -301,7 +301,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 			fmt.Fprintf(b, "\t%s\n", l)
 		}
 		if hasRes && cres.Kind == ArgV128 {
-			fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", base+cres.SeqOf)
+			fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", slots.outOff(base+cres.SeqOf))
 		}
 		return true, true
 	}
@@ -311,7 +311,7 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 	if !ok || len(cargs) != 5 || cargs[3].Reg != "R3" || cargs[4].Kind != ArgV128 {
 		return false, false
 	}
-	vSeq := base + cargs[4].SeqOf
+	vSeq := slots.argOff(4, base+cargs[4].SeqOf)
 	switch {
 	case strings.Contains(op, "load"):
 		if !hasRes || cres.Kind != ArgV128 {
@@ -321,8 +321,9 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 		fmt.Fprintf(b, "\t%s (R27), R4\n", eload)
 		// Copy v into the result slot, then overwrite the lane there.
 		fmt.Fprintf(b, "\tFMOVQ %d(RSP), F16\n", vSeq)
-		fmt.Fprintf(b, "\tFMOVQ F16, %d(RSP) // simd out\n", base+cres.SeqOf)
-		fmt.Fprintf(b, "\tADD $%d, RSP, R26\n", base+cres.SeqOf)
+		outLane := slots.outOff(base + cres.SeqOf)
+		fmt.Fprintf(b, "\tFMOVQ F16, %d(RSP) // simd out\n", outLane)
+		fmt.Fprintf(b, "\tADD $%d, RSP, R26\n", outLane)
 		fmt.Fprintf(b, "\tADD R3<<%d, R26, R26\n", scale)
 		fmt.Fprintf(b, "\t%s R4, (R26)\n", estore)
 		return true, true

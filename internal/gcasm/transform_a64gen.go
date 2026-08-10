@@ -228,7 +228,7 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 				// marshalled: the op body replaces the call entirely.
 				// See simdsplice_a64.go.
 				if _, _, isSimd := simdSpliceOp(m[1]); isSimd {
-					if ok, wantsTrap := a64SpliceSimd(&b, m[1], cargs, cres, hasRes, 8+maxOut, pool, opts.ModOffsets); ok {
+					if ok, wantsTrap := a64SpliceSimd(&b, m[1], cargs, cres, hasRes, 8+maxOut, pool, opts.ModOffsets, nil); ok {
 						if wantsTrap && trapCallee == "" {
 							// Resolve the oob trap through the same
 							// package the helper lives in; the stub is

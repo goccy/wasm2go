@@ -25,6 +25,13 @@ type SimdSpliceOperand struct {
 	IsPtr bool
 	Lo    string
 	Hi    string
+	// InSlot / SlotOff: the value lives in the emitting function's
+	// frame at this SP-relative byte offset. For v128 operands a
+	// splicer can then read the argument from (or write the result
+	// to) the value's own slot directly, skipping the scratch-area
+	// staging copies entirely.
+	InSlot  bool
+	SlotOff int
 }
 
 // SimdSplicer supplies arch-specific inline bodies for SIMD helper
@@ -164,6 +171,9 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 		op := SimdSpliceOperand{Type: t}
 		if t == ssa.TypeV128 {
 			op.Lo, op.Hi = v128Parts(arg, plan, frame, spName)
+			if r := resolveCopy(arg); r.Op != ssa.OpParam || plan.packed {
+				op.InSlot, op.SlotOff = true, plan.offsets[r.ID]
+			}
 		} else {
 			switch t {
 			case ssa.TypeI32:
@@ -193,9 +203,11 @@ func trySpliceSimdCall(b *strings.Builder, v *ssa.Value, sp *simdCallSpec, plan 
 	if sp.ret != ssa.TypeInvalid && !plan.unusedResult[v.ID] {
 		dst := plan.offsets[v.ID]
 		ret = &SimdSpliceOperand{
-			Type: sp.ret,
-			Lo:   fmt.Sprintf("%d(%s)", dst, spName),
-			Hi:   fmt.Sprintf("%d(%s)", dst+8, spName),
+			Type:    sp.ret,
+			Lo:      fmt.Sprintf("%d(%s)", dst, spName),
+			Hi:      fmt.Sprintf("%d(%s)", dst+8, spName),
+			InSlot:  true,
+			SlotOff: dst,
 		}
 	}
 	spliced, wantsTrap := plan.splicer.Splice(b, sp.name, args, ret, scratchBase)

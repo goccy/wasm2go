@@ -131,7 +131,10 @@ func (s *fwdState) clobberFreg(n int) {
 // write. The splice tables only ever use v0–v3 plus the replace-lane
 // copy in F16; go: lines use R3/R4 (handled by the GPR scan). Being
 // generous here costs nothing but a missed forward.
-var a64SpliceWordClobberList = []int{0, 1, 2, 3, 16}
+// v4 appears in the f16 conversion body ("movi v4"); omitting it
+// let a forwarded value parked in F4 survive across that splice on
+// paper while being clobbered in fact.
+var a64SpliceWordClobberList = []int{0, 1, 2, 3, 4, 16}
 
 // gprsDeadAfter proves that every register in regs is redefined before
 // any use in the rest of the basic block. Only definitely-recognized

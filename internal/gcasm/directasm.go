@@ -120,6 +120,19 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: %v\n", archName, name, err)
 		return "", false
 	}
+	if archName == "arm64" && strings.Contains(asm, "FMOVQ") {
+		// Store-to-load forwarding over the v128 slots, same pass the
+		// gc-captured bodies get (identical instruction vocabulary,
+		// conservative whitelist tracking, never deletes a store).
+		// a64DeadArgStores must NOT run here: it models the capture
+		// shape, where arg-slot stores are redundant copies of a
+		// value that also lives elsewhere — in the slot-direct shape
+		// the "simd out" store IS the value's only definition, and
+		// the pass deleted live stores (caught by the native NLL
+		// parity gate).
+		asm = a64ForwardSimdSlots(asm)
+		asm = a64SpliceValueCache(asm)
+	}
 	// The marker line identifies direct-asm bodies in the bundle
 	// (tests and humans reading the .s both key off it).
 	return "// direct-asm: " + name + "\n" + asm, true
@@ -213,11 +226,28 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 	// tables may decline this op (a64SpliceSimd reports false), and
 	// the caller then emits the marshalled CALL — the staging below
 	// must not leak into the output in that case.
+	//
+	// v128 operands that live in frame slots skip staging entirely:
+	// the splice reads them from (and writes the result to) the
+	// values' own slots via the SpliceSlots overrides. Only a v128
+	// without a slot (an unpacked FP parameter) still takes the
+	// copy path into the scratch area.
+	slots := &SpliceSlots{Out: -1}
+	if ret != nil && ret.Type == ssa.TypeV128 && ret.InSlot {
+		slots.Out = ret.SlotOff
+	}
 	var tmp strings.Builder
 	for i, a := range args {
 		ra := cargs[i]
 		switch {
 		case ra.Kind == ArgV128:
+			if a.InSlot {
+				if slots.Args == nil {
+					slots.Args = map[int]int{}
+				}
+				slots.Args[i] = a.SlotOff
+				continue
+			}
 			// Stack-assigned on both sides; the splice reads the
 			// halves from the scratch area at the sequence offset.
 			// R26 is a safe staging scratch: outside the int arg
@@ -243,7 +273,7 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 			return false, false
 		}
 	}
-	ok, trap := a64SpliceSimd(&tmp, name, cargs, cres, hasRes, scratchBase, s.pool, s.offs)
+	ok, trap := a64SpliceSimd(&tmp, name, cargs, cres, hasRes, scratchBase, s.pool, s.offs, slots)
 	if !ok {
 		return false, false
 	}
@@ -255,6 +285,8 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 	}
 	if hasRes {
 		switch {
+		case cres.Kind == ArgV128 && slots.Out >= 0:
+			// The splice already wrote the value's own slot.
 		case cres.Kind == ArgV128:
 			fmt.Fprintf(&tmp, "\tMOVD %d(RSP), R26\n", scratchBase+cres.SeqOf)
 			fmt.Fprintf(&tmp, "\tMOVD R26, %s\n", ret.Lo)
