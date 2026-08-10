@@ -744,7 +744,7 @@ func buildPkg(
 		// Emission shares this package's ConstPool so spliced bodies'
 		// constants intern alongside the transform's.
 		if df, isDirect := directSSA[name]; isDirect {
-			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, modOffs, pool, importPath, rel, calleeSig, stats); ok {
+			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, modOffs, pool, importPath, rel, calleeSig, fnOwner, stats); ok {
 				asmB.WriteString(dab)
 				asmB.WriteString("\n")
 				stats.DirectAsm++

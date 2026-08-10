@@ -1086,6 +1086,13 @@ func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, fra
 			fmt.Fprintf(b, "\tFMOVS F0, %d(RSP)\n", dst)
 		}
 	}
+	storeF64 := func() {
+		if home != "" {
+			fmt.Fprintf(b, "\tFMOVD F0, %s\n", home)
+		} else {
+			fmt.Fprintf(b, "\tFMOVD F0, %d(RSP)\n", dst)
+		}
+	}
 	switch name {
 	case "i64_extend_i32_s":
 		// MOVW sign-extends the low 32 bits into the full register.
@@ -1115,6 +1122,105 @@ func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, fra
 		fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
 		fmt.Fprintf(b, "\tFABSS F0, F0\n")
 		storeF()
+		return true, nil
+	case "f32_neg":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFNEGS F0, F0\n")
+		storeF()
+		return true, nil
+	case "f64_abs":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFABSD F0, F0\n")
+		storeF64()
+		return true, nil
+	case "f64_neg":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFNEGD F0, F0\n")
+		storeF64()
+		return true, nil
+	case "i32_wrap_i64":
+		// Low 32 bits; MOVWU zero-extends whether the source is a
+		// slot or a register home.
+		fmt.Fprintf(b, "\tMOVWU %s, R0\n", operandSrc64ARM64(v.Args[0], plan, frame))
+		storeGP("MOVW")
+		return true, nil
+	case "f64_promote_f32":
+		fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFCVTSD F0, F0\n")
+		storeF64()
+		return true, nil
+	case "f32_demote_f64":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFCVTDS F0, F0\n")
+		storeF()
+		return true, nil
+	case "f32_add", "f32_sub", "f32_mul", "f32_div",
+		"f64_add", "f64_sub", "f64_mul", "f64_div":
+		wide := strings.HasPrefix(name, "f64")
+		fmov := "FMOVS"
+		mn := map[string]string{"add": "FADDS", "sub": "FSUBS", "mul": "FMULS", "div": "FDIVS"}[name[4:]]
+		if wide {
+			fmov = "FMOVD"
+			mn = map[string]string{"add": "FADDD", "sub": "FSUBD", "mul": "FMULD", "div": "FDIVD"}[name[4:]]
+		}
+		fmt.Fprintf(b, "\t%s %s, F0\n", fmov, operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\t%s %s, F1\n", fmov, operandSrcFloat(v.Args[1], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\t%s F1, F0, F0\n", mn)
+		if wide {
+			storeF64()
+		} else {
+			storeF()
+		}
+		return true, nil
+	case "f32_convert_i32_s":
+		fmt.Fprintf(b, "\tMOVW %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tSCVTFWS R0, F0\n")
+		storeF()
+		return true, nil
+	case "f32_convert_i32_u":
+		fmt.Fprintf(b, "\tMOVWU %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tUCVTFWS R0, F0\n")
+		storeF()
+		return true, nil
+	case "f32_convert_i64_s":
+		fmt.Fprintf(b, "\tMOVD %s, R0\n", operandSrc64ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tSCVTFS R0, F0\n")
+		storeF()
+		return true, nil
+	case "f64_convert_i32_s":
+		fmt.Fprintf(b, "\tMOVW %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tSCVTFWD R0, F0\n")
+		storeF64()
+		return true, nil
+	case "f64_convert_i32_u":
+		fmt.Fprintf(b, "\tMOVWU %s, R0\n", operandSrc32ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tUCVTFWD R0, F0\n")
+		storeF64()
+		return true, nil
+	case "f64_convert_i64_s":
+		fmt.Fprintf(b, "\tMOVD %s, R0\n", operandSrc64ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tSCVTFD R0, F0\n")
+		storeF64()
+		return true, nil
+	case "f32_eq", "f32_ne", "f32_lt", "f32_le", "f32_gt", "f32_ge",
+		"f64_eq", "f64_ne", "f64_lt", "f64_le", "f64_gt", "f64_ge":
+		// IEEE compare, wasm semantics: unordered (NaN) yields 0 for
+		// every predicate except ne, which yields 1. The condition
+		// codes below are all unordered-false (NE is unordered-true),
+		// matching gc's own float-compare lowering.
+		wide := strings.HasPrefix(name, "f64")
+		fmov, fcmp := "FMOVS", "FCMPS"
+		if wide {
+			fmov, fcmp = "FMOVD", "FCMPD"
+		}
+		cond := map[string]string{
+			"eq": "EQ", "ne": "NE", "lt": "MI", "le": "LS", "gt": "GT", "ge": "GE",
+		}[name[4:]]
+		fmt.Fprintf(b, "\t%s %s, F0\n", fmov, operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\t%s %s, F1\n", fmov, operandSrcFloat(v.Args[1], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\t%s F1, F0\n", fcmp)
+		fmt.Fprintf(b, "\tCSET %s, R0\n", cond)
+		storeGP("MOVW")
 		return true, nil
 	}
 	return false, nil

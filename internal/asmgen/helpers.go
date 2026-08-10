@@ -160,8 +160,16 @@ var helperSigs = map[string]helperSpec{
 func helperAlwaysInline(name string) bool {
 	switch name {
 	case "i64_extend_i32_s", "i64_extend_i32_u", "i64_extend32_s",
+		"i32_wrap_i64",
 		"i32_reinterpret_f32", "f32_reinterpret_i32",
-		"f32_abs":
+		"f32_abs", "f32_neg", "f64_abs", "f64_neg",
+		"f64_promote_f32", "f32_demote_f64",
+		"f32_eq", "f32_ne", "f32_lt", "f32_le", "f32_gt", "f32_ge",
+		"f64_eq", "f64_ne", "f64_lt", "f64_le", "f64_gt", "f64_ge",
+		"f32_add", "f32_sub", "f32_mul", "f32_div",
+		"f64_add", "f64_sub", "f64_mul", "f64_div",
+		"f32_convert_i32_s", "f32_convert_i32_u", "f32_convert_i64_s",
+		"f64_convert_i32_s", "f64_convert_i32_u", "f64_convert_i64_s":
 		return true
 	}
 	return false

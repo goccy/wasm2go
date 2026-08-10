@@ -96,6 +96,17 @@ type FuncOptions struct {
 	// slot-only mode (no register homes, no m-cache, no loop-carry
 	// coalesce) because splice bodies clobber registers freely.
 	Splicer SimdSplicer
+	// CalleeSymbol, when non-nil, resolves a direct-call target to a
+	// locally CALLable bare asm symbol (no ·/(SB) decoration; possibly
+	// a host-emitted forward wrapper). Calls resolved this way are
+	// exempt from ForbidCalls — the host guarantees the symbol links
+	// in the package the body lands in. ok=false falls back to the
+	// FuncSymbol spelling and the ForbidCalls consequence.
+	CalleeSymbol func(funcIdx uint32) (string, bool)
+	// MemHelperSymbol likewise resolves the memory-op helper family
+	// (memorySize / memoryGrow / memoryCopy / memoryFill and their 64
+	// variants) to a locally CALLable bare symbol.
+	MemHelperSymbol func(name string) (string, bool)
 	// PackedParams, when non-nil, marks the packed outlined-boundary
 	// form: the Go-side signature carries only the module pointer and
 	// the parameter VALUES ride the Module's outline-pack scratch
@@ -292,7 +303,7 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 		return "", "", fmt.Errorf("%s: %w", name, err)
 	}
 	if opts.ForbidCalls && plan.hasNonSimdCall {
-		return "", "", fmt.Errorf("%s: function calls out (%s) and ForbidCalls is set", name, plan.firstCallDesc)
+		return "", "", fmt.Errorf("%s: function calls out (%s) and ForbidCalls is set", name, strings.Join(plan.callDescs, "; "))
 	}
 	plan.gpRegPool = a.GPRegPool()
 	plan.sseRegPool = a.SSERegPool()
@@ -2017,14 +2028,15 @@ type funcPlan struct {
 	// helper symbols ship with every SIMD-using bundle, so their
 	// CALLs stay allowed under ForbidCalls.
 	hasNonSimdCall bool
-	// firstCallDesc names the first non-SIMD callee planFunc saw, for
-	// the ForbidCalls diagnostic ("which call made this fall back").
-	firstCallDesc string
-	frameSize     int
-	calleeArea    int // bytes reserved at low SP for callee-arg staging
-	helperPfx     string
-	helperRefs    map[ssa.ValueID]string
-	directs       map[ssa.ValueID]*directCall
+	// callDescs names the distinct non-SIMD callees planFunc saw
+	// (capped), for the ForbidCalls diagnostic — listing all blockers
+	// lets one transpile show the full widening work list.
+	callDescs  []string
+	frameSize  int
+	calleeArea int // bytes reserved at low SP for callee-arg staging
+	helperPfx  string
+	helperRefs map[ssa.ValueID]string
+	directs    map[ssa.ValueID]*directCall
 	// hasMem records whether the function performs at least one
 	// load / store / mem-size / mem-grow op. Drives the
 	// `mCacheCandidate` decision — only memory-touching functions
@@ -2159,12 +2171,18 @@ type globalInlineInfo struct {
 // diagnostic and sets the flag.
 func (p *funcPlan) noteNonSimdCall(v *ssa.Value) {
 	p.hasNonSimdCall = true
-	if p.firstCallDesc == "" {
-		aux, _ := v.Aux.(string)
-		if aux == "" {
-			aux = fmt.Sprintf("aux=%v", v.Aux)
+	aux, _ := v.Aux.(string)
+	if aux == "" {
+		aux = fmt.Sprintf("#%d", v.AuxInt)
+	}
+	desc := fmt.Sprintf("%v %s", v.Op, aux)
+	for _, d := range p.callDescs {
+		if d == desc {
+			return
 		}
-		p.firstCallDesc = fmt.Sprintf("%v %s", v.Op, aux)
+	}
+	if len(p.callDescs) < 8 {
+		p.callDescs = append(p.callDescs, desc)
 	}
 }
 
@@ -2233,7 +2251,6 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				}
 			case ssa.OpCallDirect:
 				p.hasCall = true
-				p.noteNonSimdCall(v)
 				if opts.Module == nil {
 					return nil, fmt.Errorf("OpCallDirect v%d: FuncOptions.Module is required", v.ID)
 				}
@@ -2244,10 +2261,18 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 					return nil, fmt.Errorf("OpCallDirect v%d: callee %d frame: %w", v.ID, calleeIdx, err)
 				}
 				var bareName string
-				if opts.FuncSymbol != nil {
-					bareName = opts.FuncSymbol(calleeIdx)
-				} else {
-					bareName = fmt.Sprintf("Fn%d", calleeIdx)
+				resolved := false
+				if opts.CalleeSymbol != nil {
+					bareName, resolved = opts.CalleeSymbol(calleeIdx)
+				}
+				if !resolved {
+					// Unresolved callees count against ForbidCalls.
+					p.noteNonSimdCall(v)
+					if opts.FuncSymbol != nil {
+						bareName = opts.FuncSymbol(calleeIdx)
+					} else {
+						bareName = fmt.Sprintf("Fn%d", calleeIdx)
+					}
 				}
 				p.directs[v.ID] = &directCall{
 					sig:    csig,
@@ -2340,7 +2365,6 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				// logic. In multi-package mode the helpers live in
 				// base/ and are capitalized for cross-package use.
 				p.hasCall = true
-				p.noteNonSimdCall(v)
 				var csig wasm.FuncType
 				helperName := ""
 				switch v.Op {
@@ -2387,7 +2411,17 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				// implementation living in base. Plan9 asm cannot
 				// CALL across packages on user code, so the indirect
 				// hop is mandatory.
-				sym := fmt.Sprintf("·%s(SB)", helperName)
+				sym := ""
+				if opts.MemHelperSymbol != nil {
+					if bare, ok := opts.MemHelperSymbol(helperName); ok {
+						sym = fmt.Sprintf("·%s(SB)", bare)
+					}
+				}
+				if sym == "" {
+					// Unresolved helpers count against ForbidCalls.
+					p.noteNonSimdCall(v)
+					sym = fmt.Sprintf("·%s(SB)", helperName)
+				}
 				p.directs[v.ID] = &directCall{sig: csig, frame: cframe, symbol: sym}
 				if cframe.argSize > maxCallee {
 					maxCallee = cframe.argSize

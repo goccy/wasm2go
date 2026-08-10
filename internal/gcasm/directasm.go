@@ -40,7 +40,7 @@ type DirectAsmFn struct {
 // from asmgen's same-package CALL spelling yet, and a body that
 // emits but fails to link would break the build instead of falling
 // back.
-func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, modOffs *ModuleOffsets, pool *ConstPool, importPath, rel string, calleeSig calleeResolver, stats *BuildStats) (string, bool) {
+func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, modOffs *ModuleOffsets, pool *ConstPool, importPath, rel string, calleeSig calleeResolver, fnOwner map[string]string, stats *BuildStats) (string, bool) {
 	if len(mod.Memories) > 0 && (modOffs == nil || modOffs.M != asmgen.ModuleMOffset) {
 		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: Module layout unverified (probe %v)\n",
 			archName, name, modOffs)
@@ -51,12 +51,41 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	if df.Packed {
 		opts.PackedParams = df.PackedParams
 	}
+	if modOffs != nil {
+		opts.GlobalOffsets = modOffs.Cfg.DirectAsmGlobals
+	}
 	if rel != "" {
 		// Multi-package chunk: same-package helper CALL spellings do
 		// not resolve here. Setting the prefix makes the emitters
 		// fail any SIMD site that does not splice (per-function
 		// fallback) instead of emitting an unresolvable CALL.
 		opts.HelperPrefix = "base"
+	}
+	// Direct-call and memory-op callees resolve through the same
+	// machinery the listing transform uses; resolution registers the
+	// chunk-local forward wrapper as a side effect, so the returned
+	// symbol always links in this package.
+	opts.CalleeSymbol = func(idx uint32) (string, bool) {
+		for _, bare := range []string{fmt.Sprintf("Fn%d", idx), fmt.Sprintf("fn%d", idx)} {
+			owner, ok := fnOwner[bare]
+			if !ok {
+				continue
+			}
+			if _, _, _, localSym, ok2 := calleeSig(owner + "." + bare); ok2 {
+				return strings.TrimPrefix(localSym, "·"), true
+			}
+		}
+		return "", false
+	}
+	opts.MemHelperSymbol = func(helper string) (string, bool) {
+		qualified := importPath + "." + helper
+		if rel != "" {
+			qualified = importPath + "/base." + strings.ToUpper(helper[:1]) + helper[1:]
+		}
+		if _, _, _, localSym, ok := calleeSig(qualified); ok {
+			return strings.TrimPrefix(localSym, "·"), true
+		}
+		return "", false
 	}
 	if archName == "arm64" {
 		// The out-of-bounds trap CALL target for spliced memory ops,

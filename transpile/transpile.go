@@ -112,9 +112,10 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
 	}
 	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
-		FastMath:       opts.FastMath,
-		FuseLoopUnroll: opts.FuseLoopUnroll,
-		DirectAsm:      directAsm,
+		FastMath:         opts.FastMath,
+		FuseLoopUnroll:   opts.FuseLoopUnroll,
+		DirectAsm:        directAsm,
+		DirectAsmGlobals: res.DirectAsmGlobals,
 	})
 	if err != nil {
 		return res, fmt.Errorf("gcasm backend: %w", err)

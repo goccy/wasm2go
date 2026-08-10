@@ -222,9 +222,14 @@ type Result struct {
 	// DirectAsmSSA maps function names listed in Options.DirectAsmFuncs
 	// to their retained finalized SSA, for the asm bundle to emit via
 	// internal/asmgen. Names the translator never saw (or whose SSA is
-	// ineligible for retention, e.g. packed outlined boundaries) are
-	// simply absent.
+	// ineligible for retention) are simply absent.
 	DirectAsmSSA map[string]DirectAsmFn
+	// DirectAsmGlobals is the byte offset of each wasm global within
+	// the generated Module struct (-1 for imported globals), for
+	// direct-asm bodies to inline global accesses. Nil unless
+	// direct-asm retention is active. The generated bundle carries
+	// compile-time assertions pinning these offsets.
+	DirectAsmGlobals []int
 }
 
 // Translate parses helpers, walks the module, and emits Go source for
@@ -533,11 +538,15 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		return res, err
 	}
 	t.appendSimdHelperFiles(res.Files)
+	t.appendDirectAsmLayoutFile(res.Files)
 	res.FusedSimd = t.FusedTrees()
 	res.FusedLoops = t.FusedLoops()
 	res.Outlined = t.outlinedByChunk
 	res.OutlinedSigs = t.outlinedSigs
 	res.DirectAsmSSA = t.directAsmSSA
+	if len(t.directAsmSSA) > 0 {
+		res.DirectAsmGlobals = t.moduleGlobalOffsets()
+	}
 	if t.nrc2 != nil {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
 		res.Nrc2Companion = t.nrc2CompanionName()

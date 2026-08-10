@@ -39,6 +39,11 @@ type Config struct {
 	// those functions' asm bodies replace the listing transform per
 	// architecture (see buildDirectAsm). Nil disables the path.
 	DirectAsm map[string]DirectAsmFn
+	// DirectAsmGlobals is the Module-struct byte offset of each wasm
+	// global (-1 imported), computed by the translator that emitted
+	// the struct and pinned by generated compile-time assertions;
+	// direct-asm bodies inline global accesses through it.
+	DirectAsmGlobals []int
 }
 
 // ModuleOffsets are the *Module field offsets the memory-op splices
