@@ -242,8 +242,12 @@ func IsVoidAtomicStore(v *ssa.Value) bool {
 		return strings.HasPrefix(name, "atomicStore")
 	case ssa.OpSimdMemCall:
 		// SIMD stores are void too: they must stay in statement position
-		// rather than being hoisted into a dummy result variable.
-		return strings.HasPrefix(name, "simd_v128_store")
+		// rather than being hoisted into a dummy result variable. Both
+		// pointer widths spell the same store family — missing the
+		// memory64 prefix here hoisted every m64 store into `vN = ...`
+		// form, which kept it out of window fusion entirely.
+		return strings.HasPrefix(name, "simd_v128_store") ||
+			strings.HasPrefix(name, "simd_m64_v128_store")
 	}
 	return false
 }

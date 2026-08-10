@@ -1212,7 +1212,12 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		if es, ok := list[i].(*ast.ExprStmt); ok {
 			if call, cok := es.X.(*ast.CallExpr); cok {
 				if m, marked := sc.em.simdCalls[call]; marked {
-					if _, sok := fusedStoreOps[m.name]; sok {
+					// Strip the memory64 marker: a simd_m64_v128_store
+					// statement is the same store sink as its wasm32
+					// twin (missing this kept every memory64 store out
+					// of window fusion, unfusing whole conversion loops).
+					storeName, _ := fuseLookupName(m.name)
+					if _, sok := fusedStoreOps[storeName]; sok {
 						cands = append(cands, cand{store: call, span: i - start + 1, inter: pendingInter})
 						pendingInter = nil
 						continue
