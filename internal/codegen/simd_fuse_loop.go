@@ -20,6 +20,7 @@ package codegen
 import (
 	"fmt"
 	"go/ast"
+	"go/printer"
 	"go/token"
 	"strings"
 
@@ -69,7 +70,7 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		if _, ok := ifs.Body.List[0].(*ast.BranchStmt); !ok {
 			return nil, false
 		}
-		counter, ok := matchUiLt(ifs.Cond, sc.wideCounters())
+		counter, condWide, ok := matchUiLt(ifs.Cond, sc.wideCounters())
 		eqHead := false
 		if !ok {
 			// Third emitted shape: a head-tested while,
@@ -78,7 +79,7 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 			// at exactly the same counter values, so the loop reuses
 			// the pre-tested descriptor; tryFuseLoop rejects any other
 			// decrement under this head.
-			counter, ok = matchEqZero(ifs.Cond, sc.wideCounters())
+			counter, condWide, ok = matchEqZero(ifs.Cond, sc.wideCounters())
 			eqHead = ok
 		}
 		if !ok {
@@ -88,7 +89,7 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		if !ok || len(blk.List) < 2 {
 			return nil, false
 		}
-		cl := &countdownLoop{counter: counter, eqHead: eqHead}
+		cl := &countdownLoop{counter: counter, eqHead: eqHead, wide: condWide}
 		if !cl.splitTail(sc, blk.List, counter) {
 			return nil, false
 		}
@@ -200,27 +201,30 @@ func unwrapWidth(e ast.Expr) ast.Expr {
 // matchEqZero matches the head-tested while's break condition
 // `c == 0` (either operand order; the zero spelled at the counter's
 // width on memory64).
-func matchEqZero(e ast.Expr, wide bool) (*ast.Ident, bool) {
-	bin, ok := e.(*ast.BinaryExpr)
-	if !ok || bin.Op != token.EQL {
-		return nil, false
+func matchEqZero(e ast.Expr, wide bool) (id *ast.Ident, isWide, ok bool) {
+	bin, bok := e.(*ast.BinaryExpr)
+	if !bok || bin.Op != token.EQL {
+		return nil, false, false
 	}
 	x, y := bin.X, bin.Y
 	if _, isID := x.(*ast.Ident); !isID {
 		x, y = y, x
 	}
-	id, ok := x.(*ast.Ident)
-	if !ok {
-		return nil, false
+	id, iok := x.(*ast.Ident)
+	if !iok {
+		return nil, false, false
 	}
 	if wide {
-		if c, cok, _ := loopConstValue(y); !cok || c != 0 {
-			return nil, false
+		c, cok, w := loopConstValue(y)
+		if !cok || c != 0 {
+			return nil, false, false
 		}
-	} else if c, cok := intConstValue(y); !cok || c != 0 {
-		return nil, false
+		return id, w, true
 	}
-	return id, true
+	if c, cok := intConstValue(y); !cok || c != 0 {
+		return nil, false, false
+	}
+	return id, false, true
 }
 
 // wideCounters reports whether the scalarizer's module carries
@@ -237,6 +241,16 @@ func (sc *simdScalarizer) wideCounters() bool {
 func (sc *simdScalarizer) loopReject(tag string) (ast.Stmt, bool) {
 	fuseDebugf("FUSELOOP reject %s", tag)
 	return nil, false
+}
+
+// loopRejectBig is loopReject with the candidate's body size attached,
+// so a large (hot-kernel-sized) loop's refusal stands out from the
+// hundreds of small-loop refusals. Diagnostics only.
+func (sc *simdScalarizer) loopRejectBig(tag string, n int) (ast.Stmt, bool) {
+	if n >= 12 {
+		fuseDebugf("FUSELOOP-BIG reject %s n=%d", tag, n)
+	}
+	return sc.loopReject(tag)
 }
 
 // blankFor returns n blank identifiers for a keep-alive assignment.
@@ -341,38 +355,42 @@ func (cl *countdownLoop) classifyTailAssign(sc *simdScalarizer, as *ast.AssignSt
 // matchUiLt matches the unrolled header guard
 // `base.Ui32(c) < base.Ui32(int32(K))` (either helper-qualified or
 // plain), returning the counter.
-func matchUiLt(e ast.Expr, wide bool) (*ast.Ident, bool) {
-	bin, ok := e.(*ast.BinaryExpr)
-	if !ok || bin.Op != token.LSS {
-		return nil, false
+func matchUiLt(e ast.Expr, wide bool) (id *ast.Ident, isWide, ok bool) {
+	bin, bok := e.(*ast.BinaryExpr)
+	if !bok || bin.Op != token.LSS {
+		return nil, false, false
 	}
 	// Both counter widths: wasm32 spells the guard Ui32(c) < Ui32(K);
 	// a memory64 module's promoted i64 counter spells it
-	// Ui64(c) < Ui64(int64(K)).
-	unwrap := func(x ast.Expr) ast.Expr {
-		if c, ok := x.(*ast.CallExpr); ok && len(c.Args) == 1 {
+	// Ui64(c) < Ui64(int64(K)). The matched width is reported back —
+	// it is the COUNTER's width, which the loop descriptor must carry
+	// even when every decrement term is a const local whose spelling
+	// cannot be inspected here.
+	unwrap := func(x ast.Expr) (ast.Expr, bool) {
+		if c, cok := x.(*ast.CallExpr); cok && len(c.Args) == 1 {
 			switch n := helperName(c.Fun); {
 			case strings.HasSuffix(n, "i32"), n == "Ui32", n == "ui32":
-				return c.Args[0]
+				return c.Args[0], false
 			case wide && (strings.HasSuffix(n, "i64") || n == "Ui64" || n == "ui64"):
-				return c.Args[0]
+				return c.Args[0], true
 			}
 		}
-		return x
+		return x, false
 	}
-	id, ok := unwrap(bin.X).(*ast.Ident)
-	if !ok {
-		return nil, false
+	x, xWide := unwrap(bin.X)
+	id, iok := x.(*ast.Ident)
+	if !iok {
+		return nil, false, false
 	}
-	c := unwrap(bin.Y)
+	c, _ := unwrap(bin.Y)
 	if wide {
-		if _, ok, _ := loopConstValue(c); !ok {
-			return nil, false
+		if _, cok, _ := loopConstValue(c); !cok {
+			return nil, false, false
 		}
-	} else if _, ok := intConstValue(c); !ok {
-		return nil, false
+	} else if _, cok := intConstValue(c); !cok {
+		return nil, false, false
 	}
-	return id, ok
+	return id, xWide, true
 }
 
 // matchCounterDec matches `c = c - K` and reassociated chains
@@ -483,12 +501,24 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	if !ok {
 		return sc.loopReject("L425")
 	}
+	if fuseDebugEnabled && len(cl.body) >= 12 {
+		var db strings.Builder
+		fmt.Fprintf(&db, "LOOPBODY n=%d carries=%d bumps=%d\n", len(cl.body), len(cl.carries), len(cl.bumps))
+		for i, st := range cl.body {
+			fmt.Fprintf(&db, "  [%02d] ", i)
+			if err := printer.Fprint(&db, token.NewFileSet(), st); err != nil {
+				fmt.Fprintf(&db, "<print error: %v>", err)
+			}
+			db.WriteString("\n")
+		}
+		fuseDebugf("%s", db.String())
+	}
 	// Fuse the whole body into one region. Leading interveners join
 	// the window; the trial must consume every statement.
 	var wpre []ast.Stmt
 	stmt, span, ok := sc.tryFuseWindowEx(cl.body, 0, &wpre, true)
 	if !ok {
-		return sc.loopReject("L432")
+		return sc.loopRejectBig("L432", len(cl.body))
 	}
 	for _, st := range cl.body[span:] {
 		// Statements after the last candidate: constant defs (bump
@@ -501,11 +531,11 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				continue
 			}
 		}
-		return sc.loopReject("L445")
+		return sc.loopRejectBig("L445", len(cl.body))
 	}
 	call, rootVars, ok := fusedCallParts(stmt)
 	if !ok {
-		return sc.loopReject("L449")
+		return sc.loopRejectBig("L449", len(cl.body))
 	}
 	fxName := helperName(call.Fun)
 	if strings.HasPrefix(fxName, "Simd_") {
@@ -515,7 +545,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	}
 	tree := sc.em.t.FusedTrees()[fxName]
 	if tree == nil {
-		return sc.loopReject("L459")
+		return sc.loopRejectBig("L459", len(cl.body))
 	}
 	// Locate argument slots by name: scalars start after m, pairs
 	// after scalars+floats (two slots each).
@@ -571,16 +601,16 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, t := range cl.decEx {
 		c, cok := resolveC(t)
 		if !cok {
-			return sc.loopReject("L515")
+			return sc.loopRejectBig("L515", len(cl.body))
 		}
 		dec += c
 	}
 	if dec <= 0 {
-		return sc.loopReject("L520")
+		return sc.loopRejectBig("L520", len(cl.body))
 	}
 	if cl.eqHead && dec != 1 {
 		// `c == 0` only equals the `< dec` pre-test when dec is 1.
-		return sc.loopReject("eq-head-nonunit-dec")
+		return sc.loopRejectBig("eq-head-nonunit-dec", len(cl.body))
 	}
 	loop := &simdfuse.Loop{Tree: tree, Dec: dec, PreTest: cl.decVar == nil, CounterWide: cl.wide}
 	// Carries: `prev = next` with prev a pair argument and next a
@@ -595,7 +625,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		next := ca.Rhs[0].(*ast.Ident).Name
 		ri, rok := rootIdx[next]
 		if !rok {
-			return sc.loopReject("L535")
+			return sc.loopRejectBig("L535", len(cl.body))
 		}
 		if pi, pok := pairSlot[prev]; pok {
 			loop.CarriedPairs = append(loop.CarriedPairs, [2]int{pi, roots[ri]})
@@ -690,7 +720,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		y := b.Rhs[0].(*ast.BinaryExpr).Y
 		if si, sok := scalarSlot[name]; sok {
 			if !addBump(si, name, y) {
-				return sc.loopReject("L627")
+				return sc.loopRejectBig("L627", len(cl.body))
 			}
 			continue
 		}
@@ -721,12 +751,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				bumpFixes = append(bumpFixes, bumpFix{target: name, temp: lhsName, addend: addend})
 			}
 			if !addBump(i, lhsName, y) {
-				return sc.loopReject("L658")
+				return sc.loopRejectBig("L658", len(cl.body))
 			}
 			matched++
 		}
 		if matched == 0 {
-			return sc.loopReject("L663")
+			return sc.loopRejectBig("L663", len(cl.body))
 		}
 		droppedBump[name] = true
 	}
@@ -742,7 +772,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	if 1+tree.NumScalars+1+loop.NumDeltas > fusedMaxIntRegs ||
 		1+tree.NumScalars+1+loop.NumDeltas+2*tree.NumPairs > fusedMaxIntSlots ||
 		2*len(roots)+len(loop.ExitScalars) > fusedMaxIntSlots {
-		return sc.loopReject("L679")
+		return sc.loopRejectBig("L679", len(cl.body))
 	}
 	// Escape checks: values the loop produces per-iteration but does
 	// not return must be dead after the loop. The carried PREVIOUS
@@ -777,11 +807,11 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				exitCopied[name] = true
 				continue
 			}
-			return sc.loopReject("L714")
+			return sc.loopRejectBig("L714", len(cl.body))
 		}
 	}
 	if cl.decVar != nil && escape(cl.decVar.Name) {
-		return sc.loopReject("L718")
+		return sc.loopRejectBig("L718", len(cl.body))
 	}
 	// Remaining interveners hoist above the loop: they must be
 	// loop-invariant, reading nothing the loop writes.
@@ -798,7 +828,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, st := range wpre {
 		as, ok := st.(*ast.AssignStmt)
 		if !ok {
-			return sc.loopReject("L735")
+			return sc.loopRejectBig("L735", len(cl.body))
 		}
 		bad := false
 		for _, r := range as.Rhs {
@@ -810,12 +840,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 			})
 		}
 		if bad {
-			return sc.loopReject("L747")
+			return sc.loopRejectBig("L747", len(cl.body))
 		}
 	}
 	name, ok := sc.em.t.internFusedLoop(loop)
 	if !ok {
-		return sc.loopReject("L752")
+		return sc.loopRejectBig("L752", len(cl.body))
 	}
 	sc.em.useHelper(name)
 	// Assemble the replacement: hoisted interveners, then one call.
@@ -907,6 +937,13 @@ func fusedCallParts(st ast.Stmt) (*ast.CallExpr, []string, bool) {
 // fuseConstOf resolves a literal or bound-constant expression.
 func (sc *simdScalarizer) fuseConstOf(e ast.Expr) (int32, bool) {
 	if c, ok := intConstValue(e); ok {
+		return c, true
+	}
+	// A memory64 module spells the same constant int64(K): the loop
+	// upgrade's tail/leftover classification must treat both widths as
+	// the constant they are (a width-blind check here left the m64
+	// bump-delta local in the body and refused the whole upgrade).
+	if c, ok, _ := loopConstValue(e); ok {
 		return c, true
 	}
 	if id, ok := e.(*ast.Ident); ok {
