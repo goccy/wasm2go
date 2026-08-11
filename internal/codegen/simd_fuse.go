@@ -1297,7 +1297,9 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		if !sc.fuseSafeIntervener(st) {
 			if loopMode && len(list)-start >= 20 {
 				var db strings.Builder
-				_ = printer.Fprint(&db, token.NewFileSet(), st)
+				if err := printer.Fprint(&db, token.NewFileSet(), st); err != nil {
+					fmt.Fprintf(&db, "<print error: %v>", err)
+				}
 				fuseDebugf("LOOPCAND stop at [%d/%d] cands=%d unsafe-intervener: %.120s", i-start, len(list)-start, len(cands), db.String())
 			}
 			break
