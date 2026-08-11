@@ -552,6 +552,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		res.Nrc2Companion = t.nrc2CompanionName()
 	}
 	t.warnStaleF16Table()
+	reportChaseSites()
 	return res, nil
 }
 

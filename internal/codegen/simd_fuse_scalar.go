@@ -64,6 +64,7 @@ type chaseSnap struct {
 	chaseUses      map[string]int
 	chaseCache     map[string]int
 	chaseReads     map[string]bool
+	chaseExpanded  map[string]bool
 }
 
 func copyMapInt(m map[string]int) map[string]int {
@@ -85,12 +86,20 @@ func (fb *fusedTreeBuilder) snapshotChase() chaseSnap {
 			reads[k] = v
 		}
 	}
+	var expanded map[string]bool
+	if fb.chaseExpanded != nil {
+		expanded = make(map[string]bool, len(fb.chaseExpanded))
+		for k, v := range fb.chaseExpanded {
+			expanded[k] = v
+		}
+	}
 	return chaseSnap{
 		nodes: len(fb.nodes), scalars: len(fb.scalars),
-		scalarDedup: copyMapInt(fb.scalarDedup),
-		chaseUses:   copyMapInt(fb.chaseUses),
-		chaseCache:  copyMapInt(fb.chaseCache),
-		chaseReads:  reads,
+		scalarDedup:   copyMapInt(fb.scalarDedup),
+		chaseUses:     copyMapInt(fb.chaseUses),
+		chaseCache:    copyMapInt(fb.chaseCache),
+		chaseReads:    reads,
+		chaseExpanded: expanded,
 	}
 }
 
@@ -102,6 +111,7 @@ func (fb *fusedTreeBuilder) restoreChase(s chaseSnap) {
 	fb.chaseUses = s.chaseUses
 	fb.chaseCache = s.chaseCache
 	fb.chaseReads = s.chaseReads
+	fb.chaseExpanded = s.chaseExpanded
 }
 
 // chaseF32 resolves a float32 expression to a ClassF32 node index.
@@ -266,10 +276,25 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 					// consuming; a plain alias stays an intervener.
 					return simdfuse.Arg{}, false
 				}
-				if fb.chaseUses == nil {
-					fb.chaseUses = map[string]int{}
+				// Count this definition's textual consumption ONCE
+				// per trial: a def dropped at commit removes exactly
+				// one occurrence of each name ITS body reads, no
+				// matter how many consumers re-chased the same chain.
+				// Counting per re-chase overcounted (two loads
+				// chasing v311 bumped v309 twice), made the
+				// fully-consumed proof hold spuriously, and dropped a
+				// definition a loop-tail bump still read — leaving
+				// the bump reading the variable's zero value.
+				if fb.chaseExpanded == nil {
+					fb.chaseExpanded = map[string]bool{}
 				}
-				fb.chaseUses[x.Name]++
+				if !fb.chaseExpanded[x.Name] {
+					fb.chaseExpanded[x.Name] = true
+					if fb.chaseUses == nil {
+						fb.chaseUses = map[string]int{}
+					}
+					fb.chaseUses[x.Name]++
+				}
 				return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: a.Index}, true
 			}
 		}

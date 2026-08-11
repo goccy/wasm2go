@@ -281,6 +281,10 @@ type fusedTreeBuilder struct {
 	chaseUses  map[string]int
 	chaseCache map[string]int
 	chaseReads map[string]bool
+	// chaseExpanded marks definitions whose CHILD reads this trial
+	// already charged to chaseUses: a def's body text is consumed at
+	// most once however many consumers re-chase the same chain.
+	chaseExpanded map[string]bool
 	// addr64 marks the tree-in-progress as a memory64 one (some member
 	// is a simd_m64_* memory op); see simdfuse.Tree.Addr64.
 	addr64 bool
@@ -921,6 +925,45 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				c, cok = addrConstOf(cExpr)
 			}
 			if cok {
+				// memory64: a const-sum base that is itself a chased
+				// intervener chain (`v243 = v228+l6`; rows sharing the
+				// atoms) burns one slot PER BASE under the plain
+				// ArgSum leg — decompose it into scalar-node atoms
+				// first, so k row addresses share the atoms' slots.
+				// The chase is transactional, and the leg is gated on
+				// addr64 to keep the wasm32 output byte-identical
+				// (same policy as chaseAddr's SUB leg).
+				if fb.addr64 && chaseSiteAllowed() {
+					if baseID, ok := base.(*ast.Ident); ok && fb.interDef != nil &&
+						!fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
+						if _, dok := fb.interDef[baseID.Name]; dok {
+							snap := fb.snapshotChase()
+							if l, lok := fb.chaseI32(base); lok {
+								var arg simdfuse.Arg
+								ok := true
+								switch l.Kind {
+								case simdfuse.ArgNode:
+									idx, nok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, {Kind: simdfuse.ArgConst, Const: c}})
+									if !nok {
+										ok = false
+									} else {
+										arg = simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}
+										fmt.Fprintf(&fb.key, "n%d,", idx)
+									}
+								default:
+									// Bisect: only the node-producing
+									// chase for now.
+									ok = false
+								}
+								if ok {
+									nodeArgs = append(nodeArgs, arg)
+									continue
+								}
+							}
+							fb.restoreChase(snap)
+						}
+					}
+				}
 				if baseID, ok := base.(*ast.Ident); ok && !fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
 					idx, iok := fb.scalarDedup[baseID.Name]
 					if !iok {
@@ -1058,6 +1101,40 @@ func (fb *fusedTreeBuilder) pairDebug() string {
 		out += exprDebugString(p)
 	}
 	return out
+}
+
+// chaseSiteCount / chaseSiteMax bisect the const-sum base chase
+// (diagnosis only): WASM2GO_CHASE_MAX=N applies the chase to the
+// first N candidate sites and leaves the rest on the legacy path.
+var (
+	chaseSiteCount int
+	chaseSiteMax   = func() int {
+		v := os.Getenv("WASM2GO_CHASE_MAX")
+		if v == "" {
+			return -1
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return -1
+		}
+		return n
+	}()
+)
+
+func chaseSiteAllowed() bool {
+	chaseSiteCount++
+	if chaseSiteMax < 0 {
+		return true
+	}
+	return chaseSiteCount <= chaseSiteMax
+}
+
+// reportChaseSites prints the running candidate-site count under the
+// bisect env (diagnosis only; called from the translate epilogue).
+func reportChaseSites() {
+	if chaseSiteMax >= 0 || os.Getenv("WASM2GO_CHASE_COUNT") != "" {
+		fmt.Fprintf(os.Stderr, "wasm2go: chase sites so far: %d\n", chaseSiteCount)
+	}
 }
 
 // fuseDebugEnabled gates the window-trial diagnostics: with
