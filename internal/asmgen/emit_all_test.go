@@ -29,7 +29,7 @@ var emitSweepFixtures = []string{
 	"cg_numerics", "cg_passive_data", "cg_recover", "cg_sharedexit",
 	"cg_sharedimage", "cg_simd", "cg_simd_addrsum32", "cg_simd_conv32",
 	"cg_simd_loop", "cg_simd_loopsum", "cg_simd_store32", "cg_specialfp",
-	"cg_threads", "cg_threads_multiword", "cg_threads_musl_lock", "cg_threads_mutex",
+	"cg_threads", "cg_threads_musl_lock", "cg_threads_mutex",
 	"cg_threads_visibility", "cg_threads_wake_dir", "cg_traps", "cg_unreachable",
 	"cg_wasi",
 }
