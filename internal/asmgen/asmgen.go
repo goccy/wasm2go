@@ -18,7 +18,6 @@ package asmgen
 import (
 	"fmt"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 
@@ -266,25 +265,6 @@ func EmitFuncARM64(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions
 	return emitFunc(name, sig, f, opts, archARM64{})
 }
 
-// parseTrailingInt returns the trailing decimal integer in s, if any —
-// "Fn42" → (42, true), "Fn" → (0, false), "abc" → (0, false). Used by
-// the BISECT_LO/HI env-var path to map function names back to their
-// wasm function index.
-func parseTrailingInt(s string) (int, bool) {
-	i := len(s)
-	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
-		i--
-	}
-	if i == len(s) {
-		return 0, false
-	}
-	n, err := strconv.Atoi(s[i:])
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
 func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a arch) (asm, goDecl string, err error) {
 	frame, err := computeArgFrame(sig)
 	if err != nil {
@@ -355,75 +335,34 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	// "one slot per actually-spilled value". On the hot integration
 	// corpus functions this collapses a 3.7 KB frame to the
 	// neighbourhood of what Pure-Go produces (~100 bytes).
-	//
-	// WASM2GO_REGALLOC_BISECT_LO / _HI restrict regalloc to functions
-	// whose numeric suffix lies in the inclusive range [LO, HI].
-	// Function names are "Fn42" / "fn42" / similar — the trailing
-	// integer is the wasm function index, which is sequential and
-	// stable across regeneration runs. When neither is set, regalloc
-	// runs for every function. When one or both are set:
-	//   - parse a trailing decimal integer from f.Name; if none, the
-	//     function is excluded;
-	//   - LO defaults to 0, HI defaults to math.MaxInt;
-	//   - regalloc runs iff LO <= index <= HI.
-	// This gives a clean log2(N) bisection over the function-index
-	// space — pin a failing range, halve it, repeat.
-	// Splice-mode arm64: no block-local regalloc (splices clobber
-	// its pool), but loop carries CAN live in the splice-safe
-	// registers — see runSpliceCoalescePass.
 	if plan.spliceMode {
 		if _, isARM64 := a.(archARM64); isARM64 {
 			runSpliceCoalescePass(f, plan)
 		}
 	}
 	if a.SupportsRegHome() && !plan.spliceMode {
-		runRegalloc := true
-		loStr, hiStr := os.Getenv("WASM2GO_REGALLOC_BISECT_LO"), os.Getenv("WASM2GO_REGALLOC_BISECT_HI")
-		if loStr != "" || hiStr != "" {
-			runRegalloc = false
-			idx, ok := parseTrailingInt(f.Name)
-			if ok {
-				lo := 0
-				hi := math.MaxInt
-				if loStr != "" {
-					if v, err := strconv.Atoi(loStr); err == nil {
-						lo = v
-					}
-				}
-				if hiStr != "" {
-					if v, err := strconv.Atoi(hiStr); err == nil {
-						hi = v
-					}
-				}
-				if idx >= lo && idx <= hi {
-					runRegalloc = true
-				}
-			}
-		}
-		if runRegalloc {
-			// Always-on: route through the cross-block Belady
-			// allocator's bridge. For functions outside the safe
-			// shape (isSafeForNewRegalloc returns false) the bridge
-			// falls back to computeRegHomes internally, so the call
-			// is correct for every function — the safety gate lives
-			// in applyNewRegalloc, not here.
-			//
-			// The cross-block allocator's stackalloc subsumes
-			// compactFrame: applyNewRegalloc runs the
-			// interference-aware slot allocator inline and rewrites
-			// plan.offsets / plan.frameSize itself. Running
-			// compactFrame after would re-shuffle the offsets via
-			// its own (simpler) re-packing, which can mis-handle
-			// shared slots — compactFrame dedupes by offset without
-			// an interference test, so it would treat each
-			// shared-slot occupant as a fresh pool entry and grow
-			// the frame again. The bridge skips compactFrame when
-			// its stackalloc fired; for functions where it didn't
-			// (no shrinkage opportunity), compactFrame still runs.
-			didStackalloc := applyNewRegalloc(f, plan, a)
-			if !didStackalloc {
-				compactFrame(f, plan)
-			}
+		// Route through the cross-block Belady allocator's bridge.
+		// For functions outside the safe shape
+		// (isSafeForNewRegalloc returns false) the bridge falls
+		// back to computeRegHomes internally, so the call is
+		// correct for every function — the safety gate lives in
+		// applyNewRegalloc, not here.
+		//
+		// The cross-block allocator's stackalloc subsumes
+		// compactFrame: applyNewRegalloc runs the
+		// interference-aware slot allocator inline and rewrites
+		// plan.offsets / plan.frameSize itself. Running
+		// compactFrame after would re-shuffle the offsets via
+		// its own (simpler) re-packing, which can mis-handle
+		// shared slots — compactFrame dedupes by offset without
+		// an interference test, so it would treat each
+		// shared-slot occupant as a fresh pool entry and grow
+		// the frame again. The bridge skips compactFrame when
+		// its stackalloc fired; for functions where it didn't
+		// (no shrinkage opportunity), compactFrame still runs.
+		didStackalloc := applyNewRegalloc(f, plan, a)
+		if !didStackalloc {
+			compactFrame(f, plan)
 		}
 	}
 

@@ -17,7 +17,6 @@ package codegen
 import (
 	"fmt"
 	"go/ast"
-	"go/printer"
 	"go/token"
 	"os"
 	"strconv"
@@ -933,7 +932,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				// The chase is transactional, and the leg is gated on
 				// addr64 to keep the wasm32 output byte-identical
 				// (same policy as chaseAddr's SUB leg).
-				if fb.addr64 && chaseSiteAllowed() {
+				if fb.addr64 {
 					if baseID, ok := base.(*ast.Ident); ok && fb.interDef != nil &&
 						!fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
 						if _, dok := fb.interDef[baseID.Name]; dok {
@@ -1103,46 +1102,15 @@ func (fb *fusedTreeBuilder) pairDebug() string {
 	return out
 }
 
-// chaseSiteCount / chaseSiteMax bisect the const-sum base chase
-// (diagnosis only): WASM2GO_CHASE_MAX=N applies the chase to the
-// first N candidate sites and leaves the rest on the legacy path.
-var (
-	chaseSiteCount int
-	chaseSiteMax   = func() int {
-		v := os.Getenv("WASM2GO_CHASE_MAX")
-		if v == "" {
-			return -1
-		}
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return -1
-		}
-		return n
-	}()
-)
-
-func chaseSiteAllowed() bool {
-	chaseSiteCount++
-	if chaseSiteMax < 0 {
-		return true
-	}
-	return chaseSiteCount <= chaseSiteMax
-}
-
-// reportChaseSites prints the running candidate-site count under the
-// bisect env (diagnosis only; called from the translate epilogue).
-func reportChaseSites() {
-	if chaseSiteMax >= 0 || os.Getenv("WASM2GO_CHASE_COUNT") != "" {
-		fmt.Fprintf(os.Stderr, "wasm2go: chase sites so far: %d\n", chaseSiteCount)
-	}
-}
-
 // fuseDebugEnabled gates the window-trial diagnostics: with
-// WASM2GO_FUSE_DEBUG set, every failed fusion trial of at least four
+// Options.FuseDebug set, every failed fusion trial of at least four
 // candidates prints its width and first refusal to stderr. This is
 // the histogram workflow that localized both the K=4 unlock and the
-// memory64 window-starvation regressions.
-var fuseDebugEnabled = os.Getenv("WASM2GO_FUSE_DEBUG") != ""
+// memory64 window-starvation regressions. Set from Translate (the
+// transpiler runs one module per process, so a package flag suffices
+// and keeps fuseDebugf callable without threading a receiver through
+// every walk helper).
+var fuseDebugEnabled bool
 
 func fuseDebugf(format string, args ...interface{}) {
 	if fuseDebugEnabled {
@@ -1372,20 +1340,10 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		st := list[i]
 		if !sc.fuseSafeIntervener(st) {
-			if loopMode && len(list)-start >= 20 {
-				var db strings.Builder
-				if err := printer.Fprint(&db, token.NewFileSet(), st); err != nil {
-					fmt.Fprintf(&db, "<print error: %v>", err)
-				}
-				fuseDebugf("LOOPCAND stop at [%d/%d] cands=%d unsafe-intervener: %.120s", i-start, len(list)-start, len(cands), db.String())
-			}
 			break
 		}
 		pendingInter = append(pendingInter, st)
 		nInter++
-	}
-	if loopMode && len(list)-start >= 20 {
-		fuseDebugf("LOOPCAND done n=%d cands=%d inter=%d", len(list)-start, len(cands), nInter)
 	}
 	// Try the longest window first; the walk is a pure analysis, so a
 	// failed length just retries shorter on a fresh builder.

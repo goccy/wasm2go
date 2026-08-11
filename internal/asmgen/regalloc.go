@@ -1,9 +1,6 @@
 package asmgen
 
 import (
-	"fmt"
-	"os"
-
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -135,16 +132,7 @@ func regHomeEligibleOp(op ssa.Op) bool {
 // called AFTER planFunc has populated plan.branchFused and
 // plan.globalInline (so the CALL-barrier check sees only the ops
 // that actually emit a CALL).
-//
-// Setting WASM2GO_REGALLOC_DEBUG in the environment activates an
-// extra post-pass that re-derives each value's lifetime by an
-// independent walk and prints a stderr warning if any pair of
-// values whose lifetimes overlap inside one block got assigned
-// the same register. Useful for shaking out lifetime-miscount
-// bugs without spamming logs in the steady state.
-//
-// Setting WASM2GO_REGALLOC_DUMP=<funcName> dumps the regalloc
-// decisions for the matching function to stderr.
+
 func computeRegHomes(f *ssa.Func, plan *funcPlan) {
 	// The cross-block loop-carry coalesce pass runs FIRST so the
 	// per-block linear scan sees the reserved-register set in
@@ -156,113 +144,6 @@ func computeRegHomes(f *ssa.Func, plan *funcPlan) {
 	runCoalescePass(f, plan)
 	for _, blk := range f.Blocks {
 		assignBlockRegHomes(blk, f, plan)
-	}
-	if os.Getenv("WASM2GO_REGALLOC_DEBUG") != "" {
-		verifyRegHomes(f, plan)
-	}
-	if dumpName := os.Getenv("WASM2GO_REGALLOC_DUMP"); dumpName != "" && dumpName == f.Name {
-		dumpRegHomes(f, plan)
-	}
-}
-
-// dumpRegHomes prints the function's per-block value list with
-// each value's def block, its Op, the regHome reg (if any), and a
-// brief use summary. Used to inspect regalloc decisions for a
-// specific function during debugging.
-func dumpRegHomes(f *ssa.Func, plan *funcPlan) {
-	fmt.Fprintf(os.Stderr, "=== regalloc dump for %s ===\n", f.Name)
-	for _, blk := range f.Blocks {
-		fmt.Fprintf(os.Stderr, "block %d:\n", blk.ID)
-		for i, v := range blk.Values {
-			reg := plan.regHome[v.ID]
-			args := ""
-			for j, a := range v.Args {
-				if j > 0 {
-					args += ", "
-				}
-				if a == nil {
-					args += "<nil>"
-				} else {
-					args += fmt.Sprintf("v%d", a.ID)
-				}
-			}
-			fmt.Fprintf(os.Stderr, "  %d: v%d %v(%s) %v home=%q\n",
-				i, v.ID, v.Op, args, v.Type, reg)
-		}
-		if blk.Control != nil {
-			fmt.Fprintf(os.Stderr, "  control: v%d\n", blk.Control.ID)
-		}
-		fmt.Fprintf(os.Stderr, "  succs: ")
-		for _, s := range blk.Succs {
-			if s.Block != nil {
-				fmt.Fprintf(os.Stderr, "b%d ", s.Block.ID)
-			}
-		}
-		fmt.Fprintf(os.Stderr, "\n")
-	}
-}
-
-// verifyRegHomes is a debug-only sanity check that two values
-// assigned the same register never have overlapping lifetimes
-// within the same block. Triggered by WASM2GO_REGALLOC_DEBUG.
-func verifyRegHomes(f *ssa.Func, plan *funcPlan) {
-	for _, blk := range f.Blocks {
-		idx := map[ssa.ValueID]int{}
-		for i, v := range blk.Values {
-			idx[v.ID] = i
-		}
-		lastUse := map[ssa.ValueID]int{}
-		for i, v := range blk.Values {
-			for _, a := range v.Args {
-				if a == nil {
-					continue
-				}
-				actual := resolveCopy(a)
-				if actual == nil {
-					continue
-				}
-				if _, ok := idx[actual.ID]; ok {
-					if i > lastUse[actual.ID] {
-						lastUse[actual.ID] = i
-					}
-				}
-			}
-		}
-		if blk.Control != nil {
-			if actual := resolveCopy(blk.Control); actual != nil {
-				if _, ok := idx[actual.ID]; ok {
-					lastUse[actual.ID] = len(blk.Values)
-				}
-			}
-		}
-		type span struct {
-			id    ssa.ValueID
-			start int
-			end   int
-		}
-		byReg := map[string][]span{}
-		for vid, reg := range plan.regHome {
-			s, ok := idx[vid]
-			if !ok {
-				continue
-			}
-			e := lastUse[vid]
-			if e < s {
-				e = s
-			}
-			byReg[reg] = append(byReg[reg], span{vid, s, e})
-		}
-		for reg, spans := range byReg {
-			for i := 0; i < len(spans); i++ {
-				for j := i + 1; j < len(spans); j++ {
-					a, b := spans[i], spans[j]
-					if a.start <= b.end && b.start <= a.end {
-						fmt.Fprintf(os.Stderr, "REGALLOC CONFLICT: block %d reg %s: v%d [%d,%d] vs v%d [%d,%d]\n",
-							blk.ID, reg, a.id, a.start, a.end, b.id, b.start, b.end)
-					}
-				}
-			}
-		}
 	}
 }
 
