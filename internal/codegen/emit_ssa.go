@@ -16,7 +16,11 @@ import (
 // (helper registration into translator.helpers, multi-package vs
 // single-package qualifier choice, etc).
 type ssaEmitter struct {
-	t *translator
+	// mem64: the module memory uses 64-bit addressing; memory access
+	// emission casts addresses to uint64 instead of uint32 and the
+	// size/grow/bulk helpers switch to their 64-bit variants.
+	mem64 bool
+	t     *translator
 	// packedPrologue, when set, holds the packed-boundary unpack
 	// statements of an outlined function; emitFuncBody prepends them
 	// BEFORE scalarization and clears the field.
@@ -61,7 +65,13 @@ type simdCallMark struct {
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
 // is allowed for unit tests that don't need helper registration.
-func newSSAEmitter(t *translator) *ssaEmitter { return &ssaEmitter{t: t} }
+func newSSAEmitter(t *translator) *ssaEmitter {
+	em := &ssaEmitter{t: t}
+	if t != nil && t.mod != nil {
+		em.mem64 = t.mod.Memory64()
+	}
+	return em
+}
 
 // emitSSAFuncBody converts an ssa.Func into the Go-AST body for one
 // translated function.
@@ -1003,15 +1013,23 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		em.markSimdCall(call, name, v, 1)
 		return call, nil
 	case ssa.OpMemSize:
-		em.useHelper("memorySize")
-		return &ast.CallExpr{Fun: em.helperRef("memorySize"), Args: []ast.Expr{newID("m")}}, nil
+		name := "memorySize"
+		if em.mem64 {
+			name = "memorySize64"
+		}
+		em.useHelper(name)
+		return &ast.CallExpr{Fun: em.helperRef(name), Args: []ast.Expr{newID("m")}}, nil
 	case ssa.OpMemGrow:
-		em.useHelper("memoryGrow")
+		name := "memoryGrow"
+		if em.mem64 {
+			name = "memoryGrow64"
+		}
+		em.useHelper(name)
 		delta, err := emit(v.Args[0])
 		if err != nil {
 			return nil, err
 		}
-		return &ast.CallExpr{Fun: em.helperRef("memoryGrow"), Args: []ast.Expr{newID("m"), delta}}, nil
+		return &ast.CallExpr{Fun: em.helperRef(name), Args: []ast.Expr{newID("m"), delta}}, nil
 	}
 	// Inline memory loads: emit the unsafe deref expression directly
 	// rather than calling a helper. See emit_memops.go for the per-
@@ -1089,7 +1107,11 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 		}
 		return &ast.ExprStmt{X: expr}, nil
 	case ssa.OpMemoryCopy:
-		em.useHelper("memoryCopy")
+		helperName := "memoryCopy"
+		if em.mem64 {
+			helperName = "memoryCopy64"
+		}
+		em.useHelper(helperName)
 		dst, err := emit(v.Args[0])
 		if err != nil {
 			return nil, err
@@ -1103,11 +1125,15 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 			return nil, err
 		}
 		return &ast.ExprStmt{X: &ast.CallExpr{
-			Fun:  em.helperRef("memoryCopy"),
+			Fun:  em.helperRef(helperName),
 			Args: []ast.Expr{newID("m"), dst, src, n},
 		}}, nil
 	case ssa.OpMemoryFill:
-		em.useHelper("memoryFill")
+		helperName := "memoryFill"
+		if em.mem64 {
+			helperName = "memoryFill64"
+		}
+		em.useHelper(helperName)
 		dst, err := emit(v.Args[0])
 		if err != nil {
 			return nil, err
@@ -1121,11 +1147,15 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 			return nil, err
 		}
 		return &ast.ExprStmt{X: &ast.CallExpr{
-			Fun:  em.helperRef("memoryFill"),
+			Fun:  em.helperRef(helperName),
 			Args: []ast.Expr{newID("m"), dst, val, n},
 		}}, nil
 	case ssa.OpMemoryInit:
-		em.useHelper("memoryInit")
+		initName := "memoryInit"
+		if em.mem64 {
+			initName = "memoryInit64"
+		}
+		em.useHelper(initName)
 		dst, err := emit(v.Args[0])
 		if err != nil {
 			return nil, err
@@ -1139,7 +1169,7 @@ func (em *ssaEmitter) emitSideEffectStmt(v *ssa.Value, emit func(*ssa.Value) (as
 			return nil, err
 		}
 		return &ast.ExprStmt{X: &ast.CallExpr{
-			Fun:  em.helperRef("memoryInit"),
+			Fun:  em.helperRef(initName),
 			Args: []ast.Expr{newID("m"), intLit(v.AuxInt), dst, src, n},
 		}}, nil
 	case ssa.OpExcRaise:

@@ -40,6 +40,12 @@ type BuildStats struct {
 	// inline vs left as marshalled calls (no table entry for the op).
 	SimdSpliced int
 	SimdKept    int
+	// DirectAsm counts functions whose asm body came straight from
+	// the retained SSA (internal/asmgen) instead of the listing
+	// transform; DirectAsmFallback counts retained functions the
+	// direct emitter declined (they took the transform path).
+	DirectAsm         int
+	DirectAsmFallback int
 }
 
 // fnSym matches generated function symbols: fn0 (single-package,
@@ -254,7 +260,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg.DirectAsm)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -562,6 +568,25 @@ func a64DispatchStub(sym, featSym, portSym, mirrorVar, argBytes string) string {
 		"\tJMP ·" + portSym + "(SB)\n"
 }
 
+// declSig renders the Go declaration signature shared by the plain
+// decl, the gated stub decls, and the direct-asm path. Packed
+// boundaries carry only the module pointer; their values ride the
+// per-module scratch.
+func declSig(rel, name string, declParams []wasm.ValType, hasRes bool, res ArgKind, synth map[string]SynthSig) string {
+	var sigB strings.Builder
+	fmt.Fprintf(&sigB, "(m %s", moduleTypeName(rel))
+	if ss, isSynth := synth[name]; !isSynth || !ss.Packed {
+		for i, p := range declParams {
+			fmt.Fprintf(&sigB, ", l%d %s", i, goTypeName(wasmKind(p)))
+		}
+	}
+	sigB.WriteString(")")
+	if hasRes {
+		fmt.Fprintf(&sigB, " (r0 %s)", goTypeName(res))
+	}
+	return sigB.String()
+}
+
 func buildPkg(
 	mod *wasm.Module,
 	importPath, rel string,
@@ -580,6 +605,7 @@ func buildPkg(
 	outlinedNames []string,
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
+	directSSA map[string]DirectAsmFn,
 ) (map[string][]byte, error) {
 	selfPath := importPath
 	if rel != "" {
@@ -711,6 +737,22 @@ func buildPkg(
 			params, names, hasRes, res = fnKinds(idx)
 			declParams = mod.FuncTypeOf(idx).Params
 		}
+		// Direct-asm body: emitted straight from the retained SSA by
+		// internal/asmgen (see emitDirectAsmBody); replaces the
+		// listing transform for this function. The decl matches the
+		// transformed path's shape, so callers see no difference.
+		// Emission shares this package's ConstPool so spliced bodies'
+		// constants intern alongside the transform's.
+		if df, isDirect := directSSA[name]; isDirect {
+			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, modOffs, pool, importPath, rel, calleeSig, fnOwner, stats); ok {
+				asmB.WriteString(dab)
+				asmB.WriteString("\n")
+				stats.DirectAsm++
+				declFns.WriteString("func " + name + declSig(rel, name, declParams, hasRes, res, synth) + "\n")
+				continue
+			}
+			stats.DirectAsmFallback++
+		}
 		body, terr := arch.transform(f, TransformOptions{
 			SymName:     name,
 			CalleeSig:   calleeSig,
@@ -741,21 +783,7 @@ func buildPkg(
 			}
 			return nil, fmt.Errorf("transform %s: %w", f.Name, terr)
 		}
-		// Declaration signature, shared by the plain decl and the gated
-		// stub decls. Packed boundaries carry only the module pointer;
-		// their values ride the per-module scratch.
-		var sigB strings.Builder
-		fmt.Fprintf(&sigB, "(m %s", moduleTypeName(rel))
-		if ss, isSynth := synth[name]; !isSynth || !ss.Packed {
-			for i, p := range declParams {
-				fmt.Fprintf(&sigB, ", l%d %s", i, goTypeName(wasmKind(p)))
-			}
-		}
-		sigB.WriteString(")")
-		if hasRes {
-			fmt.Fprintf(&sigB, " (r0 %s)", goTypeName(res))
-		}
-		sig := sigB.String()
+		sig := declSig(rel, name, declParams, hasRes, res, synth)
 		_, isSynthFn := synth[name]
 		if arch.gatedMarker != "" && !isSynthFn &&
 			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {
@@ -796,7 +824,9 @@ func buildPkg(
 			// ggml q8_0 row/column pairing: under fast-math the arm64
 			// FEATURE body's companion call goes to the native 2x2
 			// SMMLA tile kernel; the portable twin and every other
-			// backend keep the bit-exact Go companion.
+			// backend keep the bit-exact Go companion. The kernel and
+			// its declaration follow the module's pointer width — the
+			// LP64 companion takes i64 pointers and strides.
 			if nrc2 != nil && name == nrc2.VecDot && arch.name == "arm64" && modOffs != nil && modOffs.Cfg.FastMath {
 				fastSym := nrc2.Companion + "fast"
 				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
@@ -808,9 +838,14 @@ func buildPkg(
 				if rel != "" && rel != "base" {
 					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
 				}
-				asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs))
+				wide := mod.Memory64()
+				asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
 				asmB.WriteString("\n")
-				fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 int32, l2 int32, l3 int32, l4 int32, l5 int32, l6 int32)\n", fastSym, moduleTypeName(rel))
+				argType := "int32"
+				if wide {
+					argType = "int64"
+				}
+				fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 %s, l2 %s, l3 %s, l4 %s, l5 %s, l6 %s)\n", fastSym, moduleTypeName(rel), argType, argType, argType, argType, argType, argType)
 			}
 			mirrorVar := "gcasm" + arch.featureVar
 			asmB.WriteString(arch.dispatchStub(name, featSym, portSym, mirrorVar, m[1]))

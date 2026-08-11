@@ -1,6 +1,7 @@
 package gcasm
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -189,15 +190,31 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 			// Pair-form SIMD calls splice BEFORE callee resolution:
 			// their two-result signatures have no marshalling, by the
 			// simdPairOps contract. See simdsplice_pair_a64.go.
-			if pop, isPair := a64SplicePairOp(m[1]); isPair {
+			if pop, addr64, isPair := a64SplicePairOp(m[1]); isPair {
 				var spliced, wantsTrap bool
 				var perr error
-				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop {
-					spliced, wantsTrap, perr = a64SpliceLoop(&b, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), opts.PortableSIMD)
-				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused {
-					spliced, wantsTrap, perr = a64SpliceFused(&b, tree, pool, opts.ModOffsets, opts.PortableSIMD)
+				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop && !addr64 {
+					var fbuf strings.Builder
+					spliced, wantsTrap, perr = a64SpliceLoop(&fbuf, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), opts.PortableSIMD)
+					if errors.Is(perr, errFusedCapacity) {
+						// Over-budget signature: keep the helper CALL —
+						// the captured helper body is always correct.
+						spliced, perr = false, nil
+					}
+					if spliced {
+						b.WriteString(fbuf.String())
+					}
+				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused && !addr64 {
+					var fbuf strings.Builder
+					spliced, wantsTrap, perr = a64SpliceFused(&fbuf, tree, pool, opts.ModOffsets, opts.PortableSIMD)
+					if errors.Is(perr, errFusedCapacity) {
+						spliced, perr = false, nil
+					}
+					if spliced {
+						b.WriteString(fbuf.String())
+					}
 				} else {
-					spliced, wantsTrap, perr = a64SplicePair(&b, pop, pool, opts.ModOffsets)
+					spliced, wantsTrap, perr = a64SplicePair(&b, pop, addr64, pool, opts.ModOffsets)
 				}
 				if perr != nil {
 					return "", fmt.Errorf("%s at +%d: %w", m[1], in.Off, perr)
@@ -227,8 +244,8 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 				// A SIMD helper call is spliced inline instead of
 				// marshalled: the op body replaces the call entirely.
 				// See simdsplice_a64.go.
-				if _, isSimd := simdSpliceOp(m[1]); isSimd {
-					if ok, wantsTrap := a64SpliceSimd(&b, m[1], cargs, cres, hasRes, 8+maxOut, pool, opts.ModOffsets); ok {
+				if _, _, isSimd := simdSpliceOp(m[1]); isSimd {
+					if ok, wantsTrap := a64SpliceSimd(&b, m[1], cargs, cres, hasRes, 8+maxOut, pool, opts.ModOffsets, nil); ok {
 						if wantsTrap && trapCallee == "" {
 							// Resolve the oob trap through the same
 							// package the helper lives in; the stub is

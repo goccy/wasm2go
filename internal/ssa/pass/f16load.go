@@ -244,7 +244,7 @@ func isSimdMem(v *ssa.Value, name string) bool {
 }
 
 func constOf(v *ssa.Value) (int64, bool) {
-	if v.Op != ssa.OpConst32 {
+	if v.Op != ssa.OpConst32 && v.Op != ssa.OpConst64 {
 		return 0, false
 	}
 	return v.AuxInt, true
@@ -256,7 +256,7 @@ func constOf(v *ssa.Value) (int64, bool) {
 func memRoot(ld *ssa.Value) (*ssa.Value, int64) {
 	total := ld.AuxInt
 	a := ld.Args[0]
-	for a.Op == ssa.OpAdd32 && len(a.Args) == 2 {
+	for (a.Op == ssa.OpAdd32 || a.Op == ssa.OpAdd64) && len(a.Args) == 2 {
 		x, c := a.Args[0], a.Args[1]
 		if _, isC := constOf(x); isC {
 			x, c = c, x

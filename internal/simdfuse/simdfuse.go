@@ -150,8 +150,15 @@ type Tree struct {
 	// NeedsMem reports whether any member is a memory op (the fused
 	// splice then needs the Module field offsets and the trap stub).
 	NeedsMem bool
-	Nodes    []Node
-	Roots    []int
+	// Addr64 marks a memory64 module's tree: every scalar parameter is
+	// int64, the addresses/offsets of memory members ride as OPAQUE
+	// scalars (the builder never const-folds them — Arg.Const is
+	// 32-bit), the fallback body calls the simd_m64_* helpers, and the
+	// splicers widen the address glue with carry-checked sums. The
+	// vector node bodies are identical either way.
+	Addr64 bool
+	Nodes  []Node
+	Roots  []int
 	// NoResult marks a pure-sink region (every value flows into
 	// stores): the fused function returns nothing.
 	NoResult bool

@@ -345,8 +345,9 @@ func mergeF16StoreGroup(g *[4]lane16, bits *ssa.Value) bool {
 // so the conversion AND the store ride inside a fused region (and a
 // fused loop) instead of round-tripping the vector through a GPR
 // pair at the region boundary. Runs after MergeF16Stores; requires
-// the packed word to have no other use.
-func FuseF16CvtStores(f *ssa.Func) bool {
+// the packed word to have no other use. wide selects the memory64
+// spelling: an i64 offset constant and the simd_m64_* helper.
+func FuseF16CvtStores(f *ssa.Func, wide bool) bool {
 	uses := map[*ssa.Value]int{}
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
@@ -369,10 +370,14 @@ func FuseF16CvtStores(f *ssa.Func) bool {
 				continue
 			}
 			W := bits.Args[0]
-			off := b.NewValueBefore(f, i, ssa.OpConst32, ssa.TypeI32, v.AuxInt, nil)
+			offOp, offType, helper := ssa.OpConst32, ssa.TypeI32, "simd_v128_f16x4_cvt_store"
+			if wide {
+				offOp, offType, helper = ssa.OpConst64, ssa.TypeI64, "simd_m64_v128_f16x4_cvt_store"
+			}
+			off := b.NewValueBefore(f, i, offOp, offType, v.AuxInt, nil)
 			v.Op = ssa.OpSimdMemCall
 			v.Type = ssa.TypeI32
-			v.Aux = "simd_v128_f16x4_cvt_store"
+			v.Aux = helper
 			v.AuxInt = 0
 			v.Args = []*ssa.Value{v.Args[0], off, W}
 			changed = true

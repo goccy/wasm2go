@@ -91,7 +91,7 @@ func coalesceBlock(f *ssa.Func, b *ssa.Block) bool {
 		if v == nil || v.Op == ssa.OpInvalid {
 			continue
 		}
-		if v.Op == ssa.OpSimdMemCall && v.Aux == "simd_v128_load" {
+		if v.Op == ssa.OpSimdMemCall && (v.Aux == "simd_v128_load" || v.Aux == "simd_m64_v128_load") {
 			base, off, ok := splitSimdAddr(v)
 			if !ok {
 				continue // opaque address: not groupable, but no barrier either
@@ -154,21 +154,38 @@ func splitSimdAddr(v *ssa.Value) (*ssa.Value, int64, bool) {
 	}
 	addr := v.Args[0]
 	offV := v.Args[1]
-	if offV.Op != ssa.OpConst32 {
-		return nil, 0, false
-	}
-	off := int64(uint32(int32(offV.AuxInt)))
-	if addr.Op == ssa.OpAdd32 && len(addr.Args) == 2 && addr.Args[1].Op == ssa.OpConst32 {
-		// Peel only NON-NEGATIVE addends: the exactness argument in
-		// the package doc needs every member displacement ≥ 0, so a
-		// member's u32 address can only wrap UPWARD past 2^32 relative
-		// to the base, never downward past 0.
-		c := int64(int32(addr.Args[1].AuxInt))
-		if c >= 0 && c < simdBoundsWindow {
-			return addr.Args[0], off + c, true
+	// wasm32 addresses are i32 (Const32 offset / Add32 base), memory64
+	// ones i64. The peeled memarg offset and the peeled base addend are
+	// small either way (bounded by the load window); the range check is
+	// done at the address width, so accept both here.
+	switch offV.Op {
+	case ssa.OpConst32:
+		off := int64(uint32(int32(offV.AuxInt)))
+		if addr.Op == ssa.OpAdd32 && len(addr.Args) == 2 && addr.Args[1].Op == ssa.OpConst32 {
+			// Peel only NON-NEGATIVE addends: the exactness argument in
+			// the package doc needs every member displacement ≥ 0, so a
+			// member's u32 address can only wrap UPWARD past 2^32
+			// relative to the base, never downward past 0.
+			c := int64(int32(addr.Args[1].AuxInt))
+			if c >= 0 && c < simdBoundsWindow {
+				return addr.Args[0], off + c, true
+			}
 		}
+		return addr, off, true
+	case ssa.OpConst64:
+		off := offV.AuxInt
+		if off < 0 || off >= simdBoundsWindow {
+			return nil, 0, false
+		}
+		if addr.Op == ssa.OpAdd64 && len(addr.Args) == 2 && addr.Args[1].Op == ssa.OpConst64 {
+			c := addr.Args[1].AuxInt
+			if c >= 0 && c < simdBoundsWindow {
+				return addr.Args[0], off + c, true
+			}
+		}
+		return addr, off, true
 	}
-	return addr, off, true
+	return nil, 0, false
 }
 
 func fitsWindow(refs []simdLoadRef, off int64) bool {
@@ -220,17 +237,35 @@ func emitCoalesced(f *ssa.Func, b *ssa.Block, base *ssa.Value, refs []simdLoadRe
 	}
 	span := hi + 16 - lo
 	first := refs[0]
-	firstOff := int64(uint32(int32(first.v.Args[1].AuxInt)))
+	mem64 := first.v.Aux == "simd_m64_v128_load"
+	var firstOff int64
+	if mem64 {
+		firstOff = first.v.Args[1].AuxInt
+	} else {
+		firstOff = int64(uint32(int32(first.v.Args[1].AuxInt)))
+	}
 	c1 := first.total - firstOff // the peeled addend
 	rlo := lo - c1
 	if rlo < -(1<<31) || rlo >= 1<<31 || span >= 1<<31 {
 		return // huge memarg offsets pushed the window out of i32; keep per-load checks
 	}
-	loC := b.NewValueBefore(f, first.idx, ssa.OpConst32, ssa.TypeI32, int64(int32(rlo)), nil)
-	spanC := b.NewValueBefore(f, first.idx+1, ssa.OpConst32, ssa.TypeI32, int64(int32(uint32(span))), nil)
-	first.v.Aux = "simd_v128_load_rng"
+	rngName, ncName := "simd_v128_load_rng", "simd_v128_load_nc"
+	loOp, spanOp := ssa.OpConst32, ssa.OpConst32
+	loT, spanT := ssa.TypeI32, ssa.TypeI32
+	loAux, spanAux := int64(int32(rlo)), int64(int32(uint32(span)))
+	if mem64 {
+		// The window (rlo, span) is small enough to fit i32, but the
+		// m64 helpers take i64 operands; carry them as Const64.
+		rngName, ncName = "simd_m64_v128_load_rng", "simd_m64_v128_load_nc"
+		loOp, spanOp = ssa.OpConst64, ssa.OpConst64
+		loT, spanT = ssa.TypeI64, ssa.TypeI64
+		loAux, spanAux = rlo, span
+	}
+	loC := b.NewValueBefore(f, first.idx, loOp, loT, loAux, nil)
+	spanC := b.NewValueBefore(f, first.idx+1, spanOp, spanT, spanAux, nil)
+	first.v.Aux = rngName
 	first.v.Args = append(first.v.Args, loC, spanC)
 	for _, r := range refs[1:] {
-		r.v.Aux = "simd_v128_load_nc"
+		r.v.Aux = ncName
 	}
 }

@@ -15,9 +15,9 @@ import (
 // with a defined vec_dot of the ggml_vec_dot_t shape.
 func nrc2TestModule(t *testing.T, mutate func(rows []byte)) *wasm.Module {
 	t.Helper()
-	rows := make([]byte, 16*nrc2TraitsRowSize)
+	rows := make([]byte, 16*nrc2LayoutFor(false).row)
 	putRow := func(idx int, ff, vd, vdt uint32, nrows uint64) {
-		off := idx * nrc2TraitsRowSize
+		off := idx * nrc2LayoutFor(false).row
 		binary.LittleEndian.PutUint32(rows[off:], ff)
 		binary.LittleEndian.PutUint32(rows[off+4:], vd)
 		binary.LittleEndian.PutUint32(rows[off+8:], vdt)
@@ -65,7 +65,7 @@ func TestScanGgmlNrc2Accepts(t *testing.T) {
 	if tr.nrc2.funcIdx != 17 {
 		t.Fatalf("vec_dot func = %d, want 17", tr.nrc2.funcIdx)
 	}
-	if tr.nrc2.nrowsOff != 8*nrc2TraitsRowSize+16 {
+	if tr.nrc2.nrowsOff != 8*nrc2LayoutFor(false).row+16 {
 		t.Fatalf("nrows offset = %d", tr.nrc2.nrowsOff)
 	}
 	// The patch flows only into the recognized segment, as a copy.
@@ -85,16 +85,16 @@ func TestScanGgmlNrc2Accepts(t *testing.T) {
 func TestScanGgmlNrc2Rejections(t *testing.T) {
 	cases := map[string]func(rows []byte){
 		"nrows already 2": func(rows []byte) {
-			binary.LittleEndian.PutUint64(rows[8*nrc2TraitsRowSize+16:], 2)
+			binary.LittleEndian.PutUint64(rows[8*nrc2LayoutFor(false).row+16:], 2)
 		},
 		"entry0 not F32-typed": func(rows []byte) {
 			binary.LittleEndian.PutUint32(rows[8:], 3)
 		},
 		"vec_dot table index invalid": func(rows []byte) {
-			binary.LittleEndian.PutUint32(rows[8*nrc2TraitsRowSize+4:], 999)
+			binary.LittleEndian.PutUint32(rows[8*nrc2LayoutFor(false).row+4:], 999)
 		},
 		"pad nonzero": func(rows []byte) {
-			binary.LittleEndian.PutUint32(rows[8*nrc2TraitsRowSize+12:], 7)
+			binary.LittleEndian.PutUint32(rows[8*nrc2LayoutFor(false).row+12:], 7)
 		},
 	}
 	for name, mutate := range cases {
@@ -147,5 +147,93 @@ func TestNrc2CompanionShape(t *testing.T) {
 	}
 	if !bytes.Contains(pb.Bytes(), []byte("if l7 == 2 {")) {
 		t.Errorf("prelude shape:\n%s", pb.String())
+	}
+}
+
+// nrc2TestModule64 is the memory64 twin of nrc2TestModule: LP64 rows
+// (u64 function pointers, 32-byte stride) and the widened
+// ggml_vec_dot_t signature (pointers and size_t as i64).
+func nrc2TestModule64(t *testing.T, mutate func(rows []byte)) *wasm.Module {
+	t.Helper()
+	lay := nrc2LayoutFor(true)
+	rows := make([]byte, 16*lay.row)
+	putRow := func(idx int, ff, vd uint64, vdt uint32, nrows uint64) {
+		off := idx * lay.row
+		binary.LittleEndian.PutUint64(rows[off:], ff)
+		binary.LittleEndian.PutUint64(rows[off+lay.vdOff:], vd)
+		binary.LittleEndian.PutUint32(rows[off+lay.vdtOff:], vdt)
+		binary.LittleEndian.PutUint64(rows[off+lay.nrowsOff:], nrows)
+	}
+	putRow(0, 10, 11, 0, 1)
+	putRow(2, 12, 13, 8, 1)
+	putRow(6, 14, 15, 8, 1)
+	putRow(8, 16, 17, 8, 1)
+	putRow(9, 18, 19, 9, 1)
+	if mutate != nil {
+		mutate(rows)
+	}
+	vecDotType := wasm.FuncType{Params: []wasm.ValType{
+		wasm.ValI32, wasm.ValI64, wasm.ValI64, wasm.ValI64,
+		wasm.ValI64, wasm.ValI64, wasm.ValI64, wasm.ValI32,
+	}}
+	m := &wasm.Module{
+		Types:     []wasm.FuncType{vecDotType},
+		Functions: make([]wasm.Function, 30),
+		Memories:  []wasm.MemoryType{{Limits: wasm.Limits{Min: 1}, Is64: true}},
+		Datas: []wasm.DataSegment{
+			{Offset: i32ConstExpr(4096), Bytes: rows},
+		},
+		Elements: []wasm.ElementSegment{
+			{Offset: i32ConstExpr(0), FuncIdxs: func() []uint32 {
+				idxs := make([]uint32, 30)
+				for i := range idxs {
+					idxs[i] = uint32(i)
+				}
+				return idxs
+			}()},
+		},
+	}
+	return m
+}
+
+func TestScanGgmlNrc2AcceptsMemory64(t *testing.T) {
+	m := nrc2TestModule64(t, nil)
+	tr := &translator{mod: m}
+	tr.scanGgmlNrc2()
+	if tr.nrc2 == nil {
+		t.Fatal("LP64 traits array not recognized")
+	}
+	lay := nrc2LayoutFor(true)
+	if tr.nrc2.funcIdx != 17 {
+		t.Fatalf("vec_dot func = %d, want 17", tr.nrc2.funcIdx)
+	}
+	if tr.nrc2.nrowsOff != 8*lay.row+lay.nrowsOff {
+		t.Fatalf("nrows offset = %d", tr.nrc2.nrowsOff)
+	}
+	patched := tr.nrc2SegBytes(0, m.Datas[0].Bytes)
+	if binary.LittleEndian.Uint64(patched[tr.nrc2.nrowsOff:]) != 2 {
+		t.Fatal("nrows not patched")
+	}
+}
+
+func TestScanGgmlNrc2Memory64Rejections(t *testing.T) {
+	lay := nrc2LayoutFor(true)
+	cases := map[string]func(rows []byte){
+		// A function-pointer value with nonzero high bits can never be
+		// a table index; the row must not parse.
+		"high bits in vec_dot": func(rows []byte) {
+			binary.LittleEndian.PutUint64(rows[8*lay.row+lay.vdOff:], 1<<40|17)
+		},
+		"already paired": func(rows []byte) {
+			binary.LittleEndian.PutUint64(rows[8*lay.row+lay.nrowsOff:], 2)
+		},
+	}
+	for name, mutate := range cases {
+		m := nrc2TestModule64(t, mutate)
+		tr := &translator{mod: m}
+		tr.scanGgmlNrc2()
+		if tr.nrc2 != nil {
+			t.Errorf("%s: recognized, want rejected", name)
+		}
 	}
 }

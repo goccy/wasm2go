@@ -191,6 +191,9 @@ func (em *ssaEmitter) memBasePtrExpr() ast.Expr {
 //   - Runtime int32 baseExprs are wrapped in uint32(...) for the same
 //     zero-extension guarantee.
 func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *ssa.Value) ast.Expr {
+	if em.mem64 {
+		return em.memOffsetExpr64(baseExpr, offset, baseVal)
+	}
 	n, ok := constInt32(baseExpr)
 	if !ok {
 		// The AST shape check misses a constant base that was HOISTED
@@ -245,6 +248,40 @@ func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *s
 		return uintLit(total)
 	}
 	return &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{uintLit(total)}}
+}
+
+// memOffsetExpr64 is memOffsetExpr for a memory64 module: the address
+// is a u64 and effective-address arithmetic is u64 (mod 2^64), so no
+// 32-bit wrap is ever applied. Large constant totals still route
+// through the _consts table for the same addressing-immediate reasons.
+func (em *ssaEmitter) memOffsetExpr64(baseExpr ast.Expr, offset uint64, baseVal *ssa.Value) ast.Expr {
+	if c := ssaConstBase64(baseVal); c != nil {
+		total := uint64(c.AuxInt) + offset
+		if total >= largeConstThreshold && em.t != nil {
+			return em.constsIndexExpr(total)
+		}
+		return uintLit(total)
+	}
+	addr := ast.Expr(&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{baseExpr}})
+	if offset != 0 {
+		var off ast.Expr = uintLit(offset)
+		if offset >= largeConstThreshold && em.t != nil {
+			off = &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{em.constsIndexExpr(offset)}}
+		}
+		addr = &ast.BinaryExpr{X: addr, Op: token.ADD, Y: off}
+	}
+	return addr
+}
+
+// ssaConstBase64 is ssaConstBase for i64 addresses.
+func ssaConstBase64(v *ssa.Value) *ssa.Value {
+	for v != nil && v.Op == ssa.OpCopy && len(v.Args) == 1 {
+		v = v.Args[0]
+	}
+	if v != nil && v.Op == ssa.OpConst64 {
+		return v
+	}
+	return nil
 }
 
 // ssaConstBase peels OpCopy chains and returns the OpConst32 value a

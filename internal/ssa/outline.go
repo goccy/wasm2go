@@ -49,6 +49,18 @@ type OutlinedFunc struct {
 // Must match the module scratch array length in the emitter.
 const outlinePackedMax = 128
 
+// outlinePackAmortRatio is the minimum body-values-per-boundary-slot
+// ratio for a PACKED extraction on a memory64 module: the caller
+// writes every slot into the scratch array and the outlined function
+// reads them all back on every call, and with i64 locals doubling the
+// callers' register pressure the round trip stops paying for wide
+// boundaries. Measured on the llama.cpp module: gating these packs
+// gains ~17% memory64 prompt throughput (the ~130-slot conversion
+// loop), while the SAME gate on wasm32 LOSES ~25% — its outlined
+// conversion loop compiles better extracted than inline — so the
+// ratio applies only when wide.
+const outlinePackAmortRatio = 24
+
 // outlineV128MinBody is the minimum body size for a v128-boundary loop.
 const outlineV128MinBody = 600
 
@@ -65,7 +77,7 @@ const outlineMaxShare = 0.8
 // header's block ID (the caller owns naming policy). The parent is
 // modified in place and re-verified; extracted functions are returned
 // ready for their own lowering pipeline.
-func OutlineLoops(f *Func, name func(header BlockID) string, minValues int) ([]OutlinedFunc, error) {
+func OutlineLoops(f *Func, name func(header BlockID) string, minValues int, wide bool) ([]OutlinedFunc, error) {
 	if f.MutableLocals || len(f.TryRegions) > 0 {
 		return nil, nil
 	}
@@ -81,7 +93,7 @@ func OutlineLoops(f *Func, name func(header BlockID) string, minValues int) ([]O
 	// Re-detect after each extraction: the surgery invalidates block
 	// sets, and one extraction can make an enclosing loop eligible.
 	for {
-		cand := findOutlineCandidate(f, minValues, taken)
+		cand := findOutlineCandidate(f, minValues, taken, wide)
 		if cand == nil {
 			break
 		}
@@ -138,7 +150,7 @@ type outlineCand struct {
 }
 
 // findOutlineCandidate returns the largest eligible loop of f, or nil.
-func findOutlineCandidate(f *Func, minValues int, taken map[BlockID]bool) *outlineCand {
+func findOutlineCandidate(f *Func, minValues int, taken map[BlockID]bool, wide bool) *outlineCand {
 	idom := Dominators(f)
 	dominates := func(a, b *Block) bool {
 		for b != nil {
@@ -204,7 +216,7 @@ func findOutlineCandidate(f *Func, minValues int, taken map[BlockID]bool) *outli
 		if float64(n) > outlineMaxShare*float64(total) {
 			continue
 		}
-		c := checkOutlineCand(f, headers[hid], body, minValues, dominates)
+		c := checkOutlineCand(f, headers[hid], body, minValues, dominates, wide)
 		if c == nil {
 			continue
 		}
@@ -226,7 +238,7 @@ func findOutlineCandidate(f *Func, minValues int, taken map[BlockID]bool) *outli
 // checkOutlineCand tests eligibility and computes the boundary. Size
 // and share policy live in findOutlineCandidate; this checks only the
 // boundary shape.
-func checkOutlineCand(f *Func, h *Block, body map[BlockID]bool, minValues int, dominates func(a, b *Block) bool) *outlineCand {
+func checkOutlineCand(f *Func, h *Block, body map[BlockID]bool, minValues int, dominates func(a, b *Block) bool, wide bool) *outlineCand {
 	c := &outlineCand{header: h, body: body}
 	reject := func(format string, args ...any) *outlineCand {
 		return nil
@@ -360,8 +372,12 @@ func checkOutlineCand(f *Func, h *Block, body map[BlockID]bool, minValues int, d
 		return reject("v128 boundary needs %d+ values to amortize (have %d)", outlineV128MinBody, c.nBody)
 	}
 	if ints > outlineIntArgBudget || floats > outlineFloatArgBudget || vecs > 0 {
-		if ints+floats+2*vecs > outlinePackedMax {
+		slots := ints + floats + 2*vecs
+		if slots > outlinePackedMax {
 			return reject("packed cap: %d int + %d float + %d v128 live-ins > %d slots", ints, floats, vecs, outlinePackedMax)
+		}
+		if wide && c.nBody < slots*outlinePackAmortRatio {
+			return reject("packed boundary unamortized: %d slots against %d body values (need %dx)", slots, c.nBody, outlinePackAmortRatio)
 		}
 		c.packed = true
 	}

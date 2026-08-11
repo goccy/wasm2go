@@ -46,11 +46,19 @@ type unrollShape struct {
 	exitSucc int        // b.Succs index of the exit edge
 	backSucc int        // b.Succs index of the back edge
 	counter  *ssa.Value // the countdown phi
-	update   *ssa.Value // Sub32(counter, 1)
+	update   *ssa.Value // Sub(counter, 1) at the counter's width
+	wide     bool       // the counter is i64 (memory64 modules promote it)
 }
 
-// UnrollSimdLoops applies the transform to every matching loop.
-func UnrollSimdLoops(f *ssa.Func, k int) bool {
+// UnrollSimdLoops applies the transform to every matching loop. wide
+// additionally admits i64-countdown loops — the shape memory64 modules
+// produce, where LP64 promotes the induction variable. It is an
+// explicit opt-in per module width because unrolling is only a win
+// when the downstream window fusion consumes the unrolled body; on
+// wasm32 the i64-counter loops are exactly the ones that do NOT fuse
+// (measured: admitting them cost ~40% prompt throughput), while on
+// memory64 they are the hot SIMD kernels themselves.
+func UnrollSimdLoops(f *ssa.Func, k int, wide bool) bool {
 	if k < 2 {
 		return false
 	}
@@ -58,7 +66,7 @@ func UnrollSimdLoops(f *ssa.Func, k int) bool {
 	// Collect first: the transform adds blocks while iterating.
 	var shapes []unrollShape
 	for _, b := range f.Blocks {
-		if sh, ok := analyzeUnrollLoop(b); ok {
+		if sh, ok := analyzeUnrollLoop(b, wide); ok {
 			shapes = append(shapes, sh)
 		}
 	}
@@ -71,7 +79,7 @@ func UnrollSimdLoops(f *ssa.Func, k int) bool {
 
 // analyzeUnrollLoop matches the countdown do-while self-loop the wasm
 // lowering produces for ggml-style inner loops.
-func analyzeUnrollLoop(b *ssa.Block) (unrollShape, bool) {
+func analyzeUnrollLoop(b *ssa.Block, wide bool) (unrollShape, bool) {
 	var sh unrollShape
 	sh.b = b
 	if b.Kind != ssa.BlockIf || len(b.Succs) != 2 || len(b.Preds) != 2 || b.Control == nil {
@@ -103,20 +111,28 @@ func analyzeUnrollLoop(b *ssa.Block) (unrollShape, bool) {
 	}
 	// Control: the countdown update used as the branch condition —
 	// either the raw i32 (`If u`, the shape the lowering produces for
-	// br_if) or wrapped as Ne32(u, 0). u = Sub32(counterPhi, 1), and
-	// the counter phi's back-edge argument is u.
+	// br_if) or wrapped as Ne(u, 0) at the counter's width. u =
+	// Sub(counterPhi, 1), and the counter phi's back-edge argument is
+	// u. Memory64 modules promote the counter to i64 (LP64 induction
+	// variables), so both widths must match.
 	u := b.Control
-	if u.Op == ssa.OpNe32 && len(u.Args) == 2 {
+	if len(u.Args) == 2 && (u.Op == ssa.OpNe32 || (wide && u.Op == ssa.OpNe64)) {
+		wide := u.Op == ssa.OpNe64
 		a, zero := u.Args[0], u.Args[1]
-		if !isConst32(zero, 0) {
+		if !isConstInt(zero, 0, wide) {
 			a, zero = zero, a
 		}
-		if !isConst32(zero, 0) {
+		if !isConstInt(zero, 0, wide) {
 			return sh, false
 		}
 		u = a
+		sh.wide = wide
 	}
-	if u.Op != ssa.OpSub32 || len(u.Args) != 2 || u.Block != b || !isConst32(u.Args[1], 1) {
+	subOp := ssa.OpSub32
+	if sh.wide {
+		subOp = ssa.OpSub64
+	}
+	if u.Op != subOp || len(u.Args) != 2 || u.Block != b || !isConstInt(u.Args[1], 1, sh.wide) {
 		return sh, false
 	}
 	p := u.Args[0]
@@ -147,34 +163,60 @@ func isConst32(v *ssa.Value, want int64) bool {
 	return v != nil && v.Op == ssa.OpConst32 && v.AuxInt == want
 }
 
-// ReassocConstAdds folds Add32(Add32(x, c1), c2) into Add32(x, c1+c2)
-// (mod 2^32, exactly wasm's add). Unrolled pointer-bump chains produce
-// exactly this shape, and the memory-addend and bounds passes peel
-// only one constant level — without reassociation the unrolled loads
-// would not share a base.
-func ReassocConstAdds(f *ssa.Func) bool {
+// isConstInt is isConst32 at a selectable width.
+func isConstInt(v *ssa.Value, want int64, wide bool) bool {
+	if wide {
+		return v != nil && v.Op == ssa.OpConst64 && v.AuxInt == want
+	}
+	return isConst32(v, want)
+}
+
+// ReassocConstAdds folds Add(Add(x, c1), c2) into Add(x, c1+c2)
+// (mod 2^32 / mod 2^64, exactly wasm's adds). Unrolled pointer-bump
+// chains produce exactly this shape — i32 addresses on wasm32, i64 on
+// memory64 — and the memory-addend and bounds passes peel only one
+// constant level: without reassociation the unrolled loads would not
+// share a base. The i64 arm is memory64-only (wide): on wasm32 the
+// i64 adds are ordinary scalar arithmetic, and rewriting them shifts
+// downstream code shapes for no addressing benefit.
+func ReassocConstAdds(f *ssa.Func, wide bool) bool {
 	changed := false
 	for _, b := range f.Blocks {
 		for i, v := range b.Values {
-			if v == nil || v.Op != ssa.OpAdd32 || len(v.Args) != 2 {
+			if v == nil || len(v.Args) != 2 {
+				continue
+			}
+			var constOp ssa.Op
+			var typ ssa.Type
+			var wrap func(a, b int64) int64
+			switch v.Op {
+			case ssa.OpAdd32:
+				constOp, typ = ssa.OpConst32, ssa.TypeI32
+				wrap = func(a, b int64) int64 { return int64(int32(uint32(a) + uint32(b))) }
+			case ssa.OpAdd64:
+				if !wide {
+					continue
+				}
+				constOp, typ = ssa.OpConst64, ssa.TypeI64
+				wrap = func(a, b int64) int64 { return int64(uint64(a) + uint64(b)) }
+			default:
 				continue
 			}
 			inner, c2 := v.Args[0], v.Args[1]
-			if c2 == nil || c2.Op != ssa.OpConst32 {
+			if c2 == nil || c2.Op != constOp {
 				inner, c2 = c2, inner
 			}
-			if c2 == nil || c2.Op != ssa.OpConst32 || inner == nil || inner.Op != ssa.OpAdd32 || len(inner.Args) != 2 {
+			if c2 == nil || c2.Op != constOp || inner == nil || inner.Op != v.Op || len(inner.Args) != 2 {
 				continue
 			}
 			x, c1 := inner.Args[0], inner.Args[1]
-			if c1 == nil || c1.Op != ssa.OpConst32 {
+			if c1 == nil || c1.Op != constOp {
 				x, c1 = c1, x
 			}
-			if c1 == nil || c1.Op != ssa.OpConst32 {
+			if c1 == nil || c1.Op != constOp {
 				continue
 			}
-			sum := int64(int32(uint32(c1.AuxInt) + uint32(c2.AuxInt)))
-			sumC := b.NewValueBefore(f, i, ssa.OpConst32, ssa.TypeI32, sum, nil)
+			sumC := b.NewValueBefore(f, i, constOp, typ, wrap(c1.AuxInt, c2.AuxInt), nil)
 			v.Args[0] = x
 			v.Args[1] = sumC
 			changed = true
@@ -231,6 +273,15 @@ func unrollOne(f *ssa.Func, sh unrollShape, k int) {
 		return blk.NewValueBefore(f, len(blk.Values), op, typ, auxInt, aux, args...)
 	}
 
+	// The guard arithmetic runs at the counter's own width; every
+	// comparison below uses this op family. Routing stays exact at
+	// both widths (an initial counter of zero means 2^32 — or 2^64 —
+	// iterations and takes the untouched remainder loop).
+	ctrConstOp, ctrType, ctrNeOp, ctrLtUOp := ssa.OpConst32, ssa.TypeI32, ssa.OpNe32, ssa.OpLtU32
+	if sh.wide {
+		ctrConstOp, ctrType, ctrNeOp, ctrLtUOp = ssa.OpConst64, ssa.TypeI64, ssa.OpNe64, ssa.OpLtU64
+	}
+
 	// --- Rewire the preheader to G0. ---
 	pre := b.Preds[sh.preIdx].Block
 	preSuccIdx := b.Preds[sh.preIdx].Index
@@ -251,12 +302,12 @@ func unrollOne(f *ssa.Func, sh unrollShape, k int) {
 			initCounter = inits[i]
 		}
 	}
-	zeroC := newV(g0, ssa.OpConst32, ssa.TypeI32, 0, nil)
+	zeroC := newV(g0, ctrConstOp, ctrType, 0, nil)
 	// Typed zero placeholders for carrier-phi arguments along the G0
 	// edge. Those arguments are never OBSERVED (G1's exit arm cannot be
 	// taken on the first entry: init != 0 there), but the verifier
 	// rightly demands a dominating definition for every phi argument.
-	zeroOf := map[ssa.Type]*ssa.Value{ssa.TypeI32: zeroC}
+	zeroOf := map[ssa.Type]*ssa.Value{ctrType: zeroC}
 	typedZero := func(t ssa.Type) *ssa.Value {
 		if z, ok := zeroOf[t]; ok {
 			return z
@@ -277,7 +328,7 @@ func unrollOne(f *ssa.Func, sh unrollShape, k int) {
 		zeroOf[t] = z
 		return z
 	}
-	g0.Control = newV(g0, ssa.OpNe32, ssa.TypeBool, 0, nil, initCounter, zeroC)
+	g0.Control = newV(g0, ctrNeOp, ssa.TypeBool, 0, nil, initCounter, zeroC)
 	// G0's TRUE arm goes to G1; the FALSE arm re-enters the untouched
 	// loop through its ORIGINAL preheader slot (init phi arguments stay
 	// valid there), wired manually below.
@@ -302,14 +353,14 @@ func unrollOne(f *ssa.Func, sh unrollShape, k int) {
 	// goto emission flattens expressions, killing tree fusion).
 	// TRUE: rem < k → leave for the tail guard. FALSE: full stride.
 	rem := g1Phi[sh.counter]
-	kC := newV(g1, ssa.OpConst32, ssa.TypeI32, int64(k), nil)
-	g1.Control = newV(g1, ssa.OpLtU32, ssa.TypeBool, 0, nil, rem, kC)
+	kC := newV(g1, ctrConstOp, ctrType, int64(k), nil)
+	g1.Control = newV(g1, ctrLtUOp, ssa.TypeBool, 0, nil, rem, kC)
 	ssa.AddEdge(g1, g2) // TRUE arm: tail guard (g2 plays T0)
 	// FALSE arm to U is wired after the clones exist (below).
 
 	// --- T0 (g2): rem != 0 → R (remainder loop), else E. ---
-	zeroC1 := newV(g2, ssa.OpConst32, ssa.TypeI32, 0, nil)
-	g2.Control = newV(g2, ssa.OpNe32, ssa.TypeBool, 0, nil, rem, zeroC1)
+	zeroC1 := newV(g2, ctrConstOp, ctrType, 0, nil)
+	g2.Control = newV(g2, ctrNeOp, ssa.TypeBool, 0, nil, rem, zeroC1)
 
 	// --- U: k straight-line clones of the body. ---
 	running := map[*ssa.Value]*ssa.Value{}

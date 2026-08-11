@@ -44,6 +44,7 @@ func main() {
 	fuseLoopUnroll := flag.Int("fuse-loop-unroll", 0, "in-splice unroll factor for fused loops (2..8; 0 disables)")
 	f16Table := flag.Uint("f16-table", 0, "linear-memory base address of a runtime-built IEEE f16->f32 table (asserted, not verified; 0 asserts nothing)")
 	fastMath := flag.Bool("fast-math", false, "allow asm splices that trade wasm bit-exactness for native-style rounding (SDOT raw grouping, FMA, SMMLA pairing)")
+	directAsm := flag.String("direct-asm", "", "comma-separated function names (FnN / outlined FnNlH) to emit via the direct-asm backend instead of the gc-listing transform; unsupported functions fall back per function")
 	flag.Parse()
 
 	var r io.Reader
@@ -101,6 +102,7 @@ func main() {
 		FuseLoopUnroll:      *fuseLoopUnroll,
 		F16TableAddr:        uint32(*f16Table),
 		FastMath:            *fastMath,
+		DirectAsmFuncs:      splitCommaList(*directAsm),
 	}
 
 	if wantsMulti {
@@ -195,6 +197,22 @@ func main() {
 // export is a root). The literal "NONE" returns a non-nil empty
 // slice (no export is a root). Otherwise the value is split on commas
 // with whitespace trimmed and empty fields dropped.
+// splitCommaList splits a comma-separated flag value into trimmed,
+// non-empty entries; "" yields nil.
+func splitCommaList(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func parseEntryExports(v string) []string {
 	if v == "" {
 		return nil

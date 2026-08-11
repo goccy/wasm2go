@@ -58,7 +58,7 @@ func TestOutlineSumLoop(t *testing.T) {
 	headerID := header.ID // adoption renumbers the block afterwards
 	outs, err := OutlineLoops(f, func(h BlockID) string {
 		return fmt.Sprintf("Fn9l%d", h)
-	}, 1)
+	}, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestOutlineRejectsMultiLiveOut(t *testing.T) {
 				f.newValue(OpCopy, TypeI32, []*Value{v}, b, 0, nil))
 		}
 	}
-	outs, err := OutlineLoops(f, func(h BlockID) string { return "x" }, 1)
+	outs, err := OutlineLoops(f, func(h BlockID) string { return "x" }, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func buildTwoExitLoopFunc(t *testing.T) *Func {
 
 func TestOutlineTwoExitLoop(t *testing.T) {
 	f := buildTwoExitLoopFunc(t)
-	outs, err := OutlineLoops(f, func(h BlockID) string { return fmt.Sprintf("Fn7l%d", h) }, 1)
+	outs, err := OutlineLoops(f, func(h BlockID) string { return fmt.Sprintf("Fn7l%d", h) }, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}

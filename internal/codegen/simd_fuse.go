@@ -17,7 +17,9 @@ package codegen
 import (
 	"fmt"
 	"go/ast"
+	"go/printer"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 
@@ -87,6 +89,24 @@ var fusedStoreOps = map[string]int{
 	"simd_v128_f16x4_cvt_store": 2,
 }
 
+// isMemHelperOp reports whether a normalized node op is one of the
+// vector memory ops (loads; stores are classified by IsStore).
+func isMemHelperOp(op string) bool {
+	_, ok := fusedMemOps["simd_"+op]
+	return ok
+}
+
+// fuseLookupName strips the memory64 marker so the width-independent
+// fusion vocabulary (fusedMemOps, fusedStoreOps, the per-op arity and
+// name comparisons) applies to both helper families; the reported flag
+// makes the builder mark the tree Addr64.
+func fuseLookupName(name string) (string, bool) {
+	if rest, ok := strings.CutPrefix(name, "simd_m64_"); ok {
+		return "simd_" + rest, true
+	}
+	return name, false
+}
+
 // fusableOp reports whether a marked call can be a fused-tree member:
 // the accepted memory loads, or a pure op in the generated
 // simdFusePureOps contract — ops whose BOTH-arch pair bodies stay
@@ -95,10 +115,11 @@ var fusedStoreOps = map[string]int{
 // the same classification the fused splicers apply, so codegen and
 // gcasm can never disagree.
 func fusableOp(m simdCallMark) bool {
-	if _, ok := fusedMemOps[m.name]; ok {
+	name, _ := fuseLookupName(m.name)
+	if _, ok := fusedMemOps[name]; ok {
 		return true
 	}
-	if _, ok := fusedStoreOps[m.name]; ok {
+	if _, ok := fusedStoreOps[name]; ok {
 		return true
 	}
 	if !m.resV128 {
@@ -260,6 +281,19 @@ type fusedTreeBuilder struct {
 	chaseUses  map[string]int
 	chaseCache map[string]int
 	chaseReads map[string]bool
+	// chaseExpanded marks definitions whose CHILD reads this trial
+	// already charged to chaseUses: a def's body text is consumed at
+	// most once however many consumers re-chase the same chain.
+	chaseExpanded map[string]bool
+	// addr64 marks the tree-in-progress as a memory64 one (some member
+	// is a simd_m64_* memory op); see simdfuse.Tree.Addr64.
+	addr64 bool
+	// chaseVisiting guards the definition-chasing recursion against
+	// self-referential definitions (a loop-carried `v = v + 4` in the
+	// goto-form emission): a name already on the chase path is not
+	// chaseable, it stays an intervener. Purely re-entrancy state — no
+	// snapshot needed, entries are removed on unwind.
+	chaseVisiting map[string]bool
 	// failWhy records the walk's first refusal (diagnosis only).
 	failWhy string
 	// owner attributes each scalar/pair parameter to the window
@@ -679,18 +713,23 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 		return 0, false
 	}
-	memScalars, isMem := fusedMemOps[m.name]
+	lookupName, m64 := fuseLookupName(m.name)
+	memScalars, isMem := fusedMemOps[lookupName]
 	isStore := false
 	if !isMem {
-		if sc, ok := fusedStoreOps[m.name]; ok {
+		if sc, ok := fusedStoreOps[lookupName]; ok {
 			memScalars, isMem, isStore = sc, true, true
 		}
+	}
+	if m64 {
+		fb.addr64 = true
+		fb.key.WriteString("m64;")
 	}
 	args := call.Args
 	if isMem {
 		// Drop the leading `m`; the fused call passes its own.
 		want := 1 + memScalars
-		if isStore || m.name == "simd_v128_load32_lane" {
+		if isStore || lookupName == "simd_v128_load32_lane" {
 			want++ // the stored / lane-inserted v128 value
 		}
 		if len(args) != want {
@@ -700,16 +739,24 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// The rng window (rlo, span) must be constants: the splicers
 		// bake them as immediates, which is also what keeps the load's
 		// scratch-register budget at two on amd64. The bounds pass
-		// always emits Const32 windows, so this only rejects exotic
-		// hand-written modules.
-		if m.name == "simd_v128_load32_lane" && !fb.constResolvable(args[2]) {
+		// always emits constant windows — Const32 on wasm32, Const64
+		// (spelled int64(...)) on memory64 — so the resolvability
+		// check matches the module's width.
+		resolvable := fb.constResolvable
+		if m64 {
+			resolvable = func(e ast.Expr) bool {
+				_, ok := fb.addrConstValue(e)
+				return ok
+			}
+		}
+		if lookupName == "simd_v128_load32_lane" && !resolvable(args[2]) {
 			if fb.failWhy == "" {
 				fb.failWhy = "non-const lane"
 			}
 			return 0, false
 		}
-		if m.name == "simd_v128_load_rng" {
-			if !fb.constResolvable(args[2]) || !fb.constResolvable(args[3]) {
+		if lookupName == "simd_v128_load_rng" {
+			if !resolvable(args[2]) || !resolvable(args[3]) {
 				if fb.failWhy == "" {
 					fb.failWhy = "non-const rng window"
 				}
@@ -718,7 +765,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 	}
 	var nodeArgs []simdfuse.Arg
-	isFloatSplat := m.name == "simd_f32x4_splat"
+	isFloatSplat := lookupName == "simd_f32x4_splat"
 	for i, a := range args {
 		argIdx := i
 		if isMem {
@@ -746,7 +793,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 			continue
 		}
 		isV128 := argIdx < len(m.args) && m.args[argIdx]
-		if m.name == "simd_v128_load32_lane" {
+		if lookupName == "simd_v128_load32_lane" {
 			// The mark's positions come from the SSA args (addr, value);
 			// the emitted call interleaves literal memarg/lane operands,
 			// so classify by helper position: only the trailing value is
@@ -808,13 +855,30 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// (no ABI slot) — including single-assignment constant LOCALS,
 		// which the emitter's constant CSE creates for shared memarg
 		// offsets; identical scalar identifiers share one parameter.
-		if c, ok := intConstValue(a); ok {
+		//
+		// A memory64 member's ADDRESS (arg 0) never folds to a bare
+		// ArgConst: Arg.Const is 32-bit, so a fully-constant 64-bit
+		// pointer would truncate. The base+const ArgSum fold below IS
+		// open to it — the base stays a full-width runtime scalar and
+		// the constant is a small reassociated memarg delta — and the
+		// small memarg offset / coalesced window (rlo/span) at args ≥ 1
+		// fold as bounded constants via the int64-aware matcher, since
+		// m64 spells them int64(...).
+		foldOK := !m64 || !isMem || i != 0
+		if m64 && isMem && i >= 1 {
+			if c, ok := fb.addrConstValue(a); ok {
+				nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
+				fmt.Fprintf(&fb.key, "c%d,", c)
+				continue
+			}
+		}
+		if c, ok := intConstValue(a); ok && foldOK {
 			nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
 			fmt.Fprintf(&fb.key, "c%d,", c)
 			continue
 		}
 		if id, ok := a.(*ast.Ident); ok {
-			if c, ok := fb.sc.constBind[id.Name]; ok {
+			if c, ok := fb.sc.constBind[id.Name]; ok && foldOK {
 				nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c})
 				fmt.Fprintf(&fb.key, "c%d,", c)
 				continue
@@ -834,6 +898,15 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		// const-add reassociation) resolves through its window
 		// definition to the same form, under the chase's consumption
 		// bookkeeping so a fully-internalized definition drops out.
+		// The ArgSum fold applies at BOTH widths: on memory64 the base
+		// rides a full-width scalar register and the emitters
+		// materialize base+const with a full i64 add, so nothing
+		// truncates; only the constant matcher differs (m64 spells the
+		// reassociated deltas int64(...)).
+		addrConstOf := fb.constValueOf
+		if m64 {
+			addrConstOf = fb.addrConstValue
+		}
 		aAddr := a
 		var addrDefName string
 		if id, ok := a.(*ast.Ident); ok && isMem && i == 0 && fb.interDef != nil {
@@ -846,12 +919,51 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 		if bin, ok := aAddr.(*ast.BinaryExpr); ok && bin.Op == token.ADD && isMem && i == 0 {
 			base, cExpr := bin.X, bin.Y
-			c, cok := fb.constValueOf(cExpr)
+			c, cok := addrConstOf(cExpr)
 			if !cok {
 				base, cExpr = bin.Y, bin.X
-				c, cok = fb.constValueOf(cExpr)
+				c, cok = addrConstOf(cExpr)
 			}
 			if cok {
+				// memory64: a const-sum base that is itself a chased
+				// intervener chain (`v243 = v228+l6`; rows sharing the
+				// atoms) burns one slot PER BASE under the plain
+				// ArgSum leg — decompose it into scalar-node atoms
+				// first, so k row addresses share the atoms' slots.
+				// The chase is transactional, and the leg is gated on
+				// addr64 to keep the wasm32 output byte-identical
+				// (same policy as chaseAddr's SUB leg).
+				if fb.addr64 && chaseSiteAllowed() {
+					if baseID, ok := base.(*ast.Ident); ok && fb.interDef != nil &&
+						!fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
+						if _, dok := fb.interDef[baseID.Name]; dok {
+							snap := fb.snapshotChase()
+							if l, lok := fb.chaseI32(base); lok {
+								var arg simdfuse.Arg
+								ok := true
+								switch l.Kind {
+								case simdfuse.ArgNode:
+									idx, nok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, {Kind: simdfuse.ArgConst, Const: c}})
+									if !nok {
+										ok = false
+									} else {
+										arg = simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}
+										fmt.Fprintf(&fb.key, "n%d,", idx)
+									}
+								default:
+									// Bisect: only the node-producing
+									// chase for now.
+									ok = false
+								}
+								if ok {
+									nodeArgs = append(nodeArgs, arg)
+									continue
+								}
+							}
+							fb.restoreChase(snap)
+						}
+					}
+				}
 				if baseID, ok := base.(*ast.Ident); ok && !fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
 					idx, iok := fb.scalarDedup[baseID.Name]
 					if !iok {
@@ -886,6 +998,49 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 					continue
 				}
 			}
+			if !cok {
+				// No constant side: a variable-stride address
+				// (`base + stride`, possibly three terms). Chase it
+				// into a scalar-node chain — the leaf identifiers
+				// deduplicate by name, so k loads sharing a stride
+				// variable cost ONE slot instead of one whole-expr
+				// slot each. Transactional like every chase: a failed
+				// partway attempt restores the builder state.
+				snap := fb.snapshotChase()
+				if arg, aok := fb.chaseAddr(aAddr); aok && arg.Kind == simdfuse.ArgNode {
+					nodeArgs = append(nodeArgs, arg)
+					fmt.Fprintf(&fb.key, "n%d,", arg.Index)
+					if addrDefName != "" {
+						if fb.chaseUses == nil {
+							fb.chaseUses = map[string]int{}
+						}
+						fb.chaseUses[addrDefName]++
+					}
+					continue
+				}
+				fb.restoreChase(snap)
+			}
+		}
+		// Opaque scalar arguments deduplicate by structural key:
+		// identical expressions across candidates share one slot,
+		// exactly like identical identifiers do. Sound because every
+		// scalar evaluates once at the fused call (side-effecting
+		// values were hoisted into named locals long before this
+		// point, so these expressions are pure), and noteRead records
+		// every contained identifier for the same interference checks
+		// either way. Address forms like `base + stride` recur once
+		// per load in conversion loops; without the dedup each
+		// occurrence burned its own int slot and pushed wide windows
+		// over the cap.
+		exprKey := ""
+		if _, isID := a.(*ast.Ident); !isID {
+			exprKey = "e:" + exprKeyString(a)
+			if idx, ok := fb.scalarDedup[exprKey]; ok {
+				nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: idx})
+				fmt.Fprintf(&fb.key, "s%d,", idx)
+				fb.noteRead(a)
+				continue
+			}
 		}
 		if 1+len(fb.scalars)+1 > fusedMaxIntRegs {
 			if fb.failWhy == "" {
@@ -895,17 +1050,19 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 		nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: len(fb.scalars)})
 		fmt.Fprintf(&fb.key, "s%d,", len(fb.scalars))
+		if fb.scalarDedup == nil {
+			fb.scalarDedup = map[string]int{}
+		}
 		if id, ok := a.(*ast.Ident); ok {
-			if fb.scalarDedup == nil {
-				fb.scalarDedup = map[string]int{}
-			}
 			fb.scalarDedup[id.Name] = len(fb.scalars)
+		} else if exprKey != "" {
+			fb.scalarDedup[exprKey] = len(fb.scalars)
 		}
 		fb.scalars = append(fb.scalars, a)
 		fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
 		fb.noteRead(a)
 	}
-	op := strings.TrimPrefix(m.name, "simd_")
+	op := strings.TrimPrefix(lookupName, "simd_")
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: op, Args: nodeArgs})
 	fmt.Fprintf(&fb.key, "%s;", op)
 	return len(fb.nodes) - 1, true
@@ -946,11 +1103,76 @@ func (fb *fusedTreeBuilder) pairDebug() string {
 	return out
 }
 
+// chaseSiteCount / chaseSiteMax bisect the const-sum base chase
+// (diagnosis only): WASM2GO_CHASE_MAX=N applies the chase to the
+// first N candidate sites and leaves the rest on the legacy path.
+var (
+	chaseSiteCount int
+	chaseSiteMax   = func() int {
+		v := os.Getenv("WASM2GO_CHASE_MAX")
+		if v == "" {
+			return -1
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return -1
+		}
+		return n
+	}()
+)
+
+func chaseSiteAllowed() bool {
+	chaseSiteCount++
+	if chaseSiteMax < 0 {
+		return true
+	}
+	return chaseSiteCount <= chaseSiteMax
+}
+
+// reportChaseSites prints the running candidate-site count under the
+// bisect env (diagnosis only; called from the translate epilogue).
+func reportChaseSites() {
+	if chaseSiteMax >= 0 || os.Getenv("WASM2GO_CHASE_COUNT") != "" {
+		fmt.Fprintf(os.Stderr, "wasm2go: chase sites so far: %d\n", chaseSiteCount)
+	}
+}
+
+// fuseDebugEnabled gates the window-trial diagnostics: with
+// WASM2GO_FUSE_DEBUG set, every failed fusion trial of at least four
+// candidates prints its width and first refusal to stderr. This is
+// the histogram workflow that localized both the K=4 unlock and the
+// memory64 window-starvation regressions.
+var fuseDebugEnabled = os.Getenv("WASM2GO_FUSE_DEBUG") != ""
+
+func fuseDebugf(format string, args ...interface{}) {
+	if fuseDebugEnabled {
+		fmt.Fprintf(os.Stderr, "wasm2go: fuse-debug: "+format+"\n", args...)
+	}
+}
+
 // constResolvable reports whether e will become an ArgConst: a
 // literal, or a bound constant local.
 func (fb *fusedTreeBuilder) constResolvable(e ast.Expr) bool {
 	_, ok := fb.constValueOf(e)
 	return ok
+}
+
+// addrConstValue resolves an address-offset constant. Unlike
+// constValueOf it also accepts int64/uint64-wrapped literals (a
+// memory64 offset like `int64(2)`), which the address arithmetic
+// materializes at pointer width — but only when the value fits int32,
+// the width of an ArgSum/ArgConst descriptor field. A larger offset
+// falls back to a full scalar node.
+func (fb *fusedTreeBuilder) addrConstValue(e ast.Expr) (int32, bool) {
+	if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+		if id, ok := c.Fun.(*ast.Ident); ok {
+			switch id.Name {
+			case "int64", "uint64", "int32", "uint32":
+				return fb.addrConstValue(c.Args[0])
+			}
+		}
+	}
+	return fb.constValueOf(e)
 }
 
 // constValueOf resolves a literal or a bound constant local.
@@ -1026,6 +1248,7 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 		NumFloats:  len(fb.floats),
 		NumPairs:   len(fb.pairs),
 		NeedsMem:   needsMem,
+		Addr64:     fb.addr64,
 		Nodes:      fb.nodes,
 	})
 	if !ok {
@@ -1035,7 +1258,11 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 	if needsMem {
 		// The synthetic body calls the memory helpers; the splice needs
 		// the Module offsets probe like any mem splice.
-		sc.em.useHelper("simd_v128_load")
+		if fb.addr64 {
+			sc.em.useHelper("simd_m64_v128_load")
+		} else {
+			sc.em.useHelper("simd_v128_load")
+		}
 	}
 	// Materialize the parameter expressions only now that the fuse is
 	// committed: rewriteExpr/pairExprs mutate the AST and emit hoists.
@@ -1043,7 +1270,13 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 	// order, which is the original nested evaluation order.
 	fusedArgs := []ast.Expr{newID("m")}
 	for _, s := range fb.scalars {
-		fusedArgs = append(fusedArgs, sc.rewriteExpr(s, prelude))
+		e := sc.rewriteExpr(s, prelude)
+		if fb.addr64 {
+			// Addr64 signatures take int64 scalars; non-address
+			// scalars (int32-typed in the source) widen losslessly.
+			e = &ast.CallExpr{Fun: newID("int64"), Args: []ast.Expr{e}}
+		}
+		fusedArgs = append(fusedArgs, e)
 	}
 	for _, f := range fb.floats {
 		fusedArgs = append(fusedArgs, sc.rewriteExpr(f, prelude))
@@ -1102,7 +1335,12 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		if es, ok := list[i].(*ast.ExprStmt); ok {
 			if call, cok := es.X.(*ast.CallExpr); cok {
 				if m, marked := sc.em.simdCalls[call]; marked {
-					if _, sok := fusedStoreOps[m.name]; sok {
+					// Strip the memory64 marker: a simd_m64_v128_store
+					// statement is the same store sink as its wasm32
+					// twin (missing this kept every memory64 store out
+					// of window fusion, unfusing whole conversion loops).
+					storeName, _ := fuseLookupName(m.name)
+					if _, sok := fusedStoreOps[storeName]; sok {
 						cands = append(cands, cand{store: call, span: i - start + 1, inter: pendingInter})
 						pendingInter = nil
 						continue
@@ -1134,10 +1372,20 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		st := list[i]
 		if !sc.fuseSafeIntervener(st) {
+			if loopMode && len(list)-start >= 20 {
+				var db strings.Builder
+				if err := printer.Fprint(&db, token.NewFileSet(), st); err != nil {
+					fmt.Fprintf(&db, "<print error: %v>", err)
+				}
+				fuseDebugf("LOOPCAND stop at [%d/%d] cands=%d unsafe-intervener: %.120s", i-start, len(list)-start, len(cands), db.String())
+			}
 			break
 		}
 		pendingInter = append(pendingInter, st)
 		nInter++
+	}
+	if loopMode && len(list)-start >= 20 {
+		fuseDebugf("LOOPCAND done n=%d cands=%d inter=%d", len(list)-start, len(cands), nInter)
 	}
 	// Try the longest window first; the walk is a pure analysis, so a
 	// failed length just retries shorter on a fresh builder.
@@ -1202,6 +1450,12 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			}
 		}
 		if !ok || fb.varEdges == 0 || fb.readsCandVar {
+			if w >= 4 && !ok {
+				fuseDebugf("w=%d walk fail: %s", w, fb.failWhy)
+			}
+			if loopMode && w >= 8 {
+				fuseDebugf("LOOPWIN w=%d ok=%v edges=%d reads=%v why=%s sc=%d pr=%d", w, ok, fb.varEdges, fb.readsCandVar, fb.failWhy, len(fb.scalars), len(fb.pairs))
+			}
 			continue
 		}
 		// A window variable is INTERNAL when the region consumes every
@@ -1256,10 +1510,16 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			rootVars = append(rootVars, name)
 		}
 		if rootsOverCap || (len(roots) == 0 && !hasStore) {
+			if w >= 4 {
+				fuseDebugf("w=%d roots=%d overCap=%v", w, len(roots), rootsOverCap)
+			}
 			continue // over the root cap, or a window with no live output
 		}
 		roots = fb.scheduleNodes(roots)
 		if pl := fb.peakLive(roots); pl > fusedPoolBudget-floatPoolCost(len(fb.floats)) {
+			if w >= 4 {
+				fuseDebugf("w=%d peakLive=%d budget=%d floats=%d roots=%d", w, pl, fusedPoolBudget-floatPoolCost(len(fb.floats)), len(fb.floats), len(roots))
+			}
 			continue // would exhaust the splice synthesizers' vector pool
 		}
 		if hasStore {
@@ -1305,9 +1565,45 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		// intervener may REWRITE a name the chains read: the chains
 		// evaluate at the fused call, after every remaining intervener.
 		consumedInter := map[ast.Stmt]bool{}
+		consumedName := map[string]bool{}
 		for name, uses := range fb.chaseUses {
 			if sc.identCount[name] == uses+1 {
 				consumedInter[fb.interDef[name]] = true
+				consumedName[name] = true
+			}
+		}
+		// A dropped definition must not be read by a KEPT statement.
+		// Nested address chains make this reachable: chasing
+		// `v80 = v67 + s` internalizes v67's read, so v67 counts as
+		// fully consumed — but when v80 itself stays (a loop tail
+		// still reads it), its kept definition would read the dropped
+		// v67. Un-drop such definitions to a fixpoint (keeping one may
+		// expose reads of another).
+		for changedDrop := true; changedDrop; {
+			changedDrop = false
+			for _, st := range inter {
+				if consumedInter[st] {
+					continue
+				}
+				as, aok := st.(*ast.AssignStmt)
+				if !aok {
+					continue
+				}
+				for _, rhs := range as.Rhs {
+					ast.Inspect(rhs, func(n ast.Node) bool {
+						id, ok := n.(*ast.Ident)
+						if !ok || !consumedName[id.Name] {
+							return true
+						}
+						def := fb.interDef[id.Name]
+						if def != nil && consumedInter[def] {
+							delete(consumedInter, def)
+							delete(consumedName, id.Name)
+							changedDrop = true
+						}
+						return true
+					})
+				}
 			}
 		}
 		chaseOK := true
@@ -1364,6 +1660,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			NumFloats:  len(fb.floats),
 			NumPairs:   len(fb.pairs),
 			NeedsMem:   needsMem,
+			Addr64:     fb.addr64,
 			Nodes:      fb.nodes,
 			Roots:      roots,
 			NoResult:   len(roots) == 0,
@@ -1373,11 +1670,19 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		sc.em.useHelper(tree.Name)
 		if needsMem {
-			sc.em.useHelper("simd_v128_load")
+			if fb.addr64 {
+				sc.em.useHelper("simd_m64_v128_load")
+			} else {
+				sc.em.useHelper("simd_v128_load")
+			}
 		}
 		for _, n := range fb.nodes {
 			if n.Class() != simdfuse.ClassV128 || simdfuse.IsStore(n.Op) {
-				sc.em.useHelper("simd_" + n.Op)
+				helper := "simd_" + n.Op
+				if fb.addr64 && (isMemHelperOp(n.Op) || simdfuse.IsStore(n.Op)) {
+					helper = "simd_m64_" + n.Op
+				}
+				sc.em.useHelper(helper)
 			}
 		}
 		// Interveners run FIRST: later candidates' parameter
@@ -1391,7 +1696,13 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		fusedArgs := []ast.Expr{newID("m")}
 		for _, sa := range fb.scalars {
-			fusedArgs = append(fusedArgs, sc.rewriteExpr(sa, prelude))
+			e := sc.rewriteExpr(sa, prelude)
+			if fb.addr64 {
+				// Addr64 signatures take int64 scalars; non-address
+				// scalars (int32-typed in the source) widen losslessly.
+				e = &ast.CallExpr{Fun: newID("int64"), Args: []ast.Expr{e}}
+			}
+			fusedArgs = append(fusedArgs, e)
 		}
 		for _, fa := range fb.floats {
 			fusedArgs = append(fusedArgs, sc.rewriteExpr(fa, prelude))
@@ -1546,9 +1857,15 @@ func (t *translator) fusedHelperDecls() []ast.Decl {
 }
 
 func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
+	// Memory64 trees carry every scalar at pointer width; the register
+	// assignment is identical (one integer register either way).
+	scalarType := "int32"
+	if tree.Addr64 {
+		scalarType = "int64"
+	}
 	params := []*ast.Field{{Names: []*ast.Ident{newID("m")}, Type: &ast.StarExpr{X: newID("Module")}}}
 	for i := 0; i < tree.NumScalars; i++ {
-		params = append(params, &ast.Field{Names: []*ast.Ident{newID(fmt.Sprintf("s%d", i))}, Type: newID("int32")})
+		params = append(params, &ast.Field{Names: []*ast.Ident{newID(fmt.Sprintf("s%d", i))}, Type: newID(scalarType)})
 	}
 	for i := 0; i < tree.NumFloats; i++ {
 		params = append(params, &ast.Field{Names: []*ast.Ident{newID(fmt.Sprintf("f%d", i))}, Type: newID("float32")})
@@ -1560,7 +1877,10 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		})
 	}
 	var body []ast.Stmt
-	argExpr := func(a simdfuse.Arg) ast.Expr {
+	// narrow re-types an int64 scalar for an int32-consuming (pure)
+	// node on an Addr64 tree: only memory members consume the widened
+	// scalars raw (their m64 helpers take int64 address/offset).
+	argExpr := func(a simdfuse.Arg, narrow bool) ast.Expr {
 		switch a.Kind {
 		case simdfuse.ArgNode:
 			return newID(fmt.Sprintf("n%d", a.Index))
@@ -1570,16 +1890,25 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 				Elts: []ast.Expr{newID(fmt.Sprintf("p%d", a.Index)), newID(fmt.Sprintf("p%dh", a.Index))},
 			}
 		case simdfuse.ArgScalar:
+			if narrow {
+				return &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{newID(fmt.Sprintf("s%d", a.Index))}}
+			}
 			return newID(fmt.Sprintf("s%d", a.Index))
 		case simdfuse.ArgFloat:
 			return newID(fmt.Sprintf("f%d", a.Index))
 		case simdfuse.ArgSum:
-			// int32 addition wraps mod 2^32, exactly Add32.
-			return &ast.BinaryExpr{
+			// int32 addition wraps mod 2^32, exactly Add32. (Addr64
+			// trees never carry ArgSum — the builder keeps their
+			// memory scalars opaque.)
+			var sum ast.Expr = &ast.BinaryExpr{
 				X:  newID(fmt.Sprintf("s%d", a.Index)),
 				Op: token.ADD,
 				Y:  intLitSigned(int64(a.Const)),
 			}
+			if narrow {
+				sum = &ast.CallExpr{Fun: newID("int32"), Args: []ast.Expr{sum}}
+			}
+			return sum
 		default: // ArgConst
 			return intLitSigned(int64(a.Const))
 		}
@@ -1589,6 +1918,15 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		var callArgs []ast.Expr
 		_, isMem := fusedMemOps[helper]
 		isScalar := n.Class() != simdfuse.ClassV128
+		// On a memory64 tree the address-carrying members switch to
+		// their int64 m64 twins: the vector loads/stores, and the
+		// scalar-chain address ops (the scale/LUT computations —
+		// everything but the value-only f32_mul).
+		addrM64 := tree.Addr64 && (isMem || simdfuse.IsStore(n.Op) ||
+			(strings.HasPrefix(n.Op, "scalar_") && n.Op != "scalar_f32_mul"))
+		if addrM64 {
+			helper = "simd_m64_" + n.Op
+		}
 		if isMem || simdfuse.ScalarMemOp(n.Op) || simdfuse.IsStore(n.Op) {
 			// Memory helpers (vector and scalar) live in the embedded
 			// helper set; the multi-package export rename covers them
@@ -1601,8 +1939,12 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 			// memory ops.
 			helper = capitalize(helper)
 		}
+		// A widened scalar reaches a narrowing int32 consumer only when
+		// the node is a pure op that stayed 32-bit; the m64 scalar/
+		// memory members take the int64 scalars raw.
+		narrow := tree.Addr64 && !isMem && !simdfuse.IsStore(n.Op) && !addrM64
 		for _, a := range n.Args {
-			callArgs = append(callArgs, argExpr(a))
+			callArgs = append(callArgs, argExpr(a, narrow))
 		}
 		lhs := ast.Expr(newID(fmt.Sprintf("n%d", i)))
 		tok := token.DEFINE

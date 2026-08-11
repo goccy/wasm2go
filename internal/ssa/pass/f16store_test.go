@@ -199,7 +199,7 @@ func TestFuseF16CvtStores(t *testing.T) {
 		t.Fatal("prerequisite phases did not fire")
 	}
 	DCE(f) // the orphaned per-lane shifts still hold uses of the packed word
-	if !FuseF16CvtStores(f) {
+	if !FuseF16CvtStores(f, false) {
 		t.Fatal("cvt-store fusion did not fire")
 	}
 	var merged *ssa.Value
@@ -223,5 +223,33 @@ func TestFuseF16CvtStores(t *testing.T) {
 	}
 	if len(merged.Args) != 3 || merged.Args[2].Type != ssa.TypeV128 {
 		t.Fatalf("args = %d, want [addr, off, W]", len(merged.Args))
+	}
+}
+
+// The memory64 spelling: the fused op takes the simd_m64_* helper and
+// an i64 offset constant; everything upstream is width-neutral.
+func TestFuseF16CvtStoresMemory64(t *testing.T) {
+	f, stores := buildF16StoreFunc(t, []int{0, 1, 2, 3})
+	if !RecognizeF16Store(f) || !MergeF16Stores(f) {
+		t.Fatal("prerequisite phases did not fire")
+	}
+	DCE(f)
+	if !FuseF16CvtStores(f, true) {
+		t.Fatal("cvt-store fusion did not fire")
+	}
+	for _, b := range f.Blocks {
+		for _, v := range b.Values {
+			for _, st := range stores {
+				if v != st || v.Op != ssa.OpSimdMemCall {
+					continue
+				}
+				if n, _ := v.Aux.(string); n != "simd_m64_v128_f16x4_cvt_store" {
+					t.Fatalf("aux = %v, want the m64 helper", v.Aux)
+				}
+				if v.Args[1].Op != ssa.OpConst64 || v.Args[1].Type != ssa.TypeI64 {
+					t.Fatalf("offset = %s/%s, want Const64/i64", v.Args[1].Op, v.Args[1].Type)
+				}
+			}
+		}
 	}
 }

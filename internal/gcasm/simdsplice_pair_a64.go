@@ -22,22 +22,26 @@ import (
 )
 
 // a64SplicePairOp reports whether sym is a pair-form SIMD helper call
-// and returns the op name ("p_" stripped).
-func a64SplicePairOp(sym string) (string, bool) {
-	op, ok := simdSpliceOp(sym) // strips Simd_/simd_
+// and returns the op name ("p_" stripped) plus the memory64 address
+// width (see simdSpliceOp).
+func a64SplicePairOp(sym string) (op string, addr64, ok bool) {
+	op, addr64, ok = simdSpliceOp(sym) // strips Simd_/simd_ and m64_
 	if !ok {
-		return "", false
+		return "", false, false
 	}
-	return strings.CutPrefix(op, "p_")
+	op, ok = strings.CutPrefix(op, "p_")
+	return op, addr64, ok
 }
 
 // a64SplicePair emits the inline body for a pair-form SIMD call.
 // Returns (spliced, needsTrap, err); a table miss is an error by the
 // contract above.
-func a64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
+func a64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, offs *ModuleOffsets) (bool, bool, error) {
 	// The bounds-coalescing split forms have dedicated bodies: the
 	// group-leading load carries the whole window's range check, the
-	// other members drop theirs.
+	// other members drop theirs. On a memory64 module the args ride at
+	// full width (MOVD) with a signed 64-bit start; wasm32 uses the
+	// zero-extended MOVWU forms.
 	switch op {
 	case "v128_load_rng":
 		if offs == nil {
@@ -45,9 +49,23 @@ func a64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleO
 		}
 		// (m, addr, offset, rlo, span) in R0..R4 → trap unless
 		// [addr+rlo, addr+rlo+span) fits; pair of addr+offset in
-		// (R0, R1). rlo is signed (MOVW sign-extends); a negative
-		// start means a group member wrapped and must trap, matching
-		// the helper.
+		// (R0, R1). rlo is signed; a negative start means a group
+		// member wrapped and must trap, matching the helper.
+		if addr64 {
+			b.WriteString("\tMOVD R1, R25\n")
+			b.WriteString("\tADD R3, R25, R26\n")
+			fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tADD R4, R26, R27\n")
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.MemSize)
+			b.WriteString("\tMOVD (R26), R26\n")
+			b.WriteString("\tCMP R27, R26\n")
+			fmt.Fprintf(b, "\tBLO %s\n", a64SimdMemTrapLabel)
+			b.WriteString("\tADD R2, R25, R25\n")
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.M)
+			b.WriteString("\tADD R25, R26, R27\n")
+			b.WriteString("\tWORD $0xa9400760 // ldp x0, x1, [x27]\n")
+			return true, true, nil
+		}
 		b.WriteString("\tMOVWU R1, R25\n")
 		b.WriteString("\tMOVW R3, R26\n")
 		b.WriteString("\tADD R26, R25, R26\n")
@@ -69,6 +87,13 @@ func a64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleO
 			return false, false, fmt.Errorf("simd pair splice %s: no Module offsets", op)
 		}
 		// (m, addr, offset) in R0..R2 → pair in (R0, R1), no check.
+		if addr64 {
+			b.WriteString("\tADD R2, R1, R25\n")
+			fmt.Fprintf(b, "\tMOVD %d(R0), R26\n", offs.M)
+			b.WriteString("\tADD R25, R26, R27\n")
+			b.WriteString("\tWORD $0xa9400760 // ldp x0, x1, [x27]\n")
+			return true, false, nil
+		}
 		b.WriteString("\tMOVWU R1, R25\n")
 		b.WriteString("\tMOVWU R2, R26\n")
 		b.WriteString("\tADD R26, R25, R25\n")
@@ -94,7 +119,7 @@ func a64SplicePair(b *strings.Builder, op string, pool *ConstPool, offs *ModuleO
 		for _, l := range ent.Pre {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}
-		a64MemPreamble(b, ent.Size, offs)
+		a64MemPreamble(b, ent.Size, offs, addr64)
 		for _, l := range ent.Lines {
 			fmt.Fprintf(b, "\t%s\n", l)
 		}

@@ -1365,19 +1365,28 @@ func (w *WasiStubs) Clock_time_get(m *Module, clockID int32, precision int64, ti
 	if out == nil {
 		return _wasiEFAULT
 	}
-	var nanos uint64
-	switch clockID {
-	case 0: // CLOCK_REALTIME
-		nanos = uint64(time.Now().UnixNano())
-	case 1: // CLOCK_MONOTONIC
-		w.mu.Lock()
-		nanos = uint64(time.Since(w.monoStart).Nanoseconds())
-		w.mu.Unlock()
-	default:
-		return _wasiEINVAL
+	nanos, errno := w.clockNanos(clockID)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	binary.LittleEndian.PutUint64(out, nanos)
 	return _wasiESUCCESS
+}
+
+// clockNanos is the layout-independent body of clock_time_get, shared
+// by the wasm32 and wasm64 bindings.
+func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
+	switch clockID {
+	case 0: // CLOCK_REALTIME
+		return uint64(time.Now().UnixNano()), _wasiESUCCESS
+	case 1: // CLOCK_MONOTONIC
+		w.mu.Lock()
+		nanos := uint64(time.Since(w.monoStart).Nanoseconds())
+		w.mu.Unlock()
+		return nanos, _wasiESUCCESS
+	default:
+		return 0, _wasiEINVAL
+	}
 }
 
 // closeWasiOpen releases every underlying handle held by op and
@@ -1418,6 +1427,13 @@ func (w *WasiStubs) Fd_fdstat_get(m *Module, fd, ptr int32) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
+	return w.fdstatFill(fd, out)
+}
+
+// fdstatFill writes the 24-byte fdstat for fd into out — the shared
+// body of the 32- and 64-bit Fd_fdstat_get bindings (the struct holds
+// no pointers, so the layout is width-independent).
+func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var ftype byte = 4 // regular file
@@ -1642,42 +1658,71 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	if src == nil {
 		return _wasiEBADF
 	}
-	// The iovec array is iovsLen * 8 bytes (ptr u32 + len u32 each)
-	// and nread is a single u32 — bounds-check both up front. Compute
-	// the array size in uint64 so a pathological iovsLen can't wrap to
-	// negative.
-	iovBytes := uint64(uint32(iovsLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
 	nreadSlice := w.memSlice(m, nreadPtr, 4)
-	if iovecs == nil || nreadSlice == nil {
+	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
 	_ = op
-	var total uint32
+	binary.LittleEndian.PutUint32(nreadSlice, uint32(readVec(src, bufs)))
+	return _wasiESUCCESS
+}
+
+// iovecSlices resolves a wasm32 ciovec/iovec array ({u32 ptr, u32 len}
+// entries at iovs) into the backing memory windows. Every entry is
+// validated before any I/O happens, so a bad iovec faults the whole
+// call instead of after a partial transfer.
+func (w *WasiStubs) iovecSlices(m *Module, iovs, iovsLen int32) ([][]byte, bool) {
+	// Compute the array size in uint64 so a pathological iovsLen can't
+	// wrap to negative.
+	iovBytes := uint64(uint32(iovsLen)) * 8
+	if iovBytes > 0x7fffffff {
+		return nil, false
+	}
+	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	if iovecs == nil {
+		return nil, false
+	}
+	bufs := make([][]byte, 0, iovsLen)
 	for i := int32(0); i < iovsLen; i++ {
 		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
 		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
 		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
 		if buf == nil {
-			return _wasiEFAULT
+			return nil, false
 		}
+		bufs = append(bufs, buf)
+	}
+	return bufs, true
+}
+
+// readVec fills bufs from src in order, stopping at the first error
+// (EOF included) or short read; returns the bytes read. Shared by the
+// wasm32 and wasm64 fd_read bindings — only the iovec layout differs.
+func readVec(src io.Reader, bufs [][]byte) uint64 {
+	var total uint64
+	for _, buf := range bufs {
 		n, err := src.Read(buf)
-		total += uint32(n)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			break
-		}
-		if n < int(bufLen) {
+		total += uint64(n)
+		if err != nil || n < len(buf) {
 			break
 		}
 	}
-	binary.LittleEndian.PutUint32(nreadSlice, total)
-	return _wasiESUCCESS
+	return total
+}
+
+// writeVec drains bufs into dst in order, stopping at the first failed
+// write; returns the bytes written. Shared like readVec.
+func writeVec(dst io.Writer, bufs [][]byte) uint64 {
+	var total uint64
+	for _, buf := range bufs {
+		n, err := dst.Write(buf)
+		total += uint64(n)
+		if err != nil {
+			break
+		}
+	}
+	return total
 }
 
 // fdSrcLocked returns the io.Reader for fd and (when applicable) the
@@ -1805,18 +1850,28 @@ func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr
 	if out == nil {
 		return _wasiEFAULT
 	}
+	n, errno := w.fdSeek(fd, offset, int(whence))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint64(out, uint64(n))
+	return _wasiESUCCESS
+}
+
+// fdSeek is the layout-independent body of fd_seek, shared by the
+// wasm32 and wasm64 bindings.
+func (w *WasiStubs) fdSeek(fd int32, offset int64, whence int) (int64, int32) {
 	w.mu.Lock()
 	op := w.fdTable[fd]
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
-		return _wasiEBADF
+		return 0, _wasiEBADF
 	}
-	n, err := op.f.Seek(offset, int(whence))
+	n, err := op.f.Seek(offset, whence)
 	if err != nil {
-		return _wasiEINVAL
+		return 0, _wasiEINVAL
 	}
-	binary.LittleEndian.PutUint64(out, uint64(n))
-	return _wasiESUCCESS
+	return n, _wasiESUCCESS
 }
 
 func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
@@ -1842,37 +1897,18 @@ func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) in
 	w.mu.Lock()
 	dst, _ := w.fdDstLocked(fd)
 	w.mu.Unlock()
-	iovBytes := uint64(uint32(iovsLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
 	nwrittenSlice := w.memSlice(m, nwrittenPtr, 4)
-	if iovecs == nil || nwrittenSlice == nil {
+	if !ok || nwrittenSlice == nil {
 		return _wasiEFAULT
 	}
 	if dst == nil {
 		binary.LittleEndian.PutUint32(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	var total uint32
-	for i := int32(0); i < iovsLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := dst.Write(buf)
-		total += uint32(n)
-		if err != nil {
-			break
-		}
-	}
-	binary.LittleEndian.PutUint32(nwrittenSlice, total)
+	binary.LittleEndian.PutUint32(nwrittenSlice, uint32(writeVec(dst, bufs)))
 	return _wasiESUCCESS
 }
-
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	op := w.fdTable[fd]
@@ -2010,16 +2046,29 @@ func (d *dotDirEntry) Info() (os.FileInfo, error) {
 }
 
 func (w *WasiStubs) Fd_readdir(m *Module, fd, buf, buflen int32, cookie int64, bufusedPtr int32) int32 {
-	w.mu.Lock()
-	op := w.fdTable[fd]
-	w.mu.Unlock()
-	if op == nil || op.f == nil || !op.isDir {
-		return _wasiEBADF
-	}
 	bufSlice := w.memSlice(m, buf, buflen)
 	bufusedSlice := w.memSlice(m, bufusedPtr, 4)
 	if bufSlice == nil || bufusedSlice == nil {
 		return _wasiEFAULT
+	}
+	written, errno := w.fdReaddir(fd, bufSlice, cookie)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint32(bufusedSlice, uint32(written))
+	return _wasiESUCCESS
+}
+
+// fdReaddir is the layout-independent body of fd_readdir: it packs
+// dirents into bufSlice starting at the cookie'th entry and returns the
+// byte count used. The dirent wire format has no pointer-width fields,
+// so wasm32 and wasm64 share it; only the bufused out-pointer differs.
+func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int32) {
+	w.mu.Lock()
+	op := w.fdTable[fd]
+	w.mu.Unlock()
+	if op == nil || op.f == nil || !op.isDir {
+		return 0, _wasiEBADF
 	}
 	// cookie == 0 is the wasi-libc rewinddir signal — invalidate any
 	// snapshot so a fresh Readdir picks up entries created or removed
@@ -2029,7 +2078,7 @@ func (w *WasiStubs) Fd_readdir(m *Module, fd, buf, buflen int32, cookie int64, b
 	}
 	entries, err := op.readDirCached()
 	if err != nil {
-		return mapOSError(err)
+		return 0, mapOSError(err)
 	}
 	startIdx := int(cookie)
 	if startIdx < 0 {
@@ -2083,8 +2132,7 @@ func (w *WasiStubs) Fd_readdir(m *Module, fd, buf, buflen int32, cookie int64, b
 			break
 		}
 	}
-	binary.LittleEndian.PutUint32(bufusedSlice, uint32(written))
-	return _wasiESUCCESS
+	return written, _wasiESUCCESS
 }
 
 // Path_open opens a wasm-supplied path and registers it in the fd
@@ -2104,7 +2152,18 @@ func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, ofla
 	if pathSlice == nil || outSlice == nil {
 		return _wasiEFAULT
 	}
-	rel := string(pathSlice)
+	fd, errno := w.pathOpen(string(pathSlice), dirflags, oflags, fsRightsBase, fdflags)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint32(outSlice, uint32(fd))
+	return _wasiESUCCESS
+}
+
+// pathOpen is the layout-independent body of path_open: it resolves and
+// opens rel, registers the fd, and returns it. Callers own reading the
+// path and writing the opened fd at their ABI's pointer width.
+func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32) (int32, int32) {
 	w.mu.Lock()
 	fsys := w.fsys
 	w.mu.Unlock()
@@ -2149,7 +2208,7 @@ func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, ofla
 	// create/truncate the target.
 	writeAccess := flag&(os.O_WRONLY|os.O_RDWR) != 0 || flag&(os.O_CREATE|os.O_TRUNC) != 0
 	if !w.checkFS(rel, writeAccess) {
-		return _wasiEACCES
+		return -1, _wasiEACCES
 	}
 
 	requireDir := oflags&0x2 != 0
@@ -2169,31 +2228,30 @@ func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, ofla
 	// platform-specific syscall constants.
 	if noFollow {
 		if li, lerr := fsys.Lstat(rel); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
-			return _wasiENOENT
+			return -1, _wasiENOENT
 		}
 	}
 	f, err := fsys.OpenFile(rel, flag, 0o644)
 	if err != nil {
-		return mapOSError(err)
+		return -1, mapOSError(err)
 	}
 	st, statErr := f.Stat()
 	if statErr != nil {
-		return mapOSError(errors.Join(statErr, f.Close()))
+		return -1, mapOSError(errors.Join(statErr, f.Close()))
 	}
 	isDir := st.IsDir()
 	if requireDir && !isDir {
 		if cerr := f.Close(); cerr != nil {
-			return mapOSError(cerr)
+			return -1, mapOSError(cerr)
 		}
-		return _wasiENOTDIR
+		return -1, _wasiENOTDIR
 	}
 	w.mu.Lock()
 	fd := w.nextFD
 	w.nextFD++
 	w.fdTable[fd] = &wasiOpen{f: f, isDir: isDir, path: rel, fdflags: fdflags}
 	w.mu.Unlock()
-	binary.LittleEndian.PutUint32(outSlice, uint32(fd))
-	return _wasiESUCCESS
+	return fd, _wasiESUCCESS
 }
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -2898,6 +2956,9 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"mapExecError":            true,
 			"encodeWaitStatus":        true,
 			"totalBytesPlusNul":       true,
+			"putStrVec64":             true,
+			"readVec":                 true,
+			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
 			"Environ_get":             true,
@@ -3172,4 +3233,323 @@ func (t *translator) wasmImportsWasi() bool {
 		}
 	}
 	return false
+}
+
+// ----- wasm64-wasip1 (widened ABI) ------------------------------------------
+//
+// A memory64 module's wasi imports arrive with every argument widened
+// to pointer-width i64 (see the wasm2go wasi-libc port's
+// __wasi_abi_t), and pointer-bearing WASI structs (iovecs, sizes)
+// use the LP64 layout. The *64 methods below are the widened
+// bindings; codegen routes a memory64 module's imports here and
+// every wasm32 module keeps the standard methods above.
+
+// memSlice64 is memSlice for full-range 64-bit guest pointers.
+func (w *WasiStubs) memSlice64(m *Module, off int64, n int64) []byte {
+	mem := m.memory
+	lo := uint64(off)
+	hi := lo + uint64(n)
+	if n < 0 || hi < lo || hi > uint64(len(mem)) {
+		return nil
+	}
+	return mem[lo:hi]
+}
+
+func (w *WasiStubs) Clock_time_get64(m *Module, clockID int64, precision int64, timePtr int64) int32 {
+	out := w.memSlice64(m, timePtr, 8)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	nanos, errno := w.clockNanos(int32(clockID))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint64(out, nanos)
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_close64(m *Module, fd int64) int32 {
+	return w.Fd_close(m, int32(fd))
+}
+
+func (w *WasiStubs) Fd_fdstat_get64(m *Module, fd int64, ptr int64) int32 {
+	// The fdstat struct holds no pointers, so its 24-byte layout is
+	// identical under LP64; only the out-pointer needs the 64-bit
+	// window. Stage through a scratch struct via the 32-bit logic.
+	out := w.memSlice64(m, ptr, 24)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	return w.fdstatFill(int32(fd), out)
+}
+
+func (w *WasiStubs) Fd_seek64(m *Module, fd int64, offset int64, whence int64, newOffPtr int64) int32 {
+	out := w.memSlice64(m, newOffPtr, 8)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	n, errno := w.fdSeek(int32(fd), offset, int(whence))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint64(out, uint64(n))
+	return _wasiESUCCESS
+}
+
+// iovecSlices64 is iovecSlices for the LP64 iovec layout: {u64 buf,
+// u64 len}, 16 bytes per entry.
+func (w *WasiStubs) iovecSlices64(m *Module, iovs, iovsLen int64) ([][]byte, bool) {
+	if iovsLen < 0 || iovsLen > 1<<20 {
+		return nil, false
+	}
+	iovecs := w.memSlice64(m, iovs, iovsLen*16)
+	if iovecs == nil {
+		return nil, false
+	}
+	bufs := make([][]byte, 0, iovsLen)
+	for i := int64(0); i < iovsLen; i++ {
+		bufPtr := binary.LittleEndian.Uint64(iovecs[i*16:])
+		bufLen := binary.LittleEndian.Uint64(iovecs[i*16+8:])
+		buf := w.memSlice64(m, int64(bufPtr), int64(bufLen))
+		if buf == nil {
+			return nil, false
+		}
+		bufs = append(bufs, buf)
+	}
+	return bufs, true
+}
+
+func (w *WasiStubs) Fd_write64(m *Module, fd int64, iovs int64, iovsLen int64, nwrittenPtr int64) int32 {
+	w.mu.Lock()
+	dst, _ := w.fdDstLocked(int32(fd))
+	w.mu.Unlock()
+	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
+	// nwritten is a 64-bit __wasi_size_t.
+	nwrittenSlice := w.memSlice64(m, nwrittenPtr, 8)
+	if !ok || nwrittenSlice == nil {
+		return _wasiEFAULT
+	}
+	if dst == nil {
+		binary.LittleEndian.PutUint64(nwrittenSlice, 0)
+		return _wasiEBADF
+	}
+	binary.LittleEndian.PutUint64(nwrittenSlice, writeVec(dst, bufs))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Proc_exit64(m *Module, code int64) {
+	panic(&WasiExitError{Code: int32(code)})
+}
+
+// putStrVec64 packs ss as an LP64 char** table (8-byte guest pointers
+// at vec) plus NUL-terminated bodies (at buf, guest address bufBase).
+// Both slices must already be sized: len(ss)*8 and totalBytesPlusNul.
+func putStrVec64(vec, buf []byte, bufBase uint64, ss []string) int32 {
+	bufOff := uint64(0)
+	for i, s := range ss {
+		binary.LittleEndian.PutUint64(vec[i*8:], bufBase+bufOff)
+		n := copy(buf[bufOff:], s)
+		if n < len(s) {
+			return _wasiEFAULT
+		}
+		bufOff += uint64(n)
+		buf[bufOff] = 0
+		bufOff++
+	}
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Args_get64(m *Module, argv, argvBuf int64) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	argvSlice := w.memSlice64(m, argv, int64(len(w.args))*8)
+	if argvSlice == nil {
+		return _wasiEFAULT
+	}
+	total, ok := totalBytesPlusNul(w.args)
+	if !ok {
+		return _wasiEFAULT
+	}
+	argvBufSlice := w.memSlice64(m, argvBuf, int64(total))
+	if argvBufSlice == nil {
+		return _wasiEFAULT
+	}
+	return putStrVec64(argvSlice, argvBufSlice, uint64(argvBuf), w.args)
+}
+
+func (w *WasiStubs) Args_sizes_get64(m *Module, argcPtr, argvBufLenPtr int64) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	argcSlice := w.memSlice64(m, argcPtr, 8)
+	bufLenSlice := w.memSlice64(m, argvBufLenPtr, 8)
+	if argcSlice == nil || bufLenSlice == nil {
+		return _wasiEFAULT
+	}
+	total, ok := totalBytesPlusNul(w.args)
+	if !ok {
+		return _wasiEFAULT
+	}
+	binary.LittleEndian.PutUint64(argcSlice, uint64(len(w.args)))
+	binary.LittleEndian.PutUint64(bufLenSlice, uint64(total))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Environ_get64(m *Module, envv, envBuf int64) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	envvSlice := w.memSlice64(m, envv, int64(len(w.env))*8)
+	if envvSlice == nil {
+		return _wasiEFAULT
+	}
+	total, ok := totalBytesPlusNul(w.env)
+	if !ok {
+		return _wasiEFAULT
+	}
+	envBufSlice := w.memSlice64(m, envBuf, int64(total))
+	if envBufSlice == nil {
+		return _wasiEFAULT
+	}
+	return putStrVec64(envvSlice, envBufSlice, uint64(envBuf), w.env)
+}
+
+func (w *WasiStubs) Environ_sizes_get64(m *Module, envcPtr, envBufLenPtr int64) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	envcSlice := w.memSlice64(m, envcPtr, 8)
+	bufLenSlice := w.memSlice64(m, envBufLenPtr, 8)
+	if envcSlice == nil || bufLenSlice == nil {
+		return _wasiEFAULT
+	}
+	total, ok := totalBytesPlusNul(w.env)
+	if !ok {
+		return _wasiEFAULT
+	}
+	binary.LittleEndian.PutUint64(envcSlice, uint64(len(w.env)))
+	binary.LittleEndian.PutUint64(bufLenSlice, uint64(total))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_fdstat_set_flags64(m *Module, fd, flags int64) int32 {
+	return w.Fd_fdstat_set_flags(m, int32(fd), int32(flags))
+}
+
+func (w *WasiStubs) Fd_prestat_get64(m *Module, fd, ptr int64) int32 {
+	if int32(fd) != 3 {
+		return _wasiEBADF
+	}
+	// LP64 prestat: tag u8 + pad[7] + pr_name_len (__wasi_size_t, u64)
+	// = 16 bytes.
+	out := w.memSlice64(m, ptr, 16)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	out[0] = 0 // preopen tag = directory
+	binary.LittleEndian.PutUint64(out[8:], 1)
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_prestat_dir_name64(m *Module, fd, buf, buflen int64) int32 {
+	if int32(fd) != 3 {
+		return _wasiEBADF
+	}
+	if buflen < 1 {
+		return _wasiESUCCESS
+	}
+	out := w.memSlice64(m, buf, buflen)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	out[0] = '/'
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_read64(m *Module, fd, iovs, iovsLen, nreadPtr int64) int32 {
+	w.mu.Lock()
+	src, _ := w.fdSrcLocked(int32(fd))
+	w.mu.Unlock()
+	if src == nil {
+		return _wasiEBADF
+	}
+	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
+	// nread is a 64-bit __wasi_size_t.
+	nreadSlice := w.memSlice64(m, nreadPtr, 8)
+	if !ok || nreadSlice == nil {
+		return _wasiEFAULT
+	}
+	binary.LittleEndian.PutUint64(nreadSlice, readVec(src, bufs))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Fd_readdir64(m *Module, fd, buf, buflen, cookie, bufusedPtr int64) int32 {
+	// The dirent wire format is pointer-free (u64s and a u32), so only
+	// the buffer window and the 64-bit bufused differ from wasm32.
+	bufSlice := w.memSlice64(m, buf, buflen)
+	bufusedSlice := w.memSlice64(m, bufusedPtr, 8)
+	if bufSlice == nil || bufusedSlice == nil {
+		return _wasiEFAULT
+	}
+	written, errno := w.fdReaddir(int32(fd), bufSlice, cookie)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint64(bufusedSlice, uint64(written))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Path_open64(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, fsRightsInherit, fdflags, openedFdPtr int64) int32 {
+	if int32(dirFd) != 3 {
+		return _wasiEBADF
+	}
+	pathSlice := w.memSlice64(m, pathPtr, pathLen)
+	// The opened fd is a __wasi_fd_t (u32) under LP64 too.
+	outSlice := w.memSlice64(m, openedFdPtr, 4)
+	if pathSlice == nil || outSlice == nil {
+		return _wasiEFAULT
+	}
+	fd, errno := w.pathOpen(string(pathSlice), int32(dirflags), int32(oflags), fsRightsBase, int32(fdflags))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	binary.LittleEndian.PutUint32(outSlice, uint32(fd))
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Path_filestat_get64(m *Module, dirFd, flags, pathPtr, pathLen, outPtr int64) int32 {
+	if int32(dirFd) != 3 {
+		return _wasiEBADF
+	}
+	pathSlice := w.memSlice64(m, pathPtr, pathLen)
+	// filestat is all fixed-width u64/u32 fields — 64 bytes under both
+	// ABIs.
+	out := w.memSlice64(m, outPtr, 64)
+	if pathSlice == nil || out == nil {
+		return _wasiEFAULT
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	rel := string(pathSlice)
+	var st os.FileInfo
+	var err error
+	if flags&0x1 != 0 {
+		st, err = fsys.Stat(rel)
+	} else {
+		st, err = fsys.Lstat(rel)
+	}
+	if err != nil {
+		return mapOSError(err)
+	}
+	writeFilestat(out, st)
+	return _wasiESUCCESS
+}
+
+func (w *WasiStubs) Random_get64(m *Module, buf, bufLen int64) int32 {
+	slice := w.memSlice64(m, buf, bufLen)
+	if slice == nil {
+		return _wasiEFAULT
+	}
+	if _, err := rand.Read(slice); err != nil {
+		return _wasiEIO
+	}
+	return _wasiESUCCESS
 }

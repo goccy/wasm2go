@@ -53,12 +53,29 @@ var simdSpliceConstRe = regexp.MustCompile(`·(simdConst[A-Za-z0-9]+)\(SB\)`)
 // cross-chunk linkname) and simd_-prefixed in single-package mode; only
 // they use either prefix, so the name alone identifies them regardless
 // of the bundle's package layout.
-func simdSpliceOp(sym string) (string, bool) {
+//
+// A memory64 module's memory helpers carry an extra m64_ marker
+// ("Simd_m64_v128_load", pair form "Simd_p_m64_v128_load"); it is
+// stripped here and reported as addr64 so the memory splices widen the
+// i64 address operands instead of zero-extending i32 ones. The op name
+// after stripping indexes the SAME tables — the vector bodies are
+// identical, only the effective-address glue differs.
+func simdSpliceOp(sym string) (op string, addr64, ok bool) {
 	cname := sym[strings.LastIndex(sym, ".")+1:]
-	if op, ok := strings.CutPrefix(cname, "Simd_"); ok {
-		return op, true
+	op, ok = strings.CutPrefix(cname, "Simd_")
+	if !ok {
+		op, ok = strings.CutPrefix(cname, "simd_")
 	}
-	return strings.CutPrefix(cname, "simd_")
+	if !ok {
+		return "", false, false
+	}
+	if rest, m64 := strings.CutPrefix(op, "m64_"); m64 {
+		return rest, true, true
+	}
+	if rest, m64 := strings.CutPrefix(op, "p_m64_"); m64 {
+		return "p_" + rest, true, true
+	}
+	return op, false, true
 }
 
 // simdSpliceRewriteConsts rewrites the helper bodies' ·simdConst*
@@ -95,19 +112,87 @@ func simdSpliceRewriteConsts(lines []string, pool *ConstPool) ([]string, bool) {
 // cargs/cres describe the site's ABIInternal assignment; base is the
 // RSP offset of the caller's outgoing ABIInternal argument area
 // (8+maxOut).
-func a64SpliceSimd(b *strings.Builder, sym string, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, pool *ConstPool, offs *ModuleOffsets) (bool, bool) {
-	op, ok := simdSpliceOp(sym)
+// SpliceSlots overrides where a splice reads its v128 arguments and
+// writes its v128 result: absolute RSP byte offsets of the VALUES'
+// own frame slots, replacing the ABIInternal scratch-area staging.
+// Args is keyed by the call-order argument index; Out < 0 keeps the
+// default scratch slot. nil keeps every default (the listing-
+// transform path, where the values genuinely live in the scratch).
+type SpliceSlots struct {
+	Args map[int]int
+	Out  int
+	// ArgRegs / OutReg carry v128 operands that live in vector
+	// registers (the emitter's loop-carry homes, V25–V31): the
+	// splice reads such an argument with a register move instead of
+	// a slot load, and writes the result to the home instead of a
+	// slot store. Paths that cannot honor a register form (the lane
+	// ops, which index the value's memory) decline the splice.
+	ArgRegs map[int]string
+	OutReg  string
+}
+
+func (s *SpliceSlots) argOff(i, def int) int {
+	if s != nil {
+		if off, ok := s.Args[i]; ok {
+			return off
+		}
+	}
+	return def
+}
+
+func (s *SpliceSlots) argReg(i int) string {
+	if s == nil {
+		return ""
+	}
+	return s.ArgRegs[i]
+}
+
+func (s *SpliceSlots) outOff(def int) int {
+	if s != nil && s.Out >= 0 {
+		return s.Out
+	}
+	return def
+}
+
+func a64SpliceSimd(b *strings.Builder, sym string, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, pool *ConstPool, offs *ModuleOffsets, slots *SpliceSlots) (bool, bool) {
+	op, addr64, ok := simdSpliceOp(sym)
 	if !ok {
 		return false, false
 	}
 	if strings.HasPrefix(op, "v128_load") || strings.HasPrefix(op, "v128_store") {
-		return a64SpliceSimdMem(b, op, cargs, cres, hasRes, base, offs)
+		return a64SpliceSimdMem(b, op, addr64, cargs, cres, hasRes, base, offs, slots)
 	}
-	if strings.Contains(op, "extract_lane") {
-		return a64SpliceExtractLane(b, op, cargs, base), false
-	}
-	if strings.Contains(op, "replace_lane") {
-		return a64SpliceReplaceLane(b, op, cargs, cres, hasRes, base), false
+	if strings.Contains(op, "extract_lane") || strings.Contains(op, "replace_lane") {
+		// The lane ops index the v128's MEMORY, so register-resident
+		// operands spill to their scratch slots first (loop exits
+		// only — the hot path never lanes a homed value), and a
+		// register-destined result loads back after the in-place
+		// edit.
+		outReg := ""
+		if slots != nil && (len(slots.ArgRegs) > 0 || slots.OutReg != "") {
+			ns := &SpliceSlots{Out: -1}
+			if slots.Args != nil {
+				ns.Args = slots.Args
+			}
+			for i, r := range slots.ArgRegs {
+				if i >= len(cargs) {
+					return false, false
+				}
+				fmt.Fprintf(b, "\tFMOVQ F%s, %d(RSP)\n", strings.TrimPrefix(r, "V"), base+cargs[i].SeqOf)
+			}
+			outReg = slots.OutReg
+			slots = ns
+		}
+		if strings.Contains(op, "extract_lane") {
+			return a64SpliceExtractLane(b, op, cargs, base, slots), false
+		}
+		if !a64SpliceReplaceLane(b, op, cargs, cres, hasRes, base, slots) {
+			return false, false
+		}
+		if outReg != "" {
+			fmt.Fprintf(b, "\tFMOVQ %d(RSP), F%s\n", slots.outOff(base+cres.SeqOf), strings.TrimPrefix(outReg, "V"))
+		}
+		return true, false
 	}
 	lines, ok := a64SimdSpliceTab[op]
 	if !ok {
@@ -120,10 +205,14 @@ func a64SpliceSimd(b *strings.Builder, sym string, cargs []RegAssignment, cres *
 	// Load the v128 args into F0..F2 in declaration order and verify the
 	// scalars already sit where the body expects them.
 	vord := 0
-	for _, ca := range cargs {
+	for i, ca := range cargs {
 		switch ca.Kind {
 		case ArgV128:
-			fmt.Fprintf(b, "\tFMOVQ %d(RSP), F%d\n", base+ca.SeqOf, vord)
+			if r := slots.argReg(i); r != "" {
+				fmt.Fprintf(b, "\tVORR %s.B16, %s.B16, V%d.B16\n", r, r, vord)
+			} else {
+				fmt.Fprintf(b, "\tFMOVQ %d(RSP), F%d\n", slots.argOff(i, base+ca.SeqOf), vord)
+			}
 			vord++
 		case ArgF32, ArgF64:
 			// Float scalars are only present on ops without v128 params
@@ -144,7 +233,11 @@ func a64SpliceSimd(b *strings.Builder, sym string, cargs []RegAssignment, cres *
 		fmt.Fprintf(b, "\t%s\n", l)
 	}
 	if hasRes && cres.Kind == ArgV128 {
-		fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", base+cres.SeqOf)
+		if slots != nil && slots.OutReg != "" {
+			fmt.Fprintf(b, "\tVORR V0.B16, V0.B16, %s.B16\n", slots.OutReg)
+		} else {
+			fmt.Fprintf(b, "\tFMOVQ F0, %d(RSP) // simd out\n", slots.outOff(base+cres.SeqOf))
+		}
 	}
 	// Scalar results are already in R0: the sequences end there, which
 	// is also ABIInternal's first result register.
@@ -179,7 +272,7 @@ func a64LaneElem(op string) (scale int, load, store, reg string, ok bool) {
 // (v [2]uint64, lane int32) → elem. The vector is in its stack slot and
 // the lane in R0, so the element is one indexed load away — no vector
 // register needed at all, and the lane may be any runtime value.
-func a64SpliceExtractLane(b *strings.Builder, op string, cargs []RegAssignment, base int) bool {
+func a64SpliceExtractLane(b *strings.Builder, op string, cargs []RegAssignment, base int, slots *SpliceSlots) bool {
 	if len(cargs) != 2 || cargs[0].Kind != ArgV128 || cargs[1].Reg != "R0" {
 		return false
 	}
@@ -187,7 +280,7 @@ func a64SpliceExtractLane(b *strings.Builder, op string, cargs []RegAssignment, 
 	if !ok {
 		return false
 	}
-	fmt.Fprintf(b, "\tADD $%d, RSP, R27\n", base+cargs[0].SeqOf)
+	fmt.Fprintf(b, "\tADD $%d, RSP, R27\n", slots.argOff(0, base+cargs[0].SeqOf))
 	fmt.Fprintf(b, "\tADD R0<<%d, R27, R27\n", scale)
 	fmt.Fprintf(b, "\t%s (R27), %s\n", load, reg)
 	return true
@@ -196,7 +289,7 @@ func a64SpliceExtractLane(b *strings.Builder, op string, cargs []RegAssignment, 
 // a64SpliceReplaceLane inlines Simd_<shape>_replace_lane:
 // (v [2]uint64, lane int32, val T) → [2]uint64. Copy the vector into
 // the result slot, then store the element over the lane in place.
-func a64SpliceReplaceLane(b *strings.Builder, op string, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int) bool {
+func a64SpliceReplaceLane(b *strings.Builder, op string, cargs []RegAssignment, cres *RegAssignment, hasRes bool, base int, slots *SpliceSlots) bool {
 	if len(cargs) != 3 || cargs[0].Kind != ArgV128 || cargs[1].Reg != "R0" ||
 		!hasRes || cres.Kind != ArgV128 {
 		return false
@@ -219,9 +312,10 @@ func a64SpliceReplaceLane(b *strings.Builder, op string, cargs []RegAssignment, 
 	}
 	// F16 is outside the F0–F15 ABIInternal argument file and dead at a
 	// call site, so it cannot collide with the float val in F0.
-	fmt.Fprintf(b, "\tFMOVQ %d(RSP), F16\n", base+cargs[0].SeqOf)
-	fmt.Fprintf(b, "\tFMOVQ F16, %d(RSP) // simd out\n", base+cres.SeqOf)
-	fmt.Fprintf(b, "\tADD $%d, RSP, R27\n", base+cres.SeqOf)
+	out := slots.outOff(base + cres.SeqOf)
+	fmt.Fprintf(b, "\tFMOVQ %d(RSP), F16\n", slots.argOff(0, base+cargs[0].SeqOf))
+	fmt.Fprintf(b, "\tFMOVQ F16, %d(RSP) // simd out\n", out)
+	fmt.Fprintf(b, "\tADD $%d, RSP, R27\n", out)
 	fmt.Fprintf(b, "\tADD R0<<%d, R27, R27\n", scale)
 	fmt.Fprintf(b, "\t%s %s, (R27)\n", store, valReg)
 	return true

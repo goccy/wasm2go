@@ -114,6 +114,23 @@ func (p *a64ScalarPre) allocFpr() (int, error) {
 	return f, nil
 }
 
+// takeAddrSource hands a chain-computed ADDRESS terminal to a memory
+// emitter: the GPR analog of takeSplatSource. The vector walk's
+// placement loop already decremented the use, so this only frees the
+// scratch slot on death — the caller copies the value into the
+// address register before any clobbering.
+func (p *a64ScalarPre) takeAddrSource(idx int) (string, error) {
+	g, ok := p.gprOf[idx]
+	if !ok {
+		return "", fmt.Errorf("fused splice %s: address source n%d not in a register", p.tree.Name, idx)
+	}
+	if p.uses[idx] == 0 {
+		delete(p.gprOf, idx)
+		p.freeGpr = append(p.freeGpr, g)
+	}
+	return g, nil
+}
+
 // takeGpr consumes an i32 operand and returns a GPR the caller may
 // CLOBBER: the operand's own register when this was its last use, a
 // fresh copy otherwise.
@@ -133,19 +150,41 @@ func (p *a64ScalarPre) takeGpr(a simdfuse.Arg) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVWU %s, %s\n", src, r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVD %s, %s\n", src, r)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVWU %s, %s\n", src, r)
+		}
 		return r, nil
 	case simdfuse.ArgScalar:
 		r, err := p.allocGpr()
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVWU %s, %s\n", p.scalarReg(a), r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVD %s, %s\n", p.scalarReg(a), r)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVWU %s, %s\n", p.scalarReg(a), r)
+		}
 		return r, nil
 	case simdfuse.ArgSum:
 		r, err := p.allocGpr()
 		if err != nil {
 			return "", err
+		}
+		if p.tree.Addr64 {
+			// Full-width move + signed addend (memory64 offsets may be
+			// negated struct-field subtractions).
+			fmt.Fprintf(p.b, "\tMOVD %s, %s\n", p.scalarReg(a), r)
+			switch {
+			case a.Const == 0:
+			case a.Const > 0 && a.Const < 4096:
+				fmt.Fprintf(p.b, "\tADD $%d, %s, %s\n", a.Const, r, r)
+			default:
+				fmt.Fprintf(p.b, "\tMOVD $%d, R22\n", int64(a.Const))
+				fmt.Fprintf(p.b, "\tADD R22, %s, %s\n", r, r)
+			}
+			return r, nil
 		}
 		switch {
 		case a.Const == 0:
@@ -163,7 +202,11 @@ func (p *a64ScalarPre) takeGpr(a simdfuse.Arg) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(p.b, "\tMOVD $%d, %s\n", int64(uint32(a.Const)), r)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVD $%d, %s\n", int64(a.Const), r)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVD $%d, %s\n", int64(uint32(a.Const)), r)
+		}
 		return r, nil
 	}
 	return "", fmt.Errorf("fused splice %s: bad scalar operand kind", p.tree.Name)
@@ -255,25 +298,34 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(p.b, "\tLSLW $%d, %s, %s\n", uint32(n.Args[1].Const)%32, g, g)
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tLSL $%d, %s, %s\n", uint64(n.Args[1].Const)%64, g, g)
+		} else {
+			fmt.Fprintf(p.b, "\tLSLW $%d, %s, %s\n", uint32(n.Args[1].Const)%32, g, g)
+		}
 		p.gprOf[i] = g
 	case "scalar_i32_add":
 		g, err := p.takeGpr(n.Args[0])
 		if err != nil {
 			return err
 		}
+		addOp := "ADDW"
+		imm := int64(uint32(n.Args[1].Const))
+		if p.tree.Addr64 {
+			addOp, imm = "ADD", int64(n.Args[1].Const)
+		}
 		r := n.Args[1]
 		switch r.Kind {
 		case simdfuse.ArgConst:
-			fmt.Fprintf(p.b, "\tADDW $%d, %s, %s\n", int64(uint32(r.Const)), g, g)
+			fmt.Fprintf(p.b, "\t%s $%d, %s, %s\n", addOp, imm, g, g)
 		case simdfuse.ArgScalar:
-			fmt.Fprintf(p.b, "\tADDW %s, %s, %s\n", p.scalarReg(r), g, g)
+			fmt.Fprintf(p.b, "\t%s %s, %s, %s\n", addOp, p.scalarReg(r), g, g)
 		case simdfuse.ArgNode:
 			g2, err := p.takeGpr(r)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(p.b, "\tADDW %s, %s, %s\n", g2, g, g)
+			fmt.Fprintf(p.b, "\t%s %s, %s, %s\n", addOp, g2, g, g)
 			p.freeGpr = append(p.freeGpr, g2)
 		default:
 			return fmt.Errorf("fused splice %s: bad scalar_i32_add operand", p.tree.Name)

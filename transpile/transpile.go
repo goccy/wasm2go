@@ -104,9 +104,18 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	if res.Nrc2VecDot != "" {
 		nrc2 = &gcasm.Nrc2Spec{VecDot: res.Nrc2VecDot, Companion: res.Nrc2Companion}
 	}
+	var directAsm map[string]gcasm.DirectAsmFn
+	for name, df := range res.DirectAsmSSA {
+		if directAsm == nil {
+			directAsm = map[string]gcasm.DirectAsmFn{}
+		}
+		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
+	}
 	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
-		FastMath:       opts.FastMath,
-		FuseLoopUnroll: opts.FuseLoopUnroll,
+		FastMath:         opts.FastMath,
+		FuseLoopUnroll:   opts.FuseLoopUnroll,
+		DirectAsm:        directAsm,
+		DirectAsmGlobals: res.DirectAsmGlobals,
 	})
 	if err != nil {
 		return res, fmt.Errorf("gcasm backend: %w", err)
@@ -114,6 +123,10 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	if n := gstats.SimdSpliced + gstats.SimdKept; n > 0 {
 		fmt.Fprintf(os.Stderr, "wasm2go: gcasm SIMD splice: %d call sites inlined, %d kept as calls\n",
 			gstats.SimdSpliced, gstats.SimdKept)
+	}
+	if n := gstats.DirectAsm + gstats.DirectAsmFallback; n > 0 {
+		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm: %d bodies emitted, %d fell back to the transform\n",
+			gstats.DirectAsm, gstats.DirectAsmFallback)
 	}
 	if res.Files == nil {
 		res.Files = map[string][]byte{}

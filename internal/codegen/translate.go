@@ -158,6 +158,30 @@ type Options struct {
 	// gate it and validate with token-level equivalence instead of
 	// byte-equality probes.
 	FastMath bool
+	// DirectAsmFuncs names functions (post-rename FnN / fnN symbols,
+	// or outlined-loop names like Fn1016l13807) whose finalized SSA
+	// should be retained in Result.DirectAsmSSA for the asm bundle to
+	// emit directly via internal/asmgen instead of transforming the
+	// gc-captured listing. Retention is opt-in per function; a name
+	// the direct emitter cannot handle later falls back to the normal
+	// transform path, so listing a function here never breaks the
+	// build. Empty disables retention entirely.
+	DirectAsmFuncs []string
+}
+
+// DirectAsmFn is a function retained for direct-asm emission: its
+// finalized SSA (post optimization fixpoint, idiom rewrites, and
+// outlining) plus the wasm-typed signature the asm frame layout needs.
+// Packed marks the outlined packed-boundary form: the Go-side
+// signature carries only the module pointer (Sig is then
+// results-only) and the parameter values ride the Module's
+// outline-pack scratch, PackedParams giving their SSA types in slot
+// order (v128 = two slots).
+type DirectAsmFn struct {
+	Fn           *ssa.Func
+	Sig          wasm.FuncType
+	Packed       bool
+	PackedParams []ssa.Type
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.
@@ -195,6 +219,17 @@ type Result struct {
 	// letting the asm bundle transform its body like a translated
 	// function.
 	OutlinedSigs map[string]OutlinedSig
+	// DirectAsmSSA maps function names listed in Options.DirectAsmFuncs
+	// to their retained finalized SSA, for the asm bundle to emit via
+	// internal/asmgen. Names the translator never saw (or whose SSA is
+	// ineligible for retention) are simply absent.
+	DirectAsmSSA map[string]DirectAsmFn
+	// DirectAsmGlobals is the byte offset of each wasm global within
+	// the generated Module struct (-1 for imported globals), for
+	// direct-asm bodies to inline global accesses. Nil unless
+	// direct-asm retention is active. The generated bundle carries
+	// compile-time assertions pinning these offsets.
+	DirectAsmGlobals []int
 }
 
 // Translate parses helpers, walks the module, and emits Go source for
@@ -215,6 +250,13 @@ type Result struct {
 func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if opts.Package == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.Package is required")
+	}
+	if m.Memory64() {
+		for _, mem := range m.Memories {
+			if mem.Limits.Shared {
+				return Result{}, fmt.Errorf("wasm2go: shared memory64 is not supported")
+			}
+		}
 	}
 	if opts.OutputImportPath == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.OutputImportPath is required")
@@ -240,6 +282,20 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		helpers:      map[string]bool{},
 		sidecars:     map[string][]byte{},
 		multiPackage: autoMultiPackage,
+	}
+	if len(opts.DirectAsmFuncs) > 0 {
+		t.directAsmSet = make(map[string]bool, len(opts.DirectAsmFuncs))
+		for _, name := range opts.DirectAsmFuncs {
+			t.directAsmSet[name] = true
+		}
+		// Direct-asm bodies hardcode the Module.M field offset; the
+		// bundle verifies it against this probe's captured assembly
+		// before swapping any body in (SIMD modules emit the probe
+		// anyway — this covers scalar-only modules). A module with no
+		// memory has no M field to probe and no memory ops to verify.
+		if len(m.Memories) > 0 {
+			t.helpers["gcasmMemProbe"] = true
+		}
 	}
 	// SSA pipeline is always on; an unsupported wasm feature is a hard
 	// error from Translate (the legacy direct-opcode compiler is gone).
@@ -482,15 +538,21 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		return res, err
 	}
 	t.appendSimdHelperFiles(res.Files)
+	t.appendDirectAsmLayoutFile(res.Files)
 	res.FusedSimd = t.FusedTrees()
 	res.FusedLoops = t.FusedLoops()
 	res.Outlined = t.outlinedByChunk
 	res.OutlinedSigs = t.outlinedSigs
+	res.DirectAsmSSA = t.directAsmSSA
+	if len(t.directAsmSSA) > 0 {
+		res.DirectAsmGlobals = t.moduleGlobalOffsets()
+	}
 	if t.nrc2 != nil {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
 		res.Nrc2Companion = t.nrc2CompanionName()
 	}
 	t.warnStaleF16Table()
+	reportChaseSites()
 	return res, nil
 }
 
@@ -774,6 +836,10 @@ type translator struct {
 	curOutlineFunc uint32
 	// outlinedSigs collects extraction signatures for Result.OutlinedSigs.
 	outlinedSigs map[string]OutlinedSig
+	// directAsmSet is the Options.DirectAsmFuncs opt-in as a set;
+	// directAsmSSA collects the retained SSA for Result.DirectAsmSSA.
+	directAsmSet map[string]bool
+	directAsmSSA map[string]DirectAsmFn
 
 	// multiPackage records the auto-derived decision to emit the
 	// chunked, linkname-split layout. Set in Translate based on the
@@ -987,7 +1053,15 @@ func (t *translator) funcName(funcIdx uint32) string {
 // imports). C++ mangled names starting with `_` (e.g. `_ZN4absl...`) get
 // an `X` prefix added by capitalize().
 func (t *translator) importMethodName(imp wasm.Import) string {
-	return capitalize(MangleID(imp.Name))
+	name := capitalize(MangleID(imp.Name))
+	// A memory64 module speaks the widened wasip1 ABI (every import
+	// argument is pointer-width i64), so its imports bind to the *64
+	// variants in the wasip1 shim — the 32-bit methods keep their
+	// signatures for every existing wasm32 module.
+	if imp.Module == "wasi_snapshot_preview1" && t.mod.Memory64() {
+		name += "64"
+	}
+	return name
 }
 
 // importIfaceName returns the Go type name for the interface that represents
@@ -1388,6 +1462,16 @@ const wasmMemHardCapBytes = (1 << 32) - (1 << 17)
 // constructor rejects oversized images, so only a declared MINIMUM
 // past the cap (65535/65536 pages) disqualifies a module.
 func (t *translator) simdBoundsMemOK() bool {
+	if t.mod.Memory64() {
+		// The coalesced range check is exact on memory64 without any
+		// size precondition: linear memory is capped at 2^48
+		// (mem64HardCap, enforced by memoryGrow and the constructor),
+		// so ea+span can never wrap a u64 and ea+span ≤ memSize is the
+		// same exact bound the wasm32 form relies on. The m64
+		// load_rng/load_nc splices mirror the wasm32 ones with the
+		// address load widened MOVWU→MOVD.
+		return true
+	}
 	for _, mem := range t.mod.Memories {
 		if uint64(mem.Limits.Min)*65536 > wasmMemHardCapBytes {
 			return false
@@ -1884,19 +1968,23 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// Memory init.
 	if len(t.mod.Memories) > 0 {
 		mem := t.mod.Memories[0]
-		// wasm32 caps linear memory at 65536 pages × 64 KiB = 4 GiB.
-		// A malformed module that declares a Min larger than this
+		// wasm32 caps linear memory at 65536 pages × 64 KiB = 4 GiB;
+		// a memory64's declared minimum is capped by the mem64 hard
+		// cap instead. A malformed module that declares a larger Min
 		// would otherwise have us emit `make([]byte, huge)` and
 		// either panic at init time or quietly succeed and OOM.
-		const wasm32MaxPages = 1 << 16
-		if mem.Limits.Min > wasm32MaxPages {
+		maxPages := uint64(1) << 16
+		if mem.Is64 {
+			maxPages = 1 << 32 // mem64HardCap >> 16
+		}
+		if mem.Limits.Min > maxPages {
 			return []ast.Decl{&ast.FuncDecl{
 				Name: newID("New"),
 				Type: &ast.FuncType{Params: &ast.FieldList{List: params},
 					Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}}},
 				Body: &ast.BlockStmt{List: []ast.Stmt{
 					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-						stringLit(fmt.Sprintf("wasm2go: memory min %d exceeds wasm32 maximum (%d) pages", mem.Limits.Min, wasm32MaxPages)),
+						stringLit(fmt.Sprintf("wasm2go: memory min %d exceeds the %d-page maximum", mem.Limits.Min, maxPages)),
 					}}},
 				}},
 			}}
@@ -2024,17 +2112,22 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			// The image the caller handed us is already initialized; its
 			// grown size travels with it. It must respect the same
 			// implementation limit memoryGrow enforces — the coalesced
-			// SIMD bounds check is only exact below it.
+			// SIMD bounds check is only exact below it. A memory64 uses
+			// the mem64 hard cap instead.
+			capBytes := uint64(wasmMemHardCapBytes)
+			if mem.Is64 {
+				capBytes = 1 << 48 // mem64HardCap
+			}
 			sizeArg = newID("memSize")
 			body.List = append(body.List, &ast.IfStmt{
 				Cond: &ast.BinaryExpr{
 					X:  newID("memSize"),
 					Op: token.GTR,
-					Y:  uintLit(wasmMemHardCapBytes),
+					Y:  uintLit(capBytes),
 				},
 				Body: &ast.BlockStmt{List: []ast.Stmt{
 					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", wasmMemHardCapBytes)),
+						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
 					}}},
 				}},
 			})
@@ -2073,14 +2166,14 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			// don't make sense and the uint64 multiplication
 			// (Max*65536) could overflow at uint64 itself for
 			// extreme attacker-supplied values.
-			if mem.Limits.Max > wasm32MaxPages {
+			if mem.Limits.Max > maxPages {
 				return []ast.Decl{&ast.FuncDecl{
 					Name: newID("New"),
 					Type: &ast.FuncType{Params: &ast.FieldList{List: params},
 						Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}}},
 					Body: &ast.BlockStmt{List: []ast.Stmt{
 						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-							stringLit(fmt.Sprintf("wasm2go: memory max %d exceeds wasm32 maximum (%d) pages", mem.Limits.Max, wasm32MaxPages)),
+							stringLit(fmt.Sprintf("wasm2go: memory max %d exceeds the %d-page maximum", mem.Limits.Max, maxPages)),
 						}}},
 					}},
 				}}
@@ -2095,8 +2188,13 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				Rhs: []ast.Expr{maxRhs},
 			})
 		} else {
-			// 4 GiB default cap (wasm32 limit).
+			// No declared maximum: cap at the wasm32 4 GiB limit; a
+			// memory64 is unlimited here (memoryGrow64 applies the
+			// mem64 hard cap), which is the entire point of memory64.
 			maxRhs := ast.Expr(uintLit(1 << 32))
+			if mem.Is64 {
+				maxRhs = uintLit(0)
+			}
 			if memFromArg {
 				maxRhs = memLenExpr()
 			}
@@ -2732,7 +2830,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		if k > 8 {
 			k = 8
 		}
-		pass.UnrollSimdLoops(ssaFn, k)
+		pass.UnrollSimdLoops(ssaFn, k, t.mod.Memory64())
 	}
 	const optFixpointCap = 8
 	fixpointReached := false
@@ -2744,7 +2842,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		if pass.BranchFold(ssaFn) {
 			changed = true
 		}
-		if pass.ReassocConstAdds(ssaFn) {
+		if pass.ReassocConstAdds(ssaFn, t.mod.Memory64()) {
 			changed = true
 		}
 		if pass.Simplify(ssaFn) {
@@ -2790,8 +2888,13 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// the cap would start out past it, so such modules keep per-load
 	// checks.
 	if t.simdBoundsMemOK() && pass.CoalesceSimdBounds(ssaFn) {
-		t.useHelper("simd_v128_load_rng")
-		t.useHelper("simd_v128_load_nc")
+		if t.mod.Memory64() {
+			t.useHelper("simd_m64_v128_load_rng")
+			t.useHelper("simd_m64_v128_load_nc")
+		} else {
+			t.useHelper("simd_v128_load_rng")
+			t.useHelper("simd_v128_load_nc")
+		}
 	}
 	// f16 table-gather idiom -> pure lane conversion (bit-exact only
 	// against a verified IEEE table; see pass.RecognizeF16Gather).
@@ -2805,6 +2908,10 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// ~2% tg regression (the emptied NaN-select diamonds kept
 	// evaluating their conditions), and folding them flips it to a
 	// measured ~1% gain on the llama module.
+	// The f16 store-side idiom chain runs at both pointer widths: the
+	// value-side recognition and diamond folding are width-neutral,
+	// the store-merge walks Add64 chains, and the fused cvt+store op
+	// takes the module's own address width (simd_m64_* on memory64).
 	if pass.RecognizeF16Store(ssaFn) {
 		pass.DCE(ssaFn)
 	}
@@ -2822,7 +2929,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	if pass.MergeF16Stores(ssaFn) {
 		pass.DCE(ssaFn)
 	}
-	if pass.FuseF16CvtStores(ssaFn) {
+	if pass.FuseF16CvtStores(ssaFn, t.mod.Memory64()) {
 		pass.DCE(ssaFn)
 	}
 	ssa.Compact(ssaFn)
@@ -2836,6 +2943,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	if err := ssa.Verify(ssaFn); err != nil {
 		return nil, fmt.Errorf("%w: post-opt verify: %w", lower.ErrSSAUnsupported, err)
 	}
+	t.retainDirectAsm(ssaFn, t.mod.Types[fn.TypeIdx])
 	body, err := newSSAEmitter(t).emitFuncBody(ssaFn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: emit: %w", lower.ErrSSAUnsupported, err)
@@ -3147,9 +3255,15 @@ func (t *translator) emitOneExportFunc(w wexpEntry) ast.Decl {
 		Args: []ast.Expr{newID("m"), newID("l0"), newID("l1")},
 	}
 	body := &ast.BlockStmt{List: t.buildSafeInvokeBody(call)}
+	// The (req_ptr, req_len) pair is pointer-width: i32 on wasm32, i64
+	// on a memory64 module (the C bridge declares them void*/size_t).
+	ptrType := "int32"
+	if t.mod.Memory64() {
+		ptrType = "int64"
+	}
 	params := &ast.FieldList{List: []*ast.Field{
 		{Names: []*ast.Ident{newID("m")}, Type: t.moduleType()},
-		{Names: []*ast.Ident{newID("l0"), newID("l1")}, Type: newID("int32")},
+		{Names: []*ast.Ident{newID("l0"), newID("l1")}, Type: newID(ptrType)},
 	}}
 	results := &ast.FieldList{List: []*ast.Field{
 		{Names: []*ast.Ident{newID("packed")}, Type: newID("int64")},

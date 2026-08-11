@@ -1,0 +1,176 @@
+package codegen
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/goccy/wasm2go/internal/ssa"
+	"github.com/goccy/wasm2go/internal/wasm"
+)
+
+// Direct-asm retention (see Options.DirectAsmFuncs). The translator
+// keeps the finalized SSA of opted-in functions so the asm bundle can
+// emit their bodies straight from SSA via internal/asmgen instead of
+// transforming the gc-captured listing. Retention is bookkeeping only
+// — the pure-Go body is still emitted for every function, and the
+// bundle decides per function (and falls back to the listing
+// transform) at build time.
+
+// retainDirectAsm records ssaFn under its name when the name was
+// opted in. sig is the function's signature in wasm value types — for
+// FnN functions the module's own type, for outlined functions the
+// synthetic boundary signature.
+func (t *translator) retainDirectAsm(ssaFn *ssa.Func, sig wasm.FuncType) {
+	t.retainDirectAsmFn(ssaFn.Name, DirectAsmFn{Fn: ssaFn, Sig: sig})
+}
+
+// retainDirectAsmPacked is the packed-boundary variant: the wasm sig
+// is results-only (the caller passes just m) and the parameter types
+// ride along for the pack prologue. A boundary type outside the
+// scalar/v128 set is not retainable.
+func (t *translator) retainDirectAsmPacked(ssaFn *ssa.Func) {
+	if !t.directAsmSet[ssaFn.Name] {
+		return
+	}
+	var ft wasm.FuncType
+	for _, r := range ssaFn.Sig.Results {
+		vt, ok := ssaValType(r)
+		if !ok || vt == wasm.ValV128 {
+			return
+		}
+		ft.Results = append(ft.Results, vt)
+	}
+	for _, p := range ssaFn.Sig.Params {
+		switch p {
+		case ssa.TypeI32, ssa.TypeI64, ssa.TypeF32, ssa.TypeF64, ssa.TypeV128:
+		default:
+			return
+		}
+	}
+	t.retainDirectAsmFn(ssaFn.Name, DirectAsmFn{
+		Fn:           ssaFn,
+		Sig:          ft,
+		Packed:       true,
+		PackedParams: append([]ssa.Type(nil), ssaFn.Sig.Params...),
+	})
+}
+
+func (t *translator) retainDirectAsmFn(name string, df DirectAsmFn) {
+	if !t.directAsmSet[name] {
+		return
+	}
+	if t.directAsmSSA == nil {
+		t.directAsmSSA = map[string]DirectAsmFn{}
+	}
+	t.directAsmSSA[name] = df
+}
+
+// outlinedWasmSig converts an outlined function's SSA signature into
+// wasm value types. Returns false when a boundary type has no scalar
+// wasm equivalent the asm frame layout can carry (v128 boundaries ride
+// the packed pointer form instead, which direct-asm does not emit).
+func outlinedWasmSig(sig ssa.FuncSig) (wasm.FuncType, bool) {
+	var ft wasm.FuncType
+	for _, p := range sig.Params {
+		vt, ok := ssaValType(p)
+		if !ok || vt == wasm.ValV128 {
+			return wasm.FuncType{}, false
+		}
+		ft.Params = append(ft.Params, vt)
+	}
+	for _, r := range sig.Results {
+		vt, ok := ssaValType(r)
+		if !ok || vt == wasm.ValV128 {
+			return wasm.FuncType{}, false
+		}
+		ft.Results = append(ft.Results, vt)
+	}
+	return ft, true
+}
+
+// moduleGlobalOffsets computes the byte offset of each wasm global
+// within the generated Module struct, following emitModuleStruct's
+// field order and Go's layout rules for the field types it emits
+// (no padding surprises: every leading field is 8-aligned).
+// Imported globals keep a -1 sentinel (the struct doesn't carry
+// them). The offsets are hardcoded into direct-asm bodies, so
+// appendDirectAsmLayoutFile pins them with compile-time assertions.
+func (t *translator) moduleGlobalOffsets() []int {
+	off := 0
+	if len(t.mod.Memories) > 0 {
+		off += 24 // memory []byte
+		off += 8  // maxMem uint64
+		off += 8  // M unsafe.Pointer
+	}
+	if t.opts.OutlineMinValues > 0 {
+		off += 128 * 8 // outlinePack [128]uint64
+	}
+	off += 24 * len(t.mod.Tables) // tN []any
+
+	nImp := int(t.mod.NumImportedGlobals)
+	out := make([]int, nImp+len(t.mod.Globals))
+	for i := 0; i < nImp; i++ {
+		out[i] = -1
+	}
+	align := func(n, a int) int {
+		if a <= 1 {
+			return n
+		}
+		return (n + a - 1) &^ (a - 1)
+	}
+	for i, g := range t.mod.Globals {
+		var size, al int
+		switch g.Type.Type {
+		case wasm.ValI32, wasm.ValF32:
+			size, al = 4, 4
+		case wasm.ValI64, wasm.ValF64:
+			size, al = 8, 8
+		case wasm.ValV128:
+			size, al = 16, 8
+		default:
+			// Reference-typed global: the struct field is an
+			// interface (16 bytes, 8-aligned); never inlined by
+			// direct-asm, but the offsets after it must stay right.
+			size, al = 16, 8
+		}
+		off = align(off, al)
+		out[nImp+i] = off
+		off += size
+	}
+	return out
+}
+
+// appendDirectAsmLayoutFile emits compile-time assertions pinning
+// every struct offset direct-asm bodies hardcode (M, the outline
+// pack, and each module-defined global). A drift between this
+// package's real layout and the assumed offsets then fails the
+// consumer's build instead of corrupting memory at run time.
+func (t *translator) appendDirectAsmLayoutFile(files map[string][]byte) {
+	if len(t.directAsmSSA) == 0 || len(t.mod.Memories) == 0 {
+		return
+	}
+	dir, pkg := "", t.opts.Package
+	if t.multiPackage {
+		dir, pkg = "base/", "base"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "// Code generated by wasm2go. DO NOT EDIT.\n\n")
+	fmt.Fprintf(&b, "package %s\n\nimport \"unsafe\"\n\n", pkg)
+	fmt.Fprintf(&b, "// Compile-time pins for the Module field offsets direct-asm\n")
+	fmt.Fprintf(&b, "// bodies hardcode. A nonzero index here means the layout moved.\n")
+	fmt.Fprintf(&b, "var directAsmLayoutProbe Module\n\nvar (\n")
+	assert := func(field string, want int) {
+		fmt.Fprintf(&b, "\t_ = [1]struct{}{}[unsafe.Offsetof(directAsmLayoutProbe.%s)-%d]\n", field, want)
+	}
+	assert("M", 32)
+	if t.opts.OutlineMinValues > 0 {
+		assert(t.fieldName("outlinePack"), 40)
+	}
+	offs := t.moduleGlobalOffsets()
+	nImp := int(t.mod.NumImportedGlobals)
+	for i := range t.mod.Globals {
+		assert(t.fieldName(fmt.Sprintf("g%d", nImp+i)), offs[nImp+i])
+	}
+	fmt.Fprintf(&b, ")\n")
+	files[dir+"directasm_layout.go"] = []byte(b.String())
+}

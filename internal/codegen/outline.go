@@ -52,7 +52,7 @@ func (t *translator) maybeOutline(ssaFn *ssa.Func) error {
 	}
 	outs, err := ssa.OutlineLoops(ssaFn, func(h ssa.BlockID) string {
 		return fmt.Sprintf("%sl%d", ssaFn.Name, h)
-	}, min)
+	}, min, t.mod.Memory64())
 	if err != nil {
 		return err
 	}
@@ -103,6 +103,14 @@ func (t *translator) emitOutlinedDecls() ([]ast.Decl, error) {
 	var out []ast.Decl
 	for _, of := range t.pendingOutlined {
 		g := of.Fn
+		// Direct-asm retention. Unpacked scalar boundaries carry the
+		// synthetic signature; packed boundaries retain results-only
+		// plus the parameter types for the pack prologue.
+		if of.Packed {
+			t.retainDirectAsmPacked(g)
+		} else if ft, ok := outlinedWasmSig(g.Sig); ok {
+			t.retainDirectAsm(g, ft)
+		}
 		em := newSSAEmitter(t)
 		if of.Packed {
 			// Prologue goes through the emitter pre-scalarize so v128

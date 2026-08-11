@@ -72,6 +72,7 @@ func LowerFunction(mod *wasm.Module, funcIdx uint32, name string, throwSet *Thro
 	mutableLocals := false
 
 	ls := &lowerState{
+		mem64:         mod.Memory64(),
 		b:             b,
 		mod:           mod,
 		ft:            ft,
@@ -138,6 +139,10 @@ type lowerState struct {
 	b   *ssa.FuncBuilder
 	mod *wasm.Module
 	ft  wasm.FuncType
+	// mem64: the module's linear memory uses the memory64 proposal's
+	// 64-bit index space; addresses on the stack are i64 and
+	// memory.size/grow speak i64 pages.
+	mem64 bool
 
 	// locals[i] = current SSA value of local index i (params + decls).
 	// Mutated by local.set / local.tee and at block transitions.
@@ -542,7 +547,11 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		if _, err := r.ReadByte(); err != nil {
 			return err
 		}
-		ls.push(ls.b.NewValue(ssa.OpMemSize, ssa.TypeI32))
+		szType := ssa.TypeI32
+		if ls.mem64 {
+			szType = ssa.TypeI64
+		}
+		ls.push(ls.b.NewValue(ssa.OpMemSize, szType))
 		return nil
 	case op == wasm.OpMemGrow:
 		if _, err := r.ReadByte(); err != nil {
@@ -552,7 +561,11 @@ func (ls *lowerState) handleOp(op byte, r *wasm.InstrReader) error {
 		if err != nil {
 			return err
 		}
-		ls.push(ls.b.NewValue(ssa.OpMemGrow, ssa.TypeI32, delta))
+		growType := ssa.TypeI32
+		if ls.mem64 {
+			growType = ssa.TypeI64
+		}
+		ls.push(ls.b.NewValue(ssa.OpMemGrow, growType, delta))
 		return nil
 	case op == wasm.OpUnreachable:
 		// `unreachable` is a hard trap. Seal the current block as
@@ -774,6 +787,12 @@ func (ls *lowerState) handleFEOp(r *wasm.InstrReader) error {
 	sub, err := r.ReadU32()
 	if err != nil {
 		return err
+	}
+	if ls.mem64 {
+		// The atomic helpers and the shared-memory reservation scheme
+		// are 32-bit; a shared memory64 has no toolchain producing it
+		// today. Fail loudly rather than mis-address.
+		return fmt.Errorf("%w: atomics on a memory64 memory", ErrSSAUnsupported)
 	}
 	if sub == 0x03 { // atomic.fence: reserved byte, no operands
 		if _, err := r.ReadByte(); err != nil {
