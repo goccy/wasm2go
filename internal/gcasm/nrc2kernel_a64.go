@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// Nrc2Spec names the ggml q8_0 vec_dot and its paired-tile companion
+// Nrc2Spec names the paired vec_dot and its paired-tile companion
 // (see codegen's traits recognition): under fast-math the arm64
 // feature body's companion call is retargeted to a native 2x2 SMMLA
 // tile kernel emitted by a64Nrc2Kernel.
@@ -15,7 +15,7 @@ type Nrc2Spec struct {
 }
 
 // a64Nrc2Kernel emits the q8_0 2x2 tile kernel under sym, following
-// native ggml's __ARM_FEATURE_MATMUL_INT8 shape: per 34-byte block,
+// the native 2x2 SMMLA tile shape: per 34-byte block,
 // both rows'/columns' quant halves are zipped into 2x8 matrices, the
 // 2x2 tile accumulates through four SMMLA, and the f16 d-product
 // vector scales it into a single f32 accumulator via vector FMLA.

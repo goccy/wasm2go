@@ -78,7 +78,7 @@ func UnrollSimdLoops(f *ssa.Func, k int, wide bool) bool {
 }
 
 // analyzeUnrollLoop matches the countdown do-while self-loop the wasm
-// lowering produces for ggml-style inner loops.
+// lowering produces for block-quantized inner loops.
 func analyzeUnrollLoop(b *ssa.Block, wide bool) (unrollShape, bool) {
 	var sh unrollShape
 	sh.b = b

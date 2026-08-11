@@ -6,7 +6,7 @@ package gcasm
 // base.Simd_<op> helper, and the transform used to marshal that call
 // like any other: spill the ABIInternal args to the ABI0 slots, CALL a
 // forwarding wrapper, read the result back. For code that is almost
-// nothing but v128 ops — ggml's kernels — the call machinery outweighed
+// nothing but v128 ops — quantized dot kernels — the call machinery outweighed
 // the work by more than an order of magnitude: one NEON instruction's
 // worth of computation cost two forwarding hops and eight stack moves.
 //
@@ -48,7 +48,7 @@ import (
 var simdSpliceConstRe = regexp.MustCompile(`·(simdConst[A-Za-z0-9]+)\(SB\)`)
 
 // simdSpliceOp extracts the op name from a captured callee symbol, e.g.
-// "github.com/x/llamawasm2go/base.Simd_i32x4_add" → "i32x4_add". The
+// "github.com/x/somepkg/base.Simd_i32x4_add" → "i32x4_add". The
 // helpers are Simd_-prefixed in the multi-package bundle (exported for
 // cross-chunk linkname) and simd_-prefixed in single-package mode; only
 // they use either prefix, so the name alone identifies them regardless

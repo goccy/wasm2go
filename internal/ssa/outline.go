@@ -54,7 +54,7 @@ const outlinePackedMax = 128
 // writes every slot into the scratch array and the outlined function
 // reads them all back on every call, and with i64 locals doubling the
 // callers' register pressure the round trip stops paying for wide
-// boundaries. Measured on the llama.cpp module: gating these packs
+// boundaries. Measured on the largest integration module: gating these packs
 // gains ~17% memory64 prompt throughput (the ~130-slot conversion
 // loop), while the SAME gate on wasm32 LOSES ~25% — its outlined
 // conversion loop compiles better extracted than inline — so the
@@ -67,7 +67,7 @@ const outlineV128MinBody = 600
 // outlineMaxShare rejects a body covering most of the function (the
 // giant driver loop): outlining it would just move the problem, and
 // it would take every nested loop with it into a function that is
-// never re-scanned. Measured on the llama module: extracting drained
+// never re-scanned. Measured on the largest integration module: extracting drained
 // drivers (rejecting them only while a nested eligible loop remained)
 // was a consistent ~0.6% tg regression, so the hard cap stays.
 const outlineMaxShare = 0.8
@@ -514,7 +514,7 @@ func isOutlineConst(v *Value) bool {
 // original — as are phis, params and anything v128-typed (v128 never
 // crosses the boundary). Bool values (comparisons) are also excluded,
 // which keeps loops with outside-defined bool feeders ineligible:
-// admitting them was measured as a ~1% tg regression on the llama
+// admitting them was measured as a ~1% decode regression on the largest
 // module — the bigger loops it unlocks absorb inner loops that are
 // worth more as separate extractions.
 func outlineRemat(v *Value) bool {

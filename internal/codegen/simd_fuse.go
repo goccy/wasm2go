@@ -1279,7 +1279,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 	// below) because the loop context guarantees each duplicate reads
 	// its own same-iteration definition.
 	loopMode := allowLeading
-	// Collect the candidate run. ggml kernels interleave the fusable
+	// Collect the candidate run. Quantized kernels interleave the fusable
 	// statements with pure scalar work (scale loads, float math), so a
 	// bounded number of provably safe statements may sit BETWEEN
 	// candidates: they are emitted before the fused call, which moves

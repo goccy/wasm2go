@@ -287,7 +287,7 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 				// cycles for a one-instruction operation. Emit the divide
 				// inline and keep the helper call as the slow path for
 				// the inputs that need the trap checks (divisor 0, and
-				// -1 for the signed overflow case). ggml index math hits
+				// -1 for the signed overflow case). Kernel index math hits
 				// the fast path essentially always.
 				divSpliced := false
 				if dk, isDiv := a64DivOp(m[1]); isDiv && hasRes &&

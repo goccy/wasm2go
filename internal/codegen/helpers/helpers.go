@@ -2079,7 +2079,7 @@ func simd_v128_load(m *Module, addr int32, offset int32) [2]uint64 {
 
 // The simd_scalar_* helpers are the pure fallback bodies of the
 // scalar-chain vocabulary inside fused regions (see internal/simdfuse):
-// the per-block scale computations ggml kernels run between vector
+// the per-block scale computations quantized kernels run between vector
 // statements. The loads are UNCHECKED on purpose — they replace the
 // emitter's own unchecked scalar derefs (`*(*uint16)(unsafe.Add(mBase,
 // uint32(a)))`), whose safety rests on the same memoryGrow hard cap.

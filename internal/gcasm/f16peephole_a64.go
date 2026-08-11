@@ -8,7 +8,7 @@ import (
 
 // arm64 peephole for the software fp32→fp16 rounding idiom.
 //
-// llama.cpp inlines ggml's fp32→fp16 conversion (the Giesen
+// Kernel libraries commonly inline a fp32→fp16 conversion (the Giesen
 // round-to-nearest-even algorithm) at every f16 store, and gc
 // compiles each site to a fixed ~30-instruction shape — float
 // scaling by 0x1.0p+112/0x1.0p-110, a bias clamp, a NaN branch and

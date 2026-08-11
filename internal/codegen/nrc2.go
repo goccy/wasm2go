@@ -10,40 +10,41 @@ import (
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
-// ggml pairs matmul rows and columns when a quant type's
-// type_traits_cpu entry declares nrows == 2: the generic driver loop
-// steps both the row and column indices by two, passes the row/column
-// strides through the vec_dot bs/bx/by arguments, and falls back to
-// nrows == 1 for odd shapes. The wasm build compiles all of that
-// machinery in but pins nrows to 1 (the 2-row kernels are gated on
-// __ARM_FEATURE_MATMUL_INT8, absent on wasm).
+// Quantized-kernel runtimes of a common shape dispatch their dot
+// kernels through a per-type trait table whose rows carry
+// {from_float, vec_dot, vec_dot_type, nrows}: when a row declares
+// nrows == 2 the generic matmul driver steps rows and columns by two
+// and passes the strides through the vec_dot's bs/bx/by arguments,
+// falling back to nrows == 1 for odd shapes. A wasm build of such a
+// runtime compiles all of that machinery in but pins nrows to 1 (its
+// 2-row kernels are gated on a native CPU feature absent on wasm).
 //
-// wasm2go re-enables the pairing for the q8_0 self-dot WITHOUT
+// wasm2go can re-enable the pairing for one self-dot entry WITHOUT
 // touching the wasm: the emitted data image gets nrows = 2, the
-// vec_dot function gets an nrc == 2 prelude, and a companion function
+// vec_dot function gets an nrc == 2 prelude ("nrc" being the trait
+// signature's rows-per-call parameter), and a companion function
 // computes the 2x2 tile as four nrc == 1 calls — bit-exact with the
 // unpaired semantics on every backend (the arm64 fast-math bundle
-// replaces the companion's body with the SMMLA tile kernel). The
+// replaces the companion's body with an SMMLA tile kernel). An
 // engine executing the SAME wasm under a wasm VM keeps nrows == 1;
 // only this transpiler's output takes the paired path.
 //
-// Recognition is structural, not nominal: the type_traits_cpu array
-// is located as a maximal run of parseable 24-byte rows
+// The feature is OPT-IN: Options.VecDotPairEntry selects the trait
+// row to pair (the caller supplies its runtime's type-enum value),
+// and zero leaves every module untouched. Recognition is structural,
+// not nominal: the trait array is located as a maximal run of
+// parseable rows
 //
 //	{ u32 from_float, u32 vec_dot, u32 vec_dot_type, u32 pad == 0,
 //	  u64 nrows <= 2 }
 //
 // whose function fields are 0 or valid indirect-table indices, and
-// the q8_0 entry is the run's index GGML_TYPE_Q8_0 == 8 (a stable
-// public ggml ABI value), self-typed (vec_dot_type == 8), unpaired
-// (nrows == 1), with a defined vec_dot of the ggml_vec_dot_t shape
-// (eight i32 parameters, no results). Any mismatch leaves the module
-// untouched.
+// the selected entry must be self-typed (vec_dot_type equal to its
+// own index), unpaired (nrows == 1), with a defined vec_dot of the
+// eight-parameter trait signature (n, s, bs, x, bx, y, by, nrc; no
+// results). Any mismatch leaves the module untouched.
 
-const (
-	nrc2TraitsMinRun = 16
-	nrc2Q8Entry      = 8 // GGML_TYPE_Q8_0
-)
+const nrc2TraitsMinRun = 16
 
 // nrc2Layout is the type_traits_cpu row layout at the module's
 // pointer width. ILP32 packs {u32 from_float, u32 vec_dot,
@@ -123,14 +124,15 @@ func nrc2RowOK(b []byte, tab map[uint32]uint32, l nrc2Layout) bool {
 	return true
 }
 
-// scanGgmlNrc2 locates the traits array and verifies the q8_0 entry.
+// scanVecDotPairing locates the trait array and verifies the entry
+// selected by Options.VecDotPairEntry.
 // The scan anchors on candidate ENTRIES (a self-typed q8 row) rather
 // than on the array base — zero padding parses as a valid row, so run
 // starts are ambiguous — and then verifies the enum neighborhood:
 // entries 0..15 around the candidate must all parse and entry 0 (F32)
 // must be self-typed 0. Exactly one candidate may survive; ambiguity
 // leaves the feature off. On success t.nrc2 is set.
-func (t *translator) scanGgmlNrc2() {
+func (t *translator) scanVecDotPairing() {
 	tab := nrc2TableSet(t.mod)
 	if len(tab) == 0 {
 		return
@@ -152,7 +154,7 @@ func (t *translator) scanGgmlNrc2() {
 			vdt := binary.LittleEndian.Uint32(row[lay.vdtOff:])
 			pad := binary.LittleEndian.Uint32(row[lay.padOff:])
 			nrows := binary.LittleEndian.Uint64(row[lay.nrowsOff:])
-			if !vdOK || vd == 0 || vdt != nrc2Q8Entry || pad != 0 || nrows != 1 {
+			if !vdOK || vd == 0 || vdt != uint32(t.opts.VecDotPairEntry) || pad != 0 || nrows != 1 {
 				continue
 			}
 			funcIdx, ok := tab[vd]
@@ -165,9 +167,9 @@ func (t *translator) scanGgmlNrc2() {
 			// rows become segment gaps), so assemble the neighborhood
 			// from the initial memory image; uncovered bytes default
 			// to zero, which parses as an empty row — exactly the
-			// removed-type rows ggml leaves zeroed.
+			// removed-type rows the runtime leaves zeroed.
 			addr := segOff + int64(entry)
-			base := addr - int64(nrc2Q8Entry*lay.row)
+			base := addr - int64(t.opts.VecDotPairEntry*lay.row)
 			if base < 0 {
 				continue
 			}
@@ -195,7 +197,7 @@ func (t *translator) scanGgmlNrc2() {
 			}
 			fn := t.mod.Functions[funcIdx-t.mod.NumImportedFuncs]
 			ft := t.mod.Types[fn.TypeIdx]
-			// ggml_vec_dot_t: (n i32, s *f32, bs size_t, x *void,
+			// The trait signature: (n i32, s *f32, bs size_t, x *void,
 			// bx size_t, y *void, by size_t, nrc i32) — pointers and
 			// size_t widen to i64 on a memory64 module.
 			want := []wasm.ValType{wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32, wasm.ValI32}
@@ -213,7 +215,7 @@ func (t *translator) scanGgmlNrc2() {
 				continue
 			}
 			if found != nil {
-				fmt.Fprintf(os.Stderr, "wasm2go: ggml q8_0 traits row ambiguous; row/column pairing disabled\n")
+				fmt.Fprintf(os.Stderr, "wasm2go: vec_dot traits row ambiguous; row/column pairing disabled\n")
 				return
 			}
 			found = &nrc2Info{funcIdx: funcIdx, segIdx: segIdx, nrowsOff: entry + lay.nrowsOff}
@@ -223,7 +225,7 @@ func (t *translator) scanGgmlNrc2() {
 		return
 	}
 	t.nrc2 = found
-	fmt.Fprintf(os.Stderr, "wasm2go: ggml q8_0 vec_dot row/column pairing enabled (%s, traits nrows -> 2)\n",
+	fmt.Fprintf(os.Stderr, "wasm2go: vec_dot row/column pairing enabled (%s, traits nrows -> 2)\n",
 		t.funcName(found.funcIdx))
 }
 

@@ -4,7 +4,7 @@ package simdfuse
 // between the code generator and the gcasm backend.
 //
 // The scalarizer fuses a nested tree of pairable SIMD calls — the
-// shape ggml kernels are made of, e.g.
+// shape quantized dot kernels are made of, e.g.
 //
 //	i32x4_add(i32x4_dot_i16x8(load(x), load(y)), acc)
 //
@@ -36,7 +36,7 @@ type Node struct {
 
 // NodeClass is the result class of a member op. Most members produce a
 // v128; the scalar vocabulary below produces an int32 or float32
-// instead, letting the leaf computation that FEEDS a region (ggml's
+// instead, letting the leaf computation that FEEDS a region (a kernel's
 // per-block scale chains: u16 load, shift, table base add, f32 load,
 // f32 multiply) run inside the splice instead of as gc-compiled code
 // around it.
@@ -104,7 +104,7 @@ const (
 	// ArgConst: a compile-time int32 constant (memarg offsets, rng
 	// window bounds). Rides the descriptor as Const and takes no ABI
 	// slot — the synthesized splice emits it as an immediate. Baking
-	// constants into the shape multiplies distinct shapes, but ggml
+	// constants into the shape multiplies distinct shapes, but kernel code
 	// kernels reuse the same handful of offsets, and it is what lets
 	// a whole dot-kernel iteration fit the amd64 integer-register
 	// budget.
@@ -134,7 +134,7 @@ type Arg struct {
 // backward). Roots lists the nodes whose v128 results the fused
 // function returns, two uint64s each, in order; an empty Roots means
 // the single-root form (the last node). Multi-root regions exist for
-// the ggml kernel shape where one load feeds several trees: the load
+// the common kernel shape where one load feeds several trees: the load
 // becomes an internal node executed once, and each consuming tree a
 // root.
 type Tree struct {
