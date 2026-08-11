@@ -131,7 +131,7 @@ type Options struct {
 	// OutlineMinValues enables outlining of large loops into their own
 	// functions and sets the minimum loop body size (in SSA values)
 	// worth extracting. 0 disables outlining. Modules whose hot
-	// functions exceed gc's pattern-matching appetite (llama.cpp-sized)
+	// functions exceed gc's pattern-matching appetite (kernel-library-sized)
 	// want a low threshold like 100; small modules gain nothing.
 	OutlineMinValues int
 	// SIMDUnroll unrolls eligible SIMD loops by this factor before
@@ -143,7 +143,7 @@ type Options struct {
 	FuseLoops      bool
 	FuseLoopUnroll int
 	// F16TableAddr asserts the linear-memory base address of a
-	// runtime-built IEEE f16->f32 lookup table (ggml computes its
+	// runtime-built IEEE f16->f32 lookup table (some runtimes compute the
 	// table in an init function, so the data segment holds only zeros
 	// and the static byte-for-byte verification cannot see it). The
 	// assertion is a build-input contract, not a guess — a wrong
@@ -158,6 +158,17 @@ type Options struct {
 	// gate it and validate with token-level equivalence instead of
 	// byte-equality probes.
 	FastMath bool
+	// VecDotPairEntry opts into vec_dot row/column pairing: it names
+	// the per-type trait-table entry (the source runtime's type-enum
+	// value) whose self-dot should run two rows and columns per call
+	// (see the nrc2 recognizer's package comment for the verified
+	// structural contract). Zero — the default — disables the scan
+	// and leaves every module untouched.
+	VecDotPairEntry int
+	// FuseDebug prints SIMD fusion diagnostics to stderr: failed
+	// window-trial refusals and loop-upgrade rejections, tagged by
+	// the refusing check. Diagnosis only; no effect on output.
+	FuseDebug bool
 	// DirectAsmFuncs names functions (post-rename FnN / fnN symbols,
 	// or outlined-loop names like Fn1016l13807) whose finalized SSA
 	// should be retained in Result.DirectAsmSSA for the asm bundle to
@@ -209,7 +220,7 @@ type Result struct {
 	// functions extracted there (see internal/ssa/outline.go). The asm
 	// bundle keeps their pure-Go bodies on every GOARCH.
 	Outlined map[string][]string
-	// Nrc2VecDot / Nrc2Companion name the ggml q8_0 vec_dot and its
+	// Nrc2VecDot / Nrc2Companion name the paired vec_dot and its
 	// paired-tile companion when the row/column pairing rewrite fired
 	// (see nrc2.go); empty when off. The asm bundle may retarget the
 	// fast-math feature body's companion call to a native tile kernel.
@@ -251,6 +262,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if opts.Package == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.Package is required")
 	}
+	fuseDebugEnabled = opts.FuseDebug
 	if m.Memory64() {
 		for _, mem := range m.Memories {
 			if mem.Limits.Shared {
@@ -401,7 +413,9 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		}
 	}
 	t.collectImportModules()
-	t.scanGgmlNrc2()
+	if t.opts.VecDotPairEntry > 0 {
+		t.scanVecDotPairing()
+	}
 
 	// BulkExportPrefix with zero matches is almost always a typo;
 	// surface a warning so the caller can fix it instead of silently
@@ -552,7 +566,6 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		res.Nrc2Companion = t.nrc2CompanionName()
 	}
 	t.warnStaleF16Table()
-	reportChaseSites()
 	return res, nil
 }
 
@@ -964,7 +977,7 @@ type translator struct {
 	// function (KeepDeadFuncs, or no module parsed yet).
 	reachable map[uint32]bool
 
-	// nrc2 is the verified ggml q8_0 traits entry when the row/column
+	// nrc2 is the verified vec_dot traits entry when the row/column
 	// pairing rewrite is active (see nrc2.go); nil ⇒ feature off.
 	nrc2 *nrc2Info
 }
@@ -2907,7 +2920,7 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 	// empty-diamond fold below landed: the rewrite alone measured a
 	// ~2% tg regression (the emptied NaN-select diamonds kept
 	// evaluating their conditions), and folding them flips it to a
-	// measured ~1% gain on the llama module.
+	// measured ~1% gain on the largest integration module.
 	// The f16 store-side idiom chain runs at both pointer widths: the
 	// value-side recognition and diamond folding are width-neutral,
 	// the store-merge walks Add64 chains, and the fused cvt+store op

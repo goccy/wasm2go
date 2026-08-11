@@ -821,7 +821,7 @@ func buildPkg(
 			if m == nil {
 				return nil, fmt.Errorf("transform %s: no arg size in the TEXT header", f.Name)
 			}
-			// ggml q8_0 row/column pairing: under fast-math the arm64
+			// vec_dot row/column pairing: under fast-math the arm64
 			// FEATURE body's companion call goes to the native 2x2
 			// SMMLA tile kernel; the portable twin and every other
 			// backend keep the bit-exact Go companion. The kernel and

@@ -18,7 +18,7 @@ import (
 // f16BitsToF32Bits is the IEEE binary16 -> binary32 conversion,
 // bit-exact including subnormals, infinities and NaN payloads
 // (payload shifts left by 13; the quiet bit rides along). This is
-// what FCVTL computes per lane and what ggml's table_f32_f16 holds.
+// what FCVTL computes per lane and what such a table holds.
 func f16BitsToF32Bits(h uint16) uint32 {
 	sign := uint32(h>>15) << 31
 	exp := uint32(h>>10) & 0x1F
@@ -134,7 +134,7 @@ func min64(a, b int64) int64 {
 //   - the module's initial data image holds the IEEE map at base
 //     (verified byte-for-byte), or
 //   - the integrator asserted it: Options.F16TableAddr names the
-//     base of a table the module BUILDS AT RUNTIME (ggml computes its
+//     base of a table the module BUILDS AT RUNTIME (some runtimes fill it
 //     f16->f32 table in an init function, so the data segment holds
 //     only zeros and no static check can see it). The assertion is a
 //     build-input contract, not a guess — a wrong address changes

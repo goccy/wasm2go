@@ -2,7 +2,7 @@ package pass
 
 import "github.com/goccy/wasm2go/internal/ssa"
 
-// RecognizeF16Gather rewrites the ggml f16->f32 table-gather idiom.
+// RecognizeF16Gather rewrites the f16->f32 table-gather idiom.
 // The wasm loads four contiguous f16 values widened into i32x4 lanes,
 // then rebuilds an f32x4 by looking each lane up in a module-resident
 // conversion table:

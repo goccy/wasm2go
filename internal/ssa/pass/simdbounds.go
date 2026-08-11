@@ -5,7 +5,7 @@ import "github.com/goccy/wasm2go/internal/ssa"
 // CoalesceSimdBounds replaces the per-access bounds checks of runs of
 // v128 loads with one range check.
 //
-// Every SIMD memory helper carries its own bounds check, and in ggml's
+// Every SIMD memory helper carries its own bounds check, and in tight
 // kernels — the code this exists for — a single loop iteration loads
 // several v128s at small constant offsets from one base. Each check
 // costs more instructions than the load it guards. A wasm JIT pays

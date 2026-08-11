@@ -6,7 +6,7 @@ import (
 
 // 8-bit dot selection.
 //
-// ggml integer kernels compute i32x4_dot_i16x8_s over sign-extended
+// Quantized integer kernels compute i32x4_dot_i16x8_s over sign-extended
 // byte vectors:
 //
 //	dot(i16x8_extend_low_i8x16_s(a),  i16x8_extend_low_i8x16_s(b))

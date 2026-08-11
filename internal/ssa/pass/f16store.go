@@ -4,7 +4,7 @@ import (
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
-// RecognizeF16Store vectorizes the f16 STORE side of ggml's kernels:
+// RecognizeF16Store vectorizes the f16 STORE side of the conversion kernels:
 // four lanes of an f32x4 each run the software fp32->fp16 rounding
 // idiom (the same one RecognizeF32ToF16 matches) and are stored with
 // i32.store16. The four conversions collapse into one packed op,

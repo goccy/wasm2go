@@ -57,8 +57,8 @@ func nrc2TestModule(t *testing.T, mutate func(rows []byte)) *wasm.Module {
 
 func TestScanGgmlNrc2Accepts(t *testing.T) {
 	m := nrc2TestModule(t, nil)
-	tr := &translator{mod: m}
-	tr.scanGgmlNrc2()
+	tr := &translator{mod: m, opts: Options{VecDotPairEntry: 8}}
+	tr.scanVecDotPairing()
 	if tr.nrc2 == nil {
 		t.Fatal("traits array not recognized")
 	}
@@ -98,8 +98,8 @@ func TestScanGgmlNrc2Rejections(t *testing.T) {
 		},
 	}
 	for name, mutate := range cases {
-		tr := &translator{mod: nrc2TestModule(t, mutate)}
-		tr.scanGgmlNrc2()
+		tr := &translator{mod: nrc2TestModule(t, mutate), opts: Options{VecDotPairEntry: 8}}
+		tr.scanVecDotPairing()
 		if tr.nrc2 != nil {
 			t.Errorf("%s: unexpectedly recognized", name)
 		}
@@ -110,16 +110,16 @@ func TestScanGgmlNrc2WrongSignature(t *testing.T) {
 	m := nrc2TestModule(t, nil)
 	m.Types = append(m.Types, wasm.FuncType{Params: []wasm.ValType{wasm.ValI32}})
 	m.Functions[17].TypeIdx = 1
-	tr := &translator{mod: m}
-	tr.scanGgmlNrc2()
+	tr := &translator{mod: m, opts: Options{VecDotPairEntry: 8}}
+	tr.scanVecDotPairing()
 	if tr.nrc2 != nil {
 		t.Fatal("wrong-signature vec_dot accepted")
 	}
 }
 
 func TestNrc2CompanionShape(t *testing.T) {
-	tr := &translator{mod: nrc2TestModule(t, nil)}
-	tr.scanGgmlNrc2()
+	tr := &translator{mod: nrc2TestModule(t, nil), opts: Options{VecDotPairEntry: 8}}
+	tr.scanVecDotPairing()
 	if tr.nrc2 == nil {
 		t.Fatal("not recognized")
 	}
@@ -198,8 +198,8 @@ func nrc2TestModule64(t *testing.T, mutate func(rows []byte)) *wasm.Module {
 
 func TestScanGgmlNrc2AcceptsMemory64(t *testing.T) {
 	m := nrc2TestModule64(t, nil)
-	tr := &translator{mod: m}
-	tr.scanGgmlNrc2()
+	tr := &translator{mod: m, opts: Options{VecDotPairEntry: 8}}
+	tr.scanVecDotPairing()
 	if tr.nrc2 == nil {
 		t.Fatal("LP64 traits array not recognized")
 	}
@@ -230,8 +230,8 @@ func TestScanGgmlNrc2Memory64Rejections(t *testing.T) {
 	}
 	for name, mutate := range cases {
 		m := nrc2TestModule64(t, mutate)
-		tr := &translator{mod: m}
-		tr.scanGgmlNrc2()
+		tr := &translator{mod: m, opts: Options{VecDotPairEntry: 8}}
+		tr.scanVecDotPairing()
 		if tr.nrc2 != nil {
 			t.Errorf("%s: recognized, want rejected", name)
 		}

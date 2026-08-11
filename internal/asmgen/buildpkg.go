@@ -2,7 +2,6 @@ package asmgen
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -589,10 +588,6 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 				// linkable so unaffected functions still compile; only
 				// the failed function will trip the stub's panic if
 				// it actually gets called.
-				if os.Getenv("WASM2GO_ASM_EMIT_DEBUG") != "" {
-					fmt.Fprintf(os.Stderr, "wasm2go: asm emit failed for %s on %s: %v\n",
-						localName, t.archName, err)
-				}
 				fmt.Fprintf(&t.stubBuf, "func %s%s { panic(%q) }\n",
 					localName, goSignature(sig, modulePkgRef), "asm stub: "+localName)
 				continue

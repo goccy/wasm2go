@@ -3,7 +3,7 @@ package codegen
 // Scalar-chain chasing for fused regions.
 //
 // The float arguments of a fused window are typically not free
-// variables: ggml kernels compute them per block as
+// variables: quantized kernels compute them per block as
 //
 //	v119 = int32(*(*uint16)(unsafe.Add(mBase, uint32(v102))))
 //	v122 = *(*float32)(unsafe.Add(mBase, uint32(v119<<2)+uint32(_consts[k])))
