@@ -17,6 +17,7 @@ package codegen
 import (
 	"fmt"
 	"go/ast"
+	"go/printer"
 	"go/token"
 	"os"
 	"strconv"
@@ -1294,10 +1295,18 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		st := list[i]
 		if !sc.fuseSafeIntervener(st) {
+			if loopMode && len(list)-start >= 20 {
+				var db strings.Builder
+				_ = printer.Fprint(&db, token.NewFileSet(), st)
+				fuseDebugf("LOOPCAND stop at [%d/%d] cands=%d unsafe-intervener: %.120s", i-start, len(list)-start, len(cands), db.String())
+			}
 			break
 		}
 		pendingInter = append(pendingInter, st)
 		nInter++
+	}
+	if loopMode && len(list)-start >= 20 {
+		fuseDebugf("LOOPCAND done n=%d cands=%d inter=%d", len(list)-start, len(cands), nInter)
 	}
 	// Try the longest window first; the walk is a pure analysis, so a
 	// failed length just retries shorter on a fresh builder.
@@ -1364,6 +1373,9 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		if !ok || fb.varEdges == 0 || fb.readsCandVar {
 			if w >= 4 && !ok {
 				fuseDebugf("w=%d walk fail: %s", w, fb.failWhy)
+			}
+			if loopMode && w >= 8 {
+				fuseDebugf("LOOPWIN w=%d ok=%v edges=%d reads=%v why=%s sc=%d pr=%d", w, ok, fb.varEdges, fb.readsCandVar, fb.failWhy, len(fb.scalars), len(fb.pairs))
 			}
 			continue
 		}
