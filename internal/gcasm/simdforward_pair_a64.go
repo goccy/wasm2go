@@ -146,8 +146,7 @@ func a64ForwardPairTransfers(body string) string {
 							// gc round-tripped through GPRs): one
 							// vector copy replaces both transfers.
 							if src, ok := p.findVreg(want, wantHi, vk); ok && vk >= 0 {
-								enc := 0x4EA01C00 | uint32(src)<<16 | uint32(src)<<5 | uint32(vk)
-								out = append(out, fmt.Sprintf("	WORD $0x%08x // mov v%d.16b, v%d.16b (pair fwd)", enc, vk, src))
+								out = append(out, fmt.Sprintf("	WORD $0x%08x // mov v%d.16b, v%d.16b (pair fwd)", a64VregMovEnc(vk, src), vk, src))
 								p.vlo[vk] = want
 								p.vhi[vk] = wantHi
 								i++

@@ -30,13 +30,23 @@ import (
 // argument i (0 = m).
 func a64FusedArgReg(i int) string { return fmt.Sprintf("R%d", i) }
 
+// a64VregMovEnc encodes `mov v<dst>.16b, v<src>.16b` (ORR). The
+// register fields are five bits wide; numbers outside 0..31 cannot
+// encode and indicate a caller bug, so the guard panics rather than
+// silently truncating into a different register.
+func a64VregMovEnc(dst, src int) uint32 {
+	if dst < 0 || dst > 31 || src < 0 || src > 31 {
+		panic(fmt.Sprintf("a64VregMovEnc: register out of range (dst=%d src=%d)", dst, src))
+	}
+	return 0x4EA01C00 | uint32(src)<<16 | uint32(src)<<5 | uint32(dst)
+}
+
 // a64VecCopy emits `mov v<dst>.16b, v<src>.16b` (ORR).
 func a64VecCopy(b *strings.Builder, dst, src int) {
 	if dst == src {
 		return
 	}
-	enc := 0x4EA01C00 | uint32(src)<<16 | uint32(src)<<5 | uint32(dst)
-	fmt.Fprintf(b, "\tWORD $0x%08x // mov v%d.16b, v%d.16b (fuse)\n", enc, dst, src)
+	fmt.Fprintf(b, "\tWORD $0x%08x // mov v%d.16b, v%d.16b (fuse)\n", a64VregMovEnc(dst, src), dst, src)
 }
 
 // errFusedCapacity marks a fused splice that exceeded this
