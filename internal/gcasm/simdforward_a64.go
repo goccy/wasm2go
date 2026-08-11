@@ -255,8 +255,7 @@ func a64ForwardSimdSlots(body string) string {
 			if srcReg, ok := fwdFindFreg(st, v, freg); ok {
 				// mov v<freg>.16b, v<src>.16b (ORR): value is in
 				// another V register.
-				enc := 0x4EA01C00 | uint32(srcReg)<<16 | uint32(srcReg)<<5 | uint32(freg)
-				out = append(out, fmt.Sprintf("\tWORD $0x%08x // mov v%d.16b, v%d.16b (fwd)", enc, freg, srcReg))
+				out = append(out, fmt.Sprintf("\tWORD $0x%08x // mov v%d.16b, v%d.16b (fwd)", a64VregMovEnc(freg, srcReg), freg, srcReg))
 				st.fregVal[freg] = v
 				continue
 			}
