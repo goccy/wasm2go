@@ -154,11 +154,25 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 		}
 		brkBlk = ifs.Body
 	}
-	if brkBlk == nil || len(brkBlk.List) != 1 {
+	if brkBlk == nil || len(brkBlk.List) == 0 {
 		return nil, false
 	}
-	if br, ok := brkBlk.List[0].(*ast.BranchStmt); !ok || br.Tok != token.BREAK {
+	if br, ok := brkBlk.List[len(brkBlk.List)-1].(*ast.BranchStmt); !ok || br.Tok != token.BREAK {
 		return nil, false
+	}
+	// Leading assignments in the break arm are EXIT COPIES (the
+	// emitter aliases the final accumulator under the after-loop
+	// name: `vOut = accNext; break`). They classify exactly like
+	// tail carries — the upgrade's carry logic already turns a copy
+	// whose target is not a loop argument into a post-loop exit copy
+	// (see the exitCopy handling in tryFuseLoop). Refusing them kept
+	// every K=1 dot kernel (the decode path's hot loop) out of the
+	// upgrade.
+	brkAssigns := brkBlk.List[:len(brkBlk.List)-1]
+	for _, st := range brkAssigns {
+		if _, ok := st.(*ast.AssignStmt); !ok {
+			return nil, false
+		}
 	}
 	arm := contArm
 	if len(arm) < 2 {
@@ -182,6 +196,11 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	}
 	if !sawReset {
 		return nil, false
+	}
+	for _, st := range brkAssigns {
+		if err := cl.classifyTailAssign(sc, st.(*ast.AssignStmt), counter, decVar, &sawReset); err != nil {
+			return nil, false
+		}
 	}
 	return cl, true
 }
