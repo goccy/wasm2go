@@ -1337,6 +1337,13 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 // local label, bumps and the counter test, then the exit epilogue.
 // site disambiguates labels between splice sites in one function.
 func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, offs *ModuleOffsets, site string, portable bool) (bool, bool, error) {
+	// The register-only splice reads every argument from R0..R15; a
+	// wider signature (memory64 windows may carry more slots) spills
+	// onto the ABIInternal stack, which this path cannot see — keep
+	// the helper CALL instead.
+	if 1+loop.Tree.NumScalars+1+loop.NumDeltas+2*loop.Tree.NumPairs > 16 {
+		return false, false, fmt.Errorf("fused loop %s: %w: arguments past R15", loop.Tree.Name, errFusedCapacity)
+	}
 	tree := loop.Tree
 	if err := a64FusedProlog(b, tree, offs); err != nil {
 		return false, false, err

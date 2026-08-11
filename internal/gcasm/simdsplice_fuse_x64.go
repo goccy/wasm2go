@@ -121,6 +121,12 @@ func x64ClassifyPair(lines []string, nV128 int) (opTargets []int, core []string,
 // x64SpliceFused synthesizes the inline amd64 body of a fused-region
 // call. Results in (AX, BX).
 func x64SpliceFused(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets, maxOut int) (bool, bool, error) {
+	// Scalars (addresses the body indexes with) must be
+	// register-resident here; only pair halves may ride the stack
+	// sequence. A wider window keeps the helper CALL.
+	if 1+tree.NumScalars > len(x64FusedArgRegs) {
+		return false, false, fmt.Errorf("fused splice %s: %w: scalars past the register file", tree.Name, errFusedCapacity)
+	}
 	loc, needsTrap, err := x64SpliceFusedCore(b, tree, pool, offs, nil, nil, 0, false, maxOut)
 	if err != nil {
 		return false, false, err
@@ -805,6 +811,12 @@ func x64FusedStoreTail(b *strings.Builder, n simdfuse.Node,
 // x64SpliceLoop is the amd64 fused-loop synthesizer; see the arm64
 // twin for the structure.
 func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, offs *ModuleOffsets, site string, maxOut int) (bool, bool, error) {
+	// Scalars, the counter, and stride deltas must be
+	// register-resident (the loop indexes and bumps them in place);
+	// a wider signature keeps the helper CALL.
+	if 1+loop.Tree.NumScalars+1+loop.NumDeltas > len(x64FusedArgRegs) {
+		return false, false, fmt.Errorf("fused loop %s: %w: scalars past the register file", loop.Tree.Name, errFusedCapacity)
+	}
 	tree := loop.Tree
 	if err := x64FusedProlog(b, tree, offs); err != nil {
 		return false, false, err
