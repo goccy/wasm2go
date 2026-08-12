@@ -335,10 +335,19 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 					src = loc[a.Index].pool
 				}
 			case simdfuse.ArgPairIn:
-				lo, hi := pairRegs(a)
-				fmt.Fprintf(b, "\tMOVQ %s, X1\n", lo)
-				fmt.Fprintf(b, "\tPINSRQ $1, %s, X1\n", hi)
-				src = 1
+				// A loop-carried pair lives in its reserved register
+				// across iterations (the tail writes it there); the
+				// incoming argument registers only hold the first
+				// iteration's value. Read the reserved register so
+				// later iterations see the accumulated value.
+				if cr, isCarried := carried[a.Index]; isCarried {
+					src = cr
+				} else {
+					lo, hi := pairRegs(a)
+					fmt.Fprintf(b, "\tMOVQ %s, X1\n", lo)
+					fmt.Fprintf(b, "\tPINSRQ $1, %s, X1\n", hi)
+					src = 1
+				}
 			default:
 				return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
 			}
@@ -427,9 +436,17 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 					}
 					x64VecCopy(b, dst, src.pool)
 				case simdfuse.ArgPairIn:
-					lo, hi := pairRegs(a)
-					fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, dst)
-					fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, dst)
+					// Loop-carried pair: copy from its reserved
+					// register (the tail wrote the running value
+					// there); only the first iteration's value ever
+					// reaches the argument registers.
+					if cr, isCarried := carried[a.Index]; isCarried {
+						x64VecCopy(b, dst, cr)
+					} else {
+						lo, hi := pairRegs(a)
+						fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, dst)
+						fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, dst)
+					}
 				}
 			}
 			if sArg != nil {
