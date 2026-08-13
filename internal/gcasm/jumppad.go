@@ -78,6 +78,22 @@ func (jt *JTTable) fn(sym string) *JTFn {
 	return &jt.Fns[len(jt.Fns)-1]
 }
 
+// Drop discards every registration for sym. A transform can fail
+// AFTER emitJumpPad registered sites (a later call site refuses to
+// splice and the function falls back to its pure Go body); the stubs
+// those sites describe are then absent from the emitted asm, and a
+// stale spec would send the generated init's signature scan past the
+// end of the text segment looking for them.
+func (jt *JTTable) Drop(sym string) {
+	kept := jt.Fns[:0]
+	for _, fn := range jt.Fns {
+		if fn.Sym != sym {
+			kept = append(kept, fn)
+		}
+	}
+	jt.Fns = kept
+}
+
 // jtSig derives the deterministic signature for one dispatch target.
 // bits selects the architecture's signature width.
 func jtSig(fnSym string, siteOff, target, bits int) uint64 {

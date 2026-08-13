@@ -2,9 +2,11 @@ package gcasm
 
 // Fused-region splicing, amd64 — the SSE twin of
 // simdsplice_fuse_a64.go. Same synthesis: table bodies verbatim
-// (operands in X0..X2, scratch within X0..X3, result in X0), operand
-// builds and result moves replaced by MOVOU register copies, parked
-// values in X8..X14 (X15 is the ABI zero register). Fused arguments
+// (operands in X0..X2, result in X0; scratch reaches up to X7 in the
+// wider bodies), operand builds and result moves replaced by MOVOU
+// register copies, parked values in X4..X14 (X15 is the ABI zero
+// register) — any park still live when a canned body is pasted is
+// first relocated above that body's measured reach. Fused arguments
 // ride AX,BX,CX,DI,SI,R8,R9 (fusedMaxIntRegs=7 exists exactly so the
 // load scratch R10–R12 stays free); m is saved to R13 because table
 // cores stage scalars through AX.
@@ -12,12 +14,17 @@ package gcasm
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
 var x64FusedArgRegs = []string{"AX", "BX", "CX", "DI", "SI", "R8", "R9", "R10", "R11"}
+
+// x64XRegRe matches vector-register operands in canned op lines; the
+// fused emitter uses the highest mention to size an op's scratch reach.
+var x64XRegRe = regexp.MustCompile(`\bX(\d+)\b`)
 
 // x64FusedResultRegs is the full ABIInternal integer RESULT sequence:
 // results run past the argument cap because the epilogue is the last
@@ -202,9 +209,26 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 	for _, r := range reserve {
 		reservedX[r] = true
 	}
+	// Canned pair-table op bodies (pasted verbatim by the ClassV128
+	// default arm below) use X0–X7 as inputs and scratch, so a pool
+	// value parked there is silently clobbered by the next canned op
+	// — visible as corrupt vectors whenever a window keeps a value
+	// live across a shuffle. The arm64 twin pools V16–V30 above its
+	// canned v0–v4 scratch; amd64 has no such headroom, so X4–X7 stay
+	// in the pool for capacity and any value still live when a canned
+	// op is pasted is relocated to X8+ first (see relocateForCanned).
 	for x := poolTop; x >= 4; x-- {
 		if !reservedX[x] {
 			freePool = append(freePool, x)
+		}
+	}
+	// Loop-carried accumulators are live across every canned op and
+	// are never relocated; they reserve downward from the pool top, so
+	// reaching the canned-scratch range means the window is over
+	// budget, not silently corrupt.
+	for _, r := range reserve {
+		if r < 8 {
+			return nil, false, fmt.Errorf("fused splice %s: %w: carried value in canned-scratch range", tree.Name, errFusedCapacity)
 		}
 	}
 	needsTrap := false
@@ -311,10 +335,19 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 					src = loc[a.Index].pool
 				}
 			case simdfuse.ArgPairIn:
-				lo, hi := pairRegs(a)
-				fmt.Fprintf(b, "\tMOVQ %s, X1\n", lo)
-				fmt.Fprintf(b, "\tPINSRQ $1, %s, X1\n", hi)
-				src = 1
+				// A loop-carried pair lives in its reserved register
+				// across iterations (the tail writes it there); the
+				// incoming argument registers only hold the first
+				// iteration's value. Read the reserved register so
+				// later iterations see the accumulated value.
+				if cr, isCarried := carried[a.Index]; isCarried {
+					src = cr
+				} else {
+					lo, hi := pairRegs(a)
+					fmt.Fprintf(b, "\tMOVQ %s, X1\n", lo)
+					fmt.Fprintf(b, "\tPINSRQ $1, %s, X1\n", hi)
+					src = 1
+				}
 			default:
 				return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
 			}
@@ -403,9 +436,17 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 					}
 					x64VecCopy(b, dst, src.pool)
 				case simdfuse.ArgPairIn:
-					lo, hi := pairRegs(a)
-					fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, dst)
-					fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, dst)
+					// Loop-carried pair: copy from its reserved
+					// register (the tail wrote the running value
+					// there); only the first iteration's value ever
+					// reaches the argument registers.
+					if cr, isCarried := carried[a.Index]; isCarried {
+						x64VecCopy(b, dst, cr)
+					} else {
+						lo, hi := pairRegs(a)
+						fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, dst)
+						fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, dst)
+					}
 				}
 			}
 			if sArg != nil {
@@ -414,6 +455,45 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				} else {
 					fmt.Fprintf(b, "\tMOVQ %s, AX\n", scalarReg(*sArg))
 				}
+			}
+			// Relocate pool values that must survive this op out of
+			// the canned core's reach before it is pasted; every
+			// later consumer reads the updated loc. The reach differs
+			// per op — a plain PADDW touches only its X0/X1 inputs
+			// while the shuffle body scratches up to X5 — so scan the
+			// core for the highest register it mentions and move only
+			// what that range would corrupt. This runs after the
+			// input copies above: registers freed by this op's own
+			// consumption are dead by now and safe to hand out as
+			// relocation homes.
+			maxX := 1
+			for _, l := range core {
+				for _, m := range x64XRegRe.FindAllStringSubmatch(l, -1) {
+					if x, aerr := strconv.Atoi(m[1]); aerr == nil && x > maxX {
+						maxX = x
+					}
+				}
+			}
+			for j := range loc {
+				// pool < 4: not parked (chained through X0, inline
+				// scalar chain, or not yet emitted).
+				if loc[j].chained || loc[j].pool < 4 || loc[j].pool > maxX || uses[j] <= 0 {
+					continue
+				}
+				moved := -1
+				for k := range freePool {
+					if freePool[k] > maxX {
+						moved = freePool[k]
+						freePool = append(freePool[:k], freePool[k+1:]...)
+						break
+					}
+				}
+				if moved < 0 {
+					return nil, false, fmt.Errorf("fused splice %s: %w: no register outside canned scratch", tree.Name, errFusedCapacity)
+				}
+				x64VecCopy(b, moved, loc[j].pool)
+				freePool = append(freePool, loc[j].pool)
+				loc[j].pool = moved
 			}
 			for _, l := range core {
 				fmt.Fprintf(b, "\t%s\n", l)

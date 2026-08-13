@@ -778,9 +778,11 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 					var fbuf strings.Builder
 					spliced, wantsTrap, perr = x64SpliceLoop(&fbuf, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), maxOut)
 					if errors.Is(perr, errFusedCapacity) {
-						// Over-budget signature: keep the helper CALL —
-						// the captured helper body is always correct.
-						spliced, perr = false, nil
+						// Over-budget window: pair-form helpers cannot
+						// be marshalled as calls (their contract has no
+						// ABI0 shape), so the whole function keeps its
+						// pure Go body instead.
+						spliced, perr = false, errSimdPairUnspliced
 					}
 					if spliced {
 						b.WriteString(fbuf.String())
@@ -789,7 +791,7 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 					var fbuf strings.Builder
 					spliced, wantsTrap, perr = x64SpliceFused(&fbuf, tree, pool, opts.ModOffsets, maxOut)
 					if errors.Is(perr, errFusedCapacity) {
-						spliced, perr = false, nil
+						spliced, perr = false, errSimdPairUnspliced
 					}
 					if spliced {
 						b.WriteString(fbuf.String())

@@ -777,6 +777,10 @@ func buildPkg(
 			// on the asm GOARCHs, so nothing may quietly degrade.
 			if _, isSynth := synth[name]; !isSynth &&
 				(errors.Is(terr, errUnsupportedDuff) || errors.Is(terr, errUnsupportedJumpTable) || errors.Is(terr, errSimdPairUnspliced)) {
+				// The failed attempt may already have registered
+				// jump-table sites; their stubs will not exist in the
+				// emitted asm, so the registrations must go with it.
+				jt.Drop(name)
 				fallbackNames[name] = true
 				stats.Fallback++
 				continue
