@@ -191,8 +191,7 @@ func (p *x64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(p.b, "\tMOVQ %d(R13), AX\n", p.offs.M)
-		fmt.Fprintf(p.b, "\tMOVWLZX (AX)(%s*1), %s\n", g, g)
+		fmt.Fprintf(p.b, "\tMOVWLZX (%s)(%s*1), %s\n", x64MemBase(p.b, p.offs), g, g)
 		p.gprOf[i] = g
 	case "scalar_i32_shl":
 		g, err := p.takeGpr(n.Args[0])
@@ -241,8 +240,7 @@ func (p *x64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(p.b, "\tMOVQ %d(R13), AX\n", p.offs.M)
-		fmt.Fprintf(p.b, "\tMOVSS (AX)(%s*1), X%d\n", g, f)
+		fmt.Fprintf(p.b, "\tMOVSS (%s)(%s*1), X%d\n", x64MemBase(p.b, p.offs), g, f)
 		p.freeGpr = append(p.freeGpr, g)
 		p.fprOf[i] = f
 	case "scalar_f32_mul":

@@ -61,6 +61,12 @@ type ModuleOffsets struct {
 	// site nothing survives in registers to hoist into.
 	HoistM          string
 	HoistMemSizePtr string
+	// HoistMemSizeVal, when non-empty, names a register holding the
+	// memSize VALUE. Valid only where memory cannot grow — inside one
+	// fused region or fused loop (splices contain no calls) — where
+	// the x64 emitters then bounds-check with a single CMPQ instead of
+	// the pointer-load + dereference pair per checked access.
+	HoistMemSizeVal string
 }
 
 // fastMath is the nil-safe read of Cfg.FastMath: error paths probe

@@ -1,6 +1,7 @@
 package gcasm
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -154,8 +155,8 @@ func TestX64SpineChainEmitsTwoBlockDots(t *testing.T) {
 	if strings.Count(asm, "PMADDWL") != 0 {
 		t.Errorf("literal SSE dot remains:\n%s", asm)
 	}
-	if strings.Count(asm, "VZEROUPPER") != 1 {
-		t.Errorf("want exactly one VZEROUPPER per region:\n%s", asm)
+	if strings.Count(asm, "VZEROUPPER") != 2 {
+		t.Errorf("want one VZEROUPPER per block dot (Intel dirty-upper false deps):\n%s", asm)
 	}
 }
 
@@ -297,5 +298,58 @@ func TestX64BlockDotPortableIsLiteral(t *testing.T) {
 	}
 	if !strings.Contains(asm, "PMADDWL") {
 		t.Errorf("portable body missing the literal SSE dot:\n%s", asm)
+	}
+}
+
+// TestX64LoopHoistsMemBase: a fused loop with several member loads
+// pins m.M and the memSize value once in the prologue and never
+// reloads them per access inside the loop body.
+func TestX64LoopHoistsMemBase(t *testing.T) {
+	pin := func(i int) simdfuse.Arg { return simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: i} }
+	nd := func(i int) simdfuse.Arg { return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: i} }
+	tr := &simdfuse.Tree{
+		Name:       "simd_p_fxlhoist",
+		NumScalars: 1,
+		NeedsMem:   true,
+		NumPairs:   1,
+		Nodes: []simdfuse.Node{
+			{Op: "v128_load", Args: []simdfuse.Arg{{Kind: simdfuse.ArgScalar, Index: 0}, {Kind: simdfuse.ArgConst, Const: 0}}},
+			{Op: "v128_load", Args: []simdfuse.Arg{{Kind: simdfuse.ArgScalar, Index: 0}, {Kind: simdfuse.ArgConst, Const: 16}}},
+			{Op: "i16x8_add", Args: []simdfuse.Arg{nd(0), nd(1)}},
+			{Op: "i16x8_add", Args: []simdfuse.Arg{nd(2), pin(0)}},
+		},
+		Roots: []int{3},
+	}
+	loop := &simdfuse.Loop{
+		Tree:          tr,
+		CarriedPairs:  [][2]int{{0, 3}},
+		Bumps:         []simdfuse.LoopBump{{Scalar: 0, Delta: 32, DeltaScalar: -1}},
+		CounterScalar: 0,
+		Dec:           1,
+	}
+	var b strings.Builder
+	spliced, _, err := x64SpliceLoop(&b, loop, &ConstPool{}, fuseTestOffs, "7", false, 0)
+	if err != nil {
+		t.Fatalf("splice: %v", err)
+	}
+	if !spliced {
+		t.Fatal("not spliced")
+	}
+	asm := b.String()
+	loopStart := strings.Index(asm, "gcasmfxl7:")
+	if loopStart < 0 {
+		t.Fatalf("no loop label:\n%s", asm)
+	}
+	pre, body := asm[:loopStart], asm[loopStart:]
+	// The prologue pins both values...
+	if !strings.Contains(pre, fmt.Sprintf("MOVQ %d(R13),", fuseTestOffs.M)) {
+		t.Errorf("prologue does not hoist m.M:\n%s", asm)
+	}
+	if !strings.Contains(pre, fmt.Sprintf("MOVQ %d(R13),", fuseTestOffs.MemSize)) {
+		t.Errorf("prologue does not hoist memSize:\n%s", asm)
+	}
+	// ...and the loop body never touches the Module struct again.
+	if strings.Contains(body, "(R13)") {
+		t.Errorf("loop body reloads Module fields:\n%s", asm)
 	}
 }

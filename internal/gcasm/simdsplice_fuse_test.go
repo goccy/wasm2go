@@ -85,9 +85,9 @@ func TestX64SpliceFusedChain(t *testing.T) {
 		"MOVL BX, R12",  // load addr
 		"ADDQ $16, R12", // constant offset immediate
 		"JCS " + x64SimdMemTrapLabel,
-		"MOVOU (R12), X0", // load lands in X0
-		"PMOVSXBW X0, X0", // extend consumes the chain
-		"MOVQ CX, X1",     // pair input builds into operand 1
+		"MOVOU (AX)(R12*1), X0", // indexed load lands in X0
+		"PMOVSXBW X0, X0",       // extend consumes the chain
+		"MOVQ CX, X1",           // pair input builds into operand 1
 		"PINSRQ $1, DI, X1",
 		"PADDW X1, X0",
 		"PEXTRQ $1, X0, BX", // single-root epilogue
