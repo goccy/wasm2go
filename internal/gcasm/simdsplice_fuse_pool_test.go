@@ -54,7 +54,7 @@ func fusePoolClobberTree() *simdfuse.Tree {
 // parked load and every consumer after it computed garbage.
 func TestX64FusedCannedOpRelocatesLiveValues(t *testing.T) {
 	var b strings.Builder
-	spliced, _, err := x64SpliceFused(&b, fusePoolClobberTree(), &ConstPool{}, fuseTestOffs, 0)
+	spliced, _, err := x64SpliceFused(&b, fusePoolClobberTree(), &ConstPool{}, fuseTestOffs, false, 0)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}
@@ -98,7 +98,7 @@ func TestX64FusedPoolCapacity(t *testing.T) {
 	}
 	tree.Roots = []int{prev}
 	var b strings.Builder
-	spliced, _, err := x64SpliceFused(&b, tree, &ConstPool{}, fuseTestOffs, 0)
+	spliced, _, err := x64SpliceFused(&b, tree, &ConstPool{}, fuseTestOffs, false, 0)
 	if spliced {
 		t.Fatal("over-budget tree spliced")
 	}

@@ -776,7 +776,7 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 				var perr error
 				if lp, isLoop := opts.FusedLoops["simd_p_"+pop]; isLoop && !addr64 {
 					var fbuf strings.Builder
-					spliced, wantsTrap, perr = x64SpliceLoop(&fbuf, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), maxOut)
+					spliced, wantsTrap, perr = x64SpliceLoop(&fbuf, lp, pool, opts.ModOffsets, fmt.Sprintf("%d", in.Off), opts.PortableSIMD, maxOut)
 					if errors.Is(perr, errFusedCapacity) {
 						// Over-budget window: pair-form helpers cannot
 						// be marshalled as calls (their contract has no
@@ -789,7 +789,7 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 					}
 				} else if tree, isFused := opts.FusedSimd["simd_p_"+pop]; isFused && !addr64 {
 					var fbuf strings.Builder
-					spliced, wantsTrap, perr = x64SpliceFused(&fbuf, tree, pool, opts.ModOffsets, maxOut)
+					spliced, wantsTrap, perr = x64SpliceFused(&fbuf, tree, pool, opts.ModOffsets, opts.PortableSIMD, maxOut)
 					if errors.Is(perr, errFusedCapacity) {
 						spliced, perr = false, errSimdPairUnspliced
 					}

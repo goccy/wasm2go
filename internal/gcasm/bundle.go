@@ -348,10 +348,14 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	// so the pure guards stay `!amd64 && !arm64` (the pure fallback for
 	// other arches + the `-tags purego` escape).
 	for name, data := range all {
-		if strings.HasPrefix(filepath.Base(name), "simd_") {
+		if base := filepath.Base(name); strings.HasPrefix(base, "simd_") || strings.HasPrefix(base, "cpufeat_") {
 			// The SIMD helper set (scalar reference + its own per-arch
-			// asm + fallback aliases) is arch-complete on its own and
-			// independent of the gcasm bundle — leave it untouched.
+			// asm + fallback aliases) and the CPU feature detection are
+			// arch-complete on their own and independent of the gcasm
+			// bundle — leave them untouched. In particular the
+			// feature-dispatch stubs read base.HasAVX2/CPUDotProd, so
+			// deleting cpufeat_amd64.go with the own-backend amd64
+			// decls would break the bundle build.
 			continue
 		}
 		switch {
@@ -551,10 +555,26 @@ var archSpecs = []archSpec{
 	// amd64 requires x86-64-v2: the SIMD splices use SSE4.1
 	// (PINSRQ/PEXTRQ/PMOVSX...), same baseline as the helper asm.
 	// GOAMD64=v1 builds compile the pure tree instead.
-	{name: "amd64", buildTag: "amd64 && amd64.v2", transform: Transform, jtMarker: "_jt"},
+	{name: "amd64", buildTag: "amd64 && amd64.v2", transform: Transform, jtMarker: "_jt",
+		gatedMarker: "// avx2 dot", gatedSuffix: "avx2", portableSuffix: "sse",
+		featureVar: "HasAVX2", dispatchStub: x64DispatchStub},
 	{name: "arm64", buildTag: "arm64", transform: TransformARM64, jtMarker: "_jt",
 		gatedMarker: "// sdot v", gatedSuffix: "dotprod", portableSuffix: "generic",
 		featureVar: "CPUDotProd", dispatchStub: a64DispatchStub},
+}
+
+// x64DispatchStub is the amd64 feature-dispatch stub: compare the mirror
+// bool against 0 and tail-jump to the portable SSE twin when it is
+// clear, else to the AVX2 body. The compare reads memory and sets flags
+// only — no register is touched — so the tail targets see the original
+// caller's ABIInternal argument registers intact. Same frame ($0), one
+// predicted branch.
+func x64DispatchStub(sym, featSym, portSym, mirrorVar, argBytes string) string {
+	return "TEXT ·" + sym + "(SB), NOSPLIT, $0-" + argBytes + "\n" +
+		"\tCMPB ·" + mirrorVar + "(SB), $0\n" +
+		"\tJEQ 2(PC)\n" +
+		"\tJMP ·" + featSym + "(SB)\n" +
+		"\tJMP ·" + portSym + "(SB)\n"
 }
 
 // a64DispatchStub is the arm64 feature-dispatch stub: read the mirror

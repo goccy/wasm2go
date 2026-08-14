@@ -47,7 +47,7 @@ func carryLoop() *simdfuse.Loop {
 // value, so reading them resets the accumulator every iteration.
 func TestX64LoopCarryReadsReservedRegister(t *testing.T) {
 	var b strings.Builder
-	spliced, _, err := x64SpliceLoop(&b, carryLoop(), &ConstPool{}, fuseTestOffs, "0", 0)
+	spliced, _, err := x64SpliceLoop(&b, carryLoop(), &ConstPool{}, fuseTestOffs, "0", false, 0)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}

@@ -127,7 +127,8 @@ func x64ClassifyPair(lines []string, nV128 int) (opTargets []int, core []string,
 
 // x64SpliceFused synthesizes the inline amd64 body of a fused-region
 // call. Results in (AX, BX).
-func x64SpliceFused(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets, maxOut int) (bool, bool, error) {
+func x64SpliceFused(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets, portable bool, maxOut int) (bool, bool, error) {
+	tree, usedAVX := x64Dot8Rewrite(tree, portable)
 	// Scalars (addresses the body indexes with) must be
 	// register-resident here; only pair halves may ride the stack
 	// sequence. A wider window keeps the helper CALL.
@@ -145,6 +146,11 @@ func x64SpliceFused(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, of
 		}
 		fmt.Fprintf(b, "\tMOVQ X%d, %s\n", src, x64FusedResultRegs[2*k])
 		fmt.Fprintf(b, "\tPEXTRQ $1, X%d, %s\n", src, x64FusedResultRegs[2*k+1])
+	}
+	if usedAVX {
+		// The block dots dirtied ymm upper halves; clear them before
+		// control returns to gc-emitted legacy-SSE code.
+		b.WriteString("\tVZEROUPPER\n")
 	}
 	return true, needsTrap, nil
 }
@@ -245,6 +251,12 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 	}
 
 	for i, n := range tree.Nodes {
+		if n.Op == a64OpElided {
+			// Absorbed into a synthetic AVX2 block dot: nothing to emit,
+			// nothing referenced, nothing to free.
+			loc[i] = fusedLoc{chained: true}
+			continue
+		}
 		if n.Class() != simdfuse.ClassV128 {
 			// Inline scalar-chain node (see the arm64 twin).
 			if err := chains.emitNode(i, &tree.Nodes[i]); err != nil {
@@ -397,6 +409,54 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 			default:
 				return nil, false, fmt.Errorf("fused splice %s: malformed f32x4_splat args", tree.Name)
 			}
+			loc[i] = fusedLoc{chained: willChain, pool: dst}
+			continue
+		} else if n.Op == x64OpBlockDot {
+			// AVX2 8-bit block dot (see x64Dot8Rewrite): sign-extend both
+			// 16-byte byte sources to i16 across a ymm, VPMADDWD into 8
+			// i32 lanes (0..3 = low-half dot, 4..7 = high-half), then fold
+			// the high 128 onto the low with VPADDD to yield the four i32
+			// sums. Y2/Y3 (X2/X3) are scratch the vector pool never
+			// occupies. BOTH sources are staged before either extend runs:
+			// X2 is Y2's own low half, so writing a staging register after
+			// Y2 is produced would corrupt it. Every source is read before
+			// dst is written, so dst may safely alias a source register.
+			// The "// avx2 dot" marker triggers the dual-body dispatch
+			// (see the amd64 archSpec entry): a non-AVX2 host runs the
+			// portable SSE twin.
+			blockDotSrc := func(a simdfuse.Arg, stage int) (string, error) {
+				switch a.Kind {
+				case simdfuse.ArgNode:
+					if loc[a.Index].chained {
+						return "X0", nil
+					}
+					return fmt.Sprintf("X%d", loc[a.Index].pool), nil
+				case simdfuse.ArgPairIn:
+					if cr, isCarried := carried[a.Index]; isCarried {
+						return fmt.Sprintf("X%d", cr), nil
+					}
+					lo, hi := pairRegs(a)
+					fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, stage)
+					fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, stage)
+					return fmt.Sprintf("X%d", stage), nil
+				default:
+					return "", fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+				}
+			}
+			ra, err := blockDotSrc(n.Args[0], 2)
+			if err != nil {
+				return nil, false, err
+			}
+			rb, err := blockDotSrc(n.Args[1], 3)
+			if err != nil {
+				return nil, false, err
+			}
+			fmt.Fprintf(b, "\tVPMOVSXBW %s, Y2\n", ra)
+			fmt.Fprintf(b, "\tVPMOVSXBW %s, Y3\n", rb)
+			b.WriteString("\tVPMADDWD Y3, Y2, Y2\n")
+			b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
+			fmt.Fprintf(b, "\tVPADDD X3, X2, X%d\n", dst)
+			b.WriteString("\t// avx2 dot\n")
 			loc[i] = fusedLoc{chained: willChain, pool: dst}
 			continue
 		} else {
@@ -890,14 +950,16 @@ func x64FusedStoreTail(b *strings.Builder, n simdfuse.Node,
 
 // x64SpliceLoop is the amd64 fused-loop synthesizer; see the arm64
 // twin for the structure.
-func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, offs *ModuleOffsets, site string, maxOut int) (bool, bool, error) {
+func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, offs *ModuleOffsets, site string, portable bool, maxOut int) (bool, bool, error) {
 	// Scalars, the counter, and stride deltas must be
 	// register-resident (the loop indexes and bumps them in place);
 	// a wider signature keeps the helper CALL.
 	if 1+loop.Tree.NumScalars+1+loop.NumDeltas > len(x64FusedArgRegs) {
 		return false, false, fmt.Errorf("fused loop %s: %w: scalars past the register file", loop.Tree.Name, errFusedCapacity)
 	}
-	tree := loop.Tree
+	// x64Dot8Rewrite preserves node indices (absorbed nodes become
+	// elided placeholders), so CarriedPairs/roots/bumps stay valid.
+	tree, usedAVX := x64Dot8Rewrite(loop.Tree, portable)
 	if err := x64FusedProlog(b, tree, offs); err != nil {
 		return false, false, err
 	}
@@ -1028,6 +1090,11 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		} else {
 			fmt.Fprintf(b, "\tPEXTRQ $1, X%d, %s\n", src, lo)
 		}
+	}
+	if usedAVX {
+		// The block dots dirtied ymm upper halves; clear them once on the
+		// loop-exit path before control returns to gc-emitted SSE code.
+		b.WriteString("\tVZEROUPPER\n")
 	}
 	return true, needsTrap, nil
 }

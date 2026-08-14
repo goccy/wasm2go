@@ -75,7 +75,7 @@ func TestA64SpliceFusedChain(t *testing.T) {
 
 func TestX64SpliceFusedChain(t *testing.T) {
 	var b strings.Builder
-	spliced, needsTrap, err := x64SpliceFused(&b, fuseChainTree(), nil, fuseTestOffs, 0)
+	spliced, needsTrap, err := x64SpliceFused(&b, fuseChainTree(), nil, fuseTestOffs, false, 0)
 	if err != nil || !spliced || !needsTrap {
 		t.Fatalf("spliced=%v trap=%v err=%v", spliced, needsTrap, err)
 	}
@@ -162,7 +162,7 @@ func TestA64SpliceFusedMultiRoot(t *testing.T) {
 
 func TestX64SpliceFusedMultiRoot(t *testing.T) {
 	var b strings.Builder
-	spliced, needsTrap, err := x64SpliceFused(&b, fuseMultiRootTree(), nil, fuseTestOffs, 0)
+	spliced, needsTrap, err := x64SpliceFused(&b, fuseMultiRootTree(), nil, fuseTestOffs, false, 0)
 	if err != nil || !spliced || !needsTrap {
 		t.Fatalf("spliced=%v trap=%v err=%v", spliced, needsTrap, err)
 	}
@@ -206,7 +206,7 @@ func fuseFloatPackTree() *simdfuse.Tree {
 
 func TestX64SpliceFusedFloatPack(t *testing.T) {
 	var b strings.Builder
-	spliced, _, err := x64SpliceFused(&b, fuseFloatPackTree(), nil, fuseTestOffs, 0)
+	spliced, _, err := x64SpliceFused(&b, fuseFloatPackTree(), nil, fuseTestOffs, false, 0)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}
@@ -323,7 +323,7 @@ func TestA64SpliceFusedScalarChain(t *testing.T) {
 
 func TestX64SpliceFusedScalarChain(t *testing.T) {
 	var b strings.Builder
-	spliced, needsTrap, err := x64SpliceFused(&b, fuseScalarChainTree(), nil, fuseTestOffs, 0)
+	spliced, needsTrap, err := x64SpliceFused(&b, fuseScalarChainTree(), nil, fuseTestOffs, false, 0)
 	if err != nil || !spliced || !needsTrap {
 		t.Fatalf("spliced=%v trap=%v err=%v", spliced, needsTrap, err)
 	}
@@ -347,7 +347,7 @@ func TestSpliceFusedErrors(t *testing.T) {
 	if _, _, err := a64SpliceFused(&b, memTree, nil, nil, false); err == nil {
 		t.Error("a64: memory tree without Module offsets must fail")
 	}
-	if _, _, err := x64SpliceFused(&b, memTree, nil, nil, 0); err == nil {
+	if _, _, err := x64SpliceFused(&b, memTree, nil, nil, false, 0); err == nil {
 		t.Error("x64: memory tree without Module offsets must fail")
 	}
 	unknown := &simdfuse.Tree{
@@ -357,7 +357,7 @@ func TestSpliceFusedErrors(t *testing.T) {
 	if _, _, err := a64SpliceFused(&b, unknown, nil, fuseTestOffs, false); err == nil {
 		t.Error("a64: unknown op must fail")
 	}
-	if _, _, err := x64SpliceFused(&b, unknown, nil, fuseTestOffs, 0); err == nil {
+	if _, _, err := x64SpliceFused(&b, unknown, nil, fuseTestOffs, false, 0); err == nil {
 		t.Error("x64: unknown op must fail")
 	}
 }
