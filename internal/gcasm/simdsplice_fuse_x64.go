@@ -77,7 +77,7 @@ var (
 
 func x64VecCopy(b *strings.Builder, dst, src int) {
 	if dst != src {
-		fmt.Fprintf(b, "\tMOVOU X%d, X%d\n", src, dst)
+		fmt.Fprintf(b, "\tVMOVDQU X%d, X%d\n", src, dst)
 	}
 }
 
@@ -151,7 +151,10 @@ func x64SpliceFused(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, of
 		fmt.Fprintf(b, "\tMOVQ X%d, %s\n", src, x64FusedResultRegs[2*k])
 		fmt.Fprintf(b, "\tPEXTRQ $1, X%d, %s\n", src, x64FusedResultRegs[2*k+1])
 	}
-	_ = usedAVX // uppers are cleared per block dot at the emission site
+	if usedAVX && x64TreeVexClean(tree) {
+		// Fully VEX region: one deferred upper clear at the exit.
+		b.WriteString("\tVZEROUPPER\n")
+	}
 	return true, needsTrap, nil
 }
 
@@ -163,9 +166,9 @@ func x64FusedProlog(b *strings.Builder, tree *simdfuse.Tree, offs *ModuleOffsets
 	}
 	b.WriteString("\tMOVQ AX, R13\n")
 	if tree.NumFloats > 0 {
-		b.WriteString("\tMOVOU X0, X14\n")
+		b.WriteString("\tVMOVDQU X0, X14\n")
 		for i := 1; i < tree.NumFloats; i++ {
-			fmt.Fprintf(b, "\tINSERTPS $%d, X%d, X14\n", i<<4, i)
+			fmt.Fprintf(b, "\tVINSERTPS $%d, X%d, X14, X14\n", i<<4, i)
 		}
 	}
 	return nil
@@ -238,6 +241,7 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 		}
 	}
 	needsTrap := false
+	vexClean := !portable && x64TreeVexClean(tree)
 
 	chains := newX64ScalarChain(b, tree, scalarReg, offs, uses)
 
@@ -400,13 +404,13 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 			// float argument's lane, or a computed scalar terminal's.
 			switch {
 			case len(n.Args) == 1 && n.Args[0].Kind == simdfuse.ArgFloat:
-				fmt.Fprintf(b, "\tPSHUFD $%d, X14, X%d\n", n.Args[0].Index*0x55, dst)
+				fmt.Fprintf(b, "\tVPSHUFD $%d, X14, X%d\n", n.Args[0].Index*0x55, dst)
 			case len(n.Args) == 1 && n.Args[0].Kind == simdfuse.ArgNode && tree.Nodes[n.Args[0].Index].Class() == simdfuse.ClassF32:
 				f, err := chains.takeSplatSource(n.Args[0].Index)
 				if err != nil {
 					return nil, false, err
 				}
-				fmt.Fprintf(b, "\tPSHUFD $0, X%d, X%d\n", f, dst)
+				fmt.Fprintf(b, "\tVPSHUFD $0, X%d, X%d\n", f, dst)
 			default:
 				return nil, false, fmt.Errorf("fused splice %s: malformed f32x4_splat args", tree.Name)
 			}
@@ -457,13 +461,15 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 			b.WriteString("\tVPMADDWD Y3, Y2, Y2\n")
 			b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
 			fmt.Fprintf(b, "\tVPADDD X3, X2, X%d\n", dst)
-			// Clear the ymm upper halves IMMEDIATELY: the rest of the
-			// region is legacy-SSE, and on Intel a dirty upper state
-			// makes every legacy SSE instruction merge against the full
-			// register — false dependencies that serialize the loop
-			// (measured 30x on Granite Rapids). VZEROUPPER costs ~1
-			// cycle; AMD ignores the state entirely.
-			b.WriteString("\tVZEROUPPER\n")
+			if !vexClean {
+				// Clear the ymm upper halves IMMEDIATELY: legacy SSE
+				// follows in this region, and on Intel a dirty upper
+				// state gives every legacy SSE instruction a false
+				// dependency that serializes the loop (measured 30x on
+				// Granite Rapids). A fully VEX region defers this to
+				// one clear at the exit instead.
+				b.WriteString("\tVZEROUPPER\n")
+			}
 			b.WriteString("\t// avx2 dot\n")
 			loc[i] = fusedLoc{chained: willChain, pool: dst}
 			continue
@@ -698,6 +704,25 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	// always opaque scalars; a wrapped u64 ea could land back inside
 	// bounds, so every sum traps on carry there).
 	addOffErr := error(nil)
+	// Fully-folded unchecked load: on a memory64 tree a register base
+	// plus constant terms is ONE indexed instruction — decided here,
+	// before any base materialization, so no dead address arithmetic
+	// is emitted.
+	if n.Op == "v128_load_nc" && addr64 && addrReg == "" {
+		if a := n.Args[0]; a.Kind == simdfuse.ArgScalar || a.Kind == simdfuse.ArgSum {
+			base := int64(0)
+			if a.Kind == simdfuse.ArgSum {
+				base = int64(a.Const)
+			}
+			if off := n.Args[1]; off.Kind == simdfuse.ArgConst {
+				disp := base + int64(off.Const)
+				if disp >= 0 && disp < 1<<31 {
+					fmt.Fprintf(b, "\tVMOVDQU %d(%s)(%s*1), X%d\n", disp, x64MemBase(b, offs), scalarReg(a), dst)
+					return nil
+				}
+			}
+		}
+	}
 	if addrReg != "" {
 		// Chain-computed address: move the terminal into the address
 		// register first (see the arm64 twin). MOVL re-zero-extends
@@ -778,42 +803,23 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	case "v128_load32_zero":
 		addOff(1)
 		checked(4)
-		fmt.Fprintf(b, "\tMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+		fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
 		return addOffErr
 	case "v128_load32_splat":
 		addOff(1)
 		checked(4)
-		fmt.Fprintf(b, "\tMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
-		fmt.Fprintf(b, "\tPSHUFD $0x00, X%d, X%d\n", dst, dst)
+		fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+		fmt.Fprintf(b, "\tVPSHUFD $0x00, X%d, X%d\n", dst, dst)
 		return addOffErr
 	case "v128_load16x4_u":
 		addOff(1)
 		checked(8)
-		fmt.Fprintf(b, "\tMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
-		fmt.Fprintf(b, "\tPMOVZXWD X%d, X%d\n", dst, dst)
+		fmt.Fprintf(b, "\tVMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+		fmt.Fprintf(b, "\tVPMOVZXWD X%d, X%d\n", dst, dst)
 		return addOffErr
 	case "v128_load_nc":
-		// Unchecked member load: on a memory64 tree every address term
-		// adds at full width, so a register base plus constant terms
-		// folds into ONE indexed load with a displacement — no address
-		// arithmetic at all. (wasm32 keeps the wrapping ADDL sequence.)
-		if addr64 && addrReg == "" {
-			if a := n.Args[0]; a.Kind == simdfuse.ArgScalar || a.Kind == simdfuse.ArgSum {
-				base := int64(0)
-				if a.Kind == simdfuse.ArgSum {
-					base = int64(a.Const)
-				}
-				if off := n.Args[1]; off.Kind == simdfuse.ArgConst {
-					disp := base + int64(off.Const)
-					if disp >= 0 && disp < 1<<31 {
-						fmt.Fprintf(b, "\tMOVOU %d(%s)(%s*1), X%d\n", disp, x64MemBase(b, offs), scalarReg(a), dst)
-						return addOffErr
-					}
-				}
-			}
-		}
 		if d, ok := x64DeferOff(n.Args[1]); ok {
-			fmt.Fprintf(b, "\tMOVOU %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
+			fmt.Fprintf(b, "\tVMOVDQU %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
 			return addOffErr
 		}
 		addOff(1)
@@ -842,12 +848,12 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		x64MemSizeCheck(b, offs)
 		fmt.Fprintf(b, "\tSUBQ $%d, R12\n", undo)
 		if d, ok := x64DeferOff(n.Args[1]); ok {
-			fmt.Fprintf(b, "\tMOVOU %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
+			fmt.Fprintf(b, "\tVMOVDQU %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
 			return addOffErr
 		}
 		addOff(1)
 	}
-	fmt.Fprintf(b, "\tMOVOU (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+	fmt.Fprintf(b, "\tVMOVDQU (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
 	return addOffErr
 }
 
@@ -1311,7 +1317,10 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 			fmt.Fprintf(b, "\tPEXTRQ $1, X%d, %s\n", src, lo)
 		}
 	}
-	_ = usedAVX // uppers are cleared per block dot at the emission site
+	if usedAVX && x64TreeVexClean(tree) {
+		// Fully VEX region: one deferred upper clear at the exit.
+		b.WriteString("\tVZEROUPPER\n")
+	}
 	return true, needsTrap || hoistedTrap, nil
 }
 
@@ -1343,6 +1352,35 @@ var x64VexOps = map[string]func(b *strings.Builder, srcs []string, dst int){
 	"i32x4_dot_i16x8_s": func(b *strings.Builder, s []string, d int) {
 		fmt.Fprintf(b, "\tVPMADDWD %s, %s, X%d\n", s[1], s[0], d)
 	},
+}
+
+// x64TreeVexClean reports whether a rewritten tree's emission is
+// entirely VEX-encoded (loads, the VEX op table, block dots, splats,
+// the scalar chains): then legacy-SSE code never executes between a
+// 256-bit op and the region exit, so ONE VZEROUPPER at the exit
+// replaces the per-block-dot clears (the Intel dirty-upper hazard
+// applies to legacy SSE only; VEX-128 ops are safe under dirty
+// uppers).
+func x64TreeVexClean(tree *simdfuse.Tree) bool {
+	for _, n := range tree.Nodes {
+		if n.Op == a64OpElided || n.Op == x64OpBlockDot || n.Op == "f32x4_splat" {
+			continue
+		}
+		if n.Class() != simdfuse.ClassV128 {
+			continue // scalar chains emit VEX FP ops
+		}
+		if simdfuse.IsStore(n.Op) || n.Op == "v128_load32_lane" || n.Op == "f16x4_cvt" {
+			return false
+		}
+		if _, isMem := fusedMemOpsA64[n.Op]; isMem {
+			continue
+		}
+		if _, isVex := x64VexOps[n.Op]; isVex && x64VexArgsOK(n) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // x64VexArgsOK reports whether every argument is a register-resident

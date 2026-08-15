@@ -155,8 +155,8 @@ func TestX64SpineChainEmitsTwoBlockDots(t *testing.T) {
 	if strings.Count(asm, "PMADDWL") != 0 {
 		t.Errorf("literal SSE dot remains:\n%s", asm)
 	}
-	if strings.Count(asm, "VZEROUPPER") != 2 {
-		t.Errorf("want one VZEROUPPER per block dot (Intel dirty-upper false deps):\n%s", asm)
+	if strings.Count(asm, "VZEROUPPER") != 1 {
+		t.Errorf("want one deferred VZEROUPPER for a fully VEX region:\n%s", asm)
 	}
 }
 
@@ -411,7 +411,7 @@ func TestX64LoopHoistsRangeChecks(t *testing.T) {
 	if strings.Contains(body, "$134") {
 		t.Errorf("loop body still carries the window span:\n%s", body)
 	}
-	if !strings.Contains(body, "MOVOU 2(") {
+	if !strings.Contains(body, "VMOVDQU 2(") {
 		t.Errorf("loop body lost the folded indexed load:\n%s", body)
 	}
 }

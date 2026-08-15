@@ -61,11 +61,11 @@ func TestX64FusedCannedOpRelocatesLiveValues(t *testing.T) {
 	body := b.String()
 	// n0 parks in X4 (first pool register); the shuffle must move it
 	// to X8+ before its canned lines run.
-	if !regexp.MustCompile(`MOVOU X4, X(8|9|1[0-4])\b`).MatchString(body) {
+	if !regexp.MustCompile(`VMOVDQU X4, X(8|9|1[0-4])\b`).MatchString(body) {
 		t.Fatalf("live value not relocated out of canned scratch:\n%s", body)
 	}
 	// The mul consumes the relocated home, never stale X4.
-	if strings.Contains(body, "MOVOU X4, X0") {
+	if strings.Contains(body, "VMOVDQU X4, X0") {
 		t.Fatalf("consumer read the clobbered X4 park:\n%s", body)
 	}
 }

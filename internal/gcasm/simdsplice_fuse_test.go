@@ -85,9 +85,9 @@ func TestX64SpliceFusedChain(t *testing.T) {
 		"MOVL BX, R12",  // load addr
 		"ADDQ $16, R12", // constant offset immediate
 		"JCS " + x64SimdMemTrapLabel,
-		"MOVOU (AX)(R12*1), X0", // indexed load lands in X0
-		"PMOVSXBW X0, X0",       // extend consumes the chain
-		"MOVQ CX, X2",           // pair input stages for the VEX add
+		"VMOVDQU (AX)(R12*1), X0", // indexed load lands in X0
+		"PMOVSXBW X0, X0",         // extend consumes the chain
+		"MOVQ CX, X2",             // pair input stages for the VEX add
 		"PINSRQ $1, DI, X2",
 		"VPADDW X2, X0, X0",
 		"PEXTRQ $1, X0, BX", // single-root epilogue
@@ -168,11 +168,11 @@ func TestX64SpliceFusedMultiRoot(t *testing.T) {
 	}
 	body := b.String()
 	for _, want := range []string{
-		"MOVOU X0, X14",  // float arguments packed into X14 lanes
-		"ADDQ $-16, R12", // signed rlo immediate
+		"VMOVDQU X0, X14", // float arguments packed into X14 lanes
+		"ADDQ $-16, R12",  // signed rlo immediate
 		"JS " + x64SimdMemTrapLabel,
-		"PSHUFD $0, X14, X0", // splat broadcasts lane 0 of the pack
-		"MOVQ X0, SI",        // third root lands in result 4 (SI)
+		"VPSHUFD $0, X14, X0", // splat broadcasts lane 0 of the pack
+		"MOVQ X0, SI",         // third root lands in result 4 (SI)
 		"PEXTRQ $1, X0, R8",
 	} {
 		if !strings.Contains(body, want) {
@@ -212,12 +212,12 @@ func TestX64SpliceFusedFloatPack(t *testing.T) {
 	}
 	body := b.String()
 	for _, want := range []string{
-		"MOVOU X0, X14",         // lane 0
-		"INSERTPS $16, X1, X14", // lane 1
-		"INSERTPS $32, X2, X14", // lane 2
-		"PSHUFD $0, X14, X",     // broadcast lane 0
-		"PSHUFD $85, X14, X",    // broadcast lane 1
-		"PSHUFD $170, X14, X",   // broadcast lane 2
+		"VMOVDQU X0, X14",             // lane 0
+		"VINSERTPS $16, X1, X14, X14", // lane 1
+		"VINSERTPS $32, X2, X14, X14", // lane 2
+		"VPSHUFD $0, X14, X",          // broadcast lane 0
+		"VPSHUFD $85, X14, X",         // broadcast lane 1
+		"VPSHUFD $170, X14, X",        // broadcast lane 2
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %q in body:\n%s", want, body)

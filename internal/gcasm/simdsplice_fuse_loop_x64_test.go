@@ -67,7 +67,7 @@ func TestX64LoopCarryReadsReservedRegister(t *testing.T) {
 		t.Errorf("loop body never reads the carried register X14:\n%s", loopBody)
 	}
 	// The tail writes the running value back to X14.
-	if !strings.Contains(loopBody, "MOVOU X0, X14") && !regexp.MustCompile(`MOVOU X\d+, X14`).MatchString(loopBody) {
+	if !strings.Contains(loopBody, "VMOVDQU X0, X14") && !regexp.MustCompile(`MOVOU X\d+, X14`).MatchString(loopBody) {
 		t.Errorf("loop body never writes back the carried register X14:\n%s", loopBody)
 	}
 	// The prologue (before the loop label) seeds X14 from the argument
