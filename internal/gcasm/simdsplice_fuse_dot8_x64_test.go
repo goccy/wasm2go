@@ -353,3 +353,65 @@ func TestX64LoopHoistsMemBase(t *testing.T) {
 		t.Errorf("loop body reloads Module fields:\n%s", asm)
 	}
 }
+
+// TestX64LoopHoistsRangeChecks: a memory64 pretest loop's strided
+// window loads check once at the loop head and become single indexed
+// loads inside the body.
+func TestX64LoopHoistsRangeChecks(t *testing.T) {
+	tr := &simdfuse.Tree{
+		Name:       "simd_p_fxlrng",
+		NumScalars: 1,
+		NeedsMem:   true,
+		NumPairs:   1,
+		Addr64:     true,
+		Nodes: []simdfuse.Node{
+			{Op: "v128_load_rng", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgScalar, Index: 0},
+				{Kind: simdfuse.ArgConst, Const: 2},
+				{Kind: simdfuse.ArgConst, Const: 0},
+				{Kind: simdfuse.ArgConst, Const: 134},
+			}},
+			{Op: "i16x8_add", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: 0},
+				{Kind: simdfuse.ArgPairIn, Index: 0},
+			}},
+		},
+		Roots: []int{1},
+	}
+	loop := &simdfuse.Loop{
+		Tree:          tr,
+		CarriedPairs:  [][2]int{{0, 1}},
+		Bumps:         []simdfuse.LoopBump{{Scalar: 0, Delta: 34, DeltaScalar: -1}},
+		CounterScalar: 0,
+		Dec:           4,
+		PreTest:       true,
+	}
+	var b strings.Builder
+	spliced, needsTrap, err := x64SpliceLoop(&b, loop, &ConstPool{}, fuseTestOffs, "9", false, 0)
+	if err != nil || !spliced {
+		t.Fatalf("spliced=%v err=%v", spliced, err)
+	}
+	if !needsTrap {
+		t.Error("hoisted check must still request the trap label")
+	}
+	asm := b.String()
+	loopStart := strings.Index(asm, "gcasmfxl9:")
+	if loopStart < 0 {
+		t.Fatalf("no loop label:\n%s", asm)
+	}
+	pre, body := asm[:loopStart], asm[loopStart:]
+	// The prologue computes iters-1, scales by the stride, and checks
+	// once (guarded against the zero-iteration entry).
+	for _, want := range []string{"SHRQ $2, R12", "JZ gcasmfxh9_0", "IMUL3Q $34, R12, R12", "gcasmfxh9_0:"} {
+		if !strings.Contains(pre, want) {
+			t.Errorf("prologue missing %q:\n%s", want, pre)
+		}
+	}
+	// Inside the loop: no span dance, a single folded indexed load.
+	if strings.Contains(body, "$134") {
+		t.Errorf("loop body still carries the window span:\n%s", body)
+	}
+	if !strings.Contains(body, "MOVOU 2(") {
+		t.Errorf("loop body lost the folded indexed load:\n%s", body)
+	}
+}

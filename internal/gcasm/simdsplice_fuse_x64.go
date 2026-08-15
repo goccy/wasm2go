@@ -1094,6 +1094,95 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// Pin m.M / memSize for the whole loop: every iteration's member
 	// accesses then skip the per-site Module loads.
 	offs = x64HoistMem(b, offs, tree, 1+tree.NumScalars+1+loop.NumDeltas+2*tree.NumPairs)
+	// Hoist the strided window checks out of the loop: a pretest loop
+	// with a power-of-two step runs exactly counter>>log2(Dec)
+	// iterations, so ONE check of
+	//   base + rlo + span + (iters-1)*delta
+	// against memSize covers every iteration's window and the loads
+	// inside the loop drop to single indexed instructions. Trapping at
+	// the loop head instead of the precise access is the same
+	// relaxation the windowed range check already makes. memory64
+	// trees only (all address terms add at full width there).
+	hoistedTrap := false
+	if tree.Addr64 && loop.PreTest && loop.Dec > 0 && loop.Dec&(loop.Dec-1) == 0 {
+		sh := 0
+		for d := loop.Dec; d > 1; d >>= 1 {
+			sh++
+		}
+		deltaOf := map[int]int64{}
+		dynamic := map[int]bool{}
+		for _, bump := range loop.Bumps {
+			if bump.DeltaScalar >= 0 {
+				dynamic[bump.Scalar] = true
+			} else {
+				deltaOf[bump.Scalar] += int64(bump.Delta)
+			}
+		}
+		nodes := append([]simdfuse.Node(nil), tree.Nodes...)
+		ctrReg := x64FusedArgRegs[1+loop.CounterScalar]
+		checkedSpans := map[string]bool{}
+		rewrote := false
+		for i := range nodes {
+			n := &nodes[i]
+			if n.Op != "v128_load_rng" || len(n.Args) != 4 {
+				continue
+			}
+			a := n.Args[0]
+			if a.Kind != simdfuse.ArgScalar && a.Kind != simdfuse.ArgSum {
+				continue
+			}
+			if dynamic[a.Index] {
+				continue
+			}
+			rlo, span := n.Args[2], n.Args[3]
+			if rlo.Kind != simdfuse.ArgConst || span.Kind != simdfuse.ArgConst || rlo.Const < 0 {
+				continue
+			}
+			d := deltaOf[a.Index]
+			if d < 0 || d > 1<<20 {
+				continue
+			}
+			base := int64(0)
+			if a.Kind == simdfuse.ArgSum {
+				base = int64(a.Const)
+			}
+			end := base + int64(rlo.Const) + int64(uint32(span.Const))
+			key := fmt.Sprintf("%d/%d/%d", a.Index, end, d)
+			if !checkedSpans[key] {
+				checkedSpans[key] = true
+				skip := fmt.Sprintf("gcasmfxh%s_%d", site, i)
+				// A 32-bit counter arrives with undefined upper bits;
+				// MOVL zero-extends before the shift.
+				ctrMov := "MOVL"
+				if loop.CounterWide {
+					ctrMov = "MOVQ"
+				}
+				fmt.Fprintf(b, "\t%s %s, R12\n", ctrMov, ctrReg)
+				if sh > 0 {
+					fmt.Fprintf(b, "\tSHRQ $%d, R12\n", sh)
+				}
+				b.WriteString("\tTESTQ R12, R12\n")
+				fmt.Fprintf(b, "\tJZ %s\n", skip)
+				b.WriteString("\tSUBQ $1, R12\n")
+				if d != 0 {
+					fmt.Fprintf(b, "\tIMUL3Q $%d, R12, R12\n", d)
+				}
+				fmt.Fprintf(b, "\tADDQ %s, R12\n", x64FusedArgRegs[1+a.Index])
+				fmt.Fprintf(b, "\tADDQ $%d, R12\n", end)
+				x64MemSizeCheck(b, offs)
+				fmt.Fprintf(b, "%s:\n", skip)
+				hoistedTrap = true
+			}
+			n.Op = "v128_load_nc"
+			n.Args = n.Args[:2]
+			rewrote = true
+		}
+		if rewrote {
+			nt := *tree
+			nt.Nodes = nodes
+			tree = &nt
+		}
+	}
 	if loop.Dec <= 0 {
 		return false, false, fmt.Errorf("fused loop %s: bad dec %d", tree.Name, loop.Dec)
 	}
@@ -1223,7 +1312,7 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		}
 	}
 	_ = usedAVX // uppers are cleared per block dot at the emission site
-	return true, needsTrap, nil
+	return true, needsTrap || hoistedTrap, nil
 }
 
 // x64VexOps maps ops with a VEX three-operand register form to their
