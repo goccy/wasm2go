@@ -851,7 +851,7 @@ func buildPkg(
 			// backend keep the bit-exact Go companion. The kernel and
 			// its declaration follow the module's pointer width — the
 			// LP64 companion takes i64 pointers and strides.
-			if nrc2 != nil && name == nrc2.VecDot && arch.name == "arm64" && modOffs != nil && modOffs.Cfg.FastMath {
+			if nrc2 != nil && name == nrc2.VecDot && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
 				fastSym := nrc2.Companion + "fast"
 				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
 				if retargeted == featBody {
@@ -863,7 +863,22 @@ func buildPkg(
 					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
 				}
 				wide := mod.Memory64()
-				asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
+				if arch.name == "amd64" {
+					asmB.WriteString(x64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
+					// The kernel branches to its VNNI loop on a
+					// package-local mirror of the base feature var
+					// (asm reads package-local data only).
+					if !mirrorVars["gcasmHasAVX512VNNI"] {
+						mirrorVars["gcasmHasAVX512VNNI"] = true
+						vnniRef := "HasAVX512VNNI"
+						if rel != "" && rel != "base" {
+							vnniRef = "base." + vnniRef
+						}
+						fmt.Fprintf(&declFns, "// gcasmHasAVX512VNNI mirrors %s for the tile kernel's\n// entry branch (asm reads package-local data only).\nvar gcasmHasAVX512VNNI = %s\n\n", vnniRef, vnniRef)
+					}
+				} else {
+					asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
+				}
 				asmB.WriteString("\n")
 				argType := "int32"
 				if wide {
