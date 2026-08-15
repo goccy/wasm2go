@@ -87,9 +87,9 @@ func TestX64SpliceFusedChain(t *testing.T) {
 		"JCS " + x64SimdMemTrapLabel,
 		"MOVOU (AX)(R12*1), X0", // indexed load lands in X0
 		"PMOVSXBW X0, X0",       // extend consumes the chain
-		"MOVQ CX, X1",           // pair input builds into operand 1
-		"PINSRQ $1, DI, X1",
-		"PADDW X1, X0",
+		"MOVQ CX, X2",           // pair input stages for the VEX add
+		"PINSRQ $1, DI, X2",
+		"VPADDW X2, X0, X0",
 		"PEXTRQ $1, X0, BX", // single-root epilogue
 		"MOVQ X0, AX",
 	} {

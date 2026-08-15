@@ -60,9 +60,10 @@ func TestX64LoopCarryReadsReservedRegister(t *testing.T) {
 	loopBody := body[loopStart:]
 
 	// The carried accumulator is reserved at X14 (poolTop). The add
-	// must consume it via a register copy from X14, not a MOVQ/PINSRQ
+	// must consume it straight from X14 — either the VEX form reading
+	// it as an operand or a register copy — never a MOVQ/PINSRQ
 	// rebuild from a GPR pair.
-	if !regexp.MustCompile(`MOVOU X14, X\d`).MatchString(loopBody) {
+	if !regexp.MustCompile(`(MOVOU X14, X\d|X14, X\d+\n)`).MatchString(loopBody) {
 		t.Errorf("loop body never reads the carried register X14:\n%s", loopBody)
 	}
 	// The tail writes the running value back to X14.

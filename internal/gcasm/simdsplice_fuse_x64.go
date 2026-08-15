@@ -139,7 +139,7 @@ func x64SpliceFused(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, of
 		return false, false, err
 	}
 	hoffs := x64HoistMem(b, offs, tree, 1+tree.NumScalars+2*tree.NumPairs)
-	loc, needsTrap, err := x64SpliceFusedCore(b, tree, pool, hoffs, nil, nil, 0, true, maxOut)
+	loc, needsTrap, err := x64SpliceFusedCore(b, tree, pool, hoffs, nil, nil, 0, true, portable, maxOut)
 	if err != nil {
 		return false, false, err
 	}
@@ -174,7 +174,7 @@ func x64FusedProlog(b *strings.Builder, tree *simdfuse.Tree, offs *ModuleOffsets
 // x64SpliceFusedCore is the parameterized node-body emitter; see the
 // arm64 twin for the carried/reserve/extraIntArgs contract.
 func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets,
-	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, maxOut int) ([]fusedLoc, bool, error) {
+	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, portable bool, maxOut int) ([]fusedLoc, bool, error) {
 	if !skipProlog {
 		if err := x64FusedProlog(b, tree, offs); err != nil {
 			return nil, false, err
@@ -467,6 +467,49 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 			b.WriteString("\t// avx2 dot\n")
 			loc[i] = fusedLoc{chained: willChain, pool: dst}
 			continue
+		} else if vex, isVex := x64VexOps[n.Op]; isVex && !portable && x64VexArgsOK(n) {
+			// VEX three-operand form with an explicit destination: no
+			// staging copies into the canned X0/X1 slots and no parking
+			// copy out — the op reads its sources where they live and
+			// writes the pool register directly. VEX-128 zeroes the ymm
+			// upper halves, so no dirty-upper hazard arises. Scratch is
+			// X2/X3 (never pool homes); sources are read before dst is
+			// written, so dst may alias a source.
+			srcs := make([]string, 0, 2)
+			stage := 2
+			okSrc := true
+			for _, a := range n.Args {
+				switch a.Kind {
+				case simdfuse.ArgNode:
+					if loc[a.Index].chained {
+						srcs = append(srcs, "X0")
+					} else {
+						srcs = append(srcs, fmt.Sprintf("X%d", loc[a.Index].pool))
+					}
+				case simdfuse.ArgPairIn:
+					if cr, isCarried := carried[a.Index]; isCarried {
+						srcs = append(srcs, fmt.Sprintf("X%d", cr))
+					} else {
+						lo, hi := pairRegs(a)
+						fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, stage)
+						fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, stage)
+						srcs = append(srcs, fmt.Sprintf("X%d", stage))
+						stage++
+					}
+				default:
+					okSrc = false
+				}
+			}
+			if !okSrc {
+				return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+			}
+			d := dst
+			if willChain {
+				d = 0
+			}
+			vex(b, srcs, d)
+			loc[i] = fusedLoc{chained: willChain, pool: d}
+			continue
 		} else {
 			lines, ok := x64SimdPairSpliceTab[n.Op]
 			if !ok {
@@ -750,6 +793,25 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		fmt.Fprintf(b, "\tPMOVZXWD X%d, X%d\n", dst, dst)
 		return addOffErr
 	case "v128_load_nc":
+		// Unchecked member load: on a memory64 tree every address term
+		// adds at full width, so a register base plus constant terms
+		// folds into ONE indexed load with a displacement — no address
+		// arithmetic at all. (wasm32 keeps the wrapping ADDL sequence.)
+		if addr64 && addrReg == "" {
+			if a := n.Args[0]; a.Kind == simdfuse.ArgScalar || a.Kind == simdfuse.ArgSum {
+				base := int64(0)
+				if a.Kind == simdfuse.ArgSum {
+					base = int64(a.Const)
+				}
+				if off := n.Args[1]; off.Kind == simdfuse.ArgConst {
+					disp := base + int64(off.Const)
+					if disp >= 0 && disp < 1<<31 {
+						fmt.Fprintf(b, "\tMOVOU %d(%s)(%s*1), X%d\n", disp, x64MemBase(b, offs), scalarReg(a), dst)
+						return addOffErr
+					}
+				}
+			}
+		}
 		if d, ok := x64DeferOff(n.Args[1]); ok {
 			fmt.Fprintf(b, "\tMOVOU %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
 			return addOffErr
@@ -1061,7 +1123,7 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		fmt.Fprintf(b, "\t%s %s, $%d\n", cmpOp, counterReg, loop.Dec)
 		fmt.Fprintf(b, "\tJB %s\n", exitLabel)
 	}
-	loc, needsTrap, err := x64SpliceFusedCore(b, tree, pool, offs, carried, reserve, 1+loop.NumDeltas, true, maxOut)
+	loc, needsTrap, err := x64SpliceFusedCore(b, tree, pool, offs, carried, reserve, 1+loop.NumDeltas, true, portable, maxOut)
 	if err != nil {
 		return false, false, err
 	}
@@ -1162,4 +1224,49 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	}
 	_ = usedAVX // uppers are cleared per block dot at the emission site
 	return true, needsTrap, nil
+}
+
+// x64VexOps maps ops with a VEX three-operand register form to their
+// direct-destination emitters. Only all-vector-argument shapes qualify
+// (x64VexArgsOK); everything else keeps the canned SSE paste.
+var x64VexOps = map[string]func(b *strings.Builder, srcs []string, dst int){
+	"i32x4_add": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVPADDD %s, %s, X%d\n", s[1], s[0], d)
+	},
+	"i16x8_add": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVPADDW %s, %s, X%d\n", s[1], s[0], d)
+	},
+	"i32x4_sub": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVPSUBD %s, %s, X%d\n", s[1], s[0], d)
+	},
+	"f32x4_add": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVADDPS %s, %s, X%d\n", s[1], s[0], d)
+	},
+	"f32x4_mul": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVMULPS %s, %s, X%d\n", s[1], s[0], d)
+	},
+	"f32x4_sub": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVSUBPS %s, %s, X%d\n", s[1], s[0], d)
+	},
+	"f32x4_convert_i32x4_s": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVCVTDQ2PS %s, X%d\n", s[0], d)
+	},
+	"i32x4_dot_i16x8_s": func(b *strings.Builder, s []string, d int) {
+		fmt.Fprintf(b, "\tVPMADDWD %s, %s, X%d\n", s[1], s[0], d)
+	},
+}
+
+// x64VexArgsOK reports whether every argument is a register-resident
+// vector (node result or pair input) — the shapes the VEX emitters
+// handle without staging beyond X2/X3.
+func x64VexArgsOK(n simdfuse.Node) bool {
+	if len(n.Args) == 0 {
+		return false
+	}
+	for _, a := range n.Args {
+		if a.Kind != simdfuse.ArgNode && a.Kind != simdfuse.ArgPairIn {
+			return false
+		}
+	}
+	return true
 }
