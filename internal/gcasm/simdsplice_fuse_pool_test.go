@@ -54,18 +54,18 @@ func fusePoolClobberTree() *simdfuse.Tree {
 // parked load and every consumer after it computed garbage.
 func TestX64FusedCannedOpRelocatesLiveValues(t *testing.T) {
 	var b strings.Builder
-	spliced, _, err := x64SpliceFused(&b, fusePoolClobberTree(), &ConstPool{}, fuseTestOffs, 0)
+	spliced, _, err := x64SpliceFused(&b, fusePoolClobberTree(), &ConstPool{}, fuseTestOffs, false, 0)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}
 	body := b.String()
 	// n0 parks in X4 (first pool register); the shuffle must move it
 	// to X8+ before its canned lines run.
-	if !regexp.MustCompile(`MOVOU X4, X(8|9|1[0-4])\b`).MatchString(body) {
+	if !regexp.MustCompile(`VMOVDQU X4, X(8|9|1[0-4])\b`).MatchString(body) {
 		t.Fatalf("live value not relocated out of canned scratch:\n%s", body)
 	}
 	// The mul consumes the relocated home, never stale X4.
-	if strings.Contains(body, "MOVOU X4, X0") {
+	if strings.Contains(body, "VMOVDQU X4, X0") {
 		t.Fatalf("consumer read the clobbered X4 park:\n%s", body)
 	}
 }
@@ -98,7 +98,7 @@ func TestX64FusedPoolCapacity(t *testing.T) {
 	}
 	tree.Roots = []int{prev}
 	var b strings.Builder
-	spliced, _, err := x64SpliceFused(&b, tree, &ConstPool{}, fuseTestOffs, 0)
+	spliced, _, err := x64SpliceFused(&b, tree, &ConstPool{}, fuseTestOffs, false, 0)
 	if spliced {
 		t.Fatal("over-budget tree spliced")
 	}

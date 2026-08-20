@@ -47,7 +47,7 @@ func carryLoop() *simdfuse.Loop {
 // value, so reading them resets the accumulator every iteration.
 func TestX64LoopCarryReadsReservedRegister(t *testing.T) {
 	var b strings.Builder
-	spliced, _, err := x64SpliceLoop(&b, carryLoop(), &ConstPool{}, fuseTestOffs, "0", 0)
+	spliced, _, err := x64SpliceLoop(&b, carryLoop(), &ConstPool{}, fuseTestOffs, "0", false, 0)
 	if err != nil || !spliced {
 		t.Fatalf("spliced=%v err=%v", spliced, err)
 	}
@@ -60,13 +60,14 @@ func TestX64LoopCarryReadsReservedRegister(t *testing.T) {
 	loopBody := body[loopStart:]
 
 	// The carried accumulator is reserved at X14 (poolTop). The add
-	// must consume it via a register copy from X14, not a MOVQ/PINSRQ
+	// must consume it straight from X14 — either the VEX form reading
+	// it as an operand or a register copy — never a MOVQ/PINSRQ
 	// rebuild from a GPR pair.
-	if !regexp.MustCompile(`MOVOU X14, X\d`).MatchString(loopBody) {
+	if !regexp.MustCompile(`(MOVOU X14, X\d|X14, X\d+\n)`).MatchString(loopBody) {
 		t.Errorf("loop body never reads the carried register X14:\n%s", loopBody)
 	}
 	// The tail writes the running value back to X14.
-	if !strings.Contains(loopBody, "MOVOU X0, X14") && !regexp.MustCompile(`MOVOU X\d+, X14`).MatchString(loopBody) {
+	if !strings.Contains(loopBody, "VMOVDQU X0, X14") && !regexp.MustCompile(`MOVOU X\d+, X14`).MatchString(loopBody) {
 		t.Errorf("loop body never writes back the carried register X14:\n%s", loopBody)
 	}
 	// The prologue (before the loop label) seeds X14 from the argument

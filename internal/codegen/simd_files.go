@@ -50,6 +50,12 @@ var cpufeatArm64OtherSrc string
 //go:embed helpers/simd_asm_amd64.s
 var simdAsmAmd64Src string
 
+//go:embed helpers/cpufeat_amd64.go
+var cpufeatAmd64Src string
+
+//go:embed helpers/cpufeat_amd64.s
+var cpufeatAmd64AsmSrc string
+
 // appendSimdHelperFiles adds the SIMD helper files to the output tree when
 // the module uses any SIMD helper. In multi-package mode the entry points
 // are exported (simd_ → Simd_) to match helperRef's capitalized cross-
@@ -88,4 +94,6 @@ func (t *translator) appendSimdHelperFiles(files map[string][]byte) {
 	files[dir+"cpufeat_arm64_darwin.go"] = goFile(cpufeatArm64DarwinSrc)
 	files[dir+"cpufeat_arm64_linux.go"] = goFile(cpufeatArm64LinuxSrc)
 	files[dir+"cpufeat_arm64_other.go"] = goFile(cpufeatArm64OtherSrc)
+	files[dir+"cpufeat_amd64.go"] = goFile(cpufeatAmd64Src)
+	files[dir+"cpufeat_amd64.s"] = asmFile(cpufeatAmd64AsmSrc)
 }
