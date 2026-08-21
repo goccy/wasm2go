@@ -1339,7 +1339,14 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 	// interface means an embedder gets threads without implementing anything.
 	if imp.Module == "wasi" && imp.Name == "thread-spawn" ||
 		imp.Module == "wasi_snapshot_preview1" && imp.Name == "thread_spawn" {
-		em.useHelper("threadSpawn")
+		// On a memory64 module the start_arg is an i64 linear-memory
+		// pointer, so the spawn routes to the i64-arg helper twin (which
+		// reads the threadStart64 field the mem64 Module struct declares).
+		helper := "threadSpawn"
+		if em.mem64 {
+			helper = "threadSpawn_m64"
+		}
+		em.useHelper(helper)
 		args := []ast.Expr{newID("m")}
 		for _, a := range v.Args {
 			ae, err := emit(a)
@@ -1348,7 +1355,7 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 			}
 			args = append(args, ae)
 		}
-		return &ast.CallExpr{Fun: em.helperRef("threadSpawn"), Args: args}, nil
+		return &ast.CallExpr{Fun: em.helperRef(helper), Args: args}, nil
 	}
 	args := []ast.Expr{newID("m")}
 	for _, a := range v.Args {

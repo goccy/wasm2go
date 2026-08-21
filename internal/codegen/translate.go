@@ -265,8 +265,15 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	fuseDebugEnabled = opts.FuseDebug
 	if m.Memory64() {
 		for _, mem := range m.Memories {
-			if mem.Limits.Shared {
-				return Result{}, fmt.Errorf("wasm2go: shared memory64 is not supported")
+			// A shared memory is allocated at its ceiling once (see the
+			// New() emission): other agents deref its data pointer
+			// concurrently, so the backing array must never move. On a
+			// memory64 the fallback ceiling would be the mem64 hard cap —
+			// absurd to reserve — so the declared maximum (which the
+			// threads proposal requires anyway; the parser tolerates its
+			// absence) becomes mandatory here.
+			if mem.Limits.Shared && !mem.Limits.HasMax {
+				return Result{}, fmt.Errorf("wasm2go: shared memory64 requires a declared maximum (it is reserved in full as the relocation-free growth ceiling)")
 			}
 		}
 	}
@@ -1787,11 +1794,18 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		// threadStart carries the wasi_thread_start export as a function
 		// value: multi-package output emits exports as free functions in the
 		// main package, so base's threadSpawn helper cannot reach them any
-		// other way (no method to assert, no upward import).
+		// other way (no method to assert, no upward import). The field name
+		// and the start_arg width follow the memory width: a memory64
+		// module's start_arg is an i64 linear-memory pointer, read by the
+		// threadSpawn_m64 helper through the threadStart64 field.
+		threadStartField, argType := "threadStart", "int32"
+		if t.mod.Memory64() {
+			threadStartField, argType = "threadStart64", "int64"
+		}
 		fields = append(fields, &ast.Field{
-			Names: []*ast.Ident{newID(t.fieldName("threadStart"))},
+			Names: []*ast.Ident{newID(t.fieldName(threadStartField))},
 			Type: &ast.FuncType{Params: &ast.FieldList{List: []*ast.Field{
-				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID("int32")},
+				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID(argType)},
 			}}},
 		})
 	}
@@ -2568,10 +2582,16 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	}
 
 	// Wire the wasi_thread_start export into the Module so threadSpawn (in
-	// base) can launch agents without reaching into this package.
+	// base) can launch agents without reaching into this package. The field
+	// follows the memory width (threadStart64 with an i64 start_arg on a
+	// memory64 module), matching the struct declaration.
 	for _, exp := range t.mod.Exports {
 		if exp.Kind != wasm.ExportFunc || exp.Name != "wasi_thread_start" || !t.funcReachable(exp.Index) {
 			continue
+		}
+		threadStartField := "threadStart"
+		if t.mod.Memory64() {
+			threadStartField = "threadStart64"
 		}
 		// The export already takes the module as its first parameter, so the
 		// function value itself is what goes in the field — a closure over
@@ -2579,7 +2599,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		// threadSpawn passes in.
 		body.List = append(body.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
-			Lhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName("threadStart"))}},
+			Lhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName(threadStartField))}},
 			Rhs: []ast.Expr{t.funcRef(exp.Index)},
 		})
 		break

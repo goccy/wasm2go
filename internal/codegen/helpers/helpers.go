@@ -63,6 +63,12 @@ type Module struct {
 	// base cannot import the main package to call it directly. It takes the
 	// Module explicitly so threadSpawn can hand the AGENT'S clone to it.
 	threadStart func(m *Module, tid int32, arg int32)
+	// threadStart64 is threadStart for a memory64 module: the start_arg the
+	// guest hands wasi_thread_spawn is a linear-memory pointer, so it is an
+	// i64 there. Generated output declares exactly ONE of the two fields —
+	// whichever matches the module's memory width; this placeholder carries
+	// both so the helpers package compiles standalone.
+	threadStart64 func(m *Module, tid int32, arg int64)
 	// threads tracks agents spawned through wasi_thread_spawn.
 	threads *threadPool
 }
@@ -1269,20 +1275,40 @@ func atomicEA(m *Module, addr int32, offset int32, size uint64) uint64 {
 	return ea
 }
 
+// atomicEA64 is atomicEA for a memory64 memory: i64 address and offset with
+// overflow-safe u64 effective-address arithmetic (mirroring simdEA64 — a
+// negative addr or offset becomes a huge u64 that either wraps the addition,
+// caught by the wrap checks, or fails the bounds check), then the same
+// natural-alignment check the proposal requires.
+//
 //go:noinline
-func atomicPtr32(m *Module, addr int32, offset int32) *uint32 {
-	ea := atomicEA(m, addr, offset, 4)
-	// atomicEA already bounds-checked ea against memSize, so index off the
-	// raw base pointer to skip Go's redundant slice bounds check — the same
-	// deal the plain load/store path gets. m.M tracks m.memory's data
-	// pointer (New sets it; a shared memory never relocates, and the
-	// non-shared reallocate path refreshes it).
+func atomicEA64(m *Module, addr int64, offset int64, size uint64) uint64 {
+	ea := uint64(addr) + uint64(offset)
+	end := ea + size
+	if ea < uint64(addr) || end < ea || end > m.memSize.Load() {
+		wasm_trap_atomic_oob()
+	}
+	if ea&(size-1) != 0 {
+		wasm_trap_atomic_unaligned()
+	}
+	return ea
+}
+
+// atomicPtr32At / atomicPtr64At turn a CHECKED effective address into a
+// pointer into linear memory. The caller went through atomicEA/atomicEA64,
+// which already bounds-checked ea against memSize, so index off the raw
+// base pointer to skip Go's redundant slice bounds check — the same deal
+// the plain load/store path gets. m.M tracks m.memory's data pointer (New
+// sets it; a shared memory never relocates, and the non-shared reallocate
+// path refreshes it).
+//
+//go:noinline
+func atomicPtr32At(m *Module, ea uint64) *uint32 {
 	return (*uint32)(unsafe.Add(m.M, uintptr(ea)))
 }
 
 //go:noinline
-func atomicPtr64(m *Module, addr int32, offset int32) *uint64 {
-	ea := atomicEA(m, addr, offset, 8)
+func atomicPtr64At(m *Module, ea uint64) *uint64 {
 	return (*uint64)(unsafe.Add(m.M, uintptr(ea)))
 }
 
@@ -1322,48 +1348,27 @@ func atomicSubword32(m *Module, ea uint64, bits uint, op func(old uint32) uint32
 	}
 }
 
+// ----- Effective-address-based atomic cores --------------------------------
+//
+// Every atomic op body lives in an ...At core keyed on a CHECKED effective
+// address; the wasm32 helpers the lowering names (atomicLoad32, ...) and
+// their memory64 twins (atomicLoad32_m64, ...) are one-line wrappers that
+// differ only in how the effective address is computed (atomicEA vs
+// atomicEA64). The //go:noinline rationale above applies to the cores too.
+
 //go:noinline
-func atomicLoad32(m *Module, addr int32, offset int32) int32 {
-	return int32(atomic.LoadUint32(atomicPtr32(m, addr, offset)))
+func atomicLoad32At(m *Module, ea uint64) int32 {
+	return int32(atomic.LoadUint32(atomicPtr32At(m, ea)))
 }
 
 //go:noinline
-func atomicLoad64(m *Module, addr int32, offset int32) int64 {
-	return int64(atomic.LoadUint64(atomicPtr64(m, addr, offset)))
+func atomicLoad64At(m *Module, ea uint64) int64 {
+	return int64(atomic.LoadUint64(atomicPtr64At(m, ea)))
 }
 
 //go:noinline
-func atomicLoad32_8u(m *Module, addr int32, offset int32) int32 {
-	ea := atomicEA(m, addr, offset, 1)
-	return int32(atomicSubword32(m, ea, 8, func(old uint32) uint32 { return old }))
-}
-
-//go:noinline
-func atomicLoad32_16u(m *Module, addr int32, offset int32) int32 {
-	ea := atomicEA(m, addr, offset, 2)
-	return int32(atomicSubword32(m, ea, 16, func(old uint32) uint32 { return old }))
-}
-
-//go:noinline
-func atomicLoad64_8u(m *Module, addr int32, offset int32) int64 {
-	ea := atomicEA(m, addr, offset, 1)
-	return int64(atomicSubword32(m, ea, 8, func(old uint32) uint32 { return old }))
-}
-
-//go:noinline
-func atomicLoad64_16u(m *Module, addr int32, offset int32) int64 {
-	ea := atomicEA(m, addr, offset, 2)
-	return int64(atomicSubword32(m, ea, 16, func(old uint32) uint32 { return old }))
-}
-
-//go:noinline
-func atomicLoad64_32u(m *Module, addr int32, offset int32) int64 {
-	return int64(atomic.LoadUint32(atomicPtr32(m, addr, offset)))
-}
-
-//go:noinline
-func atomicStore32(m *Module, addr int32, offset int32, v int32) int32 {
-	p := atomicPtr32(m, addr, offset)
+func atomicStore32At(m *Module, ea uint64, v int32) int32 {
+	p := atomicPtr32At(m, ea)
 	if atomicsContended(m) {
 		atomic.StoreUint32(p, uint32(v))
 	} else {
@@ -1373,8 +1378,8 @@ func atomicStore32(m *Module, addr int32, offset int32, v int32) int32 {
 }
 
 //go:noinline
-func atomicStore64(m *Module, addr int32, offset int32, v int64) int32 {
-	p := atomicPtr64(m, addr, offset)
+func atomicStore64At(m *Module, ea uint64, v int64) int32 {
+	p := atomicPtr64At(m, ea)
 	if atomicsContended(m) {
 		atomic.StoreUint64(p, uint64(v))
 	} else {
@@ -1384,47 +1389,8 @@ func atomicStore64(m *Module, addr int32, offset int32, v int64) int32 {
 }
 
 //go:noinline
-func atomicStore32_8(m *Module, addr int32, offset int32, v int32) int32 {
-	ea := atomicEA(m, addr, offset, 1)
-	atomicSubword32(m, ea, 8, func(uint32) uint32 { return uint32(v) })
-	return 0
-}
-
-//go:noinline
-func atomicStore32_16(m *Module, addr int32, offset int32, v int32) int32 {
-	ea := atomicEA(m, addr, offset, 2)
-	atomicSubword32(m, ea, 16, func(uint32) uint32 { return uint32(v) })
-	return 0
-}
-
-//go:noinline
-func atomicStore64_8(m *Module, addr int32, offset int32, v int64) int32 {
-	ea := atomicEA(m, addr, offset, 1)
-	atomicSubword32(m, ea, 8, func(uint32) uint32 { return uint32(v) })
-	return 0
-}
-
-//go:noinline
-func atomicStore64_16(m *Module, addr int32, offset int32, v int64) int32 {
-	ea := atomicEA(m, addr, offset, 2)
-	atomicSubword32(m, ea, 16, func(uint32) uint32 { return uint32(v) })
-	return 0
-}
-
-//go:noinline
-func atomicStore64_32(m *Module, addr int32, offset int32, v int64) int32 {
-	p := atomicPtr32(m, addr, offset)
-	if atomicsContended(m) {
-		atomic.StoreUint32(p, uint32(v))
-	} else {
-		*p = uint32(v)
-	}
-	return 0
-}
-
-//go:noinline
-func atomicRmw32(m *Module, addr int32, offset int32, op func(old uint32) uint32) int32 {
-	p := atomicPtr32(m, addr, offset)
+func atomicRmw32At(m *Module, ea uint64, op func(old uint32) uint32) int32 {
+	p := atomicPtr32At(m, ea)
 	if !atomicsContended(m) {
 		cur := *p
 		*p = op(cur)
@@ -1439,8 +1405,8 @@ func atomicRmw32(m *Module, addr int32, offset int32, op func(old uint32) uint32
 }
 
 //go:noinline
-func atomicRmw64(m *Module, addr int32, offset int32, op func(old uint64) uint64) int64 {
-	p := atomicPtr64(m, addr, offset)
+func atomicRmw64At(m *Module, ea uint64, op func(old uint64) uint64) int64 {
+	p := atomicPtr64At(m, ea)
 	if !atomicsContended(m) {
 		cur := *p
 		*p = op(cur)
@@ -1455,8 +1421,8 @@ func atomicRmw64(m *Module, addr int32, offset int32, op func(old uint64) uint64
 }
 
 //go:noinline
-func atomicRmwAdd32(m *Module, addr, offset, v int32) int32 {
-	p := atomicPtr32(m, addr, offset)
+func atomicRmwAdd32At(m *Module, ea uint64, v int32) int32 {
+	p := atomicPtr32At(m, ea)
 	if !atomicsContended(m) {
 		old := *p
 		*p = old + uint32(v)
@@ -1466,8 +1432,8 @@ func atomicRmwAdd32(m *Module, addr, offset, v int32) int32 {
 }
 
 //go:noinline
-func atomicRmwSub32(m *Module, addr, offset, v int32) int32 {
-	p := atomicPtr32(m, addr, offset)
+func atomicRmwSub32At(m *Module, ea uint64, v int32) int32 {
+	p := atomicPtr32At(m, ea)
 	if !atomicsContended(m) {
 		old := *p
 		*p = old - uint32(v)
@@ -1477,23 +1443,8 @@ func atomicRmwSub32(m *Module, addr, offset, v int32) int32 {
 }
 
 //go:noinline
-func atomicRmwAnd32(m *Module, addr, offset, v int32) int32 {
-	return atomicRmw32(m, addr, offset, func(o uint32) uint32 { return o & uint32(v) })
-}
-
-//go:noinline
-func atomicRmwOr32(m *Module, addr, offset, v int32) int32 {
-	return atomicRmw32(m, addr, offset, func(o uint32) uint32 { return o | uint32(v) })
-}
-
-//go:noinline
-func atomicRmwXor32(m *Module, addr, offset, v int32) int32 {
-	return atomicRmw32(m, addr, offset, func(o uint32) uint32 { return o ^ uint32(v) })
-}
-
-//go:noinline
-func atomicRmwXchg32(m *Module, addr, offset, v int32) int32 {
-	p := atomicPtr32(m, addr, offset)
+func atomicRmwXchg32At(m *Module, ea uint64, v int32) int32 {
+	p := atomicPtr32At(m, ea)
 	if !atomicsContended(m) {
 		old := *p
 		*p = uint32(v)
@@ -1503,8 +1454,8 @@ func atomicRmwXchg32(m *Module, addr, offset, v int32) int32 {
 }
 
 //go:noinline
-func atomicRmwCmpxchg32(m *Module, addr, offset, expected, replacement int32) int32 {
-	p := atomicPtr32(m, addr, offset)
+func atomicRmwCmpxchg32At(m *Module, ea uint64, expected, replacement int32) int32 {
+	p := atomicPtr32At(m, ea)
 	if !atomicsContended(m) {
 		cur := *p
 		if cur == uint32(expected) {
@@ -1524,8 +1475,8 @@ func atomicRmwCmpxchg32(m *Module, addr, offset, expected, replacement int32) in
 }
 
 //go:noinline
-func atomicRmwAdd64(m *Module, addr, offset int32, v int64) int64 {
-	p := atomicPtr64(m, addr, offset)
+func atomicRmwAdd64At(m *Module, ea uint64, v int64) int64 {
+	p := atomicPtr64At(m, ea)
 	if !atomicsContended(m) {
 		old := *p
 		*p = old + uint64(v)
@@ -1535,8 +1486,8 @@ func atomicRmwAdd64(m *Module, addr, offset int32, v int64) int64 {
 }
 
 //go:noinline
-func atomicRmwSub64(m *Module, addr, offset int32, v int64) int64 {
-	p := atomicPtr64(m, addr, offset)
+func atomicRmwSub64At(m *Module, ea uint64, v int64) int64 {
+	p := atomicPtr64At(m, ea)
 	if !atomicsContended(m) {
 		old := *p
 		*p = old - uint64(v)
@@ -1546,23 +1497,8 @@ func atomicRmwSub64(m *Module, addr, offset int32, v int64) int64 {
 }
 
 //go:noinline
-func atomicRmwAnd64(m *Module, addr, offset int32, v int64) int64 {
-	return atomicRmw64(m, addr, offset, func(o uint64) uint64 { return o & uint64(v) })
-}
-
-//go:noinline
-func atomicRmwOr64(m *Module, addr, offset int32, v int64) int64 {
-	return atomicRmw64(m, addr, offset, func(o uint64) uint64 { return o | uint64(v) })
-}
-
-//go:noinline
-func atomicRmwXor64(m *Module, addr, offset int32, v int64) int64 {
-	return atomicRmw64(m, addr, offset, func(o uint64) uint64 { return o ^ uint64(v) })
-}
-
-//go:noinline
-func atomicRmwXchg64(m *Module, addr, offset int32, v int64) int64 {
-	p := atomicPtr64(m, addr, offset)
+func atomicRmwXchg64At(m *Module, ea uint64, v int64) int64 {
+	p := atomicPtr64At(m, ea)
 	if !atomicsContended(m) {
 		old := *p
 		*p = uint64(v)
@@ -1572,8 +1508,8 @@ func atomicRmwXchg64(m *Module, addr, offset int32, v int64) int64 {
 }
 
 //go:noinline
-func atomicRmwCmpxchg64(m *Module, addr, offset int32, expected, replacement int64) int64 {
-	p := atomicPtr64(m, addr, offset)
+func atomicRmwCmpxchg64At(m *Module, ea uint64, expected, replacement int64) int64 {
+	p := atomicPtr64At(m, ea)
 	if !atomicsContended(m) {
 		cur := *p
 		if cur == uint64(expected) {
@@ -1592,75 +1528,253 @@ func atomicRmwCmpxchg64(m *Module, addr, offset int32, expected, replacement int
 	}
 }
 
+// The i64 RMW ops over a 32-bit lane (rmw32_u): always LOCKed accesses,
+// matching the pre-refactor helpers (they never had the uncontended fast
+// path the full-width forms have).
+
 //go:noinline
-func atomicRmwSubword(m *Module, addr, offset int32, size uint64, bits uint, op func(old uint32) uint32) uint32 {
-	ea := atomicEA(m, addr, offset, size)
-	return atomicSubword32(m, ea, bits, op)
+func atomicRmwAdd64_32uAt(m *Module, ea uint64, v int64) int64 {
+	return int64(atomic.AddUint32(atomicPtr32At(m, ea), uint32(v)) - uint32(v))
+}
+
+//go:noinline
+func atomicRmwSub64_32uAt(m *Module, ea uint64, v int64) int64 {
+	return int64(atomic.AddUint32(atomicPtr32At(m, ea), -uint32(v)) + uint32(v))
+}
+
+//go:noinline
+func atomicRmwXchg64_32uAt(m *Module, ea uint64, v int64) int64 {
+	return int64(atomic.SwapUint32(atomicPtr32At(m, ea), uint32(v)))
+}
+
+//go:noinline
+func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64) int64 {
+	p := atomicPtr32At(m, ea)
+	for {
+		cur := atomic.LoadUint32(p)
+		if cur != uint32(expected) {
+			return int64(cur)
+		}
+		if atomic.CompareAndSwapUint32(p, cur, uint32(replacement)) {
+			return int64(cur)
+		}
+	}
+}
+
+// ----- wasm32 atomic helpers (named by the lowering) -----------------------
+
+//go:noinline
+func atomicLoad32(m *Module, addr int32, offset int32) int32 {
+	return atomicLoad32At(m, atomicEA(m, addr, offset, 4))
+}
+
+//go:noinline
+func atomicLoad64(m *Module, addr int32, offset int32) int64 {
+	return atomicLoad64At(m, atomicEA(m, addr, offset, 8))
+}
+
+//go:noinline
+func atomicLoad32_8u(m *Module, addr int32, offset int32) int32 {
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad32_16u(m *Module, addr int32, offset int32) int32 {
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad64_8u(m *Module, addr int32, offset int32) int64 {
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad64_16u(m *Module, addr int32, offset int32) int64 {
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad64_32u(m *Module, addr int32, offset int32) int64 {
+	return int64(atomic.LoadUint32(atomicPtr32At(m, atomicEA(m, addr, offset, 4))))
+}
+
+//go:noinline
+func atomicStore32(m *Module, addr int32, offset int32, v int32) int32 {
+	return atomicStore32At(m, atomicEA(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicStore64(m *Module, addr int32, offset int32, v int64) int32 {
+	return atomicStore64At(m, atomicEA(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicStore32_8(m *Module, addr int32, offset int32, v int32) int32 {
+	atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore32_16(m *Module, addr int32, offset int32, v int32) int32 {
+	atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore64_8(m *Module, addr int32, offset int32, v int64) int32 {
+	atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore64_16(m *Module, addr int32, offset int32, v int64) int32 {
+	atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore64_32(m *Module, addr int32, offset int32, v int64) int32 {
+	// uint32(int32(v)) == uint32(v): the truncation to the 32-bit lane is
+	// the same through the int32 cast, so the full-width store core serves.
+	return atomicStore32At(m, atomicEA(m, addr, offset, 4), int32(v))
+}
+
+//go:noinline
+func atomicRmwAdd32(m *Module, addr, offset, v int32) int32 {
+	return atomicRmwAdd32At(m, atomicEA(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwSub32(m *Module, addr, offset, v int32) int32 {
+	return atomicRmwSub32At(m, atomicEA(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwAnd32(m *Module, addr, offset, v int32) int32 {
+	return atomicRmw32At(m, atomicEA(m, addr, offset, 4), func(o uint32) uint32 { return o & uint32(v) })
+}
+
+//go:noinline
+func atomicRmwOr32(m *Module, addr, offset, v int32) int32 {
+	return atomicRmw32At(m, atomicEA(m, addr, offset, 4), func(o uint32) uint32 { return o | uint32(v) })
+}
+
+//go:noinline
+func atomicRmwXor32(m *Module, addr, offset, v int32) int32 {
+	return atomicRmw32At(m, atomicEA(m, addr, offset, 4), func(o uint32) uint32 { return o ^ uint32(v) })
+}
+
+//go:noinline
+func atomicRmwXchg32(m *Module, addr, offset, v int32) int32 {
+	return atomicRmwXchg32At(m, atomicEA(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwCmpxchg32(m *Module, addr, offset, expected, replacement int32) int32 {
+	return atomicRmwCmpxchg32At(m, atomicEA(m, addr, offset, 4), expected, replacement)
+}
+
+//go:noinline
+func atomicRmwAdd64(m *Module, addr, offset int32, v int64) int64 {
+	return atomicRmwAdd64At(m, atomicEA(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicRmwSub64(m *Module, addr, offset int32, v int64) int64 {
+	return atomicRmwSub64At(m, atomicEA(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicRmwAnd64(m *Module, addr, offset int32, v int64) int64 {
+	return atomicRmw64At(m, atomicEA(m, addr, offset, 8), func(o uint64) uint64 { return o & uint64(v) })
+}
+
+//go:noinline
+func atomicRmwOr64(m *Module, addr, offset int32, v int64) int64 {
+	return atomicRmw64At(m, atomicEA(m, addr, offset, 8), func(o uint64) uint64 { return o | uint64(v) })
+}
+
+//go:noinline
+func atomicRmwXor64(m *Module, addr, offset int32, v int64) int64 {
+	return atomicRmw64At(m, atomicEA(m, addr, offset, 8), func(o uint64) uint64 { return o ^ uint64(v) })
+}
+
+//go:noinline
+func atomicRmwXchg64(m *Module, addr, offset int32, v int64) int64 {
+	return atomicRmwXchg64At(m, atomicEA(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicRmwCmpxchg64(m *Module, addr, offset int32, expected, replacement int64) int64 {
+	return atomicRmwCmpxchg64At(m, atomicEA(m, addr, offset, 8), expected, replacement)
 }
 
 //go:noinline
 func atomicRmwAdd32_8u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o + uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o + uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAdd32_16u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o + uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o + uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwSub32_8u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o - uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o - uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwSub32_16u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o - uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o - uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAnd32_8u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o & uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o & uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAnd32_16u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o & uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o & uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwOr32_8u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o | uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o | uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwOr32_16u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o | uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o | uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXor32_8u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o ^ uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o ^ uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXor32_16u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o ^ uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o ^ uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXchg32_8u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 1, 8, func(uint32) uint32 { return uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXchg32_16u(m *Module, addr, offset, v int32) int32 {
-	return int32(atomicRmwSubword(m, addr, offset, 2, 16, func(uint32) uint32 { return uint32(v) }))
+	return int32(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) }))
 }
 
+// atomicCmpxchgSubword is the compare-exchange counterpart of
+// atomicSubword32: CAS on the byte lanes [shift, shift+bits) of the aligned
+// 32-bit word containing the checked effective address ea.
+//
 //go:noinline
-func atomicCmpxchgSubword(m *Module, addr, offset int32, size uint64, bits uint, expected, replacement uint32) uint32 {
-	ea := atomicEA(m, addr, offset, size)
+func atomicCmpxchgSubword(m *Module, ea uint64, bits uint, expected, replacement uint32) uint32 {
 	word := (*uint32)(unsafe.Pointer(&m.memory[ea&^3]))
 	shift := uint(ea&3) * 8
 	mask := uint32(1)<<bits - 1
@@ -1679,126 +1793,117 @@ func atomicCmpxchgSubword(m *Module, addr, offset int32, size uint64, bits uint,
 
 //go:noinline
 func atomicRmwCmpxchg32_8u(m *Module, addr, offset, expected, replacement int32) int32 {
-	return int32(atomicCmpxchgSubword(m, addr, offset, 1, 8, uint32(expected), uint32(replacement)))
+	return int32(atomicCmpxchgSubword(m, atomicEA(m, addr, offset, 1), 8, uint32(expected), uint32(replacement)))
 }
 
 //go:noinline
 func atomicRmwCmpxchg32_16u(m *Module, addr, offset, expected, replacement int32) int32 {
-	return int32(atomicCmpxchgSubword(m, addr, offset, 2, 16, uint32(expected), uint32(replacement)))
+	return int32(atomicCmpxchgSubword(m, atomicEA(m, addr, offset, 2), 16, uint32(expected), uint32(replacement)))
 }
 
 //go:noinline
 func atomicRmwAdd64_8u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o + uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o + uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAdd64_16u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o + uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o + uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAdd64_32u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomic.AddUint32(atomicPtr32(m, addr, offset), uint32(v)) - uint32(v))
+	return atomicRmwAdd64_32uAt(m, atomicEA(m, addr, offset, 4), v)
 }
 
 //go:noinline
 func atomicRmwSub64_8u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o - uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o - uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwSub64_16u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o - uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o - uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwSub64_32u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomic.AddUint32(atomicPtr32(m, addr, offset), -uint32(v)) + uint32(v))
+	return atomicRmwSub64_32uAt(m, atomicEA(m, addr, offset, 4), v)
 }
 
 //go:noinline
 func atomicRmwAnd64_8u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o & uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o & uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAnd64_16u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o & uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o & uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwAnd64_32u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmw32(m, addr, offset, func(o uint32) uint32 { return o & uint32(v) })) & 0xffffffff
+	return int64(atomicRmw32At(m, atomicEA(m, addr, offset, 4), func(o uint32) uint32 { return o & uint32(v) })) & 0xffffffff
 }
 
 //go:noinline
 func atomicRmwOr64_8u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o | uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o | uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwOr64_16u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o | uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o | uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwOr64_32u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmw32(m, addr, offset, func(o uint32) uint32 { return o | uint32(v) })) & 0xffffffff
+	return int64(atomicRmw32At(m, atomicEA(m, addr, offset, 4), func(o uint32) uint32 { return o | uint32(v) })) & 0xffffffff
 }
 
 //go:noinline
 func atomicRmwXor64_8u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 1, 8, func(o uint32) uint32 { return o ^ uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(o uint32) uint32 { return o ^ uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXor64_16u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 2, 16, func(o uint32) uint32 { return o ^ uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(o uint32) uint32 { return o ^ uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXor64_32u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmw32(m, addr, offset, func(o uint32) uint32 { return o ^ uint32(v) })) & 0xffffffff
+	return int64(atomicRmw32At(m, atomicEA(m, addr, offset, 4), func(o uint32) uint32 { return o ^ uint32(v) })) & 0xffffffff
 }
 
 //go:noinline
 func atomicRmwXchg64_8u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 1, 8, func(uint32) uint32 { return uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXchg64_16u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomicRmwSubword(m, addr, offset, 2, 16, func(uint32) uint32 { return uint32(v) }))
+	return int64(atomicSubword32(m, atomicEA(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) }))
 }
 
 //go:noinline
 func atomicRmwXchg64_32u(m *Module, addr, offset int32, v int64) int64 {
-	return int64(atomic.SwapUint32(atomicPtr32(m, addr, offset), uint32(v)))
+	return atomicRmwXchg64_32uAt(m, atomicEA(m, addr, offset, 4), v)
 }
 
 //go:noinline
 func atomicRmwCmpxchg64_8u(m *Module, addr, offset int32, expected, replacement int64) int64 {
-	return int64(atomicCmpxchgSubword(m, addr, offset, 1, 8, uint32(expected), uint32(replacement)))
+	return int64(atomicCmpxchgSubword(m, atomicEA(m, addr, offset, 1), 8, uint32(expected), uint32(replacement)))
 }
 
 //go:noinline
 func atomicRmwCmpxchg64_16u(m *Module, addr, offset int32, expected, replacement int64) int64 {
-	return int64(atomicCmpxchgSubword(m, addr, offset, 2, 16, uint32(expected), uint32(replacement)))
+	return int64(atomicCmpxchgSubword(m, atomicEA(m, addr, offset, 2), 16, uint32(expected), uint32(replacement)))
 }
 
 //go:noinline
 func atomicRmwCmpxchg64_32u(m *Module, addr, offset int32, expected, replacement int64) int64 {
-	p := atomicPtr32(m, addr, offset)
-	for {
-		cur := atomic.LoadUint32(p)
-		if cur != uint32(expected) {
-			return int64(cur)
-		}
-		if atomic.CompareAndSwapUint32(p, cur, uint32(replacement)) {
-			return int64(cur)
-		}
-	}
+	return atomicRmwCmpxchg64_32uAt(m, atomicEA(m, addr, offset, 4), expected, replacement)
 }
 
 // atomicFence is a sequentially consistent full barrier. Locking any mutex
@@ -1817,8 +1922,7 @@ func atomicFence(m *Module) int32 {
 //
 //go:noinline
 func atomicNotify(m *Module, addr int32, offset int32, count int32) int32 {
-	ea := atomicEA(m, addr, offset, 4)
-	return m.threads.wake(ea, count)
+	return m.threads.wake(atomicEA(m, addr, offset, 4), count)
 }
 
 // atomicWait32/64 implement memory.atomic.wait: compare-and-park. The compare
@@ -1830,21 +1934,29 @@ func atomicNotify(m *Module, addr int32, offset int32, count int32) int32 {
 // deadlock, so it traps rather than hanging the process.
 //
 //go:noinline
-func atomicWait32(m *Module, addr int32, offset int32, expected int32, timeout int64) int32 {
-	ea := atomicEA(m, addr, offset, 4)
-	p := (*uint32)(unsafe.Add(m.M, uintptr(ea)))
+func atomicWait32At(m *Module, ea uint64, expected int32, timeout int64) int32 {
+	p := atomicPtr32At(m, ea)
 	return atomicWait(m, ea, timeout, func() bool {
 		return int32(atomic.LoadUint32(p)) == expected
 	})
 }
 
 //go:noinline
-func atomicWait64(m *Module, addr int32, offset int32, expected int64, timeout int64) int32 {
-	ea := atomicEA(m, addr, offset, 8)
-	p := (*uint64)(unsafe.Add(m.M, uintptr(ea)))
+func atomicWait64At(m *Module, ea uint64, expected int64, timeout int64) int32 {
+	p := atomicPtr64At(m, ea)
 	return atomicWait(m, ea, timeout, func() bool {
 		return int64(atomic.LoadUint64(p)) == expected
 	})
+}
+
+//go:noinline
+func atomicWait32(m *Module, addr int32, offset int32, expected int32, timeout int64) int32 {
+	return atomicWait32At(m, atomicEA(m, addr, offset, 4), expected, timeout)
+}
+
+//go:noinline
+func atomicWait64(m *Module, addr int32, offset int32, expected int64, timeout int64) int32 {
+	return atomicWait64At(m, atomicEA(m, addr, offset, 8), expected, timeout)
 }
 
 //go:noinline
@@ -1906,6 +2018,349 @@ func atomicWait(m *Module, ea uint64, timeout int64, stillEqual func() bool) int
 	}
 }
 
+// ----- memory64 atomic helpers ---------------------------------------------
+//
+// The _m64 family: one twin per atomic helper the lowering can name on a
+// memory64 module. Signatures mirror the wasm32 forms with i64 address and
+// offset; every body is a one-liner through atomicEA64 (overflow-safe u64
+// effective-address math) into the shared ...At core, so op semantics —
+// including the atomicsContended fast paths — are identical across widths.
+// atomicFence has no twin: it takes no address.
+
+//go:noinline
+func atomicLoad32_m64(m *Module, addr int64, offset int64) int32 {
+	return atomicLoad32At(m, atomicEA64(m, addr, offset, 4))
+}
+
+//go:noinline
+func atomicLoad64_m64(m *Module, addr int64, offset int64) int64 {
+	return atomicLoad64At(m, atomicEA64(m, addr, offset, 8))
+}
+
+//go:noinline
+func atomicLoad32_8u_m64(m *Module, addr int64, offset int64) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad32_16u_m64(m *Module, addr int64, offset int64) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad64_8u_m64(m *Module, addr int64, offset int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad64_16u_m64(m *Module, addr int64, offset int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(old uint32) uint32 { return old }))
+}
+
+//go:noinline
+func atomicLoad64_32u_m64(m *Module, addr int64, offset int64) int64 {
+	return int64(atomic.LoadUint32(atomicPtr32At(m, atomicEA64(m, addr, offset, 4))))
+}
+
+//go:noinline
+func atomicStore32_m64(m *Module, addr int64, offset int64, v int32) int32 {
+	return atomicStore32At(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicStore64_m64(m *Module, addr int64, offset int64, v int64) int32 {
+	return atomicStore64At(m, atomicEA64(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicStore32_8_m64(m *Module, addr int64, offset int64, v int32) int32 {
+	atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore32_16_m64(m *Module, addr int64, offset int64, v int32) int32 {
+	atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore64_8_m64(m *Module, addr int64, offset int64, v int64) int32 {
+	atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore64_16_m64(m *Module, addr int64, offset int64, v int64) int32 {
+	atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) })
+	return 0
+}
+
+//go:noinline
+func atomicStore64_32_m64(m *Module, addr int64, offset int64, v int64) int32 {
+	return atomicStore32At(m, atomicEA64(m, addr, offset, 4), int32(v))
+}
+
+//go:noinline
+func atomicRmwAdd32_m64(m *Module, addr, offset int64, v int32) int32 {
+	return atomicRmwAdd32At(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwSub32_m64(m *Module, addr, offset int64, v int32) int32 {
+	return atomicRmwSub32At(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwAnd32_m64(m *Module, addr, offset int64, v int32) int32 {
+	return atomicRmw32At(m, atomicEA64(m, addr, offset, 4), func(o uint32) uint32 { return o & uint32(v) })
+}
+
+//go:noinline
+func atomicRmwOr32_m64(m *Module, addr, offset int64, v int32) int32 {
+	return atomicRmw32At(m, atomicEA64(m, addr, offset, 4), func(o uint32) uint32 { return o | uint32(v) })
+}
+
+//go:noinline
+func atomicRmwXor32_m64(m *Module, addr, offset int64, v int32) int32 {
+	return atomicRmw32At(m, atomicEA64(m, addr, offset, 4), func(o uint32) uint32 { return o ^ uint32(v) })
+}
+
+//go:noinline
+func atomicRmwXchg32_m64(m *Module, addr, offset int64, v int32) int32 {
+	return atomicRmwXchg32At(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwCmpxchg32_m64(m *Module, addr, offset int64, expected, replacement int32) int32 {
+	return atomicRmwCmpxchg32At(m, atomicEA64(m, addr, offset, 4), expected, replacement)
+}
+
+//go:noinline
+func atomicRmwAdd64_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmwAdd64At(m, atomicEA64(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicRmwSub64_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmwSub64At(m, atomicEA64(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicRmwAnd64_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmw64At(m, atomicEA64(m, addr, offset, 8), func(o uint64) uint64 { return o & uint64(v) })
+}
+
+//go:noinline
+func atomicRmwOr64_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmw64At(m, atomicEA64(m, addr, offset, 8), func(o uint64) uint64 { return o | uint64(v) })
+}
+
+//go:noinline
+func atomicRmwXor64_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmw64At(m, atomicEA64(m, addr, offset, 8), func(o uint64) uint64 { return o ^ uint64(v) })
+}
+
+//go:noinline
+func atomicRmwXchg64_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmwXchg64At(m, atomicEA64(m, addr, offset, 8), v)
+}
+
+//go:noinline
+func atomicRmwCmpxchg64_m64(m *Module, addr, offset int64, expected, replacement int64) int64 {
+	return atomicRmwCmpxchg64At(m, atomicEA64(m, addr, offset, 8), expected, replacement)
+}
+
+//go:noinline
+func atomicRmwAdd32_8u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o + uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAdd32_16u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o + uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwSub32_8u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o - uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwSub32_16u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o - uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAnd32_8u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o & uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAnd32_16u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o & uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwOr32_8u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o | uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwOr32_16u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o | uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXor32_8u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o ^ uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXor32_16u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o ^ uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXchg32_8u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXchg32_16u_m64(m *Module, addr, offset int64, v int32) int32 {
+	return int32(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwCmpxchg32_8u_m64(m *Module, addr, offset int64, expected, replacement int32) int32 {
+	return int32(atomicCmpxchgSubword(m, atomicEA64(m, addr, offset, 1), 8, uint32(expected), uint32(replacement)))
+}
+
+//go:noinline
+func atomicRmwCmpxchg32_16u_m64(m *Module, addr, offset int64, expected, replacement int32) int32 {
+	return int32(atomicCmpxchgSubword(m, atomicEA64(m, addr, offset, 2), 16, uint32(expected), uint32(replacement)))
+}
+
+//go:noinline
+func atomicRmwAdd64_8u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o + uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAdd64_16u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o + uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAdd64_32u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmwAdd64_32uAt(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwSub64_8u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o - uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwSub64_16u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o - uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwSub64_32u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmwSub64_32uAt(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwAnd64_8u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o & uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAnd64_16u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o & uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwAnd64_32u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicRmw32At(m, atomicEA64(m, addr, offset, 4), func(o uint32) uint32 { return o & uint32(v) })) & 0xffffffff
+}
+
+//go:noinline
+func atomicRmwOr64_8u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o | uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwOr64_16u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o | uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwOr64_32u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicRmw32At(m, atomicEA64(m, addr, offset, 4), func(o uint32) uint32 { return o | uint32(v) })) & 0xffffffff
+}
+
+//go:noinline
+func atomicRmwXor64_8u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(o uint32) uint32 { return o ^ uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXor64_16u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(o uint32) uint32 { return o ^ uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXor64_32u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicRmw32At(m, atomicEA64(m, addr, offset, 4), func(o uint32) uint32 { return o ^ uint32(v) })) & 0xffffffff
+}
+
+//go:noinline
+func atomicRmwXchg64_8u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 1), 8, func(uint32) uint32 { return uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXchg64_16u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return int64(atomicSubword32(m, atomicEA64(m, addr, offset, 2), 16, func(uint32) uint32 { return uint32(v) }))
+}
+
+//go:noinline
+func atomicRmwXchg64_32u_m64(m *Module, addr, offset int64, v int64) int64 {
+	return atomicRmwXchg64_32uAt(m, atomicEA64(m, addr, offset, 4), v)
+}
+
+//go:noinline
+func atomicRmwCmpxchg64_8u_m64(m *Module, addr, offset int64, expected, replacement int64) int64 {
+	return int64(atomicCmpxchgSubword(m, atomicEA64(m, addr, offset, 1), 8, uint32(expected), uint32(replacement)))
+}
+
+//go:noinline
+func atomicRmwCmpxchg64_16u_m64(m *Module, addr, offset int64, expected, replacement int64) int64 {
+	return int64(atomicCmpxchgSubword(m, atomicEA64(m, addr, offset, 2), 16, uint32(expected), uint32(replacement)))
+}
+
+//go:noinline
+func atomicRmwCmpxchg64_32u_m64(m *Module, addr, offset int64, expected, replacement int64) int64 {
+	return atomicRmwCmpxchg64_32uAt(m, atomicEA64(m, addr, offset, 4), expected, replacement)
+}
+
+//go:noinline
+func atomicNotify_m64(m *Module, addr int64, offset int64, count int32) int32 {
+	return m.threads.wake(atomicEA64(m, addr, offset, 4), count)
+}
+
+//go:noinline
+func atomicWait32_m64(m *Module, addr int64, offset int64, expected int32, timeout int64) int32 {
+	return atomicWait32At(m, atomicEA64(m, addr, offset, 4), expected, timeout)
+}
+
+//go:noinline
+func atomicWait64_m64(m *Module, addr int64, offset int64, expected int64, timeout int64) int32 {
+	return atomicWait64At(m, atomicEA64(m, addr, offset, 8), expected, timeout)
+}
+
 // ----- wasi-threads ---------------------------------------------------------
 //
 // A wasm thread is a goroutine. wasi_thread_spawn hands the guest a TID and
@@ -1946,15 +2401,11 @@ func (p *threadPool) wake(ea uint64, count int32) int32 {
 	return n
 }
 
-// threadSpawn implements the wasi_thread_spawn import: run the guest's thread
-// entry on a goroutine, return the new TID (negative means "cannot spawn").
+// threadLaunch allocates a TID and runs body — the guest's thread entry
+// already bound to its start argument — on a fresh goroutine-agent.
 //
 //go:noinline
-func threadSpawn(m *Module, arg int32) int32 {
-	start := m.threadStart
-	if start == nil {
-		return -1 // module exports no wasi_thread_start: nothing to run
-	}
+func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 	tid := m.threads.nextTID.Add(1)
 	m.threads.wg.Add(1)
 	// The agent runs on a struct COPY: same memory (the slice header is
@@ -1982,9 +2433,34 @@ func threadSpawn(m *Module, arg int32) int32 {
 				panic(r)
 			}
 		}()
-		start(child, tid, arg)
+		body(child, tid)
 	}()
 	return tid
+}
+
+// threadSpawn implements the wasi_thread_spawn import: run the guest's thread
+// entry on a goroutine, return the new TID (negative means "cannot spawn").
+//
+//go:noinline
+func threadSpawn(m *Module, arg int32) int32 {
+	start := m.threadStart
+	if start == nil {
+		return -1 // module exports no wasi_thread_start: nothing to run
+	}
+	return threadLaunch(m, func(child *Module, tid int32) { start(child, tid, arg) })
+}
+
+// threadSpawn_m64 is threadSpawn for a memory64 module: the guest's
+// start_arg is a linear-memory pointer and therefore an i64. The TID
+// stays an i32 — wasi_thread_spawn returns i32 in both widths.
+//
+//go:noinline
+func threadSpawn_m64(m *Module, arg int64) int32 {
+	start := m.threadStart64
+	if start == nil {
+		return -1 // module exports no wasi_thread_start: nothing to run
+	}
+	return threadLaunch(m, func(child *Module, tid int32) { start(child, tid, arg) })
 }
 
 // ThreadsWait blocks until every spawned agent has returned. Hosts call it
@@ -2626,6 +3102,18 @@ func memoryGrow64(m *Module, n int64) int64 {
 	}
 	if m.maxMem != 0 && want > m.maxMem {
 		return -1
+	}
+	if m.memShared {
+		// Same contract as memoryGrow: the backing array of a shared
+		// memory already spans the declared maximum (New reserved it;
+		// untouched pages are not resident), so growth is a single
+		// atomic store — no copy, no reslice, and above all no
+		// relocation, since other agents deref m.M concurrently.
+		if want > uint64(len(m.memory)) {
+			return -1
+		}
+		m.memSize.Store(want)
+		return prev
 	}
 	if want <= uint64(cap(m.memory)) {
 		m.memory = m.memory[:want]

@@ -99,14 +99,14 @@ func TestAtomicMemoryOps(t *testing.T) {
 		t.Errorf("atomicRmwXor32: old %#x new %#x, want 0xFF / 0xF0", old, atomicLoad32(m, 0, 0))
 	}
 
-	// The generic op-taking RMW forms (atomicRmw32 / atomicRmw64).
+	// The generic op-taking RMW cores (atomicRmw32At / atomicRmw64At).
 	atomicStore32(m, 0, 0, 7)
-	if old := atomicRmw32(m, 0, 0, func(o uint32) uint32 { return o * 3 }); old != 7 || atomicLoad32(m, 0, 0) != 21 {
-		t.Errorf("atomicRmw32: old %d new %d, want 7 / 21", old, atomicLoad32(m, 0, 0))
+	if old := atomicRmw32At(m, atomicEA(m, 0, 0, 4), func(o uint32) uint32 { return o * 3 }); old != 7 || atomicLoad32(m, 0, 0) != 21 {
+		t.Errorf("atomicRmw32At: old %d new %d, want 7 / 21", old, atomicLoad32(m, 0, 0))
 	}
 	atomicStore64(m, 8, 0, 4)
-	if old := atomicRmw64(m, 8, 0, func(o uint64) uint64 { return o + 100 }); old != 4 || atomicLoad64(m, 8, 0) != 104 {
-		t.Errorf("atomicRmw64: old %d new %d, want 4 / 104", old, atomicLoad64(m, 8, 0))
+	if old := atomicRmw64At(m, atomicEA(m, 8, 0, 8), func(o uint64) uint64 { return o + 100 }); old != 4 || atomicLoad64(m, 8, 0) != 104 {
+		t.Errorf("atomicRmw64At: old %d new %d, want 4 / 104", old, atomicLoad64(m, 8, 0))
 	}
 
 	// Sub-word atomics: store and zero-extended load, 8- and 16-bit lanes.
