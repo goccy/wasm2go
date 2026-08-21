@@ -788,12 +788,6 @@ func (ls *lowerState) handleFEOp(r *wasm.InstrReader) error {
 	if err != nil {
 		return err
 	}
-	if ls.mem64 {
-		// The atomic helpers and the shared-memory reservation scheme
-		// are 32-bit; a shared memory64 has no toolchain producing it
-		// today. Fail loudly rather than mis-address.
-		return fmt.Errorf("%w: atomics on a memory64 memory", ErrSSAUnsupported)
-	}
 	if sub == 0x03 { // atomic.fence: reserved byte, no operands
 		if _, err := r.ReadByte(); err != nil {
 			return err
@@ -808,9 +802,25 @@ func (ls *lowerState) handleFEOp(r *wasm.InstrReader) error {
 	if _, err := r.ReadU32(); err != nil { // memarg align (validated upstream)
 		return err
 	}
-	offset, err := r.ReadU32()
-	if err != nil {
-		return err
+	// On a memory64 module the memarg offset is a u64, the address operand
+	// is an i64, and the op routes to the helper's _m64 twin (i64 address
+	// and offset, u64 effective-address math). atomic.fence above takes no
+	// address and needs no twin.
+	helper := spec.helper
+	var offVal *ssa.Value
+	if ls.mem64 {
+		offset, err := r.ReadU64()
+		if err != nil {
+			return err
+		}
+		offVal = ls.b.Const64(int64(offset))
+		helper += "_m64"
+	} else {
+		offset, err := r.ReadU32()
+		if err != nil {
+			return err
+		}
+		offVal = ls.b.Const32(int32(offset))
 	}
 	extras := make([]*ssa.Value, spec.extra)
 	for i := spec.extra - 1; i >= 0; i-- {
@@ -824,8 +834,8 @@ func (ls *lowerState) handleFEOp(r *wasm.InstrReader) error {
 	if err != nil {
 		return err
 	}
-	args := append([]*ssa.Value{addr, ls.b.Const32(int32(offset))}, extras...)
-	v := ls.b.NewValueAux(ssa.OpAtomicCall, spec.resType, spec.helper, args...)
+	args := append([]*ssa.Value{addr, offVal}, extras...)
+	v := ls.b.NewValueAux(ssa.OpAtomicCall, spec.resType, helper, args...)
 	if strings.HasPrefix(spec.helper, "atomicStore") {
 		return nil // stores leave nothing on the stack
 	}

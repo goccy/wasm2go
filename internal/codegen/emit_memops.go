@@ -483,12 +483,19 @@ type atomicInlineSpec struct {
 
 // atomicInlineSpecs maps OpAtomicCall helper names (lower.go feAtomics)
 // to their inline form. Only the four full-width aligned accesses
-// appear here; absence means "keep the helper call".
+// appear here — in both address widths, since the op itself is
+// identical and only the effective-address arithmetic differs (see
+// memOffsetExpr / memOffsetExpr64); absence means "keep the helper
+// call".
 var atomicInlineSpecs = map[string]atomicInlineSpec{
-	"atomicLoad32":  {elemType: "uint32", fn: "LoadUint32", loadCast: "int32"},
-	"atomicLoad64":  {elemType: "uint64", fn: "LoadUint64", loadCast: "int64"},
-	"atomicStore32": {elemType: "uint32", fn: "StoreUint32", isStore: true},
-	"atomicStore64": {elemType: "uint64", fn: "StoreUint64", isStore: true},
+	"atomicLoad32":      {elemType: "uint32", fn: "LoadUint32", loadCast: "int32"},
+	"atomicLoad64":      {elemType: "uint64", fn: "LoadUint64", loadCast: "int64"},
+	"atomicStore32":     {elemType: "uint32", fn: "StoreUint32", isStore: true},
+	"atomicStore64":     {elemType: "uint64", fn: "StoreUint64", isStore: true},
+	"atomicLoad32_m64":  {elemType: "uint32", fn: "LoadUint32", loadCast: "int32"},
+	"atomicLoad64_m64":  {elemType: "uint64", fn: "LoadUint64", loadCast: "int64"},
+	"atomicStore32_m64": {elemType: "uint32", fn: "StoreUint32", isStore: true},
+	"atomicStore64_m64": {elemType: "uint64", fn: "StoreUint64", isStore: true},
 }
 
 // emitAtomicInline renders an OpAtomicCall as an inline sync/atomic
@@ -503,9 +510,22 @@ func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, name string, emitExpr func(
 	if !ok {
 		return nil, false, nil
 	}
-	off := ssaConstBase(v.Args[1])
-	if off == nil {
-		return nil, false, nil
+	// The static offset is the OpConst32 (wasm32) or OpConst64 (memory64)
+	// the lowering built; its width decides the truncation-free extraction.
+	// memOffsetExpr itself dispatches on em.mem64 for the address math.
+	var offU uint64
+	if em.mem64 {
+		off := ssaConstBase64(v.Args[1])
+		if off == nil {
+			return nil, false, nil
+		}
+		offU = uint64(off.AuxInt)
+	} else {
+		off := ssaConstBase(v.Args[1])
+		if off == nil {
+			return nil, false, nil
+		}
+		offU = uint64(uint32(off.AuxInt))
 	}
 	baseExpr, err := emitExpr(v.Args[0])
 	if err != nil {
@@ -517,7 +537,7 @@ func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, name string, emitExpr func(
 		Fun: &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Add")},
 		Args: []ast.Expr{
 			em.memBasePtrExpr(),
-			em.memOffsetExpr(baseExpr, uint64(uint32(off.AuxInt)), v.Args[0]),
+			em.memOffsetExpr(baseExpr, offU, v.Args[0]),
 		},
 	}
 	ptr := &ast.CallExpr{

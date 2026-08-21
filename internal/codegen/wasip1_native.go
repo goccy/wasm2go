@@ -3272,6 +3272,12 @@ func (w *WasiStubs) Fd_close64(m *Module, fd int64) int32 {
 	return w.Fd_close(m, int32(fd))
 }
 
+func (w *WasiStubs) Sched_yield64(m *Module) int32 {
+	// No arguments to widen; the LP64 twin exists only because a wasm64
+	// module binds every wasi import through the widened interface.
+	return w.Sched_yield(m)
+}
+
 func (w *WasiStubs) Fd_fdstat_get64(m *Module, fd int64, ptr int64) int32 {
 	// The fdstat struct holds no pointers, so its 24-byte layout is
 	// identical under LP64; only the out-pointer needs the 64-bit
