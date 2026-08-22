@@ -2013,6 +2013,13 @@ type funcPlan struct {
 	// emittedCall is the per-value flag those emitters set.
 	spliceHoist string
 	emittedCall bool
+	// fusedAt maps a window's FIRST member value to the planned
+	// window; fusedMember marks every member so emission skips them
+	// (the window body at the first member covers all of them).
+	// Populated only for windows the plan validated end to end —
+	// anything else keeps per-op emission.
+	fusedAt     map[ssa.ValueID]*plannedFusedWindow
+	fusedMember map[ssa.ValueID]bool
 	// mustSplice marks SIMD call values inside register-coalesced
 	// loops: their inline splice is load-bearing (a fallback CALL
 	// would clobber the carry registers), so a splice-table miss
@@ -3152,6 +3159,11 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 	// `m+0(FP)` everywhere, and a non-empty mCacheReg would have
 	// the prologue emit `MOVQ ..., R11` which arm64 rejects).
 	p.mCacheCandidate = wantsMCache
+
+	// Fused windows: validate the codegen-claimed regions against the
+	// final slot map and index them for emission. Quiet per-op
+	// fallback on any mismatch.
+	p.planFusedWindows(f, opts.Windows)
 
 	// computeRegHomes is intentionally deferred to emitFunc — the
 	// arch instance is the gate for block-local regalloc, and only
