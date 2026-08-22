@@ -23,6 +23,7 @@ package codegen
 // to the plain float-argument path unchanged.
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/printer"
@@ -188,6 +189,36 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 	return fb.chaseI32Inner(e)
 }
 
+// chaseLoad16Deref matches a `*(*uint16)(...)` linear-memory read and
+// registers it as a scalar_i32_load16_u node over the chased address.
+func (fb *fusedTreeBuilder) chaseLoad16Deref(inner *ast.StarExpr) (simdfuse.Arg, bool) {
+	addr, is64, mok := matchMemDeref(inner, "uint16")
+	if !mok {
+		if fb.chaseTrace {
+			var buf bytes.Buffer
+			if err := printer.Fprint(&buf, token.NewFileSet(), inner); err == nil {
+				fuseDebugf("chaseTRACE load16 deref mismatch: %s", buf.String())
+			}
+		}
+		return simdfuse.Arg{}, false
+	}
+	if is64 {
+		fb.addr64 = true
+	}
+	aarg, aok := fb.chaseAddr(addr)
+	if !aok {
+		return simdfuse.Arg{}, false
+	}
+	if fb.chaseTrace {
+		fuseDebugf("chaseTRACE load16 addr %s -> kind=%d idx=%d const=%d", exprDebugString(addr), aarg.Kind, aarg.Index, aarg.Const)
+	}
+	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
+	if !nok {
+		return simdfuse.Arg{}, false
+	}
+	return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+}
+
 func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 	if c, ok := fb.constValueOf(e); ok {
 		return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c}, true
@@ -200,22 +231,8 @@ func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 		if id, ok := x.Fun.(*ast.Ident); ok && len(x.Args) == 1 &&
 			(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
 			if inner, ok := x.Args[0].(*ast.StarExpr); ok {
-				if addr, is64, mok := matchMemDeref(inner, "uint16"); mok {
-					if is64 {
-						fb.addr64 = true
-					}
-					aarg, aok := fb.chaseAddr(addr)
-					if !aok {
-						return simdfuse.Arg{}, false
-					}
-					if fb.chaseTrace {
-						fuseDebugf("chaseTRACE load16 addr %s -> kind=%d idx=%d const=%d", exprDebugString(addr), aarg.Kind, aarg.Index, aarg.Const)
-					}
-					idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
-					if !nok {
-						return simdfuse.Arg{}, false
-					}
-					return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+				if arg, lok := fb.chaseLoad16Deref(inner); lok {
+					return arg, true
 				}
 			}
 			return fb.chaseI32(x.Args[0])
@@ -224,6 +241,14 @@ func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 		// deduplicated scalar parameters via the IndexExpr case below
 		// once unwrapped; anything else is not chaseable.
 		return simdfuse.Arg{}, false
+	case *ast.StarExpr:
+		// A bare u16 memory deref (no conversion wrapper): the guest
+		// assigns `*(*uint16)(...)` straight to a wider local. Gated on
+		// wideChase so ordinary fusion keeps its historical shapes.
+		if !fb.wideChase {
+			return simdfuse.Arg{}, false
+		}
+		return fb.chaseLoad16Deref(x)
 	case *ast.BinaryExpr:
 		switch x.Op {
 		case token.ADD:
@@ -277,6 +302,33 @@ func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 				return simdfuse.Arg{}, false
 			}
 			return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+		case token.AND:
+			if !fb.wideChase {
+				return simdfuse.Arg{}, false
+			}
+			// Identity-mask elimination for the f16 gather chase: the
+			// guest masks a load16_u result before shifting it into a
+			// table index, but the load's value range is [0, 0xffff], so
+			// any mask whose low 16 bits are all ones leaves the value
+			// unchanged. Gated on wideChase so ordinary fusion keeps its
+			// historical shapes.
+			l, lok := fb.chaseI32(x.X)
+			if !lok {
+				return simdfuse.Arg{}, false
+			}
+			r, rok := fb.chaseI32(x.Y)
+			if !rok {
+				return simdfuse.Arg{}, false
+			}
+			if l.Kind == simdfuse.ArgConst {
+				l, r = r, l
+			}
+			if r.Kind == simdfuse.ArgConst && l.Kind == simdfuse.ArgNode &&
+				fb.nodes[l.Index].Op == "scalar_i32_load16_u" &&
+				uint32(r.Const)&0xffff == 0xffff {
+				return l, true
+			}
+			return simdfuse.Arg{}, false
 		}
 		return simdfuse.Arg{}, false
 	case *ast.IndexExpr:

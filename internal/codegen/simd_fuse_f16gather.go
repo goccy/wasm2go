@@ -17,6 +17,10 @@ package codegen
 // patch first, per the asm-first rule) before being wired here.
 
 import (
+	"fmt"
+	"go/ast"
+	"go/token"
+
 	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
@@ -172,40 +176,16 @@ func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, add
 // rewrites it in place. False leaves the tree unchanged (the caller
 // restores the chase snapshot).
 func (fb *fusedTreeBuilder) rewriteF16GatherGroup(tailIdx int, chain [4]int, tableOK func(uint32) bool) bool {
-	var bases [4]simdfuse.Arg
-	var totals [4]int64
-	for k := 0; k < 4; k++ {
-		n := &fb.nodes[chain[k]]
-		if n.Args[1].Kind != simdfuse.ArgConst {
-			fuseDebugf("f16gather: lane %d memarg not const (kind=%d)", k, n.Args[1].Kind)
-			return false
-		}
-		b, addend, ok := fb.f16LaneIndex(n.Args[0])
-		if !ok {
-			fuseDebugf("f16gather: lane %d index unchaseable (addr kind=%d)", k, n.Args[0].Kind)
-			return false
-		}
-		bases[k] = b
-		totals[k] = addend + int64(n.Args[1].Const)
+	ldBase, total, ok := fb.f16LaneGather(chain)
+	if !ok {
+		ldBase, total, ok = fb.f16WordGather(chain)
 	}
-	for k := 1; k < 4; k++ {
-		if totals[k] != totals[0] {
-			fuseDebugf("f16gather: lane %d table addend %d != %d", k, totals[k], totals[0])
-			return false
-		}
-	}
-	if totals[0] <= 0 || totals[0] > 1<<31-1 || !tableOK(uint32(totals[0])) {
-		fuseDebugf("f16gather: table %d not verified", totals[0])
+	if !ok {
 		return false
 	}
-	// The four f16 sources must be one base value at +0,+2,+4,+6 in
-	// lane order: proven structurally, with the lane delta carried by
-	// exactly one constant along otherwise-identical chase trees.
-	for k := 1; k < 4; k++ {
-		if !fb.argOffsetBy(bases[0], bases[k], int32(2*k)) {
-			fuseDebugf("f16gather: lane %d not base+%d", k, 2*k)
-			return false
-		}
+	if total <= 0 || total > 1<<31-1 || !tableOK(uint32(total)) {
+		fuseDebugf("f16gather: table %d not verified", total)
+		return false
 	}
 	// Capacity: the rewrite adds two nodes (the chain nodes die in
 	// compaction afterwards).
@@ -220,12 +200,250 @@ func (fb *fusedTreeBuilder) rewriteF16GatherGroup(tailIdx int, chain [4]int, tab
 	} else {
 		fb.sc.em.useHelper("simd_v128_load16x4_u")
 	}
-	ldArgs := []simdfuse.Arg{bases[0], {Kind: simdfuse.ArgConst, Const: 0}}
+	ldArgs := []simdfuse.Arg{ldBase, {Kind: simdfuse.ArgConst, Const: 0}}
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: "v128_load16x4_u", Args: ldArgs})
 	fb.nodeVals = append(fb.nodeVals, nil)
 	nl := len(fb.nodes) - 1
 	fb.nodes[tailIdx] = simdfuse.Node{Op: "f16x4_cvt", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: nl}}}
 	return true
+}
+
+// f16LaneGather proves the four-scalar-loads gather form: each lane's
+// index chases to a scalar_i32_load16_u, the four loads sit at one
+// base +0,+2,+4,+6 in lane order, and every lane accumulates the same
+// table addend. Returns the base address argument for the collapsed
+// 8-byte load and the shared table addend.
+func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bool) {
+	var bases [4]simdfuse.Arg
+	var totals [4]int64
+	for k := 0; k < 4; k++ {
+		n := &fb.nodes[chain[k]]
+		if n.Args[1].Kind != simdfuse.ArgConst {
+			fuseDebugf("f16gather: lane %d memarg not const (kind=%d)", k, n.Args[1].Kind)
+			return simdfuse.Arg{}, 0, false
+		}
+		b, addend, ok := fb.f16LaneIndex(n.Args[0])
+		if !ok {
+			fuseDebugf("f16gather: lane %d index unchaseable (addr kind=%d)", k, n.Args[0].Kind)
+			return simdfuse.Arg{}, 0, false
+		}
+		bases[k] = b
+		totals[k] = addend + int64(n.Args[1].Const)
+	}
+	for k := 1; k < 4; k++ {
+		if totals[k] != totals[0] {
+			fuseDebugf("f16gather: lane %d table addend %d != %d", k, totals[k], totals[0])
+			return simdfuse.Arg{}, 0, false
+		}
+	}
+	// The four f16 sources must be one base value at +0,+2,+4,+6 in
+	// lane order: proven structurally, with the lane delta carried by
+	// exactly one constant along otherwise-identical chase trees.
+	for k := 1; k < 4; k++ {
+		if !fb.argOffsetBy(bases[0], bases[k], int32(2*k)) {
+			// Diagnosis: report which deltas DO hold to reveal the
+			// lane-order variant.
+			pat := ""
+			for j := 1; j < 4; j++ {
+				for _, d := range []int32{-6, -4, -2, 0, 2, 4, 6} {
+					if fb.argOffsetBy(bases[0], bases[j], d) {
+						pat += fmt.Sprintf(" l%d=%+d", j, d)
+						break
+					}
+				}
+			}
+			fuseDebugf("f16gather: lane %d not base+%d (pattern:%s)", k, 2*k, pat)
+			return simdfuse.Arg{}, 0, false
+		}
+	}
+	return bases[0], totals[0], true
+}
+
+// f16WordGather proves the word-unpack gather form the guest emits
+// when it loads four f16 values as one 64-bit word and unpacks the
+// table indices by shift and mask:
+//
+//	lane 0: ( w        & 0xffff ) << 2
+//	lane k: ( w >>u (16k-2) & 0x3fffc ) + table      (k = 1..3)
+//
+// The mask 0x3fffc after the pre-scaled shift selects exactly
+// half-word k times 4, so each lane's index equals the classic
+// per-load form; signedness of the shift is irrelevant because the
+// mask discards every bit above 17. The collapsed v128_load16x4_u
+// reads the same eight bytes the word load does.
+func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int64, bool) {
+	wName := ""
+	var totals [4]int64
+	for k := 0; k < 4; k++ {
+		n := &fb.nodes[chain[k]]
+		if n.Args[1].Kind != simdfuse.ArgConst {
+			return simdfuse.Arg{}, 0, false
+		}
+		a := n.Args[0]
+		add := int64(n.Args[1].Const)
+		var e ast.Expr
+		switch a.Kind {
+		case simdfuse.ArgScalar:
+			e = fb.scalars[a.Index]
+		case simdfuse.ArgSum:
+			e = fb.scalars[a.Index]
+			add += int64(a.Const)
+		default:
+			return simdfuse.Arg{}, 0, false
+		}
+		name, tadd, ok := fb.f16WordLane(e, k)
+		if !ok {
+			fuseDebugf("f16gather: word lane %d no match: %s", k, exprDebugString(e))
+			return simdfuse.Arg{}, 0, false
+		}
+		if k == 0 {
+			wName = name
+		} else if name != wName {
+			fuseDebugf("f16gather: word lane %d ident %s != %s", k, name, wName)
+			return simdfuse.Arg{}, 0, false
+		}
+		totals[k] = add + tadd
+	}
+	for k := 1; k < 4; k++ {
+		if totals[k] != totals[0] {
+			fuseDebugf("f16gather: word lane %d table addend %d != %d", k, totals[k], totals[0])
+			return simdfuse.Arg{}, 0, false
+		}
+	}
+	// Resolve the shared word ident to its 64-bit linear-memory load
+	// and chase that load's address as the gather base.
+	if fb.sc == nil || fb.sc.defBind == nil {
+		return simdfuse.Arg{}, 0, false
+	}
+	def, isDef := fb.sc.defBind[wName]
+	if !isDef || len(def.Rhs) != 1 {
+		fuseDebugf("f16gather: word ident %s has no single def", wName)
+		return simdfuse.Arg{}, 0, false
+	}
+	star, ok := def.Rhs[0].(*ast.StarExpr)
+	if !ok {
+		fuseDebugf("f16gather: word ident %s def not a deref", wName)
+		return simdfuse.Arg{}, 0, false
+	}
+	// The uint64 address wrapper on the 64-bit load carries no
+	// memory64 information (every 8-byte deref widens its offset), so
+	// addr64 is deliberately not derived from it here.
+	addr, _, mok := matchMemDeref(star, "int64")
+	if !mok {
+		fuseDebugf("f16gather: word ident %s def not an int64 load", wName)
+		return simdfuse.Arg{}, 0, false
+	}
+	aarg, aok := fb.chaseAddr(addr)
+	if !aok {
+		fuseDebugf("f16gather: word addr unchaseable: %s", exprDebugString(addr))
+		return simdfuse.Arg{}, 0, false
+	}
+	return aarg, totals[0], true
+}
+
+// f16WordLane matches one lane of the word-unpack form, returning the
+// word local's name and the table addend folded into the expression.
+func (fb *fusedTreeBuilder) f16WordLane(e ast.Expr, lane int) (wName string, tadd int64, ok bool) {
+	e = stripIntConv(e)
+	if lane == 0 {
+		// (w & mask16) << 2
+		shl, sok := e.(*ast.BinaryExpr)
+		if !sok || shl.Op != token.SHL {
+			return "", 0, false
+		}
+		if s, cok := matchShiftConst(shl.Y, fb); !cok || s != 2 {
+			return "", 0, false
+		}
+		and, aok := stripIntConv(shl.X).(*ast.BinaryExpr)
+		if !aok || and.Op != token.AND {
+			return "", 0, false
+		}
+		w, m := and.X, and.Y
+		if _, isID := wordOperandIdent(w); !isID {
+			w, m = m, w
+		}
+		name, isID := wordOperandIdent(w)
+		if !isID {
+			return "", 0, false
+		}
+		mc, mok := fb.chaseI32(m)
+		if !mok || mc.Kind != simdfuse.ArgConst || uint32(mc.Const)&0xffff != 0xffff {
+			return "", 0, false
+		}
+		return name, 0, true
+	}
+	// ((w >> (16*lane-2)) & 0x3fffc) + table
+	addE, aok := e.(*ast.BinaryExpr)
+	if !aok || addE.Op != token.ADD {
+		return "", 0, false
+	}
+	andSide, constSide := addE.X, addE.Y
+	if _, isAnd := stripIntConv(andSide).(*ast.BinaryExpr); !isAnd {
+		andSide, constSide = constSide, andSide
+	}
+	tc, tok := fb.chaseI32(constSide)
+	if !tok || tc.Kind != simdfuse.ArgConst {
+		return "", 0, false
+	}
+	and, andok := stripIntConv(andSide).(*ast.BinaryExpr)
+	if !andok || and.Op != token.AND {
+		return "", 0, false
+	}
+	shrSide, maskSide := and.X, and.Y
+	if _, isShr := stripIntConv(shrSide).(*ast.BinaryExpr); !isShr {
+		shrSide, maskSide = maskSide, shrSide
+	}
+	mc, mok := fb.chaseI32(maskSide)
+	if !mok || mc.Kind != simdfuse.ArgConst || mc.Const != 0x3fffc {
+		return "", 0, false
+	}
+	shr, shrok := stripIntConv(shrSide).(*ast.BinaryExpr)
+	if !shrok || shr.Op != token.SHR {
+		return "", 0, false
+	}
+	if s, cok := matchShiftConst(shr.Y, fb); !cok || s != int32(16*lane-2) {
+		return "", 0, false
+	}
+	name, isID := wordOperandIdent(shr.X)
+	if !isID {
+		return "", 0, false
+	}
+	return name, int64(tc.Const), true
+}
+
+// stripIntConv unwraps integer-width conversion calls around an
+// expression (identities for the chase, which runs at pointer width).
+func stripIntConv(e ast.Expr) ast.Expr {
+	for {
+		c, ok := e.(*ast.CallExpr)
+		if !ok || len(c.Args) != 1 {
+			return e
+		}
+		id, ok := c.Fun.(*ast.Ident)
+		if !ok {
+			return e
+		}
+		switch id.Name {
+		case "int32", "uint32", "int64", "uint64", "uint":
+			e = c.Args[0]
+		default:
+			return e
+		}
+	}
+}
+
+// wordOperandIdent unwraps conversions and the unsigned-view helper
+// (base.Ui64) around the packed-word operand and returns its ident.
+func wordOperandIdent(e ast.Expr) (string, bool) {
+	e = stripIntConv(e)
+	if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 && helperName(c.Fun) == "Ui64" {
+		e = stripIntConv(c.Args[0])
+	}
+	id, ok := e.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	return id.Name, true
 }
 
 // argOffsetBy reports that b evaluates to a + delta, structurally:
@@ -247,55 +465,66 @@ func (fb *fusedTreeBuilder) argOffsetBy(a, b simdfuse.Arg, delta int32) bool {
 		return b.Const-a.Const == delta
 	case a.Kind == simdfuse.ArgNode && b.Kind == simdfuse.ArgNode:
 		na, nb := &fb.nodes[a.Index], &fb.nodes[b.Index]
-		if na.Op != nb.Op || len(na.Args) != len(nb.Args) {
-			return false
-		}
-		if len(na.Args) == 0 {
-			return delta == 0
-		}
-		for carry := range na.Args {
-			ok := true
-			for i := range na.Args {
-				d := int32(0)
-				if i == carry {
-					d = delta
+		if na.Op == nb.Op && len(na.Args) == len(nb.Args) {
+			if len(na.Args) == 0 {
+				return delta == 0
+			}
+			for carry := range na.Args {
+				ok := true
+				for i := range na.Args {
+					d := int32(0)
+					if i == carry {
+						d = delta
+					}
+					if !fb.argOffsetBy(na.Args[i], nb.Args[i], d) {
+						ok = false
+						break
+					}
 				}
-				if !fb.argOffsetBy(na.Args[i], nb.Args[i], d) {
-					ok = false
-					break
+				if ok {
+					return true
 				}
 			}
-			if ok {
-				return true
-			}
+		}
+		// Fall back to const-add peeling: one side may carry the lane
+		// delta as an explicit `base + const` node the other side lacks
+		// (lane 0 is the bare base). Each peel removes one add node, so
+		// the recursion terminates.
+		if x, c, ok := fb.addConstArm(nb); ok && fb.argOffsetBy(a, x, delta-c) {
+			return true
+		}
+		if x, c, ok := fb.addConstArm(na); ok && fb.argOffsetBy(x, b, delta+c) {
+			return true
 		}
 		return false
 	case b.Kind == simdfuse.ArgNode:
-		nb := &fb.nodes[b.Index]
-		if nb.Op == "scalar_i32_add" && len(nb.Args) == 2 {
-			x, c := nb.Args[0], nb.Args[1]
-			if x.Kind == simdfuse.ArgConst {
-				x, c = c, x
-			}
-			if c.Kind == simdfuse.ArgConst {
-				return c.Const == delta && fb.argOffsetBy(a, x, 0)
-			}
+		if x, c, ok := fb.addConstArm(&fb.nodes[b.Index]); ok {
+			return fb.argOffsetBy(a, x, delta-c)
 		}
 		return false
 	case a.Kind == simdfuse.ArgNode:
-		na := &fb.nodes[a.Index]
-		if na.Op == "scalar_i32_add" && len(na.Args) == 2 {
-			x, c := na.Args[0], na.Args[1]
-			if x.Kind == simdfuse.ArgConst {
-				x, c = c, x
-			}
-			if c.Kind == simdfuse.ArgConst {
-				return -c.Const == delta && fb.argOffsetBy(x, b, 0)
-			}
+		if x, c, ok := fb.addConstArm(&fb.nodes[a.Index]); ok {
+			return fb.argOffsetBy(x, b, delta+c)
 		}
 		return false
 	}
 	return false
+}
+
+// addConstArm decomposes a `scalar_i32_add(x, const)` node into its
+// non-const arm and the constant.
+func (fb *fusedTreeBuilder) addConstArm(n *simdfuse.Node) (x simdfuse.Arg, c int32, ok bool) {
+	if n.Op != "scalar_i32_add" || len(n.Args) != 2 {
+		return x, 0, false
+	}
+	x, ca := n.Args[0], n.Args[1]
+	if x.Kind == simdfuse.ArgConst {
+		x, ca = ca, x
+	}
+	if ca.Kind != simdfuse.ArgConst || x.Kind == simdfuse.ArgConst {
+		return x, 0, false
+	}
+	return x, ca.Const, true
 }
 
 // compactDeadNodes drops nodes no live node reaches (stores and roots
