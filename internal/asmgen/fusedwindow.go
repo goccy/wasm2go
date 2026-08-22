@@ -35,7 +35,7 @@ type plannedFusedWindow struct {
 // planFusedWindows validates each descriptor against the plan's slot
 // map and records the emission index. Called after Pass 2 (slots
 // assigned) so operand resolution can use plan.offsets.
-func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow) {
+func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow, frame argFrame) {
 	if len(windows) == 0 {
 		return
 	}
@@ -62,7 +62,7 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow) {
 	}
 	for i := range windows {
 		w := &windows[i]
-		if pw, last, ok := p.resolveFusedWindow(w, blockOf, posOf, blockValues, consumers); ok {
+		if pw, last, ok := p.resolveFusedWindow(w, blockOf, posOf, blockValues, consumers, frame); ok {
 			if p.fusedAt == nil {
 				p.fusedAt = map[ssa.ValueID]*plannedFusedWindow{}
 				p.fusedMember = map[ssa.ValueID]bool{}
@@ -79,7 +79,7 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow) {
 // The returned value ID is the window's LAST member: the whole body
 // emits there, so every input value defined between the members has
 // already been materialized; earlier members emit nothing.
-func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ssa.BlockID, posOf map[ssa.ValueID]int, blockValues map[ssa.BlockID][]*ssa.Value, consumers map[ssa.ValueID]int) (*plannedFusedWindow, ssa.ValueID, bool) {
+func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ssa.BlockID, posOf map[ssa.ValueID]int, blockValues map[ssa.BlockID][]*ssa.Value, consumers map[ssa.ValueID]int, frame argFrame) (*plannedFusedWindow, ssa.ValueID, bool) {
 	if w.Tree == nil || len(w.Members) == 0 {
 		return nil, 0, false
 	}
@@ -171,16 +171,27 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 			if s.Val == nil || s.ArgIdx < 0 || s.ArgIdx >= len(s.Val.Args) || s.Val.Args[s.ArgIdx] == nil {
 				return nil, false
 			}
-			arg := s.Val.Args[s.ArgIdx]
-			// The operand must have a materialized slot the staging
-			// can read. Constants and params resolve through the
-			// per-arch operand machinery at emit time instead; keep
-			// the strict subset slot-only for now.
-			off, ok := p.offsets[resolveSlotValue(arg).ID]
+			arg := resolveSlotValue(s.Val.Args[s.ArgIdx])
+			wide := pair || w.Tree.Addr64
+			if arg.Op == ssa.OpParam && !p.packed {
+				// Unpacked parameters are FP-resident: their RSP slots
+				// exist but are never written. Read the argument frame,
+				// exactly like the per-op operand resolvers. v128
+				// parameters never reach a pair source (fusion pairs
+				// come from SIMD producers), so a pair here rejects.
+				idx := int(arg.AuxInt)
+				if pair || idx < 0 || idx >= len(frame.paramOffsets) {
+					return nil, false
+				}
+				out = append(out, FusedOperand{Wide: wide, FPRef: fmt.Sprintf("l%d+%d(FP)", idx, frame.paramOffsets[idx])})
+				continue
+			}
+			// Everything else must have a materialized slot the
+			// staging can read.
+			off, ok := p.offsets[arg.ID]
 			if !ok {
 				return nil, false
 			}
-			wide := pair || w.Tree.Addr64
 			out = append(out, FusedOperand{SlotOff: off, Wide: wide})
 		}
 		return out, true

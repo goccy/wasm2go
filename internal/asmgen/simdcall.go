@@ -94,6 +94,11 @@ type FusedOperand struct {
 	Const   int64
 	SlotOff int
 	Wide    bool
+	// FPRef, when non-empty, is the plan9 FP-relative operand of an
+	// unpacked parameter ("l1+12(FP)") — parameters are FP-resident
+	// and their RSP slots are never written, so staging must read the
+	// argument frame instead.
+	FPRef string
 }
 
 // simdCallSpec is one SIMD helper call's ABI0 layout.

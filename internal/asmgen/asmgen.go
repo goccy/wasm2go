@@ -3166,7 +3166,9 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 	// splicer can emit whole-window bodies (per-op-only splicers and
 	// splicer-less arches keep the plain path).
 	if _, fusedOK := opts.Splicer.(FusedSplicer); fusedOK {
-		p.planFusedWindows(f, opts.Windows)
+		if fr, ferr := computeArgFrame(sig); ferr == nil {
+			p.planFusedWindows(f, opts.Windows, fr)
+		}
 	}
 
 	// computeRegHomes is intentionally deferred to emitFunc — the

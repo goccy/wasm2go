@@ -3,9 +3,11 @@ package gcasm
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/asmgen"
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -62,6 +64,13 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	opts.GlobalOffsets = cfg.DirectAsmGlobals
 	opts.Exc = cfg.DirectAsmExc
 	opts.Windows = df.Windows
+	// Bisect knob (diagnosis only): cap the number of windows handed
+	// to the emitter. Unset or invalid means no cap.
+	if capStr := os.Getenv("WASM2GO_FUSEDWIN_MAX"); capStr != "" {
+		if n, err := strconv.Atoi(capStr); err == nil && n >= 0 && n < len(opts.Windows) {
+			opts.Windows = opts.Windows[:n]
+		}
+	}
 	if rel != "" {
 		// Multi-package chunk: same-package helper CALL spellings do
 		// not resolve here. Setting the prefix makes the emitters
@@ -128,7 +137,15 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: %v\n", archName, name, err)
 		return "", false
 	}
-	if archName == "arm64" && strings.Contains(asm, "FMOVQ") {
+	hasFusedWindow := strings.Contains(asm, fusedWindowMarker)
+	if archName == "arm64" && hasFusedWindow {
+		// Fused-window bodies skip the text passes: the fused pool
+		// registers (v16..v30) overlap the passes' cache and home
+		// ranges, and the passes' line model does not understand the
+		// window interiors. The windows already keep the hot regions
+		// in registers; pass integration for the per-op remainder is
+		// tracked separately.
+	} else if archName == "arm64" && strings.Contains(asm, "FMOVQ") {
 		// Store-to-load forwarding over the v128 slots, same pass the
 		// gc-captured bodies get (identical instruction vocabulary,
 		// conservative whitelist tracking, never deletes a store).
@@ -142,7 +159,7 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		asm = a64SpliceValueCache(asm)
 		asm = a64DeadSimdOutStores(asm)
 	}
-	if archName == "arm64" {
+	if archName == "arm64" && !hasFusedWindow {
 		asm = a64ScalarSlotForward(asm)
 	}
 	// The marker line identifies direct-asm bodies in the bundle
@@ -333,4 +350,93 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 	}
 	b.WriteString(tmp.String())
 	return true, trap
+}
+
+// SpliceFused emits one whole fused window inside a direct-asm body:
+// stage the fused signature exactly as gc's ABIInternal call site
+// would (m in R0 from the emitter's R24 cache, scalars then pair
+// halves in R1.., float32 leaves in F0..), then drop in the same
+// prolog+core+epilogue the capture path splices, and land each
+// root's (lo, hi) result registers in the root value's own slot.
+//
+// The fused body clobbers the direct-asm hoist registers (R20-R24),
+// so the window ends by re-priming the m cache and the splice-hoist
+// state. Everything goes through a scratch builder: any decline
+// leaves the output untouched (the emitter then falls the function
+// back to the listing transform — earlier members already emitted
+// nothing, so there is no per-op recovery mid-window).
+// fusedWindowMarker tags direct-asm bodies containing fused-window
+// splices; emitDirectAsmBody keys the text-pass skip off it.
+const fusedWindowMarker = "// fused window"
+
+func (s *directAsmSplicer) SpliceFused(b *strings.Builder, tree *simdfuse.Tree, scalars, floats, pairs []asmgen.FusedOperand, rootSlots [][2]int, scratchBase int) (bool, bool) {
+	_ = scratchBase
+	if tree == nil {
+		return false, false
+	}
+	if tree.NeedsMem && (s.offs == nil || s.trapSym == "") {
+		return false, false
+	}
+	var tmp strings.Builder
+	fmt.Fprintf(&tmp, "\t%s %s\n", fusedWindowMarker, tree.Name)
+	tmp.WriteString("\tMOVD R24, R0\n")
+	reg := 1
+	stageInt := func(op asmgen.FusedOperand, wide bool) bool {
+		if reg >= 16 {
+			return false
+		}
+		r := fmt.Sprintf("R%d", reg)
+		reg++
+		switch {
+		case op.IsConst:
+			fmt.Fprintf(&tmp, "\tMOVD $%d, %s\n", op.Const, r)
+		case op.FPRef != "" && wide:
+			fmt.Fprintf(&tmp, "\tMOVD %s, %s\n", op.FPRef, r)
+		case op.FPRef != "":
+			fmt.Fprintf(&tmp, "\tMOVW %s, %s\n", op.FPRef, r)
+		case wide:
+			fmt.Fprintf(&tmp, "\tMOVD %d(RSP), %s\n", op.SlotOff, r)
+		default:
+			fmt.Fprintf(&tmp, "\tMOVW %d(RSP), %s\n", op.SlotOff, r)
+		}
+		return true
+	}
+	for _, sc := range scalars {
+		if !stageInt(sc, sc.Wide) {
+			return false, false
+		}
+	}
+	for _, pr := range pairs {
+		if pr.IsConst {
+			return false, false
+		}
+		lo, hi := pr, pr
+		hi.SlotOff += 8
+		if !stageInt(lo, true) || !stageInt(hi, true) {
+			return false, false
+		}
+	}
+	for i, fl := range floats {
+		if fl.IsConst || i >= 4 {
+			return false, false
+		}
+		if fl.FPRef != "" {
+			fmt.Fprintf(&tmp, "\tFMOVS %s, F%d\n", fl.FPRef, i)
+		} else {
+			fmt.Fprintf(&tmp, "\tFMOVS %d(RSP), F%d\n", fl.SlotOff, i)
+		}
+	}
+	ok, trap, err := a64SpliceFused(&tmp, tree, s.pool, s.offs, false)
+	if err != nil || !ok {
+		return false, false
+	}
+	for k, rs := range rootSlots {
+		fmt.Fprintf(&tmp, "\tMOVD R%d, %d(RSP)\n", 2*k, rs[0])
+		fmt.Fprintf(&tmp, "\tMOVD R%d, %d(RSP)\n", 2*k+1, rs[1])
+	}
+	// Re-prime the emitter's m cache and hoisted module state.
+	tmp.WriteString("\tMOVD m+0(FP), R24\n")
+	tmp.WriteString(s.HoistPrologue())
+	b.WriteString(tmp.String())
+	return true, trap && tree.NeedsMem
 }
