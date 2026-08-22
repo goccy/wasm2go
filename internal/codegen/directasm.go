@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -53,6 +54,42 @@ func (t *translator) retainDirectAsmPacked(ssaFn *ssa.Func) {
 		Packed:       true,
 		PackedParams: append([]ssa.Type(nil), ssaFn.Sig.Params...),
 	})
+}
+
+// DirectAsmParamSrc is one fused-signature parameter's source in the
+// retained SSA: a compile-time constant staged as an immediate, or a
+// member value's argument (Val.Args[ArgIdx]).
+type DirectAsmParamSrc struct {
+	IsConst bool
+	Const   int64
+	Val     *ssa.Value
+	ArgIdx  int
+}
+
+// DirectAsmWindow describes one fused window inside a retained
+// function: the interned tree, the member call values it replaces
+// (scheduled order), the root values per Tree.RootList(), and the
+// fused signature's parameter sources. The asm bundle stages the
+// signature from the sources and emits the shared fused splice body
+// in place of the members' per-op splices.
+type DirectAsmWindow struct {
+	Tree      *simdfuse.Tree
+	Members   []*ssa.Value
+	Roots     []*ssa.Value
+	ScalarSrc []DirectAsmParamSrc
+	FloatSrc  []DirectAsmParamSrc
+	PairSrc   []DirectAsmParamSrc
+}
+
+// addDirectAsmWindow appends a fused-window descriptor to a retained
+// function. No-op when the function was not retained.
+func (t *translator) addDirectAsmWindow(fnName string, w DirectAsmWindow) {
+	df, ok := t.directAsmSSA[fnName]
+	if !ok {
+		return
+	}
+	df.Windows = append(df.Windows, w)
+	t.directAsmSSA[fnName] = df
 }
 
 func (t *translator) retainDirectAsmFn(name string, df DirectAsmFn) {

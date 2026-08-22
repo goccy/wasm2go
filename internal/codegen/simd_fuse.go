@@ -331,6 +331,73 @@ type fusedTreeBuilder struct {
 	curCand     int
 }
 
+// recordFusedWindow reports one committed fused window to direct-asm
+// retention. Strict v1 contract: every fused-signature parameter must
+// have provenance and every root must map to a member SSA value —
+// otherwise the window is simply not recorded and the direct body
+// keeps per-op splices (correct, just unfused).
+func (sc *simdScalarizer) recordFusedWindow(tree *simdfuse.Tree, fb *fusedTreeBuilder) {
+	t := sc.em.t
+	if t == nil || sc.em.curFn == nil || len(t.directAsmSSA) == 0 {
+		return
+	}
+	fnName := sc.em.curFn.Name
+	if _, ok := t.directAsmSSA[fnName]; !ok {
+		return
+	}
+	conv := func(srcs []fusedParamSrc) ([]DirectAsmParamSrc, bool) {
+		out := make([]DirectAsmParamSrc, len(srcs))
+		for i, s := range srcs {
+			if !s.isConst && s.val == nil {
+				return nil, false
+			}
+			out[i] = DirectAsmParamSrc{IsConst: s.isConst, Const: s.constVal, Val: s.val, ArgIdx: s.argIdx}
+		}
+		return out, true
+	}
+	reject := func(why string) {
+		if t.opts.FuseDebug {
+			fmt.Fprintf(os.Stderr, "wasm2go: fuse window %s in %s: not retained for direct-asm: %s\n", tree.Name, fnName, why)
+		}
+	}
+	scalarSrc, ok := conv(fb.scalarSrc)
+	if !ok {
+		reject("scalar parameter without provenance")
+		return
+	}
+	floatSrc, ok := conv(fb.floatSrc)
+	if !ok {
+		reject("float parameter without provenance")
+		return
+	}
+	pairSrc, ok := conv(fb.pairSrc)
+	if !ok {
+		reject("pair parameter without provenance")
+		return
+	}
+	roots := make([]*ssa.Value, 0, len(tree.RootList()))
+	for _, r := range tree.RootList() {
+		if r < 0 || r >= len(fb.nodeVals) || fb.nodeVals[r] == nil {
+			reject("root without a member value")
+			return
+		}
+		roots = append(roots, fb.nodeVals[r])
+	}
+	var members []*ssa.Value
+	for _, v := range fb.nodeVals {
+		if v != nil {
+			members = append(members, v)
+		}
+	}
+	if len(members) == 0 {
+		return
+	}
+	t.addDirectAsmWindow(fnName, DirectAsmWindow{
+		Tree: tree, Members: members, Roots: roots,
+		ScalarSrc: scalarSrc, FloatSrc: floatSrc, PairSrc: pairSrc,
+	})
+}
+
 // paramSrcFor derives one member-call argument's provenance under the
 // v1 strict rules: a resolvable constant stages as an immediate; a
 // memory op's position 0 is the member value's Args[0]; pure-op
@@ -1302,6 +1369,7 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 			sc.em.useHelper("simd_v128_load")
 		}
 	}
+	sc.recordFusedWindow(tree, fb)
 	// Materialize the parameter expressions only now that the fuse is
 	// committed: rewriteExpr/pairExprs mutate the AST and emit hoists.
 	// Evaluation order of the fused call's arguments matches the walk
@@ -1704,6 +1772,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 				sc.em.useHelper("simd_v128_load")
 			}
 		}
+		sc.recordFusedWindow(tree, fb)
 		for _, n := range fb.nodes {
 			if n.Class() != simdfuse.ClassV128 || simdfuse.IsStore(n.Op) {
 				helper := "simd_" + n.Op

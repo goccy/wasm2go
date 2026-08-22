@@ -193,6 +193,12 @@ type DirectAsmFn struct {
 	Sig          wasm.FuncType
 	Packed       bool
 	PackedParams []ssa.Type
+	// Windows lists the fused windows the emission-time fusion pass
+	// claimed inside this function, so the asm bundle can emit the
+	// shared fused splice bodies instead of per-op splices. Recorded
+	// only when every member, root and parameter source is nameable
+	// in the retained SSA (see addDirectAsmWindow).
+	Windows []DirectAsmWindow
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.

@@ -52,6 +52,9 @@ type ssaEmitter struct {
 	// Reset per function.
 	simdCalls  map[*ast.CallExpr]simdCallMark
 	simdConsts map[*ast.CompositeLit]bool
+	// curFn is the function whose body is being emitted; the fusion
+	// pass keys direct-asm window retention off its name.
+	curFn *ssa.Func
 }
 
 // simdCallMark records, for one emitted SIMD helper call, which
@@ -107,6 +110,7 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// The SIMD marks are per-function state for the scalarization pass.
 	em.simdCalls = nil
 	em.simdConsts = nil
+	em.curFn = f
 	// Hoist the linear-memory base pointer into a function-level local
 	// when the function touches memory at all. `m.M` is a Module FIELD,
 	// so the Go compiler must conservatively reload it after every
