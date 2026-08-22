@@ -3162,8 +3162,12 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 
 	// Fused windows: validate the codegen-claimed regions against the
 	// final slot map and index them for emission. Quiet per-op
-	// fallback on any mismatch.
-	p.planFusedWindows(f, opts.Windows)
+	// fallback on any mismatch, and no indexing at all unless the
+	// splicer can emit whole-window bodies (per-op-only splicers and
+	// splicer-less arches keep the plain path).
+	if _, fusedOK := opts.Splicer.(FusedSplicer); fusedOK {
+		p.planFusedWindows(f, opts.Windows)
+	}
 
 	// computeRegHomes is intentionally deferred to emitFunc — the
 	// arch instance is the gate for block-local regalloc, and only

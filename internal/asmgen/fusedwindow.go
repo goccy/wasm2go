@@ -15,6 +15,9 @@ package asmgen
 // never an error: the per-op path is correct, just slower.
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -36,12 +39,17 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow) {
 	if len(windows) == 0 {
 		return
 	}
-	// Value ID -> defining block, for the same-block membership check.
+	// Value ID -> defining block and in-block position, for the
+	// membership and ordering checks.
 	blockOf := map[ssa.ValueID]ssa.BlockID{}
+	posOf := map[ssa.ValueID]int{}
+	blockValues := map[ssa.BlockID][]*ssa.Value{}
 	consumers := map[ssa.ValueID]int{}
 	for _, blk := range f.Blocks {
-		for _, v := range blk.Values {
+		blockValues[blk.ID] = blk.Values
+		for i, v := range blk.Values {
 			blockOf[v.ID] = blk.ID
+			posOf[v.ID] = i
 			for _, a := range v.Args {
 				if a != nil {
 					consumers[a.ID]++
@@ -54,12 +62,12 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow) {
 	}
 	for i := range windows {
 		w := &windows[i]
-		if pw, ok := p.resolveFusedWindow(w, blockOf, consumers); ok {
+		if pw, last, ok := p.resolveFusedWindow(w, blockOf, posOf, blockValues, consumers); ok {
 			if p.fusedAt == nil {
 				p.fusedAt = map[ssa.ValueID]*plannedFusedWindow{}
 				p.fusedMember = map[ssa.ValueID]bool{}
 			}
-			p.fusedAt[w.Members[0].ID] = pw
+			p.fusedAt[last] = pw
 			for _, m := range w.Members {
 				p.fusedMember[m.ID] = true
 			}
@@ -68,30 +76,68 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow) {
 }
 
 // resolveFusedWindow checks one descriptor and resolves its operands.
-func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ssa.BlockID, consumers map[ssa.ValueID]int) (*plannedFusedWindow, bool) {
+// The returned value ID is the window's LAST member: the whole body
+// emits there, so every input value defined between the members has
+// already been materialized; earlier members emit nothing.
+func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ssa.BlockID, posOf map[ssa.ValueID]int, blockValues map[ssa.BlockID][]*ssa.Value, consumers map[ssa.ValueID]int) (*plannedFusedWindow, ssa.ValueID, bool) {
 	if w.Tree == nil || len(w.Members) == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 	// Every member must live in one block, and no member may already
 	// belong to another planned window (identical trees repeat; the
 	// first claim wins and later duplicates must not double-plan).
 	blk, ok := blockOf[w.Members[0].ID]
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 	isRoot := map[ssa.ValueID]bool{}
 	for _, r := range w.Roots {
 		if r == nil {
-			return nil, false
+			return nil, 0, false
 		}
 		isRoot[r.ID] = true
 	}
 	memberSet := map[ssa.ValueID]bool{}
+	first, last := -1, -1
+	var lastID ssa.ValueID
 	for _, m := range w.Members {
 		if m == nil || blockOf[m.ID] != blk || p.fusedMember[m.ID] {
-			return nil, false
+			return nil, 0, false
 		}
 		memberSet[m.ID] = true
+		pos := posOf[m.ID]
+		if first < 0 || pos < first {
+			first = pos
+		}
+		if pos > last {
+			last = pos
+			lastID = m.ID
+		}
+	}
+	// Values interleaved between the members must be pure scalar glue
+	// (address arithmetic feeding later members): deferring the whole
+	// window past them is then observation-free. Any effectful or
+	// memory-touching interloper — or one reading a root before the
+	// window's deferred emission would write it — rejects the window.
+	for _, v := range blockValues[blk][first : last+1] {
+		if memberSet[v.ID] {
+			continue
+		}
+		switch v.Op {
+		case ssa.OpSimdCall, ssa.OpSimdMemCall,
+			ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
+			ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
+			ssa.OpLoadF32, ssa.OpLoadF64:
+			return nil, 0, false
+		}
+		if isSideEffectingOp(v.Op) || opEmitsCall(v.Op) {
+			return nil, 0, false
+		}
+		for _, a := range v.Args {
+			if a != nil && isRoot[a.ID] {
+				return nil, 0, false
+			}
+		}
 	}
 	// Non-root members must be consumed ONLY inside the window: the
 	// fused body never materializes them, so an outside reader (a
@@ -111,7 +157,7 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 			continue
 		}
 		if consumers[m.ID] != inWindow[m.ID] {
-			return nil, false
+			return nil, 0, false
 		}
 	}
 	pw := &plannedFusedWindow{win: w}
@@ -141,21 +187,47 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 	}
 	var ok2 bool
 	if pw.scalars, ok2 = resolve(w.ScalarSrc, false); !ok2 {
-		return nil, false
+		return nil, 0, false
 	}
 	if pw.floats, ok2 = resolve(w.FloatSrc, false); !ok2 {
-		return nil, false
+		return nil, 0, false
 	}
 	if pw.pairs, ok2 = resolve(w.PairSrc, true); !ok2 {
-		return nil, false
+		return nil, 0, false
 	}
 	for _, r := range w.Roots {
 		if _, ok := p.offsets[r.ID]; !ok {
-			return nil, false
+			return nil, 0, false
 		}
 		pw.roots = append(pw.roots, r.ID)
 	}
-	return pw, true
+	return pw, lastID, true
+}
+
+// emitFusedWindowARM64 emits one validated window's whole body at its
+// last member. A splicer decline here is a hard per-function error:
+// earlier members already emitted nothing, so there is no correct
+// per-op recovery mid-body — the bundle falls back to the listing
+// transform for the whole function.
+func emitFusedWindowARM64(b *strings.Builder, v *ssa.Value, pw *plannedFusedWindow, plan *funcPlan) error {
+	fs, ok := plan.splicer.(FusedSplicer)
+	if !ok {
+		return fmt.Errorf("v%d: fused window %s planned without a FusedSplicer", v.ID, pw.win.Tree.Name)
+	}
+	rootSlots := make([][2]int, len(pw.roots))
+	for i, id := range pw.roots {
+		off := plan.offsets[id]
+		rootSlots[i] = [2]int{off, off + 8}
+	}
+	const bias = 8 // archARM64.CallArgBias()
+	spliced, wantsTrap := fs.SpliceFused(b, pw.win.Tree, pw.scalars, pw.floats, pw.pairs, rootSlots, bias)
+	if !spliced {
+		return fmt.Errorf("v%d: fused window %s declined by the splicer", v.ID, pw.win.Tree.Name)
+	}
+	if wantsTrap {
+		plan.wantsTrapStub = true
+	}
+	return nil
 }
 
 // resolveSlotValue walks OpCopy chains to the value whose slot the

@@ -557,6 +557,19 @@ func emitValueARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		ssa.OpMemoryCopy, ssa.OpMemoryFill:
 		return emitCallDirectARM64(b, v, plan, frame)
 
+	// --- Fused windows: every member is covered by the single body
+	// emitted at the window's LAST member; earlier members emit
+	// nothing (plan validation proved nothing in between needs
+	// them). ---
+	case ssa.OpSimdCall, ssa.OpSimdMemCall:
+		if plan.fusedMember[v.ID] {
+			if pw := plan.fusedAt[v.ID]; pw != nil {
+				return emitFusedWindowARM64(b, v, pw, plan)
+			}
+			return nil
+		}
+		return emitSimdCallARM64(b, v, plan, frame)
+
 	// --- Branch-based EH: inline MOVs against the Module's
 	// exception-state fields (offsets from FuncOptions.Exc). ---
 	case ssa.OpExcPending, ssa.OpExcTag, ssa.OpExcVal:
@@ -571,8 +584,6 @@ func emitValueARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 	// --- SIMD: v128 constants and helper CALLs ---
 	case ssa.OpSimdConst:
 		return emitSimdConstARM64(b, v, plan)
-	case ssa.OpSimdCall, ssa.OpSimdMemCall:
-		return emitSimdCallARM64(b, v, plan, frame)
 	}
 	return fmt.Errorf("op %v not supported by the arm64 emitter", v.Op)
 }
