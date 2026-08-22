@@ -24,6 +24,11 @@ type DirectAsmFn struct {
 	// outline-pack scratch (Sig is then results-only).
 	Packed       bool
 	PackedParams []ssa.Type
+	// Windows mirrors the codegen retention's fused-window
+	// descriptors: regions of the retained SSA the emission-time
+	// fusion pass claimed, to be emitted as shared fused splice
+	// bodies instead of per-op splices.
+	Windows []asmgen.FusedWindow
 }
 
 // emitDirectAsmBody emits one retained function's asm for the given
@@ -56,6 +61,7 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	// is nil) but its globals and exception state still inline.
 	opts.GlobalOffsets = cfg.DirectAsmGlobals
 	opts.Exc = cfg.DirectAsmExc
+	opts.Windows = df.Windows
 	if rel != "" {
 		// Multi-package chunk: same-package helper CALL spellings do
 		// not resolve here. Setting the prefix makes the emitters

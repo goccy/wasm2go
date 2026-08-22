@@ -110,7 +110,21 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		if directAsm == nil {
 			directAsm = map[string]gcasm.DirectAsmFn{}
 		}
-		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
+		var windows []asmgen.FusedWindow
+		for _, w := range df.Windows {
+			conv := func(srcs []codegen.DirectAsmParamSrc) []asmgen.FusedParamSrc {
+				out := make([]asmgen.FusedParamSrc, len(srcs))
+				for i, s := range srcs {
+					out[i] = asmgen.FusedParamSrc{IsConst: s.IsConst, Const: s.Const, Val: s.Val, ArgIdx: s.ArgIdx}
+				}
+				return out
+			}
+			windows = append(windows, asmgen.FusedWindow{
+				Tree: w.Tree, Members: w.Members, Roots: w.Roots,
+				ScalarSrc: conv(w.ScalarSrc), FloatSrc: conv(w.FloatSrc), PairSrc: conv(w.PairSrc),
+			})
+		}
+		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams, Windows: windows}
 	}
 	var directAsmExc *asmgen.ExcOffsets
 	if res.DirectAsmExc != nil {

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/emit"
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -98,6 +99,12 @@ type FuncOptions struct {
 	// the layout this field expects; the codegen translator's
 	// generated compile-time pins assert it.
 	Exc *ExcOffsets
+	// Windows lists the fused regions the codegen fusion pass claimed
+	// in this function's retained SSA. Emission replaces each window's
+	// member per-op splices with one Splicer-provided fused body; a
+	// window the plan cannot validate (or a nil Splicer) falls back to
+	// per-op emission for its members — never an error.
+	Windows []FusedWindow
 	// Splicer, when non-nil, supplies inline bodies for SIMD helper
 	// call sites (OpSimdCall / OpSimdMemCall) in place of the
 	// marshalled CALL. Functions containing SIMD calls then emit in
@@ -2142,6 +2149,31 @@ type funcPlan struct {
 type globalInlineInfo struct {
 	offset int
 	vtype  wasm.ValType
+}
+
+// FusedParamSrc is one fused-signature parameter's source in the
+// retained SSA: a compile-time constant staged as an immediate, or a
+// member value's argument (Val.Args[ArgIdx]).
+type FusedParamSrc struct {
+	IsConst bool
+	Const   int64
+	Val     *ssa.Value
+	ArgIdx  int
+}
+
+// FusedWindow describes one fused region inside a retained function:
+// the interned tree, the member call values it replaces (in scheduled
+// order), the root values per Tree.RootList(), and the fused
+// signature's parameter sources. The emitter stages the signature
+// from the sources, asks the Splicer for the fused body, skips the
+// member values, and routes the roots into their slots.
+type FusedWindow struct {
+	Tree      *simdfuse.Tree
+	Members   []*ssa.Value
+	Roots     []*ssa.Value
+	ScalarSrc []FusedParamSrc
+	FloatSrc  []FusedParamSrc
+	PairSrc   []FusedParamSrc
 }
 
 // ExcOffsets is the byte offset of each exception-state field within
