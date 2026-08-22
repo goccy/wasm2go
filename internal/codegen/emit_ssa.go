@@ -61,6 +61,11 @@ type simdCallMark struct {
 	resV128 bool
 	mem     bool // OpSimdMemCall: touches linear memory (load/store/lane)
 	args    []bool
+	// val is the SSA value this call was emitted from. The fusion pass
+	// uses it to report each fused window's member/root values back to
+	// direct-asm retention, so the asm emitter can splice the same
+	// windows straight from the retained SSA (see recordFusedWindow).
+	val *ssa.Value
 }
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
@@ -1709,7 +1714,7 @@ func (em *ssaEmitter) markSimdCall(call *ast.CallExpr, name string, v *ssa.Value
 	if em.simdCalls == nil {
 		em.simdCalls = map[*ast.CallExpr]simdCallMark{}
 	}
-	mark := simdCallMark{name: name, resV128: v.Type == ssa.TypeV128, mem: skip == 1, args: make([]bool, skip+len(v.Args))}
+	mark := simdCallMark{name: name, resV128: v.Type == ssa.TypeV128, mem: skip == 1, args: make([]bool, skip+len(v.Args)), val: v}
 	for i, a := range v.Args {
 		mark.args[skip+i] = a.Type == ssa.TypeV128
 	}
