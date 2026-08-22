@@ -64,6 +64,13 @@ type simdScalarizer struct {
 	// lowering guarantees def-before-use on every path and the one
 	// static assignment always stores the same literal.
 	constBind map[string]int32
+	// defBind maps every SINGLE-ASSIGNMENT local to its defining
+	// statement, function-wide. The fused chase consults it when an
+	// identifier is not a window intervener: the definition is then
+	// recomputed inside the region (pure shapes only — the chase
+	// grammar admits nothing effectful) WITHOUT any drop bookkeeping,
+	// since the original definition may have other consumers.
+	defBind map[string]*ast.AssignStmt
 	// pairs is the candidate set: variables carried as two uint64s.
 	pairs map[string]bool
 	// arrays are v128-typed variables that must STAY arrays (function
@@ -94,6 +101,7 @@ func (em *ssaEmitter) scalarizeSimd(body *ast.BlockStmt, paramsV128 map[string]b
 	sc.identCount = countSemanticIdents(body)
 	sc.readCount, sc.carryLoopReads = countCarryLoopReads(body)
 	sc.constBind = collectConstBindings(body, em.mem64)
+	sc.defBind = collectDefBindings(body)
 	sc.collect(body)
 	sc.audit(body)
 	body.List = sc.rewriteStmts(body.List)
@@ -301,6 +309,47 @@ func countCarryLoopReads(body *ast.BlockStmt) (map[string]int, map[string]int) {
 // value locals (v<n>, its own naming contract) qualify: wasm locals
 // (l<n>) are MUTABLE and default to zero, so a read can legitimately
 // precede their one assignment.
+// collectDefBindings maps single-assignment locals to their defining
+// assignment (nil'd out on a second write, IncDec included).
+func collectDefBindings(body *ast.BlockStmt) map[string]*ast.AssignStmt {
+	defs := map[string]*ast.AssignStmt{}
+	dead := map[string]bool{}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch st := n.(type) {
+		case *ast.IncDecStmt:
+			if id, ok := st.X.(*ast.Ident); ok {
+				dead[id.Name] = true
+				delete(defs, id.Name)
+			}
+		case *ast.AssignStmt:
+			if len(st.Lhs) != 1 || len(st.Rhs) != 1 {
+				for _, l := range st.Lhs {
+					if id, ok := l.(*ast.Ident); ok {
+						dead[id.Name] = true
+						delete(defs, id.Name)
+					}
+				}
+				return true
+			}
+			id, ok := st.Lhs[0].(*ast.Ident)
+			if !ok || id.Name == "_" {
+				return true
+			}
+			if dead[id.Name] {
+				return true
+			}
+			if _, seen := defs[id.Name]; seen {
+				dead[id.Name] = true
+				delete(defs, id.Name)
+				return true
+			}
+			defs[id.Name] = st
+		}
+		return true
+	})
+	return defs
+}
+
 func collectConstBindings(body *ast.BlockStmt, wide bool) map[string]int32 {
 	assigns := map[string]int{}
 	val := map[string]int32{}

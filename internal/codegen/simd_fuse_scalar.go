@@ -178,6 +178,17 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 // ClassI32 node. u32/i32 conversions are identities mod 2^32, exactly
 // like the wasm ops the emitter lowered from.
 func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
+	if fb.chaseTrace {
+		a, ok := fb.chaseI32Inner(e)
+		if !ok {
+			fuseDebugf("chaseTRACE fail: %T %s", e, exprDebugString(e))
+		}
+		return a, ok
+	}
+	return fb.chaseI32Inner(e)
+}
+
+func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 	if c, ok := fb.constValueOf(e); ok {
 		return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c}, true
 	}
@@ -196,6 +207,9 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 					aarg, aok := fb.chaseAddr(addr)
 					if !aok {
 						return simdfuse.Arg{}, false
+					}
+					if fb.chaseTrace {
+						fuseDebugf("chaseTRACE load16 addr %s -> kind=%d idx=%d const=%d", exprDebugString(addr), aarg.Kind, aarg.Index, aarg.Const)
 					}
 					idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
 					if !nok {
@@ -225,6 +239,22 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 			if l.Kind == simdfuse.ArgConst && r.Kind == simdfuse.ArgConst {
 				return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: l.Const + r.Const}, true
 			}
+			if fb.wideChase {
+				// The gather rewrite needs canonical base+const forms
+				// to prove lane adjacency; gated so ordinary fusion
+				// keeps its historical shapes byte-identical.
+				if l.Kind == simdfuse.ArgConst {
+					l, r = r, l
+				}
+				if r.Kind == simdfuse.ArgConst {
+					switch l.Kind {
+					case simdfuse.ArgScalar:
+						return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: r.Const}, true
+					case simdfuse.ArgSum:
+						return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: l.Const + r.Const}, true
+					}
+				}
+			}
 			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, r})
 			if !ok {
 				return simdfuse.Arg{}, false
@@ -233,14 +263,17 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		case token.SHL:
 			s, sok := matchShiftConst(x.Y, fb)
 			if !sok {
+				fuseDebugf("chaseI32 SHL: amount not const: %s", exprDebugString(x.Y))
 				return simdfuse.Arg{}, false
 			}
 			v, vok := fb.chaseI32(x.X)
 			if !vok {
+				fuseDebugf("chaseI32 SHL: operand fail: %s", exprDebugString(x.X))
 				return simdfuse.Arg{}, false
 			}
 			idx, ok := fb.addScalarNode("scalar_i32_shl", []simdfuse.Arg{v, {Kind: simdfuse.ArgConst, Const: s}})
 			if !ok {
+				fuseDebugf("chaseI32 SHL: node cap")
 				return simdfuse.Arg{}, false
 			}
 			return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
@@ -256,6 +289,28 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		}
 		return simdfuse.Arg{}, false
 	case *ast.Ident:
+		if fb.wideChase && (fb.interDef == nil || fb.interDef[x.Name] == nil) {
+			// Not an intervener: recompute a function-wide
+			// single-assignment definition in-region. No consumption
+			// bookkeeping — the original definition stays (it may have
+			// other readers); the chase grammar only admits pure
+			// shapes, so recomputation is safe under the runtime's
+			// no-concurrent-writer contract the intervener chase
+			// already relies on.
+			if fb.sc != nil && fb.sc.defBind != nil && !fb.chaseVisiting[x.Name] {
+				if def, isDef := fb.sc.defBind[x.Name]; isDef && len(def.Rhs) == 1 {
+					if fb.chaseVisiting == nil {
+						fb.chaseVisiting = map[string]bool{}
+					}
+					fb.chaseVisiting[x.Name] = true
+					a, aok := fb.chaseI32(def.Rhs[0])
+					delete(fb.chaseVisiting, x.Name)
+					if aok {
+						return a, true
+					}
+				}
+			}
+		}
 		if fb.interDef != nil {
 			if def, isDef := fb.interDef[x.Name]; isDef && !fb.chaseVisiting[x.Name] {
 				// No caching across uses: every consumer gets its own
@@ -364,6 +419,10 @@ func (fb *fusedTreeBuilder) chaseAddr(e ast.Expr) (simdfuse.Arg, bool) {
 				return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: c}, true
 			case simdfuse.ArgConst:
 				return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: l.Const + c}, true
+			case simdfuse.ArgSum:
+				if fb.wideChase {
+					return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: l.Const + c}, true
+				}
 			}
 			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, {Kind: simdfuse.ArgConst, Const: c}})
 			if !ok {
@@ -374,6 +433,19 @@ func (fb *fusedTreeBuilder) chaseAddr(e ast.Expr) (simdfuse.Arg, bool) {
 		r, rok := fb.chaseI32(bin.Y)
 		if !rok {
 			return simdfuse.Arg{}, false
+		}
+		if fb.wideChase {
+			if l.Kind == simdfuse.ArgConst {
+				l, r = r, l
+			}
+			if r.Kind == simdfuse.ArgConst {
+				switch l.Kind {
+				case simdfuse.ArgScalar:
+					return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: r.Const}, true
+				case simdfuse.ArgSum:
+					return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: l.Const + r.Const}, true
+				}
+			}
 		}
 		idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, r})
 		if !ok {
@@ -423,7 +495,7 @@ func (fb *fusedTreeBuilder) addChaseScalarArg(src ast.Expr, key string) (simdfus
 		fb.noteChaseRead(src)
 		return simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: idx}, true
 	}
-	if 1+len(fb.scalars)+1 > fusedMaxIntRegs {
+	if !fb.capRelax && 1+len(fb.scalars)+1 > fusedMaxIntRegs {
 		if fb.failWhy == "" {
 			fb.failWhy = "int cap (chased scalar)"
 		}
@@ -526,13 +598,32 @@ func matchShiftConst(e ast.Expr, fb *fusedTreeBuilder) (int32, bool) {
 			mod = m
 		}
 	}
-	if conv, ok := e.(*ast.CallExpr); ok && len(conv.Args) == 1 {
-		if id, ok := conv.Fun.(*ast.Ident); ok && id.Name == "uint" {
+	for {
+		conv, ok := e.(*ast.CallExpr)
+		if !ok || len(conv.Args) != 1 {
+			break
+		}
+		id, ok := conv.Fun.(*ast.Ident)
+		if !ok {
+			break
+		}
+		switch id.Name {
+		case "uint", "uint32", "uint64", "int32", "int64":
+			// Integer conversions are identities for the small
+			// non-negative shift amounts the chase accepts.
 			e = conv.Args[0]
+		default:
+			return 0, false
 		}
 	}
 	c, ok := fb.constValueOf(e)
 	if !ok {
+		if id, isID := e.(*ast.Ident); isID {
+			cb, cbok := fb.sc.constBind[id.Name]
+			fuseDebugf("matchShiftConst: ident %s constBind hit=%v val=%d (bindsize=%d)", id.Name, cbok, cb, len(fb.sc.constBind))
+		} else {
+			fuseDebugf("matchShiftConst: non-ident %T", e)
+		}
 		return 0, false
 	}
 	return c % mod, true

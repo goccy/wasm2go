@@ -269,6 +269,20 @@ type fusedTreeBuilder struct {
 	scalarSrc []fusedParamSrc
 	floatSrc  []fusedParamSrc
 	pairSrc   []fusedParamSrc
+	// wideChase widens the identifier chase to function-wide
+	// single-assignment definitions (defBind) — enabled only inside
+	// the f16 gather normalization, which recomputes pure chains
+	// without intervener bookkeeping. Off for ordinary fusion so
+	// existing tree shapes stay byte-identical.
+	wideChase bool
+	// chaseTrace prints every chaseI32 entry and failure (diagnosis).
+	chaseTrace bool
+	// capRelax suspends the per-append integer-register cap while the
+	// f16 gather rewrite runs: the rewrite retires more parameters
+	// than it adds, but the retired ones only leave at compaction.
+	// The intern-time signature check still enforces the hard bound
+	// on the FINAL shape.
+	capRelax bool
 	// nodeVals parallels nodes with the member SSA value each node was
 	// built from (nil for synthesized scalar-chain nodes). Remapped by
 	// scheduleNodes and rolled back by restoreChase in lockstep, it
@@ -1611,6 +1625,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			}
 			continue // over the root cap, or a window with no live output
 		}
+		roots = fb.fuseF16Gather(roots)
 		roots = fb.scheduleNodes(roots)
 		if pl := fb.peakLive(roots); pl > fusedPoolBudget-floatPoolCost(len(fb.floats)) {
 			if w >= 4 {

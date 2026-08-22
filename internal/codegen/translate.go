@@ -912,6 +912,9 @@ type translator struct {
 	// creates; see simd_fuse.go and internal/simdfuse.
 	fusedShapes *fusedShapeState
 	fusedLoops  *fusedLoopState
+	// segPlacements caches passiveSegmentPlacements' result (nil until
+	// first use; empty map = scanned, nothing found).
+	segPlacements map[int]int64
 	// excSlots is the operand-slot count the module's exception state
 	// needs: the widest tag arity, or 0 when the module has no EH (the
 	// state fields are then omitted entirely). See emitModuleStruct.
