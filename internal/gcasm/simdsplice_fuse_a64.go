@@ -21,6 +21,7 @@ package gcasm
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -199,6 +200,13 @@ func a64EmitSdotIdx(b *strings.Builder, reg int) {
 // once, outside the loop).
 func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets,
 	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, lutBase map[int]string, sdotIdx int, portable bool, dual *a64DualAcc) ([]fusedLoc, bool, error) {
+	return a64SpliceFusedCoreLutPtr(b, tree, pool, offs, carried, reserve, extraIntArgs, skipProlog, lutBase, sdotIdx, portable, dual, nil)
+}
+
+// a64SpliceFusedCoreLutPtr additionally receives the loop splicer's
+// carried host pointers (nil for straight-line windows).
+func a64SpliceFusedCoreLutPtr(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets,
+	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, lutBase map[int]string, sdotIdx int, portable bool, dual *a64DualAcc, hostPtrs map[int]*a64HostPtr) ([]fusedLoc, bool, error) {
 	tree = a64Dot8Rewrite(tree, portable, offs.fastMath())
 	if !skipProlog {
 		if err := a64FusedProlog(b, tree, offs); err != nil {
@@ -277,7 +285,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 		return sdotIdx, nil
 	}
 
-	chains := newA64ScalarChain(b, tree, scalarReg, uses, lutBase)
+	chains := newA64ScalarChain(b, tree, scalarReg, uses, lutBase, hostPtrs)
 
 	// memAddrReg consumes a chain-computed ADDRESS operand (Args[0]
 	// as an ArgNode): the glued scalar chain just evaluated it into
@@ -373,6 +381,11 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 			areg, aerr := memAddrReg(n)
 			if aerr != nil {
 				return nil, false, aerr
+			}
+			if areg == "" && a64HostPtrLoad(b, n, scalarReg, dst, tree.Addr64, hostPtrs) {
+				loc[i] = fusedLoc{chained: willChain, pool: dst}
+				needsTrap = true
+				continue
 			}
 			if err := a64FusedLoad(b, n, scalarReg, offs, dst, tree.Addr64, areg); err != nil {
 				return nil, false, err
@@ -1403,6 +1416,20 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	if loop.CounterWide {
 		cmpOp, subOp, cbzOp, cbnzOp = "CMP", "SUB", "CBZ", "CBNZ"
 	}
+	// Carry host pointers (memory base + bump-carried address scalar)
+	// in the argument registers the signature leaves free: the load
+	// emitters then use immediate-offset forms off them. Recomputed at
+	// the top of every unroll copy.
+	var hostPtrs map[int]*a64HostPtr
+	if os.Getenv("WASM2GO_NO_HOSTPTR") == "" {
+		argsUsed := 1 + tree.NumScalars + 1 + loop.NumDeltas + 2*tree.NumPairs
+		var freePtrRegs []string
+		for r := argsUsed; r <= 15; r++ {
+			freePtrRegs = append(freePtrRegs, a64FusedArgReg(r))
+		}
+		freePtrRegs = append(freePtrRegs, "R16")
+		hostPtrs = a64LoopHostPtrs(loop, freePtrRegs)
+	}
 	// Hoist scale-table HOST bases (memory base + table offset) for
 	// the lookup peephole: loop-invariant, one register each. R17/R19
 	// are free inside the splice (every GPR is call-clobbered; R18 is
@@ -1437,9 +1464,13 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	var loc []fusedLoc
 	needsTrap := false
 	step := func() error {
+		for _, hp := range a64SortedHostPtrs(hostPtrs) {
+			fmt.Fprintf(b, "\tADD R20, %s, %s\n", a64FusedArgReg(1+hp.scalar), hp.reg)
+			hp.bias = 0
+		}
 		var err error
 		var trap bool
-		loc, trap, err = a64SpliceFusedCoreLut(b, tree, pool, offs, carried, reserve, 1+loop.NumDeltas, true, lutHoist, sdotIdx, portable, dual)
+		loc, trap, err = a64SpliceFusedCoreLutPtr(b, tree, pool, offs, carried, reserve, 1+loop.NumDeltas, true, lutHoist, sdotIdx, portable, dual, hostPtrs)
 		if err != nil {
 			return err
 		}

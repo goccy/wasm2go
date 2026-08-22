@@ -39,6 +39,9 @@ type a64ScalarPre struct {
 	// f32 loads the peephole rewrites.
 	elided map[int]bool
 	lutOf  []int
+	// hostPtrs are the loop splicer's carried host pointers: the f16
+	// scale-load peephole reads through them with immediate offsets.
+	hostPtrs map[int]*a64HostPtr
 }
 
 // newA64ScalarChain builds the inline scalar-chain evaluator. Chains
@@ -48,14 +51,15 @@ type a64ScalarPre struct {
 // bodies). Terminals stay in their scratch FPR; the consumer splat
 // broadcasts from lane 0 and releases it.
 func newA64ScalarChain(b *strings.Builder, tree *simdfuse.Tree,
-	scalarReg func(simdfuse.Arg) string, uses []int, lutBase map[int]string) *a64ScalarPre {
+	scalarReg func(simdfuse.Arg) string, uses []int, lutBase map[int]string, hostPtrs map[int]*a64HostPtr) *a64ScalarPre {
 	p := &a64ScalarPre{
 		b: b, tree: tree, scalarReg: scalarReg, uses: uses,
-		freeGpr: []string{"R27", "R26", "R25", "R24"},
-		freeFpr: []int{3, 2, 1},
-		gprOf:   map[int]string{},
-		fprOf:   map[int]int{},
-		lutBase: lutBase,
+		freeGpr:  []string{"R27", "R26", "R25", "R24"},
+		freeFpr:  []int{3, 2, 1},
+		gprOf:    map[int]string{},
+		fprOf:    map[int]int{},
+		lutBase:  lutBase,
+		hostPtrs: hostPtrs,
 	}
 	// Pre-mark the peephole's swallowed nodes: they precede their
 	// consuming load in node order, so the elision must be decided
@@ -277,6 +281,21 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		// dot kernel by direct measurement before being wired here.
 		_ = host
 		ld := &p.tree.Nodes[ldIdx]
+		if hp, c, hok := a64HostPtrArg(p.hostPtrs, ld.Args[0]); hok {
+			if imm, sok := hp.imm(p.b, c, 2); sok {
+				f, err := p.allocFpr()
+				if err != nil {
+					return err
+				}
+				pn := a64RegNum(hp.reg)
+				ldr := 0x7C400000 | (uint32(imm)&0x1FF)<<12 | uint32(pn)<<5 | uint32(f)
+				fmt.Fprintf(p.b, "\tWORD $0x%08x // ldur h%d, [x%d, #%d] (f16 scale)\n", ldr, f, pn, imm)
+				fcvt := 0x1EE24000 | uint32(f)<<5 | uint32(f)
+				fmt.Fprintf(p.b, "\tWORD $0x%08x // fcvt s%d, h%d\n", fcvt, f, f)
+				p.fprOf[i] = f
+				return nil
+			}
+		}
 		g, err := p.takeGpr(ld.Args[0])
 		if err != nil {
 			return err

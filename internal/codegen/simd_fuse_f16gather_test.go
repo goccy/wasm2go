@@ -131,4 +131,3 @@ func TestWordOperandIdent(t *testing.T) {
 		t.Fatal("binary expr accepted as word operand")
 	}
 }
-
