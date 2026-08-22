@@ -40,7 +40,7 @@ type DirectAsmFn struct {
 // from asmgen's same-package CALL spelling yet, and a body that
 // emits but fails to link would break the build instead of falling
 // back.
-func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, modOffs *ModuleOffsets, pool *ConstPool, importPath, rel string, calleeSig calleeResolver, fnOwner map[string]string, stats *BuildStats) (string, bool) {
+func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, cfg Config, modOffs *ModuleOffsets, pool *ConstPool, importPath, rel string, calleeSig calleeResolver, fnOwner map[string]string, stats *BuildStats) (string, bool) {
 	if len(mod.Memories) > 0 && (modOffs == nil || modOffs.M != asmgen.ModuleMOffset) {
 		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: Module layout unverified (probe %v)\n",
 			archName, name, modOffs)
@@ -51,9 +51,11 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	if df.Packed {
 		opts.PackedParams = df.PackedParams
 	}
-	if modOffs != nil {
-		opts.GlobalOffsets = modOffs.Cfg.DirectAsmGlobals
-	}
+	// The translator-computed struct offsets ride Config, not the
+	// probe: a module without SIMD memory ops has no probe (modOffs
+	// is nil) but its globals and exception state still inline.
+	opts.GlobalOffsets = cfg.DirectAsmGlobals
+	opts.Exc = cfg.DirectAsmExc
 	if rel != "" {
 		// Multi-package chunk: same-package helper CALL spellings do
 		// not resolve here. Setting the prefix makes the emitters

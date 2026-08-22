@@ -241,6 +241,12 @@ type Result struct {
 	// direct-asm retention is active. The generated bundle carries
 	// compile-time assertions pinning these offsets.
 	DirectAsmGlobals []int
+	// DirectAsmExc is the byte offset of each exception-state field
+	// within the generated Module struct, for direct-asm bodies to
+	// inline OpExc* accesses. Nil unless direct-asm retention is
+	// active and the module has exception state. Pinned by the same
+	// generated compile-time assertions as DirectAsmGlobals.
+	DirectAsmExc *DirectAsmExcLayout
 }
 
 // Translate parses helpers, walks the module, and emits Go source for
@@ -567,6 +573,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	res.DirectAsmSSA = t.directAsmSSA
 	if len(t.directAsmSSA) > 0 {
 		res.DirectAsmGlobals = t.moduleGlobalOffsets()
+		res.DirectAsmExc = t.moduleExcOffsets()
 	}
 	if t.nrc2 != nil {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
@@ -1709,6 +1716,32 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		})
 	}
 
+	// The propagating-exception state, when the module uses EH. A wasm
+	// exception travels as module state plus a check-and-branch after every
+	// call that may raise one, so EH code stays ordinary straight-line Go.
+	// Value fields on purpose: a wasi-threads agent runs on a struct COPY,
+	// which makes the state per-execution-context for free (an exception
+	// belongs to one thread, exactly like a global). Declared here, in the
+	// fixed-offset leading region right after outlinePack, so direct-asm
+	// bodies can address it with a trivially modeled offset
+	// (moduleExcOffsets) instead of modeling the whole struct tail; the
+	// generated compile-time pins assert the model.
+	if t.excSlots > 0 {
+		fields = append(fields,
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excPending"))},
+				Type:  newID("int32"),
+			},
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excTag"))},
+				Type:  newID("uint32"),
+			},
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excVals"))},
+				Type:  &ast.ArrayType{Len: intLit(int64(t.excSlots)), Elt: newID("uint64")},
+			})
+	}
+
 	for i := range t.mod.Tables {
 		fields = append(fields, &ast.Field{
 			Names: []*ast.Ident{newID(t.fieldName(fmt.Sprintf("t%d", i)))},
@@ -1808,29 +1841,6 @@ func (t *translator) emitModuleStruct() ast.Decl {
 				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID(argType)},
 			}}},
 		})
-	}
-
-	// The propagating-exception state, when the module uses EH. A wasm
-	// exception travels as module state plus a check-and-branch after every
-	// call that may raise one, so EH code stays ordinary straight-line Go.
-	// Value fields on purpose: a wasi-threads agent runs on a struct COPY,
-	// which makes the state per-execution-context for free (an exception
-	// belongs to one thread, exactly like a global). Declared LAST, after
-	// every pre-existing field, per the layout convention above.
-	if t.excSlots > 0 {
-		fields = append(fields,
-			&ast.Field{
-				Names: []*ast.Ident{newID(t.fieldName("excPending"))},
-				Type:  newID("int32"),
-			},
-			&ast.Field{
-				Names: []*ast.Ident{newID(t.fieldName("excTag"))},
-				Type:  newID("uint32"),
-			},
-			&ast.Field{
-				Names: []*ast.Ident{newID(t.fieldName("excVals"))},
-				Type:  &ast.ArrayType{Len: intLit(int64(t.excSlots)), Elt: newID("uint64")},
-			})
 	}
 
 	return &ast.GenDecl{

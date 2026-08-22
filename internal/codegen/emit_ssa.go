@@ -803,9 +803,12 @@ func (em *ssaEmitter) narrowExcSlot(slot ast.Expr, t ssa.Type) ast.Expr {
 		if em.t != nil {
 			em.t.UsePackage("math")
 		}
+		// The uint64 conversion is required, not cosmetic: OpCatchArg
+		// narrows the dispatch's int64-typed snapshot, and
+		// Float64frombits does not accept int64.
 		return &ast.CallExpr{
 			Fun:  &ast.SelectorExpr{X: newID("math"), Sel: newID("Float64frombits")},
-			Args: []ast.Expr{slot},
+			Args: []ast.Expr{call("uint64", slot)},
 		}
 	default: // i32 / bool
 		return call("int32", slot)

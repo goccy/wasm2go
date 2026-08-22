@@ -19,6 +19,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/goccy/wasm2go/internal/asmgen"
 )
 
 // Config is the build configuration the splice emitters consult.
@@ -44,6 +46,11 @@ type Config struct {
 	// the struct and pinned by generated compile-time assertions;
 	// direct-asm bodies inline global accesses through it.
 	DirectAsmGlobals []int
+	// DirectAsmExc is the Module-struct byte offset of each
+	// exception-state field, computed and pinned the same way;
+	// direct-asm bodies inline the branch-based EH ops through it.
+	// Nil for modules without exception state.
+	DirectAsmExc *asmgen.ExcOffsets
 }
 
 // ModuleOffsets are the *Module field offsets the memory-op splices

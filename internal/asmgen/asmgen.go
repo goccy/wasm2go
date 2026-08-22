@@ -89,6 +89,15 @@ type FuncOptions struct {
 	// caller-side BX clobber that comes with it. ComputeGlobalOffsets
 	// produces a slice with the layout this field expects.
 	GlobalOffsets []int
+	// Exc is the byte offset of each exception-state field within the
+	// generated Module struct. When non-nil, the branch-based EH ops
+	// (OpExcPending / OpExcTag / OpExcVal / OpExcRaise / OpExcRearm /
+	// OpExcClear) lower to inline MOVs against the `*Module`
+	// parameter. When nil, any function containing an exc op fails
+	// emission (per-function fallback). ComputeExcOffsets produces
+	// the layout this field expects; the codegen translator's
+	// generated compile-time pins assert it.
+	Exc *ExcOffsets
 	// Splicer, when non-nil, supplies inline bodies for SIMD helper
 	// call sites (OpSimdCall / OpSimdMemCall) in place of the
 	// marshalled CALL. Functions containing SIMD calls then emit in
@@ -2058,6 +2067,10 @@ type funcPlan struct {
 	// populated AND the global is module-defined (imported globals
 	// keep the CALL path because they live behind the host iface).
 	globalInline map[ssa.ValueID]globalInlineInfo
+	// exc carries FuncOptions.Exc for the emitters: the Module-struct
+	// byte offsets the inline OpExc* lowerings read/write. Non-nil
+	// exactly when the plan admitted a function containing exc ops.
+	exc *ExcOffsets
 	// regHome holds the block-local register assignment
 	// for SSA values whose entire lifetime fits inside one block and
 	// does not cross a CALL boundary. When a value has an entry
@@ -2129,6 +2142,15 @@ type funcPlan struct {
 type globalInlineInfo struct {
 	offset int
 	vtype  wasm.ValType
+}
+
+// ExcOffsets is the byte offset of each exception-state field within
+// the generated Module struct (see FuncOptions.Exc). Vals is the base
+// of operand slot 0; slot i lives at Vals + 8*i.
+type ExcOffsets struct {
+	Pending int // excPending int32
+	Tag     int // excTag uint32
+	Vals    int // excVals [n]uint64
 }
 
 // planFunc walks f and builds the layout plan. The walk happens once
@@ -2445,6 +2467,16 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				if cframe.argSize > maxCallee {
 					maxCallee = cframe.argSize
 				}
+			case ssa.OpExcPending, ssa.OpExcTag, ssa.OpExcVal,
+				ssa.OpExcRaise, ssa.OpExcRearm, ssa.OpExcClear:
+				// Branch-based EH state lives in fixed Module fields;
+				// without the host-supplied offsets there is no CALL
+				// fallback (the pure-Go emitter inlines these too), so
+				// the function must fall back as a whole.
+				if opts.Exc == nil {
+					return nil, fmt.Errorf("%v v%d: FuncOptions.Exc offsets required", v.Op, v.ID)
+				}
+				p.exc = opts.Exc
 			case ssa.OpGlobalGet, ssa.OpGlobalSet:
 				if opts.Module == nil {
 					return nil, fmt.Errorf("%v v%d: FuncOptions.Module is required", v.Op, v.ID)
@@ -2782,7 +2814,12 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				ssa.OpCallDirect, ssa.OpCallImport, ssa.OpCallIndirect,
 				ssa.OpGlobalGet, ssa.OpGlobalSet,
 				ssa.OpMemSize, ssa.OpMemGrow,
-				ssa.OpMemoryCopy, ssa.OpMemoryFill:
+				ssa.OpMemoryCopy, ssa.OpMemoryFill,
+				// Exc reads feed BlockIf controls and cross-block
+				// dispatches the same-block lifetime model does not
+				// track; keep their slots dedicated like OpGlobalGet.
+				ssa.OpExcPending, ssa.OpExcTag, ssa.OpExcVal,
+				ssa.OpCatchArg:
 				opEligible = false
 			}
 			if size >= 8 {
@@ -3063,7 +3100,9 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				case ssa.OpCallDirect, ssa.OpCallImport, ssa.OpCallIndirect,
 					ssa.OpGlobalGet, ssa.OpGlobalSet,
 					ssa.OpMemSize, ssa.OpMemGrow,
-					ssa.OpMemoryCopy, ssa.OpMemoryFill:
+					ssa.OpMemoryCopy, ssa.OpMemoryFill,
+					ssa.OpExcPending, ssa.OpExcTag, ssa.OpExcVal,
+					ssa.OpExcRaise, ssa.OpExcRearm, ssa.OpExcClear:
 					wantsMCache = true
 				}
 				if wantsMCache {
@@ -3279,7 +3318,11 @@ func isSideEffectingOp(op ssa.Op) bool {
 		ssa.OpStore8, ssa.OpStore16, ssa.OpStore32, ssa.OpStore64,
 		ssa.OpStoreF32, ssa.OpStoreF64,
 		ssa.OpGlobalSet,
-		ssa.OpMemoryCopy, ssa.OpMemoryFill, ssa.OpMemGrow:
+		ssa.OpMemoryCopy, ssa.OpMemoryFill, ssa.OpMemGrow,
+		// Exc writes mutate the module's exception state; a raise whose
+		// pending flag nobody reads in THIS function is still observed
+		// by every caller up the propagation chain.
+		ssa.OpExcRaise, ssa.OpExcRearm, ssa.OpExcClear:
 		return true
 	}
 	return false
@@ -3369,15 +3412,22 @@ func goAsmSymbol(qualified string) string {
 //
 // The layout mirrors codegen.translator.emitModuleStruct exactly:
 // Memory []byte (24) + MaxMem uint64 (8) + M unsafe.Pointer (8) when
-// the module has memories, then 24 bytes per Table ([]any slice
-// header), then each defined global in the order it appears in
-// mod.Globals, aligned to its Go type's natural alignment.
+// the module has memories, then the exception state (excPending int32
+// + excTag uint32 + excVals [n]uint64) when the module has tags, then
+// 24 bytes per Table ([]any slice header), then each defined global
+// in the order it appears in mod.Globals, aligned to its Go type's
+// natural alignment. (The codegen outline-pack field is absent here:
+// this model serves the standalone package build, which runs without
+// outlining.)
 func ComputeGlobalOffsets(mod *wasm.Module) []int {
 	off := 0
 	if len(mod.Memories) > 0 {
 		off += 24 // Memory []byte slice header (data, len, cap on amd64/arm64)
 		off += 8  // MaxMem uint64
 		off += 8  // M unsafe.Pointer
+	}
+	if n := excSlotCount(mod); n > 0 {
+		off += 8 + 8*n // excPending int32 + excTag uint32 + excVals [n]uint64
 	}
 	off += 24 * len(mod.Tables) // T_i []any per table
 	n := int(mod.NumImportedGlobals) + len(mod.Globals)
@@ -3392,6 +3442,51 @@ func ComputeGlobalOffsets(mod *wasm.Module) []int {
 		off += s
 	}
 	return offs
+}
+
+// excSlotCount mirrors codegen's maxTagArity: the operand-slot count
+// of the module's exception state, or 0 when the module has no tags.
+// A module that declares only nullary tags still needs the flag and
+// tag fields, and the generated struct gives excVals one unused slot
+// rather than special-casing an empty array — mirror that too.
+func excSlotCount(mod *wasm.Module) int {
+	n := 0
+	consider := func(typeIdx uint32) {
+		if int(typeIdx) >= len(mod.Types) {
+			return
+		}
+		if c := len(mod.Types[typeIdx].Params); c > n {
+			n = c
+		}
+	}
+	for _, imp := range mod.Imports {
+		if imp.Kind == wasm.ImportTag {
+			consider(imp.Tag.TypeIdx)
+		}
+	}
+	for _, tg := range mod.Tags {
+		consider(tg.TypeIdx)
+	}
+	if n == 0 && (mod.NumImportedTags > 0 || len(mod.Tags) > 0) {
+		n = 1
+	}
+	return n
+}
+
+// ComputeExcOffsets returns the exception-state field offsets within
+// the Module struct, following the same layout model as
+// ComputeGlobalOffsets (standalone build: no outline pack). Nil when
+// the module has no tags — FuncOptions.Exc then stays unset and any
+// function containing an exc op falls back.
+func ComputeExcOffsets(mod *wasm.Module) *ExcOffsets {
+	if excSlotCount(mod) == 0 {
+		return nil
+	}
+	off := 0
+	if len(mod.Memories) > 0 {
+		off += 24 + 8 + 8 // Memory + MaxMem + M
+	}
+	return &ExcOffsets{Pending: off, Tag: off + 4, Vals: off + 8}
 }
 
 // goTypeSizeAlign returns the Go-side (align, size) of the

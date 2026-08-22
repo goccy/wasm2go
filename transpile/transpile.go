@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/goccy/wasm2go/internal/asmgen"
 	"github.com/goccy/wasm2go/internal/codegen"
 	"github.com/goccy/wasm2go/internal/gcasm"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -111,11 +112,20 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		}
 		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
 	}
+	var directAsmExc *asmgen.ExcOffsets
+	if res.DirectAsmExc != nil {
+		directAsmExc = &asmgen.ExcOffsets{
+			Pending: res.DirectAsmExc.Pending,
+			Tag:     res.DirectAsmExc.Tag,
+			Vals:    res.DirectAsmExc.Vals,
+		}
+	}
 	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
 		FastMath:         opts.FastMath,
 		FuseLoopUnroll:   opts.FuseLoopUnroll,
 		DirectAsm:        directAsm,
 		DirectAsmGlobals: res.DirectAsmGlobals,
+		DirectAsmExc:     directAsmExc,
 	})
 	if err != nil {
 		return res, fmt.Errorf("gcasm backend: %w", err)

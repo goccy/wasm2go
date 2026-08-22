@@ -260,7 +260,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg.DirectAsm)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -625,8 +625,9 @@ func buildPkg(
 	outlinedNames []string,
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
-	directSSA map[string]DirectAsmFn,
+	cfg Config,
 ) (map[string][]byte, error) {
+	directSSA := cfg.DirectAsm
 	selfPath := importPath
 	if rel != "" {
 		selfPath = importPath + "/" + rel
@@ -764,7 +765,7 @@ func buildPkg(
 		// Emission shares this package's ConstPool so spliced bodies'
 		// constants intern alongside the transform's.
 		if df, isDirect := directSSA[name]; isDirect {
-			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, modOffs, pool, importPath, rel, calleeSig, fnOwner, stats); ok {
+			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, cfg, modOffs, pool, importPath, rel, calleeSig, fnOwner, stats); ok {
 				asmB.WriteString(dab)
 				asmB.WriteString("\n")
 				stats.DirectAsm++
