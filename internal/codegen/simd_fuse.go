@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
+	"github.com/goccy/wasm2go/internal/ssa"
 )
 
 // Fused-signature caps. The whole signature must ride integer
@@ -235,6 +236,21 @@ func (t *translator) internFusedTree(key string, tree *simdfuse.Tree) (*simdfuse
 	return tree, true
 }
 
+// fusedParamSrc records where one fused-signature parameter came
+// from, so direct-asm retention can rebuild the fused call's
+// arguments from the retained SSA. Exactly one of the kinds holds:
+// a compile-time constant (staged as an immediate), or a member
+// value's argument (val's Args[argIdx]). The zero value marks a
+// parameter with no single-source provenance (chased or synthetic
+// expressions) — a window carrying one is not retainable for the
+// fused direct-asm path and keeps per-op splices.
+type fusedParamSrc struct {
+	isConst  bool
+	constVal int64
+	val      *ssa.Value
+	argIdx   int
+}
+
 // fusedTreeBuilder accumulates one call tree during tryFuse. The walk
 // is a PURE analysis: it mutates nothing and emits nothing, recording
 // the AST expressions that become scalar and pair parameters so the
@@ -247,7 +263,13 @@ type fusedTreeBuilder struct {
 	scalars []ast.Expr // scalar parameter source expressions, in order
 	floats  []ast.Expr // float32 parameter source expressions, in order
 	pairs   []ast.Expr // pair parameter source expressions, in order
-	key     strings.Builder
+	// scalarSrc/floatSrc/pairSrc parallel the three parameter arrays
+	// with SSA provenance for direct-asm window retention (see
+	// fusedParamSrc). Kept in lockstep by the append sites.
+	scalarSrc []fusedParamSrc
+	floatSrc  []fusedParamSrc
+	pairSrc   []fusedParamSrc
+	key       strings.Builder
 	// varNode maps window-internal variable names to the node index
 	// holding their value, so a multi-root window's later statements
 	// consume earlier results as internal edges instead of pair
@@ -301,6 +323,36 @@ type fusedTreeBuilder struct {
 	scalarOwner []int
 	pairOwner   []int
 	curCand     int
+}
+
+// paramSrcFor derives one member-call argument's provenance under the
+// v1 strict rules: a resolvable constant stages as an immediate; a
+// memory op's position 0 is the member value's Args[0]; pure-op
+// positions map 1:1 only when the emitted argument count equals the
+// SSA argument count (memarg/rng/lane literals interleave otherwise).
+// Everything else has no provenance and the window keeps per-op
+// splices in direct-asm bodies.
+func (fb *fusedTreeBuilder) paramSrcFor(m simdCallMark, isMem bool, i, nArgs int, a ast.Expr) fusedParamSrc {
+	if fb.addr64 {
+		if c, ok := fb.addrConstValue(a); ok {
+			return fusedParamSrc{isConst: true, constVal: int64(c)}
+		}
+	} else if c, ok := fb.constValueOf(a); ok {
+		return fusedParamSrc{isConst: true, constVal: int64(c)}
+	}
+	if m.val == nil || i < 0 {
+		return fusedParamSrc{}
+	}
+	if isMem {
+		if i == 0 && len(m.val.Args) > 0 {
+			return fusedParamSrc{val: m.val, argIdx: 0}
+		}
+		return fusedParamSrc{}
+	}
+	if nArgs == len(m.val.Args) && i < len(m.val.Args) {
+		return fusedParamSrc{val: m.val, argIdx: i}
+	}
+	return fusedParamSrc{}
 }
 
 // intRegsUsed is the fused signature's integer-register footprint.
@@ -788,6 +840,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 			nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgFloat, Index: len(fb.floats)})
 			fmt.Fprintf(&fb.key, "f%d,", len(fb.floats))
 			fb.floats = append(fb.floats, a)
+			fb.floatSrc = append(fb.floatSrc, fb.paramSrcFor(m, isMem, i, len(args), a))
 			fb.noteRead(a)
 			continue
 		}
@@ -847,6 +900,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 			}
 			fb.pairs = append(fb.pairs, a)
 			fb.pairOwner = append(fb.pairOwner, fb.curCand)
+			fb.pairSrc = append(fb.pairSrc, fb.paramSrcFor(m, isMem, i, len(args), a))
 			fb.noteRead(a)
 			continue
 		}
@@ -979,6 +1033,9 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 						fb.scalarDedup[baseID.Name] = idx
 						fb.scalars = append(fb.scalars, base)
 						fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
+						// Named-local sum base: no single-source SSA
+						// provenance under the v1 rules.
+						fb.scalarSrc = append(fb.scalarSrc, fusedParamSrc{})
 					}
 					nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgSum, Index: idx, Const: c})
 					fmt.Fprintf(&fb.key, "m%d+%d,", idx, c)
@@ -1059,6 +1116,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		}
 		fb.scalars = append(fb.scalars, a)
 		fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
+		fb.scalarSrc = append(fb.scalarSrc, fb.paramSrcFor(m, isMem, i, len(args), a))
 		fb.noteRead(a)
 	}
 	op := strings.TrimPrefix(lookupName, "simd_")

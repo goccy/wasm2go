@@ -107,6 +107,7 @@ func (fb *fusedTreeBuilder) restoreChase(s chaseSnap) {
 	fb.nodes = fb.nodes[:s.nodes]
 	fb.scalars = fb.scalars[:s.scalars]
 	fb.scalarOwner = fb.scalarOwner[:s.scalars]
+	fb.scalarSrc = fb.scalarSrc[:s.scalars]
 	fb.scalarDedup = s.scalarDedup
 	fb.chaseUses = s.chaseUses
 	fb.chaseCache = s.chaseCache
@@ -430,6 +431,9 @@ func (fb *fusedTreeBuilder) addChaseScalarArg(src ast.Expr, key string) (simdfus
 	fb.scalarDedup[key] = idx
 	fb.scalars = append(fb.scalars, src)
 	fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
+	// Chased compound expression: no single-source SSA provenance —
+	// a window carrying it stays on per-op splices in direct-asm.
+	fb.scalarSrc = append(fb.scalarSrc, fusedParamSrc{})
 	fb.noteChaseRead(src)
 	return simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: idx}, true
 }
