@@ -3190,12 +3190,26 @@ func memoryInit64(m *Module, seg int, dst int64, src int32, n int32) {
 		wasm_trap_meminit_oob()
 	}
 	if dstEnd > uint64(m.dataEnd) {
-		// dataEnd is 32-bit bookkeeping for shared-image embeddings;
-		// memory64 images are not shareable yet, so saturate rather
-		// than truncate.
-		m.dataEnd = ^uint32(0)
+		// Same bookkeeping as the 32-bit memoryInit: the end of the
+		// data-segment region is where BSS begins, and image-sharing
+		// embeddings must know it. dataEnd is a uint32; a segment
+		// landing beyond 4GiB saturates it, which makes the sharing
+		// layer refuse the image instead of truncating the extent.
+		if dstEnd >= uint64(^uint32(0)) {
+			m.dataEnd = ^uint32(0)
+		} else {
+			m.dataEnd = uint32(dstEnd)
+		}
 	}
-	copy(m.memory[uint64(dst):dstEnd], data[uint32(src):uint32(src)+uint32(n)])
+	d := m.memory[uint64(dst):dstEnd]
+	s := data[uint32(src) : uint32(src)+uint32(n)]
+	// Write only what differs, exactly like the 32-bit memoryInit: an
+	// image-backed instance re-running memory.init over a copy-on-write
+	// map must not fault every page private with an identical copy.
+	if bytes.Equal(d, s) {
+		return
+	}
+	copy(d, s)
 }
 
 // simdEA64 is simdEA for 64-bit addresses: u64 effective address with
