@@ -269,7 +269,13 @@ type fusedTreeBuilder struct {
 	scalarSrc []fusedParamSrc
 	floatSrc  []fusedParamSrc
 	pairSrc   []fusedParamSrc
-	key       strings.Builder
+	// nodeVals parallels nodes with the member SSA value each node was
+	// built from (nil for synthesized scalar-chain nodes). Remapped by
+	// scheduleNodes and rolled back by restoreChase in lockstep, it
+	// lets direct-asm window retention name a window's member and root
+	// values in the retained SSA.
+	nodeVals []*ssa.Value
+	key      strings.Builder
 	// varNode maps window-internal variable names to the node index
 	// holding their value, so a multi-root window's later statements
 	// consume earlier results as internal edges instead of pair
@@ -619,6 +625,11 @@ func (fb *fusedTreeBuilder) scheduleNodes(roots []int) []int {
 		newNodes[newIdx] = simdfuse.Node{Op: nd.Op, Args: args}
 	}
 	fb.nodes = newNodes
+	newVals := make([]*ssa.Value, n)
+	for newIdx, oldIdx := range scheduled {
+		newVals[newIdx] = fb.nodeVals[oldIdx]
+	}
+	fb.nodeVals = newVals
 	newRoots := make([]int, len(roots))
 	for i, r := range roots {
 		newRoots[i] = remap[r]
@@ -1121,6 +1132,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 	}
 	op := strings.TrimPrefix(lookupName, "simd_")
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: op, Args: nodeArgs})
+	fb.nodeVals = append(fb.nodeVals, m.val)
 	fmt.Fprintf(&fb.key, "%s;", op)
 	return len(fb.nodes) - 1, true
 }

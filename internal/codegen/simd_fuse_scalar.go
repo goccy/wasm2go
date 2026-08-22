@@ -105,6 +105,7 @@ func (fb *fusedTreeBuilder) snapshotChase() chaseSnap {
 
 func (fb *fusedTreeBuilder) restoreChase(s chaseSnap) {
 	fb.nodes = fb.nodes[:s.nodes]
+	fb.nodeVals = fb.nodeVals[:s.nodes]
 	fb.scalars = fb.scalars[:s.scalars]
 	fb.scalarOwner = fb.scalarOwner[:s.scalars]
 	fb.scalarSrc = fb.scalarSrc[:s.scalars]
@@ -405,6 +406,7 @@ func (fb *fusedTreeBuilder) addScalarNode(op string, args []simdfuse.Arg) (int, 
 		}
 	}
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: op, Args: args})
+	fb.nodeVals = append(fb.nodeVals, nil) // synthesized scalar-chain node
 	fmt.Fprintf(&fb.key, "%s;", op)
 	return len(fb.nodes) - 1, true
 }
