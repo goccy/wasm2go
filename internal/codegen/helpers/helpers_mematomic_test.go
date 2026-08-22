@@ -62,6 +62,51 @@ func TestMemoryInitAndDataDrop(t *testing.T) {
 	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit(m, 0, 0, 0, 1) })
 }
 
+// TestMemoryInit64DataEnd pins the memory64 variant's shared-image
+// bookkeeping: a passive-segment install below 4GiB must RAISE dataEnd
+// to its real extent, not saturate it. Threads builds make every
+// segment passive (memory.init at start-up is the only installer), so
+// a saturating memoryInit64 silently disabled copy-on-write image
+// sharing for every wasm64-threads engine.
+func TestMemoryInit64DataEnd(t *testing.T) {
+	m := newMemModuleM(64)
+	m.dataSegs = [][]byte{[]byte("hello world")}
+
+	memoryInit64(m, 0, 4, 0, 5)
+	if got := string(m.memory[4:9]); got != "hello" {
+		t.Errorf("memoryInit64 copied %q, want %q", got, "hello")
+	}
+	if m.dataEnd != 9 {
+		t.Errorf("dataEnd = %d, want 9 (dst+n)", m.dataEnd)
+	}
+	// Zero-length init is a no-op.
+	memoryInit64(m, 0, 60, 0, 0)
+	if m.dataEnd != 9 {
+		t.Errorf("dataEnd moved on a zero-length init: %d", m.dataEnd)
+	}
+	// Identical re-init takes the compare-then-write path (an
+	// image-backed instance re-running the start section must not
+	// fault shared pages private) and leaves the bytes correct.
+	memoryInit64(m, 0, 4, 0, 5)
+	if got := string(m.memory[4:9]); got != "hello" {
+		t.Errorf("second memoryInit64 corrupted memory: %q", got)
+	}
+	// A later, higher install raises dataEnd monotonically.
+	memoryInit64(m, 0, 20, 6, 5)
+	if got := string(m.memory[20:25]); got != "world" {
+		t.Errorf("memoryInit64 copied %q, want %q", got, "world")
+	}
+	if m.dataEnd != 25 {
+		t.Errorf("dataEnd = %d, want 25", m.dataEnd)
+	}
+
+	// Bounds checks trap like the 32-bit variant.
+	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit64(m, 0, 0, 0, 100) })
+	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit64(m, 0, 60, 0, 10) })
+	dataDrop(m, 0)
+	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit64(m, 0, 0, 0, 1) })
+}
+
 func TestAtomicMemoryOps(t *testing.T) {
 	m := newMemModuleM(64)
 
