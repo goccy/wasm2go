@@ -39,6 +39,33 @@ type plannedFusedWindow struct {
 	roots   []ssa.ValueID
 }
 
+// prescanFusedWindows runs BEFORE slot assignment: window emission
+// defers every operand read to the window's LAST member, so the
+// operand source values must keep DEDICATED slots — the block-local
+// reuse pool's lifetime model ends them at their original member
+// position and would overwrite them with interleaved glue. The scan
+// pins every potential operand source; over-pinning for windows the
+// full validation later rejects only costs frame bytes.
+func (p *funcPlan) prescanFusedWindows(windows []FusedWindow) {
+	for i := range windows {
+		w := &windows[i]
+		pin := func(srcs []FusedParamSrc) {
+			for _, s := range srcs {
+				if s.IsConst || s.Val == nil || s.ArgIdx < 0 || s.ArgIdx >= len(s.Val.Args) || s.Val.Args[s.ArgIdx] == nil {
+					continue
+				}
+				if p.fusedArgPinned == nil {
+					p.fusedArgPinned = map[ssa.ValueID]bool{}
+				}
+				p.fusedArgPinned[resolveSlotValue(s.Val.Args[s.ArgIdx]).ID] = true
+			}
+		}
+		pin(w.ScalarSrc)
+		pin(w.FloatSrc)
+		pin(w.PairSrc)
+	}
+}
+
 // planFusedWindows validates each descriptor against the plan's slot
 // map and records the emission index. Called after Pass 2 (slots
 // assigned) so operand resolution can use plan.offsets.

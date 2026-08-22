@@ -352,7 +352,14 @@ func emitFunc(name string, sig wasm.FuncType, f *ssa.Func, opts FuncOptions, a a
 	// corpus functions this collapses a 3.7 KB frame to the
 	// neighbourhood of what Pure-Go produces (~100 bytes).
 	if plan.spliceMode {
-		if _, isARM64 := a.(archARM64); isARM64 {
+		if _, isARM64 := a.(archARM64); isARM64 && plan.fusedAt == nil {
+			// Fused windows and the splice coalesce cannot coexist:
+			// the fused pool (v16..v30, plus R20-R24 in its prologue)
+			// clobbers the coalesce's carry homes, and a coalesced
+			// v128 phi never materializes the slot the window's
+			// deferred operand reads. Window-bearing bodies keep every
+			// carry in slots; the windows themselves carry the hot
+			// regions in registers.
 			runSpliceCoalescePass(f, plan)
 		}
 	}
@@ -2023,6 +2030,10 @@ type funcPlan struct {
 	// fusedRejectWhy holds the last window's plan-reject reason for
 	// the WASM2GO_FUSEDWIN_DEBUG diagnostics.
 	fusedRejectWhy string
+	// fusedArgPinned marks values a fused window reads at its
+	// deferred emission point: their slots must never join the
+	// block-local reuse pool (see prescanFusedWindows).
+	fusedArgPinned map[ssa.ValueID]bool
 	// mustSplice marks SIMD call values inside register-coalesced
 	// loops: their inline splice is load-bearing (a fallback CALL
 	// would clobber the carry registers), so a splice-table miss
@@ -2572,6 +2583,13 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 	maxCallee += callArgBias
 	p.calleeArea = maxCallee
 
+	// Pin fused-window operand sources before slot assignment: their
+	// reads happen at the window's deferred emission point, past the
+	// reuse model's lifetimes.
+	if _, fusedOK := opts.Splicer.(FusedSplicer); fusedOK {
+		p.prescanFusedWindows(opts.Windows)
+	}
+
 	// Pass 2: assign slot to every value. emit.ComputeHoist is
 	// captured for the per-op emitter to use as a tie-breaker
 	// (e.g., short-circuiting redundant materialisations) but the
@@ -2865,6 +2883,12 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				opEligible = false
 			}
 			if size >= 8 {
+				opEligible = false
+			}
+			if p.fusedArgPinned[v.ID] {
+				// A fused window reads this value's slot at its
+				// deferred emission point, past the lifetime the
+				// reuse model computes.
 				opEligible = false
 			}
 			if constsNeedSlot && arm64ReuseUnsafe(v.Op) {
