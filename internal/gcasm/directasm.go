@@ -139,12 +139,14 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	}
 	hasFusedWindow := strings.Contains(asm, fusedWindowMarker)
 	if archName == "arm64" && hasFusedWindow {
-		// Fused-window bodies skip the text passes: the fused pool
-		// registers (v16..v30) overlap the passes' cache and home
-		// ranges, and the passes' line model does not understand the
-		// window interiors. The windows already keep the hot regions
-		// in registers; pass integration for the per-op remainder is
-		// tracked separately.
+		// Fused-window bodies run the text passes AROUND the windows:
+		// the fused pool registers (v16..v30) overlap the passes'
+		// cache and home ranges, so the register-rewriting passes
+		// operate per outside-segment (state flushed at each window
+		// boundary, interiors verbatim), while the read-counting
+		// dead-store pass runs whole-body — window slot reads count
+		// like any other, and windows contain no droppable stores.
+		asm = a64ApplyPassesAroundWindows(asm)
 	} else if archName == "arm64" && strings.Contains(asm, "FMOVQ") {
 		// Store-to-load forwarding over the v128 slots, same pass the
 		// gc-captured bodies get (identical instruction vocabulary,
@@ -366,8 +368,84 @@ func (s *directAsmSplicer) Splice(b *strings.Builder, name string, args []asmgen
 // back to the listing transform — earlier members already emitted
 // nothing, so there is no per-op recovery mid-window).
 // fusedWindowMarker tags direct-asm bodies containing fused-window
-// splices; emitDirectAsmBody keys the text-pass skip off it.
+// splices; emitDirectAsmBody keys the pass segmentation off it. The
+// splicer brackets each window with "<marker> <tree>" and
+// "<marker> end" comment lines.
 const fusedWindowMarker = "// fused window"
+
+// a64ApplyPassesAroundWindows runs the direct-asm text passes on a
+// window-bearing body: the register-rewriting passes per
+// outside-window segment, the whole-body dead-store pass across
+// everything.
+func a64ApplyPassesAroundWindows(asm string) string {
+	segs := splitFusedSegments(asm)
+	for i := range segs {
+		if segs[i].window {
+			continue
+		}
+		t := segs[i].text
+		if strings.Contains(t, "FMOVQ") {
+			t = a64ForwardSimdSlots(t)
+			t = a64SpliceValueCache(t)
+			t = a64DeadSimdOutStoresSegmented(t, asm)
+		}
+		segs[i].text = t
+	}
+	var b strings.Builder
+	for _, sg := range segs {
+		b.WriteString(sg.text)
+	}
+	out := b.String()
+	segs = splitFusedSegments(out)
+	for i := range segs {
+		if !segs[i].window {
+			segs[i].text = a64ScalarSlotForward(segs[i].text)
+		}
+	}
+	b.Reset()
+	for _, sg := range segs {
+		b.WriteString(sg.text)
+	}
+	return b.String()
+}
+
+// fusedSegment is one alternating run of lines outside or inside a
+// fused window (markers inclusive on the inside).
+type fusedSegment struct {
+	text   string
+	window bool
+}
+
+// splitFusedSegments cuts a body at the window markers. Text always
+// round-trips: concatenating the segments reproduces the input.
+func splitFusedSegments(body string) []fusedSegment {
+	var segs []fusedSegment
+	var cur strings.Builder
+	inWin := false
+	flush := func(win bool) {
+		if cur.Len() > 0 {
+			segs = append(segs, fusedSegment{text: cur.String(), window: win})
+			cur.Reset()
+		}
+	}
+	for _, line := range strings.SplitAfter(body, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case !inWin && strings.HasPrefix(t, fusedWindowMarker):
+			flush(false)
+			inWin = true
+			cur.WriteString(line)
+		case inWin && t == fusedWindowMarker+" end":
+			cur.WriteString(line)
+			flush(true)
+			inWin = false
+		default:
+			cur.WriteString(line)
+		}
+	}
+	flush(inWin)
+	return segs
+}
 
 func (s *directAsmSplicer) SpliceFused(b *strings.Builder, tree *simdfuse.Tree, scalars, floats, pairs []asmgen.FusedOperand, rootSlots [][2]int, scratchBase int) (bool, bool) {
 	_ = scratchBase
@@ -437,6 +515,7 @@ func (s *directAsmSplicer) SpliceFused(b *strings.Builder, tree *simdfuse.Tree, 
 	// Re-prime the emitter's m cache and hoisted module state.
 	tmp.WriteString("\tMOVD m+0(FP), R24\n")
 	tmp.WriteString(s.HoistPrologue())
+	fmt.Fprintf(&tmp, "\t%s end\n", fusedWindowMarker)
 	b.WriteString(tmp.String())
 	return true, trap && tree.NeedsMem
 }
