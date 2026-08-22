@@ -16,10 +16,17 @@ package asmgen
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 )
+
+// fusedWinDebug gates plan-time reject diagnostics (stderr), for
+// coverage work on real modules where a silent per-op fallback and a
+// fused window are indistinguishable in the output values.
+var fusedWinDebug = os.Getenv("WASM2GO_FUSEDWIN_DEBUG") != ""
 
 // plannedFusedWindow is one validated window, resolved to emission
 // terms: operands in fused-signature order and the roots' value IDs
@@ -62,7 +69,11 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow, frame ar
 	}
 	for i := range windows {
 		w := &windows[i]
-		if pw, last, ok := p.resolveFusedWindow(w, blockOf, posOf, blockValues, consumers, frame); ok {
+		pw, last, ok := p.resolveFusedWindow(w, blockOf, posOf, blockValues, consumers, frame)
+		if !ok && fusedWinDebug {
+			fmt.Fprintf(os.Stderr, "wasm2go: fused window %s in %s: plan reject: %s\n", w.Tree.Name, f.Name, p.fusedRejectWhy)
+		}
+		if ok {
 			if p.fusedAt == nil {
 				p.fusedAt = map[ssa.ValueID]*plannedFusedWindow{}
 				p.fusedMember = map[ssa.ValueID]bool{}
@@ -80,20 +91,25 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow, frame ar
 // emits there, so every input value defined between the members has
 // already been materialized; earlier members emit nothing.
 func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ssa.BlockID, posOf map[ssa.ValueID]int, blockValues map[ssa.BlockID][]*ssa.Value, consumers map[ssa.ValueID]int, frame argFrame) (*plannedFusedWindow, ssa.ValueID, bool) {
-	if w.Tree == nil || len(w.Members) == 0 {
+	p.fusedRejectWhy = ""
+	reject := func(why string) (*plannedFusedWindow, ssa.ValueID, bool) {
+		p.fusedRejectWhy = why
 		return nil, 0, false
+	}
+	if w.Tree == nil || len(w.Members) == 0 {
+		return reject("empty descriptor")
 	}
 	// Every member must live in one block, and no member may already
 	// belong to another planned window (identical trees repeat; the
 	// first claim wins and later duplicates must not double-plan).
 	blk, ok := blockOf[w.Members[0].ID]
 	if !ok {
-		return nil, 0, false
+		return reject("first member not in the SSA")
 	}
 	isRoot := map[ssa.ValueID]bool{}
 	for _, r := range w.Roots {
 		if r == nil {
-			return nil, 0, false
+			return reject("nil root")
 		}
 		isRoot[r.ID] = true
 	}
@@ -102,7 +118,7 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 	var lastID ssa.ValueID
 	for _, m := range w.Members {
 		if m == nil || blockOf[m.ID] != blk || p.fusedMember[m.ID] {
-			return nil, 0, false
+			return reject("member outside the block or already claimed")
 		}
 		memberSet[m.ID] = true
 		pos := posOf[m.ID]
@@ -114,28 +130,39 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 			lastID = m.ID
 		}
 	}
-	// Values interleaved between the members must be pure scalar glue
-	// (address arithmetic feeding later members): deferring the whole
-	// window past them is then observation-free. Any effectful or
-	// memory-touching interloper — or one reading a root before the
-	// window's deferred emission would write it — rejects the window.
+	// Values interleaved between the members must be safe to ORDER
+	// BEFORE the whole window (emission defers the window to its last
+	// member): pure scalar glue always is, and plain scalar LOADS are
+	// when the window writes no memory — the codegen fusion proved
+	// exactly this hoist when it claimed the region past them. Any
+	// store, call, SIMD op, or read of a root rejects the window.
+	windowStores := false
+	for _, n := range w.Tree.Nodes {
+		if simdfuse.IsStore(n.Op) {
+			windowStores = true
+		}
+	}
 	for _, v := range blockValues[blk][first : last+1] {
 		if memberSet[v.ID] {
 			continue
 		}
 		switch v.Op {
-		case ssa.OpSimdCall, ssa.OpSimdMemCall,
-			ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
+		case ssa.OpSimdCall, ssa.OpSimdMemCall:
+			return reject(fmt.Sprintf("interleaved SIMD op %v", v.Op))
+		case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
 			ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
 			ssa.OpLoadF32, ssa.OpLoadF64:
-			return nil, 0, false
+			if windowStores {
+				return reject(fmt.Sprintf("interleaved load %v across a storing window", v.Op))
+			}
+			continue
 		}
 		if isSideEffectingOp(v.Op) || opEmitsCall(v.Op) {
-			return nil, 0, false
+			return reject(fmt.Sprintf("interleaved effectful op %v", v.Op))
 		}
 		for _, a := range v.Args {
 			if a != nil && isRoot[a.ID] {
-				return nil, 0, false
+				return reject("interleaved read of a root")
 			}
 		}
 	}
@@ -157,7 +184,7 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 			continue
 		}
 		if consumers[m.ID] != inWindow[m.ID] {
-			return nil, 0, false
+			return reject(fmt.Sprintf("non-root member v%d consumed outside the window", m.ID))
 		}
 	}
 	pw := &plannedFusedWindow{win: w}
@@ -198,17 +225,17 @@ func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ss
 	}
 	var ok2 bool
 	if pw.scalars, ok2 = resolve(w.ScalarSrc, false); !ok2 {
-		return nil, 0, false
+		return reject("unresolvable scalar operand")
 	}
 	if pw.floats, ok2 = resolve(w.FloatSrc, false); !ok2 {
-		return nil, 0, false
+		return reject("unresolvable float operand")
 	}
 	if pw.pairs, ok2 = resolve(w.PairSrc, true); !ok2 {
-		return nil, 0, false
+		return reject("unresolvable pair operand")
 	}
 	for _, r := range w.Roots {
 		if _, ok := p.offsets[r.ID]; !ok {
-			return nil, 0, false
+			return reject("root without a slot")
 		}
 		pw.roots = append(pw.roots, r.ID)
 	}

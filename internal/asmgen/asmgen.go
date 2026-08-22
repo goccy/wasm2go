@@ -2020,6 +2020,9 @@ type funcPlan struct {
 	// anything else keeps per-op emission.
 	fusedAt     map[ssa.ValueID]*plannedFusedWindow
 	fusedMember map[ssa.ValueID]bool
+	// fusedRejectWhy holds the last window's plan-reject reason for
+	// the WASM2GO_FUSEDWIN_DEBUG diagnostics.
+	fusedRejectWhy string
 	// mustSplice marks SIMD call values inside register-coalesced
 	// loops: their inline splice is load-bearing (a fallback CALL
 	// would clobber the carry registers), so a splice-table miss
