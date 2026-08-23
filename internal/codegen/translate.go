@@ -165,6 +165,14 @@ type Options struct {
 	// structural contract). Zero — the default — disables the scan
 	// and leaves every module untouched.
 	VecDotPairEntry int
+	// VecDotRows additionally batches the verified vec_dot's caller
+	// row loops: the translator emits a row-looped companion of the
+	// verified function and rewrites matching driver loops into one
+	// guarded companion call per chunk (the original loop stays as
+	// the guard-miss branch, so semantics are preserved for every
+	// runtime type). Requires VecDotPairEntry; off by default and
+	// inert without it.
+	VecDotRows bool
 	// FuseDebug prints SIMD fusion diagnostics to stderr: failed
 	// window-trial refusals and loop-upgrade rejections, tagged by
 	// the refusing check. Diagnosis only; no effect on output.
@@ -2800,6 +2808,19 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 	// the splitter does not yet recognise, so this is a no-op until
 	// that gap is closed (either by emitting a Go switch from the
 	// chain or by introducing a BlockSwitch SSA op).
+	if t.opts.VecDotRows && t.nrc2 != nil {
+		t.rewriteVecDotRowLoops(body)
+	}
+	var rowsDecl ast.Decl
+	if t.opts.VecDotRows && t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
+		// Clone before the prelude prepend: the companion pins nrc
+		// to 1, so the paired-tile dispatch would be dead weight.
+		clone, cerr := cloneBlockStmt(body)
+		if cerr != nil {
+			return nil, fmt.Errorf("vec-dot-rows companion: %w", cerr)
+		}
+		rowsDecl = t.rowsCompanion(clone)
+	}
 	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
 		// The paired-tile prelude and its companion (see nrc2.go).
 		body.List = append([]ast.Stmt{t.nrc2Prelude()}, body.List...)
@@ -2811,6 +2832,9 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 	}}
 	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
 		out = append(out, t.nrc2Companion())
+	}
+	if rowsDecl != nil {
+		out = append(out, rowsDecl)
 	}
 	outlined, err := t.emitOutlinedDecls()
 	if err != nil {
