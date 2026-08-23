@@ -809,8 +809,13 @@ func buildPkg(
 			return nil, fmt.Errorf("transform %s: %w", f.Name, terr)
 		}
 		sig := declSig(rel, name, declParams, hasRes, res, synth)
-		_, isSynthFn := synth[name]
-		if arch.gatedMarker != "" && !isSynthFn &&
+		// Synthetic bodies take the same feature-gated twin split as
+		// wasm functions: the batched-rows companion clones a kernel
+		// whose body selects SDOT/AVX2 forms, so running its plain
+		// symbol on a baseline CPU would fault. (Outlined extraction
+		// bodies historically never contained gated instructions, so
+		// including them here is a no-op for them.)
+		if arch.gatedMarker != "" &&
 			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {
 			// Feature-gated body: the feature symbol keeps this body, a
 			// baseline twin is transformed with PortableSIMD, and a
