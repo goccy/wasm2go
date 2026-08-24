@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -39,6 +40,9 @@ func flagDispatchSrc(fnName string) string {
 // false-negative holes and some leaves got no replay, so the tree's
 // leftover flags leaked into the arms and picked the wrong branch.
 func TestJumpTableFlagReplayRun(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	dir := t.TempDir()
 	src := "package lib\n\n//go:noinline\n" + flagDispatchSrc("FDispatch")
 	for name, content := range map[string]string{
