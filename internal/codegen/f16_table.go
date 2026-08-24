@@ -3,7 +3,6 @@ package codegen
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
 	"sort"
 )
 
@@ -92,15 +91,16 @@ func (t *translator) hasIEEEF16TableAt(base uint32) bool {
 	return true
 }
 
-// checkStaleF16Table warns, once translation is done, about f16
-// gather sites whose base verified NEITHER statically nor through
-// init-loop detection: the table-keyed rewrites stayed off there — a
-// pure performance loss that is otherwise invisible. The warning is
-// unconditional (no configuration gates it) so a detection miss
-// after a module change is loud in every pipeline log.
+// checkStaleF16Table fails the build, once translation is done, when
+// f16 gather sites exist whose base verified NEITHER statically nor
+// through init-loop detection. Left as a warning this state is the
+// silent-degradation trap (the rewrites stay off and nothing in a
+// long pipeline log demands attention); as an error it forces a
+// decision — fix whatever broke the detection, or declare that the
+// module has no f16 table by disabling the rewrites outright.
 func (t *translator) checkStaleF16Table() error {
 	if msg := unverifiedF16GatherMsg(t.opts.DisableF16Table, t.f16TablesOK); msg != "" {
-		fmt.Fprintln(os.Stderr, msg)
+		return fmt.Errorf("%s", msg)
 	}
 	return nil
 }
@@ -123,7 +123,7 @@ func unverifiedF16GatherMsg(disabled bool, tables map[uint32]bool) string {
 	}
 	sort.Slice(unverified, func(i, j int) bool { return unverified[i] < unverified[j] })
 	return fmt.Sprintf(
-		"wasm2go: f16 gather sites at bases %v were not verified (no static table image, no init-loop coverage) — the table-keyed rewrites stayed OFF there",
+		"wasm2go: f16 gather sites at bases %v were not verified (no static table image, no init-loop coverage): the table-keyed rewrites cannot prove themselves applicable — fix the table initialization so detection sees it, or pass -no-f16-table if this module has no runtime f16 table",
 		unverified)
 }
 

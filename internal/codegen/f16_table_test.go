@@ -176,7 +176,7 @@ func TestUnverifiedF16GatherMsg(t *testing.T) {
 			t.Errorf("unverifiedF16GatherMsg(disabled=%v, %v): warn=%v, want %v (msg %q)", tc.disabled, tc.tables, got, tc.warn, msg)
 		}
 	}
-	// The warning names the unverified bases.
+	// The error names the unverified bases and the way out.
 	if msg := unverifiedF16GatherMsg(false, map[uint32]bool{4096: false}); !strings.Contains(msg, "4096") {
 		t.Errorf("warning should list unverified bases: %q", msg)
 	}
