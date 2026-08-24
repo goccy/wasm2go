@@ -153,7 +153,7 @@ var helperSigs = map[string]helperSpec{
 
 // helperAlwaysInline names the helpers BOTH per-arch emitters lower
 // to one or two native instructions with no CALL: the sign/zero
-// extends, the 32-bit float/int reinterprets, and f32_abs. planFunc
+// extends, the float/int reinterprets, and f32_abs. planFunc
 // exempts them from hasCall (they impose no callee frame and no
 // ForbidCalls consequence); each arch's emit path must keep inline
 // coverage for exactly this set.
@@ -162,6 +162,7 @@ func helperAlwaysInline(name string) bool {
 	case "i64_extend_i32_s", "i64_extend_i32_u", "i64_extend32_s",
 		"i32_wrap_i64",
 		"i32_reinterpret_f32", "f32_reinterpret_i32",
+		"i64_reinterpret_f64", "f64_reinterpret_i64",
 		"f32_abs", "f32_neg", "f64_abs", "f64_neg",
 		"f64_promote_f32", "f32_demote_f64",
 		"f32_eq", "f32_ne", "f32_lt", "f32_le", "f32_gt", "f32_ge",

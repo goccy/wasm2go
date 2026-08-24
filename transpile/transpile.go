@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/goccy/wasm2go/internal/asmgen"
 	"github.com/goccy/wasm2go/internal/codegen"
 	"github.com/goccy/wasm2go/internal/gcasm"
 	"github.com/goccy/wasm2go/internal/wasm"
@@ -109,13 +110,36 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		if directAsm == nil {
 			directAsm = map[string]gcasm.DirectAsmFn{}
 		}
-		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
+		var windows []asmgen.FusedWindow
+		for _, w := range df.Windows {
+			conv := func(srcs []codegen.DirectAsmParamSrc) []asmgen.FusedParamSrc {
+				out := make([]asmgen.FusedParamSrc, len(srcs))
+				for i, s := range srcs {
+					out[i] = asmgen.FusedParamSrc{IsConst: s.IsConst, Const: s.Const, Val: s.Val, ArgIdx: s.ArgIdx}
+				}
+				return out
+			}
+			windows = append(windows, asmgen.FusedWindow{
+				Tree: w.Tree, Members: w.Members, Roots: w.Roots,
+				ScalarSrc: conv(w.ScalarSrc), FloatSrc: conv(w.FloatSrc), PairSrc: conv(w.PairSrc),
+			})
+		}
+		directAsm[name] = gcasm.DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams, Windows: windows}
+	}
+	var directAsmExc *asmgen.ExcOffsets
+	if res.DirectAsmExc != nil {
+		directAsmExc = &asmgen.ExcOffsets{
+			Pending: res.DirectAsmExc.Pending,
+			Tag:     res.DirectAsmExc.Tag,
+			Vals:    res.DirectAsmExc.Vals,
+		}
 	}
 	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
 		FastMath:         opts.FastMath,
 		FuseLoopUnroll:   opts.FuseLoopUnroll,
 		DirectAsm:        directAsm,
 		DirectAsmGlobals: res.DirectAsmGlobals,
+		DirectAsmExc:     directAsmExc,
 	})
 	if err != nil {
 		return res, fmt.Errorf("gcasm backend: %w", err)

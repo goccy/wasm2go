@@ -63,7 +63,7 @@ func isPlan9AsmSafe(path string) bool {
 // to the shared file.
 // The `l<blockID>` suffix names a loop outlined from that function
 // (see internal/ssa/outline.go); those bodies route with their parent.
-var wasmFuncBodyName = regexp.MustCompile(`^[Ff]n\d+(l\d+)?$`)
+var wasmFuncBodyName = regexp.MustCompile(`^[Ff]n\d+(l\d+|rows)?$`)
 
 // isLinknameTrampolineBody reports whether body is the single-stmt
 // forwarding pattern emitLinknameForwards emits for cross-chunk

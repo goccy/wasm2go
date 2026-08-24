@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/emit"
+	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 )
 
@@ -70,6 +71,34 @@ type SimdSplicer interface {
 	// Empty disables hoisting: splices then reload the state per
 	// site.
 	HoistPrologue() string
+}
+
+// FusedSplicer is the optional SimdSplicer extension for whole-window
+// bodies: one call per FusedWindow instead of per-op splices. The
+// emitter type-asserts for it, so per-op-only splicers keep working
+// unchanged. Operands arrive in fused-signature order as frame slots
+// or immediates; rootSlots gives each root value's [2]uint64 slot
+// offsets (lo, hi) for the result epilogue. Reporting false keeps
+// the window's members on per-op emission.
+type FusedSplicer interface {
+	SpliceFused(b *strings.Builder, tree *simdfuse.Tree, scalars, floats, pairs []FusedOperand, rootSlots [][2]int, scratchBase int) (spliced, wantsTrap bool)
+}
+
+// FusedOperand is one fused-signature argument at emission time: an
+// immediate constant, or a value materialized in its frame slot
+// (SlotOff; v128 pairs occupy SlotOff and SlotOff+8). Addr64 trees
+// carry 64-bit scalars; Wide reflects the load width the staging
+// must use.
+type FusedOperand struct {
+	IsConst bool
+	Const   int64
+	SlotOff int
+	Wide    bool
+	// FPRef, when non-empty, is the plan9 FP-relative operand of an
+	// unpacked parameter ("l1+12(FP)") — parameters are FP-resident
+	// and their RSP slots are never written, so staging must read the
+	// argument frame instead.
+	FPRef string
 }
 
 // simdCallSpec is one SIMD helper call's ABI0 layout.

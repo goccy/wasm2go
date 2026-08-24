@@ -98,6 +98,66 @@ func TestMatchCountdownLoopHeaderForm(t *testing.T) {
 	}
 }
 
+func TestMatchCountdownLoopDoWhileFloor(t *testing.T) {
+	// Rotated count-down-to-K source loops exit on `K < d` (or the
+	// mirrored `d > K`) instead of `d != 0`; the floor rides the
+	// descriptor as a signed threshold.
+	for name, src := range map[string]string{
+		"const lit floor": `
+	for {
+		acc = acc + x
+		d = c - 1
+		if 1 < d {
+			p = p + 16
+			c = d
+			continue
+		} else {
+			break
+		}
+		break
+	}`,
+		"const local floor": `
+	for {
+		acc = acc + x
+		k = 1
+		d = c - k
+		if k < d {
+			p = p + 16
+			c = d
+			continue
+		} else {
+			break
+		}
+		break
+	}`,
+		"mirrored gtr floor": `
+	for {
+		acc = acc + x
+		d = c - 1
+		if d > 1 {
+			p = p + 16
+			c = d
+			continue
+		} else {
+			break
+		}
+		break
+	}`,
+	} {
+		cl, ok := matchCountdownLoop(nil, parseFor(t, src))
+		if !ok {
+			t.Errorf("%s: floor countdown not matched", name)
+			continue
+		}
+		if cl.thresh == nil {
+			t.Errorf("%s: threshold not recorded", name)
+		}
+		if cl.counter.Name != "c" || cl.decVar.Name != "d" {
+			t.Errorf("%s: bound wrong: counter=%s dec=%s", name, cl.counter.Name, cl.decVar.Name)
+		}
+	}
+}
+
 func TestMatchCountdownLoopRejections(t *testing.T) {
 	cases := map[string]string{
 		"three-part for": `for i = 0; i < n; i = i + 1 { acc = acc + x }`,
@@ -146,6 +206,18 @@ func TestMatchCountdownLoopRejections(t *testing.T) {
 			acc = acc + x
 			c = c - 1
 		}
+	}`,
+		"count-up guard (decVar left of lss)": `
+	for {
+		acc = acc + x
+		d = c - 1
+		if d < 8 {
+			c = d
+			continue
+		} else {
+			break
+		}
+		break
 	}`,
 	}
 	for name, src := range cases {

@@ -165,6 +165,14 @@ type Options struct {
 	// structural contract). Zero — the default — disables the scan
 	// and leaves every module untouched.
 	VecDotPairEntry int
+	// VecDotRows additionally batches the verified vec_dot's caller
+	// row loops: the translator emits a row-looped companion of the
+	// verified function and rewrites matching driver loops into one
+	// guarded companion call per chunk (the original loop stays as
+	// the guard-miss branch, so semantics are preserved for every
+	// runtime type). Requires VecDotPairEntry; off by default and
+	// inert without it.
+	VecDotRows bool
 	// FuseDebug prints SIMD fusion diagnostics to stderr: failed
 	// window-trial refusals and loop-upgrade rejections, tagged by
 	// the refusing check. Diagnosis only; no effect on output.
@@ -193,6 +201,12 @@ type DirectAsmFn struct {
 	Sig          wasm.FuncType
 	Packed       bool
 	PackedParams []ssa.Type
+	// Windows lists the fused windows the emission-time fusion pass
+	// claimed inside this function, so the asm bundle can emit the
+	// shared fused splice bodies instead of per-op splices. Recorded
+	// only when every member, root and parameter source is nameable
+	// in the retained SSA (see addDirectAsmWindow).
+	Windows []DirectAsmWindow
 }
 
 // Result returns auxiliary outputs from Translate beyond the main Go source.
@@ -241,6 +255,12 @@ type Result struct {
 	// direct-asm retention is active. The generated bundle carries
 	// compile-time assertions pinning these offsets.
 	DirectAsmGlobals []int
+	// DirectAsmExc is the byte offset of each exception-state field
+	// within the generated Module struct, for direct-asm bodies to
+	// inline OpExc* accesses. Nil unless direct-asm retention is
+	// active and the module has exception state. Pinned by the same
+	// generated compile-time assertions as DirectAsmGlobals.
+	DirectAsmExc *DirectAsmExcLayout
 }
 
 // Translate parses helpers, walks the module, and emits Go source for
@@ -567,6 +587,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	res.DirectAsmSSA = t.directAsmSSA
 	if len(t.directAsmSSA) > 0 {
 		res.DirectAsmGlobals = t.moduleGlobalOffsets()
+		res.DirectAsmExc = t.moduleExcOffsets()
 	}
 	if t.nrc2 != nil {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
@@ -899,6 +920,9 @@ type translator struct {
 	// creates; see simd_fuse.go and internal/simdfuse.
 	fusedShapes *fusedShapeState
 	fusedLoops  *fusedLoopState
+	// segPlacements caches passiveSegmentPlacements' result (nil until
+	// first use; empty map = scanned, nothing found).
+	segPlacements map[int]int64
 	// excSlots is the operand-slot count the module's exception state
 	// needs: the widest tag arity, or 0 when the module has no EH (the
 	// state fields are then omitted entirely). See emitModuleStruct.
@@ -1709,6 +1733,32 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		})
 	}
 
+	// The propagating-exception state, when the module uses EH. A wasm
+	// exception travels as module state plus a check-and-branch after every
+	// call that may raise one, so EH code stays ordinary straight-line Go.
+	// Value fields on purpose: a wasi-threads agent runs on a struct COPY,
+	// which makes the state per-execution-context for free (an exception
+	// belongs to one thread, exactly like a global). Declared here, in the
+	// fixed-offset leading region right after outlinePack, so direct-asm
+	// bodies can address it with a trivially modeled offset
+	// (moduleExcOffsets) instead of modeling the whole struct tail; the
+	// generated compile-time pins assert the model.
+	if t.excSlots > 0 {
+		fields = append(fields,
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excPending"))},
+				Type:  newID("int32"),
+			},
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excTag"))},
+				Type:  newID("uint32"),
+			},
+			&ast.Field{
+				Names: []*ast.Ident{newID(t.fieldName("excVals"))},
+				Type:  &ast.ArrayType{Len: intLit(int64(t.excSlots)), Elt: newID("uint64")},
+			})
+	}
+
 	for i := range t.mod.Tables {
 		fields = append(fields, &ast.Field{
 			Names: []*ast.Ident{newID(t.fieldName(fmt.Sprintf("t%d", i)))},
@@ -1808,29 +1858,6 @@ func (t *translator) emitModuleStruct() ast.Decl {
 				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID(argType)},
 			}}},
 		})
-	}
-
-	// The propagating-exception state, when the module uses EH. A wasm
-	// exception travels as module state plus a check-and-branch after every
-	// call that may raise one, so EH code stays ordinary straight-line Go.
-	// Value fields on purpose: a wasi-threads agent runs on a struct COPY,
-	// which makes the state per-execution-context for free (an exception
-	// belongs to one thread, exactly like a global). Declared LAST, after
-	// every pre-existing field, per the layout convention above.
-	if t.excSlots > 0 {
-		fields = append(fields,
-			&ast.Field{
-				Names: []*ast.Ident{newID(t.fieldName("excPending"))},
-				Type:  newID("int32"),
-			},
-			&ast.Field{
-				Names: []*ast.Ident{newID(t.fieldName("excTag"))},
-				Type:  newID("uint32"),
-			},
-			&ast.Field{
-				Names: []*ast.Ident{newID(t.fieldName("excVals"))},
-				Type:  &ast.ArrayType{Len: intLit(int64(t.excSlots)), Elt: newID("uint64")},
-			})
 	}
 
 	return &ast.GenDecl{
@@ -2781,6 +2808,19 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 	// the splitter does not yet recognise, so this is a no-op until
 	// that gap is closed (either by emitting a Go switch from the
 	// chain or by introducing a BlockSwitch SSA op).
+	if t.opts.VecDotRows && t.nrc2 != nil {
+		t.rewriteVecDotRowLoops(body)
+	}
+	var rowsDecl ast.Decl
+	if t.opts.VecDotRows && t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
+		// Clone before the prelude prepend: the companion pins nrc
+		// to 1, so the paired-tile dispatch would be dead weight.
+		clone, cerr := cloneBlockStmt(body)
+		if cerr != nil {
+			return nil, fmt.Errorf("vec-dot-rows companion: %w", cerr)
+		}
+		rowsDecl = t.rowsCompanion(clone)
+	}
 	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
 		// The paired-tile prelude and its companion (see nrc2.go).
 		body.List = append([]ast.Stmt{t.nrc2Prelude()}, body.List...)
@@ -2792,6 +2832,9 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 	}}
 	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
 		out = append(out, t.nrc2Companion())
+	}
+	if rowsDecl != nil {
+		out = append(out, rowsDecl)
 	}
 	outlined, err := t.emitOutlinedDecls()
 	if err != nil {

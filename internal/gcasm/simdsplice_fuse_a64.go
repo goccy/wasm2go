@@ -199,6 +199,13 @@ func a64EmitSdotIdx(b *strings.Builder, reg int) {
 // once, outside the loop).
 func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets,
 	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, lutBase map[int]string, sdotIdx int, portable bool, dual *a64DualAcc) ([]fusedLoc, bool, error) {
+	return a64SpliceFusedCoreLutPtr(b, tree, pool, offs, carried, reserve, extraIntArgs, skipProlog, lutBase, sdotIdx, portable, dual, nil)
+}
+
+// a64SpliceFusedCoreLutPtr additionally receives the loop splicer's
+// carried host pointers (nil for straight-line windows).
+func a64SpliceFusedCoreLutPtr(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool, offs *ModuleOffsets,
+	carried map[int]int, reserve []int, extraIntArgs int, skipProlog bool, lutBase map[int]string, sdotIdx int, portable bool, dual *a64DualAcc, hostPtrs map[int]*a64HostPtr) ([]fusedLoc, bool, error) {
 	tree = a64Dot8Rewrite(tree, portable, offs.fastMath())
 	if !skipProlog {
 		if err := a64FusedProlog(b, tree, offs); err != nil {
@@ -277,7 +284,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 		return sdotIdx, nil
 	}
 
-	chains := newA64ScalarChain(b, tree, scalarReg, uses, lutBase)
+	chains := newA64ScalarChain(b, tree, scalarReg, uses, lutBase, hostPtrs)
 
 	// memAddrReg consumes a chain-computed ADDRESS operand (Args[0]
 	// as an ArgNode): the glued scalar chain just evaluated it into
@@ -373,6 +380,11 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 			areg, aerr := memAddrReg(n)
 			if aerr != nil {
 				return nil, false, aerr
+			}
+			if areg == "" && a64HostPtrLoad(b, n, scalarReg, dst, tree.Addr64, hostPtrs) {
+				loc[i] = fusedLoc{chained: willChain, pool: dst}
+				needsTrap = true
+				continue
 			}
 			if err := a64FusedLoad(b, n, scalarReg, offs, dst, tree.Addr64, areg); err != nil {
 				return nil, false, err
@@ -602,12 +614,64 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 			fmt.Fprintf(b, "\tWORD $0x%08x // fcvtl v%d.4s, v%d.4h\n", enc, dst, dst)
 			loc[i] = fusedLoc{chained: willChain, pool: dst}
 			continue
-		} else if n.Op == a64OpSdot16 || n.Op == a64OpSdotAcc {
+		} else if n.Op == "i8x16_shuffle_const" {
+			// Shuffle with a descriptor-constant control vector: the
+			// pattern materializes from immediates (no ABI slot), the
+			// two sources route into the consecutive TBL table pair
+			// v1/v2, and one two-register TBL produces the result.
+			if len(n.Args) != 6 {
+				return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+			}
+			// Sources land in the sanctioned scratch v1/v2 (pool and
+			// carried registers live at V16+, the chain value at v0 —
+			// no overlap); the pattern rides v3.
+			for k := 0; k < 2; k++ {
+				a := n.Args[k]
+				tbl := 1 + k
+				switch a.Kind {
+				case simdfuse.ArgNode:
+					if loc[a.Index].chained {
+						if k != 0 {
+							return nil, false, fmt.Errorf("fused splice %s: chained value consumed at operand %d", tree.Name, k)
+						}
+						a64VecCopy(b, tbl, 0)
+					} else {
+						a64VecCopy(b, tbl, loc[a.Index].pool)
+					}
+				case simdfuse.ArgPairIn:
+					if cr, isCarried := carried[a.Index]; isCarried {
+						a64VecCopy(b, tbl, cr)
+					} else {
+						lo, hi := pairRegs(a)
+						fmt.Fprintf(b, "\tFMOVD %s, F%d\n", lo, tbl)
+						fmt.Fprintf(b, "\tVMOV %s, V%d.D[1]\n", hi, tbl)
+					}
+				default:
+					return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+				}
+			}
+			u32c := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
+			patLo := u32c(n.Args[2]) | u32c(n.Args[3])<<32
+			patHi := u32c(n.Args[4]) | u32c(n.Args[5])<<32
+			fmt.Fprintf(b, "\tMOVD $0x%016x, R22\n", patLo)
+			b.WriteString("\tFMOVD R22, F3\n")
+			fmt.Fprintf(b, "\tMOVD $0x%016x, R22\n", patHi)
+			b.WriteString("\tVMOV R22, V3.D[1]\n")
+			enc := 0x4E000000 | uint32(3)<<16 | 0x2000 | uint32(1)<<5 | uint32(dst)
+			fmt.Fprintf(b, "\tWORD $0x%08x // tbl v%d.16b, {v1.16b, v2.16b}, v3.16b\n", enc, dst)
+			loc[i] = fusedLoc{chained: willChain, pool: dst}
+			continue
+		} else if n.Op == a64OpSdot16 || n.Op == a64OpSdotAcc ||
+			n.Op == a64OpSdotRaw || n.Op == a64OpSdotRawAcc {
 			// Full 16-byte dot via TBL-permuted SDOT (see the rewrite for
 			// the bit-identity argument). Byte sources are the last two
-			// args; a64OpSdotAcc's arg0 is the int32 accumulator.
+			// args; the _acc variants' arg0 is the int32 accumulator. The
+			// _raw variants come from the cross-chain rewrite, whose
+			// matched lane combine wants SDOT's natural grouping — never
+			// permute those.
+			raw := n.Op == a64OpSdotRaw || n.Op == a64OpSdotRawAcc
 			base := 0
-			if n.Op == a64OpSdotAcc {
+			if n.Op == a64OpSdotAcc || n.Op == a64OpSdotRawAcc {
 				base = 1
 			}
 			var srcs [2]int
@@ -639,9 +703,10 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 				}
 			}
 			dotN, dotM := 1, 2
-			if offs.fastMath() {
-				// Lane grouping is unobservable without bit-exactness:
-				// feed SDOT the raw byte sources (the native selection).
+			if raw || offs.fastMath() {
+				// Raw ops: the lane combine proved SDOT's grouping.
+				// Fast math: lane grouping is unobservable without
+				// bit-exactness. Feed the raw byte sources either way.
 				dotN, dotM = srcs[0], srcs[1]
 			} else {
 				idx, err := ensureSdotIdx()
@@ -664,7 +729,7 @@ func a64SpliceFusedCoreLut(b *strings.Builder, tree *simdfuse.Tree, pool *ConstP
 				}
 			}
 			acc := dst
-			if n.Op == a64OpSdot16 {
+			if n.Op == a64OpSdot16 || n.Op == a64OpSdotRaw {
 				if acc == dotN || acc == dotM {
 					// Fast mode feeds SDOT the raw sources; a freed
 					// source register can be re-allocated as dst. Zero a
@@ -886,6 +951,7 @@ var fusedMemOpsA64 = map[string]int{
 	"v128_load_nc":      2,
 	"v128_load_rng":     4,
 	"v128_load32_zero":  2,
+	"v128_load64_zero":  2,
 	"v128_load32_splat": 2,
 	"v128_load16x4_u":   2,
 	"v128_load32_lane":  3, // + the v128 operand the lane inserts into
@@ -1241,6 +1307,13 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		checked(4)
 		fmt.Fprintf(b, "\tFMOVS (R20)(R25), F%d\n", dst)
 		return addOffErr
+	case "v128_load64_zero":
+		// 8-byte load into the low half, upper lanes zeroed — exactly
+		// the wasm op (ldr d writes the D register, clearing the top).
+		addOff(1)
+		checked(8)
+		fmt.Fprintf(b, "\tFMOVD (R20)(R25), F%d\n", dst)
+		return addOffErr
 	case "v128_load32_splat":
 		// 4-byte load broadcast to every lane: ldr s + dup.
 		addOff(1)
@@ -1361,6 +1434,9 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	if loop.Dec <= 0 || loop.Dec >= 4096 {
 		return false, false, fmt.Errorf("fused loop %s: bad dec %d", tree.Name, loop.Dec)
 	}
+	if loop.ExitGT && (loop.PreTest || loop.ExitThresh < 0 || loop.ExitThresh >= 4096) {
+		return false, false, fmt.Errorf("fused loop %s: bad exit threshold %d", tree.Name, loop.ExitThresh)
+	}
 	carried := map[int]int{}
 	var reserve []int
 	pairBase := func(idx int) (string, string) {
@@ -1403,6 +1479,17 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	if loop.CounterWide {
 		cmpOp, subOp, cbzOp, cbnzOp = "CMP", "SUB", "CBZ", "CBNZ"
 	}
+	// Carry host pointers (memory base + bump-carried address scalar)
+	// in the argument registers the signature leaves free: the load
+	// emitters then use immediate-offset forms off them. Recomputed at
+	// the top of every unroll copy.
+	argsUsed := 1 + tree.NumScalars + 1 + loop.NumDeltas + 2*tree.NumPairs
+	var freePtrRegs []string
+	for r := argsUsed; r <= 15; r++ {
+		freePtrRegs = append(freePtrRegs, a64FusedArgReg(r))
+	}
+	freePtrRegs = append(freePtrRegs, "R16")
+	hostPtrs := a64LoopHostPtrs(loop, freePtrRegs)
 	// Hoist scale-table HOST bases (memory base + table offset) for
 	// the lookup peephole: loop-invariant, one register each. R17/R19
 	// are free inside the splice (every GPR is call-clobbered; R18 is
@@ -1436,10 +1523,22 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// original would have committed.
 	var loc []fusedLoc
 	needsTrap := false
+	// Whole-loop range checks: one prologue check per carried pointer
+	// replaces its per-load checks (store-free do-while loops only —
+	// see a64HoistLoopChecks for the soundness argument).
+	if len(hostPtrs) > 0 {
+		if a64HoistLoopChecks(b, loop, hostPtrs, counterReg, tree.Addr64) {
+			needsTrap = true
+		}
+	}
 	step := func() error {
+		for _, hp := range a64SortedHostPtrs(hostPtrs) {
+			fmt.Fprintf(b, "\tADD R20, %s, %s\n", a64FusedArgReg(1+hp.scalar), hp.reg)
+			hp.bias = 0
+		}
 		var err error
 		var trap bool
-		loc, trap, err = a64SpliceFusedCoreLut(b, tree, pool, offs, carried, reserve, 1+loop.NumDeltas, true, lutHoist, sdotIdx, portable, dual)
+		loc, trap, err = a64SpliceFusedCoreLutPtr(b, tree, pool, offs, carried, reserve, 1+loop.NumDeltas, true, lutHoist, sdotIdx, portable, dual, hostPtrs)
 		if err != nil {
 			return err
 		}
@@ -1477,7 +1576,18 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	unroll := offs.fuseLoopUnroll()
 	loopLabel := "gcasmfxl" + site
 	exitLabel := "gcasmfxlx" + site
-	if unroll > 1 && loop.Dec < 4096/int32(unroll) {
+	// The threshold backedge is body-first for EVERY initial counter
+	// (the source loop is a do-while), so the pre-tested fast lane
+	// below would skip the mandatory first iteration; take the plain
+	// lane instead.
+	if loop.ExitGT {
+		fmt.Fprintf(b, "%s:\n", loopLabel)
+		if err := step(); err != nil {
+			return false, false, err
+		}
+		fmt.Fprintf(b, "\t%s $%d, %s\n", cmpOp, loop.ExitThresh, counterReg)
+		fmt.Fprintf(b, "\tBGT %s\n", loopLabel)
+	} else if unroll > 1 && loop.Dec < 4096/int32(unroll) {
 		// Fast lane: process `unroll` iterations per branch while the
 		// counter allows, then finish one at a time. Both lanes use
 		// the same step emission, so semantics are the sequential

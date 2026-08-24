@@ -39,6 +39,9 @@ type a64ScalarPre struct {
 	// f32 loads the peephole rewrites.
 	elided map[int]bool
 	lutOf  []int
+	// hostPtrs are the loop splicer's carried host pointers: the f16
+	// scale-load peephole reads through them with immediate offsets.
+	hostPtrs map[int]*a64HostPtr
 }
 
 // newA64ScalarChain builds the inline scalar-chain evaluator. Chains
@@ -48,14 +51,15 @@ type a64ScalarPre struct {
 // bodies). Terminals stay in their scratch FPR; the consumer splat
 // broadcasts from lane 0 and releases it.
 func newA64ScalarChain(b *strings.Builder, tree *simdfuse.Tree,
-	scalarReg func(simdfuse.Arg) string, uses []int, lutBase map[int]string) *a64ScalarPre {
+	scalarReg func(simdfuse.Arg) string, uses []int, lutBase map[int]string, hostPtrs map[int]*a64HostPtr) *a64ScalarPre {
 	p := &a64ScalarPre{
 		b: b, tree: tree, scalarReg: scalarReg, uses: uses,
-		freeGpr: []string{"R27", "R26", "R25", "R24"},
-		freeFpr: []int{3, 2, 1},
-		gprOf:   map[int]string{},
-		fprOf:   map[int]int{},
-		lutBase: lutBase,
+		freeGpr:  []string{"R27", "R26", "R25", "R24"},
+		freeFpr:  []int{3, 2, 1},
+		gprOf:    map[int]string{},
+		fprOf:    map[int]int{},
+		lutBase:  lutBase,
+		hostPtrs: hostPtrs,
 	}
 	// Pre-mark the peephole's swallowed nodes: they precede their
 	// consuming load in node order, so the elision must be decided
@@ -269,18 +273,45 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		return nil
 	}
 	if ldIdx, host, ok := p.lutPattern(n); ok {
-		// Fused lookup: one u16 load, one scaled-register f32 load.
+		// f16 -> f32 scale: the guest code is a table lookup
+		// (load16_u -> <<2 -> + F16 table base -> f32 load), but the
+		// host has hardware half-to-single conversion — one H load
+		// plus FCVT replaces the dependent double load, and the
+		// hoisted table base goes unread. Proven ~6% tg on the q8_0
+		// dot kernel by direct measurement before being wired here.
+		_ = host
 		ld := &p.tree.Nodes[ldIdx]
+		if hp, c, hok := a64HostPtrArg(p.hostPtrs, ld.Args[0]); hok {
+			if imm, sok := hp.imm(p.b, c, 2); sok {
+				f, err := p.allocFpr()
+				if err != nil {
+					return err
+				}
+				pn := a64RegNum(hp.reg)
+				ldr := 0x7C400000 | (uint32(imm)&0x1FF)<<12 | uint32(pn)<<5 | uint32(f)
+				fmt.Fprintf(p.b, "\tWORD $0x%08x // ldur h%d, [x%d, #%d] (f16 scale)\n", ldr, f, pn, imm)
+				fcvt := 0x1EE24000 | uint32(f)<<5 | uint32(f)
+				fmt.Fprintf(p.b, "\tWORD $0x%08x // fcvt s%d, h%d\n", fcvt, f, f)
+				p.fprOf[i] = f
+				return nil
+			}
+		}
 		g, err := p.takeGpr(ld.Args[0])
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(p.b, "\tMOVHU (R20)(%s), %s\n", g, g)
 		f, err := p.allocFpr()
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(p.b, "\tFMOVS (%s)(%s<<2), F%d\n", host, g, f)
+		gn := a64RegNum(g)
+		if gn > 30 {
+			return fmt.Errorf("fused splice %s: bad GPR %q for f16 scale", p.tree.Name, g)
+		}
+		ldr := 0x7C606800 | uint32(gn)<<16 | 20<<5 | uint32(f)
+		fcvt := 0x1EE24000 | uint32(f)<<5 | uint32(f)
+		fmt.Fprintf(p.b, "\tWORD $0x%08x // ldr h%d, [x20, x%d] (f16 scale)\n", ldr, f, gn)
+		fmt.Fprintf(p.b, "\tWORD $0x%08x // fcvt s%d, h%d\n", fcvt, f, f)
 		p.freeGpr = append(p.freeGpr, g)
 		p.fprOf[i] = f
 		return nil

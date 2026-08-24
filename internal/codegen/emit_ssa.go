@@ -52,6 +52,9 @@ type ssaEmitter struct {
 	// Reset per function.
 	simdCalls  map[*ast.CallExpr]simdCallMark
 	simdConsts map[*ast.CompositeLit]bool
+	// curFn is the function whose body is being emitted; the fusion
+	// pass keys direct-asm window retention off its name.
+	curFn *ssa.Func
 }
 
 // simdCallMark records, for one emitted SIMD helper call, which
@@ -61,6 +64,11 @@ type simdCallMark struct {
 	resV128 bool
 	mem     bool // OpSimdMemCall: touches linear memory (load/store/lane)
 	args    []bool
+	// val is the SSA value this call was emitted from. The fusion pass
+	// uses it to report each fused window's member/root values back to
+	// direct-asm retention, so the asm emitter can splice the same
+	// windows straight from the retained SSA (see recordFusedWindow).
+	val *ssa.Value
 }
 
 // newSSAEmitter constructs an emitter bound to a translator. nil t
@@ -102,6 +110,7 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// The SIMD marks are per-function state for the scalarization pass.
 	em.simdCalls = nil
 	em.simdConsts = nil
+	em.curFn = f
 	// Hoist the linear-memory base pointer into a function-level local
 	// when the function touches memory at all. `m.M` is a Module FIELD,
 	// so the Go compiler must conservatively reload it after every
@@ -803,9 +812,12 @@ func (em *ssaEmitter) narrowExcSlot(slot ast.Expr, t ssa.Type) ast.Expr {
 		if em.t != nil {
 			em.t.UsePackage("math")
 		}
+		// The uint64 conversion is required, not cosmetic: OpCatchArg
+		// narrows the dispatch's int64-typed snapshot, and
+		// Float64frombits does not accept int64.
 		return &ast.CallExpr{
 			Fun:  &ast.SelectorExpr{X: newID("math"), Sel: newID("Float64frombits")},
-			Args: []ast.Expr{slot},
+			Args: []ast.Expr{call("uint64", slot)},
 		}
 	default: // i32 / bool
 		return call("int32", slot)
@@ -1706,7 +1718,7 @@ func (em *ssaEmitter) markSimdCall(call *ast.CallExpr, name string, v *ssa.Value
 	if em.simdCalls == nil {
 		em.simdCalls = map[*ast.CallExpr]simdCallMark{}
 	}
-	mark := simdCallMark{name: name, resV128: v.Type == ssa.TypeV128, mem: skip == 1, args: make([]bool, skip+len(v.Args))}
+	mark := simdCallMark{name: name, resV128: v.Type == ssa.TypeV128, mem: skip == 1, args: make([]bool, skip+len(v.Args)), val: v}
 	for i, a := range v.Args {
 		mark.args[skip+i] = a.Type == ssa.TypeV128
 	}

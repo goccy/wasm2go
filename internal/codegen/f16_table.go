@@ -42,7 +42,8 @@ func f16BitsToF32Bits(h uint16) uint32 {
 	return sign | (exp+112)<<23 | man<<13
 }
 
-// hasIEEEF16TableAt reports whether the module's ACTIVE data segments
+// hasIEEEF16TableAt reports whether the module's data segments
+// (active, or passive with a recovered start-section placement)
 // fully populate [base, base+65536*4) with table[i] == the IEEE
 // conversion of i. Bytes not covered by any active segment default to
 // zero in the initial image; the table has almost no zero entries, so
@@ -51,13 +52,25 @@ func (t *translator) hasIEEEF16TableAt(base uint32) bool {
 	const tableLen = 65536 * 4
 	img := make([]byte, tableLen)
 	covered := 0
-	for _, ds := range t.mod.Datas {
+	placements := t.passiveSegmentPlacements()
+	for segIdx, ds := range t.mod.Datas {
+		var off int64
 		if ds.Passive {
-			continue
-		}
-		off, err := evalConstExprI64(ds.Offset, t.mod)
-		if err != nil {
-			continue
+			// Shared-memory (threads) links make every segment
+			// passive; the recovered start-section placement stands in
+			// for the active-segment offset (see
+			// passiveSegmentPlacements).
+			po, ok := placements[segIdx]
+			if !ok {
+				continue
+			}
+			off = po
+		} else {
+			eo, err := evalConstExprI64(ds.Offset, t.mod)
+			if err != nil {
+				continue
+			}
+			off = eo
 		}
 		segEnd := off + int64(len(ds.Bytes))
 		lo, hi := int64(base), int64(base)+tableLen

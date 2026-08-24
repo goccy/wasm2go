@@ -36,12 +36,21 @@ var (
 )
 
 func a64DeadSimdOutStores(body string) string {
+	return a64DeadSimdOutStoresSegmented(body, body)
+}
+
+// a64DeadSimdOutStoresSegmented is the fused-window form: reads are
+// counted over `whole` (the complete function body, so a store whose
+// only reader sits inside a fused window stays), while stores are
+// dropped only within `body` (one outside-window segment).
+func a64DeadSimdOutStoresSegmented(body, whole string) string {
 	lines := strings.Split(body, "\n")
 
-	// Pass 1: count reads per offset (16-byte overlap granularity).
+	// Pass 1: count reads per offset (16-byte overlap granularity)
+	// across the WHOLE function.
 	reads := map[int]int{}
 	note := func(off int) { reads[off]++ }
-	for _, l := range lines {
+	for _, l := range strings.Split(whole, "\n") {
 		t := strings.TrimSpace(l)
 		// Comments are not memory operands: a spare-forwarded reload
 		// carries its origin slot in a comment only, and pinning the

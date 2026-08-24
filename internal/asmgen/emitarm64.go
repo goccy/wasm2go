@@ -557,11 +557,33 @@ func emitValueARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		ssa.OpMemoryCopy, ssa.OpMemoryFill:
 		return emitCallDirectARM64(b, v, plan, frame)
 
+	// --- Fused windows: every member is covered by the single body
+	// emitted at the window's LAST member; earlier members emit
+	// nothing (plan validation proved nothing in between needs
+	// them). ---
+	case ssa.OpSimdCall, ssa.OpSimdMemCall:
+		if plan.fusedMember[v.ID] {
+			if pw := plan.fusedAt[v.ID]; pw != nil {
+				return emitFusedWindowARM64(b, v, pw, plan)
+			}
+			return nil
+		}
+		return emitSimdCallARM64(b, v, plan, frame)
+
+	// --- Branch-based EH: inline MOVs against the Module's
+	// exception-state fields (offsets from FuncOptions.Exc). ---
+	case ssa.OpExcPending, ssa.OpExcTag, ssa.OpExcVal:
+		return emitExcReadARM64(b, v, plan)
+	case ssa.OpExcRaise:
+		return emitExcRaiseARM64(b, v, plan, frame)
+	case ssa.OpExcRearm, ssa.OpExcClear:
+		return emitExcFlagARM64(b, v, plan)
+	case ssa.OpCatchArg:
+		return emitCatchArgARM64(b, v, plan, frame)
+
 	// --- SIMD: v128 constants and helper CALLs ---
 	case ssa.OpSimdConst:
 		return emitSimdConstARM64(b, v, plan)
-	case ssa.OpSimdCall, ssa.OpSimdMemCall:
-		return emitSimdCallARM64(b, v, plan, frame)
 	}
 	return fmt.Errorf("op %v not supported by the arm64 emitter", v.Op)
 }
@@ -1132,6 +1154,16 @@ func emitInlineHelperARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, fra
 		fmt.Fprintf(b, "\tFMOVS R0, F0\n")
 		storeF()
 		return true, nil
+	case "i64_reinterpret_f64":
+		fmt.Fprintf(b, "\tFMOVD %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
+		fmt.Fprintf(b, "\tFMOVD F0, R0\n")
+		storeGP("MOVD")
+		return true, nil
+	case "f64_reinterpret_i64":
+		fmt.Fprintf(b, "\tMOVD %s, R0\n", operandSrc64ARM64(v.Args[0], plan, frame))
+		fmt.Fprintf(b, "\tFMOVD R0, F0\n")
+		storeF64()
+		return true, nil
 	case "f32_abs":
 		fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(v.Args[0], plan, frame, "RSP"))
 		fmt.Fprintf(b, "\tFABSS F0, F0\n")
@@ -1508,6 +1540,149 @@ func emitGlobalSetInlineARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, 
 	default:
 		return fmt.Errorf("OpGlobalSet v%d: global type %v unsupported by inline emitter", v.ID, info.vtype)
 	}
+	return nil
+}
+
+// excMRegARM64 resolves the register holding m for an inline exc
+// access, mirroring the emitGlobalGetInlineARM64 pattern: the
+// function-wide m-cache when available, else a one-shot FP load
+// into R0.
+func excMRegARM64(b *strings.Builder, plan *funcPlan) string {
+	if plan.mCacheReg != "" {
+		return plan.mCacheReg
+	}
+	fmt.Fprintf(b, "\tMOVD m+0(FP), R0\n")
+	return "R0"
+}
+
+// emitExcReadARM64 lowers OpExcPending / OpExcTag / OpExcVal to a
+// load from the Module's exception state into the value's slot.
+// OpExcVal narrows the uint64 operand slot to the value's type — on
+// a little-endian target that is a plain load of the low bytes (or a
+// float load of the raw bits) at the slot's base address.
+func emitExcReadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan) error {
+	exc := plan.exc
+	if exc == nil {
+		return fmt.Errorf("%v v%d: no exc offsets in plan", v.Op, v.ID)
+	}
+	dst := plan.offsets[v.ID]
+	mReg := excMRegARM64(b, plan)
+	switch v.Op {
+	case ssa.OpExcPending:
+		fmt.Fprintf(b, "\tMOVW %d(%s), R1\n", exc.Pending, mReg)
+		fmt.Fprintf(b, "\tMOVW R1, %d(RSP)\n", dst)
+	case ssa.OpExcTag:
+		fmt.Fprintf(b, "\tMOVW %d(%s), R1\n", exc.Tag, mReg)
+		fmt.Fprintf(b, "\tMOVW R1, %d(RSP)\n", dst)
+	default: // OpExcVal
+		off := exc.Vals + 8*int(v.AuxInt)
+		switch v.Type {
+		case ssa.TypeI32, ssa.TypeBool:
+			fmt.Fprintf(b, "\tMOVW %d(%s), R1\n", off, mReg)
+			fmt.Fprintf(b, "\tMOVW R1, %d(RSP)\n", dst)
+		case ssa.TypeI64:
+			fmt.Fprintf(b, "\tMOVD %d(%s), R1\n", off, mReg)
+			fmt.Fprintf(b, "\tMOVD R1, %d(RSP)\n", dst)
+		case ssa.TypeF32:
+			fmt.Fprintf(b, "\tFMOVS %d(%s), F0\n", off, mReg)
+			fmt.Fprintf(b, "\tFMOVS F0, %d(RSP)\n", dst)
+		case ssa.TypeF64:
+			fmt.Fprintf(b, "\tFMOVD %d(%s), F0\n", off, mReg)
+			fmt.Fprintf(b, "\tFMOVD F0, %d(RSP)\n", dst)
+		default:
+			return fmt.Errorf("OpExcVal v%d: type %v unsupported", v.ID, v.Type)
+		}
+	}
+	return nil
+}
+
+// emitExcRaiseARM64 lowers OpExcRaise: store the tag, widen each
+// operand into its uint64 slot (zero-extend for 32-bit values, raw
+// bits for floats — the inverse of emitExcReadARM64's narrowing),
+// then set the pending flag.
+func emitExcRaiseARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
+	exc := plan.exc
+	if exc == nil {
+		return fmt.Errorf("OpExcRaise v%d: no exc offsets in plan", v.ID)
+	}
+	if len(v.Args) == 0 || v.Args[0] == nil {
+		return fmt.Errorf("OpExcRaise v%d: missing tag arg", v.ID)
+	}
+	mReg := excMRegARM64(b, plan)
+	fmt.Fprintf(b, "\tMOVW %s, R1\n", operandSrc32ARM64(v.Args[0], plan, frame))
+	fmt.Fprintf(b, "\tMOVW R1, %d(%s)\n", exc.Tag, mReg)
+	for i, a := range v.Args[1:] {
+		if a == nil {
+			return fmt.Errorf("OpExcRaise v%d: nil operand %d", v.ID, i)
+		}
+		off := exc.Vals + 8*i
+		switch a.Type {
+		case ssa.TypeI32, ssa.TypeBool:
+			// uint64(uint32(x)): MOVW materialises the 32-bit value,
+			// the register-to-register MOVWU zero-extends it.
+			fmt.Fprintf(b, "\tMOVW %s, R1\n", operandSrc32ARM64(a, plan, frame))
+			fmt.Fprintf(b, "\tMOVWU R1, R1\n")
+			fmt.Fprintf(b, "\tMOVD R1, %d(%s)\n", off, mReg)
+		case ssa.TypeI64:
+			fmt.Fprintf(b, "\tMOVD %s, R1\n", operandSrc64ARM64(a, plan, frame))
+			fmt.Fprintf(b, "\tMOVD R1, %d(%s)\n", off, mReg)
+		case ssa.TypeF32:
+			// uint64(math.Float32bits(x)): FMOV to a GPR moves the raw
+			// bits; the W-form write zeroes the upper half.
+			fmt.Fprintf(b, "\tFMOVS %s, F0\n", operandSrcFloat(a, plan, frame, "RSP"))
+			fmt.Fprintf(b, "\tFMOVS F0, R1\n")
+			fmt.Fprintf(b, "\tMOVD R1, %d(%s)\n", off, mReg)
+		case ssa.TypeF64:
+			fmt.Fprintf(b, "\tFMOVD %s, F0\n", operandSrcFloat(a, plan, frame, "RSP"))
+			fmt.Fprintf(b, "\tFMOVD F0, R1\n")
+			fmt.Fprintf(b, "\tMOVD R1, %d(%s)\n", off, mReg)
+		default:
+			return fmt.Errorf("OpExcRaise v%d: operand type %v unsupported", v.ID, a.Type)
+		}
+	}
+	fmt.Fprintf(b, "\tMOVD $1, R1\n")
+	fmt.Fprintf(b, "\tMOVW R1, %d(%s)\n", exc.Pending, mReg)
+	return nil
+}
+
+// emitCatchArgARM64 lowers OpCatchArg: narrow the dispatch's
+// int64-typed operand snapshot (Args[0]) to the value's type. On a
+// little-endian target every narrowing is a plain copy of the low
+// bytes — float slots receive the raw bits, which is exactly what
+// their consumers' FMOV loads reinterpret.
+func emitCatchArgARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) error {
+	if len(v.Args) != 1 || v.Args[0] == nil {
+		return fmt.Errorf("OpCatchArg v%d: expected the saved slot arg", v.ID)
+	}
+	a := v.Args[0]
+	dst := plan.offsets[v.ID]
+	switch v.Type {
+	case ssa.TypeI32, ssa.TypeBool, ssa.TypeF32:
+		fmt.Fprintf(b, "\tMOVW %s, R1\n", operandSrc32ARM64(a, plan, frame))
+		fmt.Fprintf(b, "\tMOVW R1, %d(RSP)\n", dst)
+	case ssa.TypeI64, ssa.TypeF64:
+		fmt.Fprintf(b, "\tMOVD %s, R1\n", operandSrc64ARM64(a, plan, frame))
+		fmt.Fprintf(b, "\tMOVD R1, %d(RSP)\n", dst)
+	default:
+		return fmt.Errorf("OpCatchArg v%d: type %v unsupported", v.ID, v.Type)
+	}
+	return nil
+}
+
+// emitExcFlagARM64 lowers OpExcRearm (flag := 1) and OpExcClear
+// (flag := 0).
+func emitExcFlagARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan) error {
+	exc := plan.exc
+	if exc == nil {
+		return fmt.Errorf("%v v%d: no exc offsets in plan", v.Op, v.ID)
+	}
+	mReg := excMRegARM64(b, plan)
+	if v.Op == ssa.OpExcClear {
+		fmt.Fprintf(b, "\tMOVW ZR, %d(%s)\n", exc.Pending, mReg)
+		return nil
+	}
+	fmt.Fprintf(b, "\tMOVD $1, R1\n")
+	fmt.Fprintf(b, "\tMOVW R1, %d(%s)\n", exc.Pending, mReg)
 	return nil
 }
 

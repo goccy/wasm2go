@@ -260,7 +260,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg.DirectAsm)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -625,8 +625,9 @@ func buildPkg(
 	outlinedNames []string,
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
-	directSSA map[string]DirectAsmFn,
+	cfg Config,
 ) (map[string][]byte, error) {
+	directSSA := cfg.DirectAsm
 	selfPath := importPath
 	if rel != "" {
 		selfPath = importPath + "/" + rel
@@ -764,7 +765,7 @@ func buildPkg(
 		// Emission shares this package's ConstPool so spliced bodies'
 		// constants intern alongside the transform's.
 		if df, isDirect := directSSA[name]; isDirect {
-			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, modOffs, pool, importPath, rel, calleeSig, fnOwner, stats); ok {
+			if dab, ok := emitDirectAsmBody(mod, name, df, arch.name, cfg, modOffs, pool, importPath, rel, calleeSig, fnOwner, stats); ok {
 				asmB.WriteString(dab)
 				asmB.WriteString("\n")
 				stats.DirectAsm++
@@ -808,8 +809,13 @@ func buildPkg(
 			return nil, fmt.Errorf("transform %s: %w", f.Name, terr)
 		}
 		sig := declSig(rel, name, declParams, hasRes, res, synth)
-		_, isSynthFn := synth[name]
-		if arch.gatedMarker != "" && !isSynthFn &&
+		// Synthetic bodies take the same feature-gated twin split as
+		// wasm functions: the batched-rows companion clones a kernel
+		// whose body selects SDOT/AVX2 forms, so running its plain
+		// symbol on a baseline CPU would fault. (Outlined extraction
+		// bodies historically never contained gated instructions, so
+		// including them here is a no-op for them.)
+		if arch.gatedMarker != "" &&
 			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {
 			// Feature-gated body: the feature symbol keeps this body, a
 			// baseline twin is transformed with PortableSIMD, and a

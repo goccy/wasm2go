@@ -105,8 +105,10 @@ func (fb *fusedTreeBuilder) snapshotChase() chaseSnap {
 
 func (fb *fusedTreeBuilder) restoreChase(s chaseSnap) {
 	fb.nodes = fb.nodes[:s.nodes]
+	fb.nodeVals = fb.nodeVals[:s.nodes]
 	fb.scalars = fb.scalars[:s.scalars]
 	fb.scalarOwner = fb.scalarOwner[:s.scalars]
+	fb.scalarSrc = fb.scalarSrc[:s.scalars]
 	fb.scalarDedup = s.scalarDedup
 	fb.chaseUses = s.chaseUses
 	fb.chaseCache = s.chaseCache
@@ -171,6 +173,181 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 	return 0, false
 }
 
+// chaseLoad16Deref matches a `*(*uint16)(...)` linear-memory read and
+// registers it as a scalar_i32_load16_u node over the chased address.
+func (fb *fusedTreeBuilder) chaseLoad16Deref(inner *ast.StarExpr) (simdfuse.Arg, bool) {
+	addr, is64, mok := matchMemDeref(inner, "uint16")
+	if !mok {
+		return simdfuse.Arg{}, false
+	}
+	if is64 {
+		fb.addr64 = true
+	}
+	aarg, aok := fb.chaseAddr(addr)
+	if !aok {
+		return simdfuse.Arg{}, false
+	}
+	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
+	if !nok {
+		return simdfuse.Arg{}, false
+	}
+	return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+}
+
+// chaseNarrowExtract16 rewrites `(wideload >> C) & 0xffff` (and the
+// C==0 form `wideload & 0xffff`) into a scalar_i32_load16_u at the
+// load's address plus C/8 bytes. Linear memory and every supported
+// host are little-endian, so a 16-bit field of a wider aligned-free
+// load is exactly the 16-bit load at the byte-shifted address. This
+// is the form clang produces when it packs several adjacent f16
+// scale reads into one 32/64-bit load.
+func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Arg, bool) {
+	if x.Op != token.AND {
+		return simdfuse.Arg{}, false
+	}
+	// The mask constant arrives wrapped in the pointer-width
+	// conversion (`int64(65535)`) on memory64; constValueOf
+	// deliberately rejects 64-bit wrappers, so unwrap here where the
+	// extract-width semantics make it safe.
+	unwrapConv := func(e ast.Expr) ast.Expr {
+		for {
+			if p, ok := e.(*ast.ParenExpr); ok {
+				e = p.X
+				continue
+			}
+			if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+				if id, ok := c.Fun.(*ast.Ident); ok &&
+					(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
+					e = c.Args[0]
+					continue
+				}
+			}
+			return e
+		}
+	}
+	valExpr, maskExpr := unwrapConv(x.X), unwrapConv(x.Y)
+	mask, mok := fb.constValueOf(unwrapConv(maskExpr))
+	if !mok {
+		valExpr, maskExpr = maskExpr, valExpr
+		mask, mok = fb.constValueOf(unwrapConv(maskExpr))
+	}
+	if !mok || uint32(mask) != 0xffff {
+		return simdfuse.Arg{}, false
+	}
+	// Shift amounts resolve here rather than via matchShiftConst: its
+	// default mod-32 reduction encodes i32 shift semantics, and a
+	// 64-bit extract's lane offsets (32, 48) must NOT wrap. The `% 64`
+	// spelling of memory64 emission reduces identically either way.
+	shiftAmount := func(e ast.Expr) (int32, bool) {
+		e = unwrapConv(e)
+		if bin, ok := e.(*ast.BinaryExpr); ok && bin.Op == token.REM {
+			m, mok := fb.constValueOf(unwrapConv(bin.Y))
+			if !mok || (m != 32 && m != 64) {
+				return 0, false
+			}
+			c, cok := fb.constValueOf(unwrapConv(bin.X))
+			if !cok {
+				return 0, false
+			}
+			return c % m, true
+		}
+		c, ok := fb.constValueOf(e)
+		return c, ok
+	}
+	shift := int32(0)
+	if sh, ok := valExpr.(*ast.BinaryExpr); ok && sh.Op == token.SHR {
+		s, sok := shiftAmount(sh.Y)
+		if !sok {
+			return simdfuse.Arg{}, false
+		}
+		shift = s
+		valExpr = sh.X
+	}
+	if shift%8 != 0 || shift < 0 {
+		return simdfuse.Arg{}, false
+	}
+	// Unwrap width conversions and single-def locals down to the
+	// memory deref itself, remembering which locals the rewrite
+	// consumes so intervener accounting sees them as absorbed.
+	var consumed []string
+	for {
+		if p, ok := valExpr.(*ast.ParenExpr); ok {
+			valExpr = p.X
+			continue
+		}
+		if conv, ok := valExpr.(*ast.CallExpr); ok && len(conv.Args) == 1 {
+			if id, ok := conv.Fun.(*ast.Ident); ok &&
+				(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
+				valExpr = conv.Args[0]
+				continue
+			}
+		}
+		if id, ok := valExpr.(*ast.Ident); ok {
+			def, dok := fb.interDef[id.Name]
+			if !dok || len(def.Rhs) != 1 {
+				return simdfuse.Arg{}, false
+			}
+			consumed = append(consumed, id.Name)
+			valExpr = def.Rhs[0]
+			continue
+		}
+		break
+	}
+	star, ok := valExpr.(*ast.StarExpr)
+	if !ok {
+		return simdfuse.Arg{}, false
+	}
+	var (
+		addr ast.Expr
+		is64 bool
+		bits int32
+	)
+	for _, w := range []struct {
+		typ  string
+		bits int32
+	}{{"uint64", 64}, {"int64", 64}, {"uint32", 32}, {"int32", 32}} {
+		if a, i64, mok := matchMemDeref(star, w.typ); mok {
+			addr, is64, bits = a, i64, w.bits
+			break
+		}
+	}
+	if addr == nil || shift+16 > bits {
+		return simdfuse.Arg{}, false
+	}
+	aarg, aok := fb.chaseAddr(addr)
+	if !aok {
+		return simdfuse.Arg{}, false
+	}
+	if off := shift / 8; off != 0 {
+		switch aarg.Kind {
+		case simdfuse.ArgConst, simdfuse.ArgSum:
+			aarg.Const += off
+		case simdfuse.ArgScalar:
+			aarg = simdfuse.Arg{Kind: simdfuse.ArgSum, Index: aarg.Index, Const: off}
+		default:
+			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{aarg, {Kind: simdfuse.ArgConst, Const: off}})
+			if !ok {
+				return simdfuse.Arg{}, false
+			}
+			aarg = simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}
+		}
+	}
+	if is64 {
+		fb.addr64 = true
+	}
+	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
+	if !nok {
+		return simdfuse.Arg{}, false
+	}
+	if fb.chaseUses == nil {
+		fb.chaseUses = map[string]int{}
+	}
+	for _, name := range consumed {
+		fb.chaseUses[name]++
+	}
+	return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+}
+
 // chaseI32 resolves an int32/uint32 scalar expression to an Arg: a
 // descriptor constant, a (deduplicated) scalar parameter, or a
 // ClassI32 node. u32/i32 conversions are identities mod 2^32, exactly
@@ -187,19 +364,8 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		if id, ok := x.Fun.(*ast.Ident); ok && len(x.Args) == 1 &&
 			(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
 			if inner, ok := x.Args[0].(*ast.StarExpr); ok {
-				if addr, is64, mok := matchMemDeref(inner, "uint16"); mok {
-					if is64 {
-						fb.addr64 = true
-					}
-					aarg, aok := fb.chaseAddr(addr)
-					if !aok {
-						return simdfuse.Arg{}, false
-					}
-					idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
-					if !nok {
-						return simdfuse.Arg{}, false
-					}
-					return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+				if arg, lok := fb.chaseLoad16Deref(inner); lok {
+					return arg, true
 				}
 			}
 			return fb.chaseI32(x.Args[0])
@@ -208,6 +374,14 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		// deduplicated scalar parameters via the IndexExpr case below
 		// once unwrapped; anything else is not chaseable.
 		return simdfuse.Arg{}, false
+	case *ast.StarExpr:
+		// A bare u16 memory deref (no conversion wrapper): the guest
+		// assigns `*(*uint16)(...)` straight to a wider local. Gated on
+		// wideChase so ordinary fusion keeps its historical shapes.
+		if !fb.wideChase {
+			return simdfuse.Arg{}, false
+		}
+		return fb.chaseLoad16Deref(x)
 	case *ast.BinaryExpr:
 		switch x.Op {
 		case token.ADD:
@@ -222,6 +396,22 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 			// Const folding keeps shapes canonical and saves nodes.
 			if l.Kind == simdfuse.ArgConst && r.Kind == simdfuse.ArgConst {
 				return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: l.Const + r.Const}, true
+			}
+			if fb.wideChase {
+				// The gather rewrite needs canonical base+const forms
+				// to prove lane adjacency; gated so ordinary fusion
+				// keeps its historical shapes byte-identical.
+				if l.Kind == simdfuse.ArgConst {
+					l, r = r, l
+				}
+				if r.Kind == simdfuse.ArgConst {
+					switch l.Kind {
+					case simdfuse.ArgScalar:
+						return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: r.Const}, true
+					case simdfuse.ArgSum:
+						return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: l.Const + r.Const}, true
+					}
+				}
 			}
 			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, r})
 			if !ok {
@@ -242,6 +432,36 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 				return simdfuse.Arg{}, false
 			}
 			return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+		case token.AND:
+			if !fb.wideChase {
+				return simdfuse.Arg{}, false
+			}
+			if arg, ok := fb.chaseNarrowExtract16(x); ok {
+				return arg, true
+			}
+			// Identity-mask elimination for the f16 gather chase: the
+			// guest masks a load16_u result before shifting it into a
+			// table index, but the load's value range is [0, 0xffff], so
+			// any mask whose low 16 bits are all ones leaves the value
+			// unchanged. Gated on wideChase so ordinary fusion keeps its
+			// historical shapes.
+			l, lok := fb.chaseI32(x.X)
+			if !lok {
+				return simdfuse.Arg{}, false
+			}
+			r, rok := fb.chaseI32(x.Y)
+			if !rok {
+				return simdfuse.Arg{}, false
+			}
+			if l.Kind == simdfuse.ArgConst {
+				l, r = r, l
+			}
+			if r.Kind == simdfuse.ArgConst && l.Kind == simdfuse.ArgNode &&
+				fb.nodes[l.Index].Op == "scalar_i32_load16_u" &&
+				uint32(r.Const)&0xffff == 0xffff {
+				return l, true
+			}
+			return simdfuse.Arg{}, false
 		}
 		return simdfuse.Arg{}, false
 	case *ast.IndexExpr:
@@ -254,6 +474,28 @@ func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 		}
 		return simdfuse.Arg{}, false
 	case *ast.Ident:
+		if fb.wideChase && (fb.interDef == nil || fb.interDef[x.Name] == nil) {
+			// Not an intervener: recompute a function-wide
+			// single-assignment definition in-region. No consumption
+			// bookkeeping — the original definition stays (it may have
+			// other readers); the chase grammar only admits pure
+			// shapes, so recomputation is safe under the runtime's
+			// no-concurrent-writer contract the intervener chase
+			// already relies on.
+			if fb.sc != nil && fb.sc.defBind != nil && !fb.chaseVisiting[x.Name] {
+				if def, isDef := fb.sc.defBind[x.Name]; isDef && len(def.Rhs) == 1 {
+					if fb.chaseVisiting == nil {
+						fb.chaseVisiting = map[string]bool{}
+					}
+					fb.chaseVisiting[x.Name] = true
+					a, aok := fb.chaseI32(def.Rhs[0])
+					delete(fb.chaseVisiting, x.Name)
+					if aok {
+						return a, true
+					}
+				}
+			}
+		}
 		if fb.interDef != nil {
 			if def, isDef := fb.interDef[x.Name]; isDef && !fb.chaseVisiting[x.Name] {
 				// No caching across uses: every consumer gets its own
@@ -362,6 +604,10 @@ func (fb *fusedTreeBuilder) chaseAddr(e ast.Expr) (simdfuse.Arg, bool) {
 				return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: c}, true
 			case simdfuse.ArgConst:
 				return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: l.Const + c}, true
+			case simdfuse.ArgSum:
+				if fb.wideChase {
+					return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: l.Const + c}, true
+				}
 			}
 			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, {Kind: simdfuse.ArgConst, Const: c}})
 			if !ok {
@@ -372,6 +618,19 @@ func (fb *fusedTreeBuilder) chaseAddr(e ast.Expr) (simdfuse.Arg, bool) {
 		r, rok := fb.chaseI32(bin.Y)
 		if !rok {
 			return simdfuse.Arg{}, false
+		}
+		if fb.wideChase {
+			if l.Kind == simdfuse.ArgConst {
+				l, r = r, l
+			}
+			if r.Kind == simdfuse.ArgConst {
+				switch l.Kind {
+				case simdfuse.ArgScalar:
+					return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: r.Const}, true
+				case simdfuse.ArgSum:
+					return simdfuse.Arg{Kind: simdfuse.ArgSum, Index: l.Index, Const: l.Const + r.Const}, true
+				}
+			}
 		}
 		idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{l, r})
 		if !ok {
@@ -404,6 +663,7 @@ func (fb *fusedTreeBuilder) addScalarNode(op string, args []simdfuse.Arg) (int, 
 		}
 	}
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: op, Args: args})
+	fb.nodeVals = append(fb.nodeVals, nil) // synthesized scalar-chain node
 	fmt.Fprintf(&fb.key, "%s;", op)
 	return len(fb.nodes) - 1, true
 }
@@ -420,7 +680,7 @@ func (fb *fusedTreeBuilder) addChaseScalarArg(src ast.Expr, key string) (simdfus
 		fb.noteChaseRead(src)
 		return simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: idx}, true
 	}
-	if 1+len(fb.scalars)+1 > fusedMaxIntRegs {
+	if !fb.capRelax && 1+len(fb.scalars)+1 > fusedMaxIntRegs {
 		if fb.failWhy == "" {
 			fb.failWhy = "int cap (chased scalar)"
 		}
@@ -430,6 +690,9 @@ func (fb *fusedTreeBuilder) addChaseScalarArg(src ast.Expr, key string) (simdfus
 	fb.scalarDedup[key] = idx
 	fb.scalars = append(fb.scalars, src)
 	fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
+	// Chased compound expression: no single-source SSA provenance —
+	// a window carrying it stays on per-op splices in direct-asm.
+	fb.scalarSrc = append(fb.scalarSrc, fusedParamSrc{})
 	fb.noteChaseRead(src)
 	return simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: idx}, true
 }
@@ -520,9 +783,22 @@ func matchShiftConst(e ast.Expr, fb *fusedTreeBuilder) (int32, bool) {
 			mod = m
 		}
 	}
-	if conv, ok := e.(*ast.CallExpr); ok && len(conv.Args) == 1 {
-		if id, ok := conv.Fun.(*ast.Ident); ok && id.Name == "uint" {
+	for {
+		conv, ok := e.(*ast.CallExpr)
+		if !ok || len(conv.Args) != 1 {
+			break
+		}
+		id, ok := conv.Fun.(*ast.Ident)
+		if !ok {
+			break
+		}
+		switch id.Name {
+		case "uint", "uint32", "uint64", "int32", "int64":
+			// Integer conversions are identities for the small
+			// non-negative shift amounts the chase accepts.
 			e = conv.Args[0]
+		default:
+			return 0, false
 		}
 	}
 	c, ok := fb.constValueOf(e)

@@ -490,6 +490,10 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 	// can lower to an inline MOV against `*Module` instead of a
 	// wrapper CALL.
 	globalOffsets := ComputeGlobalOffsets(mod)
+	// Exception-state offsets, nil for tag-free modules. Passed to
+	// every EmitFunc so the branch-based EH ops lower to inline MOVs
+	// against *Module.
+	excOffsets := ComputeExcOffsets(mod)
 
 	// Aggregate the wrapper-emission decisions: which OpCallIndirect
 	// type indices appear, whether mem.size/grow/copy/fill are used.
@@ -580,6 +584,7 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 				Module:        mod,
 				FuncSymbol:    funcSymbol,
 				GlobalOffsets: globalOffsets,
+				Exc:           excOffsets,
 			})
 			if err != nil {
 				// Surface emit failures behind an env-var gate so a

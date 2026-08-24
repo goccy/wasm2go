@@ -7,6 +7,8 @@ import (
 	"go/token"
 	"os"
 
+	"github.com/goccy/wasm2go/internal/lower"
+	"github.com/goccy/wasm2go/internal/ssa"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
@@ -80,6 +82,7 @@ func nrc2Ptr(b []byte, l nrc2Layout) (uint32, bool) {
 // nrc2Info records a verified q8_0 traits entry.
 type nrc2Info struct {
 	funcIdx  uint32 // the q8_0 vec_dot (module function index)
+	tableIdx uint32 // its indirect-table element index (the traits vd value)
 	segIdx   int    // data segment holding the traits array
 	nrowsOff int    // byte offset of the entry's nrows field in the segment
 }
@@ -139,13 +142,32 @@ func (t *translator) scanVecDotPairing() {
 	}
 	lay := nrc2LayoutFor(t.mod.Memory64())
 	var found *nrc2Info
+	placements := t.passiveSegmentPlacements()
 	for segIdx, ds := range t.mod.Datas {
-		if ds.Passive || len(ds.Bytes) < lay.row {
+		if len(ds.Bytes) < lay.row {
 			continue
 		}
-		segOff, err := evalConstExprI64(ds.Offset, t.mod)
-		if err != nil {
-			continue
+		var segOff int64
+		if ds.Passive {
+			// Shared-memory (threads) links emit only passive
+			// segments; their start-section placements are as static
+			// as active offsets (see passiveSegmentPlacements). Gated
+			// on the rows opt-in so plain pair-entry runs keep their
+			// established behavior on threads modules.
+			if !t.opts.VecDotRows {
+				continue
+			}
+			off, ok := placements[segIdx]
+			if !ok {
+				continue
+			}
+			segOff = off
+		} else {
+			off, err := evalConstExprI64(ds.Offset, t.mod)
+			if err != nil {
+				continue
+			}
+			segOff = off
 		}
 		b := ds.Bytes
 		for entry := 0; entry+lay.row <= len(b); entry += 4 {
@@ -218,7 +240,7 @@ func (t *translator) scanVecDotPairing() {
 				fmt.Fprintf(os.Stderr, "wasm2go: vec_dot traits row ambiguous; row/column pairing disabled\n")
 				return
 			}
-			found = &nrc2Info{funcIdx: funcIdx, segIdx: segIdx, nrowsOff: entry + lay.nrowsOff}
+			found = &nrc2Info{funcIdx: funcIdx, tableIdx: vd, segIdx: segIdx, nrowsOff: entry + lay.nrowsOff}
 		}
 	}
 	if found == nil {
@@ -233,13 +255,21 @@ func (t *translator) scanVecDotPairing() {
 // at addr from the active data segments; uncovered bytes are zero.
 func (t *translator) nrc2ImageAt(addr int64, n int) []byte {
 	img := make([]byte, n)
-	for _, ds := range t.mod.Datas {
+	placements := t.passiveSegmentPlacements()
+	for segIdx, ds := range t.mod.Datas {
+		var off int64
 		if ds.Passive {
-			continue
-		}
-		off, err := evalConstExprI64(ds.Offset, t.mod)
-		if err != nil {
-			continue
+			o, ok := placements[segIdx]
+			if !ok {
+				continue
+			}
+			off = o
+		} else {
+			o, err := evalConstExprI64(ds.Offset, t.mod)
+			if err != nil {
+				continue
+			}
+			off = o
 		}
 		segEnd := off + int64(len(ds.Bytes))
 		lo, hi := addr, addr+int64(n)
@@ -252,11 +282,70 @@ func (t *translator) nrc2ImageAt(addr int64, n int) []byte {
 	return img
 }
 
+// passiveSegmentPlacements recovers each passive data segment's
+// static destination by walking the start section's lowered body (and
+// its direct callees, shallowly) for memory.init ops with constant
+// destinations. Shared-memory (threads) links emit ONLY passive
+// segments, installed once at start-up with constant addresses — for
+// the initial-image analyses here they are exactly as static as
+// active segments. Cached: the scan lowers functions, which is not
+// free.
+func (t *translator) passiveSegmentPlacements() map[int]int64 {
+	if t.segPlacements != nil {
+		return t.segPlacements
+	}
+	t.segPlacements = map[int]int64{}
+	if t.mod.Start == nil {
+		return t.segPlacements
+	}
+	seen := map[uint32]bool{}
+	var walk func(funcIdx uint32, depth int)
+	walk = func(funcIdx uint32, depth int) {
+		if depth > 3 || funcIdx < t.mod.NumImportedFuncs || seen[funcIdx] {
+			return
+		}
+		if int(funcIdx-t.mod.NumImportedFuncs) >= len(t.mod.Functions) {
+			return
+		}
+		seen[funcIdx] = true
+		fn, err := lower.LowerFunction(t.mod, funcIdx, "segplacescan", nil)
+		if err != nil {
+			return
+		}
+		for _, blk := range fn.Blocks {
+			for _, v := range blk.Values {
+				switch v.Op {
+				case ssa.OpMemoryInit:
+					if len(v.Args) < 1 || v.Args[0] == nil {
+						continue
+					}
+					dst := v.Args[0]
+					switch dst.Op {
+					case ssa.OpConst32:
+						t.segPlacements[int(v.AuxInt)] = int64(uint32(dst.AuxInt))
+					case ssa.OpConst64:
+						t.segPlacements[int(v.AuxInt)] = dst.AuxInt
+					}
+				case ssa.OpCallDirect:
+					if v.AuxInt >= 0 {
+						walk(uint32(v.AuxInt), depth+1)
+					}
+				}
+			}
+		}
+	}
+	walk(*t.mod.Start, 0)
+	return t.segPlacements
+}
+
 // nrc2SegBytes returns the segment's bytes with the traits patch
 // applied when segIdx is the recognized traits segment; the input is
 // never mutated.
 func (t *translator) nrc2SegBytes(segIdx int, b []byte) []byte {
-	if t.nrc2 == nil || t.nrc2.segIdx != segIdx {
+	// Row batching needs the drivers to keep stepping one row per
+	// call (the companion runs the loop), so the nrows patch that
+	// switches the guest to paired two-row calls stays off with it.
+	if t.nrc2 == nil || t.nrc2.segIdx != segIdx || t.opts.VecDotRows {
 		return b
 	}
 	out := make([]byte, len(b))

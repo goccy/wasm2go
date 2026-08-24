@@ -364,6 +364,153 @@ func main() {
 	}
 }
 
+// TestDirectAsmExc opts every function of the EH fixture into the
+// direct-asm path: the branch-based exception ops (pending-flag
+// check-and-branch after may-throw calls, tag dispatch, operand
+// reads/writes across all four widths, catch_all rethrow) lower to
+// inline MOVs against the Module's exception-state fields. The
+// direct output is compared DIFFERENTIALLY against the normal
+// backend, on amd64 and natively on arm64.
+func TestDirectAsmExc(t *testing.T) {
+	bin := testfixture.Wasm(t, "eh_direct")
+	translate := func(importPath string, direct []string) (string, map[string][]byte) {
+		m, err := transpile.Parse(bytes.NewReader(bin))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		res, err := transpile.Translate(&buf, m, transpile.Options{
+			Package:          importPath[strings.LastIndex(importPath, "/")+1:],
+			OutputImportPath: importPath,
+			DirectAsmFuncs:   direct,
+		})
+		if err != nil {
+			t.Fatalf("translate %s: %v", importPath, err)
+		}
+		return buf.String(), mergeFiles(res.Files, res.Sidecars)
+	}
+	var direct []string
+	for i := 0; i < 7; i++ {
+		direct = append(direct, fmt.Sprintf("fn%d", i))
+	}
+	refSrc, refFiles := translate("daexc/ref", nil)
+	dirSrc, dirFiles := translate("daexc/dir", direct)
+
+	// Every function must emit on both arches — a fallback here means
+	// an exc op the emitters no longer cover.
+	var asmAll strings.Builder
+	for name, data := range dirFiles {
+		if strings.HasSuffix(name, ".s") {
+			asmAll.Write(data)
+		}
+	}
+	for _, fn := range direct {
+		if got := strings.Count(asmAll.String(), "// direct-asm: "+fn+"\n"); got != 2 {
+			t.Errorf("marker for %s appears %d times in the bundle, want 2 (both arches)", fn, got)
+		}
+	}
+
+	dir := t.TempDir()
+	w := func(rel string, data []byte) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w("go.mod", []byte("module daexc\n\ngo 1.25.0\n"))
+	if refSrc != "" {
+		w("ref/gen.go", []byte(refSrc))
+	}
+	for name, data := range refFiles {
+		w("ref/"+name, data)
+	}
+	if dirSrc != "" {
+		w("dir/gen.go", []byte(dirSrc))
+	}
+	for name, data := range dirFiles {
+		w("dir/"+name, data)
+	}
+	w("main.go", []byte(`package main
+
+import (
+	"fmt"
+	"os"
+
+	"daexc/dir"
+	"daexc/ref"
+)
+
+func main() {
+	r := ref.New()
+	d := dir.New()
+	check := func(name string, want, got int32) {
+		if want != got {
+			fmt.Printf("%s: ref %d, direct %d\n", name, want, got)
+			os.Exit(1)
+		}
+	}
+	for x := int32(0); x <= 4; x++ {
+		check("catch_sum", r.CatchSum(x), d.CatchSum(x))
+		check("reraise", r.Reraise(x), d.Reraise(x))
+		check("catch_dyn", r.CatchDyn(x), d.CatchDyn(x))
+	}
+	check("which", r.Which(0), d.Which(0))
+	check("which", r.Which(1), d.Which(1))
+	// The reference itself must match the wasm semantics these
+	// constants pin (throw operands across all four widths; the
+	// float terms are raw bit patterns: bits(43.5f)=0x422E0000,
+	// hi32(bits(44.25))=0x40462000, bits(7f)=0x40E00000,
+	// hi32(bits(8.0))=0x40200000).
+	for _, pin := range []struct {
+		name string
+		want int32
+		got  int32
+	}{
+		{"catch_sum(0)", -1, r.CatchSum(0)},
+		{"catch_sum(1)", -2106318765, r.CatchSum(1)},
+		{"reraise(0)", -2, r.Reraise(0)},
+		{"reraise(1)", 41, r.Reraise(1)},
+		{"catch_dyn(5)", -2130706421, r.CatchDyn(5)},
+		{"which(0)", 1, r.Which(0)},
+		{"which(1)", 109, r.Which(1)},
+	} {
+		if pin.want != pin.got {
+			fmt.Printf("%s: want %d, got %d\n", pin.name, pin.want, pin.got)
+			os.Exit(1)
+		}
+	}
+	fmt.Println("OK")
+}
+`))
+	run := func(env []string, label string) {
+		exe := filepath.Join(dir, "driver_"+label)
+		cb := exec.Command("go", "build", "-o", exe, ".")
+		cb.Dir = dir
+		if env != nil {
+			cb.Env = append(os.Environ(), env...)
+		}
+		if out, err := cb.CombinedOutput(); err != nil {
+			t.Fatalf("%s go build: %v\n%s", label, err, out)
+		}
+		out, err := exec.Command(exe).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s driver: %v\n%s", label, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != "OK" {
+			t.Fatalf("%s: %s", label, got)
+		}
+	}
+	run(nil, "host")
+	if canExecArm64(t) {
+		run([]string{"GOOS=" + runtime.GOOS, "GOARCH=arm64", "CGO_ENABLED=0"}, "arm64")
+	} else {
+		t.Logf("host cannot execute arm64 binaries; arm64 leg skipped")
+	}
+}
+
 // mergeFiles flattens the translate outputs into one relative map.
 func mergeFiles(sets ...map[string][]byte) map[string][]byte {
 	out := map[string][]byte{}
