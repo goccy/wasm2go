@@ -1049,9 +1049,9 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		if lo, hi, ok := fb.constPairValue(args[2]); ok {
 			shuffleConst = true
 			shufflePat = [4]uint32{
-			uint32(lo & 0xffffffff), uint32((lo >> 32) & 0xffffffff),
-			uint32(hi & 0xffffffff), uint32((hi >> 32) & 0xffffffff),
-		}
+				uint32(lo & 0xffffffff), uint32((lo >> 32) & 0xffffffff),
+				uint32(hi & 0xffffffff), uint32((hi >> 32) & 0xffffffff),
+			}
 			args = args[:2]
 		}
 	}
