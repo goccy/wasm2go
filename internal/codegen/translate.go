@@ -142,14 +142,13 @@ type Options struct {
 	// lane by that factor (0 = no in-splice unroll).
 	FuseLoops      bool
 	FuseLoopUnroll int
-	// F16TableAddr asserts the linear-memory base address of a
-	// runtime-built IEEE f16->f32 lookup table (some runtimes compute the
-	// table in an init function, so the data segment holds only zeros
-	// and the static byte-for-byte verification cannot see it). The
-	// assertion is a build-input contract, not a guess — a wrong
-	// address changes numeric results. 0 asserts nothing; statically
-	// verifiable tables are recognized regardless.
-	F16TableAddr uint32
+	// DisableF16Table opts out of the f16-table-keyed rewrites.
+	// Tables are verified automatically — statically when the data
+	// image holds the IEEE map, otherwise by detecting the module's
+	// own initialization loop (full-range constant-strided store
+	// coverage) — so there is no address to configure; this switch
+	// exists only to disable the rewrites outright.
+	DisableF16Table bool
 	// FastMath opts asm splice synthesis out of wasm bit-exactness:
 	// SDOT lane grouping without the TBL permutation, fused
 	// multiply-adds, dual accumulators, and the SMMLA tile kernel for
@@ -593,7 +592,9 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
 		res.Nrc2Companion = t.nrc2CompanionName()
 	}
-	t.warnStaleF16Table()
+	if err := t.checkStaleF16Table(); err != nil {
+		return Result{}, err
+	}
 	return res, nil
 }
 
@@ -864,6 +865,12 @@ type translator struct {
 	// f16TablesOK caches per-base verification of module-resident
 	// f16->f32 tables (see hasIEEEF16TableAt / the gather rewrite).
 	f16TablesOK map[uint32]bool
+	// runtimeTables holds the store intervals of detected init loops
+	// (nil until the first f16TableOK query triggers the scan); a
+	// gather base covered by one verifies without any assertion.
+	runtimeTables []initStoreRegion
+	// f16Announced dedups the auto-detection log line per base.
+	f16Announced map[uint32]bool
 
 	// pendingOutlined holds loops extracted from the function being
 	// compiled, emitted as sibling decls in the same chunk.

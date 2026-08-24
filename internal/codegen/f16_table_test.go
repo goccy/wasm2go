@@ -149,38 +149,35 @@ func TestF16TableOKCacheAndAssertion(t *testing.T) {
 		t.Fatal("unverified base accepted")
 	}
 
-	// The integrator assertion admits a runtime-built table at exactly
-	// the asserted base, nothing else.
-	tr = &translator{mod: &wasm.Module{}, opts: Options{F16TableAddr: 9013200}}
-	if !tr.f16TableOK(9013200) {
-		t.Fatal("asserted base rejected")
-	}
-	if tr.f16TableOK(9013204) {
-		t.Fatal("non-asserted base accepted")
+	// The opt-out switch turns verification off wholesale, even for a
+	// statically present table.
+	tr = &translator{opts: Options{DisableF16Table: true}, mod: &wasm.Module{Datas: []wasm.DataSegment{
+		{Offset: i32ConstExpr(base), Bytes: ieeeF16TableBytes()},
+	}}}
+	if tr.f16TableOK(base) {
+		t.Fatal("disabled verification still accepted a table")
 	}
 }
 
-func TestStaleF16TableMsg(t *testing.T) {
-	queried := map[uint32]bool{9013200: true, 4096: false}
+func TestUnverifiedF16GatherMsg(t *testing.T) {
 	for _, tc := range []struct {
-		addr   uint32
-		tables map[uint32]bool
-		warn   bool
+		disabled bool
+		tables   map[uint32]bool
+		warn     bool
 	}{
-		{0, nil, false},           // unset: nothing to check
-		{9013200, queried, false}, // queried (and matched)
-		{4096, queried, false},    // queried, even if unverified
-		{9013472, queried, true},  // never queried: stale
-		{9013472, nil, true},      // no gather sites at all
+		{false, nil, false},                            // no gather sites
+		{false, map[uint32]bool{9013200: true}, false}, // everything verified
+		{false, map[uint32]bool{4096: false}, true},    // unverified base: warn
+		{true, map[uint32]bool{4096: false}, false},    // rewrites disabled: silent
+		{false, map[uint32]bool{4096: false, 8192: true}, true},
 	} {
-		msg := staleF16TableMsg(tc.addr, tc.tables)
+		msg := unverifiedF16GatherMsg(tc.disabled, tc.tables)
 		if got := msg != ""; got != tc.warn {
-			t.Errorf("staleF16TableMsg(%d): warn=%v, want %v (msg %q)", tc.addr, got, tc.warn, msg)
+			t.Errorf("unverifiedF16GatherMsg(disabled=%v, %v): warn=%v, want %v (msg %q)", tc.disabled, tc.tables, got, tc.warn, msg)
 		}
 	}
-	// The stale warning names the unverified bases so the integrator
-	// can re-point the assertion.
-	if msg := staleF16TableMsg(9013472, queried); !strings.Contains(msg, "4096") {
-		t.Errorf("stale message should list unverified candidate bases: %q", msg)
+	// The warning names the unverified bases.
+	if msg := unverifiedF16GatherMsg(false, map[uint32]bool{4096: false}); !strings.Contains(msg, "4096") {
+		t.Errorf("warning should list unverified bases: %q", msg)
 	}
 }

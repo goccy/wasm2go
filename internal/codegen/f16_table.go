@@ -92,39 +92,39 @@ func (t *translator) hasIEEEF16TableAt(base uint32) bool {
 	return true
 }
 
-// warnStaleF16Table reports, once translation is done, an
-// Options.F16TableAddr assertion that no gather site ever queried:
-// the module's data layout has shifted and the asserted address no
-// longer matches the table, so the f16 gather rewrite silently
-// stayed off — a pure performance loss that is otherwise invisible.
-// The bases that WERE queried and failed verification are the
-// candidates the integrator should re-point the assertion at.
-func (t *translator) warnStaleF16Table() {
-	if msg := staleF16TableMsg(t.opts.F16TableAddr, t.f16TablesOK); msg != "" {
+// checkStaleF16Table warns, once translation is done, about f16
+// gather sites whose base verified NEITHER statically nor through
+// init-loop detection: the table-keyed rewrites stayed off there — a
+// pure performance loss that is otherwise invisible. The warning is
+// unconditional (no configuration gates it) so a detection miss
+// after a module change is loud in every pipeline log.
+func (t *translator) checkStaleF16Table() error {
+	if msg := unverifiedF16GatherMsg(t.opts.DisableF16Table, t.f16TablesOK); msg != "" {
 		fmt.Fprintln(os.Stderr, msg)
 	}
+	return nil
 }
 
-// staleF16TableMsg is warnStaleF16Table's decision: empty means the
-// assertion is unset or was queried by some gather site (matched or
-// not — being queried means the address still appears in code).
-func staleF16TableMsg(addr uint32, tables map[uint32]bool) string {
-	if addr == 0 {
+// unverifiedF16GatherMsg is checkStaleF16Table's decision: empty
+// means the rewrites are disabled, no gather sites exist, or every
+// queried base verified.
+func unverifiedF16GatherMsg(disabled bool, tables map[uint32]bool) string {
+	if disabled {
 		return ""
 	}
-	if _, seen := tables[addr]; seen {
-		return ""
-	}
-	var cands []uint32
+	var unverified []uint32
 	for base, ok := range tables {
 		if !ok {
-			cands = append(cands, base)
+			unverified = append(unverified, base)
 		}
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+	if len(unverified) == 0 {
+		return ""
+	}
+	sort.Slice(unverified, func(i, j int) bool { return unverified[i] < unverified[j] })
 	return fmt.Sprintf(
-		"wasm2go: F16TableAddr %d matches no f16 gather site — the table has likely moved and the gather rewrite stayed OFF; unverified gather bases seen: %v",
-		addr, cands)
+		"wasm2go: f16 gather sites at bases %v were not verified (no static table image, no init-loop coverage) — the table-keyed rewrites stayed OFF there",
+		unverified)
 }
 
 func max64(a, b int64) int64 {
@@ -146,14 +146,17 @@ func min64(a, b int64) int64 {
 //
 //   - the module's initial data image holds the IEEE map at base
 //     (verified byte-for-byte), or
-//   - the integrator asserted it: Options.F16TableAddr names the
-//     base of a table the module BUILDS AT RUNTIME (some runtimes fill it
-//     f16->f32 table in an init function, so the data segment holds
-//     only zeros and no static check can see it). The assertion is a
-//     build-input contract, not a guess — a wrong address changes
-//     numeric results, which the integrator's bit-equality gates
-//     catch.
+//   - the module's own code provably initializes the whole range at
+//     base (an init loop streaming constant-strided stores — the
+//     ggml_init shape; see detectRuntimeTables).
+//
+// There is no external address input: verification is derived from
+// the module alone, and Options.DisableF16Table turns the whole
+// mechanism off.
 func (t *translator) f16TableOK(base uint32) bool {
+	if t.opts.DisableF16Table {
+		return false
+	}
 	if t.f16TablesOK == nil {
 		t.f16TablesOK = map[uint32]bool{}
 	}
@@ -161,7 +164,16 @@ func (t *translator) f16TableOK(base uint32) bool {
 	if seen {
 		return ok
 	}
-	ok = t.hasIEEEF16TableAt(base) || (t.opts.F16TableAddr != 0 && t.opts.F16TableAddr == base)
+	switch {
+	case t.hasIEEEF16TableAt(base):
+		ok = true
+	default:
+		t.detectRuntimeTables()
+		if t.runtimeInitCovered(base) {
+			ok = true
+			t.noteF16TableDetection(base)
+		}
+	}
 	t.f16TablesOK[base] = ok
 	return ok
 }

@@ -42,7 +42,7 @@ func main() {
 	simdUnroll := flag.Int("simd-unroll", 0, "unroll eligible SIMD loops by this factor (2..8; 0 disables)")
 	fuseLoops := flag.Bool("fuse-loops", false, "fuse whole countdown loops around fused SIMD regions into single asm splices")
 	fuseLoopUnroll := flag.Int("fuse-loop-unroll", 0, "in-splice unroll factor for fused loops (2..8; 0 disables)")
-	f16Table := flag.Uint("f16-table", 0, "linear-memory base address of a runtime-built IEEE f16->f32 table (asserted, not verified; 0 asserts nothing)")
+	noF16Table := flag.Bool("no-f16-table", false, "disable the f16-table-keyed rewrites (the table address is auto-detected from the module; this switch turns the rewrites off entirely)")
 	fastMath := flag.Bool("fast-math", false, "allow asm splices that trade wasm bit-exactness for native-style rounding (SDOT raw grouping, FMA, SMMLA pairing)")
 	fuseDebug := flag.Bool("fuse-debug", false, "print SIMD fusion diagnostics (failed window trials and loop-upgrade rejections) to stderr")
 	vecDotPairEntry := flag.Int("vec-dot-pair-entry", 0, "trait-table entry index whose self vec_dot should pair rows/columns (0 disables; structural verification decides whether it applies)")
@@ -103,7 +103,7 @@ func main() {
 		SIMDUnroll:          *simdUnroll,
 		FuseLoops:           *fuseLoops,
 		FuseLoopUnroll:      *fuseLoopUnroll,
-		F16TableAddr:        uint32(*f16Table),
+		DisableF16Table:     *noF16Table,
 		FastMath:            *fastMath,
 		FuseDebug:           *fuseDebug,
 		VecDotPairEntry:     *vecDotPairEntry,
