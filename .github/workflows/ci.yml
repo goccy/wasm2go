@@ -56,8 +56,12 @@ jobs:
       - name: Install wat2wasm
         run: make install/wat2wasm
 
+      # internal/codegen is deliberately absent: its runtime tests
+      # build codegen.Translate output, which by design carries the
+      # pure bodies under the asm-dormancy tag with no asm bundle —
+      # only the full transpile backend produces v2-runnable packages.
       - name: Test with the amd64 splices enabled
-        run: go test -count=1 ./transpile/... ./internal/gcasm/... ./internal/codegen/...
+        run: go test -count=1 ./transpile/... ./internal/gcasm/...
 
   lint:
     runs-on: ubuntu-latest
