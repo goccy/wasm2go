@@ -236,6 +236,10 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 	// extract-width semantics make it safe.
 	unwrapConv := func(e ast.Expr) ast.Expr {
 		for {
+			if p, ok := e.(*ast.ParenExpr); ok {
+				e = p.X
+				continue
+			}
 			if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
 				if id, ok := c.Fun.(*ast.Ident); ok &&
 					(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
@@ -246,7 +250,7 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 			return e
 		}
 	}
-	valExpr, maskExpr := x.X, x.Y
+	valExpr, maskExpr := unwrapConv(x.X), unwrapConv(x.Y)
 	mask, mok := fb.constValueOf(unwrapConv(maskExpr))
 	if !mok {
 		valExpr, maskExpr = maskExpr, valExpr
@@ -255,9 +259,29 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 	if !mok || uint32(mask) != 0xffff {
 		return simdfuse.Arg{}, false
 	}
+	// Shift amounts resolve here rather than via matchShiftConst: its
+	// default mod-32 reduction encodes i32 shift semantics, and a
+	// 64-bit extract's lane offsets (32, 48) must NOT wrap. The `% 64`
+	// spelling of memory64 emission reduces identically either way.
+	shiftAmount := func(e ast.Expr) (int32, bool) {
+		e = unwrapConv(e)
+		if bin, ok := e.(*ast.BinaryExpr); ok && bin.Op == token.REM {
+			m, mok := fb.constValueOf(unwrapConv(bin.Y))
+			if !mok || (m != 32 && m != 64) {
+				return 0, false
+			}
+			c, cok := fb.constValueOf(unwrapConv(bin.X))
+			if !cok {
+				return 0, false
+			}
+			return c % m, true
+		}
+		c, ok := fb.constValueOf(e)
+		return c, ok
+	}
 	shift := int32(0)
 	if sh, ok := valExpr.(*ast.BinaryExpr); ok && sh.Op == token.SHR {
-		s, sok := matchShiftConst(sh.Y, fb)
+		s, sok := shiftAmount(sh.Y)
 		if !sok {
 			return simdfuse.Arg{}, false
 		}
@@ -272,6 +296,10 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 	// consumes so intervener accounting sees them as absorbed.
 	var consumed []string
 	for {
+		if p, ok := valExpr.(*ast.ParenExpr); ok {
+			valExpr = p.X
+			continue
+		}
 		if conv, ok := valExpr.(*ast.CallExpr); ok && len(conv.Args) == 1 {
 			if id, ok := conv.Fun.(*ast.Ident); ok &&
 				(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {

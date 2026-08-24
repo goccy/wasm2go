@@ -120,3 +120,21 @@ func TestA64LoopCheckHoistingSkipsStores(t *testing.T) {
 		t.Fatalf("hoisted check on a store-carrying loop:\n%s", pro)
 	}
 }
+
+// Register assignment must not depend on map iteration order: the
+// carried pointers' scalars get freeRegs in ascending scalar order,
+// every run.
+func TestA64LoopHostPtrsAssignmentOrder(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		ptrs := a64LoopHostPtrs(hoistLoop(false), []string{"R7", "R8"})
+		if ptrs == nil {
+			t.Fatal("no carried pointers")
+		}
+		if got := ptrs[0].reg; got != "R7" {
+			t.Fatalf("scalar 0 got %s, want R7", got)
+		}
+		if got := ptrs[1].reg; got != "R8" {
+			t.Fatalf("scalar 1 got %s, want R8", got)
+		}
+	}
+}
