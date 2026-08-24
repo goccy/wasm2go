@@ -20,7 +20,10 @@ package codegen
 import (
 	"fmt"
 	"go/ast"
+	"go/printer"
 	"go/token"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -32,6 +35,7 @@ type countdownLoop struct {
 	counter *ast.Ident        // the loop-carried counter variable
 	decVar  *ast.Ident        // do-while form: `decVar = counter - dec` (nil for header form)
 	decEx   []ast.Expr        // per-iteration decrement terms (const or const-local)
+	thresh  ast.Expr          // do-while floor test `thresh < decVar` (nil for the zero-exit forms)
 	wide    bool              // the counter is int64 (constants spelled int64(...))
 	eqHead  bool              // header form tested `c == 0` (valid only for a unit decrement)
 	bumps   []*ast.AssignStmt // `p = p + const`
@@ -128,23 +132,49 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	} else if _, iok := bin.Y.(*ast.Ident); !iok {
 		return nil, false
 	}
-	// Condition `decVar != 0 { tail; continue } else { break }` or the
-	// inverted `decVar == 0 { break } else { tail; continue }`.
+	// Condition `decVar != 0 { tail; continue } else { break }`, the
+	// inverted `decVar == 0 { break } else { tail; continue }`, or the
+	// floor-tested `T < decVar { tail; continue } else { break }`
+	// (also spelled `decVar > T`) that a rotated count-down-to-K
+	// source loop produces. T is a constant or constant local,
+	// resolved at upgrade time like the decrement.
 	cond, ok := ifs.Cond.(*ast.BinaryExpr)
-	if !ok || (cond.Op != token.NEQ && cond.Op != token.EQL) {
+	if !ok {
 		return nil, false
 	}
-	if id, ok := cond.X.(*ast.Ident); !ok || id.Name != decVar.Name {
+	var thresh ast.Expr
+	switch cond.Op {
+	case token.NEQ, token.EQL:
+		if id, ok := cond.X.(*ast.Ident); !ok || id.Name != decVar.Name {
+			return nil, false
+		}
+		if c, ok, w := loopConstValue(cond.Y); !ok || c != 0 {
+			return nil, false
+		} else if w {
+			wide = true
+		}
+	case token.LSS:
+		if id, ok := cond.Y.(*ast.Ident); !ok || id.Name != decVar.Name {
+			return nil, false
+		}
+		if !constishExpr(cond.X, wide) {
+			return nil, false
+		}
+		thresh = cond.X
+	case token.GTR:
+		if id, ok := cond.X.(*ast.Ident); !ok || id.Name != decVar.Name {
+			return nil, false
+		}
+		if !constishExpr(cond.Y, wide) {
+			return nil, false
+		}
+		thresh = cond.Y
+	default:
 		return nil, false
-	}
-	if c, ok, w := loopConstValue(cond.Y); !ok || c != 0 {
-		return nil, false
-	} else if w {
-		wide = true
 	}
 	var contArm []ast.Stmt
 	var brkBlk *ast.BlockStmt
-	if cond.Op == token.NEQ {
+	if cond.Op != token.EQL {
 		contArm = ifs.Body.List
 		brkBlk, _ = ifs.Else.(*ast.BlockStmt)
 	} else {
@@ -180,7 +210,7 @@ func matchCountdownLoop(sc *simdScalarizer, f *ast.ForStmt) (*countdownLoop, boo
 	if br, ok := arm[len(arm)-1].(*ast.BranchStmt); !ok || br.Tok != token.CONTINUE {
 		return nil, false
 	}
-	cl := &countdownLoop{counter: counter, decVar: decVar, decEx: []ast.Expr{bin.Y}, wide: wide}
+	cl := &countdownLoop{counter: counter, decVar: decVar, decEx: []ast.Expr{bin.Y}, thresh: thresh, wide: wide}
 	cl.body = list[:len(list)-3]
 	// The continue arm holds bumps, carries, and `c = decVar`.
 	sawReset := false
@@ -257,8 +287,138 @@ func (sc *simdScalarizer) wideCounters() bool {
 // result. Diagnostics only; the caller emits the loop as the window
 // path would have.
 func (sc *simdScalarizer) loopReject(tag string) (ast.Stmt, bool) {
-	fuseDebugf("FUSELOOP reject %s", tag)
+	fuseDebugf("FUSELOOP reject %s (fn=%s)", tag, sc.fnNameForDebug())
 	return nil, false
+}
+
+// tryFuseGotoLoop upgrades a GOTO-form countdown loop. Functions too
+// irregular for structured emission come out as label/goto chains:
+//
+//	L: ;
+//	   <body...; d = c - K>
+//	   if <exit test> { <bumps/carries; c = d>; goto L } else { goto Lexit }
+//
+// which is the do-while shape with the branches spelled as jumps —
+// and exactly where the big mul_mat hosts' INLINED kernel loops
+// land, so skipping it leaves the hottest loops at the window
+// boundary. The span converts to a synthetic ForStmt (goto L ->
+// continue, goto Lexit -> break) and reuses the whole upgrade; on
+// success the emitted replacement keeps the label (it is a loop
+// ENTRY other code jumps to) and ends with the exit jump.
+//
+// list[i] must be the label. Returns the replacement statements and
+// the number of input statements consumed.
+func (sc *simdScalarizer) tryFuseGotoLoop(list []ast.Stmt, i int, prelude *[]ast.Stmt) ([]ast.Stmt, int, bool) {
+	// On by default. WASM2GO_GOTO_FUSE_MAX=<n> caps the number of
+	// upgrades for bisection (0 disables). The commit-time intervener
+	// check refuses any loop whose per-iteration scalar chains the
+	// walk cannot absorb, so an unfusable shape degrades to the
+	// window form instead of miscomputing.
+	if lim := os.Getenv("WASM2GO_GOTO_FUSE_MAX"); lim != "" {
+		if n, err := strconv.Atoi(lim); err != nil || gotoFuseCount >= n {
+			return nil, 0, false
+		}
+	}
+	lbl, ok := list[i].(*ast.LabeledStmt)
+	if !ok {
+		return nil, 0, false
+	}
+	if _, empty := lbl.Stmt.(*ast.EmptyStmt); !empty {
+		return nil, 0, false
+	}
+	// Find the terminator: the first IfStmt at this level. Every
+	// statement before it must be a plain assignment (no labels — a
+	// side entry would skip the hoisted region — and no nested jumps).
+	j := i + 1
+	for ; j < len(list); j++ {
+		switch s := list[j].(type) {
+		case *ast.AssignStmt:
+			continue
+		case *ast.IfStmt:
+			if s.Else == nil {
+				return nil, 0, false
+			}
+		default:
+			return nil, 0, false
+		}
+		break
+	}
+	if j >= len(list) {
+		return nil, 0, false
+	}
+	term := list[j].(*ast.IfStmt)
+	// Both arms must end in gotos; the backedge names our label.
+	armGoto := func(bs *ast.BlockStmt) (*ast.Ident, []ast.Stmt, bool) {
+		if bs == nil || len(bs.List) == 0 {
+			return nil, nil, false
+		}
+		br, ok := bs.List[len(bs.List)-1].(*ast.BranchStmt)
+		if !ok || br.Tok != token.GOTO || br.Label == nil {
+			return nil, nil, false
+		}
+		return br.Label, bs.List[:len(bs.List)-1], true
+	}
+	elseBlk, _ := term.Else.(*ast.BlockStmt)
+	thenLbl, thenPre, tok1 := armGoto(term.Body)
+	elseLbl, elsePre, tok2 := armGoto(elseBlk)
+	if !tok1 || !tok2 {
+		return nil, 0, false
+	}
+	var contPre, brkPre []ast.Stmt
+	var exit *ast.Ident
+	var contFirst bool
+	switch {
+	case thenLbl.Name == lbl.Label.Name && elseLbl.Name != lbl.Label.Name:
+		contPre, brkPre, exit, contFirst = thenPre, elsePre, elseLbl, true
+	case elseLbl.Name == lbl.Label.Name && thenLbl.Name != lbl.Label.Name:
+		contPre, brkPre, exit, contFirst = elsePre, thenPre, thenLbl, false
+	default:
+		return nil, 0, false
+	}
+	// Synthesize the structured do-while and reuse the upgrade. The
+	// arm contents are shared (not copied): on failure nothing was
+	// mutated, on success the originals are discarded wholesale.
+	contArm := append(append([]ast.Stmt{}, contPre...), &ast.BranchStmt{Tok: token.CONTINUE})
+	brkArm := append(append([]ast.Stmt{}, brkPre...), &ast.BranchStmt{Tok: token.BREAK})
+	var synthIf *ast.IfStmt
+	if contFirst {
+		synthIf = &ast.IfStmt{Cond: term.Cond, Body: &ast.BlockStmt{List: contArm}, Else: &ast.BlockStmt{List: brkArm}}
+	} else {
+		synthIf = &ast.IfStmt{Cond: term.Cond, Body: &ast.BlockStmt{List: brkArm}, Else: &ast.BlockStmt{List: contArm}}
+	}
+	synth := &ast.ForStmt{Body: &ast.BlockStmt{List: append(
+		append([]ast.Stmt{}, list[i+1:j]...),
+		synthIf,
+		&ast.BranchStmt{Tok: token.BREAK},
+	)}}
+	// The hoisted invariants must sit AFTER the label: the label is a
+	// live jump target (the loop's entry edge), and anything emitted
+	// before it would be skipped on entry.
+	var hoisted []ast.Stmt
+	repl, ok := sc.tryFuseLoop(synth, &hoisted)
+	if !ok {
+		return nil, 0, false
+	}
+	_ = prelude
+	gotoFuseCount++
+	out := []ast.Stmt{&ast.LabeledStmt{Label: lbl.Label, Stmt: &ast.EmptyStmt{}}}
+	out = append(out, hoisted...)
+	out = append(out, repl, &ast.BranchStmt{Tok: token.GOTO, Label: exit})
+	return out, j - i + 1, true
+}
+
+// gotoFuseCount counts committed goto-form loop upgrades for the
+// WASM2GO_GOTO_FUSE_MAX bisection gate (diagnostics only; the
+// transpiler runs one module per process).
+var gotoFuseCount int
+
+// renderStmtForDebug prints a statement for FuseDebug diagnostics.
+func renderStmtForDebug(st ast.Stmt) string {
+	var buf strings.Builder
+	if err := printer.Fprint(&buf, token.NewFileSet(), st); err != nil {
+		return fmt.Sprintf("<%T>", st)
+	}
+	return strings.Join(strings.Fields(buf.String()), " ")
 }
 
 // blankFor returns n blank identifiers for a keep-alive assignment.
@@ -456,15 +616,24 @@ func constishExpr(e ast.Expr, wide bool) bool {
 
 // identWrites collects every identifier the statements assign.
 func identWrites(stmts []ast.Stmt) map[string]bool {
+	// Nested statements count: the countdown forms keep their bumps,
+	// carries and counter reset inside the backedge IfStmt's arm, and
+	// missing those let a loop-VARIANT intervener (a per-iteration
+	// scale load reading a bumped pointer) hoist as "invariant" — the
+	// value then freezes at its entry reading and every later
+	// iteration computes with the wrong scale.
 	w := map[string]bool{}
 	for _, st := range stmts {
-		if as, ok := st.(*ast.AssignStmt); ok {
-			for _, l := range as.Lhs {
-				if id, ok := l.(*ast.Ident); ok {
-					w[id.Name] = true
+		ast.Inspect(st, func(n ast.Node) bool {
+			if as, ok := n.(*ast.AssignStmt); ok {
+				for _, l := range as.Lhs {
+					if id, ok := l.(*ast.Ident); ok {
+						w[id.Name] = true
+					}
 				}
 			}
-		}
+			return true
+		})
 	}
 	return w
 }
@@ -526,6 +695,9 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				cl.consts = append(cl.consts, as)
 				continue
 			}
+		}
+		if fuseDebugEnabled {
+			return sc.loopReject(fmt.Sprintf("L445: %s", renderStmtForDebug(st)))
 		}
 		return sc.loopReject("L445")
 	}
@@ -609,6 +781,17 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		return sc.loopReject("eq-head-nonunit-dec")
 	}
 	loop := &simdfuse.Loop{Tree: tree, Dec: dec, PreTest: cl.decVar == nil, CounterWide: cl.wide}
+	if cl.thresh != nil {
+		c, cok := resolveC(cl.thresh)
+		if !cok {
+			return sc.loopReject("thresh-unresolved")
+		}
+		if c < 0 || c >= 4096 {
+			return sc.loopReject("thresh-range")
+		}
+		loop.ExitGT = true
+		loop.ExitThresh = c
+	}
 	// Carries: `prev = next` with prev a pair argument and next a
 	// root is loop-carried state; prev NOT an argument is an
 	// EXIT-COPY (the unroller's after-loop phi carrier), reassigned
@@ -836,6 +1019,9 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 			})
 		}
 		if bad {
+			if fuseDebugEnabled {
+				return sc.loopReject(fmt.Sprintf("L747: %s", renderStmtForDebug(st)))
+			}
 			return sc.loopReject("L747")
 		}
 	}
@@ -1021,8 +1207,13 @@ func fusedLoopDecl(name string, loop *simdfuse.Loop, multiPackage bool) *ast.Fun
 			Body: &ast.BlockStmt{List: iter},
 		}
 	} else {
+		exitCond := &ast.BinaryExpr{X: newID(ctr.Name), Op: token.EQL, Y: intLit(0)}
+		if loop.ExitGT {
+			// Signed floor test: the loop repeats while ctr > thresh.
+			exitCond = &ast.BinaryExpr{X: newID(ctr.Name), Op: token.LEQ, Y: intLitSigned(int64(loop.ExitThresh))}
+		}
 		iter = append(iter, &ast.IfStmt{
-			Cond: &ast.BinaryExpr{X: newID(ctr.Name), Op: token.EQL, Y: intLit(0)},
+			Cond: exitCond,
 			Body: &ast.BlockStmt{List: []ast.Stmt{&ast.BranchStmt{Tok: token.BREAK}}},
 		})
 		forStmt = &ast.ForStmt{Body: &ast.BlockStmt{List: iter}}

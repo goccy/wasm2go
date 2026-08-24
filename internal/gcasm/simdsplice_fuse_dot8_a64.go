@@ -1,6 +1,8 @@
 package gcasm
 
 import (
+	"os"
+
 	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
@@ -50,6 +52,12 @@ const (
 	a64OpSdot16 = "i32x4_sdot16" // movi #0 + tbl + tbl + sdot
 	// arg0's int32 accumulator + the full 16-byte dot of arg1, arg2.
 	a64OpSdotAcc = "i32x4_sdot16_acc" // tbl + tbl + sdot (accumulating)
+	// Raw (unpermuted) SDOT: natural per-4-byte-group lanes. Selected
+	// ONLY by the cross-chain rewrite, whose matched even/odd lane
+	// combine proves the consumer wants exactly SDOT's grouping — so
+	// no TBL and bit-exact regardless of fast-math.
+	a64OpSdotRaw    = "i32x4_sdot16_raw"     // movi #0 + sdot
+	a64OpSdotRawAcc = "i32x4_sdot16_raw_acc" // sdot (accumulating)
 	// FMUL by element: multiplies a vector by lane 0 of a scalar
 	// source register, absorbing a single-use f32x4_splat. IEEE
 	// multiply per lane, identical to dup + vector fmul.
@@ -128,6 +136,7 @@ func a64Dot8Rewrite(tree *simdfuse.Tree, portable, fastMath bool) *simdfuse.Tree
 		a64Dot8FlattenAdds(nodes, isRoot)
 		if !portable {
 			a64SdotRewrite(nodes)
+			a64CrossSdotRewrite(nodes, isRoot, tree.ConstPairs)
 		}
 	}
 	if rewrote && fastMath {
@@ -281,6 +290,226 @@ func a64SdotRewrite(nodes []simdfuse.Node) {
 			// accumulation must land there. len(links) == 2*len(pairs)-1,
 			// so links[2k] for the final k IS the tail.
 			panic("sdot rewrite: chain tail mismatch")
+		}
+	}
+}
+
+// Even/odd dword-select shuffle patterns, as the two u64 halves of an
+// i8x16_shuffle control vector: even picks dwords {x0, x2, y0, y2} of
+// the concatenated 32-byte input, odd picks {x1, x3, y1, y3}.
+var (
+	a64EvenSel = [2]uint64{0x0b0a090803020100, 0x1b1a191813121110}
+	a64OddSel  = [2]uint64{0x0f0e0d0c07060504, 0x1f1e1d1c17161514}
+)
+
+// a64CrossSdotRewrite upgrades the even/odd lane-combine of TWO
+// sadalp chains — one all-low, one all-high, over pairwise-identical
+// byte sources — to a single RAW SDOT chain.
+//
+// dot_i16x8(extend_low(b), extend_low(a)) lane j holds the product
+// sum of bytes {2j, 2j+1}; the high dot covers bytes {2j+8, 2j+9}.
+// The matched combine add(shuffle(dl, dh, even), shuffle(dl, dh,
+// odd)) therefore computes, per output lane, the sum of one FOUR-BYTE
+// group's products — exactly SDOT's natural lane grouping, summed
+// over the chains' common leaf sequence. Every step is exact integer
+// arithmetic, so replacing the two chains, both shuffles and the add
+// with sdot accumulations over the raw 16-byte sources is
+// bit-identical — no TBL permutation, independent of fast-math.
+//
+// Interleaved-layout kernels (ggml's q8_0x4 repack gemv/gemm) hit
+// this shape structurally: the 4-column interleave forces columns 0/1
+// into the low half and 2/3 into the high half, so the single-chain
+// (low,high) pairing above never fires for them.
+func a64CrossSdotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int][2]uint64) {
+	if os.Getenv("WASM2GO_NO_CROSS_SDOT") != "" {
+		return
+	}
+	uses := make([]int, len(nodes))
+	for _, n := range nodes {
+		for _, a := range n.Args {
+			if a.Kind == simdfuse.ArgNode {
+				uses[a.Index]++
+			}
+		}
+	}
+	// selKind classifies a shuffle node: its control vector must be a
+	// known even/odd dword select — either the descriptor-constant
+	// form (i8x16_shuffle_const, pattern in four ArgConst) or a pair
+	// argument whose call-site value is a recorded constant.
+	selKind := func(i int) (x, y int, even, ok bool) {
+		n := &nodes[i]
+		var pat [2]uint64
+		switch {
+		case n.Op == "i8x16_shuffle_const" && len(n.Args) == 6 &&
+			n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode:
+			u32c := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
+			pat = [2]uint64{u32c(n.Args[2]) | u32c(n.Args[3])<<32, u32c(n.Args[4]) | u32c(n.Args[5])<<32}
+		case n.Op == "i8x16_shuffle" && len(n.Args) == 3 &&
+			n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode &&
+			n.Args[2].Kind == simdfuse.ArgPairIn:
+			var isConst bool
+			pat, isConst = constPairs[n.Args[2].Index]
+			if !isConst {
+				return 0, 0, false, false
+			}
+		default:
+			return 0, 0, false, false
+		}
+		switch pat {
+		case a64EvenSel:
+			return n.Args[0].Index, n.Args[1].Index, true, true
+		case a64OddSel:
+			return n.Args[0].Index, n.Args[1].Index, false, true
+		}
+		return 0, 0, false, false
+	}
+	// chainOf collects a sadalp chain in leaf order: (head Dot8Low/High
+	// + Dot8Acc links over Dot8Mul products), or a bare head. Interior
+	// values are unobservable (single use, not a root).
+	chainOf := func(tail int, low bool) (leaves, all []int, ok bool) {
+		headOp, mulOp := a64OpDot8Low, a64OpDot8MulLow
+		if !low {
+			headOp, mulOp = a64OpDot8High, a64OpDot8MulHigh
+		}
+		at := tail
+		var rev []int // product leaves, tail-first
+		for nodes[at].Op == a64OpDot8Acc {
+			n := &nodes[at]
+			if len(n.Args) != 2 || n.Args[0].Kind != simdfuse.ArgNode || n.Args[1].Kind != simdfuse.ArgNode {
+				return nil, nil, false
+			}
+			p := n.Args[1].Index
+			if nodes[p].Op != mulOp || uses[p] != 1 || isRoot[p] {
+				return nil, nil, false
+			}
+			if at != tail && (uses[at] != 1 || isRoot[at]) {
+				return nil, nil, false
+			}
+			rev = append(rev, p)
+			all = append(all, at, p)
+			at = n.Args[0].Index
+		}
+		if nodes[at].Op != headOp {
+			return nil, nil, false
+		}
+		if at != tail && (uses[at] != 1 || isRoot[at]) {
+			return nil, nil, false
+		}
+		all = append(all, at)
+		leaves = []int{at}
+		for j := len(rev) - 1; j >= 0; j-- {
+			leaves = append(leaves, rev[j])
+		}
+		return leaves, all, true
+	}
+	for c := len(nodes) - 1; c >= 0; c-- {
+		n := &nodes[c]
+		if n.Op != "i32x4_add" || len(n.Args) != 2 ||
+			n.Args[0].Kind != simdfuse.ArgNode || n.Args[1].Kind != simdfuse.ArgNode {
+			continue
+		}
+		e, o := n.Args[0].Index, n.Args[1].Index
+		ex, ey, eEven, eok := selKind(e)
+		ox, oy, oEven, ook := selKind(o)
+		if !eok || !ook || eEven == oEven || ex != ox || ey != oy {
+			continue
+		}
+		if uses[e] != 1 || uses[o] != 1 || isRoot[e] || isRoot[o] {
+			continue
+		}
+		// Both shuffles read (dl, dh); each chain tail is consumed by
+		// exactly the two shuffles.
+		dl, dh := ex, ey
+		if uses[dl] != 2 || uses[dh] != 2 || isRoot[dl] || isRoot[dh] {
+			continue
+		}
+		lowLeaves, lowAll, lok := chainOf(dl, true)
+		highLeaves, highAll, hok := chainOf(dh, false)
+		if !lok || !hok || len(lowLeaves) != len(highLeaves) {
+			continue
+		}
+		paired := true
+		for j := range lowLeaves {
+			la, ha := nodes[lowLeaves[j]].Args, nodes[highLeaves[j]].Args
+			if len(la) != 2 || len(ha) != 2 || la[0] != ha[0] || la[1] != ha[1] {
+				paired = false
+				break
+			}
+		}
+		if !paired {
+			continue
+		}
+		// Rebuild: raw sdot accumulation over the common sources.
+		// Four or more pairs split across TWO alternating chains
+		// joined by one add (exact integer reassociation): a single
+		// chain serializes k accumulations on the sdot latency, and
+		// the measured kernels are latency-bound there, not
+		// throughput-bound. Chain nodes land on the low chain's leaf
+		// slots (ascending, each already following its own sources in
+		// post-order); the join — or the single chain's final
+		// accumulation — lands on the combine node so its consumers
+		// read the same index.
+		k := len(lowLeaves)
+		srcArgs := make([][2]simdfuse.Arg, k)
+		for j, l := range lowLeaves {
+			srcArgs[j] = [2]simdfuse.Arg{nodes[l].Args[0], nodes[l].Args[1]}
+		}
+		for _, i := range lowAll {
+			nodes[i] = simdfuse.Node{Op: a64OpElided}
+		}
+		for _, i := range highAll {
+			nodes[i] = simdfuse.Node{Op: a64OpElided}
+		}
+		nodes[e] = simdfuse.Node{Op: a64OpElided}
+		nodes[o] = simdfuse.Node{Op: a64OpElided}
+		if k == 1 {
+			nodes[c] = simdfuse.Node{Op: a64OpSdotRaw, Args: []simdfuse.Arg{srcArgs[0][0], srcArgs[0][1]}}
+			continue
+		}
+		slots := make([]int, 0, k)
+		slots = append(slots, lowLeaves...)
+		sortInts(slots)
+		if k >= 4 {
+			tailA, tailB := -1, -1
+			for j := 0; j < k; j++ {
+				prev := tailA
+				if j%2 == 1 {
+					prev = tailB
+				}
+				var nd simdfuse.Node
+				if prev < 0 {
+					nd = simdfuse.Node{Op: a64OpSdotRaw, Args: []simdfuse.Arg{srcArgs[j][0], srcArgs[j][1]}}
+				} else {
+					nd = simdfuse.Node{Op: a64OpSdotRawAcc, Args: []simdfuse.Arg{
+						{Kind: simdfuse.ArgNode, Index: prev}, srcArgs[j][0], srcArgs[j][1],
+					}}
+				}
+				nodes[slots[j]] = nd
+				if j%2 == 0 {
+					tailA = slots[j]
+				} else {
+					tailB = slots[j]
+				}
+			}
+			nodes[c] = simdfuse.Node{Op: "i32x4_add", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: tailA}, {Kind: simdfuse.ArgNode, Index: tailB},
+			}}
+		} else {
+			prev := slots[0]
+			nodes[prev] = simdfuse.Node{Op: a64OpSdotRaw, Args: []simdfuse.Arg{srcArgs[0][0], srcArgs[0][1]}}
+			for j := 1; j < k-1; j++ {
+				nodes[slots[j]] = simdfuse.Node{Op: a64OpSdotRawAcc, Args: []simdfuse.Arg{
+					{Kind: simdfuse.ArgNode, Index: prev}, srcArgs[j][0], srcArgs[j][1],
+				}}
+				prev = slots[j]
+			}
+			nodes[c] = simdfuse.Node{Op: a64OpSdotRawAcc, Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: prev}, srcArgs[k-1][0], srcArgs[k-1][1],
+			}}
+		}
+		// Consumers still read index c; uses of elided slots are gone.
+		for _, i := range append(append([]int{}, lowAll...), highAll...) {
+			uses[i] = 0
 		}
 	}
 }

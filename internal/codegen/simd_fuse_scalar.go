@@ -219,6 +219,135 @@ func (fb *fusedTreeBuilder) chaseLoad16Deref(inner *ast.StarExpr) (simdfuse.Arg,
 	return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
 }
 
+// chaseNarrowExtract16 rewrites `(wideload >> C) & 0xffff` (and the
+// C==0 form `wideload & 0xffff`) into a scalar_i32_load16_u at the
+// load's address plus C/8 bytes. Linear memory and every supported
+// host are little-endian, so a 16-bit field of a wider aligned-free
+// load is exactly the 16-bit load at the byte-shifted address. This
+// is the form clang produces when it packs several adjacent f16
+// scale reads into one 32/64-bit load.
+func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Arg, bool) {
+	if x.Op != token.AND {
+		return simdfuse.Arg{}, false
+	}
+	// The mask constant arrives wrapped in the pointer-width
+	// conversion (`int64(65535)`) on memory64; constValueOf
+	// deliberately rejects 64-bit wrappers, so unwrap here where the
+	// extract-width semantics make it safe.
+	unwrapConv := func(e ast.Expr) ast.Expr {
+		for {
+			if c, ok := e.(*ast.CallExpr); ok && len(c.Args) == 1 {
+				if id, ok := c.Fun.(*ast.Ident); ok &&
+					(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
+					e = c.Args[0]
+					continue
+				}
+			}
+			return e
+		}
+	}
+	valExpr, maskExpr := x.X, x.Y
+	mask, mok := fb.constValueOf(unwrapConv(maskExpr))
+	if !mok {
+		valExpr, maskExpr = maskExpr, valExpr
+		mask, mok = fb.constValueOf(unwrapConv(maskExpr))
+	}
+	if !mok || uint32(mask) != 0xffff {
+		return simdfuse.Arg{}, false
+	}
+	shift := int32(0)
+	if sh, ok := valExpr.(*ast.BinaryExpr); ok && sh.Op == token.SHR {
+		s, sok := matchShiftConst(sh.Y, fb)
+		if !sok {
+			return simdfuse.Arg{}, false
+		}
+		shift = s
+		valExpr = sh.X
+	}
+	if shift%8 != 0 || shift < 0 {
+		return simdfuse.Arg{}, false
+	}
+	// Unwrap width conversions and single-def locals down to the
+	// memory deref itself, remembering which locals the rewrite
+	// consumes so intervener accounting sees them as absorbed.
+	var consumed []string
+	for {
+		if conv, ok := valExpr.(*ast.CallExpr); ok && len(conv.Args) == 1 {
+			if id, ok := conv.Fun.(*ast.Ident); ok &&
+				(id.Name == "int32" || id.Name == "uint32" || id.Name == "int64" || id.Name == "uint64") {
+				valExpr = conv.Args[0]
+				continue
+			}
+		}
+		if id, ok := valExpr.(*ast.Ident); ok {
+			def, dok := fb.interDef[id.Name]
+			if !dok || len(def.Rhs) != 1 {
+				return simdfuse.Arg{}, false
+			}
+			consumed = append(consumed, id.Name)
+			valExpr = def.Rhs[0]
+			continue
+		}
+		break
+	}
+	star, ok := valExpr.(*ast.StarExpr)
+	if !ok {
+		return simdfuse.Arg{}, false
+	}
+	var (
+		addr ast.Expr
+		is64 bool
+		bits int32
+	)
+	for _, w := range []struct {
+		typ  string
+		bits int32
+	}{{"uint64", 64}, {"int64", 64}, {"uint32", 32}, {"int32", 32}} {
+		if a, i64, mok := matchMemDeref(star, w.typ); mok {
+			addr, is64, bits = a, i64, w.bits
+			break
+		}
+	}
+	if addr == nil || shift+16 > bits {
+		return simdfuse.Arg{}, false
+	}
+	aarg, aok := fb.chaseAddr(addr)
+	if !aok {
+		return simdfuse.Arg{}, false
+	}
+	if off := shift / 8; off != 0 {
+		switch aarg.Kind {
+		case simdfuse.ArgConst, simdfuse.ArgSum:
+			aarg.Const += off
+		case simdfuse.ArgScalar:
+			aarg = simdfuse.Arg{Kind: simdfuse.ArgSum, Index: aarg.Index, Const: off}
+		default:
+			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{aarg, {Kind: simdfuse.ArgConst, Const: off}})
+			if !ok {
+				return simdfuse.Arg{}, false
+			}
+			aarg = simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}
+		}
+	}
+	if is64 {
+		fb.addr64 = true
+	}
+	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
+	if !nok {
+		return simdfuse.Arg{}, false
+	}
+	if fb.chaseUses == nil {
+		fb.chaseUses = map[string]int{}
+	}
+	for _, name := range consumed {
+		fb.chaseUses[name]++
+	}
+	if fb.chaseTrace {
+		fuseDebugf("chaseTRACE narrow16: shift=%d bits=%d addr kind=%d idx=%d const=%d", shift, bits, aarg.Kind, aarg.Index, aarg.Const)
+	}
+	return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
+}
+
 func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 	if c, ok := fb.constValueOf(e); ok {
 		return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c}, true
@@ -305,6 +434,9 @@ func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 		case token.AND:
 			if !fb.wideChase {
 				return simdfuse.Arg{}, false
+			}
+			if arg, ok := fb.chaseNarrowExtract16(x); ok {
+				return arg, true
 			}
 			// Identity-mask elimination for the f16 gather chase: the
 			// guest masks a load16_u result before shifting it into a
@@ -555,6 +687,9 @@ func (fb *fusedTreeBuilder) addChaseScalarArg(src ast.Expr, key string) (simdfus
 	}
 	idx := len(fb.scalars)
 	fb.scalarDedup[key] = idx
+	if fb.chaseTrace {
+		fuseDebugf("chaseTRACE opaque scalar s%d: %s", idx, exprDebugString(src))
+	}
 	fb.scalars = append(fb.scalars, src)
 	fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
 	// Chased compound expression: no single-source SSA provenance —

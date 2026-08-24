@@ -516,6 +516,69 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 			vex(b, srcs, d)
 			loc[i] = fusedLoc{chained: willChain, pool: d}
 			continue
+		} else if n.Op == "i8x16_shuffle_const" {
+			// Shuffle with a descriptor-constant control vector: the
+			// pattern comes from the const pool (no ABI slot), the two
+			// sources route to X0/X1 and the standard two-source
+			// PSHUFB emulation runs with the pattern in X2.
+			if len(n.Args) != 6 {
+				return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+			}
+			if pool == nil {
+				return nil, false, fmt.Errorf("fused splice %s: %s needs a const pool", tree.Name, n.Op)
+			}
+			for k := 0; k < 2; k++ {
+				a := n.Args[k]
+				switch a.Kind {
+				case simdfuse.ArgNode:
+					if loc[a.Index].chained {
+						if k != 0 {
+							return nil, false, fmt.Errorf("fused splice %s: chained value consumed at operand %d", tree.Name, k)
+						}
+					} else {
+						x64VecCopy(b, k, loc[a.Index].pool)
+					}
+				case simdfuse.ArgPairIn:
+					if cr, isCarried := carried[a.Index]; isCarried {
+						x64VecCopy(b, k, cr)
+					} else {
+						lo, hi := pairRegs(a)
+						fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, k)
+						fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, k)
+					}
+				default:
+					return nil, false, fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+				}
+			}
+			u32c := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
+			patLo := u32c(n.Args[2]) | u32c(n.Args[3])<<32
+			patHi := u32c(n.Args[4]) | u32c(n.Args[5])<<32
+			blob := make([]byte, 16)
+			for bi := 0; bi < 8; bi++ {
+				blob[bi] = byte(patLo >> (8 * bi))
+				blob[8+bi] = byte(patHi >> (8 * bi))
+			}
+			fmt.Fprintf(b, "\tMOVOU ·%s(SB), X2\n", pool.addBlob(blob))
+			shufLines, cok := simdSpliceRewriteConsts([]string{
+				"MOVOU ·simdConst70(SB), X3", "MOVOU X2, X4", "PADDUSB X3, X4", "PSHUFB X4, X0",
+				"MOVOU ·simdConst16(SB), X5", "PSUBB X5, X2", "PADDUSB X3, X2", "PSHUFB X2, X1",
+				"POR X1, X0",
+			}, pool)
+			if !cok {
+				return nil, false, fmt.Errorf("fused splice %s: shuffle const table", tree.Name)
+			}
+			for _, ln := range shufLines {
+				fmt.Fprintf(b, "\t%s\n", ln)
+			}
+			d := dst
+			if willChain {
+				d = 0
+			}
+			if d != 0 {
+				x64VecCopy(b, d, 0)
+			}
+			loc[i] = fusedLoc{chained: willChain, pool: d}
+			continue
 		} else {
 			lines, ok := x64SimdPairSpliceTab[n.Op]
 			if !ok {
@@ -804,6 +867,11 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		addOff(1)
 		checked(4)
 		fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+		return addOffErr
+	case "v128_load64_zero":
+		addOff(1)
+		checked(8)
+		fmt.Fprintf(b, "\tVMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
 		return addOffErr
 	case "v128_load32_splat":
 		addOff(1)
@@ -1192,6 +1260,9 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	if loop.Dec <= 0 {
 		return false, false, fmt.Errorf("fused loop %s: bad dec %d", tree.Name, loop.Dec)
 	}
+	if loop.ExitGT && (loop.PreTest || loop.ExitThresh < 0) {
+		return false, false, fmt.Errorf("fused loop %s: bad exit threshold %d", tree.Name, loop.ExitThresh)
+	}
 	poolTop := 14
 	if tree.NumFloats > 0 {
 		poolTop = 13
@@ -1245,10 +1316,15 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		fmt.Fprintf(b, "\t%s $%d, %s\n", bumpAdd, bump.Delta, x64FusedArgRegs[1+bump.Scalar])
 	}
 	fmt.Fprintf(b, "\t%s $%d, %s\n", subOp, loop.Dec, counterReg)
-	if loop.PreTest {
+	switch {
+	case loop.PreTest:
 		fmt.Fprintf(b, "\tJMP %s\n", loopLabel)
 		fmt.Fprintf(b, "%s:\n", exitLabel)
-	} else {
+	case loop.ExitGT:
+		// Signed floor test: repeat while counter > ExitThresh.
+		fmt.Fprintf(b, "\t%s %s, $%d\n", cmpOp, counterReg, loop.ExitThresh)
+		fmt.Fprintf(b, "\tJGT %s\n", loopLabel)
+	default:
 		fmt.Fprintf(b, "\tJNE %s\n", loopLabel)
 	}
 	roots := tree.RootList()

@@ -19,6 +19,7 @@ import (
 	"go/ast"
 	"go/token"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -172,7 +173,7 @@ func (t *translator) internFusedLoop(l *simdfuse.Loop) (string, bool) {
 	if t.fusedLoops == nil {
 		t.fusedLoops = &fusedLoopState{byKey: map[string]*simdfuse.Loop{}}
 	}
-	key := fmt.Sprintf("%s|D%d|P%v|C%d|B%v|N%d|X%v|T%v|W%v", l.Tree.Name, l.Dec, l.CarriedPairs, l.CounterScalar, l.Bumps, l.NumDeltas, l.ExitScalars, l.PreTest, l.CounterWide)
+	key := fmt.Sprintf("%s|D%d|P%v|C%d|B%v|N%d|X%v|T%v|W%v|G%v|H%d", l.Tree.Name, l.Dec, l.CarriedPairs, l.CounterScalar, l.Bumps, l.NumDeltas, l.ExitScalars, l.PreTest, l.CounterWide, l.ExitGT, l.ExitThresh)
 	if _, ok := t.fusedLoops.byKey[key]; ok {
 		for i, k := range t.fusedLoops.names {
 			_ = i
@@ -269,6 +270,10 @@ type fusedTreeBuilder struct {
 	scalarSrc []fusedParamSrc
 	floatSrc  []fusedParamSrc
 	pairSrc   []fusedParamSrc
+	// constPairs records pair parameters whose source expression is a
+	// compile-time v128 constant (value folded into the shape key;
+	// copied to Tree.ConstPairs for splicer specialization).
+	constPairs map[int][2]uint64
 	// wideChase widens the identifier chase to function-wide
 	// single-assignment definitions (defBind) — enabled only inside
 	// the f16 gather normalization, which recomputes pure chains
@@ -457,6 +462,119 @@ func floatPoolCost(nFloats int) int {
 	return 1
 }
 
+// reassocOps are the vector ops whose reassociation is BIT-EXACT
+// (wrapping adds and bitwise logic): a maximal same-op tree over
+// them computes the same lanes in any association.
+var reassocOps = map[string]bool{
+	"i8x16_add": true, "i16x8_add": true, "i32x4_add": true, "i64x2_add": true,
+	"v128_and": true, "v128_or": true, "v128_xor": true,
+}
+
+// reassociateChains left-folds maximal same-op trees of exactly
+// associative vector ops. The emitter's reduction trees arrive
+// right-deep with the OUTERMOST node consuming the earliest leaf, so
+// no partial sum can retire until every leaf is live — with the
+// region's loads pinned to program order that makes peak liveness
+// grow with the leaf count (a dual-extended dot kernel keeps every
+// dot result parked). Re-hanging the same leaves, in their original
+// walk order, off a left fold lets each leaf combine as soon as it
+// exists; the scheduler then keeps one running partial instead.
+// Only the interior nodes' argument lists change: in the walk's
+// post-order every leaf indexes below every interior node, so
+// assigning interior nodes (ascending) leaf pairs left-to-right
+// preserves the array's topological invariant.
+func (fb *fusedTreeBuilder) reassociateChains(roots []int) {
+	if os.Getenv("WASM2GO_NO_REASSOC") != "" {
+		return
+	}
+	consumers := make([]int, len(fb.nodes))
+	for _, nd := range fb.nodes {
+		for _, a := range nd.Args {
+			if a.Kind == simdfuse.ArgNode {
+				consumers[a.Index]++
+			}
+		}
+	}
+	rootUse := map[int]bool{}
+	for _, r := range roots {
+		rootUse[r] = true
+	}
+	inChain := make([]bool, len(fb.nodes))
+	for head := len(fb.nodes) - 1; head >= 0; head-- {
+		op := fb.nodes[head].Op
+		if !reassocOps[op] || inChain[head] || len(fb.nodes[head].Args) != 2 {
+			continue
+		}
+		// Interior nodes: same op, exclusively chain-consumed, not a
+		// region output themselves. Leaves keep walk (index) order.
+		var interior []int
+		var leaves []simdfuse.Arg
+		var collect func(a simdfuse.Arg) bool
+		collect = func(a simdfuse.Arg) bool {
+			if a.Kind == simdfuse.ArgNode {
+				i := a.Index
+				if i != head && fb.nodes[i].Op == op && len(fb.nodes[i].Args) == 2 &&
+					consumers[i] == 1 && !rootUse[i] && !inChain[i] {
+					interior = append(interior, i)
+					for _, sub := range fb.nodes[i].Args {
+						if !collect(sub) {
+							return false
+						}
+					}
+					return true
+				}
+			}
+			leaves = append(leaves, a)
+			return true
+		}
+		okChain := true
+		for _, a := range fb.nodes[head].Args {
+			if !collect(a) {
+				okChain = false
+				break
+			}
+		}
+		if !okChain || len(interior) < 2 || len(leaves) != len(interior)+2 {
+			continue
+		}
+		// Every leaf node must index below every interior slot it is
+		// assigned to; the walk's post-order guarantees it, but verify
+		// rather than assume (a future walk change must fail safe).
+		slots := append(append([]int{}, interior...), head)
+		sort.Ints(slots)
+		valid := true
+		for li, a := range leaves {
+			if a.Kind != simdfuse.ArgNode {
+				continue
+			}
+			slot := slots[0]
+			if li >= 2 {
+				slot = slots[li-1]
+			}
+			if a.Index >= slot {
+				valid = false
+				break
+			}
+		}
+		for i := 1; i < len(slots); i++ {
+			if slots[i-1] >= slots[i] {
+				valid = false
+			}
+		}
+		if !valid {
+			continue
+		}
+		fb.nodes[slots[0]].Args = []simdfuse.Arg{leaves[0], leaves[1]}
+		for i := 1; i < len(slots); i++ {
+			fb.nodes[slots[i]].Args = []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: slots[i-1]}, leaves[i+1]}
+		}
+		for _, i := range interior {
+			inChain[i] = true
+		}
+		inChain[head] = true
+	}
+}
+
 // scheduleNodes reorders the region's nodes to minimize
 // simultaneously-live values: statement order piles every unrolled
 // load up front (peak live = the load count), but inside a region only
@@ -469,6 +587,7 @@ func floatPoolCost(nFloats int) int {
 // next load; otherwise take any ready pure op. Node indices, roots
 // and the shape key are remapped afterwards.
 func (fb *fusedTreeBuilder) scheduleNodes(roots []int) []int {
+	fb.reassociateChains(roots)
 	n := len(fb.nodes)
 	deps := make([][]int, n)
 	remaining := make([]int, n) // unmet dependency count
@@ -846,9 +965,17 @@ func (fb *fusedTreeBuilder) noteRead(e ast.Expr) {
 // node index, or false if any part is unfusable or over the caps.
 func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 	m := fb.sc.em.simdCalls[call]
-	if !fusableOp(m) || len(fb.nodes) >= fusedMaxNodes {
+	// Loop-mode trials (capRelax) take the doubled bound: a fully
+	// absorbed multi-accumulator block body legitimately runs past
+	// 320 nodes, and the vector-pool budget (peakLive) is the real
+	// resource limit there.
+	maxNodes := fusedMaxNodes
+	if fb.capRelax {
+		maxNodes = 2 * fusedMaxNodes
+	}
+	if !fusableOp(m) || len(fb.nodes) >= maxNodes {
 		if fb.failWhy == "" {
-			if len(fb.nodes) >= fusedMaxNodes {
+			if len(fb.nodes) >= maxNodes {
 				fb.failWhy = "node cap"
 			} else {
 				fb.failWhy = "unfusable op " + m.name
@@ -909,6 +1036,22 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 	}
 	var nodeArgs []simdfuse.Arg
 	isFloatSplat := lookupName == "simd_f32x4_splat"
+	// A shuffle whose control vector is a compile-time constant keeps
+	// the pattern OUT of the pair signature: the four u32 halves ride
+	// the descriptor as ArgConst (no ABI slot — two const pairs cost
+	// four integer registers otherwise, which alone can push a
+	// multi-accumulator loop body past the signature cap). The op
+	// renames to i8x16_shuffle_const so the splicers and the fallback
+	// body know the trailing four args are the pattern.
+	shuffleConst := false
+	var shufflePat [4]uint32
+	if lookupName == "simd_i8x16_shuffle" && len(args) == 3 {
+		if lo, hi, ok := fb.constPairValue(args[2]); ok {
+			shuffleConst = true
+			shufflePat = [4]uint32{uint32(lo), uint32(lo >> 32), uint32(hi), uint32(hi >> 32)}
+			args = args[:2]
+		}
+	}
 	for i, a := range args {
 		argIdx := i
 		if isMem {
@@ -976,7 +1119,7 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 					continue
 				}
 			}
-			if fb.intRegsUsed()+2 > fusedMaxIntSlots {
+			if !fb.capRelax && fb.intRegsUsed()+2 > fusedMaxIntSlots {
 				if fb.failWhy == "" {
 					fb.failWhy = fmt.Sprintf("int cap (pair #%d: %s; prior=%s)", len(fb.pairs), exprDebugString(a), fb.pairDebug())
 				}
@@ -989,6 +1132,17 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 					fb.pairDedup = map[string]int{}
 				}
 				fb.pairDedup[id.Name] = len(fb.pairs)
+			}
+			// A compile-time v128 constant folds its VALUE into the shape
+			// key: shapes fed different constants intern separately, so
+			// the splicers may specialize on Tree.ConstPairs (shuffle
+			// pattern recognition). The pair still rides the ABI.
+			if lo, hi, ok := fb.constPairValue(a); ok {
+				if fb.constPairs == nil {
+					fb.constPairs = map[int][2]uint64{}
+				}
+				fb.constPairs[len(fb.pairs)] = [2]uint64{lo, hi}
+				fmt.Fprintf(&fb.key, "K%x_%x,", lo, hi)
 			}
 			fb.pairs = append(fb.pairs, a)
 			fb.pairOwner = append(fb.pairOwner, fb.curCand)
@@ -1079,9 +1233,23 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				// addr64 to keep the wasm32 output byte-identical
 				// (same policy as chaseAddr's SUB leg).
 				if fb.addr64 {
+					// An INLINE variable side (`idx<<2 + table`) must
+					// chase too under the wide chase: left opaque it
+					// freezes at the call as a plain scalar — a per-
+					// iteration LUT index inside a fused LOOP then reads
+					// the entry-time slot on every trip. The chase
+					// rebuilds it as scalar nodes off the live scalars,
+					// exactly the shape the single-lane LUT loads already
+					// use.
+					chaseableBase := false
 					if baseID, ok := base.(*ast.Ident); ok && fb.interDef != nil &&
 						!fb.sc.pairs[baseID.Name] && !fb.sc.arrays[baseID.Name] {
-						if _, dok := fb.interDef[baseID.Name]; dok {
+						_, chaseableBase = fb.interDef[baseID.Name]
+					} else if fb.wideChase {
+						_, chaseableBase = base.(*ast.BinaryExpr)
+					}
+					if chaseableBase {
+						{
 							snap := fb.snapshotChase()
 							if l, lok := fb.chaseI32(base); lok {
 								var arg simdfuse.Arg
@@ -1169,6 +1337,22 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				fb.restoreChase(snap)
 			}
 		}
+		if bin, ok := aAddr.(*ast.BinaryExpr); ok && bin.Op != token.ADD && isMem && i == 0 &&
+			fb.addr64 && fb.wideChase {
+			// A computed address that is not a base+const sum (`idx<<2`
+			// with the table constant riding the memarg offset): left
+			// opaque it freezes at the call as a plain scalar — inside a
+			// fused loop a per-iteration LUT index would then read the
+			// entry-time value on every trip. Chase it into scalar
+			// nodes like the variable-stride sums; transactional.
+			snap := fb.snapshotChase()
+			if arg, aok := fb.chaseI32(aAddr); aok && arg.Kind == simdfuse.ArgNode {
+				nodeArgs = append(nodeArgs, arg)
+				fmt.Fprintf(&fb.key, "n%d,", arg.Index)
+				continue
+			}
+			fb.restoreChase(snap)
+		}
 		// Opaque scalar arguments deduplicate by structural key:
 		// identical expressions across candidates share one slot,
 		// exactly like identical identifiers do. Sound because every
@@ -1190,7 +1374,12 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 				continue
 			}
 		}
-		if 1+len(fb.scalars)+1 > fusedMaxIntRegs {
+		if !fb.capRelax && 1+len(fb.scalars)+1 > fusedMaxIntRegs {
+			// capRelax (the f16 gather normalization, and loop-mode
+			// trials whose gather pass runs AFTER the walk) defers
+			// this bound to the final-shape check: the rewrite retires
+			// more scalars than it keeps, so refusing mid-walk starves
+			// exactly the trees the rewrite exists for.
 			if fb.failWhy == "" {
 				fb.failWhy = "int cap (scalar)"
 			}
@@ -1212,6 +1401,13 @@ func (fb *fusedTreeBuilder) walk(call *ast.CallExpr) (int, bool) {
 		fb.noteRead(a)
 	}
 	op := strings.TrimPrefix(lookupName, "simd_")
+	if shuffleConst {
+		op = "i8x16_shuffle_const"
+		for _, c := range shufflePat {
+			nodeArgs = append(nodeArgs, simdfuse.Arg{Kind: simdfuse.ArgConst, Const: int32(c)})
+			fmt.Fprintf(&fb.key, "c%x,", c)
+		}
+	}
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: op, Args: nodeArgs})
 	fb.nodeVals = append(fb.nodeVals, m.val)
 	fmt.Fprintf(&fb.key, "%s;", op)
@@ -1239,6 +1435,33 @@ func exprDebugString(e ast.Expr) string {
 		return exprDebugString(x.X) + "[i]"
 	}
 	return fmt.Sprintf("%T", e)
+}
+
+// constPairValue reports the compile-time value of a v128-constant
+// pair source: the scalarizer spells those as marked composite
+// literals `{lo, hi}` of untyped integer constants.
+func (fb *fusedTreeBuilder) constPairValue(e ast.Expr) (lo, hi uint64, ok bool) {
+	cl, isCL := e.(*ast.CompositeLit)
+	if !isCL || fb.sc == nil || fb.sc.em == nil || !fb.sc.em.simdConsts[cl] || len(cl.Elts) != 2 {
+		return 0, 0, false
+	}
+	parse := func(x ast.Expr) (uint64, bool) {
+		bl, isBL := x.(*ast.BasicLit)
+		if !isBL || bl.Kind != token.INT {
+			return 0, false
+		}
+		v, err := strconv.ParseUint(bl.Value, 0, 64)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+	l, lok := parse(cl.Elts[0])
+	h, hok := parse(cl.Elts[1])
+	if !lok || !hok {
+		return 0, 0, false
+	}
+	return l, h, true
 }
 
 // pairDebug lists the pair parameters collected so far.
@@ -1369,6 +1592,7 @@ func (sc *simdScalarizer) tryFuse(call *ast.CallExpr, prelude *[]ast.Stmt) (*ast
 		NeedsMem:   needsMem,
 		Addr64:     fb.addr64,
 		Nodes:      fb.nodes,
+		ConstPairs: fb.constPairs,
 	})
 	if !ok {
 		return nil, false
@@ -1497,12 +1721,45 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		pendingInter = append(pendingInter, st)
 		nInter++
 	}
+	if loopMode && len(cands) >= 4 {
+		var ops []string
+		for _, c := range cands {
+			switch {
+			case c.call != nil:
+				if m, ok := sc.em.simdCalls[c.call]; ok {
+					ops = append(ops, m.name)
+				} else {
+					ops = append(ops, "?")
+				}
+			case c.alias != nil:
+				ops = append(ops, "alias:"+c.alias.Name)
+			default:
+				ops = append(ops, "store")
+			}
+		}
+		fuseDebugf("CANDS(%s) n=%d: %s", sc.fnNameForDebug(), len(cands), strings.Join(ops, ","))
+	}
 	// Try the longest window first; the walk is a pure analysis, so a
 	// failed length just retries shorter on a fresh builder.
 	for w := len(cands); w >= 2; w-- {
 		fb := &fusedTreeBuilder{
 			sc: sc, varNode: map[string]int{}, varNodeHits: map[string]int{},
 			interDef: map[string]*ast.AssignStmt{},
+			// Loop upgrades need maximal scalar absorption: the wide
+			// chase resolves u16-deref/shift/mask chains (LUT indexes)
+			// into scalar nodes instead of opaque per-expression slots
+			// — a multi-accumulator body carries several such chains
+			// and blows the scalar cap otherwise. The per-append cap
+			// relaxes with it: the gather normalization retires those
+			// scalars after the walk, and the loop upgrade's own
+			// final-shape budget still enforces the hard bound.
+			// Window-only trials keep the historical shapes.
+			wideChase: loopMode,
+			capRelax:  loopMode,
+			// Chase tracing follows -fuse-debug for loop trials: their
+			// absorption failures are exactly what the flag exists to
+			// localize.
+			chaseTrace: loopMode && fuseDebugEnabled,
 		}
 		var nodeOf []int
 		var inter []ast.Stmt
@@ -1552,8 +1809,10 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		// The authoritative slot bound lives at the intern point (see
 		// internFusedTree); reject early here only for the diagnosis
-		// message.
-		if ok && fb.intRegsUsed() > fusedMaxIntSlots {
+		// message. Under capRelax the gather normalization has not run
+		// yet — it retires whole scalar chains — so the early bound
+		// waits for the post-rewrite shape.
+		if ok && !fb.capRelax && fb.intRegsUsed() > fusedMaxIntSlots {
 			ok = false
 			if fb.failWhy == "" {
 				fb.failWhy = fmt.Sprintf("int cap (final: %d slots)", fb.intRegsUsed())
@@ -1561,10 +1820,15 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		if !ok || fb.varEdges == 0 || fb.readsCandVar {
 			if w >= 4 && !ok {
-				fuseDebugf("w=%d walk fail: %s", w, fb.failWhy)
+				fuseDebugf("w=%d walk fail (fn=%s): %s", w, sc.fnNameForDebug(), fb.failWhy)
 			}
 			if loopMode && w >= 8 {
-				fuseDebugf("LOOPWIN w=%d ok=%v edges=%d reads=%v why=%s sc=%d pr=%d", w, ok, fb.varEdges, fb.readsCandVar, fb.failWhy, len(fb.scalars), len(fb.pairs))
+				var scs []string
+				for _, s := range fb.scalars {
+					scs = append(scs, exprDebugString(s))
+				}
+				fuseDebugf("LOOPWIN(%s) w=%d ok=%v edges=%d reads=%v why=%s sc=%d pr=%d scalars=%s pairs=%s",
+					sc.fnNameForDebug(), w, ok, fb.varEdges, fb.readsCandVar, fb.failWhy, len(fb.scalars), len(fb.pairs), strings.Join(scs, ","), fb.pairDebug())
 			}
 			continue
 		}
@@ -1626,6 +1890,16 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			continue // over the root cap, or a window with no live output
 		}
 		roots = fb.fuseF16Gather(roots)
+		// The relaxed walk deferred the slot bound to here: the gather
+		// pass has now retired what it can, and an over-budget shape
+		// must not COMMIT (an interned tree past the register file
+		// fails to splice and falls back to a pure call per iteration).
+		if fb.capRelax && fb.intRegsUsed() > fusedMaxIntSlots {
+			if w >= 4 {
+				fuseDebugf("w=%d post-gather slots=%d over cap (fn=%s)", w, fb.intRegsUsed(), sc.fnNameForDebug())
+			}
+			continue
+		}
 		roots = fb.scheduleNodes(roots)
 		if pl := fb.peakLive(roots); pl > fusedPoolBudget-floatPoolCost(len(fb.floats)) {
 			if w >= 4 {
@@ -1775,6 +2049,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			Nodes:      fb.nodes,
 			Roots:      roots,
 			NoResult:   len(roots) == 0,
+			ConstPairs: fb.constPairs,
 		})
 		if !iok {
 			continue
@@ -2026,6 +2301,33 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		}
 	}
 	for i, n := range tree.Nodes {
+		// A const-pattern shuffle calls the plain shuffle helper with
+		// the control vector rebuilt from its four descriptor
+		// constants (bit pattern, not value: the halves reassemble as
+		// unsigned).
+		if n.Op == "i8x16_shuffle_const" && len(n.Args) == 6 {
+			u32 := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
+			lo := u32(n.Args[2]) | u32(n.Args[3])<<32
+			hi := u32(n.Args[4]) | u32(n.Args[5])<<32
+			n = simdfuse.Node{Op: "i8x16_shuffle", Args: n.Args[:2]}
+			helper := "simd_i8x16_shuffle"
+			if multiPackage {
+				helper = capitalize(helper)
+			}
+			callArgs := []ast.Expr{
+				argExpr(n.Args[0], tree.Addr64), argExpr(n.Args[1], tree.Addr64),
+				&ast.CompositeLit{
+					Type: &ast.ArrayType{Len: intLit(2), Elt: newID("uint64")},
+					Elts: []ast.Expr{uintLit(lo), uintLit(hi)},
+				},
+			}
+			body = append(body, &ast.AssignStmt{
+				Tok: token.DEFINE,
+				Lhs: []ast.Expr{newID(fmt.Sprintf("n%d", i))},
+				Rhs: []ast.Expr{&ast.CallExpr{Fun: newID(helper), Args: callArgs}},
+			})
+			continue
+		}
 		helper := "simd_" + n.Op
 		var callArgs []ast.Expr
 		_, isMem := fusedMemOps[helper]
@@ -2093,4 +2395,13 @@ func fusedHelperDecl(tree *simdfuse.Tree, multiPackage bool) *ast.FuncDecl {
 		},
 		Body: &ast.BlockStmt{List: body},
 	}
+}
+
+// fnNameForDebug names the function being scalarized for fusion
+// diagnostics; empty when unknown.
+func (sc *simdScalarizer) fnNameForDebug() string {
+	if sc == nil || sc.em == nil || sc.em.curFn == nil {
+		return ""
+	}
+	return sc.em.curFn.Name
 }

@@ -162,6 +162,14 @@ type Tree struct {
 	// NoResult marks a pure-sink region (every value flows into
 	// stores): the fused function returns nothing.
 	NoResult bool
+	// ConstPairs records pair parameters whose value is the same
+	// compile-time v128 constant at EVERY call site (the builder folds
+	// the constant into the shape key, so distinct constants intern
+	// distinct trees). Splicers may specialize on the value — e.g.
+	// recognizing an even/odd lane-combine shuffle pattern — while the
+	// ABI still passes the pair, keeping the fallback body and the
+	// other splicer untouched. Keyed by pair-parameter index.
+	ConstPairs map[int][2]uint64
 }
 
 // RootList resolves the effective root set.
@@ -247,6 +255,14 @@ type Loop struct {
 	// iteration); false is the do-while form, whose callers guarantee
 	// a non-zero initial counter.
 	PreTest bool
+	// ExitGT switches the do-while backedge from the exact-zero
+	// (non-equal) test to a SIGNED greater-than test against
+	// ExitThresh: the loop repeats while counter > ExitThresh. This
+	// mirrors source loops that count down to a floor (`while --c >
+	// K`), whose compare the emitter preserves verbatim. Only the
+	// do-while form may set it.
+	ExitGT     bool
+	ExitThresh int32
 }
 
 // LoopBump advances one scalar argument at each backedge. The step is

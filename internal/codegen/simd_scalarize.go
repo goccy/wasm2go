@@ -82,7 +82,12 @@ type simdScalarizer struct {
 	// which Go forbids.
 	tmp        int
 	hoistPairs []string // pair temps (__svN)
-	hoistArrs  []string // array temps (__saN)
+	// stmtDepth counts rewriteStmts nesting: 1 at the function's
+	// top-level list, deeper inside blocks/loops. The goto-form loop
+	// upgrade fires at depth 1 only — labels inside structured
+	// regions belong to shapes the ForStmt path already owns.
+	stmtDepth int
+	hoistArrs []string // array temps (__saN)
 }
 
 // scalarizeSimd rewrites body in place. Functions with v128 PARAMETERS
@@ -700,9 +705,23 @@ func (sc *simdScalarizer) rewriteExpr(e ast.Expr, prelude *[]ast.Stmt) ast.Expr 
 // rewriteStmts rewrites a statement list, expanding pair assignments
 // and splitting declarations.
 func (sc *simdScalarizer) rewriteStmts(list []ast.Stmt) []ast.Stmt {
+	sc.stmtDepth++
+	defer func() { sc.stmtDepth-- }()
 	var out []ast.Stmt
 	for i := 0; i < len(list); i++ {
 		var prelude []ast.Stmt
+		// GOTO-form countdown loops (the label/goto emission of
+		// irregular functions) upgrade exactly like ForStmt countdown
+		// loops; the label survives as the entry point. Top-level
+		// lists only: a label nested inside a structured region is
+		// part of a shape the ForStmt path already owns.
+		if _, isLbl := list[i].(*ast.LabeledStmt); isLbl && sc.stmtDepth == 1 {
+			if repl, consumed, ok := sc.tryFuseGotoLoop(list, i, &prelude); ok {
+				out = append(out, repl...)
+				i += consumed - 1
+				continue
+			}
+		}
 		// A run of pair assignments sharing values can fuse into one
 		// multi-root region call (see tryFuseWindow); otherwise the
 		// statement rewrites alone.
