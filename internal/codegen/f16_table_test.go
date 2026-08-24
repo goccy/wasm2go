@@ -160,27 +160,34 @@ func TestF16TableOKCacheAndAssertion(t *testing.T) {
 	}
 }
 
-func TestStaleF16TableMsg(t *testing.T) {
-	queried := map[uint32]bool{9013200: true, 4096: false}
+func TestStaleF16TableIssue(t *testing.T) {
+	verifiedElsewhere := map[uint32]bool{9013200: true, 4096: false}
+	unverifiedOnly := map[uint32]bool{4096: false}
 	for _, tc := range []struct {
 		addr   uint32
 		tables map[uint32]bool
 		warn   bool
+		fatal  bool
 	}{
-		{0, nil, false},           // unset: nothing to check
-		{9013200, queried, false}, // queried (and matched)
-		{4096, queried, false},    // queried, even if unverified
-		{9013472, queried, true},  // never queried: stale
-		{9013472, nil, true},      // no gather sites at all
+		{0, nil, false, false},                     // unset: nothing to check
+		{9013200, verifiedElsewhere, false, false}, // matched a verified base
+		{9013472, verifiedElsewhere, true, true},   // contradicted by a verified base: build error
+		{4096, verifiedElsewhere, true, true},      // queried-but-unverified while another base verified
+		{9013472, unverifiedOnly, true, false},     // nothing verified: warning only
+		{4096, unverifiedOnly, false, false},       // queried, nothing verified anywhere
+		{9013472, nil, true, false},                // no gather sites at all: warning only
 	} {
-		msg := staleF16TableMsg(tc.addr, tc.tables)
-		if got := msg != ""; got != tc.warn {
-			t.Errorf("staleF16TableMsg(%d): warn=%v, want %v (msg %q)", tc.addr, got, tc.warn, msg)
+		msg, fatal := staleF16TableIssue(tc.addr, tc.tables)
+		if got := msg != ""; got != tc.warn || fatal != tc.fatal {
+			t.Errorf("staleF16TableIssue(%d): warn=%v fatal=%v, want %v/%v (msg %q)", tc.addr, got, fatal, tc.warn, tc.fatal, msg)
 		}
 	}
-	// The stale warning names the unverified bases so the integrator
-	// can re-point the assertion.
-	if msg := staleF16TableMsg(9013472, queried); !strings.Contains(msg, "4096") {
-		t.Errorf("stale message should list unverified candidate bases: %q", msg)
+	// The fatal message names the verified base to adopt; the warning
+	// names the unverified candidates.
+	if msg, _ := staleF16TableIssue(9013472, verifiedElsewhere); !strings.Contains(msg, "9013200") {
+		t.Errorf("stale error should name the verified base: %q", msg)
+	}
+	if msg, _ := staleF16TableIssue(9013472, unverifiedOnly); !strings.Contains(msg, "4096") {
+		t.Errorf("stale warning should list unverified candidate bases: %q", msg)
 	}
 }

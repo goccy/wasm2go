@@ -92,39 +92,57 @@ func (t *translator) hasIEEEF16TableAt(base uint32) bool {
 	return true
 }
 
-// warnStaleF16Table reports, once translation is done, an
-// Options.F16TableAddr assertion that no gather site ever queried:
-// the module's data layout has shifted and the asserted address no
-// longer matches the table, so the f16 gather rewrite silently
-// stayed off — a pure performance loss that is otherwise invisible.
-// The bases that WERE queried and failed verification are the
-// candidates the integrator should re-point the assertion at.
-func (t *translator) warnStaleF16Table() {
-	if msg := staleF16TableMsg(t.opts.F16TableAddr, t.f16TablesOK); msg != "" {
-		fmt.Fprintln(os.Stderr, msg)
+// checkStaleF16Table decides, once translation is done, what a set
+// Options.F16TableAddr that matched no verified gather base means.
+// When the module itself verified a DIFFERENT base (the runtime
+// init-loop detection or the static image), the assertion is
+// provably stale and the build FAILS — a silent mismatch either
+// disables the table-keyed rewrites or blesses whatever now lives at
+// the old address. With no verified base to contradict it, the old
+// warning remains: the address may simply appear in a module with no
+// gather sites at all.
+func (t *translator) checkStaleF16Table() error {
+	msg, fatal := staleF16TableIssue(t.opts.F16TableAddr, t.f16TablesOK)
+	if msg == "" {
+		return nil
 	}
+	if fatal {
+		return fmt.Errorf("%s", msg)
+	}
+	fmt.Fprintln(os.Stderr, msg)
+	return nil
 }
 
-// staleF16TableMsg is warnStaleF16Table's decision: empty means the
-// assertion is unset or was queried by some gather site (matched or
-// not — being queried means the address still appears in code).
-func staleF16TableMsg(addr uint32, tables map[uint32]bool) string {
-	if addr == 0 {
-		return ""
+// staleF16TableIssue is checkStaleF16Table's decision: empty means
+// the assertion is unset or matched a verified base.
+func staleF16TableIssue(addr uint32, tables map[uint32]bool) (msg string, fatal bool) {
+	if addr == 0 || tables[addr] {
+		return "", false
 	}
-	if _, seen := tables[addr]; seen {
-		return ""
-	}
-	var cands []uint32
+	var verified, unverified []uint32
 	for base, ok := range tables {
-		if !ok {
-			cands = append(cands, base)
+		if base == addr {
+			continue
+		}
+		if ok {
+			verified = append(verified, base)
+		} else {
+			unverified = append(unverified, base)
 		}
 	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+	sort.Slice(verified, func(i, j int) bool { return verified[i] < verified[j] })
+	sort.Slice(unverified, func(i, j int) bool { return unverified[i] < unverified[j] })
+	if len(verified) > 0 {
+		return fmt.Sprintf(
+			"wasm2go: F16TableAddr %d is stale — the module verifies its f16 table at %v; update or drop the assertion (auto-detection covers this module)",
+			addr, verified), true
+	}
+	if _, seen := tables[addr]; seen {
+		return "", false
+	}
 	return fmt.Sprintf(
 		"wasm2go: F16TableAddr %d matches no f16 gather site — the table has likely moved and the gather rewrite stayed OFF; unverified gather bases seen: %v",
-		addr, cands)
+		addr, unverified), false
 }
 
 func max64(a, b int64) int64 {
@@ -142,17 +160,17 @@ func min64(a, b int64) int64 {
 }
 
 // f16TableOK is the cached table check, shaped as the callback the
-// SSA gather pass takes. Two ways a table qualifies:
+// SSA gather pass takes. Three ways a table qualifies:
 //
 //   - the module's initial data image holds the IEEE map at base
 //     (verified byte-for-byte), or
+//   - the module's own code provably initializes the whole range at
+//     base (an init loop streaming constant-strided stores — the
+//     ggml_init shape; see detectRuntimeTables), or
 //   - the integrator asserted it: Options.F16TableAddr names the
-//     base of a table the module BUILDS AT RUNTIME (some runtimes fill it
-//     f16->f32 table in an init function, so the data segment holds
-//     only zeros and no static check can see it). The assertion is a
-//     build-input contract, not a guess — a wrong address changes
-//     numeric results, which the integrator's bit-equality gates
-//     catch.
+//     base explicitly. The assertion is cross-checked against the
+//     detection at the end of translation — a stale address fails
+//     the build instead of silently disabling rewrites.
 func (t *translator) f16TableOK(base uint32) bool {
 	if t.f16TablesOK == nil {
 		t.f16TablesOK = map[uint32]bool{}
@@ -161,7 +179,18 @@ func (t *translator) f16TableOK(base uint32) bool {
 	if seen {
 		return ok
 	}
-	ok = t.hasIEEEF16TableAt(base) || (t.opts.F16TableAddr != 0 && t.opts.F16TableAddr == base)
+	switch {
+	case t.hasIEEEF16TableAt(base):
+		ok = true
+	default:
+		t.detectRuntimeTables()
+		if t.runtimeInitCovered(base) {
+			ok = true
+			t.noteF16TableDetection(base)
+		} else if t.opts.F16TableAddr != 0 && t.opts.F16TableAddr == base {
+			ok = true
+		}
+	}
 	t.f16TablesOK[base] = ok
 	return ok
 }
