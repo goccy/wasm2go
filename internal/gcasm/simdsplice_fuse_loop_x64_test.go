@@ -77,3 +77,64 @@ func TestX64LoopCarryReadsReservedRegister(t *testing.T) {
 		t.Errorf("carried register not seeded from arguments before the loop:\n%s", prologue)
 	}
 }
+
+// shuffleConstLoop puts an i8x16_shuffle_const between two loads and a
+// carried accumulator, with a splat that stays live across the
+// shuffle — the shape whose emulation once scratched X4/X5 and
+// clobbered pool-resident values.
+func shuffleConstLoop() *simdfuse.Loop {
+	sc := func(i int) simdfuse.Arg { return simdfuse.Arg{Kind: simdfuse.ArgScalar, Index: i} }
+	cst := func(c int32) simdfuse.Arg { return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c} }
+	nd := func(i int) simdfuse.Arg { return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: i} }
+	tree := &simdfuse.Tree{
+		Name:       "simd_p_fxl_shufconst",
+		NumScalars: 1,
+		NumPairs:   1,
+		NeedsMem:   true,
+		Nodes: []simdfuse.Node{
+			// node 0: a splat that must survive past the shuffle.
+			{Op: "v128_load32_splat", Args: []simdfuse.Arg{sc(0), cst(0)}},
+			{Op: "v128_load", Args: []simdfuse.Arg{sc(0), cst(16)}},
+			{Op: "v128_load", Args: []simdfuse.Arg{sc(0), cst(32)}},
+			// node 3: const-pattern shuffle of the two loads.
+			{Op: "i8x16_shuffle_const", Args: []simdfuse.Arg{
+				nd(1), nd(2),
+				cst(0x03020100), cst(0x0b0a0908), cst(0x13121110), cst(0x1b1a1918),
+			}},
+			// node 4: the splat is consumed AFTER the shuffle ran.
+			{Op: "i32x4_add", Args: []simdfuse.Arg{nd(3), nd(0)}},
+			{Op: "i32x4_add", Args: []simdfuse.Arg{{Kind: simdfuse.ArgPairIn, Index: 0}, nd(4)}},
+		},
+		Roots: []int{5},
+	}
+	return &simdfuse.Loop{
+		Tree:          tree,
+		CarriedPairs:  [][2]int{{0, 5}},
+		CounterScalar: 0,
+		Dec:           1,
+		PreTest:       true,
+	}
+}
+
+// The const-pattern shuffle emulation must stay inside the splicer's
+// scratch registers (X0-X3): pool values live in X4+ for the whole
+// loop body and there is no relocation pass here. The old body
+// staged the biased patterns in X4/X5 and corrupted whatever the
+// allocator had parked there.
+func TestX64LoopShuffleConstStaysInScratch(t *testing.T) {
+	var b strings.Builder
+	spliced, _, err := x64SpliceLoop(&b, shuffleConstLoop(), &ConstPool{}, fuseTestOffs, "0", false, 0)
+	if err != nil || !spliced {
+		t.Fatalf("spliced=%v err=%v", spliced, err)
+	}
+	body := b.String()
+	shuf := regexp.MustCompile(`(?s)MOVOU ·gcb16_[0-9a-f]+\(SB\), X2.*?POR X1, X0`).FindString(body)
+	if shuf == "" {
+		t.Fatalf("no shuffle-const emulation in body:\n%s", body)
+	}
+	for _, m := range regexp.MustCompile(`X(\d+)`).FindAllStringSubmatch(shuf, -1) {
+		if m[1] != "0" && m[1] != "1" && m[1] != "2" && m[1] != "3" {
+			t.Fatalf("shuffle-const emulation touches X%s (outside the X0-X3 scratch set):\n%s", m[1], shuf)
+		}
+	}
+}
