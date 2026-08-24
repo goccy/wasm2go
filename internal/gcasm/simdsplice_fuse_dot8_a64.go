@@ -1,8 +1,6 @@
 package gcasm
 
 import (
-	"os"
-
 	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
@@ -321,9 +319,6 @@ var (
 // into the low half and 2/3 into the high half, so the single-chain
 // (low,high) pairing above never fires for them.
 func a64CrossSdotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int][2]uint64) {
-	if os.Getenv("WASM2GO_NO_CROSS_SDOT") != "" {
-		return
-	}
 	uses := make([]int, len(nodes))
 	for _, n := range nodes {
 		for _, a := range n.Args {

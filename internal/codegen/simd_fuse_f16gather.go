@@ -60,22 +60,17 @@ func (fb *fusedTreeBuilder) fuseF16Gather(roots []int) []int {
 		u := uses()
 		chain, ok := fb.f16GatherChain(tailIdx, u)
 		if !ok {
-			fuseDebugf("f16gather: node %d (%s args=%d) no chain", tailIdx, fb.nodes[tailIdx].Op, len(fb.nodes[tailIdx].Args))
 			continue
 		}
 		snap := fb.snapshotChase()
 		fb.wideChase = true
-		fb.chaseTrace = true
 		fb.capRelax = true
 		if fb.rewriteF16GatherGroup(tailIdx, chain, tableOK) {
-			fuseDebugf("f16gather: node %d REWRITTEN", tailIdx)
 			changed = true
 		} else {
-			fuseDebugf("f16gather: node %d chain ok but group rejected (fn=%s)", tailIdx, fn)
 			fb.restoreChase(snap)
 		}
 		fb.wideChase = false
-		fb.chaseTrace = false
 		fb.capRelax = false
 	}
 	if !changed {
@@ -122,24 +117,20 @@ func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, add
 	case simdfuse.ArgScalar:
 		narg, cok := fb.chaseI32(fb.scalars[a.Index])
 		if !cok {
-			fuseDebugf("f16gather: chase fail on scalar %d: %s (interDef=%v)", a.Index, exprDebugString(fb.scalars[a.Index]), fb.interDef != nil)
 			return base, 0, false
 		}
 		a = narg
 	case simdfuse.ArgSum:
 		narg, cok := fb.chaseI32(fb.scalars[a.Index])
 		if !cok {
-			fuseDebugf("f16gather: chase fail on SUM scalar %d: %s", a.Index, exprDebugString(fb.scalars[a.Index]))
 			return base, 0, false
 		}
 		addend += int64(a.Const)
 		a = narg
 	case simdfuse.ArgConst:
-		fuseDebugf("f16gather: addr is const")
 		return base, 0, false
 	}
 	if a.Kind != simdfuse.ArgNode {
-		fuseDebugf("f16gather: post-chase kind %d", a.Kind)
 		return base, 0, false
 	}
 	n := &fb.nodes[a.Index]
@@ -149,7 +140,6 @@ func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, add
 			x, c = c, x
 		}
 		if c.Kind != simdfuse.ArgConst || x.Kind != simdfuse.ArgNode {
-			fuseDebugf("f16gather: add arms kinds %d/%d", x.Kind, c.Kind)
 			return base, 0, false
 		}
 		addend += int64(c.Const)
@@ -158,12 +148,10 @@ func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, add
 	if n.Op != "scalar_i32_shl" || len(n.Args) != 2 ||
 		n.Args[1].Kind != simdfuse.ArgConst || n.Args[1].Const != 2 ||
 		n.Args[0].Kind != simdfuse.ArgNode {
-		fuseDebugf("f16gather: not shl2 (op=%s args=%d a1kind=%d a1c=%d a0kind=%d)", n.Op, len(n.Args), n.Args[1].Kind, n.Args[1].Const, n.Args[0].Kind)
 		return base, 0, false
 	}
 	ld := &fb.nodes[n.Args[0].Index]
 	if ld.Op != "scalar_i32_load16_u" || len(ld.Args) != 1 {
-		fuseDebugf("f16gather: shl src not load16 (op=%s)", ld.Op)
 		return base, 0, false
 	}
 	// Any address form is acceptable here — the group verifier proves
@@ -184,7 +172,6 @@ func (fb *fusedTreeBuilder) rewriteF16GatherGroup(tailIdx int, chain [4]int, tab
 		return false
 	}
 	if total <= 0 || total > 1<<31-1 || !tableOK(uint32(total)) {
-		fuseDebugf("f16gather: table %d not verified", total)
 		return false
 	}
 	// Capacity: the rewrite adds two nodes (the chain nodes die in
@@ -219,12 +206,10 @@ func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bo
 	for k := 0; k < 4; k++ {
 		n := &fb.nodes[chain[k]]
 		if n.Args[1].Kind != simdfuse.ArgConst {
-			fuseDebugf("f16gather: lane %d memarg not const (kind=%d)", k, n.Args[1].Kind)
 			return simdfuse.Arg{}, 0, false
 		}
 		b, addend, ok := fb.f16LaneIndex(n.Args[0])
 		if !ok {
-			fuseDebugf("f16gather: lane %d index unchaseable (addr kind=%d)", k, n.Args[0].Kind)
 			return simdfuse.Arg{}, 0, false
 		}
 		bases[k] = b
@@ -232,7 +217,6 @@ func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bo
 	}
 	for k := 1; k < 4; k++ {
 		if totals[k] != totals[0] {
-			fuseDebugf("f16gather: lane %d table addend %d != %d", k, totals[k], totals[0])
 			return simdfuse.Arg{}, 0, false
 		}
 	}
@@ -252,7 +236,6 @@ func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bo
 					}
 				}
 			}
-			fuseDebugf("f16gather: lane %d not base+%d (pattern:%s)", k, 2*k, pat)
 			return simdfuse.Arg{}, 0, false
 		}
 	}
@@ -293,20 +276,17 @@ func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int64, bo
 		}
 		name, tadd, ok := fb.f16WordLane(e, k)
 		if !ok {
-			fuseDebugf("f16gather: word lane %d no match: %s", k, exprDebugString(e))
 			return simdfuse.Arg{}, 0, false
 		}
 		if k == 0 {
 			wName = name
 		} else if name != wName {
-			fuseDebugf("f16gather: word lane %d ident %s != %s", k, name, wName)
 			return simdfuse.Arg{}, 0, false
 		}
 		totals[k] = add + tadd
 	}
 	for k := 1; k < 4; k++ {
 		if totals[k] != totals[0] {
-			fuseDebugf("f16gather: word lane %d table addend %d != %d", k, totals[k], totals[0])
 			return simdfuse.Arg{}, 0, false
 		}
 	}
@@ -317,12 +297,10 @@ func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int64, bo
 	}
 	def, isDef := fb.sc.defBind[wName]
 	if !isDef || len(def.Rhs) != 1 {
-		fuseDebugf("f16gather: word ident %s has no single def", wName)
 		return simdfuse.Arg{}, 0, false
 	}
 	star, ok := def.Rhs[0].(*ast.StarExpr)
 	if !ok {
-		fuseDebugf("f16gather: word ident %s def not a deref", wName)
 		return simdfuse.Arg{}, 0, false
 	}
 	// The uint64 address wrapper on the 64-bit load carries no
@@ -330,12 +308,10 @@ func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int64, bo
 	// addr64 is deliberately not derived from it here.
 	addr, _, mok := matchMemDeref(star, "int64")
 	if !mok {
-		fuseDebugf("f16gather: word ident %s def not an int64 load", wName)
 		return simdfuse.Arg{}, 0, false
 	}
 	aarg, aok := fb.chaseAddr(addr)
 	if !aok {
-		fuseDebugf("f16gather: word addr unchaseable: %s", exprDebugString(addr))
 		return simdfuse.Arg{}, 0, false
 	}
 	return aarg, totals[0], true

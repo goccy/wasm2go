@@ -3,7 +3,6 @@ package gcasm
 import (
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -268,9 +267,6 @@ func TransformARM64(fn *Fn, opts TransformOptions) (string, error) {
 					}
 					if opts.SpliceStats != nil {
 						opts.SpliceStats.Kept++
-					}
-					if os.Getenv("WASM2GO_SPLICE_DEBUG") != "" {
-						fmt.Fprintf(os.Stderr, "wasm2go: splice kept (a64): %s\n", m[1])
 					}
 				}
 				// Software fp32→fp16 conversion: this helper is only

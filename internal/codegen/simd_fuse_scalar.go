@@ -23,7 +23,6 @@ package codegen
 // to the plain float-argument path unchanged.
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
 	"go/printer"
@@ -174,32 +173,11 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 	return 0, false
 }
 
-// chaseI32 resolves an int32/uint32 scalar expression to an Arg: a
-// descriptor constant, a (deduplicated) scalar parameter, or a
-// ClassI32 node. u32/i32 conversions are identities mod 2^32, exactly
-// like the wasm ops the emitter lowered from.
-func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
-	if fb.chaseTrace {
-		a, ok := fb.chaseI32Inner(e)
-		if !ok {
-			fuseDebugf("chaseTRACE fail: %T %s", e, exprDebugString(e))
-		}
-		return a, ok
-	}
-	return fb.chaseI32Inner(e)
-}
-
 // chaseLoad16Deref matches a `*(*uint16)(...)` linear-memory read and
 // registers it as a scalar_i32_load16_u node over the chased address.
 func (fb *fusedTreeBuilder) chaseLoad16Deref(inner *ast.StarExpr) (simdfuse.Arg, bool) {
 	addr, is64, mok := matchMemDeref(inner, "uint16")
 	if !mok {
-		if fb.chaseTrace {
-			var buf bytes.Buffer
-			if err := printer.Fprint(&buf, token.NewFileSet(), inner); err == nil {
-				fuseDebugf("chaseTRACE load16 deref mismatch: %s", buf.String())
-			}
-		}
 		return simdfuse.Arg{}, false
 	}
 	if is64 {
@@ -208,9 +186,6 @@ func (fb *fusedTreeBuilder) chaseLoad16Deref(inner *ast.StarExpr) (simdfuse.Arg,
 	aarg, aok := fb.chaseAddr(addr)
 	if !aok {
 		return simdfuse.Arg{}, false
-	}
-	if fb.chaseTrace {
-		fuseDebugf("chaseTRACE load16 addr %s -> kind=%d idx=%d const=%d", exprDebugString(addr), aarg.Kind, aarg.Index, aarg.Const)
 	}
 	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
 	if !nok {
@@ -370,13 +345,14 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 	for _, name := range consumed {
 		fb.chaseUses[name]++
 	}
-	if fb.chaseTrace {
-		fuseDebugf("chaseTRACE narrow16: shift=%d bits=%d addr kind=%d idx=%d const=%d", shift, bits, aarg.Kind, aarg.Index, aarg.Const)
-	}
 	return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
 }
 
-func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
+// chaseI32 resolves an int32/uint32 scalar expression to an Arg: a
+// descriptor constant, a (deduplicated) scalar parameter, or a
+// ClassI32 node. u32/i32 conversions are identities mod 2^32, exactly
+// like the wasm ops the emitter lowered from.
+func (fb *fusedTreeBuilder) chaseI32(e ast.Expr) (simdfuse.Arg, bool) {
 	if c, ok := fb.constValueOf(e); ok {
 		return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c}, true
 	}
@@ -445,17 +421,14 @@ func (fb *fusedTreeBuilder) chaseI32Inner(e ast.Expr) (simdfuse.Arg, bool) {
 		case token.SHL:
 			s, sok := matchShiftConst(x.Y, fb)
 			if !sok {
-				fuseDebugf("chaseI32 SHL: amount not const: %s", exprDebugString(x.Y))
 				return simdfuse.Arg{}, false
 			}
 			v, vok := fb.chaseI32(x.X)
 			if !vok {
-				fuseDebugf("chaseI32 SHL: operand fail: %s", exprDebugString(x.X))
 				return simdfuse.Arg{}, false
 			}
 			idx, ok := fb.addScalarNode("scalar_i32_shl", []simdfuse.Arg{v, {Kind: simdfuse.ArgConst, Const: s}})
 			if !ok {
-				fuseDebugf("chaseI32 SHL: node cap")
 				return simdfuse.Arg{}, false
 			}
 			return simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}, true
@@ -715,9 +688,6 @@ func (fb *fusedTreeBuilder) addChaseScalarArg(src ast.Expr, key string) (simdfus
 	}
 	idx := len(fb.scalars)
 	fb.scalarDedup[key] = idx
-	if fb.chaseTrace {
-		fuseDebugf("chaseTRACE opaque scalar s%d: %s", idx, exprDebugString(src))
-	}
 	fb.scalars = append(fb.scalars, src)
 	fb.scalarOwner = append(fb.scalarOwner, fb.curCand)
 	// Chased compound expression: no single-source SSA provenance —
@@ -833,12 +803,6 @@ func matchShiftConst(e ast.Expr, fb *fusedTreeBuilder) (int32, bool) {
 	}
 	c, ok := fb.constValueOf(e)
 	if !ok {
-		if id, isID := e.(*ast.Ident); isID {
-			cb, cbok := fb.sc.constBind[id.Name]
-			fuseDebugf("matchShiftConst: ident %s constBind hit=%v val=%d (bindsize=%d)", id.Name, cbok, cb, len(fb.sc.constBind))
-		} else {
-			fuseDebugf("matchShiftConst: non-ident %T", e)
-		}
 		return 0, false
 	}
 	return c % mod, true

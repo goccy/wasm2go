@@ -20,10 +20,7 @@ package codegen
 import (
 	"fmt"
 	"go/ast"
-	"go/printer"
 	"go/token"
-	"os"
-	"strconv"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -309,16 +306,6 @@ func (sc *simdScalarizer) loopReject(tag string) (ast.Stmt, bool) {
 // list[i] must be the label. Returns the replacement statements and
 // the number of input statements consumed.
 func (sc *simdScalarizer) tryFuseGotoLoop(list []ast.Stmt, i int, prelude *[]ast.Stmt) ([]ast.Stmt, int, bool) {
-	// On by default. WASM2GO_GOTO_FUSE_MAX=<n> caps the number of
-	// upgrades for bisection (0 disables). The commit-time intervener
-	// check refuses any loop whose per-iteration scalar chains the
-	// walk cannot absorb, so an unfusable shape degrades to the
-	// window form instead of miscomputing.
-	if lim := os.Getenv("WASM2GO_GOTO_FUSE_MAX"); lim != "" {
-		if n, err := strconv.Atoi(lim); err != nil || gotoFuseCount >= n {
-			return nil, 0, false
-		}
-	}
 	lbl, ok := list[i].(*ast.LabeledStmt)
 	if !ok {
 		return nil, 0, false
@@ -400,25 +387,10 @@ func (sc *simdScalarizer) tryFuseGotoLoop(list []ast.Stmt, i int, prelude *[]ast
 		return nil, 0, false
 	}
 	_ = prelude
-	gotoFuseCount++
 	out := []ast.Stmt{&ast.LabeledStmt{Label: lbl.Label, Stmt: &ast.EmptyStmt{}}}
 	out = append(out, hoisted...)
 	out = append(out, repl, &ast.BranchStmt{Tok: token.GOTO, Label: exit})
 	return out, j - i + 1, true
-}
-
-// gotoFuseCount counts committed goto-form loop upgrades for the
-// WASM2GO_GOTO_FUSE_MAX bisection gate (diagnostics only; the
-// transpiler runs one module per process).
-var gotoFuseCount int
-
-// renderStmtForDebug prints a statement for FuseDebug diagnostics.
-func renderStmtForDebug(st ast.Stmt) string {
-	var buf strings.Builder
-	if err := printer.Fprint(&buf, token.NewFileSet(), st); err != nil {
-		return fmt.Sprintf("<%T>", st)
-	}
-	return strings.Join(strings.Fields(buf.String()), " ")
 }
 
 // blankFor returns n blank identifiers for a keep-alive assignment.
@@ -695,9 +667,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 				cl.consts = append(cl.consts, as)
 				continue
 			}
-		}
-		if fuseDebugEnabled {
-			return sc.loopReject(fmt.Sprintf("L445: %s", renderStmtForDebug(st)))
 		}
 		return sc.loopReject("L445")
 	}
@@ -1019,9 +988,6 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 			})
 		}
 		if bad {
-			if fuseDebugEnabled {
-				return sc.loopReject(fmt.Sprintf("L747: %s", renderStmtForDebug(st)))
-			}
 			return sc.loopReject("L747")
 		}
 	}

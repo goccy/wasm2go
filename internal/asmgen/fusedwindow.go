@@ -16,17 +16,11 @@ package asmgen
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/ssa"
 )
-
-// fusedWinDebug gates plan-time reject diagnostics (stderr), for
-// coverage work on real modules where a silent per-op fallback and a
-// fused window are indistinguishable in the output values.
-var fusedWinDebug = os.Getenv("WASM2GO_FUSEDWIN_DEBUG") != ""
 
 // plannedFusedWindow is one validated window, resolved to emission
 // terms: operands in fused-signature order and the roots' value IDs
@@ -97,9 +91,6 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow, frame ar
 	for i := range windows {
 		w := &windows[i]
 		pw, last, ok := p.resolveFusedWindow(w, blockOf, posOf, blockValues, consumers, frame)
-		if !ok && fusedWinDebug {
-			fmt.Fprintf(os.Stderr, "wasm2go: fused window %s in %s: plan reject: %s\n", w.Tree.Name, f.Name, p.fusedRejectWhy)
-		}
 		if ok {
 			if p.fusedAt == nil {
 				p.fusedAt = map[ssa.ValueID]*plannedFusedWindow{}
@@ -118,9 +109,9 @@ func (p *funcPlan) planFusedWindows(f *ssa.Func, windows []FusedWindow, frame ar
 // emits there, so every input value defined between the members has
 // already been materialized; earlier members emit nothing.
 func (p *funcPlan) resolveFusedWindow(w *FusedWindow, blockOf map[ssa.ValueID]ssa.BlockID, posOf map[ssa.ValueID]int, blockValues map[ssa.BlockID][]*ssa.Value, consumers map[ssa.ValueID]int, frame argFrame) (*plannedFusedWindow, ssa.ValueID, bool) {
-	p.fusedRejectWhy = ""
-	reject := func(why string) (*plannedFusedWindow, ssa.ValueID, bool) {
-		p.fusedRejectWhy = why
+	// The reason strings at the reject sites are documentation; a
+	// refused window silently keeps per-op emission.
+	reject := func(string) (*plannedFusedWindow, ssa.ValueID, bool) {
 		return nil, 0, false
 	}
 	if w.Tree == nil || len(w.Members) == 0 {

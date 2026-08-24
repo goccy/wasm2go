@@ -3,7 +3,6 @@ package gcasm
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/asmgen"
@@ -64,13 +63,6 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 	opts.GlobalOffsets = cfg.DirectAsmGlobals
 	opts.Exc = cfg.DirectAsmExc
 	opts.Windows = df.Windows
-	// Bisect knob (diagnosis only): cap the number of windows handed
-	// to the emitter. Unset or invalid means no cap.
-	if capStr := os.Getenv("WASM2GO_FUSEDWIN_MAX"); capStr != "" {
-		if n, err := strconv.Atoi(capStr); err == nil && n >= 0 && n < len(opts.Windows) {
-			opts.Windows = opts.Windows[:n]
-		}
-	}
 	if rel != "" {
 		// Multi-package chunk: same-package helper CALL spellings do
 		// not resolve here. Setting the prefix makes the emitters

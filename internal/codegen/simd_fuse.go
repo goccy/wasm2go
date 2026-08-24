@@ -280,8 +280,6 @@ type fusedTreeBuilder struct {
 	// without intervener bookkeeping. Off for ordinary fusion so
 	// existing tree shapes stay byte-identical.
 	wideChase bool
-	// chaseTrace prints every chaseI32 entry and failure (diagnosis).
-	chaseTrace bool
 	// capRelax suspends the per-append integer-register cap while the
 	// f16 gather rewrite runs: the rewrite retires more parameters
 	// than it adds, but the retired ones only leave at compaction.
@@ -484,9 +482,6 @@ var reassocOps = map[string]bool{
 // assigning interior nodes (ascending) leaf pairs left-to-right
 // preserves the array's topological invariant.
 func (fb *fusedTreeBuilder) reassociateChains(roots []int) {
-	if os.Getenv("WASM2GO_NO_REASSOC") != "" {
-		return
-	}
 	consumers := make([]int, len(fb.nodes))
 	for _, nd := range fb.nodes {
 		for _, a := range nd.Args {
@@ -1724,24 +1719,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		pendingInter = append(pendingInter, st)
 		nInter++
 	}
-	if loopMode && len(cands) >= 4 {
-		var ops []string
-		for _, c := range cands {
-			switch {
-			case c.call != nil:
-				if m, ok := sc.em.simdCalls[c.call]; ok {
-					ops = append(ops, m.name)
-				} else {
-					ops = append(ops, "?")
-				}
-			case c.alias != nil:
-				ops = append(ops, "alias:"+c.alias.Name)
-			default:
-				ops = append(ops, "store")
-			}
-		}
-		fuseDebugf("CANDS(%s) n=%d: %s", sc.fnNameForDebug(), len(cands), strings.Join(ops, ","))
-	}
 	// Try the longest window first; the walk is a pure analysis, so a
 	// failed length just retries shorter on a fresh builder.
 	for w := len(cands); w >= 2; w-- {
@@ -1759,10 +1736,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			// Window-only trials keep the historical shapes.
 			wideChase: loopMode,
 			capRelax:  loopMode,
-			// Chase tracing follows -fuse-debug for loop trials: their
-			// absorption failures are exactly what the flag exists to
-			// localize.
-			chaseTrace: loopMode && fuseDebugEnabled,
 		}
 		var nodeOf []int
 		var inter []ast.Stmt
@@ -1822,17 +1795,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 			}
 		}
 		if !ok || fb.varEdges == 0 || fb.readsCandVar {
-			if w >= 4 && !ok {
-				fuseDebugf("w=%d walk fail (fn=%s): %s", w, sc.fnNameForDebug(), fb.failWhy)
-			}
-			if loopMode && w >= 8 {
-				var scs []string
-				for _, s := range fb.scalars {
-					scs = append(scs, exprDebugString(s))
-				}
-				fuseDebugf("LOOPWIN(%s) w=%d ok=%v edges=%d reads=%v why=%s sc=%d pr=%d scalars=%s pairs=%s",
-					sc.fnNameForDebug(), w, ok, fb.varEdges, fb.readsCandVar, fb.failWhy, len(fb.scalars), len(fb.pairs), strings.Join(scs, ","), fb.pairDebug())
-			}
 			continue
 		}
 		// A window variable is INTERNAL when the region consumes every
@@ -1898,9 +1860,6 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		// must not COMMIT (an interned tree past the register file
 		// fails to splice and falls back to a pure call per iteration).
 		if fb.capRelax && fb.intRegsUsed() > fusedMaxIntSlots {
-			if w >= 4 {
-				fuseDebugf("w=%d post-gather slots=%d over cap (fn=%s)", w, fb.intRegsUsed(), sc.fnNameForDebug())
-			}
 			continue
 		}
 		roots = fb.scheduleNodes(roots)

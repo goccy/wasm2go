@@ -21,7 +21,6 @@ package gcasm
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
@@ -1484,16 +1483,13 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// in the argument registers the signature leaves free: the load
 	// emitters then use immediate-offset forms off them. Recomputed at
 	// the top of every unroll copy.
-	var hostPtrs map[int]*a64HostPtr
-	if os.Getenv("WASM2GO_NO_HOSTPTR") == "" {
-		argsUsed := 1 + tree.NumScalars + 1 + loop.NumDeltas + 2*tree.NumPairs
-		var freePtrRegs []string
-		for r := argsUsed; r <= 15; r++ {
-			freePtrRegs = append(freePtrRegs, a64FusedArgReg(r))
-		}
-		freePtrRegs = append(freePtrRegs, "R16")
-		hostPtrs = a64LoopHostPtrs(loop, freePtrRegs)
+	argsUsed := 1 + tree.NumScalars + 1 + loop.NumDeltas + 2*tree.NumPairs
+	var freePtrRegs []string
+	for r := argsUsed; r <= 15; r++ {
+		freePtrRegs = append(freePtrRegs, a64FusedArgReg(r))
 	}
+	freePtrRegs = append(freePtrRegs, "R16")
+	hostPtrs := a64LoopHostPtrs(loop, freePtrRegs)
 	// Hoist scale-table HOST bases (memory base + table offset) for
 	// the lookup peephole: loop-invariant, one register each. R17/R19
 	// are free inside the splice (every GPR is call-clobbered; R18 is
@@ -1530,7 +1526,7 @@ func a64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// Whole-loop range checks: one prologue check per carried pointer
 	// replaces its per-load checks (store-free do-while loops only —
 	// see a64HoistLoopChecks for the soundness argument).
-	if len(hostPtrs) > 0 && os.Getenv("WASM2GO_NO_CHECK_HOIST") == "" {
+	if len(hostPtrs) > 0 {
 		if a64HoistLoopChecks(b, loop, hostPtrs, counterReg, tree.Addr64) {
 			needsTrap = true
 		}
