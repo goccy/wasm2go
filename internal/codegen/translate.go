@@ -142,16 +142,13 @@ type Options struct {
 	// lane by that factor (0 = no in-splice unroll).
 	FuseLoops      bool
 	FuseLoopUnroll int
-	// F16TableAddr optionally asserts the linear-memory base address
-	// of a runtime-built IEEE f16->f32 lookup table. Runtime-built
-	// tables are normally AUTO-DETECTED from the module's own
-	// initialization loop (full-range constant-strided store
-	// coverage), so most integrations leave this 0. A set value that
-	// contradicts the detection fails the build — a stale address
-	// would otherwise silently disable the table-keyed rewrites or
-	// bless whatever now lives at the old address. Statically
-	// verifiable tables are recognized regardless.
-	F16TableAddr uint32
+	// DisableF16Table opts out of the f16-table-keyed rewrites.
+	// Tables are verified automatically — statically when the data
+	// image holds the IEEE map, otherwise by detecting the module's
+	// own initialization loop (full-range constant-strided store
+	// coverage) — so there is no address to configure; this switch
+	// exists only to disable the rewrites outright.
+	DisableF16Table bool
 	// FastMath opts asm splice synthesis out of wasm bit-exactness:
 	// SDOT lane grouping without the TBL permutation, fused
 	// multiply-adds, dual accumulators, and the SMMLA tile kernel for

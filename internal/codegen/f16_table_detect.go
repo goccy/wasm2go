@@ -6,12 +6,12 @@ package codegen
 //
 // ggml-style engines build the 65536-entry f16->f32 lookup table at
 // runtime (ggml_init), so the module's data image holds zeros and the
-// static byte-check in hasIEEEF16TableAt can never see it. The
-// F16TableAddr option existed to bridge that gap, but an external
-// address is a liability: the table MOVES with every layout shift
-// (source changes, even build-cache state), and a stale assertion
-// does not fail anything — it silently disables the table-verified
-// rewrites, or worse, blesses whatever now lives at the old address.
+// static byte-check in hasIEEEF16TableAt can never see it. An
+// externally-asserted address used to bridge that gap, but proved a
+// liability: the table MOVES with every layout shift (source
+// changes, even build-cache state), and a stale assertion silently
+// disabled the table-verified rewrites — or worse, blessed whatever
+// now lived at the old address.
 //
 // The initialization loop itself is the in-module proof this pass
 // extracts: a loop that streams constant-strided stores from a
