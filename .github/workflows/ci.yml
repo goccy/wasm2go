@@ -35,6 +35,30 @@ jobs:
       - name: Test with coverage
         run: make test-cover
 
+  # The amd64 SIMD splices only compile into GOAMD64=v2+ binaries
+  # (v1 keeps the pure fallback), so the default job never EXECUTES
+  # them. This job runs the execution-heavy suites with the splices
+  # live on the runner's AVX2 hardware — the gate that would have
+  # caught the const-shuffle scratch clobber before release.
+  test-amd64-v2:
+    runs-on: ubuntu-latest
+    env:
+      GOAMD64: v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install wat2wasm
+        run: make install/wat2wasm
+
+      - name: Test with the amd64 splices enabled
+        run: go test -count=1 ./transpile/... ./internal/gcasm/... ./internal/codegen/...
+
   lint:
     runs-on: ubuntu-latest
     steps:
