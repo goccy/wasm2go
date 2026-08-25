@@ -35,6 +35,52 @@ jobs:
       - name: Test with coverage
         run: make test-cover
 
+  # The default job (amd64 at GOAMD64=v1) executes only the PURE
+  # fallback: the amd64 splices compile into v2+ binaries and the
+  # arm64 splices need arm64 hardware. These jobs run the
+  # execution-heavy suites on each spliced backend — the gates that
+  # would have caught the const-shuffle scratch clobber before
+  # release. internal/codegen is deliberately absent from both: its
+  # runtime tests build codegen.Translate output, which by design
+  # carries the pure bodies under the asm-dormancy tag with no asm
+  # bundle — only the full transpile backend produces packages that
+  # run on the spliced targets.
+  test-amd64-v2:
+    runs-on: ubuntu-latest
+    env:
+      GOAMD64: v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install wat2wasm
+        run: make install/wat2wasm
+
+      - name: Test with the amd64 splices enabled
+        run: go test -count=1 ./transpile/... ./internal/gcasm/...
+
+  test-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install wat2wasm
+        run: make install/wat2wasm
+
+      - name: Test with the arm64 splices enabled
+        run: go test -count=1 ./transpile/... ./internal/gcasm/...
+
   lint:
     runs-on: ubuntu-latest
     steps:

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -46,6 +47,9 @@ func Rec(n int32) int32 {
 // with an ABI0 wrapper, run it against the pure implementation, and
 // verify the transform is DETERMINISTIC (two captures → identical .s).
 func TestGate0CaptureTransformRun(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	dir := writeRecModule(t)
 	sig := func(sym string) ([]ArgKind, bool, ArgKind, string, bool) {
 		if strings.HasSuffix(sym, ".Rec") {
@@ -141,6 +145,9 @@ func TestRec(t *testing.T) {
 // the wraparound-checking variant) through capture, transform,
 // assembly and a deep-recursion run.
 func TestGate0BigFrame(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	dir := t.TempDir()
 	libSrc := `package lib
 

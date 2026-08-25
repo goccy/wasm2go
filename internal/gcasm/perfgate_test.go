@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,9 @@ import (
 // The gate only asserts sanity bounds (transform not catastrophically
 // slower); the measured ratios go to the log for bench-metrics.md.
 func TestPerfGate(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	if testing.Short() {
 		t.Skip("perf gate skipped in -short")
 	}

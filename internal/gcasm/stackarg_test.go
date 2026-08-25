@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -13,6 +14,9 @@ import (
 // itself stays pure — its own params stack-assign). Gate 3a validated
 // that such call sites TRANSFORM; this gate validates they RUN.
 func TestStackArgCallGate(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	dir := t.TempDir()
 	libSrc := `package lib
 

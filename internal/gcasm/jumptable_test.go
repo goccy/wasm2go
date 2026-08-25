@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -34,6 +35,9 @@ func dispatchSrc(fnName string) string {
 // against the pure implementation for every selector including
 // out-of-range ones. Also asserts transform determinism.
 func TestJumpTableTransformRun(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	dir := t.TempDir()
 	src := "package lib\n\n//go:noinline\n" + dispatchSrc("Dispatch")
 	for name, content := range map[string]string{

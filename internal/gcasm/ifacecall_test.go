@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -13,6 +14,9 @@ import (
 // slot load, CALL DX with ABIInternal register args). The python.wasm
 // consumer crashed on exactly this pattern.
 func TestIfaceCallGate(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	dir := t.TempDir()
 	libSrc := `package lib
 

@@ -558,10 +558,19 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				blob[bi] = byte(patLo >> (8 * bi))
 				blob[8+bi] = byte(patHi >> (8 * bi))
 			}
-			fmt.Fprintf(b, "\tMOVOU ·%s(SB), X2\n", pool.addBlob(blob))
+			// The emulation must stay inside the splicer's scratch set
+			// (X0-X3): pool values live in X4+ for the whole loop
+			// body, and the window path's relocate-out-of-reach scan
+			// does not run here. The pattern reloads from the pool
+			// instead of holding a second biased copy, and the bias
+			// constants apply as memory operands, so three registers
+			// suffice.
+			patBlob := pool.addBlob(blob)
 			shufLines, cok := simdSpliceRewriteConsts([]string{
-				"MOVOU ·simdConst70(SB), X3", "MOVOU X2, X4", "PADDUSB X3, X4", "PSHUFB X4, X0",
-				"MOVOU ·simdConst16(SB), X5", "PSUBB X5, X2", "PADDUSB X3, X2", "PSHUFB X2, X1",
+				"MOVOU ·" + patBlob + "(SB), X2",
+				"PADDUSB ·simdConst70(SB), X2", "PSHUFB X2, X0",
+				"MOVOU ·" + patBlob + "(SB), X2",
+				"PSUBB ·simdConst16(SB), X2", "PADDUSB ·simdConst70(SB), X2", "PSHUFB X2, X1",
 				"POR X1, X0",
 			}, pool)
 			if !cok {

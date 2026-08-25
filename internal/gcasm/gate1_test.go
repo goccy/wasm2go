@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -549,6 +550,9 @@ func TestFixtureGate(t *testing.T) {
 
 // TestGate1ControlFixture is the original whole-fixture gate.
 func TestGate1ControlFixture(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	fixtureGate(t, "control")
 }
 
@@ -556,6 +560,9 @@ func TestGate1ControlFixture(t *testing.T) {
 // fixture corpus: floats, i64, memory ops, globals, traps, indirect
 // calls, dense dispatch.
 func TestGate2Fixtures(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	for _, fixture := range []string{
 		"cg_brtable64",
 		"cg_bittest",
