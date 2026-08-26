@@ -39,14 +39,20 @@ func translateSpinguard(t *testing.T) (string, string, codegen.Result) {
 // plain (non-atomic) load, must stay untouched.
 func TestSpinGuardInjection(t *testing.T) {
 	_, all, _ := translateSpinguard(t)
-	if got := strings.Count(all, "__spinGuard++"); got != 2 {
-		t.Errorf("spin guard sites = %d, want 2 (bare_spin, bare_spin64)", got)
+	if got := strings.Count(all, "__spinGuard++"); got != 3 {
+		t.Errorf("spin guard sites = %d, want 3 (bare_spin, bare_spin64, big_spin)", got)
 	}
+	// The minimal spins get the widest interval; big_spin's body carries
+	// dozens of values, so its derived interval is proportionally
+	// shorter — the guard budget is time, not iterations.
 	if got := strings.Count(all, "if __spinGuard&16383 == 0 {"); got != 2 {
-		t.Errorf("spin guard cold branches = %d, want 2", got)
+		t.Errorf("spin guard cold branches at max interval = %d, want 2", got)
 	}
-	if got := strings.Count(all, "var __spinGuard uint32"); got != 2 {
-		t.Errorf("__spinGuard declarations = %d, want 2", got)
+	if got := strings.Count(all, "if __spinGuard&2047 == 0 {"); got != 1 {
+		t.Errorf("spin guard cold branches at derived big-body interval = %d, want 1", got)
+	}
+	if got := strings.Count(all, "var __spinGuard uint32"); got != 3 {
+		t.Errorf("__spinGuard declarations = %d, want 3", got)
 	}
 	if !strings.Contains(all, "func spinRelax(") {
 		t.Error("spinRelax helper source not included")
@@ -69,6 +75,7 @@ import (
 
 func main() {
 	m := pkg.New()
+	m.BigSpin(1) // exits on the first check; pins that the guarded big-body loop runs
 	fmt.Println(m.BareSpin(1), m.BareSpin64(1), m.SpinWithCall(1), m.PlainLoop(1))
 }
 `

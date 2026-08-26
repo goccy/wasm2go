@@ -1571,11 +1571,13 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 // already parked.
 //
 // The generated hot path is a counter increment and a not-taken
-// branch; every 16384th iteration reaches this call. The call itself
+// branch; every 2^k-th iteration reaches this call, with k derived at
+// emission from the loop body's size so the interval is a roughly
+// constant TIME budget (see spinGuardMask). The call itself
 // is the fix — it must survive to machine code (hence //go:noinline),
 // and its prologue's stack check is the preemption point, so a
-// stop-the-world waits at most ~16k spin iterations (tens of
-// microseconds). The Gosched additionally donates the core when a
+// stop-the-world waits at most tens-to-low-hundreds of microseconds
+// of spinning. The Gosched additionally donates the core when a
 // wait is genuinely long. Calling on every iteration instead measured
 // ~40% decode overhead at n_threads=8: eight workers reaching
 // runtime.Gosched at spin rate serialize on sched.lock, and the call

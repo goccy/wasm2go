@@ -32,11 +32,12 @@ type ssaEmitter struct {
 	// evaluation could run memory.grow. See emitFuncBody.
 	memBaseHoisted bool
 
-	// spinHeaders holds the loop headers (per function) that need a
-	// spinRelax preemption guard; spinGuardEmitted records that at
-	// least one guard statement was actually emitted, gating the
-	// __spinGuard counter declaration. See spinguard.go.
-	spinHeaders      map[ssa.BlockID]bool
+	// spinHeaders maps the loop headers (per function) that need a
+	// spinRelax preemption guard to their guard mask (interval-1, see
+	// spinGuardMask); spinGuardEmitted records that at least one guard
+	// statement was actually emitted, gating the __spinGuard counter
+	// declaration. See spinguard.go.
+	spinHeaders      map[ssa.BlockID]int
 	spinGuardEmitted bool
 
 	// catchExcVar is the Go variable holding the *wasmExc currently being
@@ -239,18 +240,19 @@ const spinGuardLocal = "__spinGuard"
 // atomic spin loop (see spinguard.go):
 //
 //	__spinGuard++
-//	if __spinGuard&16383 == 0 { spinRelax() }
+//	if __spinGuard&<mask> == 0 { spinRelax() }
 //
 // The hot path is an increment and a not-taken branch — cheap enough
 // for a spin that mostly loses the race by a few iterations. The cold
 // call is the preemption point (its prologue runs the stack check, so
-// a stop-the-world waits at most ~16k spin iterations, tens of
-// microseconds) and hands the core over when the wait is genuinely
-// long. An unconditional call per iteration measured ~40% decode
-// overhead at n_threads=8: eight workers calling runtime.Gosched at
-// spin rate serialize on sched.lock, and the call round-trip alone
-// showed ~15% — the counter keeps both off the hot path.
-func (em *ssaEmitter) spinGuardStmts() []ast.Stmt {
+// a stop-the-world waits at most the time budget spinGuardMask
+// derives the mask from) and hands the core over when the wait is
+// genuinely long. An unconditional call per iteration measured ~40%
+// decode overhead at n_threads=8: eight workers calling
+// runtime.Gosched at spin rate serialize on sched.lock, and the call
+// round-trip alone showed ~15% — the counter keeps both off the hot
+// path.
+func (em *ssaEmitter) spinGuardStmts(mask int) []ast.Stmt {
 	em.spinGuardEmitted = true
 	em.useHelper("spinRelax")
 	return []ast.Stmt{
@@ -260,7 +262,7 @@ func (em *ssaEmitter) spinGuardStmts() []ast.Stmt {
 				X: &ast.BinaryExpr{
 					X:  newID(spinGuardLocal),
 					Op: token.AND,
-					Y:  &ast.BasicLit{Kind: token.INT, Value: "16383"},
+					Y:  &ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(mask)},
 				},
 				Op: token.EQL,
 				Y:  &ast.BasicLit{Kind: token.INT, Value: "0"},
@@ -552,8 +554,8 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 			*out = append(*out, assignBool(v, true))
 		}
 	}
-	if em.spinHeaders[blk.ID] {
-		*out = append(*out, em.spinGuardStmts()...)
+	if mask, ok := em.spinHeaders[blk.ID]; ok {
+		*out = append(*out, em.spinGuardStmts(mask)...)
 	}
 
 	valuesEnd := len(blk.Values)

@@ -38,7 +38,16 @@ import (
 // Over-approximation is deliberately cheap: a guarded loop that never
 // spins long pays one counter increment and a predictable branch per
 // iteration.
-func spinGuardHeaders(f *ssa.Func) map[ssa.BlockID]bool {
+//
+// The returned value per header is the guard MASK: the cold call runs
+// when __spinGuard&mask == 0. The interval is derived from the loop
+// body's size so the stop-the-world arrival bound is a TIME budget,
+// not an iteration count that would stretch with the body: a minimal
+// barrier spin (a handful of values) checks every 16384th iteration,
+// while an interpreter-style loop carrying hundreds of values per
+// iteration checks every few hundred — either way the budget lands in
+// the tens-to-low-hundreds of microseconds of spinning.
+func spinGuardHeaders(f *ssa.Func) map[ssa.BlockID]int {
 	if f == nil || f.Entry == nil {
 		return nil
 	}
@@ -88,12 +97,14 @@ func spinGuardHeaders(f *ssa.Func) map[ssa.BlockID]bool {
 		return nil
 	}
 
-	var headers map[ssa.BlockID]bool
+	var headers map[ssa.BlockID]int
 	for h, body := range bodies {
 		sawAtomicLoad := false
 		sawCall := false
+		bodyValues := 0
 	scan:
 		for blk := range body {
+			bodyValues += len(blk.Values)
 			for _, v := range blk.Values {
 				switch v.Op {
 				case ssa.OpCallDirect, ssa.OpCallIndirect, ssa.OpCallImport:
@@ -116,10 +127,38 @@ func spinGuardHeaders(f *ssa.Func) map[ssa.BlockID]bool {
 		}
 		if sawAtomicLoad && !sawCall {
 			if headers == nil {
-				headers = map[ssa.BlockID]bool{}
+				headers = map[ssa.BlockID]int{}
 			}
-			headers[h.ID] = true
+			headers[h.ID] = spinGuardMask(bodyValues)
 		}
 	}
 	return headers
+}
+
+// Spin-guard interval policy. The single tunable is a stop-the-world
+// latency budget expressed in value-iterations: interval × body size
+// ≈ spinGuardBudget, i.e. roughly constant TIME between preemption
+// points across guests, assuming ~ns-scale SSA values. The clamps keep
+// the derivation honest at the extremes: intervals above 2^14 buy
+// nothing (the cold call is already <0.1% there), and intervals below
+// 2^8 would let the guard itself become a per-iteration cost on very
+// large bodies (which already reach the budget in few iterations).
+const (
+	spinGuardBudget      = 1 << 18
+	spinGuardMinInterval = 1 << 8
+	spinGuardMaxInterval = 1 << 14
+)
+
+// spinGuardMask derives a power-of-two guard interval from the loop
+// body size and returns interval-1, the literal the emitters test the
+// counter against.
+func spinGuardMask(bodyValues int) int {
+	if bodyValues < 1 {
+		bodyValues = 1
+	}
+	interval := spinGuardMaxInterval
+	for interval > spinGuardMinInterval && interval*bodyValues > spinGuardBudget {
+		interval >>= 1
+	}
+	return interval - 1
 }
