@@ -83,7 +83,7 @@ func main() {
 }
 `
 	out := runGoSnippetWithAux(t, buf.String(), main,
-		[]map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles)
+		[]map[string][]byte{res.Sidecars, filesWithAux(res)}, res.AuxFiles)
 
 	for _, want := range []string{
 		"dataEnd 4099",
@@ -159,7 +159,7 @@ func main() {
 }
 `
 	out := runGoSnippetWithAux(t, buf.String(), main,
-		[]map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles)
+		[]map[string][]byte{res.Sidecars, filesWithAux(res)}, res.AuxFiles)
 
 	for _, want := range []string{
 		"start ran 1 time(s) for a, 1 for b",

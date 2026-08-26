@@ -334,14 +334,14 @@ func runFixture(t *testing.T, fx fixture) {
 	}
 	mainSB.WriteString("}\n")
 
-	got := runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files)
+	got := runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res))
 	if got != want {
 		t.Errorf("output mismatch for %s\n--want--\n%s\n--got--\n%s\n--generated--\n%s", fx.name, want, got, buf.String())
 	}
 
 	// Run the SSA-mode regenerated source through the same test program
 	// to confirm the SSA + fallback path keeps semantics intact.
-	gotSSA := runGoSnippet(t, ssaBuf.String(), mainSB.String(), res.Sidecars, res.Files)
+	gotSSA := runGoSnippet(t, ssaBuf.String(), mainSB.String(), res.Sidecars, filesWithAux(res))
 	if gotSSA != want {
 		t.Errorf("UseSSA output mismatch for %s\n--want--\n%s\n--got--\n%s", fx.name, want, gotSSA)
 	}

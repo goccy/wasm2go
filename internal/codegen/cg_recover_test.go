@@ -160,7 +160,7 @@ func main() {
 
 `
 
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), main, res.Sidecars, res.Files))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), main, res.Sidecars, filesWithAux(res)))
 	want := []string{
 		"init-OK",
 		"trap-divz-OK",

@@ -48,7 +48,7 @@ func main() {
 	fmt.Printf("grown -> %d\n", m.GrowShared())
 }
 `
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	want := "joined -> 8\ngrown -> 179951\n"
 	if got != want {
 		t.Errorf("output mismatch\n--want--\n%s\n--got--\n%s", want, got)
@@ -72,7 +72,7 @@ func TestThreadsVisibilityM64(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	main := "package main\n\nimport (\n\t\"fmt\"\n\t\"gentest/pkg\"\n)\n\nfunc main() {\n\tm := pkg.New()\n\tfmt.Println(m.Run())\n}\n"
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if strings.TrimSpace(got) != "4242" {
 		t.Errorf("cross-thread plain-store visibility (memory64): got %q, want 4242", got)
 	}
@@ -113,7 +113,7 @@ func main() {
 	fmt.Println("store_neg", m.StoreNeg())
 }
 `
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	want := `rmw32 361
 rmw64 8000000000
 xchg 16
@@ -157,7 +157,7 @@ func main() {
 	fmt.Println(m.WaitUnshared())
 }
 `
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if want := "42\n1\n"; got != want {
 		t.Errorf("unshared memory64 atomics: got %q, want %q", got, want)
 	}

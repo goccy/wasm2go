@@ -63,7 +63,7 @@ func main() {
 	fmt.Printf("no-trap got=%%d\n", v)
 }
 `, method)
-			out, ok := runGoSnippetExpectPanic(t, generated, main, res.Sidecars, res.Files)
+			out, ok := runGoSnippetExpectPanic(t, generated, main, res.Sidecars, filesWithAux(res))
 			if ok {
 				t.Fatalf("expected panic for %s, got clean exit:\n%s", tc.export, out)
 			}

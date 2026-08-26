@@ -2135,6 +2135,20 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				capArg,
 			},
 		})
+		if mem.Limits.Shared {
+			// A shared memory is allocated at its full ceiling LENGTH, and
+			// that must not live on the Go heap: a freed span this large is
+			// zeroed when the allocator reuses it, so the second instance a
+			// process builds dirties the whole ceiling (gigabytes of
+			// resident pages for untouched memory). AllocSharedMemory hands
+			// out fresh anonymous mappings instead — see the sharedimage
+			// runtime.
+			fn := ast.Expr(newID("AllocSharedMemory"))
+			if t.multiPackage && t.currentChunk != chunkBase {
+				fn = &ast.SelectorExpr{X: newID("base"), Sel: newID("AllocSharedMemory")}
+			}
+			memRhs = &ast.CallExpr{Fun: fn, Args: []ast.Expr{newID("m"), lenArg}}
+		}
 		if memFromArg {
 			memRhs = newID("memory")
 		}

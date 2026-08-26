@@ -79,7 +79,7 @@ func main() {
 	fmt.Println(m.BareSpin(1), m.BareSpin64(1), m.SpinWithCall(1), m.PlainLoop(1))
 }
 `
-	got := runGoSnippetNoRace(t, src, main, res.Sidecars, res.Files)
+	got := runGoSnippetNoRace(t, src, main, res.Sidecars, filesWithAux(res))
 	if strings.TrimSpace(got) != "0 0 0 0" {
 		t.Errorf("guarded spins: got %q, want \"0 0 0 0\"", got)
 	}

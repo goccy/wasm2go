@@ -17,3 +17,10 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 }
 
 func unmapMemory(mem []byte) {}
+
+// AllocSharedMemory falls back to the heap where mmap is unavailable —
+// the historical behaviour; see the unix variant for what the mapping
+// buys.
+func AllocSharedMemory(_ *{{.Module}}, n int) []byte {
+	return make([]byte, n)
+}

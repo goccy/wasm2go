@@ -41,7 +41,7 @@ func buildMem64(t *testing.T, fixture, mainBody string) string {
 	if buf.Len() > 0 {
 		w("pkg/gen.go", buf.Bytes())
 	}
-	for _, set := range []map[string][]byte{res.Files, res.Sidecars} {
+	for _, set := range []map[string][]byte{res.Files, res.Sidecars, res.AuxFiles} {
 		for name, data := range set {
 			if len(data) == 0 {
 				continue

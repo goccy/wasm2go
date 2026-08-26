@@ -197,7 +197,7 @@ func main() {
 	fmt.Println(v)
 }
 `
-	out := runGoSnippet(t, buf.String(), main, res.Sidecars, res.Files)
+	out := runGoSnippet(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if got := strings.TrimSpace(out); got != "42" {
 		t.Fatalf("wasm2go add(7,35) printed %q want %q\n--generated--\n%s", got, "42", buf.String())
 	}

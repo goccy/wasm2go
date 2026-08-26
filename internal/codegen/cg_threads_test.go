@@ -38,7 +38,7 @@ func TestThreadsVisibility(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	main := "package main\n\nimport (\n\t\"fmt\"\n\t\"gentest/pkg\"\n)\n\nfunc main() {\n\tm := pkg.New()\n\tfmt.Println(m.Run())\n}\n"
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if strings.TrimSpace(got) != "4242" {
 		t.Errorf("cross-thread plain-store visibility: got %q, want 4242", got)
 	}
@@ -58,7 +58,7 @@ func TestThreadsMainToAgentWake(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	main := "package main\n\nimport (\n\t\"fmt\"\n\t\"gentest/pkg\"\n)\n\nfunc main() {\n\tm := pkg.New()\n\tfmt.Println(m.Run())\n}\n"
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if strings.TrimSpace(got) != "7777" {
 		t.Errorf("main->agent wake: got %q, want 7777", got)
 	}
@@ -78,7 +78,7 @@ func TestThreadsMutexHandoff(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	main := "package main\n\nimport (\n\t\"fmt\"\n\t\"gentest/pkg\"\n)\n\nfunc main() {\n\tm := pkg.New()\n\tfmt.Println(m.Run())\n}\n"
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if strings.TrimSpace(got) != "100000" {
 		t.Errorf("mutex handoff: got %q, want 100000", got)
 	}
@@ -103,7 +103,7 @@ func TestThreadsMuslLock(t *testing.T) {
 	// No -race here: wasm's shared-memory model makes plain cross-agent
 	// access a LEGAL race (coherent, tear-free words); Go's detector would
 	// flag every such access. The assertion is completion + the exact count.
-	got := runGoSnippetNoRace(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetNoRace(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	if strings.TrimSpace(got) != "100000" {
 		t.Errorf("musl lock handoff: got %q, want 100000", got)
 	}
@@ -139,7 +139,7 @@ func main() {
 	fmt.Printf("grown -> %d\n", m.GrowShared())
 }
 `
-	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, res.Files)
+	got := runGoSnippetRaceDetector(t, buf.String(), main, res.Sidecars, filesWithAux(res))
 	want := "joined -> 8\ngrown -> 179951\n"
 	if got != want {
 		t.Errorf("output mismatch\n--want--\n%s\n--got--\n%s", want, got)
@@ -163,6 +163,22 @@ func runGoSnippetNoRace(t *testing.T, generated, mainSrc string, sidecars map[st
 func runGoSnippetRaceDetector(t *testing.T, generated, mainSrc string, sidecars map[string][]byte, auxFiles map[string][]byte) string {
 	t.Helper()
 	return runGoSnippetThreads(t, generated, mainSrc, sidecars, auxFiles, true)
+}
+
+// filesWithAux merges Result.Files with Result.AuxFiles for the snippet
+// runners: the aux files are part of the output contract (the shared-memory
+// runtime lives there, and generated constructors for SHARED memories call
+// its AllocSharedMemory), so compiling generated output without them is not
+// a configuration any embedder ships.
+func filesWithAux(res codegen.Result) map[string][]byte {
+	merged := map[string][]byte{}
+	for name, data := range res.Files {
+		merged[name] = data
+	}
+	for name, data := range res.AuxFiles {
+		merged[name] = data
+	}
+	return merged
 }
 
 func runGoSnippetThreads(t *testing.T, generated, mainSrc string, sidecars map[string][]byte, auxFiles map[string][]byte, race bool) string {

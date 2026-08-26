@@ -110,7 +110,7 @@ func TestBrTable64RuntimePure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	out := strings.Fields(strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files)))
+	out := strings.Fields(strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res))))
 	if len(out) != len(want) {
 		t.Fatalf("got %d outputs, want %d", len(out), len(want))
 	}

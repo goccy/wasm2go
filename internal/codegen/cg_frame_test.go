@@ -74,7 +74,7 @@ func runExportMatrix(t *testing.T, fixture string, calls []call) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res)))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("%s UseSSA=%v: got %d lines want %d\n%s", fixture, useSSA, len(gotLines), len(want), out)
@@ -169,7 +169,7 @@ func TestSpecialFPRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res)))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)
@@ -257,7 +257,7 @@ func TestGlobalsRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res)))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)
@@ -327,7 +327,7 @@ func main() {
 	fmt.Printf("inf_gt=%d\n", m.InfGt())
 }
 `
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), main, res.Sidecars, res.Files))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), main, res.Sidecars, filesWithAux(res)))
 	if !strings.Contains(out, "is_nan=1") {
 		t.Errorf("NaN global not initialised to NaN: %q", out)
 	}

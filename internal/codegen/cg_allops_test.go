@@ -198,7 +198,7 @@ func TestAllOpsRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainHdr, res.Sidecars, res.Files))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainHdr, res.Sidecars, filesWithAux(res)))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d result lines want %d\n%s", useSSA, len(gotLines), len(want), out)
