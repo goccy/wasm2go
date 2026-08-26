@@ -1581,9 +1581,22 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 // runtime.Gosched at spin rate serialize on sched.lock, and the call
 // round-trip alone showed ~15%.
 //
+// The Gosched is rate-limited across every spinning worker (the
+// spinRelaxColdCalls counter lives in the runtime template — helper
+// extraction carries function decls only): the preemption point is the
+// spinRelax call itself (its prologue's stack check), but yielding on
+// every cold call still measured double-digit scheduler churn
+// (pthread_cond_signal — wakep — at 30% of the profile) on
+// barrier-heavy workloads, where waiting IS most of a worker's time.
+// One yield per 64 cold calls keeps donation proportional to
+// aggregate spin time — rare on an uncontended box, automatically
+// more frequent when oversubscription makes the spins long.
+//
 //go:noinline
 func spinRelax() {
-	runtime.Gosched()
+	if atomic.AddUint32(&spinRelaxColdCalls, 1)&63 == 0 {
+		runtime.Gosched()
+	}
 }
 
 // ----- wasm32 atomic helpers (named by the lowering) -----------------------
