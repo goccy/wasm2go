@@ -565,7 +565,7 @@ func (se *structEmitter) phiCopies(pred, succ *ssa.Block, predIdx int) ([]ast.St
 func (se *structEmitter) blockValues(blk *ssa.Block) ([]ast.Stmt, error) {
 	var out []ast.Stmt
 	if se.em.spinHeaders[blk.ID] {
-		out = append(out, se.em.spinGuardStmt())
+		out = append(out, se.em.spinGuardStmts()...)
 	}
 	valuesEnd := len(blk.Values)
 	if blk.Kind == ssa.BlockRet {

@@ -1561,31 +1561,29 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 	}
 }
 
-// spinRelax is the preemption valve the emitters plant in bare atomic
-// spin loops (a loop that waits on an inline atomic load and makes no
-// other call — see spinguard.go). Such a loop is fine as Go, but once
-// the gcasm bundler captures the compiled function into a .s TEXT the
-// runtime can no longer async-preempt it, and a goroutine spinning
-// there blocks every stop-the-world — a livelock when the store it
-// waits for comes from a goroutine the GC already parked.
+// spinRelax is the cold half of the preemption guard the emitters
+// plant in bare atomic spin loops (a loop that waits on an inline
+// atomic load and makes no other call — see spinguard.go). Such a loop
+// is fine as Go, but once the gcasm bundler captures the compiled
+// function into a .s TEXT the runtime can no longer async-preempt it,
+// and a goroutine spinning there blocks every stop-the-world — a
+// livelock when the store it waits for comes from a goroutine the GC
+// already parked.
 //
-// The call itself is the fix: it must survive to machine code (hence
-// //go:noinline), so the spinning goroutine periodically executes
-// ordinary preemptible Go. The Gosched hands the core to the thread
-// the spin is waiting for; doing that on every iteration measures
-// ~3.4x decode latency on ggml's barrier (n_threads=8, the waiters
-// endlessly round-tripping the run queue), while every 1024th
-// iteration is parity with no yield at all and still reaches the
-// scheduler every few microseconds of spinning. The counter lives in
-// the generated function (one uint32 per function, address-taken), so
-// this single site owns the whole policy.
+// The generated hot path is a counter increment and a not-taken
+// branch; every 16384th iteration reaches this call. The call itself
+// is the fix — it must survive to machine code (hence //go:noinline),
+// and its prologue's stack check is the preemption point, so a
+// stop-the-world waits at most ~16k spin iterations (tens of
+// microseconds). The Gosched additionally donates the core when a
+// wait is genuinely long. Calling on every iteration instead measured
+// ~40% decode overhead at n_threads=8: eight workers reaching
+// runtime.Gosched at spin rate serialize on sched.lock, and the call
+// round-trip alone showed ~15%.
 //
 //go:noinline
-func spinRelax(c *uint32) {
-	*c++
-	if *c&1023 == 0 {
-		runtime.Gosched()
-	}
+func spinRelax() {
+	runtime.Gosched()
 }
 
 // ----- wasm32 atomic helpers (named by the lowering) -----------------------

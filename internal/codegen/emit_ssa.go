@@ -235,16 +235,41 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 // value names (v<N>), parameters (l<N>), or phi temps.
 const spinGuardLocal = "__spinGuard"
 
-// spinGuardStmt renders one `spinRelax(&__spinGuard)` call — the
-// per-iteration preemption guard for a bare atomic spin loop (see
-// spinguard.go).
-func (em *ssaEmitter) spinGuardStmt() ast.Stmt {
+// spinGuardStmts renders the per-iteration preemption guard of a bare
+// atomic spin loop (see spinguard.go):
+//
+//	__spinGuard++
+//	if __spinGuard&16383 == 0 { spinRelax() }
+//
+// The hot path is an increment and a not-taken branch — cheap enough
+// for a spin that mostly loses the race by a few iterations. The cold
+// call is the preemption point (its prologue runs the stack check, so
+// a stop-the-world waits at most ~16k spin iterations, tens of
+// microseconds) and hands the core over when the wait is genuinely
+// long. An unconditional call per iteration measured ~40% decode
+// overhead at n_threads=8: eight workers calling runtime.Gosched at
+// spin rate serialize on sched.lock, and the call round-trip alone
+// showed ~15% — the counter keeps both off the hot path.
+func (em *ssaEmitter) spinGuardStmts() []ast.Stmt {
 	em.spinGuardEmitted = true
 	em.useHelper("spinRelax")
-	return &ast.ExprStmt{X: &ast.CallExpr{
-		Fun:  em.helperRef("spinRelax"),
-		Args: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: newID(spinGuardLocal)}},
-	}}
+	return []ast.Stmt{
+		&ast.IncDecStmt{X: newID(spinGuardLocal), Tok: token.INC},
+		&ast.IfStmt{
+			Cond: &ast.BinaryExpr{
+				X: &ast.BinaryExpr{
+					X:  newID(spinGuardLocal),
+					Op: token.AND,
+					Y:  &ast.BasicLit{Kind: token.INT, Value: "16383"},
+				},
+				Op: token.EQL,
+				Y:  &ast.BasicLit{Kind: token.INT, Value: "0"},
+			},
+			Body: &ast.BlockStmt{List: []ast.Stmt{
+				&ast.ExprStmt{X: &ast.CallExpr{Fun: em.helperRef("spinRelax")}},
+			}},
+		},
+	}
 }
 
 // memBaseLocal is the name of the per-function hoisted copy of m.M.
@@ -528,7 +553,7 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 		}
 	}
 	if em.spinHeaders[blk.ID] {
-		*out = append(*out, em.spinGuardStmt())
+		*out = append(*out, em.spinGuardStmts()...)
 	}
 
 	valuesEnd := len(blk.Values)

@@ -39,8 +39,11 @@ func translateSpinguard(t *testing.T) (string, string, codegen.Result) {
 // plain (non-atomic) load, must stay untouched.
 func TestSpinGuardInjection(t *testing.T) {
 	_, all, _ := translateSpinguard(t)
-	if got := strings.Count(all, "spinRelax(&__spinGuard)"); got != 2 {
-		t.Errorf("spinRelax guard sites = %d, want 2 (bare_spin, bare_spin64)", got)
+	if got := strings.Count(all, "__spinGuard++"); got != 2 {
+		t.Errorf("spin guard sites = %d, want 2 (bare_spin, bare_spin64)", got)
+	}
+	if got := strings.Count(all, "if __spinGuard&16383 == 0 {"); got != 2 {
+		t.Errorf("spin guard cold branches = %d, want 2", got)
 	}
 	if got := strings.Count(all, "var __spinGuard uint32"); got != 2 {
 		t.Errorf("__spinGuard declarations = %d, want 2", got)
