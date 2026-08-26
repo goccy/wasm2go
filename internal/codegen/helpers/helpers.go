@@ -1561,6 +1561,46 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 	}
 }
 
+// spinRelax is the cold half of the preemption guard the emitters
+// plant in bare atomic spin loops (a loop that waits on an inline
+// atomic load and makes no other call — see spinguard.go). Such a loop
+// is fine as Go, but once the gcasm bundler captures the compiled
+// function into a .s TEXT the runtime can no longer async-preempt it,
+// and a goroutine spinning there blocks every stop-the-world — a
+// livelock when the store it waits for comes from a goroutine the GC
+// already parked.
+//
+// The generated hot path is a counter increment and a not-taken
+// branch; every 2^k-th iteration reaches this call, with k derived at
+// emission from the loop body's size so the interval is a roughly
+// constant TIME budget (see spinGuardMask). The call itself
+// is the fix — it must survive to machine code (hence //go:noinline),
+// and its prologue's stack check is the preemption point, so a
+// stop-the-world waits at most tens-to-low-hundreds of microseconds
+// of spinning. The Gosched additionally donates the core when a
+// wait is genuinely long. Calling on every iteration instead measured
+// ~40% decode overhead at n_threads=8: eight workers reaching
+// runtime.Gosched at spin rate serialize on sched.lock, and the call
+// round-trip alone showed ~15%.
+//
+// The Gosched is rate-limited across every spinning worker (the
+// spinRelaxColdCalls counter lives in the runtime template — helper
+// extraction carries function decls only): the preemption point is the
+// spinRelax call itself (its prologue's stack check), but yielding on
+// every cold call still measured double-digit scheduler churn
+// (pthread_cond_signal — wakep — at 30% of the profile) on
+// barrier-heavy workloads, where waiting IS most of a worker's time.
+// One yield per 64 cold calls keeps donation proportional to
+// aggregate spin time — rare on an uncontended box, automatically
+// more frequent when oversubscription makes the spins long.
+//
+//go:noinline
+func spinRelax() {
+	if atomic.AddUint32(&spinRelaxColdCalls, 1)&63 == 0 {
+		runtime.Gosched()
+	}
+}
+
 // ----- wasm32 atomic helpers (named by the lowering) -----------------------
 
 //go:noinline

@@ -3651,6 +3651,19 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 		}
 		out = append(out, fn)
 	}
+	// spinRelax carries package-level state the function-only extraction
+	// above cannot see: emit its Gosched rate-limit counter alongside it.
+	// The name stays unexported even in multi-package mode — only the
+	// helper itself is called cross-package, the counter is base-internal.
+	if t.helpers["spinRelax"] {
+		out = append(out, &ast.GenDecl{
+			Tok: token.VAR,
+			Specs: []ast.Spec{&ast.ValueSpec{
+				Names: []*ast.Ident{newID("spinRelaxColdCalls")},
+				Type:  newID("uint32"),
+			}},
+		})
+	}
 	// The wasmExc type is not a FuncDecl, so pull it in explicitly whenever the
 	// module throws or catches. In multi-package mode the type lives in base and
 	// must be exported (WasmExc) so chunk packages can name it; single-package
