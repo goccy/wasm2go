@@ -32,6 +32,13 @@ type ssaEmitter struct {
 	// evaluation could run memory.grow. See emitFuncBody.
 	memBaseHoisted bool
 
+	// spinHeaders holds the loop headers (per function) that need a
+	// spinRelax preemption guard; spinGuardEmitted records that at
+	// least one guard statement was actually emitted, gating the
+	// __spinGuard counter declaration. See spinguard.go.
+	spinHeaders      map[ssa.BlockID]bool
+	spinGuardEmitted bool
+
 	// catchExcVar is the Go variable holding the *wasmExc currently being
 	// handled, set while the structured emitter renders an EH catch handler
 	// region so OpCatchArg can read its operand slots. Empty outside a
@@ -111,6 +118,8 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	em.simdCalls = nil
 	em.simdConsts = nil
 	em.curFn = f
+	em.spinHeaders = spinGuardHeaders(f)
+	em.spinGuardEmitted = false
 	// Hoist the linear-memory base pointer into a function-level local
 	// when the function touches memory at all. `m.M` is a Module FIELD,
 	// so the Go compiler must conservatively reload it after every
@@ -167,6 +176,17 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 		}
 		body.List = append([]ast.Stmt{decl, keep}, body.List...)
 	}
+	if em.spinGuardEmitted {
+		// The guard statements always increment the counter, so no
+		// blank-use is needed.
+		body.List = append([]ast.Stmt{&ast.DeclStmt{Decl: &ast.GenDecl{
+			Tok: token.VAR,
+			Specs: []ast.Spec{&ast.ValueSpec{
+				Names: []*ast.Ident{newID(spinGuardLocal)},
+				Type:  newID("uint32"),
+			}},
+		}}}, body.List...)
+	}
 	// In mutable-locals mode (try functions), declared (non-param) locals are
 	// mutable Go vars `lN`, zero-initialised to match wasm's zeroed locals.
 	// Params already exist as function arguments `l0..`.
@@ -208,6 +228,23 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	}
 	em.scalarizeSimd(body, paramsV128)
 	return body, nil
+}
+
+// spinGuardLocal is the per-function iteration counter the spinRelax
+// guard advances. Like mBase, the name cannot collide with generated
+// value names (v<N>), parameters (l<N>), or phi temps.
+const spinGuardLocal = "__spinGuard"
+
+// spinGuardStmt renders one `spinRelax(&__spinGuard)` call — the
+// per-iteration preemption guard for a bare atomic spin loop (see
+// spinguard.go).
+func (em *ssaEmitter) spinGuardStmt() ast.Stmt {
+	em.spinGuardEmitted = true
+	em.useHelper("spinRelax")
+	return &ast.ExprStmt{X: &ast.CallExpr{
+		Fun:  em.helperRef("spinRelax"),
+		Args: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: newID(spinGuardLocal)}},
+	}}
 }
 
 // memBaseLocal is the name of the per-function hoisted copy of m.M.
@@ -489,6 +526,9 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 		if v := ec.tramp.entrySet[blk.ID]; v != "" {
 			*out = append(*out, assignBool(v, true))
 		}
+	}
+	if em.spinHeaders[blk.ID] {
+		*out = append(*out, em.spinGuardStmt())
 	}
 
 	valuesEnd := len(blk.Values)

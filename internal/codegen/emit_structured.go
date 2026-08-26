@@ -564,6 +564,9 @@ func (se *structEmitter) phiCopies(pred, succ *ssa.Block, predIdx int) ([]ast.St
 // on edges) and the Ret-tail return markers.
 func (se *structEmitter) blockValues(blk *ssa.Block) ([]ast.Stmt, error) {
 	var out []ast.Stmt
+	if se.em.spinHeaders[blk.ID] {
+		out = append(out, se.em.spinGuardStmt())
+	}
 	valuesEnd := len(blk.Values)
 	if blk.Kind == ssa.BlockRet {
 		valuesEnd -= len(se.f.Sig.Results)
