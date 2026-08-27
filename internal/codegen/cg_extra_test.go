@@ -161,7 +161,7 @@ func TestBulkMemoryRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res)))
 	gotLines := strings.Split(out, "\n")
 	if len(gotLines) != len(want) {
 		t.Fatalf("got %d lines want %d\n%s", len(gotLines), len(want), out)
@@ -228,7 +228,7 @@ func TestDispatchIfRuntime(t *testing.T) {
 	// br_table through a BlockSwitch SSA op or extend matchDispatcher
 	// to recognise the if-chain shape, at which point this assertion
 	// can be restored.
-	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
+	out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res)))
 	gotLines := strings.Fields(out)
 	if len(gotLines) != len(want) {
 		t.Fatalf("got %d lines want %d\n%s", len(gotLines), len(want), out)

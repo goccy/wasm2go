@@ -408,7 +408,7 @@ func TestDispatchSplitRuntime(t *testing.T) {
 			}
 			mainSB.WriteString("}\n")
 
-			out := runGoSnippet(t, src, mainSB.String(), res.Sidecars, res.Files)
+			out := runGoSnippet(t, src, mainSB.String(), res.Sidecars, filesWithAux(res))
 			gotLines := strings.Fields(strings.TrimSpace(out))
 			if len(gotLines) != len(want) {
 				t.Fatalf("dispatch-split: got %d result lines, want %d\n%s", len(gotLines), len(want), out)
@@ -510,7 +510,7 @@ func TestNumericsRuntime(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate (UseSSA=%v): %v", useSSA, err)
 		}
-		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, res.Files))
+		out := strings.TrimSpace(runGoSnippet(t, buf.String(), mainSB.String(), res.Sidecars, filesWithAux(res)))
 		gotLines := strings.Split(out, "\n")
 		if len(gotLines) != len(want) {
 			t.Fatalf("UseSSA=%v: got %d lines want %d\n%s", useSSA, len(gotLines), len(want), out)

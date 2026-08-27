@@ -70,7 +70,7 @@ func TestDirectAsmLeaf(t *testing.T) {
 	if buf.Len() > 0 {
 		w("pkg/gen.go", buf.Bytes())
 	}
-	for _, set := range []map[string][]byte{res.Files, res.Sidecars} {
+	for _, set := range []map[string][]byte{res.Files, res.Sidecars, res.AuxFiles} {
 		for name, data := range set {
 			if len(data) == 0 {
 				continue
@@ -169,7 +169,7 @@ func TestDirectAsmSimd(t *testing.T) {
 	if buf.Len() > 0 {
 		w("pkg/gen.go", buf.Bytes())
 	}
-	for _, set := range []map[string][]byte{res.Files, res.Sidecars} {
+	for _, set := range []map[string][]byte{res.Files, res.Sidecars, res.AuxFiles} {
 		for name, data := range set {
 			if len(data) == 0 {
 				continue
@@ -271,7 +271,7 @@ func TestDirectAsmSimdLoop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate %s: %v", importPath, err)
 		}
-		return buf.String(), mergeFiles(res.Files, res.Sidecars)
+		return buf.String(), mergeFiles(res.Files, res.Sidecars, res.AuxFiles)
 	}
 	_ = m
 	refSrc, refFiles := translate("dasl/ref", nil)
@@ -387,7 +387,7 @@ func TestDirectAsmExc(t *testing.T) {
 		if err != nil {
 			t.Fatalf("translate %s: %v", importPath, err)
 		}
-		return buf.String(), mergeFiles(res.Files, res.Sidecars)
+		return buf.String(), mergeFiles(res.Files, res.Sidecars, res.AuxFiles)
 	}
 	var direct []string
 	for i := 0; i < 7; i++ {

@@ -43,7 +43,7 @@ func TestGcasmMutexHandoff(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, set := range []map[string][]byte{res.Files, res.Sidecars} {
+	for _, set := range []map[string][]byte{res.Files, res.Sidecars, res.AuxFiles} {
 		for name, data := range set {
 			p := filepath.Join(pkgDir, name)
 			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {

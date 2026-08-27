@@ -41,6 +41,7 @@ package {{.Pkg}}
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 )
 
@@ -99,7 +100,96 @@ func NewSharedSnapshot(build ImageBuilder) *SharedImage {
 var (
 	sharedOnce sync.Once
 	sharedImg  *SharedImage
+
+	sharedInPlaceOnce sync.Once
+	sharedInPlaceImg  *SharedImage
 )
+
+// InPlaceImageBuilder brings up one throwaway instance ON the caller-provided
+// memory — a MAP_SHARED mapping of the image file being built. Construct the
+// module with the generated NewWithMemory (passing InitialMemoryBytes for a
+// fresh, all-zero mapping) and initialize it exactly as the corresponding
+// ImageBuilder would.
+type InPlaceImageBuilder func(mem []byte) (m *{{.Module}}, err error)
+
+// NewSharedImageInPlace is NewSharedImage with the copy elided: the builder
+// runs directly on a shared mapping of the image file, so every page it
+// touches is written once, straight into the file's page cache — there is no
+// intermediate buffer, no copy, and the dirty footprint of building the image
+// is exactly the pages the build touches. Cached once per process, like
+// NewSharedImage.
+func NewSharedImageInPlace(ceiling int, build InPlaceImageBuilder) *SharedImage {
+	sharedInPlaceOnce.Do(func() { sharedInPlaceImg = buildSharedImageInPlace(ceiling, build, false) })
+	return sharedInPlaceImg
+}
+
+// NewSharedSnapshotInPlace is NewSharedSnapshot with the copy elided — see
+// NewSharedImageInPlace for the mechanics and NewSharedSnapshot for the
+// snapshot contract (build it clean and take it at rest; not cached).
+func NewSharedSnapshotInPlace(ceiling int, build InPlaceImageBuilder) *SharedImage {
+	return buildSharedImageInPlace(ceiling, build, true)
+}
+
+func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bool) *SharedImage {
+	if !mmapSupported {
+		return &SharedImage{err: fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")}
+	}
+	f, err := os.CreateTemp("", "wasm2go-image-*")
+	if err != nil {
+		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
+	}
+	// Unlink now: the image must never be reachable by name. The pages live
+	// as long as we hold the descriptor.
+	_ = os.Remove(f.Name())
+	if err := f.Truncate(int64(ceiling)); err != nil {
+		f.Close()
+		return &SharedImage{err: fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)}
+	}
+	mem, err := mmapShared(f, ceiling)
+	if err != nil {
+		f.Close()
+		return &SharedImage{err: err}
+	}
+	fail := func(err error) *SharedImage {
+		unmapMemory(mem)
+		f.Close()
+		return &SharedImage{err: err}
+	}
+	m, err := build(mem)
+	if err != nil {
+		return fail(fmt.Errorf("wasm2go: building the shared memory image: %w", err))
+	}
+	size := m.{{.MemSize}}.Load()
+	dataEnd := m.{{.DataEnd}}
+	if dataEnd == 0 || uint64(dataEnd) > size {
+		return fail(fmt.Errorf(
+			"wasm2go: shared memory image: no data segments were installed (dataEnd=%d, size=%d)",
+			dataEnd, size))
+	}
+	var globals []uint64
+	if snapshot {
+		globals = {{.SaveGlobals}}(m)
+	}
+	if !snapshot {
+		// The data-segment kind must carry NOTHING above the segments (see
+		// NewSharedImage). The builder's BSS is already in the file, so punch
+		// it back out: truncating to dataEnd drops those pages, re-extending
+		// restores the sparse zero tail instances expect. The builder ran
+		// only the start section and spawned no agents, so nothing touches
+		// the mapping above dataEnd after this.
+		if err := f.Truncate(int64(dataEnd)); err != nil {
+			return fail(fmt.Errorf("wasm2go: trimming the shared memory image: %w", err))
+		}
+		if err := f.Truncate(int64(ceiling)); err != nil {
+			return fail(fmt.Errorf("wasm2go: re-extending the shared memory image: %w", err))
+		}
+	}
+	// The builder's mapping is not GC-managed. A finalizer ties the unmap
+	// to the module's reachability: a builder that parked agent goroutines
+	// (they reference the module) keeps its mapping until they go.
+	runtime.SetFinalizer(m, func(fm *{{.Module}}) { unmapMemory(mem) })
+	return &SharedImage{f: f, size: size, dataEnd: dataEnd, globals: globals}
+}
 
 func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	if !mmapSupported {

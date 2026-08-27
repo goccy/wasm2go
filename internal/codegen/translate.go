@@ -1923,10 +1923,27 @@ const (
 func (t *translator) emitNewFuncs() []ast.Decl {
 	decls := t.emitNewFuncsMode(newAlloc)
 	if len(t.mod.Memories) > 0 {
+		decls = append(decls, t.initialMemoryBytesConst())
 		decls = append(decls, t.emitNewFuncsMode(newFromMemory)...)
 		decls = append(decls, t.emitNewFuncsMode(newFromSnapshot)...)
 	}
 	return decls
+}
+
+// initialMemoryBytesConst emits the module's declared initial linear-memory
+// size as an exported constant. It is what NewWithMemory's memSize parameter
+// must be when the caller-provided memory is FRESH (all zeros, e.g. a
+// MAP_SHARED mapping handed to an in-place image builder): the constructor
+// then installs the data segments and runs initialization exactly as the
+// allocating constructor would.
+func (t *translator) initialMemoryBytesConst() ast.Decl {
+	return &ast.GenDecl{
+		Tok: token.CONST,
+		Specs: []ast.Spec{&ast.ValueSpec{
+			Names:  []*ast.Ident{newID("InitialMemoryBytes")},
+			Values: []ast.Expr{uintLit(t.mod.Memories[0].Limits.Min * 65536)},
+		}},
+	}
 }
 
 // memLenExpr is uint64(len(memory)): with a caller-supplied memory the
@@ -2127,16 +2144,18 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				capArg = ceiling
 			}
 		}
-		memRhs := ast.Expr(&ast.CallExpr{
-			Fun: newID("make"),
-			Args: []ast.Expr{
-				&ast.ArrayType{Elt: newID("byte")},
-				lenArg,
-				capArg,
-			},
-		})
+		var memRhs ast.Expr
 		if memFromArg {
 			memRhs = newID("memory")
+		} else {
+			memRhs = &ast.CallExpr{
+				Fun: newID("make"),
+				Args: []ast.Expr{
+					&ast.ArrayType{Elt: newID("byte")},
+					lenArg,
+					capArg,
+				},
+			}
 		}
 		body.List = append(body.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
