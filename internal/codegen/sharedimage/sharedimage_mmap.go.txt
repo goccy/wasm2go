@@ -5,7 +5,6 @@ package {{.Pkg}}
 import (
 	"fmt"
 	"os"
-	"runtime"
 	"syscall"
 )
 
@@ -57,35 +56,3 @@ func unmapMemory(mem []byte) {
 	_ = syscall.Munmap(mem)
 }
 
-// AllocSharedMemory returns the backing array for a SHARED linear
-// memory: n bytes of anonymous, private, zero-fill-on-demand pages
-// outside the Go heap. A shared memory is allocated at its ceiling
-// once (agents deref the base pointer concurrently, so the array can
-// never move), and the Go heap is the wrong place for an allocation
-// that size: a freed heap span that gets reused is zeroed by the
-// allocator, so the SECOND instance a process builds — e.g. the
-// snapshot builders behind the copy-on-write images above — memclrs
-// the whole ceiling and turns address space that should stay
-// untouched into gigabytes of dirty resident pages. Fresh anonymous
-// mappings come back zero from the OS on every call: untouched pages
-// never page in, no matter how many instances were built and
-// discarded before.
-//
-// The mapping is not GC-managed; a finalizer on the module unmaps it
-// when the module becomes unreachable, preserving the heap
-// allocation's reclaim semantics. A module kept reachable — by a
-// parked agent goroutine, for instance — keeps its memory, exactly
-// as with a heap slice. On mmap failure (address-space limits) the
-// heap allocation this replaces is the fallback.
-func AllocSharedMemory(m *{{.Module}}, n int) []byte {
-	mem, err := syscall.Mmap(-1, 0, n,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANON)
-	if err != nil {
-		return make([]byte, n)
-	}
-	runtime.SetFinalizer(m, func(fm *{{.Module}}) {
-		_ = syscall.Munmap(mem)
-	})
-	return mem
-}

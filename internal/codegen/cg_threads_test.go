@@ -166,10 +166,9 @@ func runGoSnippetRaceDetector(t *testing.T, generated, mainSrc string, sidecars 
 }
 
 // filesWithAux merges Result.Files with Result.AuxFiles for the snippet
-// runners: the aux files are part of the output contract (the shared-memory
-// runtime lives there, and generated constructors for SHARED memories call
-// its AllocSharedMemory), so compiling generated output without them is not
-// a configuration any embedder ships.
+// runners: the aux files are part of the output contract — the shared-memory
+// runtime (the image builders and their in-place variants) lives there, and
+// snippets that exercise it must compile the full output.
 func filesWithAux(res codegen.Result) map[string][]byte {
 	merged := map[string][]byte{}
 	for name, data := range res.Files {

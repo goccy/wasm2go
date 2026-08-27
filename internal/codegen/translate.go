@@ -2116,9 +2116,6 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			lenArg = nil
 			capArg = nil
 		} else if mem.Limits.Shared {
-			// Only lenArg matters here: a shared memory goes through
-			// AllocSharedMemory below, which takes the ceiling length and no
-			// separate capacity.
 			ceiling := ast.Expr(uintLit(defaultReserveCap))
 			if mem.Limits.HasMax {
 				ceiling = uintLit(mem.Limits.Max * 65536)
@@ -2141,28 +2138,16 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 					}}},
 				})
 				lenArg = newID("__memcap")
+				capArg = newID("__memcap")
 			} else {
 				lenArg = ceiling
+				capArg = ceiling
 			}
 		}
 		var memRhs ast.Expr
-		switch {
-		case memFromArg:
+		if memFromArg {
 			memRhs = newID("memory")
-		case mem.Limits.Shared:
-			// A shared memory is allocated at its full ceiling LENGTH, and
-			// that must not live on the Go heap: a freed span this large is
-			// zeroed when the allocator reuses it, so the second instance a
-			// process builds dirties the whole ceiling (gigabytes of
-			// resident pages for untouched memory). AllocSharedMemory hands
-			// out fresh anonymous mappings instead — see the sharedimage
-			// runtime.
-			fn := ast.Expr(newID("AllocSharedMemory"))
-			if t.multiPackage && t.currentChunk != chunkBase {
-				fn = &ast.SelectorExpr{X: newID("base"), Sel: newID("AllocSharedMemory")}
-			}
-			memRhs = &ast.CallExpr{Fun: fn, Args: []ast.Expr{newID("m"), lenArg}}
-		default:
+		} else {
 			memRhs = &ast.CallExpr{
 				Fun: newID("make"),
 				Args: []ast.Expr{

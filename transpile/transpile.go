@@ -97,12 +97,6 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	for name, data := range res.Files {
 		treeIn[name] = data
 	}
-	// Aux files are part of the output the capture must faithfully
-	// compile: the shared-memory runtime lives there, and a SHARED
-	// memory's generated constructor calls its AllocSharedMemory.
-	for name, data := range res.AuxFiles {
-		treeIn[name] = data
-	}
 	synthSigs := map[string]gcasm.SynthSig{}
 	for name, sig := range res.OutlinedSigs {
 		synthSigs[name] = gcasm.SynthSig{Params: sig.Params, Result: sig.Result, Packed: sig.Packed}

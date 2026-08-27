@@ -184,9 +184,9 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 			return fail(fmt.Errorf("wasm2go: re-extending the shared memory image: %w", err))
 		}
 	}
-	// The builder's mapping is not GC-managed. A finalizer keeps the unmap
-	// tied to the module's reachability: a builder that parked agent
-	// goroutines (they reference the module) keeps its mapping until they go.
+	// The builder's mapping is not GC-managed. A finalizer ties the unmap
+	// to the module's reachability: a builder that parked agent goroutines
+	// (they reference the module) keeps its mapping until they go.
 	runtime.SetFinalizer(m, func(fm *{{.Module}}) { unmapMemory(mem) })
 	return &SharedImage{f: f, size: size, dataEnd: dataEnd, globals: globals}
 }
