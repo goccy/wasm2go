@@ -37,6 +37,19 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 	return mem, nil
 }
 
+// mmapShared maps the image file MAP_SHARED, for an in-place builder:
+// every page the builder writes lands directly in the file's page cache
+// and IS the image — no intermediate buffer, no copy, no write-out. The
+// caller has already sized the file (sparse) to length.
+func mmapShared(f *os.File, length int) ([]byte, error) {
+	mem, err := syscall.Mmap(int(f.Fd()), 0, length,
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		return nil, fmt.Errorf("wasm2go: mapping the image for in-place build: %w", err)
+	}
+	return mem, nil
+}
+
 func unmapMemory(mem []byte) {
 	if len(mem) == 0 {
 		return

@@ -18,6 +18,10 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 
 func unmapMemory(mem []byte) {}
 
+func mmapShared(f *os.File, length int) ([]byte, error) {
+	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+}
+
 // AllocSharedMemory falls back to the heap where mmap is unavailable —
 // the historical behaviour; see the unix variant for what the mapping
 // buys.
