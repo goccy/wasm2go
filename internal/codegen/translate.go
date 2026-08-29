@@ -3306,13 +3306,29 @@ func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 			Rhs: []ast.Expr{newID(s.saved)},
 		})
 	}
-	ifBody.List = append(ifBody.List, &ast.AssignStmt{
-		Tok: token.ASSIGN,
-		Lhs: []ast.Expr{newID("err")},
-		Rhs: []ast.Expr{&ast.CallExpr{
-			Fun:  &ast.SelectorExpr{X: newID("fmt"), Sel: newID("Errorf")},
-			Args: []ast.Expr{stringLit("wasm trap: %v"), newID("r")},
-		}},
+	// Preserve the recovered value's error chain: a *WasiExitError from
+	// proc_exit (or any other error-typed panic) is wrapped with %w so the
+	// caller's errors.As/Is still reach it through the "wasm trap:" prefix;
+	// non-error panic values keep the plain %v formatting.
+	trapErrf := func(verb string, arg ast.Expr) *ast.AssignStmt {
+		return &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID("err")},
+			Rhs: []ast.Expr{&ast.CallExpr{
+				Fun:  &ast.SelectorExpr{X: newID("fmt"), Sel: newID("Errorf")},
+				Args: []ast.Expr{stringLit("wasm trap: " + verb), arg},
+			}},
+		}
+	}
+	ifBody.List = append(ifBody.List, &ast.IfStmt{
+		Init: &ast.AssignStmt{
+			Tok: token.DEFINE,
+			Lhs: []ast.Expr{newID("trapErr"), newID("trapIsErr")},
+			Rhs: []ast.Expr{&ast.TypeAssertExpr{X: newID("r"), Type: newID("error")}},
+		},
+		Cond: newID("trapIsErr"),
+		Body: &ast.BlockStmt{List: []ast.Stmt{trapErrf("%w", newID("trapErr"))}},
+		Else: &ast.BlockStmt{List: []ast.Stmt{trapErrf("%v", newID("r"))}},
 	})
 	recoverBody.List = append(recoverBody.List, &ast.IfStmt{
 		Cond: &ast.BinaryExpr{X: newID("r"), Op: token.NEQ, Y: newID("nil")},
