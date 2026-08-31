@@ -45,7 +45,7 @@ func TestWasi_ProcSpawnWait(t *testing.T) {
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "hello-proc"})
 	const pidOff, statusOff int32 = 4000, 4004
 
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, pidOff); rc != _wasiESUCCESS {
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
 		t.Fatalf("Proc_spawn rc=%d", rc)
 	}
 	pid := int32(binary.LittleEndian.Uint32(m.memory[pidOff:]))
@@ -75,7 +75,7 @@ func TestWasi_ProcSpawnExitCode(t *testing.T) {
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "exit 7"})
 	const pidOff, statusOff int32 = 4000, 4004
 
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, pidOff); rc != _wasiESUCCESS {
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
 		t.Fatalf("Proc_spawn rc=%d", rc)
 	}
 	pid := int32(binary.LittleEndian.Uint32(m.memory[pidOff:]))
@@ -96,7 +96,7 @@ func TestWasi_ProcSpawnExecHookDenies(t *testing.T) {
 
 	pathOff := writeCStr(m, 1000, "/bin/echo")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "x"})
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 4000); rc != -_wasiEACCES {
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiEACCES {
 		t.Fatalf("denied spawn rc=%d, want -EACCES", rc)
 	}
 	if seen != "/bin/echo" {
@@ -109,7 +109,7 @@ func TestWasi_ProcSpawnNotFound(t *testing.T) {
 	w.stdout, w.stderr, w.stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	pathOff := writeCStr(m, 1000, "/no/such/binary-xyz")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/no/such/binary-xyz"})
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 4000); rc != -_wasiENOENT {
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiENOENT {
 		t.Fatalf("missing binary rc=%d, want -ENOENT", rc)
 	}
 }
@@ -130,7 +130,7 @@ func TestWasi_ProcWaitWNOHANG(t *testing.T) {
 	pathOff := writeCStr(m, 1000, "/bin/sh")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "sleep 0.3; exit 3"})
 	const pidOff, statusOff int32 = 4000, 4004
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, pidOff); rc != _wasiESUCCESS {
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
 		t.Fatalf("spawn rc=%d", rc)
 	}
 	pid := int32(binary.LittleEndian.Uint32(m.memory[pidOff:]))
@@ -176,7 +176,7 @@ func TestWasi_PipeCapture(t *testing.T) {
 	pathOff := writeCStr(m, 1000, "/bin/echo")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "captured-output"})
 	const pidOff, statusOff int32 = 4000, 4004
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, writeFd, -1, pidOff); rc != _wasiESUCCESS {
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, writeFd, -1, 0, pidOff); rc != _wasiESUCCESS {
 		t.Fatalf("Proc_spawn rc=%d", rc)
 	}
 	pid := int32(binary.LittleEndian.Uint32(m.memory[pidOff:]))
