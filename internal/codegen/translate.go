@@ -2950,6 +2950,9 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		if pass.Simplify(ssaFn) {
 			changed = true
 		}
+		if pass.FoldCondMaskPhi(ssaFn) {
+			changed = true
+		}
 		if pass.CSE(ssaFn) {
 			changed = true
 		}
