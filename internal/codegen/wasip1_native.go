@@ -2012,7 +2012,9 @@ func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
 	w.mu.Lock()
 	fsys := w.fsys
 	w.mu.Unlock()
-	ch, ok := fsys.(interface{ Chmod(string, os.FileMode) error })
+	ch, ok := fsys.(interface {
+		Chmod(string, os.FileMode) error
+	})
 	if !ok {
 		return -_wasiENOSYS
 	}
