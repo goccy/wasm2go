@@ -163,6 +163,7 @@ func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	return f, nil
 }
 func (o osFS) Mkdir(name string, perm os.FileMode) error { return os.Mkdir(o.join(name), perm) }
+func (o osFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(o.join(name), mode) }
 func (o osFS) Remove(name string) error                  { return os.Remove(o.join(name)) }
 func (o osFS) Rename(a, b string) error                  { return os.Rename(o.join(a), o.join(b)) }
 func (o osFS) Stat(name string) (os.FileInfo, error)     { return os.Stat(o.join(name)) }
@@ -576,6 +577,13 @@ type wasiOpen struct {
 	path     string // guest path relative to the preopen root
 	fdflags  int32  // last fdflags set via Path_open or Fd_fdstat_set_flags
 	dirCache []os.DirEntry
+	// stdio marks an alias of an interpreter stream (1/2/3 = the
+	// configured stdin/stdout/stderr; 0 = not an alias). Fd_dup of a bare
+	// fd 0/1/2 creates one; closing it never touches the real stream.
+	stdio int8
+	// refs counts EXTRA table slots sharing this entry (dup/dup2):
+	// closeWasiOpen only closes the descriptor when it reaches zero.
+	refs int32
 }
 
 // WasiStubs is the default Go-native implementation of wasi_snapshot_preview1.
@@ -821,7 +829,7 @@ func (w *WasiStubs) readCStrArray(m *Module, ptr int32) (out []string, ok bool) 
 // Only stdio inheritance is supported today (no fd remapping / pipes), which
 // covers subprocess.run/call with default streams; capture_output via host
 // pipes is a follow-up.
-func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, pidOutPtr int32) int32 {
+func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	path, ok := w.readCStr(m, pathPtr)
 	if !ok || path == "" {
 		return -_wasiEINVAL
@@ -831,6 +839,13 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		return -_wasiEFAULT
 	}
 	env, ok := w.readCStrArray(m, envpPtr)
+	if !ok {
+		return -_wasiEFAULT
+	}
+	// The guest's working directory lives in its libc (WASI has no chdir
+	// syscall), so the bridge passes it explicitly; the child must start
+	// there, not in the host process's cwd.
+	cwd, ok := w.readCStr(m, cwdPtr)
 	if !ok {
 		return -_wasiEFAULT
 	}
@@ -854,6 +869,9 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		cmd.Args = argv
 	} else {
 		cmd.Args = []string{path}
+	}
+	if cwd != "" {
+		cmd.Dir = cwd
 	}
 	// Sandbox: the child sees ONLY the guest-provided environment; a nil
 	// (NULL envp) must NOT fall through to the host process environment.
@@ -900,26 +918,26 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	return _wasiESUCCESS
 }
 
-// childReaderLocked resolves a child stdin source fd. fd < 3 (including -1)
-// inherits the interpreter's stdin; otherwise it is a guest fd (a pipe read
-// end) whose backing file is used directly. Caller holds w.mu.
+// childReaderLocked resolves a child stdin source fd. A guest fd whose
+// table entry carries a real file (a pipe end, or a guest stdio fd the
+// program re-opened onto a file) is used directly; everything else —
+// including -1 and an unredirected fd 0 — inherits the interpreter's
+// stdin. Caller holds w.mu.
 func (w *WasiStubs) childReaderLocked(fd int32) io.Reader {
-	if fd < 3 {
-		return w.stdin
-	}
-	if op := w.fdTable[fd]; op != nil && op.f != nil {
-		return op.f
+	if fd >= 0 {
+		if op := w.fdTable[fd]; op != nil && op.f != nil {
+			return op.f
+		}
 	}
 	return w.stdin
 }
 
 // childWriterLocked is the stdout/stderr counterpart of childReaderLocked.
 func (w *WasiStubs) childWriterLocked(fd int32, deflt io.Writer) io.Writer {
-	if fd < 3 {
-		return deflt
-	}
-	if op := w.fdTable[fd]; op != nil && op.f != nil {
-		return op.f
+	if fd >= 0 {
+		if op := w.fdTable[fd]; op != nil && op.f != nil {
+			return op.f
+		}
 	}
 	return deflt
 }
@@ -1195,6 +1213,7 @@ const (
 	_wasiENOTDIR      int32 = 54
 	_wasiENOTSOCK     int32 = 57
 	_wasiENOTSUP      int32 = 58
+	_wasiENOSYS       int32 = 52
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
 )
@@ -1393,6 +1412,11 @@ func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 // joins any Close errors so callers can map them to a wasi errno
 // instead of silently dropping the failure.
 func closeWasiOpen(op *wasiOpen) error {
+	if op.refs > 0 {
+		// another table slot still references this descriptor (dup/dup2)
+		op.refs--
+		return nil
+	}
 	var err error
 	if op.f != nil {
 		err = errors.Join(err, op.f.Close())
@@ -1728,13 +1752,18 @@ func writeVec(dst io.Writer, bufs [][]byte) uint64 {
 // fdSrcLocked returns the io.Reader for fd and (when applicable) the
 // wasiOpen it came from, or nil if fd is invalid. Caller must hold w.mu.
 func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
-	switch fd {
-	case 0:
-		return w.stdin, nil
-	}
+	// Table entries win over the stdio defaults: a program that dup2'd
+	// another descriptor onto fd 0 reads from THAT, like after a real
+	// dup2. A bare fd 0 (no entry) is the interpreter's stdin.
 	op := w.fdTable[fd]
 	if op == nil {
+		if fd == 0 {
+			return w.stdin, nil
+		}
 		return nil, nil
+	}
+	if op.stdio == 1 {
+		return w.stdin, op
 	}
 	if op.f != nil {
 		return op.f, op
@@ -1748,15 +1777,21 @@ func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
 // fdDstLocked returns the io.Writer for fd or nil if fd is invalid.
 // Caller must hold w.mu.
 func (w *WasiStubs) fdDstLocked(fd int32) (io.Writer, *wasiOpen) {
-	switch fd {
-	case 1:
-		return w.stdout, nil
-	case 2:
-		return w.stderr, nil
-	}
 	op := w.fdTable[fd]
 	if op == nil {
+		switch fd {
+		case 1:
+			return w.stdout, nil
+		case 2:
+			return w.stderr, nil
+		}
 		return nil, nil
+	}
+	switch op.stdio {
+	case 2:
+		return w.stdout, op
+	case 3:
+		return w.stderr, op
 	}
 	if op.f != nil {
 		return op.f, op
@@ -1960,6 +1995,137 @@ func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32
 	// to offset+length so the file is at least the requested size.
 	if err := op.f.Truncate(offset + length); err != nil {
 		return mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Path_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "path_chmod") backing a bridge-provided chmod(): WASI preview1 has
+// no way to change file modes. The path at (pathPtr,pathLen) is
+// preopen-relative, like path_open's. Backends without chmod support
+// (MemFS keeps no modes) report ENOSYS. Returns 0 or a negative errno.
+func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	ch, ok := fsys.(interface {
+		Chmod(string, os.FileMode) error
+	})
+	if !ok {
+		return -_wasiENOSYS
+	}
+	if err := ch.Chmod(string(pathSlice), os.FileMode(uint32(mode)&0o7777)); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Path_filestat_mode is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "path_filestat_mode") backing a
+// bridge-provided stat/lstat: WASI's filestat carries no permission
+// bits, so the bridge merges the real mode in from here. The path is
+// preopen-relative; follow selects stat vs lstat semantics. Writes the
+// unix permission bits at modeOutPtr; returns 0 or a negative errno.
+func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, modeOutPtr int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	out := w.memSlice(m, modeOutPtr, 4)
+	if pathSlice == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	var fi os.FileInfo
+	var err error
+	if follow != 0 {
+		fi, err = fsys.Stat(string(pathSlice))
+	} else {
+		fi, err = fsys.Lstat(string(pathSlice))
+	}
+	if err != nil {
+		return -mapOSError(err)
+	}
+	mode := fi.Mode()
+	bits := uint32(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		bits |= 0o4000
+	}
+	if mode&os.ModeSetgid != 0 {
+		bits |= 0o2000
+	}
+	if mode&os.ModeSticky != 0 {
+		bits |= 0o1000
+	}
+	binary.LittleEndian.PutUint32(out, bits)
+	return _wasiESUCCESS
+}
+
+// dupSourceLocked resolves the entry a dup of fd should share: the
+// existing table entry, or a fresh alias for a bare interpreter stdio fd.
+// Caller holds w.mu.
+func (w *WasiStubs) dupSourceLocked(fd int32) *wasiOpen {
+	if op := w.fdTable[fd]; op != nil {
+		return op
+	}
+	if fd >= 0 && fd <= 2 {
+		op := &wasiOpen{stdio: int8(fd + 1)}
+		w.fdTable[fd] = op
+		return op
+	}
+	return nil
+}
+
+// Fd_dup is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_dup") backing the bridge's dup(): the new fd shares the same
+// open descriptor (offset included), and the underlying file closes only
+// when the last sharing fd does. Writes the new fd at outPtr.
+func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 4)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	op := w.dupSourceLocked(fd)
+	if op == nil {
+		return _wasiEBADF
+	}
+	nfd := w.nextFD
+	w.nextFD++
+	w.fdTable[nfd] = op
+	op.refs++
+	binary.LittleEndian.PutUint32(out, uint32(nfd))
+	return _wasiESUCCESS
+}
+
+// Fd_dup2 is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_dup2") backing the bridge's dup2(): to becomes another
+// reference to from's descriptor, closing whatever to previously held.
+func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	src := w.dupSourceLocked(from)
+	if src == nil {
+		return _wasiEBADF
+	}
+	if from == to {
+		return _wasiESUCCESS
+	}
+	var closeErr error
+	if dst := w.fdTable[to]; dst != nil {
+		if dst == src {
+			return _wasiESUCCESS
+		}
+		closeErr = closeWasiOpen(dst)
+	}
+	w.fdTable[to] = src
+	src.refs++
+	if closeErr != nil {
+		return mapOSError(closeErr)
 	}
 	return _wasiESUCCESS
 }
@@ -2581,15 +2747,22 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 	}
 
-	// Sleep for the shortest clock subscription. fd events are polled
-	// best-effort with that as the deadline (or no wait if there is no
-	// clock).
-	if minClockNs > 0 {
+	// fd subscriptions report their (optimistic) readiness immediately, so
+	// when any are present the clock subscription must NOT be slept first —
+	// that would turn every select/poll carrying a timeout into a wait for
+	// the full timeout. The clock paces the call only when it is the sole
+	// kind of subscription, and its "timeout fired" event is suppressed
+	// while ready fds are being reported (a real poll returns ready fds
+	// without also claiming the timeout expired).
+	if minClockNs > 0 && len(fdEvents) == 0 {
 		time.Sleep(time.Duration(minClockNs))
 	}
 
 	written := int32(0)
 	for _, ev := range clockEvents {
+		if ev.etype == 0 && len(fdEvents) > 0 {
+			continue
+		}
 		writeEvent(events[written:written+32], ev.userdata, ev.etype, 0, 0)
 		written += 32
 	}
