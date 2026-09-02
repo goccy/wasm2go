@@ -381,6 +381,22 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				}
 				return pool.addBlob(blob)
 			}
+			if !portable {
+				// Feature body: hardware conversion, the x64 mirror of
+				// the arm64 xtn+fcvtl pair. Mask each lane to its low
+				// 16 bits (the conversion reads nothing else), pack the
+				// four u32 lanes into four contiguous u16s (exact — the
+				// masked values fit unsaturated), and convert with
+				// VCVTPH2PS (F16C, which the HasAVX2 gate requires).
+				// All VEX-128, so no ymm upper state is dirtied. The
+				// marker routes non-AVX2 hosts to the portable twin.
+				fmt.Fprintf(b, "\tVPAND ·%s(SB), X%d, X1\n", c4(0xFFFF), src)
+				b.WriteString("\tVPACKUSDW X1, X1, X1\n")
+				fmt.Fprintf(b, "\tVCVTPH2PS X1, X%d\n", dst)
+				b.WriteString("\t// avx2 dot\n")
+				loc[i] = fusedLoc{chained: willChain, pool: dst}
+				continue
+			}
 			fmt.Fprintf(b, "\tMOVOU X%d, X3\n", src)
 			b.WriteString("\tPSLLL $16, X3\n")
 			fmt.Fprintf(b, "\tPAND \u00b7%s(SB), X3\n", c4(0x80000000))
@@ -468,6 +484,73 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				// dependency that serializes the loop (measured 30x on
 				// Granite Rapids). A fully VEX region defers this to
 				// one clear at the exit instead.
+				b.WriteString("\tVZEROUPPER\n")
+			}
+			b.WriteString("\t// avx2 dot\n")
+			loc[i] = fusedLoc{chained: willChain, pool: dst}
+			continue
+		} else if n.Op == x64OpRawDot || n.Op == x64OpRawDotAcc {
+			// Raw 16-byte 8-bit dot (see x64CrossDotRewrite): 8-lane
+			// madd across one ymm, then collapse to the four-byte
+			// grouping. Y2/Y3 (X2/X3) are scratch the pool never
+			// occupies; byte sources stage BEFORE either extend runs
+			// (X2 is Y2's own low half), and every source is read
+			// before dst is written, so dst may alias a source.
+			args := n.Args
+			accSrc := ""
+			if n.Op == x64OpRawDotAcc {
+				a := args[0]
+				if a.Kind != simdfuse.ArgNode {
+					return nil, false, fmt.Errorf("fused splice %s: %s accumulator is not a node", tree.Name, n.Op)
+				}
+				if loc[a.Index].chained {
+					accSrc = "X0"
+				} else {
+					accSrc = fmt.Sprintf("X%d", loc[a.Index].pool)
+				}
+				args = args[1:]
+			}
+			rawSrc := func(a simdfuse.Arg, stage int) (string, error) {
+				switch a.Kind {
+				case simdfuse.ArgNode:
+					if loc[a.Index].chained {
+						return "X0", nil
+					}
+					return fmt.Sprintf("X%d", loc[a.Index].pool), nil
+				case simdfuse.ArgPairIn:
+					if cr, isCarried := carried[a.Index]; isCarried {
+						return fmt.Sprintf("X%d", cr), nil
+					}
+					lo, hi := pairRegs(a)
+					fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, stage)
+					fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, stage)
+					return fmt.Sprintf("X%d", stage), nil
+				default:
+					return "", fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+				}
+			}
+			ra, err := rawSrc(args[0], 2)
+			if err != nil {
+				return nil, false, err
+			}
+			rb, err := rawSrc(args[1], 3)
+			if err != nil {
+				return nil, false, err
+			}
+			fmt.Fprintf(b, "\tVPMOVSXBW %s, Y2\n", ra)
+			fmt.Fprintf(b, "\tVPMOVSXBW %s, Y3\n", rb)
+			b.WriteString("\tVPMADDWD Y3, Y2, Y2\n")
+			b.WriteString("\tVPHADDD Y2, Y2, Y2\n")
+			b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
+			if accSrc == "" {
+				fmt.Fprintf(b, "\tVPUNPCKLQDQ X3, X2, X%d\n", dst)
+			} else {
+				b.WriteString("\tVPUNPCKLQDQ X3, X2, X2\n")
+				fmt.Fprintf(b, "\tVPADDD %s, X2, X%d\n", accSrc, dst)
+			}
+			if !vexClean {
+				// See the block dot above: uppers must not stay dirty
+				// into legacy SSE code.
 				b.WriteString("\tVZEROUPPER\n")
 			}
 			b.WriteString("\t// avx2 dot\n")
@@ -1448,13 +1531,20 @@ var x64VexOps = map[string]func(b *strings.Builder, srcs []string, dst int){
 // uppers).
 func x64TreeVexClean(tree *simdfuse.Tree) bool {
 	for _, n := range tree.Nodes {
-		if n.Op == a64OpElided || n.Op == x64OpBlockDot || n.Op == "f32x4_splat" {
+		if n.Op == a64OpElided || n.Op == x64OpBlockDot ||
+			n.Op == x64OpRawDot || n.Op == x64OpRawDotAcc || n.Op == "f32x4_splat" {
+			continue
+		}
+		if n.Op == "f16x4_cvt" {
+			// VEX-128 VCVTPH2PS sequence in feature bodies — and the
+			// caller only consults this in feature bodies (usedAVX
+			// and vexClean are both !portable-gated).
 			continue
 		}
 		if n.Class() != simdfuse.ClassV128 {
 			continue // scalar chains emit VEX FP ops
 		}
-		if simdfuse.IsStore(n.Op) || n.Op == "v128_load32_lane" || n.Op == "f16x4_cvt" {
+		if simdfuse.IsStore(n.Op) || n.Op == "v128_load32_lane" {
 			return false
 		}
 		if _, isMem := fusedMemOpsA64[n.Op]; isMem {

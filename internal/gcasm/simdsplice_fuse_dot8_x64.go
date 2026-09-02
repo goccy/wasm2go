@@ -280,6 +280,13 @@ func x64Dot8Rewrite(tree *simdfuse.Tree, portable bool) (*simdfuse.Tree, bool) {
 		}
 		rewrote = true
 	}
+	// Cross-chain shapes (separate all-low/all-high chains joined by
+	// the even/odd shuffle combine — the interleaved repack kernels)
+	// are untouched by the pairing walk above; upgrade them to raw
+	// block-dot chains.
+	if x64CrossDotRewrite(nodes, isRoot, tree.ConstPairs) {
+		rewrote = true
+	}
 	if !rewrote {
 		return tree, false
 	}
