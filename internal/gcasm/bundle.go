@@ -218,12 +218,17 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	sort.Strings(pkgList)
 
 	// Group each arch's captured fns by package relDir; record each
-	// symbol's owning package (arch-independent) for cross-chunk
-	// reference resolution.
-	fnOwner := map[string]string{} // "Fn83" → qualified path
+	// symbol's owning package for cross-chunk reference resolution.
+	// The owner map is PER ARCH: direct cross-chunk asm CALLs (see
+	// calleeSig) are sound only when the callee's own package emits
+	// either the TEXT or the gcasmABI0Keep anchor for it on the SAME
+	// arch, which is exactly membership in that arch's capture.
+	fnOwnerByArch := map[string]map[string]string{} // arch → "Fn83" → qualified path
 	for _, spec := range archSpecs {
 		ac := caps[spec.name]
 		ac.byPkg = map[string][]*Fn{}
+		fnOwner := map[string]string{}
+		fnOwnerByArch[spec.name] = fnOwner
 		for _, f := range ac.fns {
 			i := strings.LastIndex(f.Name, ".")
 			if i < 0 {
@@ -260,7 +265,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwner, pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -675,14 +680,24 @@ func buildPkg(
 			if cpkg == selfPath {
 				return params, hasRes, res, "·" + cname, true
 			}
-			// Remote fn (transformed or fallback): a local Go wrapper
-			// forwards through //go:linkname — the classic alias.go
-			// shape. Imports cannot be used (chunk call graphs are
-			// cyclic) and direct asm references cannot either (real
-			// import paths contain dots, which Plan9 asm cannot
-			// spell). For transformed remotes the linkname resolves
-			// against the remote package's Go decl, whose compile
-			// provides the ABI bridge onto the asm body.
+			// Remote fn (transformed or fallback): CALL the remote
+			// symbol directly. The plan 9 lexer maps U+00B7 to "." and
+			// U+2215 to "/", so a dotted import path is spellable in an
+			// asm operand and the linker sees the canonical symbol —
+			// no forwarding frame. Transformed remotes resolve against
+			// the remote TEXT (ABI0, the exact layout the marshalling
+			// below stages); fallback remotes resolve against the ABI0
+			// wrapper their own package's gcasmABI0Keep anchor forces
+			// the compiler to emit. Imports still cannot be used (chunk
+			// call graphs are cyclic), but no import is needed: every
+			// chunk is linked via the root package's import chain, the
+			// same guarantee the old //go:linkname forwards relied on.
+			// A path plan 9 cannot spell (e.g. a hyphenated host repo)
+			// or a callee outside the capture keeps the historical
+			// Go-wrapper hop.
+			if fnOwner[cname] == cpkg && plan9AsmPathSafe(cpkg) {
+				return params, hasRes, res, asmSpellPath(cpkg) + "·" + cname, true
+			}
 			wrap := "gcasmFwd" + cname
 			goForwards[wrap] = sym
 			goForwardSig[wrap] = goSigB{params: params, hasRes: hasRes, res: res, ok: true}
@@ -929,6 +944,34 @@ func buildPkg(
 		if !seenSynth[n] {
 			return nil, fmt.Errorf("outlined %s: not present in the %s capture", n, arch.name)
 		}
+	}
+
+	// ABI0 anchor: reference every pure-Go fallback fn from this
+	// package's own asm, so the compiler emits its ABI0 wrapper
+	// (symabis marks the fn as asm-referenced). Other chunks' asm
+	// CALLs the fn's dotted symbol directly — see calleeSig — and
+	// that reference resolves against this wrapper when the fn kept
+	// its Go body. Dead code (never jumped to), alive as an object
+	// symbol regardless of linker deadcode decisions.
+	//
+	// Needed ONLY when calleeSig actually emits spelled direct CALLs,
+	// i.e. when the import path is plan-9-spellable. An unspellable
+	// path (a hyphenated host repo) keeps the gcasmFwd linkname
+	// wrappers for every cross-chunk call, so no direct reference to a
+	// fallback fn is ever made and the anchor would be pure dead
+	// weight — skip it there.
+	if len(fallbackNames) > 0 && plan9AsmPathSafe(importPath) {
+		var names []string
+		for n := range fallbackNames {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		asmB.WriteString("// gcasmABI0Keep: asm references forcing ABI0 wrappers for the\n// pure-Go fallback fns, so cross-chunk direct CALLs link.\nTEXT ·gcasmABI0Keep(SB), NOSPLIT, $0-0\n")
+		for _, n := range names {
+			asmB.WriteString("\tJMP ·" + n + "(SB)\n")
+		}
+		asmB.WriteString("\n")
+		declFns.WriteString("\n// gcasmABI0Keep is an assembly-only anchor (see the .s file).\nfunc gcasmABI0Keep()\n\nvar _ = gcasmABI0Keep\n")
 	}
 
 	// Fallback bodies (extracted early: their Go-level FnN references

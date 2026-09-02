@@ -23,7 +23,7 @@ import (
 // pure-only) — outputs must match exactly. Also asserts Build is
 // deterministic (two invocations → identical file map).
 func TestGate4Bundle(t *testing.T) {
-	for _, fixture := range []string{"control", "cg_brtable64", "cg_indirect", "cg_numerics", "cg_memops"} {
+	for _, fixture := range []string{"control", "cg_brtable64", "cg_indirect", "cg_numerics", "cg_memops", "cg_crosscall"} {
 		t.Run(fixture, func(t *testing.T) {
 			gate4(t, fixture)
 		})
@@ -35,16 +35,35 @@ func TestGate4Bundle(t *testing.T) {
 		defer codegen.SetMultiPackageThreshold(0)()
 		gate4(t, "control")
 	})
+	// A dotted module path — the real bundles live under
+	// github.com/... — proves the spelled direct cross-chunk CALLs
+	// (see calleeSig) assemble, link, and behave identically.
+	t.Run("control_multipkg_dotted", func(t *testing.T) {
+		defer codegen.SetMultiPackageThreshold(0)()
+		gate4At(t, "control", "github.com/gentest")
+	})
+	// A tiny chunk budget splits the crosscall fixture's caller and
+	// callees into separate chunk packages, so the transformed asm
+	// CALLs remote fns directly through their spelled dotted symbols
+	// — the exact production shape of the direct-call optimization.
+	t.Run("crosscall_multichunk_dotted", func(t *testing.T) {
+		defer codegen.SetMultiPackageThreshold(64)()
+		gate4At(t, "cg_crosscall", "github.com/gentest")
+	})
 }
 
 func gate4(t *testing.T, fixture string) {
+	gate4At(t, fixture, "gentest")
+}
+
+func gate4At(t *testing.T, fixture string, modPath string) {
 	bin := testfixture.Wasm(t, fixture)
 	mod, err := wasm.Parse(bytes.NewReader(bin))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: modPath + "/pkg"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +77,7 @@ func gate4(t *testing.T, fixture string) {
 	}
 	build := func() map[string][]byte {
 		t.Helper()
-		files, stats, err := Build(mod, buf.Bytes(), treeIn, "gentest/pkg", nil, nil, nil, nil, nil, Config{})
+		files, stats, err := Build(mod, buf.Bytes(), treeIn, modPath+"/pkg", nil, nil, nil, nil, nil, Config{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,7 +102,7 @@ func gate4(t *testing.T, fixture string) {
 		t.Helper()
 		dir := t.TempDir()
 		tree := map[string][]byte{
-			"go.mod": []byte("module gentest\n\ngo 1.25.0\n"),
+			"go.mod": []byte("module " + modPath + "\n\ngo 1.25.0\n"),
 		}
 		if buf.Len() > 0 { // multi-package mode leaves the main writer empty
 			tree["pkg/gen.go"] = buf.Bytes()
@@ -115,7 +134,7 @@ func gate4(t *testing.T, fixture string) {
 				pf[name] = data
 			}
 			pf = PureFilter(pf)
-			tree = map[string][]byte{"go.mod": []byte("module gentest\n\ngo 1.25.0\n")}
+			tree = map[string][]byte{"go.mod": []byte("module " + modPath + "\n\ngo 1.25.0\n")}
 			for name, data := range pf {
 				tree["pkg/"+name] = data
 			}
@@ -135,11 +154,11 @@ func gate4(t *testing.T, fixture string) {
 	// Export-level driver: call every exported method over an input
 	// sweep and print outcomes; both variants must print identically.
 	var driver strings.Builder
-	driver.WriteString(`package main
+	driver.WriteString(strings.ReplaceAll(`package main
 
 import (
 	"fmt"
-	"gentest/pkg"
+	"MODPATH/pkg"
 )
 
 func run(f func() int64) (val int64, panicked bool) {
@@ -152,7 +171,7 @@ func run(f func() int64) (val int64, panicked bool) {
 }
 
 func main() {
-`)
+`, "MODPATH", modPath))
 	exports := 0
 	for _, exp := range mod.Exports {
 		if exp.Kind != wasm.ExportFunc {
