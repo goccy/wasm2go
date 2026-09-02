@@ -381,6 +381,28 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				}
 				return pool.addBlob(blob)
 			}
+			if !portable {
+				// Feature body: hardware conversion, the x64 mirror of
+				// the arm64 xtn+fcvtl pair. Mask each lane to its low
+				// 16 bits (the conversion reads nothing else), pack the
+				// four u32 lanes into four contiguous u16s (exact — the
+				// masked values fit unsaturated), and convert with
+				// VCVTPH2PS (F16C, which the HasAVX2 gate requires).
+				// All VEX-128, so no ymm upper state is dirtied. The
+				// marker routes non-AVX2 hosts to the portable twin.
+				// A zero-extending 16x4 load already has empty upper
+				// lane halves, so its mask is dead weight.
+				if a := n.Args[0]; a.Kind == simdfuse.ArgNode && tree.Nodes[a.Index].Op == "v128_load16x4_u" {
+					fmt.Fprintf(b, "\tVPACKUSDW X%d, X%d, X1\n", src, src)
+				} else {
+					fmt.Fprintf(b, "\tVPAND ·%s(SB), X%d, X1\n", c4(0xFFFF), src)
+					b.WriteString("\tVPACKUSDW X1, X1, X1\n")
+				}
+				fmt.Fprintf(b, "\tVCVTPH2PS X1, X%d\n", dst)
+				b.WriteString("\t// avx2 dot\n")
+				loc[i] = fusedLoc{chained: willChain, pool: dst}
+				continue
+			}
 			fmt.Fprintf(b, "\tMOVOU X%d, X3\n", src)
 			b.WriteString("\tPSLLL $16, X3\n")
 			fmt.Fprintf(b, "\tPAND \u00b7%s(SB), X3\n", c4(0x80000000))
@@ -470,6 +492,102 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				// one clear at the exit instead.
 				b.WriteString("\tVZEROUPPER\n")
 			}
+			b.WriteString("\t// avx2 dot\n")
+			loc[i] = fusedLoc{chained: willChain, pool: dst}
+			continue
+		} else if n.Op == x64OpRawDot || n.Op == x64OpRawDotAcc ||
+			n.Op == x64OpRawDotWide || n.Op == x64OpRawDotWideAcc {
+			// Raw 16-byte 8-bit dots (see x64CrossDotRewrite). The
+			// self-contained forms collapse to the four-byte grouping
+			// in place; the wide forms leave the value in the 8-lane
+			// pair domain across a full ymm for x64OpRawDotFold.
+			// Y2/Y3 (X2/X3) are scratch the pool never occupies; byte
+			// sources stage BEFORE either extend runs (X2 is Y2's own
+			// low half), and every source is read before dst is
+			// written, so dst may alias a source.
+			isWide := n.Op == x64OpRawDotWide || n.Op == x64OpRawDotWideAcc
+			hasAcc := n.Op == x64OpRawDotAcc || n.Op == x64OpRawDotWideAcc
+			args := n.Args
+			accReg := -1
+			if hasAcc {
+				a := args[0]
+				if a.Kind != simdfuse.ArgNode {
+					return nil, false, fmt.Errorf("fused splice %s: %s accumulator is not a node", tree.Name, n.Op)
+				}
+				if loc[a.Index].chained {
+					accReg = 0
+				} else {
+					accReg = loc[a.Index].pool
+				}
+				args = args[1:]
+			}
+			rawSrc := func(a simdfuse.Arg, stage int) (string, error) {
+				switch a.Kind {
+				case simdfuse.ArgNode:
+					if loc[a.Index].chained {
+						return "X0", nil
+					}
+					return fmt.Sprintf("X%d", loc[a.Index].pool), nil
+				case simdfuse.ArgPairIn:
+					if cr, isCarried := carried[a.Index]; isCarried {
+						return fmt.Sprintf("X%d", cr), nil
+					}
+					lo, hi := pairRegs(a)
+					fmt.Fprintf(b, "\tMOVQ %s, X%d\n", lo, stage)
+					fmt.Fprintf(b, "\tPINSRQ $1, %s, X%d\n", hi, stage)
+					return fmt.Sprintf("X%d", stage), nil
+				default:
+					return "", fmt.Errorf("fused splice %s: malformed %s args", tree.Name, n.Op)
+				}
+			}
+			ra, err := rawSrc(args[0], 2)
+			if err != nil {
+				return nil, false, err
+			}
+			rb, err := rawSrc(args[1], 3)
+			if err != nil {
+				return nil, false, err
+			}
+			fmt.Fprintf(b, "\tVPMOVSXBW %s, Y2\n", ra)
+			fmt.Fprintf(b, "\tVPMOVSXBW %s, Y3\n", rb)
+			if isWide {
+				if hasAcc {
+					b.WriteString("\tVPMADDWD Y3, Y2, Y2\n")
+					fmt.Fprintf(b, "\tVPADDD Y%d, Y2, Y%d\n", accReg, dst)
+				} else {
+					fmt.Fprintf(b, "\tVPMADDWD Y3, Y2, Y%d\n", dst)
+				}
+			} else {
+				b.WriteString("\tVPMADDWD Y3, Y2, Y2\n")
+				if !hasAcc {
+					x64PairFold(b, 2, dst)
+				} else {
+					x64PairFold(b, 2, 2)
+					fmt.Fprintf(b, "\tVPADDD X%d, X2, X%d\n", accReg, dst)
+				}
+				if !vexClean {
+					// See the block dot above: uppers must not stay
+					// dirty into legacy SSE code. (The wide forms are
+					// never selected outside fully-VEX trees.)
+					b.WriteString("\tVZEROUPPER\n")
+				}
+			}
+			b.WriteString("\t// avx2 dot\n")
+			loc[i] = fusedLoc{chained: willChain, pool: dst}
+			continue
+		} else if n.Op == x64OpRawDotFold {
+			// Collapse the pair-domain chain value: lane j of the
+			// result is P2j + P2j+1 — the four-consecutive-byte
+			// grouping the consumers were proven to want.
+			a := n.Args[0]
+			if a.Kind != simdfuse.ArgNode {
+				return nil, false, fmt.Errorf("fused splice %s: %s input is not a node", tree.Name, n.Op)
+			}
+			v := 0
+			if !loc[a.Index].chained {
+				v = loc[a.Index].pool
+			}
+			x64PairFold(b, v, dst)
 			b.WriteString("\t// avx2 dot\n")
 			loc[i] = fusedLoc{chained: willChain, pool: dst}
 			continue
@@ -798,9 +916,12 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	if addrReg != "" {
 		// Chain-computed address: move the terminal into the address
 		// register first (see the arm64 twin). MOVL re-zero-extends
-		// the i32-wrapped chain result on wasm32.
+		// the i32-wrapped chain result on wasm32; at full width a
+		// chain already terminating in R12 needs no move at all.
 		if addr64 {
-			fmt.Fprintf(b, "\tMOVQ %s, R12\n", addrReg)
+			if addrReg != "R12" {
+				fmt.Fprintf(b, "\tMOVQ %s, R12\n", addrReg)
+			}
 		} else {
 			fmt.Fprintf(b, "\tMOVL %s, R12\n", addrReg)
 		}
@@ -900,6 +1021,27 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 			return addOffErr
 		}
 		addOff(1)
+	case "v128_load32_splat_nc", "v128_load16x4_u_nc", "v128_load32_zero_nc", "v128_load64_zero_nc":
+		// Unchecked narrow loads (window check hoisted at the loop
+		// head): a 4-byte VMOVSS or 8-byte VMOVQ, then the op's own
+		// widen where it has one.
+		mov := "VMOVSS"
+		if n.Op == "v128_load16x4_u_nc" || n.Op == "v128_load64_zero_nc" {
+			mov = "VMOVQ"
+		}
+		if d, ok := x64DeferOff(n.Args[1]); ok {
+			fmt.Fprintf(b, "\t%s %s(%s)(R12*1), X%d\n", mov, d, x64MemBase(b, offs), dst)
+		} else {
+			addOff(1)
+			fmt.Fprintf(b, "\t%s (%s)(R12*1), X%d\n", mov, x64MemBase(b, offs), dst)
+		}
+		switch n.Op {
+		case "v128_load32_splat_nc":
+			fmt.Fprintf(b, "\tVPSHUFD $0x00, X%d, X%d\n", dst, dst)
+		case "v128_load16x4_u_nc":
+			fmt.Fprintf(b, "\tVPMOVZXWD X%d, X%d\n", dst, dst)
+		}
+		return addOffErr
 	case "v128_load_rng":
 		// start/end accumulate in R12 and are undone afterwards, so
 		// the address survives without a third register. The window is
@@ -1177,21 +1319,35 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// Pin m.M / memSize for the whole loop: every iteration's member
 	// accesses then skip the per-site Module loads.
 	offs = x64HoistMem(b, offs, tree, 1+tree.NumScalars+1+loop.NumDeltas+2*tree.NumPairs)
-	// Hoist the strided window checks out of the loop: a pretest loop
-	// with a power-of-two step runs exactly counter>>log2(Dec)
-	// iterations, so ONE check of
-	//   base + rlo + span + (iters-1)*delta
-	// against memSize covers every iteration's window and the loads
+	// Hoist the strided window checks out of the loop: when the
+	// iteration count is computable at entry, ONE check of
+	//   maxAddress = base + end + (iters-1)*delta
+	// against memSize covers every iteration's accesses and the loads
 	// inside the loop drop to single indexed instructions. Trapping at
 	// the loop head instead of the precise access is the same
 	// relaxation the windowed range check already makes. memory64
-	// trees only (all address terms add at full width there).
+	// trees only (all address terms add at full width there). Two loop
+	// forms qualify: the pretest power-of-two-step loop (iters =
+	// counter>>log2(Dec)) and the do-while floor loop with a unit step
+	// (iters = max(counter - thresh, 1) — the body runs at least
+	// once). Addresses may be a scalar argument, a scalar+const sum,
+	// or a scalar-chain ADD tree over those — the interleaved kernels
+	// derive every load address as bumpedBase + columnBase + const.
 	hoistedTrap := false
-	if tree.Addr64 && loop.PreTest && loop.Dec > 0 && loop.Dec&(loop.Dec-1) == 0 {
-		sh := 0
-		for d := loop.Dec; d > 1; d >>= 1 {
-			sh++
+	hoistForm := 0 // 1 = pretest pow2, 2 = do-while ExitGT unit-step
+	sh := 0
+	if tree.Addr64 && loop.Dec > 0 {
+		switch {
+		case loop.PreTest && loop.Dec&(loop.Dec-1) == 0:
+			hoistForm = 1
+			for d := loop.Dec; d > 1; d >>= 1 {
+				sh++
+			}
+		case !loop.PreTest && loop.ExitGT && loop.Dec == 1 && loop.ExitThresh >= 0:
+			hoistForm = 2
 		}
+	}
+	if hoistForm != 0 {
 		deltaOf := map[int]int64{}
 		dynamic := map[int]bool{}
 		for _, bump := range loop.Bumps {
@@ -1203,60 +1359,131 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 		}
 		nodes := append([]simdfuse.Node(nil), tree.Nodes...)
 		ctrReg := x64FusedArgRegs[1+loop.CounterScalar]
-		checkedSpans := map[string]bool{}
-		rewrote := false
-		for i := range nodes {
-			n := &nodes[i]
-			if n.Op != "v128_load_rng" || len(n.Args) != 4 {
-				continue
+		// resolveAffine flattens a load address into scalar-argument
+		// terms plus a constant: ArgScalar/ArgSum directly, or a
+		// scalar-chain add tree over those.
+		var resolveAffine func(a simdfuse.Arg, depth int) ([]int, int64, bool)
+		resolveAffine = func(a simdfuse.Arg, depth int) ([]int, int64, bool) {
+			if depth > 6 {
+				return nil, 0, false
 			}
-			a := n.Args[0]
-			if a.Kind != simdfuse.ArgScalar && a.Kind != simdfuse.ArgSum {
-				continue
-			}
-			if dynamic[a.Index] {
-				continue
-			}
-			rlo, span := n.Args[2], n.Args[3]
-			if rlo.Kind != simdfuse.ArgConst || span.Kind != simdfuse.ArgConst || rlo.Const < 0 {
-				continue
-			}
-			d := deltaOf[a.Index]
-			if d < 0 || d > 1<<20 {
-				continue
-			}
-			base := int64(0)
-			if a.Kind == simdfuse.ArgSum {
-				base = int64(a.Const)
-			}
-			end := base + int64(rlo.Const) + int64(uint32(span.Const))
-			key := fmt.Sprintf("%d/%d/%d", a.Index, end, d)
-			if !checkedSpans[key] {
-				checkedSpans[key] = true
-				skip := fmt.Sprintf("gcasmfxh%s_%d", site, i)
-				// A 32-bit counter arrives with undefined upper bits;
-				// MOVL zero-extends before the shift.
-				ctrMov := "MOVL"
-				if loop.CounterWide {
-					ctrMov = "MOVQ"
+			switch a.Kind {
+			case simdfuse.ArgScalar:
+				return []int{a.Index}, 0, true
+			case simdfuse.ArgSum:
+				return []int{a.Index}, int64(a.Const), true
+			case simdfuse.ArgConst:
+				return nil, int64(a.Const), true
+			case simdfuse.ArgNode:
+				nd := &nodes[a.Index]
+				if nd.Op != "scalar_i32_add" || len(nd.Args) != 2 {
+					return nil, 0, false
 				}
-				fmt.Fprintf(b, "\t%s %s, R12\n", ctrMov, ctrReg)
+				t1, c1, ok1 := resolveAffine(nd.Args[0], depth+1)
+				if !ok1 {
+					return nil, 0, false
+				}
+				t2, c2, ok2 := resolveAffine(nd.Args[1], depth+1)
+				if !ok2 {
+					return nil, 0, false
+				}
+				return append(append([]int{}, t1...), t2...), c1 + c2, true
+			}
+			return nil, 0, false
+		}
+		// emitIters leaves (iters-1) in R12. Form 1 branches to after
+		// the check when the loop runs zero times; form 2 always runs
+		// at least once and clamps (counter - thresh - 1) at zero.
+		ctrMov := "MOVL"
+		if loop.CounterWide {
+			ctrMov = "MOVQ"
+		}
+		emitIters := func(lbl string) (post string) {
+			fmt.Fprintf(b, "\t%s %s, R12\n", ctrMov, ctrReg)
+			if hoistForm == 1 {
 				if sh > 0 {
 					fmt.Fprintf(b, "\tSHRQ $%d, R12\n", sh)
 				}
 				b.WriteString("\tTESTQ R12, R12\n")
-				fmt.Fprintf(b, "\tJZ %s\n", skip)
+				fmt.Fprintf(b, "\tJZ %s\n", lbl)
 				b.WriteString("\tSUBQ $1, R12\n")
+				return lbl
+			}
+			fmt.Fprintf(b, "\tSUBQ $%d, R12\n", int64(loop.ExitThresh)+1)
+			fmt.Fprintf(b, "\tJGE %s\n", lbl)
+			b.WriteString("\tXORL R12, R12\n")
+			fmt.Fprintf(b, "%s:\n", lbl)
+			return ""
+		}
+		checkedSpans := map[string]bool{}
+		rewrote := false
+		for i := range nodes {
+			n := &nodes[i]
+			var width int64
+			var ncOp string
+			switch n.Op {
+			case "v128_load_rng":
+				ncOp = "v128_load_nc"
+			case "v128_load":
+				width, ncOp = 16, "v128_load_nc"
+			case "v128_load32_splat":
+				width, ncOp = 4, "v128_load32_splat_nc"
+			case "v128_load16x4_u":
+				width, ncOp = 8, "v128_load16x4_u_nc"
+			case "v128_load32_zero":
+				width, ncOp = 4, "v128_load32_zero_nc"
+			case "v128_load64_zero":
+				width, ncOp = 8, "v128_load64_zero_nc"
+			default:
+				continue
+			}
+			terms, base, aok := resolveAffine(n.Args[0], 0)
+			if !aok {
+				continue
+			}
+			var d int64
+			bad := false
+			for _, tm := range terms {
+				if dynamic[tm] {
+					bad = true
+				}
+				d += deltaOf[tm]
+			}
+			if bad || d < 0 || d > 1<<20 {
+				continue
+			}
+			var end int64
+			if n.Op == "v128_load_rng" {
+				rlo, span := n.Args[2], n.Args[3]
+				if rlo.Kind != simdfuse.ArgConst || span.Kind != simdfuse.ArgConst || rlo.Const < 0 {
+					continue
+				}
+				end = base + int64(rlo.Const) + int64(uint32(span.Const))
+			} else {
+				off := n.Args[1]
+				if off.Kind != simdfuse.ArgConst || off.Const < 0 {
+					continue
+				}
+				end = base + int64(off.Const) + width
+			}
+			key := fmt.Sprintf("%v/%d/%d", terms, end, d)
+			if !checkedSpans[key] {
+				checkedSpans[key] = true
+				post := emitIters(fmt.Sprintf("gcasmfxh%s_%d", site, i))
 				if d != 0 {
 					fmt.Fprintf(b, "\tIMUL3Q $%d, R12, R12\n", d)
 				}
-				fmt.Fprintf(b, "\tADDQ %s, R12\n", x64FusedArgRegs[1+a.Index])
+				for _, tm := range terms {
+					fmt.Fprintf(b, "\tADDQ %s, R12\n", x64FusedArgRegs[1+tm])
+				}
 				fmt.Fprintf(b, "\tADDQ $%d, R12\n", end)
 				x64MemSizeCheck(b, offs)
-				fmt.Fprintf(b, "%s:\n", skip)
+				if post != "" {
+					fmt.Fprintf(b, "%s:\n", post)
+				}
 				hoistedTrap = true
 			}
-			n.Op = "v128_load_nc"
+			n.Op = ncOp
 			n.Args = n.Args[:2]
 			rewrote = true
 		}
@@ -1447,14 +1674,27 @@ var x64VexOps = map[string]func(b *strings.Builder, srcs []string, dst int){
 // applies to legacy SSE only; VEX-128 ops are safe under dirty
 // uppers).
 func x64TreeVexClean(tree *simdfuse.Tree) bool {
-	for _, n := range tree.Nodes {
-		if n.Op == a64OpElided || n.Op == x64OpBlockDot || n.Op == "f32x4_splat" {
+	return x64NodesVexClean(tree.Nodes)
+}
+
+func x64NodesVexClean(nodes []simdfuse.Node) bool {
+	for _, n := range nodes {
+		if n.Op == a64OpElided || n.Op == x64OpBlockDot ||
+			n.Op == x64OpRawDot || n.Op == x64OpRawDotAcc ||
+			n.Op == x64OpRawDotWide || n.Op == x64OpRawDotWideAcc ||
+			n.Op == x64OpRawDotFold || n.Op == "f32x4_splat" {
+			continue
+		}
+		if n.Op == "f16x4_cvt" {
+			// VEX-128 VCVTPH2PS sequence in feature bodies — and the
+			// caller only consults this in feature bodies (usedAVX
+			// and vexClean are both !portable-gated).
 			continue
 		}
 		if n.Class() != simdfuse.ClassV128 {
 			continue // scalar chains emit VEX FP ops
 		}
-		if simdfuse.IsStore(n.Op) || n.Op == "v128_load32_lane" || n.Op == "f16x4_cvt" {
+		if simdfuse.IsStore(n.Op) || n.Op == "v128_load32_lane" {
 			return false
 		}
 		if _, isMem := fusedMemOpsA64[n.Op]; isMem {
@@ -1466,6 +1706,15 @@ func x64TreeVexClean(tree *simdfuse.Tree) bool {
 		return false
 	}
 	return true
+}
+
+// x64PairFold collapses an 8-lane VPMADDWD pair-domain ymm value to
+// the four-consecutive-byte i32x4 grouping: lane j of the result is
+// P2j + P2j+1. Y2/X3 are scratch; dst may equal src.
+func x64PairFold(b *strings.Builder, src, dst int) {
+	fmt.Fprintf(b, "\tVPHADDD Y%d, Y%d, Y2\n", src, src)
+	b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
+	fmt.Fprintf(b, "\tVPUNPCKLQDQ X3, X2, X%d\n", dst)
 }
 
 // x64VexArgsOK reports whether every argument is a register-resident

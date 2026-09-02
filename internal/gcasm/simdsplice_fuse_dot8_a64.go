@@ -300,6 +300,40 @@ var (
 	a64OddSel  = [2]uint64{0x0f0e0d0c07060504, 0x1f1e1d1c17161514}
 )
 
+// crossSelKind classifies node i as an even/odd dword-select shuffle
+// of two node sources: its control vector must be a known even/odd
+// dword select — either the descriptor-constant form
+// (i8x16_shuffle_const, pattern in four ArgConst) or a pair argument
+// whose call-site value is a recorded constant. The patterns are
+// wasm-level constants, so both arch rewrites share the classifier.
+func crossSelKind(nodes []simdfuse.Node, constPairs map[int][2]uint64, i int) (x, y int, even, ok bool) {
+	n := &nodes[i]
+	var pat [2]uint64
+	switch {
+	case n.Op == "i8x16_shuffle_const" && len(n.Args) == 6 &&
+		n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode:
+		u32c := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
+		pat = [2]uint64{u32c(n.Args[2]) | u32c(n.Args[3])<<32, u32c(n.Args[4]) | u32c(n.Args[5])<<32}
+	case n.Op == "i8x16_shuffle" && len(n.Args) == 3 &&
+		n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode &&
+		n.Args[2].Kind == simdfuse.ArgPairIn:
+		var isConst bool
+		pat, isConst = constPairs[n.Args[2].Index]
+		if !isConst {
+			return 0, 0, false, false
+		}
+	default:
+		return 0, 0, false, false
+	}
+	switch pat {
+	case a64EvenSel:
+		return n.Args[0].Index, n.Args[1].Index, true, true
+	case a64OddSel:
+		return n.Args[0].Index, n.Args[1].Index, false, true
+	}
+	return 0, 0, false, false
+}
+
 // a64CrossSdotRewrite upgrades the even/odd lane-combine of TWO
 // sadalp chains — one all-low, one all-high, over pairwise-identical
 // byte sources — to a single RAW SDOT chain.
@@ -326,37 +360,6 @@ func a64CrossSdotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[in
 				uses[a.Index]++
 			}
 		}
-	}
-	// selKind classifies a shuffle node: its control vector must be a
-	// known even/odd dword select — either the descriptor-constant
-	// form (i8x16_shuffle_const, pattern in four ArgConst) or a pair
-	// argument whose call-site value is a recorded constant.
-	selKind := func(i int) (x, y int, even, ok bool) {
-		n := &nodes[i]
-		var pat [2]uint64
-		switch {
-		case n.Op == "i8x16_shuffle_const" && len(n.Args) == 6 &&
-			n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode:
-			u32c := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
-			pat = [2]uint64{u32c(n.Args[2]) | u32c(n.Args[3])<<32, u32c(n.Args[4]) | u32c(n.Args[5])<<32}
-		case n.Op == "i8x16_shuffle" && len(n.Args) == 3 &&
-			n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode &&
-			n.Args[2].Kind == simdfuse.ArgPairIn:
-			var isConst bool
-			pat, isConst = constPairs[n.Args[2].Index]
-			if !isConst {
-				return 0, 0, false, false
-			}
-		default:
-			return 0, 0, false, false
-		}
-		switch pat {
-		case a64EvenSel:
-			return n.Args[0].Index, n.Args[1].Index, true, true
-		case a64OddSel:
-			return n.Args[0].Index, n.Args[1].Index, false, true
-		}
-		return 0, 0, false, false
 	}
 	// chainOf collects a sadalp chain in leaf order: (head Dot8Low/High
 	// + Dot8Acc links over Dot8Mul products), or a bare head. Interior
@@ -404,8 +407,8 @@ func a64CrossSdotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[in
 			continue
 		}
 		e, o := n.Args[0].Index, n.Args[1].Index
-		ex, ey, eEven, eok := selKind(e)
-		ox, oy, oEven, ook := selKind(o)
+		ex, ey, eEven, eok := crossSelKind(nodes, constPairs, e)
+		ox, oy, oEven, ook := crossSelKind(nodes, constPairs, o)
 		if !eok || !ook || eEven == oEven || ex != ox || ey != oy {
 			continue
 		}

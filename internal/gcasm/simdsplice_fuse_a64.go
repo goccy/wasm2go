@@ -955,6 +955,14 @@ var fusedMemOpsA64 = map[string]int{
 	"v128_load32_splat": 2,
 	"v128_load16x4_u":   2,
 	"v128_load32_lane":  3, // + the v128 operand the lane inserts into
+	// Unchecked twins the x64 loop-level window hoist rewrites narrow
+	// loads into (see x64SpliceLoop). They exist only inside that
+	// splicer's local tree copy — the a64 splicer and the Go fallback
+	// never see them.
+	"v128_load32_splat_nc": 2,
+	"v128_load16x4_u_nc":   2,
+	"v128_load32_zero_nc":  2,
+	"v128_load64_zero_nc":  2,
 }
 
 // dst0Src resolves a store's v128 VALUE operand register: a chained

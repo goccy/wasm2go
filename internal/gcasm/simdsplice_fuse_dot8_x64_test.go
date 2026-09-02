@@ -415,3 +415,81 @@ func TestX64LoopHoistsRangeChecks(t *testing.T) {
 		t.Errorf("loop body lost the folded indexed load:\n%s", body)
 	}
 }
+
+// TestX64LoopHoistsChecksFloorForm: a memory64 do-while floor loop
+// (unit step) with loads addressed through a scalar-chain sum also
+// hoists its window checks — iters-1 = counter - thresh - 1, clamped
+// at zero — and every narrow load inside the body drops its check.
+func TestX64LoopHoistsChecksFloorForm(t *testing.T) {
+	tr := &simdfuse.Tree{
+		Name:       "simd_p_fxlfloor",
+		NumScalars: 3,
+		NeedsMem:   true,
+		NumPairs:   1,
+		Addr64:     true,
+		Nodes: []simdfuse.Node{
+			{Op: "scalar_i32_add", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgScalar, Index: 0},
+				{Kind: simdfuse.ArgScalar, Index: 1},
+			}},
+			{Op: "v128_load", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: 0},
+				{Kind: simdfuse.ArgConst, Const: 8},
+			}},
+			{Op: "v128_load32_splat", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: 0},
+				{Kind: simdfuse.ArgConst, Const: 4},
+			}},
+			{Op: "i32x4_add", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: 1},
+				{Kind: simdfuse.ArgNode, Index: 2},
+			}},
+			{Op: "i32x4_add", Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: 3},
+				{Kind: simdfuse.ArgPairIn, Index: 0},
+			}},
+		},
+		Roots: []int{4},
+	}
+	loop := &simdfuse.Loop{
+		Tree:          tr,
+		CarriedPairs:  [][2]int{{0, 4}},
+		Bumps:         []simdfuse.LoopBump{{Scalar: 0, Delta: 136, DeltaScalar: -1}},
+		CounterScalar: 2,
+		Dec:           1,
+		PreTest:       false,
+		ExitGT:        true,
+		ExitThresh:    1,
+	}
+	var b strings.Builder
+	spliced, needsTrap, err := x64SpliceLoop(&b, loop, &ConstPool{}, fuseTestOffs, "7", false, 0)
+	if err != nil || !spliced {
+		t.Fatalf("spliced=%v err=%v", spliced, err)
+	}
+	if !needsTrap {
+		t.Error("hoisted check must still request the trap label")
+	}
+	asm := b.String()
+	loopStart := strings.Index(asm, "gcasmfxl7:")
+	if loopStart < 0 {
+		t.Fatalf("no loop label:\n%s", asm)
+	}
+	pre, body := asm[:loopStart], asm[loopStart:]
+	// iters-1 = counter - (thresh+1), clamped at zero, scaled by the
+	// bump, plus both chain terms and the widest end offset (8+16).
+	for _, want := range []string{"SUBQ $2, R12", "JGE gcasmfxh7_", "XORL R12, R12", "IMUL3Q $136, R12, R12", "ADDQ $24, R12"} {
+		if !strings.Contains(pre, want) {
+			t.Errorf("prologue missing %q:\n%s", want, pre)
+		}
+	}
+	// The body keeps no per-load bounds checks and uses folded
+	// indexed forms for both the vector load and the splat.
+	if strings.Contains(body, "JCS gcasmsimdoob") {
+		t.Errorf("loop body still bounds-checks:\n%s", body)
+	}
+	for _, want := range []string{"VMOVDQU 8(", "VMOVSS 4(", "VPSHUFD $0x00"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("loop body missing %q:\n%s", want, body)
+		}
+	}
+}

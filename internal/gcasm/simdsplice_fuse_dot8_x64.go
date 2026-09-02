@@ -280,6 +280,24 @@ func x64Dot8Rewrite(tree *simdfuse.Tree, portable bool) (*simdfuse.Tree, bool) {
 		}
 		rewrote = true
 	}
+	// Cross-chain shapes (separate all-low/all-high chains joined by
+	// the even/odd shuffle combine — the interleaved repack kernels)
+	// are untouched by the pairing walk above; upgrade them to raw
+	// block-dot chains. Try the pair-domain wide form first — it
+	// keeps a live ymm upper between links, which is only sound in a
+	// fully-VEX region — and fall back to the self-contained per-leaf
+	// form otherwise.
+	snapshot := append([]simdfuse.Node(nil), nodes...)
+	if x64CrossDotRewrite(nodes, isRoot, tree.ConstPairs, true) {
+		if x64NodesVexClean(nodes) {
+			rewrote = true
+		} else {
+			copy(nodes, snapshot)
+			if x64CrossDotRewrite(nodes, isRoot, tree.ConstPairs, false) {
+				rewrote = true
+			}
+		}
+	}
 	if !rewrote {
 		return tree, false
 	}

@@ -908,6 +908,138 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		}
 		droppedBump[name] = true
 	}
+	// Derived slots of DIRECTLY-bumped arguments: an argument whose
+	// hoisted defining statement is `p + invariant`, with p itself a
+	// bumped scalar slot, advances in lockstep with p. The hoisted
+	// initial reads p's pre-loop value — exactly the slot's correct
+	// base — so give the slot p's step and exempt the definition from
+	// the invariance check below. (The reassociation above only
+	// covers bump targets that are NOT arguments themselves.)
+	directStep := map[string]ast.Expr{}
+	for _, bst := range cl.bumps {
+		name := bst.Lhs[0].(*ast.Ident).Name
+		if _, sok := scalarSlot[name]; sok {
+			directStep[name] = bst.Rhs[0].(*ast.BinaryExpr).Y
+		}
+	}
+	bumpedSlot := map[int]bool{}
+	for _, b := range loop.Bumps {
+		bumpedSlot[b.Scalar] = true
+	}
+	exemptWpre := map[ast.Stmt]bool{}
+	// invariantExpr: a resolvable constant, or a variable the loop
+	// never writes.
+	invariantExpr := func(e ast.Expr) bool {
+		if _, cok := resolveC(e); cok {
+			return true
+		}
+		id, iok := unwrapWidth(e).(*ast.Ident)
+		return iok && !bodyWrites[id.Name]
+	}
+	// affineBase resolves `bumpedArg ± invariants`, possibly through
+	// hoisted defining statements (the emitter derives per-iteration
+	// addresses in one or two steps). The base keeps coefficient +1 —
+	// it may not appear as a subtrahend — so the derived slot advances
+	// by exactly the base's step.
+	var affineBase func(e ast.Expr, depth int) (string, []ast.Stmt, bool)
+	affineBase = func(e ast.Expr, depth int) (string, []ast.Stmt, bool) {
+		if depth > 4 {
+			return "", nil, false
+		}
+		switch x := e.(type) {
+		case *ast.Ident:
+			if directStep[x.Name] != nil {
+				return x.Name, nil, true
+			}
+			if def := wpreDef(x.Name); def != nil {
+				if base, defs, ok := affineBase(def.Rhs[0], depth+1); ok {
+					return base, append(defs, ast.Stmt(def)), true
+				}
+			}
+			return "", nil, false
+		case *ast.ParenExpr:
+			return affineBase(x.X, depth+1)
+		case *ast.CallExpr:
+			if id, iok := x.Fun.(*ast.Ident); iok && len(x.Args) == 1 {
+				switch id.Name {
+				case "int32", "int64", "uint32", "uint64":
+					return affineBase(x.Args[0], depth+1)
+				}
+			}
+			return "", nil, false
+		case *ast.BinaryExpr:
+			if x.Op != token.ADD && x.Op != token.SUB {
+				return "", nil, false
+			}
+			if base, defs, ok := affineBase(x.X, depth+1); ok && invariantExpr(x.Y) {
+				return base, defs, true
+			}
+			if x.Op == token.ADD {
+				if base, defs, ok := affineBase(x.Y, depth+1); ok && invariantExpr(x.X) {
+					return base, defs, true
+				}
+			}
+			return "", nil, false
+		}
+		return "", nil, false
+	}
+	for i := 0; i < tree.NumScalars; i++ {
+		if bumpedSlot[i] {
+			continue
+		}
+		base, defs, aok := affineBase(unwrapWidth(call.Args[1+i]), 0)
+		if !aok || len(defs) == 0 {
+			continue
+		}
+		if !addBump(i, "_", directStep[base]) {
+			continue
+		}
+		bumpedSlot[i] = true
+		for _, d := range defs {
+			exemptWpre[d] = true
+		}
+	}
+	removedWpre := map[ast.Stmt]bool{}
+	// Uses that survive the upgrade: the fused call's arguments and
+	// the other leftover interveners. A variable read only by
+	// statements the window CONSUMED (its consumers now live inside
+	// the tree, which recomputes the value) is dead once the loop
+	// fuses.
+	liveUses := map[string]int{}
+	countIdents := func(e ast.Expr) {
+		ast.Inspect(e, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && id.Name != "_" {
+				liveUses[id.Name]++
+			}
+			return true
+		})
+	}
+	for _, a := range call.Args {
+		countIdents(a)
+	}
+	for _, st := range wpre {
+		if as, aok := st.(*ast.AssignStmt); aok {
+			for _, r := range as.Rhs {
+				countIdents(r)
+			}
+		}
+	}
+	for _, st := range wpre {
+		as, aok := st.(*ast.AssignStmt)
+		if !aok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			continue
+		}
+		lhs, lok := as.Lhs[0].(*ast.Ident)
+		if !lok {
+			continue
+		}
+		// A dead intervener drops: its only readers were consumed
+		// into the fused tree (which recomputes the value through its
+		// own scalar chain), and nothing outside the loop reads it.
+		if liveUses[lhs.Name] == 0 && sc.identCount[lhs.Name] <= inLoop[lhs.Name]+1 && !hasSideEffects(as.Rhs[0]) {
+			removedWpre[st] = true
+		}
+	}
 	loop.NumDeltas = len(deltaArgs)
 	// The counter joins as one extra scalar (slot NumScalars); its
 	// final value and the bump pointers' final values return as extra
@@ -974,6 +1106,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		delete(writes, name)
 	}
 	for _, st := range wpre {
+		// Consumed by the passes above: a derived-slot initial
+		// hoists by construction (it reads pre-loop values and the
+		// slot advances via its bump), and a dead intervener drops.
+		if exemptWpre[st] || removedWpre[st] {
+			continue
+		}
 		as, ok := st.(*ast.AssignStmt)
 		if !ok {
 			return sc.loopReject("L735")
@@ -1003,7 +1141,12 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	for _, cs := range cl.consts {
 		*prelude = append(*prelude, cs)
 	}
-	*prelude = append(*prelude, wpre...)
+	for _, st := range wpre {
+		if removedWpre[st] {
+			continue
+		}
+		*prelude = append(*prelude, st)
+	}
 	args := make([]ast.Expr, 0, len(call.Args)+1)
 	args = append(args, call.Args[:1+tree.NumScalars]...)
 	args = append(args, newID(cl.counter.Name))
@@ -1236,5 +1379,34 @@ func fusedLoopDecl(name string, loop *simdfuse.Loop, multiPackage bool) *ast.Fun
 		Name: newID(name),
 		Type: &ast.FuncType{Params: &ast.FieldList{List: params}, Results: &ast.FieldList{List: results}},
 		Body: &ast.BlockStmt{List: body},
+	}
+}
+
+// hasSideEffects reports whether dropping an expression could change
+// program behavior: anything but idents, constants, conversions,
+// arithmetic and the inline memory-load form (whose only effect — a
+// wasm OOB trap — cannot fire here: validated modules do not trap on
+// addresses their own loop is about to dereference) is kept.
+func hasSideEffects(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.Ident, *ast.BasicLit:
+		return false
+	case *ast.BinaryExpr:
+		return hasSideEffects(x.X) || hasSideEffects(x.Y)
+	case *ast.ParenExpr:
+		return hasSideEffects(x.X)
+	case *ast.CallExpr:
+		// Width conversions only (int64(v), uint64(v), ...).
+		id, ok := x.Fun.(*ast.Ident)
+		if !ok || len(x.Args) != 1 {
+			return true
+		}
+		switch id.Name {
+		case "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "uint", "int":
+			return hasSideEffects(x.Args[0])
+		}
+		return true
+	default:
+		return true
 	}
 }
