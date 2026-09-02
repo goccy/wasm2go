@@ -31,7 +31,11 @@ func Plan9AsmPathSafe(path string) bool {
 	if path == "" {
 		return false
 	}
-	if c := path[0]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_') {
+	switch c := path[0]; {
+	case c >= 'a' && c <= 'z':
+	case c >= 'A' && c <= 'Z':
+	case c == '_':
+	default:
 		return false
 	}
 	for i := 1; i < len(path); i++ {
