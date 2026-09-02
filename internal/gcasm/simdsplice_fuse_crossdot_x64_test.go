@@ -17,31 +17,59 @@ func TestX64CrossDotRewrite(t *testing.T) {
 		t.Fatal("cross-chain shape not rewritten")
 	}
 	ops := countOps(rt.Nodes)
-	if ops[x64OpRawDot] != 1 || ops[x64OpRawDotAcc] != 1 {
-		t.Fatalf("raw dot chain not built: %v", ops)
+	// A fully-VEX tree takes the pair-domain wide chain with one
+	// fold on the combine slot.
+	if ops[x64OpRawDotWide] != 1 || ops[x64OpRawDotWideAcc] != 1 || ops[x64OpRawDotFold] != 1 {
+		t.Fatalf("wide raw dot chain not built: %v", ops)
 	}
 	if ops["i8x16_shuffle"] != 0 || ops["i32x4_add"] != 0 ||
 		ops["i32x4_dot_i16x8_s"] != 0 || ops[x64OpBlockDot] != 0 {
 		t.Fatalf("combine not fully absorbed: %v", ops)
 	}
-	// The final accumulation must sit on the combine's slot (16), so
-	// consumers and the root are untouched.
-	if rt.Nodes[16].Op != x64OpRawDotAcc {
-		t.Fatalf("final accumulation not at the combine slot: %s", rt.Nodes[16].Op)
+	// The fold must sit on the combine's slot (16), so consumers and
+	// the root are untouched.
+	if rt.Nodes[16].Op != x64OpRawDotFold {
+		t.Fatalf("fold not at the combine slot: %s", rt.Nodes[16].Op)
 	}
-	head := rt.Nodes[16].Args[0]
-	if head.Kind != simdfuse.ArgNode || rt.Nodes[head.Index].Op != x64OpRawDot {
-		t.Fatalf("chain head malformed: %+v", rt.Nodes[16].Args)
+	tail := rt.Nodes[16].Args[0]
+	if tail.Kind != simdfuse.ArgNode || rt.Nodes[tail.Index].Op != x64OpRawDotWideAcc {
+		t.Fatalf("chain tail malformed: %+v", rt.Nodes[16].Args)
+	}
+	tArgs := rt.Nodes[tail.Index].Args
+	if tArgs[1] != (simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 2}) ||
+		tArgs[2] != (simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 3}) {
+		t.Fatalf("tail sources wrong: %+v", tArgs)
+	}
+	head := tArgs[0]
+	if head.Kind != simdfuse.ArgNode || rt.Nodes[head.Index].Op != x64OpRawDotWide {
+		t.Fatalf("chain head malformed: %+v", tArgs)
 	}
 	hArgs := rt.Nodes[head.Index].Args
 	if hArgs[0] != (simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 0}) ||
 		hArgs[1] != (simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 1}) {
 		t.Fatalf("head sources wrong: %+v", hArgs)
 	}
-	tArgs := rt.Nodes[16].Args
-	if tArgs[1] != (simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 2}) ||
-		tArgs[2] != (simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 3}) {
-		t.Fatalf("tail sources wrong: %+v", tArgs)
+}
+
+// A tree whose emission is not fully VEX (a store rides along) keeps
+// the self-contained per-leaf forms: no live ymm upper crosses a
+// possible mid-region VZEROUPPER.
+func TestX64CrossDotRewriteFallsBackPerLeaf(t *testing.T) {
+	tree := crossChainTree(a64EvenSel, a64OddSel, simdfuse.Arg{Kind: simdfuse.ArgPairIn, Index: 2})
+	tree.Nodes = append(tree.Nodes, simdfuse.Node{Op: "v128_store", Args: []simdfuse.Arg{
+		{Kind: simdfuse.ArgScalar, Index: 0}, {Kind: simdfuse.ArgConst}, {Kind: simdfuse.ArgNode, Index: 16},
+	}})
+	tree.Roots = []int{len(tree.Nodes) - 1}
+	rt, rewrote := x64Dot8Rewrite(tree, false)
+	if !rewrote {
+		t.Fatal("cross-chain shape not rewritten")
+	}
+	ops := countOps(rt.Nodes)
+	if ops[x64OpRawDotWide] != 0 || ops[x64OpRawDotWideAcc] != 0 || ops[x64OpRawDotFold] != 0 {
+		t.Fatalf("wide forms selected in a non-VEX tree: %v", ops)
+	}
+	if ops[x64OpRawDot] != 1 || ops[x64OpRawDotAcc] != 1 {
+		t.Fatalf("per-leaf chain not built: %v", ops)
 	}
 }
 
@@ -80,8 +108,8 @@ func TestX64RawDotEmitsCollapsedMadd(t *testing.T) {
 	}
 	asm := b.String()
 	for _, want := range []string{
-		"VPMOVSXBW", "VPMADDWD Y3, Y2, Y2", "VPHADDD Y2, Y2, Y2",
-		"VEXTRACTI128 $1, Y2, X3", "VPUNPCKLQDQ X3, X2,", "VPADDD",
+		"VPMOVSXBW", "VPMADDWD Y3, Y2,", "VPADDD Y",
+		"VPHADDD Y", "VEXTRACTI128 $1, Y2, X3", "VPUNPCKLQDQ X3, X2,",
 		"// avx2 dot", "VZEROUPPER",
 	} {
 		if !strings.Contains(asm, want) {

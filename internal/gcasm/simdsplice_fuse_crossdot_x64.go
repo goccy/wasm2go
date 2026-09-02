@@ -41,10 +41,27 @@ import (
 const (
 	// x64OpRawDot(a, b): the 16-byte signed 8-bit dot with SDOT's
 	// natural grouping — lane j sums the products of bytes 4j..4j+3.
+	// Self-contained (collapses in-place); used for single-leaf
+	// chains and as the fallback when the wide form is unavailable.
 	x64OpRawDot = "i32x4_rawdot8_avx2"
-	// x64OpRawDotAcc(acc, a, b): acc + the raw dot. acc is always a
-	// rebuilt chain node (ArgNode), never a pair input.
+	// x64OpRawDotAcc(acc, a, b): acc + the raw dot, acc and result in
+	// the collapsed 4-lane domain. acc is always a rebuilt chain node
+	// (ArgNode), never a pair input.
 	x64OpRawDotAcc = "i32x4_rawdot8_acc_avx2"
+	// Wide-chain forms: the accumulation stays in the 8-lane VPMADDWD
+	// pair domain across one full ymm — 4 ops per leaf, only the two
+	// unavoidable VPMOVSXBW lane crossings — and collapses ONCE per
+	// chain (the Zen 3 lesson: per-leaf ymm collapses lose to their
+	// own lane-crossing shuffles). The ymm upper half of the running
+	// value must survive between links, so these are selected only
+	// for fully-VEX trees, where the region defers VZEROUPPER to its
+	// exit and every other write is VEX (upper-zeroing only for its
+	// own destination).
+	x64OpRawDotWide    = "i32x8_rawdotwide8_avx2"     // (a, b)
+	x64OpRawDotWideAcc = "i32x8_rawdotwide8_acc_avx2" // (acc, a, b)
+	// x64OpRawDotFold(v): collapse the 8-lane pair-domain value to
+	// the four-consecutive-byte grouping.
+	x64OpRawDotFold = "i32x4_rawdotfold_avx2"
 )
 
 // x64CrossSelKind classifies node i as an even/odd dword-select
@@ -81,9 +98,12 @@ func x64CrossSelKind(nodes []simdfuse.Node, constPairs map[int][2]uint64, i int)
 // x64CrossDotRewrite matches the cross-chain combine shape on the RAW
 // node forms (adds over dot(extend, extend) leaves — nothing here has
 // been touched by the pairing walk, which skips all-low/all-high
-// chains) and rebuilds it as a raw-dot chain. Mutates nodes in place;
-// reports whether anything was rewritten.
-func x64CrossDotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int][2]uint64) bool {
+// chains) and rebuilds it as a raw-dot chain. wide selects the
+// pair-domain chain forms (see the op comments); the caller falls
+// back to the self-contained per-leaf form for trees whose emission
+// is not fully VEX. Mutates nodes in place; reports whether anything
+// was rewritten.
+func x64CrossDotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int][2]uint64, wide bool) bool {
 	uses := make([]int, len(nodes))
 	for _, n := range nodes {
 		for _, a := range n.Args {
@@ -214,9 +234,25 @@ func x64CrossDotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int
 		}
 		nodes[e] = simdfuse.Node{Op: a64OpElided}
 		nodes[o] = simdfuse.Node{Op: a64OpElided}
-		if k == 1 {
+		switch {
+		case k == 1:
 			nodes[c] = simdfuse.Node{Op: x64OpRawDot, Args: []simdfuse.Arg{srcArgs[0][0], srcArgs[0][1]}}
-		} else {
+		case wide:
+			// Pair-domain chain: the last leaf's accumulation lands on
+			// the highest slot and the fold on the combine node, so
+			// consumers keep reading c.
+			prev := slots[0]
+			nodes[prev] = simdfuse.Node{Op: x64OpRawDotWide, Args: []simdfuse.Arg{srcArgs[0][0], srcArgs[0][1]}}
+			for j := 1; j < k; j++ {
+				nodes[slots[j]] = simdfuse.Node{Op: x64OpRawDotWideAcc, Args: []simdfuse.Arg{
+					{Kind: simdfuse.ArgNode, Index: prev}, srcArgs[j][0], srcArgs[j][1],
+				}}
+				prev = slots[j]
+			}
+			nodes[c] = simdfuse.Node{Op: x64OpRawDotFold, Args: []simdfuse.Arg{
+				{Kind: simdfuse.ArgNode, Index: prev},
+			}}
+		default:
 			prev := slots[0]
 			nodes[prev] = simdfuse.Node{Op: x64OpRawDot, Args: []simdfuse.Arg{srcArgs[0][0], srcArgs[0][1]}}
 			for j := 1; j < k-1; j++ {
