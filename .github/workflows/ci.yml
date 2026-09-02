@@ -108,8 +108,28 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Resource trace: the first runs of this job were SIGTERMed (exit
+      # 143) four minutes in with no message; sample memory and disk so
+      # the next termination has a cause attached.
+      - name: Start resource sampler
+        run: |
+          ( while true; do
+              printf '%s ' "$(date -u +%H:%M:%S)"; free -m | awk '/Mem:/ {printf "mem used=%sM avail=%sM ", $3, $7}'; \
+              df -m /tmp / | awk 'NR>1 {printf "%s avail=%sM ", $6, $4}'; \
+              ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<=4 {printf "%s=%dM ", $2, $1/1024}'; echo
+              sleep 10
+            done ) > "$RUNNER_TEMP/resources.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/sampler.pid"
+
       - name: Transpile the pinned llama.wasm and link a consumer per target
         run: make llama-bundle-link
+
+      - name: Resource trace
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/sampler.pid")" 2>/dev/null || true
+          tail -n 60 "$RUNNER_TEMP/resources.log" || true
+          dmesg 2>/dev/null | grep -iE "oom|killed process|out of memory" | tail -n 5 || true
 
   lint:
     runs-on: ubuntu-latest
