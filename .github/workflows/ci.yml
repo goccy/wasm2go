@@ -108,28 +108,25 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Resource trace: the first runs of this job were SIGTERMed (exit
-      # 143) four minutes in with no message; sample memory and disk so
-      # the next termination has a cause attached.
-      - name: Start resource sampler
+      # Resource trace, inline: the first runs of this job ended with
+      # exit 143 four minutes in, and even the if: always() steps were
+      # skipped afterwards — the runner itself went away, so nothing
+      # printed after the fact survives. The step log streams live, so
+      # a sampler writing to stdout inside the same step keeps every
+      # sample taken before the runner dies.
+      - name: Transpile the pinned llama.wasm and link a consumer per target
         run: |
+          echo "runner: $(nproc) cpus, $(free -m | awk '/Mem:/ {print $2}') MiB RAM, $(df -m / | awk 'NR==2 {print $4}') MiB free on /, $(df -m /tmp | awk 'NR==2 {print $4}') MiB free on /tmp"
           ( while true; do
-              printf '%s ' "$(date -u +%H:%M:%S)"; free -m | awk '/Mem:/ {printf "mem used=%sM avail=%sM ", $3, $7}'; \
-              df -m /tmp / | awk 'NR>1 {printf "%s avail=%sM ", $6, $4}'; \
+              printf 'sample %s ' "$(date -u +%H:%M:%S)"; free -m | awk '/Mem:/ {printf "mem used=%sM avail=%sM swap_used=", $3, $7}'; free -m | awk '/Swap:/ {printf "%sM ", $3}'; \
+              df -m / | awk 'NR==2 {printf "disk_avail=%sM ", $4}'; \
               ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<=4 {printf "%s=%dM ", $2, $1/1024}'; echo
               sleep 10
-            done ) > "$RUNNER_TEMP/resources.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/sampler.pid"
-
-      - name: Transpile the pinned llama.wasm and link a consumer per target
-        run: make llama-bundle-link
-
-      - name: Resource trace
-        if: always()
-        run: |
-          kill "$(cat "$RUNNER_TEMP/sampler.pid")" 2>/dev/null || true
-          tail -n 60 "$RUNNER_TEMP/resources.log" || true
-          dmesg 2>/dev/null | grep -iE "oom|killed process|out of memory" | tail -n 5 || true
+            done ) &
+          sampler=$!
+          make llama-bundle-link; rc=$?
+          kill $sampler 2>/dev/null || true
+          exit $rc
 
   lint:
     runs-on: ubuntu-latest
