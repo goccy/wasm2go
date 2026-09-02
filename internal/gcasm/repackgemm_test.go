@@ -7,7 +7,29 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/goccy/wasm2go/internal/wasm"
 )
+
+// The retarget fires only under FastMath without the opt-out, and
+// only when the module exports the repack GEMM by its debug name.
+func TestRepackGemmExportGate(t *testing.T) {
+	mod := &wasm.Module{Exports: []wasm.Export{
+		{Name: "dbg_gemm_q8_0_4x4", Kind: wasm.ExportFunc, Index: 9},
+	}}
+	if got := repackGemmExport(mod, Config{FastMath: true}); got != "Fn9" {
+		t.Errorf("FastMath retarget = %q, want Fn9", got)
+	}
+	if got := repackGemmExport(mod, Config{FastMath: true, DisableRepackGemm: true}); got != "" {
+		t.Errorf("DisableRepackGemm retarget = %q, want none", got)
+	}
+	if got := repackGemmExport(mod, Config{}); got != "" {
+		t.Errorf("non-FastMath retarget = %q, want none", got)
+	}
+	if got := repackGemmExport(&wasm.Module{}, Config{FastMath: true}); got != "" {
+		t.Errorf("no-export retarget = %q, want none", got)
+	}
+}
 
 func TestRepackGemmKernelShape(t *testing.T) {
 	offs := &ModuleOffsets{M: 8, MemSize: 0}

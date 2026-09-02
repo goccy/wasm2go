@@ -72,6 +72,25 @@ type SynthSig struct {
 	Packed bool
 }
 
+// repackGemmExport resolves the repack GEMM retarget target: llama-wasm
+// exports its wasm-shaped q8_0x4 GEMM under a stable debug name so the
+// transpiler can swap the whole body for a native 4x4 tile kernel (see
+// a64RepackGemmKernel / x64RepackGemmKernel). FastMath only — the
+// kernel fuses the per-block scale multiply-accumulate — and subject
+// to the DisableRepackGemm opt-out. Returns the FnN symbol, or ""
+// when the retarget is off or the export is absent.
+func repackGemmExport(mod *wasm.Module, cfg Config) string {
+	if !cfg.FastMath || cfg.DisableRepackGemm {
+		return ""
+	}
+	for _, e := range mod.Exports {
+		if e.Kind == wasm.ExportFunc && e.Name == "dbg_gemm_q8_0_4x4" {
+			return fmt.Sprintf("Fn%d", e.Index)
+		}
+	}
+	return ""
+}
+
 func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string, fused map[string]*simdfuse.Tree, fusedLoops map[string]*simdfuse.Loop, outlined map[string][]string, synth map[string]SynthSig, nrc2 *Nrc2Spec, cfg Config) (map[string][]byte, *BuildStats, error) {
 	all := map[string][]byte{}
 	if len(mainSrc) > 0 {
@@ -82,19 +101,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	}
 	pure := PureFilter(all)
 
-	// The repack GEMM retarget: llama-wasm exports its wasm-shaped
-	// q8_0x4 GEMM under a stable debug name so the transpiler can
-	// swap the whole body for a native 4x4 tile kernel (see
-	// a64RepackGemmKernel / x64RepackGemmKernel). Fast-math only —
-	// the kernel fuses the per-block scale multiply-accumulate.
-	repackGemmFn := ""
-	if cfg.FastMath && os.Getenv("WASM2GO_NO_REPACK_GEMM") == "" {
-		for _, e := range mod.Exports {
-			if e.Kind == wasm.ExportFunc && e.Name == "dbg_gemm_q8_0_4x4" {
-				repackGemmFn = fmt.Sprintf("Fn%d", e.Index)
-			}
-		}
-	}
+	repackGemmFn := repackGemmExport(mod, cfg)
 
 	// Capture tree.
 	dir, err := os.MkdirTemp("", "gcasm-capture-*")

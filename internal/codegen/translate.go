@@ -157,6 +157,12 @@ type Options struct {
 	// gate it and validate with token-level equivalence instead of
 	// byte-equality probes.
 	FastMath bool
+	// DisableRepackGemm opts out of the repack GEMM retarget: under
+	// FastMath, the asm bundle replaces an exported dbg_gemm_q8_0_4x4
+	// body wholesale with a native 4x4 tile kernel; this switch keeps
+	// the transformed wasm lowering instead. It exists for A/B
+	// comparison and fault isolation of that one replacement.
+	DisableRepackGemm bool
 	// VecDotPairEntry opts into vec_dot row/column pairing: it names
 	// the per-type trait-table entry (the source runtime's type-enum
 	// value) whose self-dot should run two rows and columns per call
