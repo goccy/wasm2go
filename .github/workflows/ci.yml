@@ -92,21 +92,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      # The gcasm capture compiles the chunk packages (each a multi-
-      # hundred-thousand-line generated file) with the gc toolchain; in
-      # parallel they exhaust the runner's memory and the step is
-      # terminated (exit 143). Serialize the package builds and cap the
-      # Go heap of every compiler / wasm2go process.
+      # The gcasm capture compiles each chunk package (a multi-hundred-
+      # thousand-line generated file) with the gc toolchain; serialize
+      # the package builds so their peaks do not add up on the runner.
       GOFLAGS: -p=1
-      GOMEMLIMIT: 6GiB
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Latest Go 1.25 patch, NOT go.mod's floor: go1.25.0's compiler
+      # needs ~12-15 GiB for the largest chunk package (p0) and took the
+      # 16 GiB runner down (exit 143, every later step skipped); go1.26
+      # and the later 1.25 patches compile it in under 2 GiB. The
+      # production bundle is built in the wasmify image from
+      # golang:1.25 (latest patch), so this is also the faithful choice.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.25'
+          check-latest: true
 
       # Resource trace, inline: the first runs of this job ended with
       # exit 143 four minutes in, and even the if: always() steps were
