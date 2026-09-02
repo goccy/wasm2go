@@ -120,7 +120,8 @@ jobs:
           ( while true; do
               printf 'sample %s ' "$(date -u +%H:%M:%S)"; free -m | awk '/Mem:/ {printf "mem used=%sM avail=%sM swap_used=", $3, $7}'; free -m | awk '/Swap:/ {printf "%sM ", $3}'; \
               df -m / | awk 'NR==2 {printf "disk_avail=%sM ", $4}'; \
-              ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<=4 {printf "%s=%dM ", $2, $1/1024}'; echo
+              ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<=4 {printf "%s=%dM ", $2, $1/1024}'; \
+              ps -eo rss,args --sort=-rss | awk 'NR==2 {for (i=2;i<=NF;i++) if ($i=="-p") {printf "top_pkg=%s", $(i+1)}}'; echo
               sleep 10
             done ) &
           sampler=$!
