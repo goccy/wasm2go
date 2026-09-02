@@ -425,6 +425,35 @@ func wasmKind(v wasm.ValType) ArgKind {
 	}
 }
 
+// abi0ArgBytes is the ABI0 stack-argument byte count of a wasm
+// signature carried behind the module pointer: m at +0, then each
+// parameter at its natural size and alignment (4 for i32/f32, 8 for
+// i64/f64), then — when there is a result — the result section at the
+// next pointer-aligned offset. This is the "-N" the TEXT directive of
+// the fn's own asm body carries, which the gc toolchain checks against
+// the Go declaration.
+func abi0ArgBytes(ft wasm.FuncType) int {
+	off := 8
+	add := func(v wasm.ValType) {
+		sz := 8
+		if v == wasm.ValI32 || v == wasm.ValF32 {
+			sz = 4
+		}
+		off = (off + sz - 1) &^ (sz - 1)
+		off += sz
+	}
+	for _, p := range ft.Params {
+		add(p)
+	}
+	if len(ft.Results) > 0 {
+		off = (off + 7) &^ 7
+		for _, r := range ft.Results {
+			add(r)
+		}
+	}
+	return off
+}
+
 // goSigB is the bundle-side signature entry (AST-parsed).
 type goSigB struct {
 	params []ArgKind
@@ -668,6 +697,20 @@ func buildPkg(
 	stdlibUsed := map[string]bool{}
 
 	fallbackNames := map[string]bool{}
+	// spelledRemote / pulledRemote record, per qualified symbol, every
+	// remote fn this package's ASM references by its spelled dotted
+	// name and every remote symbol this package's GO declares through
+	// a bodyless //go:linkname pull. The two sets must stay disjoint:
+	// a bodyless linkname pull of a symbol the same package's asm also
+	// references makes the compiler emit a DUPOK ABI0 wrapper under the
+	// REMOTE name (symabis reports the asm reference, the pull supplies
+	// the declaration), and the linker keeps whichever of that wrapper
+	// and the remote's real TEXT it loads first — when the wrapper wins,
+	// the two ABI wrappers call each other forever and the link fails
+	// with "nosplit stack over ... infinite cycle". buildPkg refuses to
+	// emit such a package (see the check after the decls are built).
+	spelledRemote := map[string]bool{}
+	pulledRemote := map[string]bool{}
 	// textNames records every captured fn that emitted a TEXT body
 	// (transformed, gated-split, or direct-asm). Together with
 	// fallbackNames it must cover the whole capture — the invariant
@@ -724,6 +767,7 @@ func buildPkg(
 			// or a callee outside the capture keeps the historical
 			// Go-wrapper hop.
 			if fnOwner[cname] == cpkg && asmgen.Plan9AsmPathSafe(cpkg) {
+				spelledRemote[sym] = true
 				return params, hasRes, res, asmSpellPath(cpkg) + "·" + cname, true
 			}
 			wrap := "gcasmFwd" + cname
@@ -1049,7 +1093,8 @@ func buildPkg(
 	// feed the trampoline/linkname sets below).
 	var fallbackBodies []string
 	fnTokRe := regexp.MustCompile(`\b[Ff]n\d+\b`)
-	remoteFallbackLN := map[string]string{} // local FnN name → remote qualified
+	remoteFallbackLN := map[string]string{} // local FnN name → remote qualified (unspellable owner paths)
+	remoteTramp := map[string]string{}      // local FnN name → owner import path (spellable)
 	if len(fallbackNames) > 0 {
 		var names []string
 		for n := range fallbackNames {
@@ -1077,17 +1122,54 @@ func buildPkg(
 			}
 			body := string(m)
 			fallbackBodies = append(fallbackBodies, body)
-			// Cross-chunk references from Go code: transformed remote
-			// fns get a local decl + tail-JMP trampoline (Go callers
-			// reach the local ABI0 symbol via symabis); fallback
-			// remote fns are plain Go, reached via //go:linkname.
+			// Cross-chunk references from Go code. On a plan-9-spellable
+			// owner path the reference goes through a LOCAL bodyless
+			// decl implemented by a NOSPLIT tail-JMP trampoline to the
+			// spelled remote symbol: the compiler then binds the decl to
+			// this package's own asm (symabis def) and never sees a
+			// declaration of the remote symbol, so no ABI wrapper is
+			// emitted under the remote name — the remote's real TEXT
+			// (or, for a remote fallback fn, the ABI0 wrapper its own
+			// gcasmABI0Keep anchor forces) stays the only ABI0
+			// definition (see spelledRemote / pulledRemote). Only an
+			// unspellable owner path keeps the bodyless //go:linkname
+			// pull: no asm reference can be spelled there, so the pull
+			// is the sole reference and the wrapper it induces is the
+			// sole ABI0 definition.
 			for _, tok := range fnTokRe.FindAllString(body, -1) {
 				owner, known := fnOwner[tok]
 				if !known || owner == selfPath {
 					continue
 				}
+				if asmgen.Plan9AsmPathSafe(owner) {
+					remoteTramp[tok] = owner
+					continue
+				}
 				remoteFallbackLN[tok] = owner + "." + tok
 			}
+		}
+	}
+
+	// Cross-chunk trampolines for the fallback bodies' remote calls
+	// (see the collection above). $0 frame, NOSPLIT: the JMP hands the
+	// caller's argument frame to the remote unchanged, and the remote's
+	// own prologue performs the stack check.
+	if len(remoteTramp) > 0 {
+		var names []string
+		for n := range remoteTramp {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		asmB.WriteString("// Cross-chunk trampolines: local ABI0 entry points the fallback\n// bodies' Go calls bind to; each tail-jumps to the remote fn's spelled\n// symbol (no //go:linkname pull of an asm-referenced symbol).\n")
+		for _, n := range names {
+			fm := fnSymRe.FindStringSubmatch(n)
+			idx, err := strconv.ParseUint(fm[1], 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			target := asmSpellPath(remoteTramp[n]) + "·" + n
+			spelledRemote[remoteTramp[n]+"."+n] = true
+			fmt.Fprintf(&asmB, "TEXT ·%s(SB), NOSPLIT, $0-%d\n\tJMP %s(SB)\n\n", n, abi0ArgBytes(mod.FuncTypeOf(uint32(idx))), target)
 		}
 	}
 
@@ -1183,6 +1265,7 @@ func buildPkg(
 			if sig.hasRes {
 				ret = " " + goTypeName(sig.res)
 			}
+			pulledRemote[goForwards[k]] = true
 			fmt.Fprintf(&decl, "//go:linkname gcasmLN%s %s\nfunc gcasmLN%s(%s)%s\n\n", k, goForwards[k], k, ps.String(), ret)
 			fmt.Fprintf(&decl, "func %s(%s)%s {\n\t", k, ps.String(), ret)
 			if sig.hasRes {
@@ -1226,34 +1309,61 @@ var (
 )
 `)
 
-	// Fallback bodies on amd64 (extracted above), plus linkname decls
-	// for the remote FALLBACK fns those bodies reference (plain Go on
-	// both sides).
+	// Remote fns referenced from the fallback bodies (extracted above):
+	// a bare local decl per trampoline (the asm above implements it),
+	// and — for unspellable owner paths only — the bodyless linkname
+	// pull (plain Go on both sides; chunk import graphs are cyclic).
+	remoteDecl := func(k string) (string, error) {
+		fm := fnSymRe.FindStringSubmatch(k)
+		idx, err := strconv.ParseUint(fm[1], 10, 32)
+		if err != nil {
+			return "", err
+		}
+		ft := mod.FuncTypeOf(uint32(idx))
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "func %s(m %s", k, moduleTypeName(rel))
+		for i, pk := range ft.Params {
+			fmt.Fprintf(&sb, ", l%d %s", i, goTypeName(wasmKind(pk)))
+		}
+		sb.WriteString(")")
+		if len(ft.Results) == 1 {
+			fmt.Fprintf(&sb, " (r0 %s)", goTypeName(wasmKind(ft.Results[0])))
+		}
+		return sb.String(), nil
+	}
+	if len(remoteTramp) > 0 {
+		var keys []string
+		for k := range remoteTramp {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		decl.WriteString("\n// Remote functions referenced from local fallback bodies, reached\n// through the tail-JMP trampolines in the asm file.\n\n")
+		for _, k := range keys {
+			d, err := remoteDecl(k)
+			if err != nil {
+				return nil, err
+			}
+			decl.WriteString(d + "\n\n")
+		}
+	}
 	if len(remoteFallbackLN) > 0 {
 		var keys []string
 		for k := range remoteFallbackLN {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		decl.WriteString("\n// Remote pure-fallback functions referenced from local fallback\n// bodies (Go-to-Go via linkname; chunk import graphs are cyclic).\n\n")
+		decl.WriteString("\n// Remote functions referenced from local fallback bodies on an\n// import path plan 9 asm cannot spell (Go-to-Go via linkname).\n\n")
 		for _, k := range keys {
-			fm := fnSymRe.FindStringSubmatch(k)
-			idx, err := strconv.ParseUint(fm[1], 10, 32)
+			d, err := remoteDecl(k)
 			if err != nil {
 				return nil, err
 			}
-			ft := mod.FuncTypeOf(uint32(idx))
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "func %s(m %s", k, moduleTypeName(rel))
-			for i, pk := range ft.Params {
-				fmt.Fprintf(&sb, ", l%d %s", i, goTypeName(wasmKind(pk)))
-			}
-			sb.WriteString(")")
-			if len(ft.Results) == 1 {
-				fmt.Fprintf(&sb, " (r0 %s)", goTypeName(wasmKind(ft.Results[0])))
-			}
-			fmt.Fprintf(&decl, "//go:linkname %s %s\n%s\n\n", k, remoteFallbackLN[k], sb.String())
+			pulledRemote[remoteFallbackLN[k]] = true
+			fmt.Fprintf(&decl, "//go:linkname %s %s\n%s\n\n", k, remoteFallbackLN[k], d)
 		}
+	}
+	if conflicts := crossChunkPullConflicts(pulledRemote, spelledRemote); len(conflicts) > 0 {
+		return nil, fmt.Errorf("%s/%s: cross-chunk symbols both //go:linkname-pulled and asm-referenced in one package (the compiler would emit a DUPOK ABI0 wrapper that can shadow the remote TEXT): %s", pkgOrRoot(rel), arch.name, strings.Join(conflicts, ", "))
 	}
 	if len(fallbackBodies) > 0 {
 		decl.WriteString("\n// Per-function pure fallbacks (signatures ABIInternal cannot\n// register-assign).\n\n")
@@ -1341,4 +1451,19 @@ func localTypeSpelling(typ, importPath, rel string) string {
 	typ = strings.ReplaceAll(typ, importPath+"/base.", "base.")
 	selfPath := importPath + "/" + rel
 	return strings.ReplaceAll(typ, selfPath+".", "")
+}
+
+// crossChunkPullConflicts returns, sorted, the qualified symbols a
+// package both declares through a bodyless //go:linkname pull and
+// references from its own asm by spelled name. The set must be empty:
+// see the spelledRemote / pulledRemote comment in buildPkg.
+func crossChunkPullConflicts(pulled, spelled map[string]bool) []string {
+	var out []string
+	for sym := range pulled {
+		if spelled[sym] {
+			out = append(out, sym)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

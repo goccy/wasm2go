@@ -50,6 +50,16 @@ func TestGate4Bundle(t *testing.T) {
 		defer codegen.SetMultiPackageThreshold(64)()
 		gate4At(t, "cg_crosscall", "github.com/gentest")
 	})
+	// A pure-Go fallback body calling a remote transformed fn, packed
+	// into the same chunk as a transformed fn that CALLs the same
+	// remote from asm (budget 100 packs the two next to each other):
+	// the Go-level reference must reach the remote through a local
+	// trampoline, never a //go:linkname pull of an asm-referenced
+	// symbol (see TestCrossChunkBundleLinksInEveryPackageOrder).
+	t.Run("fallbackcaller_multichunk_dotted", func(t *testing.T) {
+		defer codegen.SetMultiPackageThreshold(100)()
+		gate4At(t, "cg_crosscall_fallbackcaller", "github.com/gentest")
+	})
 }
 
 func gate4(t *testing.T, fixture string) {

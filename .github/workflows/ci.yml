@@ -81,6 +81,28 @@ jobs:
       - name: Test with the arm64 splices enabled
         run: go test -count=1 ./transpile/... ./internal/gcasm/...
 
+  # Consumer-link gate on the production bundle shape: transpile the
+  # pinned goccy/llama-wasm release wasm with llama-wasm's own options
+  # and LINK a consumer for linux/arm64, linux/amd64 (GOAMD64=v2) and
+  # linux/amd64 (GOAMD64=v1). Package builds alone never run the
+  # linker's nosplit/ABI-wrapper resolution; a multi-chunk bundle once
+  # compiled everywhere and linked nowhere, and was only caught four
+  # releases downstream. See `make llama-bundle-link`.
+  llama-bundle-link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Transpile the pinned llama.wasm and link a consumer per target
+        run: make llama-bundle-link
+
   lint:
     runs-on: ubuntu-latest
     steps:

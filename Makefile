@@ -20,7 +20,7 @@ GORELEASER := go tool -modfile=tools/go.mod goreleaser
 # own gates plus the transpile end-to-end test and the consumer e2e.
 COVERAGE_THRESHOLD ?= 83
 
-.PHONY: build test test-cover lint vet release release/check install/wat2wasm clean
+.PHONY: build test test-cover lint vet release release/check install/wat2wasm clean llama-bundle-link
 
 # build compiles the wasm2go CLI into ./bin.
 build: | $(BIN)
@@ -106,3 +106,28 @@ if_sudo = $$(command -v sudo >/dev/null 2>&1 && echo sudo || true)
 
 clean:
 	rm -rf $(BIN) coverage.out dist
+
+# llama-bundle-link is the consumer-link gate for the production bundle
+# shape: transpile the pinned goccy/llama-wasm release wasm with the
+# SAME options llama-wasm's pipeline passes (see WASM2GO_TUNING in that
+# repo's Makefile and wasmify's transpilerOptions), then LINK a consumer
+# binary that reaches every export, for each asm target. `go build` of
+# the bundle packages alone is NOT this check: the linker's nosplit walk
+# and ABI-wrapper resolution run only when a binary is linked, and the
+# multi-chunk direct-call layout once shipped a bundle that compiled
+# everywhere and linked nowhere (arm64 / amd64 v2). Cross-compiles, so
+# one host covers every target; no execution.
+LLAMA_WASM_REPO    ?= goccy/llama-wasm
+LLAMA_WASM_VERSION ?= v0.3.1
+LLAMA_BUNDLE_DIR   := $(BIN)/llama-bundle
+LLAMA_BUNDLE_FLAGS := -import github.com/goccy/llamawasm2go -pkg wasm2go -bulk-export-prefix w_ \
+	-outline 100 -simd-unroll 4 -fuse-loops -fuse-loop-unroll 4 -fast-math \
+	-vec-dot-pair-entry 8 -vec-dot-rows
+
+llama-bundle-link: build
+	rm -rf $(LLAMA_BUNDLE_DIR) && mkdir -p $(LLAMA_BUNDLE_DIR)/bundle $(LLAMA_BUNDLE_DIR)/consumer
+	curl -fSL --proto '=https' --tlsv1.2 -o $(LLAMA_BUNDLE_DIR)/llama.wasm \
+		https://github.com/$(LLAMA_WASM_REPO)/releases/download/$(LLAMA_WASM_VERSION)/llama.wasm
+	$(BIN)/wasm2go -i $(LLAMA_BUNDLE_DIR)/llama.wasm -out-dir $(LLAMA_BUNDLE_DIR)/bundle $(LLAMA_BUNDLE_FLAGS)
+	printf 'module github.com/goccy/llamawasm2go\n\ngo 1.25.0\n' > $(LLAMA_BUNDLE_DIR)/bundle/go.mod
+	scripts/bundle-link-consumer.sh $(LLAMA_BUNDLE_DIR)/bundle github.com/goccy/llamawasm2go $(LLAMA_BUNDLE_DIR)/consumer
