@@ -71,17 +71,19 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		opts.HelperPrefix = "base"
 	}
 	// Direct-call and memory-op callees resolve through the same
-	// machinery the listing transform uses; resolution registers the
-	// chunk-local forward wrapper as a side effect, so the returned
-	// symbol always links in this package.
+	// machinery the listing transform uses. calleeSig returns the
+	// exact CALL operand — a local "·name", a chunk-local forward
+	// wrapper it registers as a side effect, or a spelled remote
+	// "pkg·FnN" reference — and asmgen emits it verbatim, so every
+	// shape links from this package.
 	opts.CalleeSymbol = func(idx uint32) (string, bool) {
 		for _, bare := range []string{fmt.Sprintf("Fn%d", idx), fmt.Sprintf("fn%d", idx)} {
 			owner, ok := fnOwner[bare]
 			if !ok {
 				continue
 			}
-			if _, _, _, localSym, ok2 := calleeSig(owner + "." + bare); ok2 {
-				return strings.TrimPrefix(localSym, "·"), true
+			if _, _, _, sym, ok2 := calleeSig(owner + "." + bare); ok2 {
+				return sym, true
 			}
 		}
 		return "", false
@@ -91,8 +93,8 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		if rel != "" {
 			qualified = importPath + "/base." + strings.ToUpper(helper[:1]) + helper[1:]
 		}
-		if _, _, _, localSym, ok := calleeSig(qualified); ok {
-			return strings.TrimPrefix(localSym, "·"), true
+		if _, _, _, sym, ok := calleeSig(qualified); ok {
+			return sym, true
 		}
 		return "", false
 	}

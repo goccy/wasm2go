@@ -111,16 +111,20 @@ type FuncOptions struct {
 	// slot-only mode (no register homes, no m-cache, no loop-carry
 	// coalesce) because splice bodies clobber registers freely.
 	Splicer SimdSplicer
-	// CalleeSymbol, when non-nil, resolves a direct-call target to a
-	// locally CALLable bare asm symbol (no ·/(SB) decoration; possibly
-	// a host-emitted forward wrapper). Calls resolved this way are
-	// exempt from ForbidCalls — the host guarantees the symbol links
-	// in the package the body lands in. ok=false falls back to the
-	// FuncSymbol spelling and the ForbidCalls consequence.
+	// CalleeSymbol, when non-nil, resolves a direct-call target to
+	// the plan 9 symbol operand to CALL, without the "(SB)" suffix:
+	// a package-local "·name" (possibly a host-emitted forward
+	// wrapper) or a spelled cross-package "pkg·name" reference. The
+	// operand is emitted verbatim — goAsmSymbol is NOT applied, so
+	// the host controls the exact spelling. Calls resolved this way
+	// are exempt from ForbidCalls — the host guarantees the symbol
+	// links in the package the body lands in. ok=false falls back to
+	// the FuncSymbol spelling and the ForbidCalls consequence.
 	CalleeSymbol func(funcIdx uint32) (string, bool)
 	// MemHelperSymbol likewise resolves the memory-op helper family
 	// (memorySize / memoryGrow / memoryCopy / memoryFill and their 64
-	// variants) to a locally CALLable bare symbol.
+	// variants) to a CALLable symbol operand (same shape as
+	// CalleeSymbol: no "(SB)" suffix, emitted verbatim).
 	MemHelperSymbol func(name string) (string, bool)
 	// PackedParams, when non-nil, marks the packed outlined-boundary
 	// form: the Go-side signature carries only the module pointer and
@@ -2305,7 +2309,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 						z, ok1 := opts.MemHelperSymbol("wasm_trap_div_zero")
 						ovf, ok2 := opts.MemHelperSymbol("wasm_trap_int_overflow")
 						if ok1 && ok2 {
-							p.trapDivZero, p.trapIntOvf = "·"+z, "·"+ovf
+							p.trapDivZero, p.trapIntOvf = z, ovf
 							break
 						}
 						p.divRemInline = false
@@ -2351,24 +2355,32 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				if err != nil {
 					return nil, fmt.Errorf("OpCallDirect v%d: callee %d frame: %w", v.ID, calleeIdx, err)
 				}
-				var bareName string
+				symbol := ""
 				resolved := false
 				if opts.CalleeSymbol != nil {
-					bareName, resolved = opts.CalleeSymbol(calleeIdx)
+					var operand string
+					if operand, resolved = opts.CalleeSymbol(calleeIdx); resolved {
+						// The resolver hands back the exact operand
+						// (local "·name" or spelled cross-package
+						// "pkg·name") — use it verbatim; goAsmSymbol
+						// would mis-split a spelled name (its dots
+						// are U+00B7, not ASCII ".").
+						symbol = operand + "(SB)"
+					}
 				}
 				if !resolved {
 					// Unresolved callees count against ForbidCalls.
 					p.noteNonSimdCall(v)
+					bareName := fmt.Sprintf("Fn%d", calleeIdx)
 					if opts.FuncSymbol != nil {
 						bareName = opts.FuncSymbol(calleeIdx)
-					} else {
-						bareName = fmt.Sprintf("Fn%d", calleeIdx)
 					}
+					symbol = goAsmSymbol(bareName)
 				}
 				p.directs[v.ID] = &directCall{
 					sig:    csig,
 					frame:  cframe,
-					symbol: goAsmSymbol(bareName),
+					symbol: symbol,
 				}
 				if cframe.argSize > maxCallee {
 					maxCallee = cframe.argSize
@@ -2494,18 +2506,15 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 				if err != nil {
 					return nil, fmt.Errorf("%v v%d: frame: %w", v.Op, v.ID, err)
 				}
-				// OpMem* lowerings always CALL the same-package
-				// helper symbol — `·memorySize(SB)` etc. In
-				// multi-package mode the caller is responsible for
-				// emitting a chunk-local trampoline that uses
-				// //go:linkname to bridge to the canonical
-				// implementation living in base. Plan9 asm cannot
-				// CALL across packages on user code, so the indirect
-				// hop is mandatory.
+				// OpMem* lowerings CALL the operand the resolver
+				// hands back — `·memorySize(SB)` same-package, or in
+				// multi-package mode the chunk-local //go:linkname
+				// trampoline the host registers to bridge to the
+				// canonical implementation living in base.
 				sym := ""
 				if opts.MemHelperSymbol != nil {
-					if bare, ok := opts.MemHelperSymbol(helperName); ok {
-						sym = fmt.Sprintf("·%s(SB)", bare)
+					if operand, ok := opts.MemHelperSymbol(helperName); ok {
+						sym = operand + "(SB)"
 					}
 				}
 				if sym == "" {
@@ -3458,10 +3467,10 @@ func wrapperSymbol(helperPfx, name string) string {
 // embed a "/" or "." inside a symbol operand — the U+00B7 /
 // U+2215 substitution we apply here. Any other punctuation that
 // Go module paths permit ("-", "+", "~", ...) has no plan 9
-// counterpart, which is why the asm-CALL optimization in
-// asm_bundle.go is gated behind isPlan9AsmSafe and falls back to
-// the per-chunk Go-body wrapper for hyphenated host paths
-// (see asm_bundle.go's comment on buildAsmFilesMultiChunk).
+// counterpart, which is why the cross-package asm-CALL shapes in
+// internal/codegen and internal/gcasm are gated behind
+// Plan9AsmPathSafe (plan9path.go) and fall back to per-chunk
+// Go-body wrappers for hyphenated host paths.
 //
 // The split between package and symbol uses the LAST dot, which
 // is the only dot that can legitimately separate path from symbol

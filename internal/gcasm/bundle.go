@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goccy/wasm2go/internal/asmgen"
 	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -645,6 +646,11 @@ func buildPkg(
 	stdlibUsed := map[string]bool{}
 
 	fallbackNames := map[string]bool{}
+	// textNames records every captured fn that emitted a TEXT body
+	// (transformed, gated-split, or direct-asm). Together with
+	// fallbackNames it must cover the whole capture — the invariant
+	// the post-loop check below enforces.
+	textNames := map[string]bool{}
 	pool := &ConstPool{}
 	types := &TypeTable{}
 	jt := &JTTable{}
@@ -695,7 +701,7 @@ func buildPkg(
 			// A path plan 9 cannot spell (e.g. a hyphenated host repo)
 			// or a callee outside the capture keeps the historical
 			// Go-wrapper hop.
-			if fnOwner[cname] == cpkg && plan9AsmPathSafe(cpkg) {
+			if fnOwner[cname] == cpkg && asmgen.Plan9AsmPathSafe(cpkg) {
 				return params, hasRes, res, asmSpellPath(cpkg) + "·" + cname, true
 			}
 			wrap := "gcasmFwd" + cname
@@ -784,6 +790,7 @@ func buildPkg(
 				asmB.WriteString(dab)
 				asmB.WriteString("\n")
 				stats.DirectAsm++
+				textNames[name] = true
 				declFns.WriteString("func " + name + declSig(rel, name, declParams, hasRes, res, synth) + "\n")
 				continue
 			}
@@ -925,6 +932,7 @@ func buildPkg(
 					mirrorVar, featureRef, mirrorVar, featureRef)
 			}
 			fmt.Fprintf(&declFns, "func %s%s\nfunc %s%s\nfunc %s%s\n", name, sig, featSym, sig, portSym, sig)
+			textNames[name] = true
 			continue
 		}
 		asmB.WriteString(body)
@@ -933,6 +941,7 @@ func buildPkg(
 			stats.JumpTables++
 		}
 		stats.Transformed++
+		textNames[name] = true
 		declFns.WriteString("func " + name + sig + "\n")
 	}
 	stats.SimdSpliced += splices.Spliced
@@ -943,6 +952,20 @@ func buildPkg(
 	for _, n := range outlinedNames {
 		if !seenSynth[n] {
 			return nil, fmt.Errorf("outlined %s: not present in the %s capture", n, arch.name)
+		}
+	}
+	// Every captured fn must leave the loop above either with a TEXT
+	// body or registered as a pure-Go fallback. A name that slips
+	// both sets has no symbol in this package at all, and — worse —
+	// other chunks may already have spelled a direct CALL against it
+	// (see calleeSig), a hole that would otherwise surface only as a
+	// link error in the consumer build. Each degrade path added to
+	// the loop must keep this invariant; the check catches the one
+	// that forgets.
+	for _, f := range pfns {
+		name := f.Name[strings.LastIndex(f.Name, ".")+1:]
+		if !textNames[name] && !fallbackNames[name] {
+			return nil, fmt.Errorf("%s: dropped by the %s build: neither transformed to asm nor registered as a pure-Go fallback", name, arch.name)
 		}
 	}
 
@@ -960,7 +983,7 @@ func buildPkg(
 	// wrappers for every cross-chunk call, so no direct reference to a
 	// fallback fn is ever made and the anchor would be pure dead
 	// weight — skip it there.
-	if len(fallbackNames) > 0 && plan9AsmPathSafe(importPath) {
+	if len(fallbackNames) > 0 && asmgen.Plan9AsmPathSafe(importPath) {
 		var names []string
 		for n := range fallbackNames {
 			names = append(names, n)

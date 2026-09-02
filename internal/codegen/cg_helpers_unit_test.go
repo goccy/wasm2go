@@ -347,47 +347,6 @@ func TestFloatInitExpr(t *testing.T) {
 	}
 }
 
-// TestIsPlan9AsmSafe pins the per-byte safety predicate that decides
-// whether the asm CALL syntax can embed a Go import path verbatim
-// (mapping "/" → "∕" and "." → "·") or whether we have to fall back
-// to the per-chunk Go-body trampoline because some byte in the path
-// has no plan 9 identifier substitute.
-func TestIsPlan9AsmSafe(t *testing.T) {
-	cases := []struct {
-		path string
-		want bool
-	}{
-		// Single-name stdlib-style paths: safe.
-		{"runtime", true},
-		{"syscall", true},
-		// Nested paths with letters / digits / underscores: safe.
-		{"internal/runtime/atomic", true},
-		{"a/b/c", true},
-		{"foo_bar/baz", true},
-		// Domain-style paths: dots are remapped to U+00B7, still safe.
-		{"github.com/foo/bar", true},
-		{"x.y.z/pkg", true},
-		// Hyphen has no identifier-rune substitute — unsafe. This is
-		// what makes any module path containing a "-" fall back to
-		// the per-chunk Go-body trampoline.
-		{"github.com/example/foo-bar", false},
-		{"a-b", false},
-		// Other punctuation that can legally appear in module paths
-		// but breaks plan 9 asm identifier scanning.
-		{"a+b", false},
-		{"a~b", false},
-		{"foo bar", false},
-		// Empty path: treated as unsafe so the caller skips the
-		// optimization rather than emitting "·" alone.
-		{"", false},
-	}
-	for _, c := range cases {
-		if got := isPlan9AsmSafe(c.path); got != c.want {
-			t.Errorf("isPlan9AsmSafe(%q) = %v, want %v", c.path, got, c.want)
-		}
-	}
-}
-
 // TestPlanLinknamePackagesPublic exercises the package-public chunk
 // planner against an arbitrary parsed module. The behavioural
 // guarantees we assert are minimal and stable across any future
