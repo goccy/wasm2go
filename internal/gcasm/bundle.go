@@ -88,7 +88,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	// a64RepackGemmKernel / x64RepackGemmKernel). Fast-math only —
 	// the kernel fuses the per-block scale multiply-accumulate.
 	repackGemmFn := ""
-	if cfg.FastMath {
+	if cfg.FastMath && os.Getenv("WASM2GO_NO_REPACK_GEMM") == "" {
 		for _, e := range mod.Exports {
 			if e.Kind == wasm.ExportFunc && e.Name == "dbg_gemm_q8_0_4x4" {
 				repackGemmFn = fmt.Sprintf("Fn%d", e.Index)

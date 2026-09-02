@@ -16,6 +16,7 @@ func TestRepackGemmKernelShape(t *testing.T) {
 		"sdot v24.4s, v0.16b, v1.4b[0]",
 		"sdot v27.4s, v0.16b, v1.4b[3]",
 		"fmul v4.4s, v2.4s, v3.s[3]",
+		"fadd v31.4s, v31.4s, v5.4s",
 		"fcvtl v2.4s, v2.4h",
 		"gemmblk:", "gemmoob:",
 	} {
@@ -26,7 +27,7 @@ func TestRepackGemmKernelShape(t *testing.T) {
 	pool := &ConstPool{}
 	x := x64RepackGemmKernel("Fn9avx2", "trapstub", offs, pool, true)
 	for _, want := range []string{
-		"VPDPBUSD", "VPMADDWD", "VPHADDD", "VCVTPH2PS", "VFMADD231PS",
+		"VPDPBUSD", "VPMADDWD", "VPHADDD", "VCVTPH2PS", "VADDPS",
 		"gcasmHasAVX512VNNI", "vgemmblk:", "gemmblk:", "VZEROUPPER",
 	} {
 		if !strings.Contains(x, want) {

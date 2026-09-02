@@ -184,7 +184,8 @@ func x64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 			w("\tVCVTDQ2PS\tX%d, X%d", row, row)
 			w("\tVPSHUFD\t$%#02x, X13, X7", row*0x55)
 			w("\tVMULPS\tX12, X7, X7")
-			w("\tVFMADD231PS\tX7, X%d, X%d", row, 8+row)
+			w("\tVMULPS\tX%d, X7, X7", row)
+			w("\tVADDPS\tX7, X%d, X%d", 8+row, 8+row)
 		}
 		w("\tADDQ\t$136, R12")
 		w("\tADDQ\t$136, AX")

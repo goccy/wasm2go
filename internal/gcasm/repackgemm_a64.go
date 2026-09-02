@@ -18,10 +18,12 @@ import (
 // shape. Per block the four per-row i32x4 column sums convert once,
 // scale by d_col[4]*d_row (FMUL by element + vector FMLA), and
 // accumulate into four f32x4 row accumulators that store once per
-// column group. Integer arithmetic is exact; the f32 accumulation
-// keeps the same per-row block order as the sequential form but fuses
-// mul+add (single rounding), so the retarget is fast-math-only, like
-// the nrc2 tile kernel.
+// column group. Integer arithmetic is exact, and the f32 tail keeps
+// the wasm gemm's own multiply/multiply/add sequence and rounding —
+// the same sequence the fused GEMV loops execute — so the batched
+// and single-row paths stay as close as the wasm semantics themselves
+// (prompt batch-size invariance depends on it). FastMath-gated only
+// because the retarget replaces the verified wasm lowering wholesale.
 //
 // C signature (see llama-wasm's arch/wasm/repack.cpp):
 //
@@ -64,8 +66,11 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 		enc := 0x4F809000 | uint32(idx&1)<<21 | uint32(idx>>1)<<11 | uint32(m)<<16 | uint32(n)<<5 | uint32(d)
 		word(enc, fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.s[%d]", d, n, m, idx))
 	}
-	fmlaV := func(d, n, m int) {
-		word(0x4E20CC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmla v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	fmulV := func(d, n, m int) {
+		word(0x6E20DC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	}
+	faddV := func(d, n, m int) {
+		word(0x4E20D400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fadd v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
 
 	argOff := map[string]int{"l1": 12, "l2": 16, "l3": 20, "l4": 24, "l5": 28, "l6": 32}
@@ -167,13 +172,17 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	scvtf(26, 26)
 	scvtf(27, 27)
 	fmulLane(4, 2, 3, 0)
-	fmlaV(28, 24, 4)
+	fmulV(5, 24, 4)
+	faddV(28, 28, 5)
 	fmulLane(4, 2, 3, 1)
-	fmlaV(29, 25, 4)
+	fmulV(5, 25, 4)
+	faddV(29, 29, 5)
 	fmulLane(4, 2, 3, 2)
-	fmlaV(30, 26, 4)
+	fmulV(5, 26, 4)
+	faddV(30, 30, 5)
 	fmulLane(4, 2, 3, 3)
-	fmlaV(31, 27, 4)
+	fmulV(5, 27, 4)
+	faddV(31, 31, 5)
 	w("\tADD\t$136, R16, R16")
 	w("\tADD\t$136, R17, R17")
 	w("\tSUBW\t$1, R15, R15")
