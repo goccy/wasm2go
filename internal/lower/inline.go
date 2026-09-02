@@ -2,6 +2,7 @@ package lower
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -63,7 +64,13 @@ type fnInlineInfo struct {
 	bodyBytes int
 	leaf      bool // no call / call_indirect anywhere in the body
 	hasTry    bool
-	sites     int // static `call <idx>` sites referencing this function
+	// noInline pins the function out-of-line regardless of size: it
+	// is a stable export the downstream gcasm backend retargets by
+	// name (the repack dbg_ kernels). Inlining it into every caller
+	// would leave the exported body dead and the retarget landing on
+	// unreachable code.
+	noInline bool
+	sites    int // static `call <idx>` sites referencing this function
 	// innerCalls lists the direct callees inside the body (dedup'd);
 	// hasIndirect marks a call_indirect. A non-leaf body may still
 	// inline when every inner call is direct and non-throwing: the
@@ -94,6 +101,20 @@ func analyzeModuleForInline(mod *wasm.Module) *inlineAnalysis {
 	for i := range mod.Functions {
 		idx := mod.NumImportedFuncs + uint32(i)
 		a.fns[idx] = &fnInlineInfo{bodyBytes: len(mod.Functions[i].Body), leaf: true}
+	}
+	// Exported retarget anchors: pin them out-of-line so the gcasm
+	// backend's by-name kernel retarget lands on a live body. The
+	// engine names these dbg_* by convention.
+	// Only the batched GEMM is pinned: the GEMV runs at nrows=1 in
+	// the decode hot path, where its per-call overhead outweighs the
+	// tile benefit, so it stays inlinable. The GEMM tile earns its
+	// keep only when a caller batches four or more rows.
+	for _, e := range mod.Exports {
+		if e.Kind == wasm.ExportFunc && strings.HasPrefix(e.Name, "dbg_gemm_") {
+			if info, ok := a.fns[e.Index]; ok {
+				info.noInline = true
+			}
+		}
 	}
 	for i := range mod.Functions {
 		idx := mod.NumImportedFuncs + uint32(i)
@@ -188,7 +209,7 @@ func (ls *lowerState) shouldInline(funcIdx uint32, ft wasm.FuncType) bool {
 		return false
 	}
 	info, ok := ls.inlineInfo.fns[funcIdx]
-	if !ok || info.hasTry {
+	if !ok || info.hasTry || info.noInline {
 		return false
 	}
 	// A non-leaf body may inline when every inner call is direct,
