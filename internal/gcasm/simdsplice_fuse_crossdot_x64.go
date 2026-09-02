@@ -1,6 +1,8 @@
 package gcasm
 
 import (
+	"sort"
+
 	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
@@ -63,37 +65,6 @@ const (
 	// the four-consecutive-byte grouping.
 	x64OpRawDotFold = "i32x4_rawdotfold_avx2"
 )
-
-// x64CrossSelKind classifies node i as an even/odd dword-select
-// shuffle of two node sources (the a64CrossSdotRewrite selKind,
-// unchanged: the patterns are wasm-level constants).
-func x64CrossSelKind(nodes []simdfuse.Node, constPairs map[int][2]uint64, i int) (x, y int, even, ok bool) {
-	n := &nodes[i]
-	var pat [2]uint64
-	switch {
-	case n.Op == "i8x16_shuffle_const" && len(n.Args) == 6 &&
-		n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode:
-		u32c := func(a simdfuse.Arg) uint64 { return uint64(uint32(a.Const)) }
-		pat = [2]uint64{u32c(n.Args[2]) | u32c(n.Args[3])<<32, u32c(n.Args[4]) | u32c(n.Args[5])<<32}
-	case n.Op == "i8x16_shuffle" && len(n.Args) == 3 &&
-		n.Args[0].Kind == simdfuse.ArgNode && n.Args[1].Kind == simdfuse.ArgNode &&
-		n.Args[2].Kind == simdfuse.ArgPairIn:
-		var isConst bool
-		pat, isConst = constPairs[n.Args[2].Index]
-		if !isConst {
-			return 0, 0, false, false
-		}
-	default:
-		return 0, 0, false, false
-	}
-	switch pat {
-	case a64EvenSel:
-		return n.Args[0].Index, n.Args[1].Index, true, true
-	case a64OddSel:
-		return n.Args[0].Index, n.Args[1].Index, false, true
-	}
-	return 0, 0, false, false
-}
 
 // x64CrossDotRewrite matches the cross-chain combine shape on the RAW
 // node forms (adds over dot(extend, extend) leaves — nothing here has
@@ -164,8 +135,8 @@ func x64CrossDotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int
 			continue
 		}
 		e, o := n.Args[0].Index, n.Args[1].Index
-		ex, ey, eEven, eok := x64CrossSelKind(nodes, constPairs, e)
-		ox, oy, oEven, ook := x64CrossSelKind(nodes, constPairs, o)
+		ex, ey, eEven, eok := crossSelKind(nodes, constPairs, e)
+		ox, oy, oEven, ook := crossSelKind(nodes, constPairs, o)
 		if !eok || !ook || eEven == oEven || ex != ox || ey != oy {
 			continue
 		}
@@ -207,24 +178,13 @@ func x64CrossDotRewrite(nodes []simdfuse.Node, isRoot []bool, constPairs map[int
 		// pairing above was positional; the chain's summation order is
 		// free (associative), so re-sorting the (slot, sources)
 		// triples together is exact.
-		type rawLeaf struct {
-			slot int
-			src  [2]simdfuse.Arg
-		}
-		rl := make([]rawLeaf, k)
-		for j, h := range lowLeaves {
-			rl[j] = rawLeaf{slot: h.dot, src: [2]simdfuse.Arg{h.srcA, h.srcB}}
-		}
-		for i := 1; i < k; i++ {
-			for j := i; j > 0 && rl[j].slot < rl[j-1].slot; j-- {
-				rl[j], rl[j-1] = rl[j-1], rl[j]
-			}
-		}
+		rl := append([]x64HalfDot(nil), lowLeaves...)
+		sort.Slice(rl, func(i, j int) bool { return rl[i].dot < rl[j].dot })
 		srcArgs := make([][2]simdfuse.Arg, k)
 		slots := make([]int, k)
-		for j, l := range rl {
-			srcArgs[j] = l.src
-			slots[j] = l.slot
+		for j, h := range rl {
+			srcArgs[j] = [2]simdfuse.Arg{h.srcA, h.srcB}
+			slots[j] = h.dot
 		}
 		for _, i := range lowAll {
 			nodes[i] = simdfuse.Node{Op: a64OpElided}

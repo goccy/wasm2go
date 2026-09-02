@@ -40,6 +40,17 @@ import (
 //
 // Requires FEAT_DotProd; callers gate the retarget on the dotprod
 // feature dispatch that guards the SDOT bodies.
+// repackGemmArgs returns the ABI0 stack offsets of the GEMM's l1..l6
+// arguments and the frame's argument-byte count for the module's
+// pointer width (see the layout comment above). Shared by the a64 and
+// x64 emitters — the frame is arch-independent.
+func repackGemmArgs(wide bool) (map[string]int, int) {
+	if wide {
+		return map[string]int{"l1": 16, "l2": 24, "l3": 32, "l4": 40, "l5": 48, "l6": 52}, 56
+	}
+	return map[string]int{"l1": 12, "l2": 16, "l3": 20, "l4": 24, "l5": 28, "l6": 32}, 36
+}
+
 func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) string {
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
@@ -73,11 +84,10 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 		word(0x4E20D400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fadd v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
 
-	argOff := map[string]int{"l1": 12, "l2": 16, "l3": 20, "l4": 24, "l5": 28, "l6": 32}
-	movArg, argBytes := "MOVWU", 36
+	argOff, argBytes := repackGemmArgs(wide)
+	movArg := "MOVWU"
 	if wide {
-		argOff = map[string]int{"l1": 16, "l2": 24, "l3": 32, "l4": 40, "l5": 48, "l6": 52}
-		movArg, argBytes = "MOVD", 56
+		movArg = "MOVD"
 	}
 	arg := func(name string, reg int) {
 		mv := movArg

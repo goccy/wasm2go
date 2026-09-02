@@ -559,12 +559,10 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 				}
 			} else {
 				b.WriteString("\tVPMADDWD Y3, Y2, Y2\n")
-				b.WriteString("\tVPHADDD Y2, Y2, Y2\n")
-				b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
 				if !hasAcc {
-					fmt.Fprintf(b, "\tVPUNPCKLQDQ X3, X2, X%d\n", dst)
+					x64PairFold(b, 2, dst)
 				} else {
-					b.WriteString("\tVPUNPCKLQDQ X3, X2, X2\n")
+					x64PairFold(b, 2, 2)
 					fmt.Fprintf(b, "\tVPADDD X%d, X2, X%d\n", accReg, dst)
 				}
 				if !vexClean {
@@ -589,9 +587,7 @@ func x64SpliceFusedCore(b *strings.Builder, tree *simdfuse.Tree, pool *ConstPool
 			if !loc[a.Index].chained {
 				v = loc[a.Index].pool
 			}
-			fmt.Fprintf(b, "\tVPHADDD Y%d, Y%d, Y2\n", v, v)
-			b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
-			fmt.Fprintf(b, "\tVPUNPCKLQDQ X3, X2, X%d\n", dst)
+			x64PairFold(b, v, dst)
 			b.WriteString("\t// avx2 dot\n")
 			loc[i] = fusedLoc{chained: willChain, pool: dst}
 			continue
@@ -1025,38 +1021,25 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 			return addOffErr
 		}
 		addOff(1)
-	case "v128_load32_splat_nc":
-		if d, ok := x64DeferOff(n.Args[1]); ok {
-			fmt.Fprintf(b, "\tVMOVSS %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
-		} else {
-			addOff(1)
-			fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+	case "v128_load32_splat_nc", "v128_load16x4_u_nc", "v128_load32_zero_nc", "v128_load64_zero_nc":
+		// Unchecked narrow loads (window check hoisted at the loop
+		// head): a 4-byte VMOVSS or 8-byte VMOVQ, then the op's own
+		// widen where it has one.
+		mov := "VMOVSS"
+		if n.Op == "v128_load16x4_u_nc" || n.Op == "v128_load64_zero_nc" {
+			mov = "VMOVQ"
 		}
-		fmt.Fprintf(b, "\tVPSHUFD $0x00, X%d, X%d\n", dst, dst)
-		return addOffErr
-	case "v128_load16x4_u_nc":
 		if d, ok := x64DeferOff(n.Args[1]); ok {
-			fmt.Fprintf(b, "\tVMOVQ %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
+			fmt.Fprintf(b, "\t%s %s(%s)(R12*1), X%d\n", mov, d, x64MemBase(b, offs), dst)
 		} else {
 			addOff(1)
-			fmt.Fprintf(b, "\tVMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+			fmt.Fprintf(b, "\t%s (%s)(R12*1), X%d\n", mov, x64MemBase(b, offs), dst)
 		}
-		fmt.Fprintf(b, "\tVPMOVZXWD X%d, X%d\n", dst, dst)
-		return addOffErr
-	case "v128_load32_zero_nc":
-		if d, ok := x64DeferOff(n.Args[1]); ok {
-			fmt.Fprintf(b, "\tVMOVSS %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
-		} else {
-			addOff(1)
-			fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
-		}
-		return addOffErr
-	case "v128_load64_zero_nc":
-		if d, ok := x64DeferOff(n.Args[1]); ok {
-			fmt.Fprintf(b, "\tVMOVQ %s(%s)(R12*1), X%d\n", d, x64MemBase(b, offs), dst)
-		} else {
-			addOff(1)
-			fmt.Fprintf(b, "\tVMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
+		switch n.Op {
+		case "v128_load32_splat_nc":
+			fmt.Fprintf(b, "\tVPSHUFD $0x00, X%d, X%d\n", dst, dst)
+		case "v128_load16x4_u_nc":
+			fmt.Fprintf(b, "\tVPMOVZXWD X%d, X%d\n", dst, dst)
 		}
 		return addOffErr
 	case "v128_load_rng":
@@ -1723,6 +1706,15 @@ func x64NodesVexClean(nodes []simdfuse.Node) bool {
 		return false
 	}
 	return true
+}
+
+// x64PairFold collapses an 8-lane VPMADDWD pair-domain ymm value to
+// the four-consecutive-byte i32x4 grouping: lane j of the result is
+// P2j + P2j+1. Y2/X3 are scratch; dst may equal src.
+func x64PairFold(b *strings.Builder, src, dst int) {
+	fmt.Fprintf(b, "\tVPHADDD Y%d, Y%d, Y2\n", src, src)
+	b.WriteString("\tVEXTRACTI128 $1, Y2, X3\n")
+	fmt.Fprintf(b, "\tVPUNPCKLQDQ X3, X2, X%d\n", dst)
 }
 
 // x64VexArgsOK reports whether every argument is a register-resident

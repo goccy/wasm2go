@@ -42,11 +42,10 @@ func x64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 	biasSym := c16(0x80)
 	onesSym := c16(0x01)
 
-	argOff := map[string]int{"l1": 12, "l2": 16, "l3": 20, "l4": 24, "l5": 28, "l6": 32}
-	movArg, argBytes := "MOVL", 36
+	argOff, argBytes := repackGemmArgs(wide)
+	movArg := "MOVL"
 	if wide {
-		argOff = map[string]int{"l1": 16, "l2": 24, "l3": 32, "l4": 40, "l5": 48, "l6": 52}
-		movArg, argBytes = "MOVQ", 56
+		movArg = "MOVQ"
 	}
 	arg := func(name, reg string) {
 		mv := movArg

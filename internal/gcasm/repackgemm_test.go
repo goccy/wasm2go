@@ -162,16 +162,16 @@ func runOne(t *testing.T, kernel func(m *mockModule, l0 int32, l1, l2, l3, l4 in
 
 func writeGemmRunTree(t *testing.T, dir, arch, kernelAsm, extraGo, runTest string) {
 	t.Helper()
+	trapstub := "\nTEXT ·trapstub(SB), NOSPLIT, $0-0\n\tMOVD $0, R0\n\tMOVD R0, (R0)\n\tRET\n"
+	if arch == "amd64" {
+		trapstub = "\nTEXT ·trapstub(SB), NOSPLIT, $0-0\n\tMOVQ $0, AX\n\tMOVQ AX, (AX)\n\tRET\n"
+	}
 	files := map[string]string{
 		"go.mod": "module gemmrun\n\ngo 1.25.0\n",
-		"kernel_" + arch + ".s": "//go:build " + arch + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n" + kernelAsm +
-			"\nTEXT ·trapstub(SB), NOSPLIT, $0-0\n\tMOVD $0, R0\n\tMOVD R0, (R0)\n\tRET\n",
+		"kernel_" + arch + ".s": "//go:build " + arch + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n" +
+			kernelAsm + trapstub,
 		"run.go":      repackGemmRunSrc + extraGo,
 		"run_test.go": runTest,
-	}
-	if arch == "amd64" {
-		files["kernel_"+arch+".s"] = "//go:build " + arch + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n" + kernelAsm +
-			"\nTEXT ·trapstub(SB), NOSPLIT, $0-0\n\tMOVQ $0, AX\n\tMOVQ AX, (AX)\n\tRET\n"
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
