@@ -127,3 +127,126 @@ func TestCrossChunkWrapperFallback(t *testing.T) {
 		t.Errorf("%d gcasmABI0Keep anchors emitted for an unspellable path; none should be (no direct calls)", anchors)
 	}
 }
+
+// finalBundleTree returns the file set an amd64/arm64 consumer would
+// actually compile: the codegen multi-package output with the gcasm
+// backend's delta merged in (a nil gcasm entry deletes the file).
+func finalBundleTree(t *testing.T, fixture, importPath string) map[string][]byte {
+	t.Helper()
+	defer codegen.SetMultiPackageThreshold(64)()
+	bin := testfixture.Wasm(t, fixture)
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: importPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := map[string][]byte{}
+	for name, data := range res.Sidecars {
+		tree[name] = data
+	}
+	for name, data := range res.Files {
+		tree[name] = data
+	}
+	delta, _, err := Build(mod, buf.Bytes(), tree, importPath, nil, nil, nil, nil, nil, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range delta {
+		if data == nil {
+			delete(tree, name)
+			continue
+		}
+		tree[name] = data
+	}
+	return tree
+}
+
+// buildDirectiveOf returns the first //go:build expression in a Go
+// source file, or "" for an untagged (all-arch) file.
+func buildDirectiveOf(src []byte) string {
+	for _, ln := range strings.Split(string(src), "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "//go:build ") {
+			return strings.TrimSpace(strings.TrimPrefix(ln, "//go:build "))
+		}
+		if strings.HasPrefix(ln, "package ") {
+			break
+		}
+	}
+	return ""
+}
+
+// TestPlan9SafeBundleFileStructure asserts the final bundle a
+// plan-9-spellable consumer compiles has no amd64/arm64 linkname
+// alias file: the codegen amd64||arm64 alias.go is deleted by the
+// gcasm backend, its cross-chunk declarations fold into the
+// decls_<arch>.go the asm bodies need anyway, and every remaining
+// linkname-only alias file is guarded off the asm arches. This is the
+// file-set contract the direct-call path relies on for parse economy.
+func TestPlan9SafeBundleFileStructure(t *testing.T) {
+	// The file-set contract (no separate amd64/arm64 linkname alias
+	// file; cross-chunk decls in decls_<arch>.go) holds for BOTH the
+	// spellable and the hyphenated path — only the CONTENT of
+	// decls_<arch>.go differs (direct symbols vs gcasmFwd wrappers).
+	for _, importPath := range []string{"github.com/gentest/pkg", "github.com/gen-test/pkg"} {
+		t.Run(importPath, func(t *testing.T) { assertBundleFileStructure(t, importPath) })
+	}
+}
+
+func assertBundleFileStructure(t *testing.T, importPath string) {
+	tree := finalBundleTree(t, "cg_indirect", importPath)
+
+	// Collect the chunk packages (pN directories).
+	chunkDirs := map[string]bool{}
+	for name := range tree {
+		if i := strings.IndexByte(name, '/'); i > 0 && strings.HasPrefix(name[:i], "p") {
+			chunkDirs[name[:i]] = true
+		}
+	}
+	if len(chunkDirs) < 2 {
+		t.Fatalf("fixture did not split into multiple chunks: %v", chunkDirs)
+	}
+
+	for dir := range chunkDirs {
+		// No amd64||arm64 alias.go survives — it was deleted, its
+		// decls folded into decls_<arch>.go.
+		if _, ok := tree[dir+"/alias.go"]; ok {
+			t.Errorf("%s/alias.go survived; the gcasm backend must delete the amd64||arm64 alias", dir)
+		}
+		hasArchDecls := false
+		for _, arch := range []string{"amd64", "arm64"} {
+			if data, ok := tree[dir+"/decls_"+arch+".go"]; ok {
+				hasArchDecls = true
+				if d := buildDirectiveOf(data); !strings.Contains(d, arch) {
+					t.Errorf("%s/decls_%s.go build guard %q does not restrict to %s", dir, arch, d, arch)
+				}
+			}
+		}
+		if !hasArchDecls {
+			t.Errorf("%s: no decls_amd64.go/decls_arm64.go to carry the asm-body and cross-chunk decls", dir)
+		}
+		// Every linkname-only alias file left in the chunk must be
+		// guarded OFF the asm arches (the pure fallback path only).
+		for name, data := range tree {
+			if !strings.HasPrefix(name, dir+"/") || !strings.HasSuffix(name, ".go") {
+				continue
+			}
+			if !strings.Contains(string(data), "//go:linkname") {
+				continue
+			}
+			d := buildDirectiveOf(data)
+			// The arch decls legitimately carry linkname forwards; the
+			// concern is a SEPARATE alias file compiled on the asm arch.
+			if strings.HasSuffix(name, "/decls_amd64.go") || strings.HasSuffix(name, "/decls_arm64.go") {
+				continue
+			}
+			if !strings.Contains(d, "!amd64") && !strings.Contains(d, "!arm64") {
+				t.Errorf("%s carries //go:linkname but is not guarded off the asm arches (build %q)", name, d)
+			}
+		}
+	}
+}
