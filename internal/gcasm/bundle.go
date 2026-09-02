@@ -82,6 +82,20 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	}
 	pure := PureFilter(all)
 
+	// The repack GEMM retarget: llama-wasm exports its wasm-shaped
+	// q8_0x4 GEMM under a stable debug name so the transpiler can
+	// swap the whole body for a native 4x4 tile kernel (see
+	// a64RepackGemmKernel / x64RepackGemmKernel). Fast-math only —
+	// the kernel fuses the per-block scale multiply-accumulate.
+	repackGemmFn := ""
+	if cfg.FastMath {
+		for _, e := range mod.Exports {
+			if e.Kind == wasm.ExportFunc && e.Name == "dbg_gemm_q8_0_4x4" {
+				repackGemmFn = fmt.Sprintf("Fn%d", e.Index)
+			}
+		}
+	}
+
 	// Capture tree.
 	dir, err := os.MkdirTemp("", "gcasm-capture-*")
 	if err != nil {
@@ -265,7 +279,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, cfg)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, repackGemmFn, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -630,6 +644,7 @@ func buildPkg(
 	outlinedNames []string,
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
+	repackGemmFn string,
 	cfg Config,
 ) (map[string][]byte, error) {
 	directSSA := cfg.DirectAsm
@@ -872,6 +887,32 @@ func buildPkg(
 			// backend keep the bit-exact Go companion. The kernel and
 			// its declaration follow the module's pointer width — the
 			// LP64 companion takes i64 pointers and strides.
+			// Repack GEMM: the feature body is replaced WHOLESALE by
+			// the native 4x4 tile kernel (a64: by-element SDOT under
+			// the dotprod gate; x64: AVX2 with a VNNI entry branch
+			// under the AVX2 gate). The portable twin keeps the
+			// transformed wasm body, and the existing dual-body stub
+			// dispatches between them.
+			if repackGemmFn != "" && name == repackGemmFn && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
+				trapSym := "wasm_trap_simd_oob"
+				if rel != "" && rel != "base" {
+					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
+				}
+				wide := mod.Memory64()
+				if arch.name == "amd64" {
+					featBody = x64RepackGemmKernel(featSym, trapSym, modOffs, pool, wide)
+					if !mirrorVars["gcasmHasAVX512VNNI"] {
+						mirrorVars["gcasmHasAVX512VNNI"] = true
+						vnniRef := "HasAVX512VNNI"
+						if rel != "" && rel != "base" {
+							vnniRef = "base." + vnniRef
+						}
+						fmt.Fprintf(&declFns, "// gcasmHasAVX512VNNI mirrors %s for the tile kernels'\n// entry branches (asm reads package-local data only).\nvar gcasmHasAVX512VNNI = %s\n\n", vnniRef, vnniRef)
+					}
+				} else {
+					featBody = a64RepackGemmKernel(featSym, trapSym, modOffs, wide)
+				}
+			}
 			if nrc2 != nil && name == nrc2.VecDot && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
 				fastSym := nrc2.Companion + "fast"
 				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
