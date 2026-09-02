@@ -953,7 +953,14 @@ func buildPkg(
 	// that reference resolves against this wrapper when the fn kept
 	// its Go body. Dead code (never jumped to), alive as an object
 	// symbol regardless of linker deadcode decisions.
-	if len(fallbackNames) > 0 {
+	//
+	// Needed ONLY when calleeSig actually emits spelled direct CALLs,
+	// i.e. when the import path is plan-9-spellable. An unspellable
+	// path (a hyphenated host repo) keeps the gcasmFwd linkname
+	// wrappers for every cross-chunk call, so no direct reference to a
+	// fallback fn is ever made and the anchor would be pure dead
+	// weight — skip it there.
+	if len(fallbackNames) > 0 && plan9AsmPathSafe(importPath) {
 		var names []string
 		for n := range fallbackNames {
 			names = append(names, n)

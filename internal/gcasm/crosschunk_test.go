@@ -105,10 +105,11 @@ func TestCrossChunkDirectCalls(t *testing.T) {
 // spell (a hyphen) keeps the historical Go-wrapper forwarding shape.
 func TestCrossChunkWrapperFallback(t *testing.T) {
 	files := buildMultiChunk(t, "cg_crosscall", "github.com/gen-test/pkg")
-	var spelled, wrappers int
+	var spelled, wrappers, anchors int
 	for name, data := range files {
 		if strings.HasSuffix(name, ".s") {
 			spelled += strings.Count(string(data), "∕")
+			anchors += strings.Count(string(data), "TEXT ·gcasmABI0Keep(SB)")
 		}
 		if strings.HasSuffix(name, ".go") {
 			wrappers += strings.Count(string(data), "func gcasmFwdFn")
@@ -119,5 +120,10 @@ func TestCrossChunkWrapperFallback(t *testing.T) {
 	}
 	if wrappers == 0 {
 		t.Error("no gcasmFwdFn wrappers emitted; the unspellable path must keep the forwarding shape")
+	}
+	// No direct CALL is ever made on this path, so the ABI0 keep
+	// anchor would be pure dead weight — it must not be emitted.
+	if anchors != 0 {
+		t.Errorf("%d gcasmABI0Keep anchors emitted for an unspellable path; none should be (no direct calls)", anchors)
 	}
 }
