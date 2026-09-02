@@ -10,23 +10,6 @@ import (
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
-func TestPlan9AsmPathSafe(t *testing.T) {
-	for path, want := range map[string]bool{
-		"":                                  false,
-		"gentest/pkg":                       true,
-		"github.com/goccy/llamawasm2go/p1":  true,
-		"github.com/goccy/some-hyphen/pkg":  false,
-		"example.org/x_y/v2":                true,
-		"host.tld/a+b":                      false,
-		"host.tld/sp ace":                   false,
-		"github.com/goccy/wasm2go/internal": true,
-	} {
-		if got := plan9AsmPathSafe(path); got != want {
-			t.Errorf("plan9AsmPathSafe(%q) = %v, want %v", path, got, want)
-		}
-	}
-}
-
 func TestAsmSpellPath(t *testing.T) {
 	got := asmSpellPath("github.com/goccy/llamawasm2go/p1")
 	want := "github·com∕goccy∕llamawasm2go∕p1"
@@ -102,9 +85,19 @@ func TestCrossChunkDirectCalls(t *testing.T) {
 }
 
 // TestCrossChunkWrapperFallback: an import path plan 9 asm cannot
-// spell (a hyphen) keeps the historical Go-wrapper forwarding shape.
+// spell keeps the historical Go-wrapper forwarding shape. Both
+// unspellable classes are covered: a hyphenated host path, and a
+// digit-leading host path (the asm lexer accepts digits only after
+// the first identifier rune, so "4d63·com∕..." would lex as a
+// number, not a symbol).
 func TestCrossChunkWrapperFallback(t *testing.T) {
-	files := buildMultiChunk(t, "cg_crosscall", "github.com/gen-test/pkg")
+	for _, importPath := range []string{"github.com/gen-test/pkg", "4d63.com/gentest/pkg"} {
+		t.Run(importPath, func(t *testing.T) { assertWrapperFallback(t, importPath) })
+	}
+}
+
+func assertWrapperFallback(t *testing.T, importPath string) {
+	files := buildMultiChunk(t, "cg_crosscall", importPath)
 	var spelled, wrappers, anchors int
 	for name, data := range files {
 		if strings.HasSuffix(name, ".s") {
@@ -125,6 +118,78 @@ func TestCrossChunkWrapperFallback(t *testing.T) {
 	// anchor would be pure dead weight — it must not be emitted.
 	if anchors != 0 {
 		t.Errorf("%d gcasmABI0Keep anchors emitted for an unspellable path; none should be (no direct calls)", anchors)
+	}
+}
+
+// TestCrossChunkDirectAsmCallSymbols: a function retained for
+// direct-asm emission whose body makes cross-chunk calls must emit
+// the same CALL operand shapes the listing transform does — a
+// spelled remote symbol on a spellable path, never a
+// current-package-qualified mangling of it ("CALL ·github·com∕...")
+// that could not link.
+func TestCrossChunkDirectAsmCallSymbols(t *testing.T) {
+	defer codegen.SetMultiPackageThreshold(64)()
+	bin := testfixture.Wasm(t, "cg_crosscall_directasm")
+	mod, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const importPath = "github.com/gentest/pkg"
+	var buf bytes.Buffer
+	// Fn2 ($mid) calls Fn0/Fn1 across chunks; Fn4 (the export) also
+	// calls the fallback fn Fn3 ($wide), covering the anchor-resolved
+	// shape from a direct-asm body too.
+	res, err := codegen.Translate(&buf, mod, codegen.Options{
+		Package: "pkg", OutputImportPath: importPath,
+		DirectAsmFuncs: []string{"Fn2", "Fn4"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.DirectAsmSSA) == 0 {
+		t.Fatal("translator retained no direct-asm SSA; the direct-asm path is not exercised")
+	}
+	directAsm := map[string]DirectAsmFn{}
+	for name, df := range res.DirectAsmSSA {
+		directAsm[name] = DirectAsmFn{Fn: df.Fn, Sig: df.Sig, Packed: df.Packed, PackedParams: df.PackedParams}
+	}
+	treeIn := map[string][]byte{}
+	for name, data := range res.Sidecars {
+		treeIn[name] = data
+	}
+	for name, data := range res.Files {
+		treeIn[name] = data
+	}
+	files, stats, err := Build(mod, buf.Bytes(), treeIn, importPath, nil, nil, nil, nil, nil,
+		Config{DirectAsm: directAsm, DirectAsmGlobals: res.DirectAsmGlobals})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.DirectAsm == 0 {
+		t.Fatal("no direct-asm body emitted; the direct-asm path is not exercised")
+	}
+	var directBodies, spelledInDirect int
+	for name, data := range files {
+		if !strings.HasSuffix(name, ".s") {
+			continue
+		}
+		s := string(data)
+		// A spelled remote symbol re-wrapped as current-package-local
+		// can never link; it must not appear anywhere in the bundle.
+		if strings.Contains(s, "·github·com") {
+			t.Errorf("%s: current-package-mangled spelled symbol (CALL ·github·com...) emitted", name)
+		}
+		if !strings.Contains(s, "// direct-asm: ") {
+			continue
+		}
+		directBodies++
+		spelledInDirect += strings.Count(s, "CALL github·com∕gentest∕pkg")
+	}
+	if directBodies == 0 {
+		t.Fatal("no .s file carries a direct-asm body marker")
+	}
+	if spelledInDirect == 0 {
+		t.Error("no spelled cross-chunk CALL emitted from a direct-asm body")
 	}
 }
 

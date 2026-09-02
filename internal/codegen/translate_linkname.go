@@ -9,6 +9,7 @@ import (
 	"path"
 	"strconv"
 
+	"github.com/goccy/wasm2go/internal/asmgen"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
@@ -417,7 +418,7 @@ func (t *translator) emitChunkAliasFiles(pkgName string, callerChunk int, dir st
 	// wrapper-pair shape forces the Go compiler to emit the local
 	// ABI0 wrapper that asm `CALL ·FnN(SB)` resolves through.
 	asmKind := linknameForwardWrapperPair
-	if isPlan9AsmSafe(t.opts.OutputImportPath) {
+	if asmgen.Plan9AsmPathSafe(t.opts.OutputImportPath) {
 		asmKind = linknameForwardDeclOnly
 	}
 	asmForwards := t.emitWasmFnForwards(callerChunk, asmKind)

@@ -14,48 +14,6 @@ import (
 	"strings"
 )
 
-// isPlan9AsmSafe reports whether path can be embedded into a plan 9
-// asm symbol operand by mapping "/" → U+2215 ("∕") and "." →
-// U+00B7 ("·"). The plan 9 asm lexer is the source of truth:
-//
-//   - src/cmd/asm/internal/lex/tokenizer.go: isIdentRune accepts
-//     unicode.IsLetter, digits (after the first character), "_",
-//     U+00B7, and U+2215 — and nothing else.
-//
-//   - src/cmd/asm/internal/lex/lex.go: lex.Make post-processes
-//     identifier tokens with `strings.ReplaceAll`, mapping U+00B7
-//     back to "." and U+2215 back to "/" before the name is
-//     handed to the symbol-lookup pass. So the only ASCII
-//     punctuation that survives a round-trip through the scanner
-//     into a symbol operand is "." and "/" — every other character
-//     ("-", "+", "~", " ", ...) has no plan 9 substitute and is
-//     simply unrepresentable in an asm CALL operand. There is no
-//     escape syntax: macros must themselves be alphanumeric
-//     identifiers (input.go: macroName) and string literals are
-//     immediate-only ("string constant must be an immediate").
-//
-// Any byte outside [A-Za-z0-9_./] therefore forces a fall back to
-// the per-chunk Go-body trampoline so the asm CALL stays a local
-// ·FnN(SB) reference. Empty path is rejected so the caller treats
-// it as unsafe.
-func isPlan9AsmSafe(path string) bool {
-	if path == "" {
-		return false
-	}
-	for i := 0; i < len(path); i++ {
-		c := path[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9':
-		case c == '_' || c == '.' || c == '/':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
 // wasmFuncBodyName matches the identifiers codegen uses for wasm
 // function bodies — `Fn<N>` in multi-package mode, `fn<N>` in
 // single-package mode. Anything else (export wrappers, helpers,
