@@ -198,7 +198,15 @@ func TestCrossChunkDirectAsmCallSymbols(t *testing.T) {
 // backend's delta merged in (a nil gcasm entry deletes the file).
 func finalBundleTree(t *testing.T, fixture, importPath string) map[string][]byte {
 	t.Helper()
-	defer codegen.SetMultiPackageThreshold(64)()
+	return finalBundleTreeAt(t, fixture, importPath, 64)
+}
+
+// finalBundleTreeAt is finalBundleTree under an explicit chunk byte
+// budget, for fixtures whose interesting shape needs two functions in
+// ONE chunk package (the planner first-fit packs SCCs by size).
+func finalBundleTreeAt(t *testing.T, fixture, importPath string, chunkBytes int) map[string][]byte {
+	t.Helper()
+	defer codegen.SetMultiPackageThreshold(chunkBytes)()
 	bin := testfixture.Wasm(t, fixture)
 	mod, err := wasm.Parse(bytes.NewReader(bin))
 	if err != nil {
