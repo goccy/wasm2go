@@ -30,7 +30,9 @@ func runArm64Gate(t *testing.T, dir, pkg, runName, diag string) {
 	}
 	cmd := exec.Command(bin, "-test.run", runName, "-test.v")
 	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("arm64 execution failed: %v\n%s\n--- asm ---\n%s", err, out, diag)
 	}
+	t.Logf("arm64 execution:\n%s", out)
 }

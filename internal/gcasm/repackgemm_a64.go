@@ -5,25 +5,52 @@ import (
 	"strings"
 )
 
-// a64RepackGemmKernel emits the q8_0x4 repack GEMM under sym: the
-// 4-rows x 4-columns tile the native q8_0_4x4 dotprod path computes,
-// replacing the engine's four sequential gemv-shaped passes. The wasm
-// activation block (block_q8_0x4) already interleaves the four rows'
-// 4-byte groups contiguously, so each 16-byte weight group pairs with
-// ONE 16-byte activation load and four BY-ELEMENT SDOTs:
+// a64RepackGemmChunkBlocks / a64RepackGemmScratch / a64RepackGemmFrame
+// size the SMMLA nest's stack scratch, the arm64 twin of the amd64
+// constants: per block, the two activation row groups' four 8-column
+// pairs zipped into SMMLA A operands = 4 x 64 bytes.
+const (
+	a64RepackGemmChunkBlocks = 256
+	a64RepackGemmScratch     = a64RepackGemmChunkBlocks * 256
+	a64RepackGemmFrame       = 64 + a64RepackGemmScratch
+)
+
+// a64RepackGemmKernel emits the q8_0x4 repack GEMM under sym.
+//
+// Two nests share the prologue and the bounds contract:
+//
+// SMMLA nest (FEAT_I8MM, package mirror gcasmCPUI8MM): an 8-rows x
+// 4-columns tile over two activation row groups at once, so every
+// weight byte streamed from memory feeds 1024 MACs (the native
+// q8_0_4x8 gemm's shape; the 4x4 SDOT tile below feeds 512). The
+// weights stay in their 4x4 interleave: two consecutive 16-byte
+// groups zip (zip1/zip2 .4s) into the two 2-columns x 8-k SMMLA B
+// operands, shared by all eight rows. The activations are zipped the
+// same way ONCE per chunk into the stack scratch, so the block loop
+// loads its A operands ready-made. Eight 2x2 i32 tiles accumulate
+// per block; each converts and scales by drow[r]*dcol[c] built from
+// the two f16 quads (dup .2d of the column pair, zip of the row pair)
+// and adds into eight f32 tiles that unzip (zip1/zip2 .2d) to rows at
+// store time. Row groups beyond the last pair, and every CPU without
+// I8MM, run the SDOT nest.
+//
+// SDOT nest: the 4-rows x 4-columns tile the native q8_0_4x4 dotprod
+// path computes. The wasm activation block (block_q8_0x4) already
+// interleaves the four rows' 4-byte groups contiguously, so each
+// 16-byte weight group pairs with ONE 16-byte activation load and
+// four BY-ELEMENT SDOTs:
 //
 //	sdot vAcc_r.4s, vWeights.16b, vActs.4b[r]
 //
-// — one instruction per (weight group, row), the native kernel's own
-// shape. Per block the four per-row i32x4 column sums convert once,
-// scale by d_col[4]*d_row (FMUL by element + vector FMLA), and
-// accumulate into four f32x4 row accumulators that store once per
-// column group. Integer arithmetic is exact, and the f32 tail keeps
-// the wasm gemm's own multiply/multiply/add sequence and rounding —
-// the same sequence the fused GEMV loops execute — so the batched
-// and single-row paths stay as close as the wasm semantics themselves
-// (prompt batch-size invariance depends on it). FastMath-gated only
-// because the retarget replaces the verified wasm lowering wholesale.
+// Both nests keep the wasm gemm's own per-element arithmetic on every
+// output: exact i32 column sum -> f32 -> x (dcol * drow) -> + running
+// sum, in block order (the same sequence the fused GEMV loops
+// execute, so the batched and single-row paths stay as close as the
+// wasm semantics themselves — prompt batch-size invariance depends on
+// it). Larger K than the scratch holds runs as chunks that accumulate
+// into the output rows in place, in the same block order. FastMath-
+// gated only because the retarget replaces the verified wasm lowering
+// wholesale.
 //
 // C signature (see llama-wasm's arch/wasm/repack.cpp):
 //
@@ -39,7 +66,8 @@ import (
 // l3+32, l4+40, l5(nr)+48, l6(nc)+52.
 //
 // Requires FEAT_DotProd; callers gate the retarget on the dotprod
-// feature dispatch that guards the SDOT bodies.
+// feature dispatch that guards the SDOT bodies. FEAT_I8MM is checked
+// here, at entry.
 // repackGemmArgs returns the ABI0 stack offsets of the GEMM's l1..l6
 // arguments and the frame's argument-byte count for the module's
 // pointer width (see the layout comment above). Shared by the a64 and
@@ -71,6 +99,25 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 		enc := 0x4F80E000 | uint32(idx&1)<<21 | uint32(idx>>1)<<11 | uint32(m)<<16 | uint32(n)<<5 | uint32(d)
 		word(enc, fmt.Sprintf("sdot v%d.4s, v%d.16b, v%d.4b[%d]", d, n, m, idx))
 	}
+	// SMMLA: d.4s (2x2) += n (2 rows x 8 i8) · m (2 rows x 8 i8)^T.
+	smmla := func(d, n, m int) {
+		word(0x4E80A400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("smmla v%d.4s, v%d.16b, v%d.16b", d, n, m))
+	}
+	zip1S := func(d, n, m int) {
+		word(0x4E803800|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("zip1 v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	}
+	zip2S := func(d, n, m int) {
+		word(0x4E807800|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("zip2 v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	}
+	zip1D := func(d, n, m int) {
+		word(0x4EC03800|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("zip1 v%d.2d, v%d.2d, v%d.2d", d, n, m))
+	}
+	zip2D := func(d, n, m int) {
+		word(0x4EC07800|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("zip2 v%d.2d, v%d.2d, v%d.2d", d, n, m))
+	}
+	dupD := func(d, n, idx int) {
+		word(0x4E080400|uint32(idx)<<20|uint32(n)<<5|uint32(d), fmt.Sprintf("dup v%d.2d, v%d.d[%d]", d, n, idx))
+	}
 	fcvtl := func(d, n int) { word(0x0E217800|uint32(n)<<5|uint32(d), fmt.Sprintf("fcvtl v%d.4s, v%d.4h", d, n)) }
 	scvtf := func(d, n int) { word(0x4E21D800|uint32(n)<<5|uint32(d), fmt.Sprintf("scvtf v%d.4s, v%d.4s", d, n)) }
 	fmulLane := func(d, n, m, idx int) {
@@ -97,8 +144,8 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 		w("\t%s\t%s+%d(FP), R%d", mv, name, argOff[name], reg)
 	}
 
-	w("// %s: q8_0x4 repack GEMM, 4x4 tile via by-element SDOT.", sym)
-	w("TEXT ·%s(SB), $16-%d", sym, argBytes)
+	w("// %s: q8_0x4 repack GEMM, 8x4 tile via SMMLA / 4x4 tile via by-element SDOT.", sym)
+	w("TEXT ·%s(SB), $%d-%d", sym, a64RepackGemmFrame, argBytes)
 	w("\tNO_LOCAL_POINTERS")
 	w("\tMOVD\tm+0(FP), R0")
 	w("\tMOVD\t%d(R0), R21", offs.MemSize)
@@ -145,10 +192,164 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	w("\tADD\tR20, R2, R11") // s row base (host)
 	w("\tADD\tR20, R4, R22") // vx base (host)
 	w("\tLSL\t$2, R3, R23")  // 4*bs bytes: s row-group stride
+	w("\tMOVBU\t·gcasmCPUI8MM(SB), R26")
+	w("\tCBZ\tR26, gemmsdot")
+
+	// ---- SMMLA nest: row-group pairs.
+	//
+	// R9 chunk byte offset | R24 blocks left | R25 chunk blocks
+	// R19 scratch cursor | R17 ap (group a) | R27 ap (group b)
+	// v0..v7 i32 2x2 tiles (index 2*rowpair+colpair, row pairs
+	// 01a 23a 01b 23b) | v24..v31 f32 tiles | v16..v23 operands.
+	w("gemmm:")
+	w("\tCMPW\t$2, R6")
+	w("\tBLO\tgemmsdot") // 0 or 1 row groups left
+	w("\tMOVD\t$0, R9")
+	w("\tMOVW\tR1, R24")
+	w("gemmmchunk:")
+	w("\tMOVW\t$%d, R25", a64RepackGemmChunkBlocks)
+	w("\tCMPW\tR25, R24")
+	w("\tCSELW\tLO, R24, R25, R25")
+	// Zip this tile's activation chunk: per block and 8-column pair,
+	// A01/A23 of row group a then of row group b (4 x 16 bytes).
+	w("\tADD\tR10, R9, R17")
+	w("\tADD\tR17, R8, R27")
+	w("\tMOVD\t$gemmscratch-%d(SP), R19", a64RepackGemmScratch)
+	w("\tMOVW\tR25, R15")
+	w("\tCBZW\tR15, gemmmx0")
+	w("gemmmpre:")
+	for p := 0; p < 4; p++ {
+		ldurQ(16, 17, 8+32*p)
+		ldurQ(17, 17, 24+32*p)
+		zip1S(18, 16, 17)
+		zip2S(19, 16, 17)
+		sturQ(18, 19, 64*p)
+		sturQ(19, 19, 64*p+16)
+		ldurQ(16, 27, 8+32*p)
+		ldurQ(17, 27, 24+32*p)
+		zip1S(20, 16, 17)
+		zip2S(21, 16, 17)
+		sturQ(20, 19, 64*p+32)
+		sturQ(21, 19, 64*p+48)
+	}
+	w("\tADD\t$136, R17, R17")
+	w("\tADD\t$136, R27, R27")
+	w("\tADD\t$256, R19, R19")
+	w("\tSUBW\t$1, R15, R15")
+	w("\tCBNZW\tR15, gemmmpre")
+	w("gemmmx0:")
+	w("\tADD\tR22, R9, R13") // b column-group cursor at the chunk offset
+	w("\tMOVD\tR11, R14")    // s column cursor
+	w("\tMOVW\tR7, R12")     // x counter
+	w("gemmmx:")
+	// f32 tiles: zero on the first chunk, else the rows' running
+	// sums re-zipped into 2x2 form.
+	w("\tCBNZ\tR9, gemmmxload")
+	for i := 24; i < 32; i++ {
+		movi0(i)
+	}
+	w("\tB\tgemmmxgo")
+	w("gemmmxload:")
+	w("\tMOVD\tR14, R26")
+	for rp := 0; rp < 4; rp++ {
+		ldurQ(16, 26, 0)
+		w("\tADD\tR3, R26, R26")
+		ldurQ(17, 26, 0)
+		w("\tADD\tR3, R26, R26")
+		zip1D(24+2*rp, 16, 17)
+		zip2D(25+2*rp, 16, 17)
+	}
+	w("gemmmxgo:")
+	w("\tMOVD\tR13, R16")
+	w("\tADD\tR10, R9, R17")
+	w("\tADD\tR17, R8, R27")
+	w("\tMOVD\t$gemmscratch-%d(SP), R19", a64RepackGemmScratch)
+	w("\tMOVW\tR25, R15")
+	w("\tCBZW\tR15, gemmmstore")
+	w("gemmmblk:")
+	for i := 0; i < 8; i++ {
+		movi0(i)
+	}
+	for p := 0; p < 4; p++ {
+		ldurQ(16, 16, 8+32*p)
+		ldurQ(17, 16, 24+32*p)
+		zip1S(18, 16, 17) // B01: columns 0,1 x 8 k
+		zip2S(19, 16, 17) // B23
+		ldurQ(20, 19, 64*p)
+		ldurQ(21, 19, 64*p+16)
+		ldurQ(22, 19, 64*p+32)
+		ldurQ(23, 19, 64*p+48)
+		smmla(0, 20, 18)
+		smmla(1, 20, 19)
+		smmla(2, 21, 18)
+		smmla(3, 21, 19)
+		smmla(4, 22, 18)
+		smmla(5, 22, 19)
+		smmla(6, 23, 18)
+		smmla(7, 23, 19)
+	}
+	// Scales. dcol -> [dc0 dc1 dc0 dc1] / [dc2 dc3 dc2 dc3]; each
+	// row group's drow -> [dr0 dr0 dr1 dr1] / [dr2 dr2 dr3 dr3].
+	ldurD(16, 16, 0)
+	fcvtl(16, 16)
+	dupD(18, 16, 0)
+	dupD(19, 16, 1)
+	ldurD(17, 17, 0)
+	fcvtl(17, 17)
+	zip1S(20, 17, 17)
+	zip2S(21, 17, 17)
+	ldurD(17, 27, 0)
+	fcvtl(17, 17)
+	zip1S(22, 17, 17)
+	zip2S(23, 17, 17)
+	// tile(rp, cp): f32 += f32(i32) * (drow_rp * dcol_cp)
+	for i := 0; i < 8; i++ {
+		rp, cp := i/2, i%2
+		fmulV(16, 18+cp, 20+rp)
+		scvtf(i, i)
+		fmulV(i, i, 16)
+		faddV(24+i, 24+i, i)
+	}
+	w("\tADD\t$136, R16, R16")
+	w("\tADD\t$136, R17, R17")
+	w("\tADD\t$136, R27, R27")
+	w("\tADD\t$256, R19, R19")
+	w("\tSUBW\t$1, R15, R15")
+	w("\tCBNZW\tR15, gemmmblk")
+	w("gemmmstore:")
+	// Rows 2rp / 2rp+1 = the low / high halves of tiles (rp,01),(rp,23).
+	w("\tMOVD\tR14, R26")
+	for rp := 0; rp < 4; rp++ {
+		zip1D(16, 24+2*rp, 25+2*rp)
+		zip2D(17, 24+2*rp, 25+2*rp)
+		sturQ(16, 26, 0)
+		w("\tADD\tR3, R26, R26")
+		sturQ(17, 26, 0)
+		w("\tADD\tR3, R26, R26")
+	}
+	w("\tADD\tR8, R13, R13")
+	w("\tADD\t$16, R14, R14")
+	w("\tSUBW\t$1, R12, R12")
+	w("\tCBNZW\tR12, gemmmx")
+	// Next chunk of this tile, if any.
+	w("\tSUBW\tR25, R24, R24")
+	w("\tMOVD\t$136, R26")
+	w("\tMUL\tR25, R26, R26")
+	w("\tADD\tR26, R9, R9")
+	w("\tCBNZW\tR24, gemmmchunk")
+	// Next row-group pair.
+	w("\tADD\tR8<<1, R10, R10")
+	w("\tADD\tR23<<1, R11, R11")
+	w("\tSUBW\t$2, R6, R6")
+	w("\tB\tgemmm")
+
+	// ---- SDOT nest: remaining row groups (all of them without I8MM).
+	w("gemmsdot:")
+	w("\tCBZW\tR6, gemmdone")
 	w("gemmy:")
 	w("\tMOVD\tR22, R13") // b column-group cursor
 	w("\tMOVD\tR11, R14") // s column cursor
-	w("\tMOVD\tR7, R12")  // x counter
+	w("\tMOVW\tR7, R12")  // x counter
 	w("gemmx:")
 	movi0(28)
 	movi0(29)
@@ -156,7 +357,7 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	movi0(31)
 	w("\tMOVD\tR13, R16") // bp
 	w("\tMOVD\tR10, R17") // ap
-	w("\tMOVD\tR1, R15")  // block counter
+	w("\tMOVW\tR1, R15")  // block counter
 	w("\tCBZW\tR15, gemmstore")
 	w("gemmblk:")
 	movi0(24)

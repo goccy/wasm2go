@@ -633,6 +633,36 @@ func x64DispatchStub(sym, featSym, portSym, mirrorVar, argBytes string) string {
 		"\tJMP ·" + portSym + "(SB)\n"
 }
 
+// a64I8MMDispatchStub is the frameless entry of an arm64 SMMLA tile
+// kernel: it reads the package-local FEAT_I8MM mirror and tail-jumps
+// to the tile kernel when set, else to the bit-exact Go companion.
+// Both targets take the same ABI0 argument frame, and a $0 stub is
+// the only place a tail jump is legal — a kernel with a frame cannot
+// hand off without unwinding it first.
+func a64I8MMDispatchStub(sym, kernelSym, fallbackSym, mirrorVar string, argBytes int) string {
+	return "TEXT ·" + sym + "(SB), NOSPLIT, $0-" + strconv.Itoa(argBytes) + "\n" +
+		"\tMOVBU ·" + mirrorVar + "(SB), R27\n" +
+		"\tCBZ R27, 2(PC)\n" +
+		"\tJMP ·" + kernelSym + "(SB)\n" +
+		"\tJMP ·" + fallbackSym + "(SB)\n"
+}
+
+// nrc2ArgBytes / nrc2ArgType describe the vec_dot companion's ABI0
+// argument frame at the module's pointer width (see a64Nrc2Kernel).
+func nrc2ArgBytes(wide bool) int {
+	if wide {
+		return 64
+	}
+	return 36
+}
+
+func nrc2ArgType(wide bool) string {
+	if wide {
+		return "int64"
+	}
+	return "int32"
+}
+
 // a64DispatchStub is the arm64 feature-dispatch stub: read the mirror
 // bool, tail-jump to the portable twin when it is clear. Same frame,
 // same FP layout — the targets see the original caller's arguments.
@@ -969,6 +999,14 @@ func buildPkg(
 					}
 				} else {
 					featBody = a64RepackGemmKernel(featSym, trapSym, modOffs, wide)
+					if !mirrorVars["gcasmCPUI8MM"] {
+						mirrorVars["gcasmCPUI8MM"] = true
+						i8mmRef := "CPUI8MM"
+						if rel != "" && rel != "base" {
+							i8mmRef = "base." + i8mmRef
+						}
+						fmt.Fprintf(&declFns, "// gcasmCPUI8MM mirrors %s for the SMMLA tile kernels'\n// entry branches (asm reads package-local data only).\nvar gcasmCPUI8MM = %s\n\n", i8mmRef, i8mmRef)
+					}
 				}
 			}
 			if nrc2 != nil && name == nrc2.VecDot && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
@@ -997,7 +1035,24 @@ func buildPkg(
 						fmt.Fprintf(&declFns, "// gcasmHasAVX512VNNI mirrors %s for the tile kernel's\n// entry branch (asm reads package-local data only).\nvar gcasmHasAVX512VNNI = %s\n\n", vnniRef, vnniRef)
 					}
 				} else {
-					asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
+					// The SMMLA tile needs FEAT_I8MM, which the dotprod
+					// gate that selected this feature body does not
+					// imply: fastSym is a frameless stub that sends
+					// CPUs without I8MM back to the bit-exact Go
+					// companion and the rest to the tile kernel.
+					smmlaSym := fastSym + "smmla"
+					asmB.WriteString(a64I8MMDispatchStub(fastSym, smmlaSym, nrc2.Companion, "gcasmCPUI8MM", nrc2ArgBytes(wide)))
+					asmB.WriteString("\n")
+					asmB.WriteString(a64Nrc2Kernel(smmlaSym, trapSym, modOffs, wide))
+					if !mirrorVars["gcasmCPUI8MM"] {
+						mirrorVars["gcasmCPUI8MM"] = true
+						i8mmRef := "CPUI8MM"
+						if rel != "" && rel != "base" {
+							i8mmRef = "base." + i8mmRef
+						}
+						fmt.Fprintf(&declFns, "// gcasmCPUI8MM mirrors %s for the SMMLA tile kernels'\n// entry stubs (asm reads package-local data only).\nvar gcasmCPUI8MM = %s\n\n", i8mmRef, i8mmRef)
+					}
+					fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 %s, l2 %s, l3 %s, l4 %s, l5 %s, l6 %s)\n", smmlaSym, moduleTypeName(rel), nrc2ArgType(wide), nrc2ArgType(wide), nrc2ArgType(wide), nrc2ArgType(wide), nrc2ArgType(wide), nrc2ArgType(wide))
 				}
 				asmB.WriteString("\n")
 				argType := "int32"
