@@ -530,17 +530,35 @@ func (fb *fusedTreeBuilder) compactDeadNodes(roots []int) []int {
 			mark(i)
 		}
 	}
+	// Rebuild in index order, except that a node's operands are placed
+	// before the node: a rewrite that appends a fresh operand node at
+	// the end of the list (the gather's collapsed 8-byte load) would
+	// otherwise leave a forward reference, and the pure twin body
+	// emits nodes in list order. Hoisting a dependency to just before
+	// its first consumer keeps every other relative order intact — the
+	// load lands where the chain's last lane load used to be.
 	remap := make([]int, n)
+	for i := range remap {
+		remap[i] = -1
+	}
 	var newNodes []simdfuse.Node
 	newNodeVals := fb.nodeVals[:0:0]
-	for i := 0; i < n; i++ {
-		if !live[i] {
-			remap[i] = -1
-			continue
+	var place func(i int)
+	place = func(i int) {
+		if remap[i] >= 0 || !live[i] {
+			return
+		}
+		for _, a := range fb.nodes[i].Args {
+			if a.Kind == simdfuse.ArgNode && remap[a.Index] < 0 {
+				place(a.Index)
+			}
 		}
 		remap[i] = len(newNodes)
 		newNodes = append(newNodes, fb.nodes[i])
 		newNodeVals = append(newNodeVals, fb.nodeVals[i])
+	}
+	for i := 0; i < n; i++ {
+		place(i)
 	}
 	for i := range newNodes {
 		for ai := range newNodes[i].Args {
