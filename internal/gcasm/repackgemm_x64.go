@@ -43,11 +43,13 @@ const x64RepackGemmFrame = 64 + x64RepackGemmScratch
 // own: exact i32 column sum -> f32 -> x (dcol * drow) -> + running
 // sum, in block order.
 //
-// VNNI nest: VPDPBUSD with the exact +128 bias identity — the per-row
-// byte sums the identity needs accumulate in ONE extra VPDPBUSD per
-// group (ones · activation block = all four rows' group sums, one
-// lane each); each row's quad arrives by VPBROADCASTD straight from
-// memory.
+// VNNI nest: the same chunk/prepass structure at 256-bit width. The
+// prepass stores, per group pair and row, the 8 bytes [quad_k,
+// quad_k+1] xor 0x80 (u8); the weight pair is VPERMD'd to per-column
+// pairs (s8) and ONE VPDPBUSD per row covers 8 columns x 4 k; the
+// +128 activation bias is undone with a weight column sum shared by
+// the four rows (one VPDPBUSD(ones, weights) per pair, one subtract
+// per row per block), then the AVX2 collapse applies unchanged.
 //
 // Register file after the prologue (memSize/M die once the entry
 // checks pass and every pointer is host-absolute):
@@ -84,6 +86,15 @@ func x64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 	}
 	idx02Sym := idxSym(0, 2)
 	idx13Sym := idxSym(1, 3)
+	// VPERMD index [0 4 1 5 2 6 3 7]: a 32-byte weight pair
+	// [c0..c3 of group k | c0..c3 of group k+1] -> per-column pairs.
+	permSym := func() string {
+		blob := make([]byte, 32)
+		for i, v := range []byte{0, 4, 1, 5, 2, 6, 3, 7} {
+			blob[4*i] = v
+		}
+		return pool.addBlob(blob)
+	}()
 
 	argOff, argBytes := repackGemmArgs(wide)
 	movArg := "MOVL"
@@ -279,73 +290,147 @@ func x64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 	w("\tJNZ\tgemmy")
 	w("\tJMP\tgemmdone")
 
-	// ---- VNNI nest.
-	fmt.Fprintf(&b, "vgemmy:\n\tVMOVDQU ·%s(SB), X14\n", onesSym)
-	w("\tMOVL\t24(SP), R11")
+	// ---- VNNI nest: chunked like the AVX2 nest, but the activation
+	// prepass produces, per group PAIR and row, the 8 bytes
+	// [quad_k, quad_k+1] xor 0x80 (u8), so one VPBROADCASTQ serves a
+	// 256-bit VPDPBUSD against the pair of weight groups permuted to
+	// [c0g0 c0g1 c1g0 c1g1 | c2g0 c2g1 c3g0 c3g1] (s8). The +128 bias
+	// then sits on the ACTIVATION side and its correction is a weight
+	// column sum shared by all four rows: one VPDPBUSD(ones, weights)
+	// per pair, subtracted once per block in the pair domain before
+	// the same collapse the AVX2 nest uses.
+	//
+	//	R12 bp | AX ap (scales) | R11 scratch cursor | Y6 wsum
+	//	Y14 permute index | Y15 u8 ones
+	w("vgemmy:")
+	fmt.Fprintf(&b, "\tVMOVDQU ·%s(SB), Y14\n", permSym)
+	fmt.Fprintf(&b, "\tVMOVDQU ·%s(SB), X15\n", onesSym)
+	w("\tVINSERTI128\t$1, X15, Y15, Y15")
 	w("vgemmyy:")
+	w("\tMOVQ\t$0, 16(SP)")
+	w("\tMOVL\tR8, 8(SP)")
+	w("vgemmchunk:")
+	w("\tMOVL\t8(SP), R13")
+	w("\tMOVL\t$%d, AX", x64RepackGemmChunkBlocks)
+	w("\tCMPL\tR13, AX")
+	w("\tCMOVLGT\tAX, R13")
+	w("\tMOVL\tR13, 32(SP)")
+	// Prepass: per pair, rows 0/1 and 2/3 interleaved by dword.
+	w("\tMOVQ\tSI, AX")
+	w("\tADDQ\t16(SP), AX")
+	w("\tLEAQ\t64(SP), R11")
+	w("\tTESTL\tR13, R13")
+	w("\tJZ\tvgemmxinit")
+	w("vgemmpre:")
+	for p := 0; p < 4; p++ {
+		w("\tVMOVDQU\t%d(AX), X4", 8+32*p)
+		w("\tVMOVDQU\t%d(AX), X5", 8+32*p+16)
+		w("\tVPUNPCKLDQ\tX5, X4, X6")
+		w("\tVPUNPCKHDQ\tX5, X4, X7")
+		fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X6, X6\n", biasSym)
+		fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X7, X7\n", biasSym)
+		w("\tVMOVDQU\tX6, %d(R11)", 32*p)
+		w("\tVMOVDQU\tX7, %d(R11)", 32*p+16)
+	}
+	w("\tADDQ\t$136, AX")
+	w("\tADDQ\t$128, R11")
+	w("\tDECL\tR13")
+	w("\tJNZ\tvgemmpre")
+	w("vgemmxinit:")
 	w("\tMOVQ\tCX, DX")
+	w("\tADDQ\t16(SP), DX")
 	w("\tMOVQ\tBX, DI")
-	w("\tMOVQ\tR11, R13")
+	w("\tMOVL\t24(SP), R13")
 	w("vgemmx:")
-	w("\tVPXOR\tX8, X8, X8")
-	w("\tVPXOR\tX9, X9, X9")
-	w("\tVPXOR\tX10, X10, X10")
-	w("\tVPXOR\tX11, X11, X11")
+	w("\tCMPQ\t16(SP), $0")
+	w("\tJNE\tvgemmxload")
+	w("\tVPXOR\tY8, Y8, Y8")
+	w("\tVPXOR\tY9, Y9, Y9")
+	w("\tJMP\tvgemmxgo")
+	w("vgemmxload:")
+	w("\tLEAQ\t(DI)(R14*2), R12")
+	w("\tVMOVUPS\t(DI), X8")
+	w("\tVINSERTF128\t$1, (R12), Y8, Y8")
+	w("\tVMOVUPS\t(DI)(R14*1), X9")
+	w("\tVINSERTF128\t$1, (R12)(R14*1), Y9, Y9")
+	w("vgemmxgo:")
 	w("\tMOVQ\tDX, R12")
 	w("\tMOVQ\tSI, AX")
-	w("\tMOVL\tR8, 0(SP)")
-	w("\tTESTL\tR8, R8")
+	w("\tADDQ\t16(SP), AX")
+	w("\tMOVL\t32(SP), R11")
+	w("\tMOVL\tR11, 0(SP)")
+	w("\tLEAQ\t64(SP), R11")
+	w("\tCMPL\t0(SP), $0")
 	w("\tJZ\tvgemmstore")
 	w("vgemmblk:")
-	w("\tVPXOR\tX0, X0, X0")
-	w("\tVPXOR\tX1, X1, X1")
-	w("\tVPXOR\tX2, X2, X2")
-	w("\tVPXOR\tX3, X3, X3")
-	w("\tVPXOR\tX7, X7, X7")
-	for k := 0; k < 8; k++ {
-		w("\tVMOVDQU\t%d(R12), X4", 8+16*k)
-		fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X4, X4\n", biasSym)
-		w("\tVMOVDQU\t%d(AX), X5", 8+16*k)
-		w("\tVPDPBUSD\tX5, X14, X7") // rowsum += group sums
+	w("\tVPXOR\tY0, Y0, Y0")
+	w("\tVPXOR\tY1, Y1, Y1")
+	w("\tVPXOR\tY2, Y2, Y2")
+	w("\tVPXOR\tY3, Y3, Y3")
+	w("\tVPXOR\tY6, Y6, Y6")
+	for p := 0; p < 4; p++ {
+		w("\tVPERMD\t%d(R12), Y14, Y4", 8+32*p)
+		w("\tVPDPBUSD\tY4, Y15, Y6") // wsum += column sums (u8 ones x s8 weights)
 		for row := 0; row < 4; row++ {
-			w("\tVPBROADCASTD\t%d(AX), X6", 8+16*k+4*row)
-			w("\tVPDPBUSD\tX6, X4, X%d", row)
+			w("\tVPBROADCASTQ\t%d(R11), Y5", 32*p+8*row)
+			w("\tVPDPBUSD\tY4, Y5, Y%d", row) // acc_row += u8 acts x s8 weights
 		}
 	}
-	// acc_row -= 128 * rowsum[row].
+	// acc_row -= 128 * wsum (pair domain), then the AVX2 collapse.
+	w("\tVPSLLD\t$7, Y6, Y6")
 	for row := 0; row < 4; row++ {
-		w("\tVPSHUFD\t$%#02x, X7, X6", row*0x55)
-		w("\tVPSLLD\t$7, X6, X6")
-		w("\tVPSUBD\tX6, X%d, X%d", row, row)
+		w("\tVPSUBD\tY6, Y%d, Y%d", row, row)
 	}
-	// Scales: sumv_row += f32(acc_row) * (dcol * drow[row]).
-	w("\tVMOVQ\t(R12), X6")
-	w("\tVCVTPH2PS\tX6, X12")
-	w("\tVMOVQ\t(AX), X6")
-	w("\tVCVTPH2PS\tX6, X13")
-	for row := 0; row < 4; row++ {
-		w("\tVCVTDQ2PS\tX%d, X%d", row, row)
-		w("\tVPSHUFD\t$%#02x, X13, X7", row*0x55)
-		w("\tVMULPS\tX12, X7, X7")
-		w("\tVMULPS\tX%d, X7, X7", row)
-		w("\tVADDPS\tX7, X%d, X%d", 8+row, 8+row)
-	}
+	w("\tVPHADDD\tY1, Y0, Y10")
+	w("\tVPHADDD\tY3, Y2, Y11")
+	w("\tVPERM2I128\t$0x20, Y11, Y10, Y4")
+	w("\tVPERM2I128\t$0x31, Y11, Y10, Y5")
+	w("\tVPUNPCKLQDQ\tY5, Y4, Y10")
+	w("\tVPUNPCKHQDQ\tY5, Y4, Y11")
+	w("\tVMOVQ\t(R12), X7")
+	w("\tVCVTPH2PS\tX7, X12")
+	w("\tVINSERTF128\t$1, X12, Y12, Y12")
+	w("\tVMOVQ\t(AX), X7")
+	w("\tVCVTPH2PS\tX7, X13")
+	// Row scales per half without an index register: [d0 x4 | d2 x4]
+	// and [d1 x4 | d3 x4] from lane shuffles.
+	w("\tVPSHUFD\t$0x00, X13, X4")
+	w("\tVPSHUFD\t$0xaa, X13, X7")
+	w("\tVINSERTI128\t$1, X7, Y4, Y4")
+	w("\tVMULPS\tY12, Y4, Y4")
+	w("\tVPSHUFD\t$0x55, X13, X5")
+	w("\tVPSHUFD\t$0xff, X13, X7")
+	w("\tVINSERTI128\t$1, X7, Y5, Y5")
+	w("\tVMULPS\tY12, Y5, Y5")
+	w("\tVCVTDQ2PS\tY10, Y10")
+	w("\tVMULPS\tY4, Y10, Y10")
+	w("\tVADDPS\tY10, Y8, Y8")
+	w("\tVCVTDQ2PS\tY11, Y11")
+	w("\tVMULPS\tY5, Y11, Y11")
+	w("\tVADDPS\tY11, Y9, Y9")
 	w("\tADDQ\t$136, R12")
 	w("\tADDQ\t$136, AX")
+	w("\tADDQ\t$128, R11")
 	w("\tDECL\t0(SP)")
 	w("\tJNZ\tvgemmblk")
 	w("vgemmstore:")
+	w("\tLEAQ\t(DI)(R14*2), R12")
 	w("\tVMOVUPS\tX8, (DI)")
-	w("\tLEAQ\t(DI)(R14*1), R12")
-	w("\tVMOVUPS\tX9, (R12)")
-	w("\tADDQ\tR14, R12")
-	w("\tVMOVUPS\tX10, (R12)")
-	w("\tADDQ\tR14, R12")
-	w("\tVMOVUPS\tX11, (R12)")
+	w("\tVMOVUPS\tX9, (DI)(R14*1)")
+	w("\tVEXTRACTF128\t$1, Y8, X7")
+	w("\tVMOVUPS\tX7, (R12)")
+	w("\tVEXTRACTF128\t$1, Y9, X7")
+	w("\tVMOVUPS\tX7, (R12)(R14*1)")
 	w("\tADDQ\tR9, DX")
 	w("\tADDQ\t$16, DI")
 	w("\tSUBL\t$1, R13")
 	w("\tJNZ\tvgemmx")
+	w("\tMOVL\t32(SP), R13")
+	w("\tSUBL\tR13, 8(SP)")
+	w("\tIMUL3Q\t$136, R13, R13")
+	w("\tADDQ\tR13, 16(SP)")
+	w("\tCMPL\t8(SP), $0")
+	w("\tJNE\tvgemmchunk")
 	w("\tADDQ\tR9, SI")
 	w("\tADDQ\tR15, BX")
 	w("\tSUBL\t$1, R10")
