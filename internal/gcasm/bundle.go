@@ -103,7 +103,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	pure := PureFilter(all)
 
 	repackGemmFn := repackGemmExport(mod, cfg)
-	simdGemmFn := simdGemmF32Export(mod, cfg)
+	kernelRetargets := kernelRetargetExports(mod, cfg)
 
 	// Capture tree.
 	dir, err := os.MkdirTemp("", "gcasm-capture-*")
@@ -288,7 +288,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, repackGemmFn, simdGemmFn, cfg)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, repackGemmFn, kernelRetargets, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -713,7 +713,7 @@ func buildPkg(
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
 	repackGemmFn string,
-	simdGemmFn string,
+	kernelRetargets map[string]kernelRetarget,
 	cfg Config,
 ) (map[string][]byte, error) {
 	directSSA := cfg.DirectAsm
@@ -935,13 +935,15 @@ func buildPkg(
 		// symbol on a baseline CPU would fault. (Outlined extraction
 		// bodies historically never contained gated instructions, so
 		// including them here is a no-op for them.)
-		// The f32 GEMM retarget rides the same twin split even though
-		// its transformed body has no gated instruction: the native
-		// kernel becomes the feature body (the amd64 one needs AVX2)
-		// and the transformed body stays as the baseline twin.
-		retargetSimdGemm := simdGemmFn != "" && name == simdGemmFn && (arch.name == "arm64" || arch.name == "amd64") &&
+		// The by-export kernel retargets (f32 GEMM, vector exp) ride
+		// the same twin split even though their transformed bodies
+		// have no gated instruction: the native kernel becomes the
+		// feature body (the amd64 ones need AVX2) and the transformed
+		// body stays as the baseline twin.
+		kr, retargetKernel := kernelRetargets[name]
+		retargetKernel = retargetKernel && (arch.name == "arm64" || arch.name == "amd64") &&
 			modOffs != nil && modOffs.Cfg.FastMath && arch.gatedMarker != "" && !strings.Contains(body, arch.jtMarker)
-		if retargetSimdGemm || (arch.gatedMarker != "" &&
+		if retargetKernel || (arch.gatedMarker != "" &&
 			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker)) {
 			// Feature-gated body: the feature symbol keeps this body, a
 			// baseline twin is transformed with PortableSIMD, and a
@@ -1020,20 +1022,19 @@ func buildPkg(
 			// f32 GEMM (flash attention's tiled QK^T / PV): the feature
 			// body is replaced wholesale by a register-tiled kernel
 			// that reproduces the wasm arithmetic exactly.
-			if retargetSimdGemm {
+			if retargetKernel {
 				trapSym := "wasm_trap_simd_oob"
 				if rel != "" && rel != "base" {
 					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
 				}
 				wide := mod.Memory64()
-				_, wantArgs := simdGemmF32Args(wide)
-				if m[1] != fmt.Sprint(wantArgs) {
-					return nil, fmt.Errorf("transform %s: f32 GEMM retarget expects a %d-byte argument frame, transformed body has %s", f.Name, wantArgs, m[1])
+				if want := kr.argBytes(wide); m[1] != fmt.Sprint(want) {
+					return nil, fmt.Errorf("transform %s: %s retarget expects a %d-byte argument frame, transformed body has %s", f.Name, kr.export, want, m[1])
 				}
 				if arch.name == "amd64" {
-					featBody = x64SimdGemmF32Kernel(featSym, trapSym, modOffs, wide)
+					featBody = kr.x64(featSym, trapSym, modOffs, pool, wide)
 				} else {
-					featBody = a64SimdGemmF32Kernel(featSym, trapSym, modOffs, wide)
+					featBody = kr.a64(featSym, trapSym, modOffs, pool, wide)
 				}
 			}
 			if nrc2 != nil && name == nrc2.VecDot && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {

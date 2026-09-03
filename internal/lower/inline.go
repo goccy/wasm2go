@@ -111,7 +111,7 @@ func analyzeModuleForInline(mod *wasm.Module) *inlineAnalysis {
 	// tile benefit, so it stays inlinable. The GEMM tiles earn their
 	// keep only when a caller batches four or more rows.
 	for _, e := range mod.Exports {
-		if e.Kind == wasm.ExportFunc && (strings.HasPrefix(e.Name, "dbg_gemm_") || strings.HasPrefix(e.Name, "dbg_simd_gemm_")) {
+		if e.Kind == wasm.ExportFunc && (strings.HasPrefix(e.Name, "dbg_gemm_") || strings.HasPrefix(e.Name, "dbg_simd_gemm_") || strings.HasPrefix(e.Name, "dbg_vec_")) {
 			if info, ok := a.fns[e.Index]; ok {
 				info.noInline = true
 			}

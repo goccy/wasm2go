@@ -7,21 +7,75 @@ import (
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
-// simdGemmF32Export resolves the f32 GEMM retarget target: llama-wasm
-// exports ggml's simd_gemm (the tiled flash-attention QK^T / PV
-// micro-GEMM) under a stable debug name so the transpiler can swap its
-// body for a native register-tiled kernel. The kernel reproduces the
-// wasm arithmetic exactly — per element a k-ordered multiply-then-add
-// into the running sum — so it is bit-identical to the transformed
-// body; the FastMath gate is only the retarget infrastructure's.
-// Returns the FnN symbol, or "" when the export is absent.
-func simdGemmF32Export(mod *wasm.Module, cfg Config) string {
+// kernelRetarget describes one by-export native kernel: the wasm
+// function exported under `export` has its feature body replaced
+// wholesale by a64/x64 (see the repack GEMM retarget for the origin of
+// the scheme). argBytes is the ABI0 argument frame the emitted TEXT
+// declares; the bundle checks it against the transformed body's.
+type kernelRetarget struct {
+	export   string
+	argBytes func(wide bool) int
+	a64      func(sym, trapSym string, offs *ModuleOffsets, pool *ConstPool, wide bool) string
+	x64      func(sym, trapSym string, offs *ModuleOffsets, pool *ConstPool, wide bool) string
+}
+
+// kernelRetargetTable lists the exports llama-wasm publishes for
+// retargeting: ggml's simd_gemm (the tiled flash-attention QK^T / PV
+// micro-GEMM) and the vector exp kernels behind soft_max and swiglu.
+// All three reproduce the wasm arithmetic up to fused multiply-adds
+// (native-style rounding, which the FastMath gate admits).
+var kernelRetargetTable = []kernelRetarget{
+	{
+		export:   "dbg_simd_gemm_f32",
+		argBytes: func(wide bool) int { _, n := simdGemmF32Args(wide); return n },
+		a64: func(sym, trapSym string, offs *ModuleOffsets, _ *ConstPool, wide bool) string {
+			return a64SimdGemmF32Kernel(sym, trapSym, offs, wide)
+		},
+		x64: func(sym, trapSym string, offs *ModuleOffsets, _ *ConstPool, wide bool) string {
+			return x64SimdGemmF32Kernel(sym, trapSym, offs, wide)
+		},
+	},
+	{
+		export:   "dbg_vec_soft_max_f32",
+		argBytes: func(wide bool) int { _, n, _, _ := vecExpArgs(wide); return n },
+		a64:      a64VecSoftMaxKernel,
+		x64:      x64VecSoftMaxKernel,
+	},
+	{
+		export:   "dbg_vec_swiglu_f32",
+		argBytes: func(wide bool) int { _, _, _, n := vecExpArgs(wide); return n },
+		a64:      a64VecSwigluKernel,
+		x64:      x64VecSwigluKernel,
+	},
+}
+
+// kernelRetargetExports resolves the retarget table against the
+// module's exports: FnN symbol -> kernel. FastMath only, and subject
+// to the same opt-out as the repack GEMM retarget.
+func kernelRetargetExports(mod *wasm.Module, cfg Config) map[string]kernelRetarget {
+	out := map[string]kernelRetarget{}
 	if !cfg.FastMath || cfg.DisableRepackGemm {
-		return ""
+		return out
 	}
 	for _, e := range mod.Exports {
-		if e.Kind == wasm.ExportFunc && e.Name == "dbg_simd_gemm_f32" {
-			return fmt.Sprintf("Fn%d", e.Index)
+		if e.Kind != wasm.ExportFunc {
+			continue
+		}
+		for _, kr := range kernelRetargetTable {
+			if e.Name == kr.export {
+				out[fmt.Sprintf("Fn%d", e.Index)] = kr
+			}
+		}
+	}
+	return out
+}
+
+// simdGemmF32Export resolves the f32 GEMM retarget target (kept for
+// the export gate test): the FnN symbol, or "".
+func simdGemmF32Export(mod *wasm.Module, cfg Config) string {
+	for sym, kr := range kernelRetargetExports(mod, cfg) {
+		if kr.export == "dbg_simd_gemm_f32" {
+			return sym
 		}
 	}
 	return ""
