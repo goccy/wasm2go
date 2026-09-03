@@ -39,8 +39,8 @@ func TestRepackGemmKernelShape(t *testing.T) {
 		"dup v19.2d, v16.d[1]", "gcasmCPUI8MM", "gemmmpre:", "gemmmchunk:",
 		"sdot v24.4s, v0.16b, v1.4b[0]",
 		"sdot v27.4s, v0.16b, v1.4b[3]",
-		"fmul v4.4s, v2.4s, v3.s[3]",
-		"fadd v31.4s, v31.4s, v5.4s",
+		"fmul v27.4s, v27.4s, v2.4s",
+		"fmla v31.4s, v27.4s, v3.s[3]",
 		"fcvtl v2.4s, v2.4h",
 		"gemmblk:", "gemmoob:",
 	} {

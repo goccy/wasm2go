@@ -14,8 +14,9 @@ import (
 // whose 4-byte lanes are the eight k-quads, and each weight group
 // SDOTs against the matching lane (sdot .4b[k]) into its own i32
 // accumulator — 32 independent SDOTs per block over four weight
-// streams, then per group scvtf -> x (dcol * da) -> + running f32 sum
-// (the wasm gemv's own per-block order). Leftover groups run one at a
+// streams, then per group scvtf -> x dcol -> fused x da + running f32
+// sum, in the wasm gemv's per-block order and with the GEMM nests'
+// rounding. Leftover groups run one at a
 // time. The kernel exists to replace the transpiled fused loop, which
 // pays a bounds check per load and a table lookup per f16 scale; it is
 // bandwidth-bound after that.
@@ -60,15 +61,12 @@ func a64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	}
 	fcvtl := func(d, n int) { word(0x0E217800|uint32(n)<<5|uint32(d), fmt.Sprintf("fcvtl v%d.4s, v%d.4h", d, n)) }
 	scvtf := func(d, n int) { word(0x4E21D800|uint32(n)<<5|uint32(d), fmt.Sprintf("scvtf v%d.4s, v%d.4s", d, n)) }
-	fmulLane := func(d, n, m, idx int) {
-		enc := 0x4F809000 | uint32(idx&1)<<21 | uint32(idx>>1)<<11 | uint32(m)<<16 | uint32(n)<<5 | uint32(d)
-		word(enc, fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.s[%d]", d, n, m, idx))
+	fmlaLane := func(d, n, m, idx int) {
+		enc := 0x4F801000 | uint32(idx&1)<<21 | uint32(idx>>1)<<11 | uint32(m)<<16 | uint32(n)<<5 | uint32(d)
+		word(enc, fmt.Sprintf("fmla v%d.4s, v%d.4s, v%d.s[%d]", d, n, m, idx))
 	}
 	fmulV := func(d, n, m int) {
 		word(0x6E20DC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.4s", d, n, m))
-	}
-	faddV := func(d, n, m int) {
-		word(0x4E20D400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fadd v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
 
 	argOff, argBytes := repackGemmArgs(wide)
@@ -84,15 +82,17 @@ func a64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 		w("\t%s\t%s+%d(FP), R%d", mv, name, argOff[name], reg)
 	}
 
-	// Per-group block tail: v(acc) i32 -> f32, x (dcol * da), into v(sum).
-	// dcol comes from the group's block header, da is in v18.s[0].
+	// Per-group block tail: v(sum) += (f32(v(acc)) * dcol) * da with the
+	// activation scale fused — the same sequence and rounding as the
+	// GEMM nests' tails, so a row scores the same whether it was decoded
+	// alone (this kernel) or inside a batch (the GEMM). dcol comes from
+	// the group's block header, da is in v18.s[0].
 	tail := func(acc, sum, bp int) {
 		ldurD(19, bp, 0)
 		fcvtl(19, 19)
-		fmulLane(19, 19, 18, 0)
 		scvtf(acc, acc)
 		fmulV(acc, acc, 19)
-		faddV(sum, sum, acc)
+		fmlaLane(sum, acc, 18, 0)
 	}
 
 	w("// %s: q8_0x4 repack GEMV, four column groups per pass via by-element SDOT.", sym)

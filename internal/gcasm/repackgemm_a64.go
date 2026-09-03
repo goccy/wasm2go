@@ -42,15 +42,14 @@ const (
 //
 //	sdot vAcc_r.4s, vWeights.16b, vActs.4b[r]
 //
-// The SDOT nest keeps the wasm gemm's own per-element arithmetic on
-// every output: exact i32 column sum -> f32 -> x (dcol * drow) -> +
-// running sum, in block order. The SMMLA nest keeps the exact i32 sums
-// and the block order but fuses the row scale into the accumulate
-// ((f32(sum) * dcol) * drow with one rounding), the native-style
-// rounding the FastMath gate admits; the block tail was 36% of the
-// kernel's time and the fused form is three ops per tile. Larger K than
-// the scratch holds runs as chunks that accumulate into the output
-// rows in place, in the same block order.
+// Both nests keep the exact i32 sums and the block order and fuse the
+// row scale into the accumulate ((f32(sum) * dcol) * drow, one
+// rounding), the native-style rounding the FastMath gate admits — and
+// the same sequence in both, so a row's result does not depend on the
+// nest it fell into. (The SMMLA block tail was 36% of the kernel's time;
+// the fused form is three ops per tile.) Larger K than the scratch
+// holds runs as chunks that accumulate into the output rows in place,
+// in the same block order.
 //
 // C signature (see llama-wasm's arch/wasm/repack.cpp):
 //
@@ -120,18 +119,15 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	}
 	fcvtl := func(d, n int) { word(0x0E217800|uint32(n)<<5|uint32(d), fmt.Sprintf("fcvtl v%d.4s, v%d.4h", d, n)) }
 	scvtf := func(d, n int) { word(0x4E21D800|uint32(n)<<5|uint32(d), fmt.Sprintf("scvtf v%d.4s, v%d.4s", d, n)) }
-	fmulLane := func(d, n, m, idx int) {
-		enc := 0x4F809000 | uint32(idx&1)<<21 | uint32(idx>>1)<<11 | uint32(m)<<16 | uint32(n)<<5 | uint32(d)
-		word(enc, fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.s[%d]", d, n, m, idx))
-	}
 	fmulV := func(d, n, m int) {
 		word(0x6E20DC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
 	fmlaV := func(d, n, m int) {
 		word(0x4E20CC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmla v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
-	faddV := func(d, n, m int) {
-		word(0x4E20D400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fadd v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	fmlaLane := func(d, n, m, idx int) {
+		enc := 0x4F801000 | uint32(idx&1)<<21 | uint32(idx>>1)<<11 | uint32(m)<<16 | uint32(n)<<5 | uint32(d)
+		word(enc, fmt.Sprintf("fmla v%d.4s, v%d.4s, v%d.s[%d]", d, n, m, idx))
 	}
 
 	argOff, argBytes := repackGemmArgs(wide)
@@ -379,27 +375,19 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 		sdotLane(27, 0, 1, 3)
 	}
 	// Scales: column d[4] and row d[4] (f16 -> f32), then per row
-	// sumv_r += f32(acc_r) * (dcol * drow[r]).
+	// sumv_r += (f32(acc_r) * dcol) * drow[r] with the row scale fused
+	// — the SAME sequence and rounding as the SMMLA nest's tail, so a
+	// row's result does not depend on whether it fell into a pair or
+	// into this tail group.
 	ldurD(2, 16, 0)
 	fcvtl(2, 2)
 	ldurD(3, 17, 0)
 	fcvtl(3, 3)
-	scvtf(24, 24)
-	scvtf(25, 25)
-	scvtf(26, 26)
-	scvtf(27, 27)
-	fmulLane(4, 2, 3, 0)
-	fmulV(5, 24, 4)
-	faddV(28, 28, 5)
-	fmulLane(4, 2, 3, 1)
-	fmulV(5, 25, 4)
-	faddV(29, 29, 5)
-	fmulLane(4, 2, 3, 2)
-	fmulV(5, 26, 4)
-	faddV(30, 30, 5)
-	fmulLane(4, 2, 3, 3)
-	fmulV(5, 27, 4)
-	faddV(31, 31, 5)
+	for r := 0; r < 4; r++ {
+		scvtf(24+r, 24+r)
+		fmulV(24+r, 24+r, 2)
+		fmlaLane(28+r, 24+r, 3, r)
+	}
 	w("\tADD\t$136, R16, R16")
 	w("\tADD\t$136, R17, R17")
 	w("\tSUBW\t$1, R15, R15")
