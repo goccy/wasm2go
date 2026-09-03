@@ -12,8 +12,8 @@ import (
 // Tiles: 4 rows x 16 columns (eight ymm accumulators, two B ymm per k
 // shared by the rows, one VBROADCASTSS per row) for the bulk; 4 x 8
 // (ymm), 4 x 4 (xmm) and 4 x 1 for the column tail; the same shapes
-// one row at a time for the row tail. acc = acc + (b * a) in k order,
-// no FMA, so the result matches the transformed body bit for bit.
+// one row at a time for the row tail. acc = fma(b, a, acc) in k order
+// (one rounding; the wasm body rounds twice — fast-math, as on arm64).
 //
 // Register file after the prologue: CX C row base, SI A row base,
 // BX B base (host pointers); R10 rows left, R9 K, R8 N*4 (B/C row
@@ -101,7 +101,6 @@ func x64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 		w("%sk:", p)
 		bReg := rows * nv // B vectors follow the accumulators
 		bc := bReg + nv   // broadcast
-		tmp := bc + 1     // product
 		vsz := 32
 		if width == "X" {
 			vsz = 16
@@ -113,8 +112,7 @@ func x64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 			w("\tVBROADCASTSS\t(%s), %s%d", aRegs[r], width, bc)
 			w("\tADDQ\t$4, %s", aRegs[r])
 			for c := 0; c < nv; c++ {
-				w("\tVMULPS\t%s%d, %s%d, %s%d", width, bReg+c, width, bc, width, tmp)
-				w("\tVADDPS\t%s%d, %s%d, %s%d", width, tmp, width, r*nv+c, width, r*nv+c)
+				w("\tVFMADD231PS\t%s%d, %s%d, %s%d", width, bReg+c, width, bc, width, r*nv+c)
 			}
 		}
 		w("\tADDQ\tR8, R12")
@@ -134,8 +132,7 @@ func x64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 		for r := 0; r < rows; r++ {
 			w("\tVMOVSS\t(%s), X9", aRegs[r])
 			w("\tADDQ\t$4, %s", aRegs[r])
-			w("\tVMULSS\tX8, X9, X9")
-			w("\tVADDSS\tX9, X%d, X%d", r, r)
+			w("\tVFMADD231SS\tX8, X9, X%d", r)
 		}
 		w("\tADDQ\tR8, R12")
 		w("\tDECQ\tR11")

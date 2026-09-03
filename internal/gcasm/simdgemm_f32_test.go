@@ -30,7 +30,7 @@ func TestSimdGemmF32KernelShape(t *testing.T) {
 	offs := &ModuleOffsets{M: 8, MemSize: 0}
 	a := a64SimdGemmF32Kernel("Fn12dotprod", "trapstub", offs, true)
 	for _, want := range []string{
-		"ld1r {v20.4s}, [x16], #4", "fmul v24.4s, v16.4s, v20.4s", "fadd v15.4s, v15.4s, v27.4s",
+		"ld1r {v20.4s}, [x16], #4", "fmla v15.4s, v19.4s, v23.4s", "FMADDS",
 		"sg4c16k:", "sg4c4k:", "sg4c1k:", "sg1c16k:", "sg1c4k:", "sg1c1k:", "sgoob:",
 		"TEXT ·Fn12dotprod(SB), $16-44",
 	} {
@@ -43,7 +43,7 @@ func TestSimdGemmF32KernelShape(t *testing.T) {
 	}
 	x := x64SimdGemmF32Kernel("Fn12avx2", "trapstub", offs, true)
 	for _, want := range []string{
-		"VBROADCASTSS", "VMULPS\tY8, Y10, Y11", "VADDPS\tY11, Y7, Y7", "VMULSS", "VADDSS",
+		"VBROADCASTSS", "VFMADD231PS\tY8, Y10, Y0", "VFMADD231PS\tY9, Y10, Y7", "VFMADD231SS",
 		"sg4c16k:", "sg4c8k:", "sg4c4k:", "sg4c1k:", "sg1c16k:", "sg1c1k:", "VZEROUPPER",
 		"TEXT ·Fn12avx2(SB), $16-44",
 	} {
@@ -51,14 +51,12 @@ func TestSimdGemmF32KernelShape(t *testing.T) {
 			t.Errorf("x64 kernel missing %q", want)
 		}
 	}
-	if strings.Contains(x, "VFMADD") {
-		t.Error("x64 kernel must not use FMA (the wasm body rounds the product)")
-	}
 }
 
 // simdGemmRunSrc is the execution driver: random A/B/C in a mock module
-// memory, the kernel, and a float32 reference that accumulates in the
-// same k order — the comparison is bit-exact.
+// memory, the kernel, and a reference that fuses each multiply-add in
+// float64 in the same k order; the kernel's single-rounded f32 FMAs
+// must land within a few ulps of it.
 const simdGemmRunSrc = `package gemmrun
 
 import (
@@ -124,11 +122,12 @@ func runCase(t *testing.T, kernel func(m *mockModule, l0, l1, l2 int64, l3, l4, 
 	kernel(m, int64(cOff), int64(aOff), int64(bOff), int32(c.m), int32(c.k), int32(c.n))
 	for i := 0; i < c.m; i++ {
 		for j := 0; j < c.n; j++ {
-			acc := C[i*c.n+j]
+			acc := float64(C[i*c.n+j])
 			for kk := 0; kk < c.k; kk++ {
-				acc = acc + B[kk*c.n+j]*A[i*c.k+kk]
+				acc = float64(float32(math.FMA(float64(B[kk*c.n+j]), float64(A[i*c.k+kk]), acc)))
 			}
-			if got := getF32(mem, cOff+4*(i*c.n+j)); got != acc {
+			got := float64(getF32(mem, cOff+4*(i*c.n+j)))
+			if math.Abs(got-acc) > 1e-6*math.Max(1, math.Abs(acc)) {
 				t.Fatalf("case %+v: C[%d][%d] = %v, want %v", c, i, j, got, acc)
 			}
 		}

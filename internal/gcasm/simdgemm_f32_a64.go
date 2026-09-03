@@ -45,9 +45,10 @@ func simdGemmF32Args(wide bool) (map[string]int, int) {
 // per k shared by the rows, one LD1R broadcast per row) for the bulk;
 // 4 rows x 4 columns and 4 rows x 1 column for the column tail; then
 // the same three shapes for the row tail one row at a time. Every
-// element's sum is formed as acc = acc + (b * a) in k order — the wasm
-// GGML_F32x4_FMA is add(mul(b, c), a) — so the result matches the
-// transformed body bit for bit whatever the tile.
+// element's sum is formed as acc = fma(b, a, acc) in k order: the wasm
+// body rounds the product and the sum separately, the kernel fuses
+// them (one rounding, the more accurate result) — the native-style
+// rounding the FastMath gate admits, as in the vec_dot tile kernels.
 //
 // Bounds: the three spans A[M*K], B[K*N], C[M*N] are checked against
 // memSize once at entry; a non-positive dimension returns without
@@ -73,11 +74,9 @@ func a64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 	ld1rPost := func(t, n int) {
 		word(0x4DDFC800|uint32(n)<<5|uint32(t), fmt.Sprintf("ld1r {v%d.4s}, [x%d], #4", t, n))
 	}
-	fmulV := func(d, n, m int) {
-		word(0x6E20DC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.4s", d, n, m))
-	}
-	faddV := func(d, n, m int) {
-		word(0x4E20D400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fadd v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	// fmla d.4s, n.4s, m.4s: d += n * m, one rounding (fast-math).
+	fmlaV := func(d, n, m int) {
+		word(0x4E20CC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmla v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
 
 	argOff, argBytes := simdGemmF32Args(wide)
@@ -147,8 +146,7 @@ func a64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 		ld1rPost(23, 23)
 		for r := 0; r < 4; r++ {
 			for c := 0; c < nv; c++ {
-				fmulV(24+c, 16+c, 20+r)
-				faddV(4*r+c, 4*r+c, 24+c)
+				fmlaV(4*r+c, 16+c, 20+r)
 			}
 		}
 		w("\tADD\tR8, R22, R22")
@@ -167,8 +165,7 @@ func a64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 		}
 		ld1rPost(20, 16)
 		for c := 0; c < nv; c++ {
-			fmulV(24+c, 16+c, 20)
-			faddV(c, c, 24+c)
+			fmlaV(c, 16+c, 20)
 		}
 		w("\tADD\tR8, R22, R22")
 		w("\tSUBW\t$1, R24, R24")
@@ -188,21 +185,17 @@ func a64SimdGemmF32Kernel(sym, trapSym string, offs *ModuleOffsets, wide bool) s
 		w("\tFMOVS\t(R22), F16")
 		w("\tFMOVS\t(R16), F20")
 		w("\tADD\t$4, R16, R16")
-		w("\tFMULS\tF16, F20, F24")
-		w("\tFADDS\tF24, F0, F0")
+		w("\tFMADDS\tF16, F0, F20, F0")
 		if rows == 4 {
 			w("\tFMOVS\t(R17), F21")
 			w("\tADD\t$4, R17, R17")
-			w("\tFMULS\tF16, F21, F25")
-			w("\tFADDS\tF25, F1, F1")
+			w("\tFMADDS\tF16, F1, F21, F1")
 			w("\tFMOVS\t(R19), F22")
 			w("\tADD\t$4, R19, R19")
-			w("\tFMULS\tF16, F22, F26")
-			w("\tFADDS\tF26, F2, F2")
+			w("\tFMADDS\tF16, F2, F22, F2")
 			w("\tFMOVS\t(R23), F23")
 			w("\tADD\t$4, R23, R23")
-			w("\tFMULS\tF16, F23, F27")
-			w("\tFADDS\tF27, F3, F3")
+			w("\tFMADDS\tF16, F3, F23, F3")
 		}
 		w("\tADD\tR8, R22, R22")
 		w("\tSUBW\t$1, R24, R24")
