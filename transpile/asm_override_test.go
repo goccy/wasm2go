@@ -12,9 +12,9 @@ import (
 	"github.com/goccy/wasm2go/transpile"
 )
 
-// kernelOverrideWat exports sumf(ptr, n) -> f32: the sum of n f32 values
+// asmOverrideWat exports sumf(ptr, n) -> f32: the sum of n f32 values
 // at ptr in linear memory.
-const kernelOverrideWat = `(module
+const asmOverrideWat = `(module
   (memory (export "memory") 1)
   (func (export "sumf") (param $p i32) (param $n i32) (result f32)
     (local $acc f32)
@@ -31,8 +31,8 @@ const kernelOverrideWat = `(module
 // Override bodies for the host baselines. Both follow the contract:
 // arguments at l0+8 / l1+12 / r0+16 (FP), memory through the base and
 // size registers the prologue loads, every access range checked
-// against the size with the miss sent to kov_oob, no calls.
-const kernelOverrideNeon = `	MOVWU	l0+8(FP), R1
+// against the size with the miss sent to ovr_oob, no calls.
+const asmOverrideNeon = `	MOVWU	l0+8(FP), R1
 	MOVW	l1+12(FP), R2
 	FMOVS	$0.0, F0
 	CMPW	$1, R2
@@ -40,7 +40,7 @@ const kernelOverrideNeon = `	MOVWU	l0+8(FP), R1
 	LSL	$2, R2, R3
 	ADD	R1, R3, R3
 	CMP	R3, R21
-	BLO	kov_oob
+	BLO	ovr_oob
 	ADD	R20, R1, R1
 loop:
 	FMOVS	(R1), F1
@@ -53,7 +53,7 @@ done:
 	RET
 `
 
-const kernelOverrideSSE4 = `	MOVL	l0+8(FP), SI
+const asmOverrideSSE4 = `	MOVL	l0+8(FP), SI
 	MOVL	l1+12(FP), CX
 	XORPS	X0, X0
 	TESTL	CX, CX
@@ -62,7 +62,7 @@ const kernelOverrideSSE4 = `	MOVL	l0+8(FP), SI
 	SHLQ	$2, DX
 	ADDQ	SI, DX
 	CMPQ	R15, DX
-	JCS	kov_oob
+	JCS	ovr_oob
 	ADDQ	R14, SI
 loop:
 	ADDSS	(SI), X0
@@ -74,10 +74,10 @@ done:
 	RET
 `
 
-const kernelOverrideManifest = `{
+const asmOverrideManifest = `{
   "version": 1,
   "memory64": false,
-  "kernels": [{
+  "functions": [{
     "export": "sumf",
     "params": ["i32", "i32"],
     "result": "f32",
@@ -89,12 +89,12 @@ const kernelOverrideManifest = `{
 }
 `
 
-// kernelOverrideDriver sums a few ranges through the export. With the
+// asmOverrideDriver sums a few ranges through the export. With the
 // "oob" argument it also calls the export once past the end of memory:
-// the override contract requires that to reach kov_oob and trap (the
+// the override contract requires that to reach ovr_oob and trap (the
 // lowered scalar path does not check bounds — it relies on the host
 // fault — so only the override build runs that probe).
-const kernelOverrideDriver = `package main
+const asmOverrideDriver = `package main
 
 import (
 	"encoding/binary"
@@ -102,7 +102,7 @@ import (
 	"math"
 	"os"
 
-	"kovtest/pkg"
+	"ovrtest/pkg"
 )
 
 func main() {
@@ -127,10 +127,10 @@ func main() {
 }
 `
 
-// TestKernelOverrideEndToEnd transpiles the module twice — lowered, and
+// TestAsmOverrideEndToEnd transpiles the module twice — lowered, and
 // with the project-supplied bodies — builds both, and requires the
 // same outputs, including the out-of-bounds trap.
-func TestKernelOverrideEndToEnd(t *testing.T) {
+func TestAsmOverrideEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("wat2wasm"); err != nil {
 		t.Skip("wat2wasm not installed")
 	}
@@ -144,10 +144,10 @@ func TestKernelOverrideEndToEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("t.wat", kernelOverrideWat)
-	write("kernels/sumf_arm64_neon.s", kernelOverrideNeon)
-	write("kernels/sumf_amd64_sse4.s", kernelOverrideSSE4)
-	write("kernels/kernels.json", kernelOverrideManifest)
+	write("t.wat", asmOverrideWat)
+	write("overrides/sumf_arm64_neon.s", asmOverrideNeon)
+	write("overrides/sumf_amd64_sse4.s", asmOverrideSSE4)
+	write("overrides/overrides.json", asmOverrideManifest)
 	if out, err := exec.Command("wat2wasm", "--output="+filepath.Join(dir, "t.wasm"), filepath.Join(dir, "t.wat")).CombinedOutput(); err != nil {
 		t.Fatalf("wat2wasm: %v\n%s", err, out)
 	}
@@ -167,8 +167,8 @@ func TestKernelOverrideEndToEnd(t *testing.T) {
 		var buf bytes.Buffer
 		res, err := transpile.Translate(&buf, m, transpile.Options{
 			Package:          "pkg",
-			OutputImportPath: "kovtest/pkg",
-			KernelOverrides:  manifest,
+			OutputImportPath: "ovrtest/pkg",
+			AsmOverrides:     manifest,
 		})
 		if err != nil {
 			t.Fatalf("%s: Translate: %v", name, err)
@@ -183,7 +183,7 @@ func TestKernelOverrideEndToEnd(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		w("go.mod", []byte("module kovtest\n\ngo 1.25.0\n"))
+		w("go.mod", []byte("module ovrtest\n\ngo 1.25.0\n"))
 		w("pkg/gen.go", buf.Bytes())
 		var asm strings.Builder
 		for rel, data := range res.Files {
@@ -195,7 +195,7 @@ func TestKernelOverrideEndToEnd(t *testing.T) {
 		for n, data := range res.Sidecars {
 			w("pkg/"+n, data)
 		}
-		w("main.go", []byte(kernelOverrideDriver))
+		w("main.go", []byte(asmOverrideDriver))
 		cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
 		cmd.Dir = mod
 		// The asm bundle is built for amd64 only at GOAMD64=v2 or
@@ -208,7 +208,7 @@ func TestKernelOverrideEndToEnd(t *testing.T) {
 		return string(out), asm.String()
 	}
 	plain, plainAsm := run("plain", "")
-	over, overAsm := run("override", filepath.Join(dir, "kernels", "kernels.json"), "oob")
+	over, overAsm := run("override", filepath.Join(dir, "overrides", "overrides.json"), "oob")
 	overLines := strings.Split(strings.TrimSpace(over), "\n")
 	if len(overLines) != 7 || overLines[6] != "trap" {
 		t.Fatalf("override build: expected six sums and a trap:\n%s", over)
@@ -219,11 +219,11 @@ func TestKernelOverrideEndToEnd(t *testing.T) {
 	if overLines[0] != "0" || overLines[2] != "-15.75" {
 		t.Fatalf("unexpected sums:\n%s", over)
 	}
-	feature := map[string]string{"arm64": "kovneon", "amd64": "kovsse4"}[runtime.GOARCH]
-	if !strings.Contains(overAsm, feature) || !strings.Contains(overAsm, "kov_oob:") {
+	feature := map[string]string{"arm64": "ovrneon", "amd64": "ovrsse4"}[runtime.GOARCH]
+	if !strings.Contains(overAsm, feature) || !strings.Contains(overAsm, "ovr_oob:") {
 		t.Fatalf("override body not emitted for %s", runtime.GOARCH)
 	}
-	if strings.Contains(plainAsm, "kov_oob:") {
+	if strings.Contains(plainAsm, "ovr_oob:") {
 		t.Fatal("lowered build must not carry override bodies")
 	}
 }

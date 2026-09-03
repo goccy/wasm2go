@@ -75,16 +75,16 @@ func Parse(r io.Reader) (*Module, error) {
 // every measured configuration.
 func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	var mainBuf bytes.Buffer
-	// Kernel overrides: validate the project's manifest against the
+	// Assembly overrides: validate the project's manifest against the
 	// module up front, and pin its exports out of line before lowering.
-	var kov *gcasm.KernelOverrides
-	if opts.KernelOverrides != "" {
+	var ovr *gcasm.AsmOverrides
+	if opts.AsmOverrides != "" {
 		var err error
-		if kov, err = gcasm.LoadKernelOverrides(opts.KernelOverrides, m); err != nil {
+		if ovr, err = gcasm.LoadAsmOverrides(opts.AsmOverrides, m); err != nil {
 			return Result{}, err
 		}
-		names := make([]string, 0, len(kov.Kernels))
-		for name := range kov.Kernels {
+		names := make([]string, 0, len(ovr.Functions))
+		for name := range ovr.Functions {
 			names = append(names, name)
 		}
 		sort.Strings(names)
@@ -148,7 +148,7 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	}
 	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, gcasm.Config{
 		FastMath:         opts.FastMath,
-		KernelOverrides:  kov,
+		AsmOverrides:     ovr,
 		FuseLoopUnroll:   opts.FuseLoopUnroll,
 		DirectAsm:        directAsm,
 		DirectAsmGlobals: res.DirectAsmGlobals,

@@ -7,7 +7,7 @@ import (
 )
 
 // An export registered through SetNoInlineExports is pinned out of
-// line so a kernel override lands on a live body, even when it is small
+// line so a assembly override lands on a live body, even when it is small
 // enough to inline; an ordinary small exported leaf is still inlinable.
 func TestPinnedExportNotInlined(t *testing.T) {
 	body := []byte{0x0b} // just `end`: a tiny leaf body

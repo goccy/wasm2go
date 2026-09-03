@@ -65,7 +65,7 @@ type fnInlineInfo struct {
 	hasTry    bool
 	// noInline pins the function out-of-line regardless of size: it
 	// is an export whose body the downstream asm bundle replaces (a
-	// kernel override). Inlining it into every caller would leave the
+	// assembly override). Inlining it into every caller would leave the
 	// exported body dead and the replacement landing on unreachable
 	// code.
 	noInline bool
@@ -118,7 +118,7 @@ func analyzeModuleForInline(mod *wasm.Module) *inlineAnalysis {
 		idx := mod.NumImportedFuncs + uint32(i)
 		a.fns[idx] = &fnInlineInfo{bodyBytes: len(mod.Functions[i].Body), leaf: true}
 	}
-	// Pinned exports: the asm bundle replaces their bodies (kernel
+	// Pinned exports: the asm bundle replaces their bodies (assembly
 	// overrides), so every call must reach the exported body itself.
 	if pinned, ok := noInlineExports.Load(mod); ok {
 		for _, e := range mod.Exports {

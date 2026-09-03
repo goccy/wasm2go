@@ -157,15 +157,15 @@ type Options struct {
 	// gate it and validate with token-level equivalence instead of
 	// byte-equality probes.
 	FastMath bool
-	// KernelOverrides is the path of a kernel-override manifest: asm
+	// AsmOverrides is the path of an assembly-override manifest: asm
 	// bodies the project that produced the wasm supplies for exported
 	// leaf functions, wrapped by the asm bundle in a fixed ABI and
-	// dispatched on CPU features (see docs/kernel-overrides.md). Empty
+	// dispatched on CPU features (see docs/asm-overrides.md). Empty
 	// disables the mechanism. The transpiler never inspects what a body
 	// computes; it validates the manifest against the module.
-	KernelOverrides string
+	AsmOverrides string
 	// NoInlineExports lists exported functions that must stay out of
-	// line: the asm bundle replaces their bodies (kernel overrides), and
+	// line: the asm bundle replaces their bodies (assembly overrides), and
 	// an inlined copy would leave that replacement unreachable. The
 	// transpile package fills it from the manifest.
 	NoInlineExports []string
@@ -327,11 +327,11 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 			t.helpers["gcasmMemProbe"] = true
 		}
 	}
-	// Kernel overrides: their bodies read the linear-memory base and
+	// Assembly overrides: their bodies read the linear-memory base and
 	// size through the probe's offsets and trap through the SIMD
 	// out-of-bounds helper, so both must exist even in a module that
 	// has no SIMD (the SIMD path emits them anyway).
-	if opts.KernelOverrides != "" && len(m.Memories) > 0 {
+	if opts.AsmOverrides != "" && len(m.Memories) > 0 {
 		t.helpers["gcasmMemProbe"] = true
 		t.helpers["wasm_trap_simd_oob"] = true
 	}

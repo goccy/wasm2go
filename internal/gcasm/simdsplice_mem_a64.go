@@ -32,9 +32,9 @@ type Config struct {
 	// gate it and validate with token-level equivalence instead of
 	// the byte-equality probe.
 	FastMath bool
-	// KernelOverrides are the project-supplied bodies for exported
-	// leaf functions (see kernelov.go); nil when none.
-	KernelOverrides *KernelOverrides
+	// AsmOverrides are the project-supplied bodies for exported
+	// leaf functions (see asmoverride.go); nil when none.
+	AsmOverrides *AsmOverrides
 	// FuseLoopUnroll is the in-splice unroll factor: how many
 	// iteration steps a fused loop's fast lane emits per branch.
 	// 0 or 1 means no in-splice unrolling; 2..8 unroll.

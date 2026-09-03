@@ -1,17 +1,17 @@
-# Kernel overrides
+# Assembly overrides
 
-A kernel override lets the project that produced a wasm module supply
+A assembly override lets the project that produced a wasm module supply
 the assembly body of one of its exported functions. wasm2go wraps the
 body in a fixed ABI, keeps the lowered body as the portable fallback,
 and dispatches at runtime on the CPU features the body declares. The
 transpiler never learns what the function computes; it only checks that
 the manifest describes the module truthfully.
 
-The mechanism exists for one situation: a leaf compute kernel whose
+The mechanism exists for one situation: a leaf compute function whose
 wasm shape the transpiler cannot yet turn into competitive machine
 code. It is not a way to bypass the wasm execution model, and every
 override should be paired with the wasm2go issue that would make it
-unnecessary. When wasm2go can lower the kernel well from the wasm,
+unnecessary. When wasm2go can lower the function well from the wasm,
 delete the override.
 
 ## What a body may do
@@ -21,7 +21,7 @@ The contract keeps a body inside the wasm execution model:
 - **Linear memory only, through the prologue's registers.** The body
   receives the memory base and the current memory size (bytes). Every
   access range must be checked against the size before the first load
-  or store of that range, and a miss must branch to the `kov_oob`
+  or store of that range, and a miss must branch to the `ovr_oob`
   label, which wasm2go appends: it calls the module's out-of-bounds trap
   (the same trap the lowered code raises). Nothing outside
   `[base, base+size)` may be read or written. Stack scratch inside the
@@ -29,14 +29,14 @@ The contract keeps a body inside the wasm execution model:
 - **No calls.** No host imports, no other module functions, no Go
   runtime symbols. The manifest loader rejects `CALL`/`BL`/`SVC`/
   `SYSCALL` and any `·symbol` reference that is not the body's own
-  `·kov_`-prefixed data.
+  `·ovr_`-prefixed data.
 - **Same meaning as the wasm function.** Under the module's own
   semantics, or under the rounding the project has explicitly accepted
   (fused multiply-add, accumulation order). The project's tests must
   check the override against the lowered body.
 - **A leaf with one entry and its own `RET`.** wasm2go writes the
   `TEXT` header and the prologue; the body ends with `RET` (falling off
-  the end reaches `kov_oob`).
+  the end reaches `ovr_oob`).
 
 ## Manifest
 
@@ -44,7 +44,7 @@ The contract keeps a body inside the wasm execution model:
 {
   "version": 1,
   "memory64": true,
-  "kernels": [
+  "functions": [
     {
       "export": "my_dot",
       "params": ["i32", "i64", "i64"],
@@ -73,8 +73,8 @@ The contract keeps a body inside the wasm execution model:
 - `frame` is the body's stack frame in bytes (a multiple of 8).
 - `file` is the body, resolved relative to the manifest.
 
-Pass the manifest with `wasm2go -kernel-overrides <path>` (or
-`Options.KernelOverrides`). The exports it names are kept out of line
+Pass the manifest with `wasm2go -asm-overrides <path>` (or
+`Options.AsmOverrides`). The exports it names are kept out of line
 by the inliner so every call reaches the replaced body.
 
 ## ABI
@@ -86,7 +86,7 @@ TEXT ·<sym>(SB), $<frame>-<argBytes>
 	NO_LOCAL_POINTERS
 	<prologue>
 	<body>
-kov_oob:
+ovr_oob:
 	[VZEROUPPER]           // amd64, non-sse4 bodies
 	CALL ·<trap>(SB)
 	RET
@@ -119,7 +119,7 @@ so a body cannot be wired to a frame it did not expect.
 
 Labels inside the body are function-local; the `kov_` prefix is
 reserved for wasm2go. Constant data belongs to the body: `DATA`/`GLOBL`
-entries named `·kov_<something>` in the same file.
+entries named `·ovr_<something>` in the same file.
 
 ## Dispatch
 
@@ -137,8 +137,8 @@ overrides is responsible for:
 
 - a numeric test of every body against a reference (and against the
   lowered body, so the override never drifts from the wasm), on every
-  input length class the kernel handles (vector body, tails, zero);
+  input length class the function handles (vector body, tails, zero);
 - running that test on hardware that has the declared features, or
   skipping the level explicitly when it cannot;
 - recording, per override, the wasm2go issue that tracks lowering the
-  kernel from the wasm instead.
+  function from the wasm instead.
