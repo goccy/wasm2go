@@ -19,7 +19,7 @@ func TestKernelRetargetExports(t *testing.T) {
 		{Name: "dbg_gemv_q8_0_4x4", Kind: wasm.ExportFunc, Index: 15},
 	}}
 	got := kernelRetargetExports(mod, Config{FastMath: true})
-	if len(got) != 3 || got["Fn13"].export != "dbg_vec_soft_max_f32" || got["Fn14"].export != "dbg_vec_swiglu_f32" {
+	if len(got) != 4 || got["Fn13"].export != "dbg_vec_soft_max_f32" || got["Fn14"].export != "dbg_vec_swiglu_f32" || got["Fn15"].export != "dbg_gemv_q8_0_4x4" {
 		t.Fatalf("retargets = %v", got)
 	}
 	if got["Fn13"].argBytes(true) != 48 || got["Fn13"].argBytes(false) != 32 || got["Fn14"].argBytes(true) != 40 || got["Fn14"].argBytes(false) != 24 {

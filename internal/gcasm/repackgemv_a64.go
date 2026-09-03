@@ -27,6 +27,12 @@ import (
 // nr is 1 by contract (asserted in C); the kernel computes row 0.
 // Bounds: vx + nc4*xtotal, vy + nb*34 and s + nc*4 are checked against
 // memSize at entry.
+// a64GemvFourGroups selects the four-groups-per-pass main loop; when
+// false every group runs through the single-group loop (measurement
+// knob for the streaming pattern; the single-group loop keeps two
+// SDOT chains per block).
+var a64GemvFourGroups = true
+
 func a64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) string {
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
@@ -123,6 +129,9 @@ func a64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 
 	// ---- four groups per pass.
 	w("gv4:")
+	if !a64GemvFourGroups {
+		w("\tB\tgv1")
+	}
 	w("\tCMPW\t$4, R7")
 	w("\tBLT\tgv1")
 	movi0(28)
@@ -183,14 +192,16 @@ func a64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	w("\tCBZW\tR15, gv1store")
 	w("gv1blk:")
 	movi0(24)
+	movi0(25)
 	ldurQ(16, 17, 2)
 	ldurQ(17, 17, 18)
 	ldurH(18, 17, 0)
 	fcvtSH(18, 18)
 	for k := 0; k < 8; k++ {
-		ldurQ(0, 13, 8+16*k)
-		sdotLane(24, 0, 16+k/4, k%4)
+		ldurQ(k%2, 13, 8+16*k)
+		sdotLane(24+k%2, k%2, 16+k/4, k%4)
 	}
+	word(0x4EA08400|uint32(25)<<16|uint32(24)<<5|uint32(24), "add v24.4s, v24.4s, v25.4s")
 	tail(24, 28, 13)
 	w("\tADD\t$136, R13, R13")
 	w("\tADD\t$34, R17, R17")

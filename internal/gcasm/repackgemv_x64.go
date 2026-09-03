@@ -8,7 +8,7 @@ import (
 // x64RepackGemvChunkBlocks / x64RepackGemvFrame size the GEMV's stack
 // scratch: the activation row is prepared once per chunk of blocks
 // (AVX2: the eight k-quads widened to i16, 64 bytes per block; VNNI:
-// the quads xor 0x80 plus the block's byte sum, 48 bytes per block).
+// the raw quads plus 128 x the block's byte sum, 48 bytes per block).
 const (
 	x64RepackGemvChunkBlocks = 512
 	x64RepackGemvFrame       = 64 + x64RepackGemvChunkBlocks*64
@@ -25,10 +25,11 @@ const (
 // block the pair domain collapses (VPHADDD + lane fold) to the four
 // column sums, converts, scales by dcol * da and accumulates.
 //
-// VNNI nest: weights stay s8 in xmm, the activation quad arrives as
-// u8 (xor 0x80) by VPBROADCASTD, one VPDPBUSD per group; the +128
-// bias is undone with the block's activation byte sum, which the
-// prepass stores once per block and every column group reuses.
+// VNNI nest: the weight group is biased to u8 (xor 0x80) in register,
+// the activation quad arrives as s8 by VPBROADCASTD, one VPDPBUSD per
+// group; the +128 weight bias is undone with the block's activation
+// byte sum, which the prepass stores once per block and every column
+// group reuses.
 func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPool, wide bool) string {
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
@@ -113,8 +114,9 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		w("\tCMPL\tR13, AX")
 		w("\tCMOVLGT\tAX, R13")
 		w("\tMOVL\tR13, 16(SP)")
-		w("\tMOVQ\tSI, AX")
-		w("\tADDQ\t8(SP), AX")
+		w("\tMOVQ\t8(SP), AX")
+		w("\tIMUL3Q\t$34, AX, AX")
+		w("\tADDQ\tSI, AX")
 		w("\tLEAQ\t64(SP), R11")
 		w("\tTESTL\tR13, R13")
 		w("\tJZ\t%spassinit", p)
@@ -306,8 +308,6 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		w("\tVPHADDD\tX6, X6, X6")
 		w("\tVPHADDD\tX6, X6, X6")
 		w("\tVPSLLD\t$7, X6, X6") // 128 * sum, replicated
-		fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X4, X4\n", biasSym)
-		fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X5, X5\n", biasSym)
 		w("\tVMOVDQU\tX4, (R11)")
 		w("\tVMOVDQU\tX5, 16(R11)")
 		w("\tVMOVDQU\tX6, 32(R11)")
@@ -359,7 +359,8 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 			w("\tVPBROADCASTD\t%d(R11), X5", 4*k)
 			for g, cur := range []string{"R13", "R14", "R15", "DI"} {
 				w("\tVMOVDQU\t%d(%s), X4", 8+16*k, cur)
-				w("\tVPDPBUSD\tX4, X5, X%d", g)
+				fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X4, X4\n", biasSym)
+				w("\tVPDPBUSD\tX5, X4, X%d", g) // acc += u8(w+128) . s8(a)
 			}
 		}
 		w("\tVMOVD\t(AX), X6")
@@ -426,7 +427,8 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		for k := 0; k < 8; k++ {
 			w("\tVPBROADCASTD\t%d(R11), X5", 4*k)
 			w("\tVMOVDQU\t%d(R13), X4", 8+16*k)
-			w("\tVPDPBUSD\tX4, X5, X0")
+			fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X4, X4\n", biasSym)
+			w("\tVPDPBUSD\tX5, X4, X0")
 		}
 		w("\tVMOVD\t(AX), X6")
 		w("\tVCVTPH2PS\tX6, X6")

@@ -22,7 +22,7 @@ func TestExportedRetargetAnchorNotInlined(t *testing.T) {
 	if !a.fns[0].noInline {
 		t.Error("dbg_-exported function must be pinned noInline")
 	}
-	if a.fns[1].noInline {
-		t.Error("gemv (nrows=1 decode kernel) must stay inlinable")
+	if !a.fns[1].noInline {
+		t.Error("gemv is a retarget anchor too and must be pinned noInline")
 	}
 }
