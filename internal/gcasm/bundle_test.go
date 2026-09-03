@@ -87,7 +87,7 @@ func gate4At(t *testing.T, fixture string, modPath string) {
 	}
 	build := func() map[string][]byte {
 		t.Helper()
-		files, stats, err := Build(mod, buf.Bytes(), treeIn, modPath+"/pkg", nil, nil, nil, nil, nil, Config{})
+		files, stats, err := Build(mod, buf.Bytes(), treeIn, modPath+"/pkg", nil, nil, nil, nil, Config{})
 		if err != nil {
 			t.Fatal(err)
 		}

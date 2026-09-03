@@ -2,6 +2,7 @@
 
 package helpers
 
-// CPUDotProd: no detection story on this OS — run the portable
-// bodies.
+// CPUDotProd / CPUI8MM: no detection story on this OS — run the
+// portable bodies.
 var CPUDotProd = false
+var CPUI8MM = false

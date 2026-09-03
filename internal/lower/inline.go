@@ -2,7 +2,6 @@ package lower
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -65,10 +64,10 @@ type fnInlineInfo struct {
 	leaf      bool // no call / call_indirect anywhere in the body
 	hasTry    bool
 	// noInline pins the function out-of-line regardless of size: it
-	// is a stable export the downstream gcasm backend retargets by
-	// name (the repack dbg_ kernels). Inlining it into every caller
-	// would leave the exported body dead and the retarget landing on
-	// unreachable code.
+	// is an export whose body the downstream asm bundle replaces (a
+	// assembly override). Inlining it into every caller would leave the
+	// exported body dead and the replacement landing on unreachable
+	// code.
 	noInline bool
 	sites    int // static `call <idx>` sites referencing this function
 	// innerCalls lists the direct callees inside the body (dedup'd);
@@ -90,6 +89,23 @@ type inlineAnalysis struct {
 // is called once per function of the same module; the scan runs once.
 var inlineAnalysisCache sync.Map
 
+// noInlineExports maps *wasm.Module → map[string]bool of export names
+// pinned out of line (see fnInlineInfo.noInline). SetNoInlineExports
+// registers them; it must run before the module's first LowerFunction,
+// since the inline analysis is computed once and cached.
+var noInlineExports sync.Map
+
+// SetNoInlineExports pins the named exports of mod out of line for
+// inlining decisions. Call it before lowering any function of mod.
+func SetNoInlineExports(mod *wasm.Module, names []string) {
+	set := map[string]bool{}
+	for _, n := range names {
+		set[n] = true
+	}
+	noInlineExports.Store(mod, set)
+	inlineAnalysisCache.Delete(mod)
+}
+
 // analyzeModuleForInline scans every defined function body once,
 // recording size, leafness, try-presence and per-callee static call
 // site counts.
@@ -102,17 +118,14 @@ func analyzeModuleForInline(mod *wasm.Module) *inlineAnalysis {
 		idx := mod.NumImportedFuncs + uint32(i)
 		a.fns[idx] = &fnInlineInfo{bodyBytes: len(mod.Functions[i].Body), leaf: true}
 	}
-	// Exported retarget anchors: pin them out-of-line so the gcasm
-	// backend's by-name kernel retarget lands on a live body. The
-	// engine names these dbg_* by convention.
-	// Only the batched GEMM is pinned: the GEMV runs at nrows=1 in
-	// the decode hot path, where its per-call overhead outweighs the
-	// tile benefit, so it stays inlinable. The GEMM tile earns its
-	// keep only when a caller batches four or more rows.
-	for _, e := range mod.Exports {
-		if e.Kind == wasm.ExportFunc && strings.HasPrefix(e.Name, "dbg_gemm_") {
-			if info, ok := a.fns[e.Index]; ok {
-				info.noInline = true
+	// Pinned exports: the asm bundle replaces their bodies (assembly
+	// overrides), so every call must reach the exported body itself.
+	if pinned, ok := noInlineExports.Load(mod); ok {
+		for _, e := range mod.Exports {
+			if e.Kind == wasm.ExportFunc && pinned.(map[string]bool)[e.Name] {
+				if info, ok := a.fns[e.Index]; ok {
+					info.noInline = true
+				}
 			}
 		}
 	}
