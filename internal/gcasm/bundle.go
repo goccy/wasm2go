@@ -103,6 +103,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	pure := PureFilter(all)
 
 	repackGemmFn := repackGemmExport(mod, cfg)
+	simdGemmFn := simdGemmF32Export(mod, cfg)
 
 	// Capture tree.
 	dir, err := os.MkdirTemp("", "gcasm-capture-*")
@@ -287,7 +288,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, repackGemmFn, cfg)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, repackGemmFn, simdGemmFn, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -712,6 +713,7 @@ func buildPkg(
 	synth map[string]SynthSig,
 	nrc2 *Nrc2Spec,
 	repackGemmFn string,
+	simdGemmFn string,
 	cfg Config,
 ) (map[string][]byte, error) {
 	directSSA := cfg.DirectAsm
@@ -1007,6 +1009,25 @@ func buildPkg(
 						}
 						fmt.Fprintf(&declFns, "// gcasmCPUI8MM mirrors %s for the SMMLA tile kernels'\n// entry branches (asm reads package-local data only).\nvar gcasmCPUI8MM = %s\n\n", i8mmRef, i8mmRef)
 					}
+				}
+			}
+			// f32 GEMM (flash attention's tiled QK^T / PV): the feature
+			// body is replaced wholesale by a register-tiled kernel
+			// that reproduces the wasm arithmetic exactly.
+			if simdGemmFn != "" && name == simdGemmFn && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
+				trapSym := "wasm_trap_simd_oob"
+				if rel != "" && rel != "base" {
+					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
+				}
+				wide := mod.Memory64()
+				_, wantArgs := simdGemmF32Args(wide)
+				if m[1] != fmt.Sprint(wantArgs) {
+					return nil, fmt.Errorf("transform %s: f32 GEMM retarget expects a %d-byte argument frame, transformed body has %s", f.Name, wantArgs, m[1])
+				}
+				if arch.name == "amd64" {
+					featBody = x64SimdGemmF32Kernel(featSym, trapSym, modOffs, wide)
+				} else {
+					featBody = a64SimdGemmF32Kernel(featSym, trapSym, modOffs, wide)
 				}
 			}
 			if nrc2 != nil && name == nrc2.VecDot && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
