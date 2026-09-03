@@ -28,10 +28,13 @@ import (
 // Bounds: vx + nc4*xtotal, vy + nb*34 and s + nc*4 are checked against
 // memSize at entry.
 // a64GemvFourGroups selects the four-groups-per-pass main loop; when
-// false every group runs through the single-group loop (measurement
-// knob for the streaming pattern; the single-group loop keeps two
-// SDOT chains per block).
-var a64GemvFourGroups = true
+// false (the default) every group runs through the single-group loop,
+// two SDOT chains per block. Decode is DRAM-bound and one sequential
+// weight stream feeds the prefetchers best: on Apple M5 the single
+// stream decodes 3% faster than four interleaved streams (and 5% faster
+// than the transpiled fused loop), even though the four-stream loop
+// wins a warm-cache micro-benchmark (90 vs 83 GB/s).
+var a64GemvFourGroups = false
 
 func a64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) string {
 	var b strings.Builder
