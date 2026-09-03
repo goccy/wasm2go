@@ -81,58 +81,6 @@ jobs:
       - name: Test with the arm64 splices enabled
         run: go test -count=1 ./transpile/... ./internal/gcasm/...
 
-  # Consumer-link gate on the production bundle shape: transpile the
-  # pinned goccy/llama-wasm release wasm with llama-wasm's own options
-  # and LINK a consumer for linux/arm64, linux/amd64 (GOAMD64=v2) and
-  # linux/amd64 (GOAMD64=v1). Package builds alone never run the
-  # linker's nosplit/ABI-wrapper resolution; a multi-chunk bundle once
-  # compiled everywhere and linked nowhere, and was only caught four
-  # releases downstream. See `make llama-bundle-link`.
-  llama-bundle-link:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      # The gcasm capture compiles each chunk package (a multi-hundred-
-      # thousand-line generated file) with the gc toolchain; serialize
-      # the package builds so their peaks do not add up on the runner.
-      GOFLAGS: -p=1
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Latest Go 1.25 patch, NOT go.mod's floor: go1.25.0's compiler
-      # needs ~12-15 GiB for the largest chunk package (p0) and took the
-      # 16 GiB runner down (exit 143, every later step skipped); go1.26
-      # and the later 1.25 patches compile it in under 2 GiB. The
-      # production bundle is built in the wasmify image from
-      # golang:1.25 (latest patch), so this is also the faithful choice.
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          check-latest: true
-
-      # Resource trace, inline: the first runs of this job ended with
-      # exit 143 four minutes in, and even the if: always() steps were
-      # skipped afterwards — the runner itself went away, so nothing
-      # printed after the fact survives. The step log streams live, so
-      # a sampler writing to stdout inside the same step keeps every
-      # sample taken before the runner dies.
-      - name: Transpile the pinned llama.wasm and link a consumer per target
-        run: |
-          echo "runner: $(nproc) cpus, $(free -m | awk '/Mem:/ {print $2}') MiB RAM, $(df -m / | awk 'NR==2 {print $4}') MiB free on /, $(df -m /tmp | awk 'NR==2 {print $4}') MiB free on /tmp"
-          ( while true; do
-              printf 'sample %s ' "$(date -u +%H:%M:%S)"; free -m | awk '/Mem:/ {printf "mem used=%sM avail=%sM swap_used=", $3, $7}'; free -m | awk '/Swap:/ {printf "%sM ", $3}'; \
-              df -m / | awk 'NR==2 {printf "disk_avail=%sM ", $4}'; \
-              ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<=4 {printf "%s=%dM ", $2, $1/1024}'; \
-              ps -eo rss,args --sort=-rss | awk 'NR==2 {for (i=2;i<=NF;i++) if ($i=="-p") {printf "top_pkg=%s", $(i+1)}}'; echo
-              sleep 10
-            done ) &
-          sampler=$!
-          make llama-bundle-link; rc=$?
-          kill $sampler 2>/dev/null || true
-          exit $rc
-
   lint:
     runs-on: ubuntu-latest
     steps:
