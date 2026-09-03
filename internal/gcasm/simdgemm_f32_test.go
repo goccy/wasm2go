@@ -32,7 +32,7 @@ func TestSimdGemmF32KernelShape(t *testing.T) {
 	for _, want := range []string{
 		"ld1r {v20.4s}, [x16], #4", "fmul v24.4s, v16.4s, v20.4s", "fadd v15.4s, v15.4s, v27.4s",
 		"sg4c16k:", "sg4c4k:", "sg4c1k:", "sg1c16k:", "sg1c4k:", "sg1c1k:", "sgoob:",
-		"TEXT ·Fn12dotprod(SB), $16-48",
+		"TEXT ·Fn12dotprod(SB), $16-44",
 	} {
 		if !strings.Contains(a, want) {
 			t.Errorf("a64 kernel missing %q", want)
@@ -45,7 +45,7 @@ func TestSimdGemmF32KernelShape(t *testing.T) {
 	for _, want := range []string{
 		"VBROADCASTSS", "VMULPS\tY8, Y10, Y11", "VADDPS\tY11, Y7, Y7", "VMULSS", "VADDSS",
 		"sg4c16k:", "sg4c8k:", "sg4c4k:", "sg4c1k:", "sg1c16k:", "sg1c1k:", "VZEROUPPER",
-		"TEXT ·Fn12avx2(SB), $16-48",
+		"TEXT ·Fn12avx2(SB), $16-44",
 	} {
 		if !strings.Contains(x, want) {
 			t.Errorf("x64 kernel missing %q", want)

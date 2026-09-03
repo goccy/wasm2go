@@ -935,8 +935,14 @@ func buildPkg(
 		// symbol on a baseline CPU would fault. (Outlined extraction
 		// bodies historically never contained gated instructions, so
 		// including them here is a no-op for them.)
-		if arch.gatedMarker != "" &&
-			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {
+		// The f32 GEMM retarget rides the same twin split even though
+		// its transformed body has no gated instruction: the native
+		// kernel becomes the feature body (the amd64 one needs AVX2)
+		// and the transformed body stays as the baseline twin.
+		retargetSimdGemm := simdGemmFn != "" && name == simdGemmFn && (arch.name == "arm64" || arch.name == "amd64") &&
+			modOffs != nil && modOffs.Cfg.FastMath && arch.gatedMarker != "" && !strings.Contains(body, arch.jtMarker)
+		if retargetSimdGemm || (arch.gatedMarker != "" &&
+			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker)) {
 			// Feature-gated body: the feature symbol keeps this body, a
 			// baseline twin is transformed with PortableSIMD, and a
 			// NOSPLIT tail-jump stub under the original name dispatches
@@ -1014,7 +1020,7 @@ func buildPkg(
 			// f32 GEMM (flash attention's tiled QK^T / PV): the feature
 			// body is replaced wholesale by a register-tiled kernel
 			// that reproduces the wasm arithmetic exactly.
-			if simdGemmFn != "" && name == simdGemmFn && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
+			if retargetSimdGemm {
 				trapSym := "wasm_trap_simd_oob"
 				if rel != "" && rel != "base" {
 					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"

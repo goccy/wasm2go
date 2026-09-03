@@ -33,7 +33,7 @@ func simdGemmF32Export(mod *wasm.Module, cfg Config) string {
 // the a64 and x64 emitters.
 func simdGemmF32Args(wide bool) (map[string]int, int) {
 	if wide {
-		return map[string]int{"l0": 8, "l1": 16, "l2": 24, "l3": 32, "l4": 36, "l5": 40}, 48
+		return map[string]int{"l0": 8, "l1": 16, "l2": 24, "l3": 32, "l4": 36, "l5": 40}, 44
 	}
 	return map[string]int{"l0": 8, "l1": 12, "l2": 16, "l3": 20, "l4": 24, "l5": 28}, 32
 }
