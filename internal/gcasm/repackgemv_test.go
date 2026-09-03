@@ -20,7 +20,7 @@ func TestRepackGemvKernelShape(t *testing.T) {
 	}
 	pool := &ConstPool{}
 	x := x64RepackGemvKernel("Fn9avx2", "trapstub", offs, pool, true)
-	for _, want := range []string{"VPMADDWD", "VPDPBUSD", "VPBROADCASTQ", "VPBROADCASTD", "gvg4blk:", "vgvg4blk:", "gvg1blk:", "VZEROUPPER", "$" + strconv.Itoa(x64RepackGemvFrame) + "-56"} {
+	for _, want := range []string{"VPMADDWD", "VPDPBUSD", "VPBROADCASTQ", "VBROADCASTI128", "VINSERTI128", "gvg4blk:", "vgvg4blk:", "gvg1blk:", "VZEROUPPER", "$" + strconv.Itoa(x64RepackGemvFrame) + "-56"} {
 		if !strings.Contains(x, want) {
 			t.Errorf("x64 gemv missing %q", want)
 		}

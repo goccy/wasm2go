@@ -8,10 +8,12 @@ import (
 // x64RepackGemvChunkBlocks / x64RepackGemvFrame size the GEMV's stack
 // scratch: the activation row is prepared once per chunk of blocks
 // (AVX2: the eight k-quads widened to i16, 64 bytes per block; VNNI:
-// the raw quads plus 128 x the block's byte sum, 48 bytes per block).
+// the four k-quad pairs each laid out as [quad 2j x4 | quad 2j+1 x4]
+// for a 256-bit VPDPBUSD, plus 128 x the block's byte sum, 144 bytes
+// per block).
 const (
 	x64RepackGemvChunkBlocks = 512
-	x64RepackGemvFrame       = 64 + x64RepackGemvChunkBlocks*64
+	x64RepackGemvFrame       = 64 + x64RepackGemvChunkBlocks*144
 )
 
 // x64RepackGemvKernel emits the q8_0x4 repack GEMV under sym for amd64
@@ -25,11 +27,17 @@ const (
 // block the pair domain collapses (VPHADDD + lane fold) to the four
 // column sums, converts, scales by dcol * da and accumulates.
 //
-// VNNI nest: the weight group is biased to u8 (xor 0x80) in register,
-// the activation quad arrives as s8 by VPBROADCASTD, one VPDPBUSD per
-// group; the +128 weight bias is undone with the block's activation
-// byte sum, which the prepass stores once per block and every column
-// group reuses.
+// VNNI nest: 32 weight bytes at a time — two consecutive k-quads of
+// the four columns — biased to u8 (xor 0x80) in register, against the
+// prepared activation pair [quad 2j x4 | quad 2j+1 x4] (s8) straight
+// from the scratch as the VPDPBUSD memory operand: two instructions per
+// 32 bytes, two independent accumulators per column group (even and odd
+// pairs), the halves folded per block. The +128 weight bias is undone
+// with the block's activation byte sum, which the prepass stores once
+// per block and every column group reuses. (The first version did
+// 16 bytes per VPDPBUSD with a broadcast activation quad: half the work
+// per instruction, and on Zen 4 decode sat at ~18 GB/s while native
+// llama.cpp pulled 24.)
 func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPool, wide bool) string {
 	var b strings.Builder
 	w := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
@@ -308,9 +316,55 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		w("\tVPHADDD\tX6, X6, X6")
 		w("\tVPHADDD\tX6, X6, X6")
 		w("\tVPSLLD\t$7, X6, X6") // 128 * sum, replicated
-		w("\tVMOVDQU\tX4, (R11)")
-		w("\tVMOVDQU\tX5, 16(R11)")
-		w("\tVMOVDQU\tX6, 32(R11)")
+		w("\tVMOVDQU\tX6, 128(R11)")
+		// pairs: [quad 2j x4 | quad 2j+1 x4] at 32j(R11)
+		for j := 0; j < 4; j++ {
+			src := 4 + j/2
+			lo, hi := 0x00, 0x55
+			if j%2 == 1 {
+				lo, hi = 0xAA, 0xFF
+			}
+			w("\tVPSHUFD\t$0x%02x, X%d, X6", lo, src)
+			w("\tVPSHUFD\t$0x%02x, X%d, X7", hi, src)
+			w("\tVINSERTI128\t$1, X7, Y6, Y6")
+			w("\tVMOVDQU\tY6, %d(R11)", 32*j)
+		}
+	}
+	// vnniBlock emits one block of the VNNI nest for the given weight
+	// cursors: acc[g] (even pairs) / accB[g] (odd pairs) accumulate the
+	// four column sums of group g in both 128-bit halves; the tail folds
+	// them, removes the bias, scales and adds into X(8+g).
+	vnniAccB := []int{5, 7, 12, 14}
+	vnniBlock := func(curs []string) {
+		for g := range curs {
+			w("\tVPXOR\tY%d, Y%d, Y%d", g, g, g)
+			w("\tVPXOR\tY%d, Y%d, Y%d", vnniAccB[g], vnniAccB[g], vnniAccB[g])
+		}
+		for j := 0; j < 4; j++ {
+			for g, cur := range curs {
+				acc := g
+				if j%2 == 1 {
+					acc = vnniAccB[g]
+				}
+				w("\tVPXOR\t%d(%s), Y13, Y4", 8+32*j, cur)
+				w("\tVPDPBUSD\t%d(R11), Y4, Y%d", 32*j, acc) // acc += u8(w+128) . s8(a)
+			}
+		}
+		w("\tVMOVD\t(AX), X6")
+		w("\tVCVTPH2PS\tX6, X6")
+		w("\tVPSHUFD\t$0x00, X6, X6")
+		for g, cur := range curs {
+			w("\tVPADDD\tY%d, Y%d, Y%d", vnniAccB[g], g, g)
+			w("\tVEXTRACTI128\t$1, Y%d, X4", g)
+			w("\tVPADDD\tX4, X%d, X%d", g, g)
+			w("\tVPSUBD\t128(R11), X%d, X%d", g, g) // - 128 * sum(a)
+			w("\tVCVTDQ2PS\tX%d, X%d", g, g)
+			w("\tVMOVQ\t(%s), X7", cur)
+			w("\tVCVTPH2PS\tX7, X7")
+			w("\tVMULPS\tX6, X7, X7")
+			w("\tVMULPS\tX7, X%d, X%d", g, g)
+			w("\tVADDPS\tX%d, X%d, X%d", g, 8+g, 8+g)
+		}
 	}
 	vnniPass := func(p string) {
 		w("\tMOVQ\tCX, DX")
@@ -351,37 +405,15 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		w("\tTESTL\tR12, R12")
 		w("\tJZ\t%sg4store", p)
 		w("%sg4blk:", p)
-		for g := 0; g < 4; g++ {
-			w("\tVPXOR\tX%d, X%d, X%d", g, g, g)
-		}
 		w("\tMOVQ\t32(SP), DI")
-		for k := 0; k < 8; k++ {
-			w("\tVPBROADCASTD\t%d(R11), X5", 4*k)
-			for g, cur := range []string{"R13", "R14", "R15", "DI"} {
-				w("\tVMOVDQU\t%d(%s), X4", 8+16*k, cur)
-				fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X4, X4\n", biasSym)
-				w("\tVPDPBUSD\tX5, X4, X%d", g) // acc += u8(w+128) . s8(a)
-			}
-		}
-		w("\tVMOVD\t(AX), X6")
-		w("\tVCVTPH2PS\tX6, X6")
-		w("\tVPSHUFD\t$0x00, X6, X6")
-		for g, cur := range []string{"R13", "R14", "R15", "DI"} {
-			w("\tVPSUBD\t32(R11), X%d, X%d", g, g) // - 128 * sum(a)
-			w("\tVCVTDQ2PS\tX%d, X%d", g, g)
-			w("\tVMOVQ\t(%s), X7", cur)
-			w("\tVCVTPH2PS\tX7, X7")
-			w("\tVMULPS\tX6, X7, X7")
-			w("\tVMULPS\tX7, X%d, X%d", g, g)
-			w("\tVADDPS\tX%d, X%d, X%d", g, 8+g, 8+g)
-		}
+		vnniBlock([]string{"R13", "R14", "R15", "DI"})
 		w("\tADDQ\t$136, DI")
 		w("\tMOVQ\tDI, 32(SP)")
 		w("\tADDQ\t$136, R13")
 		w("\tADDQ\t$136, R14")
 		w("\tADDQ\t$136, R15")
 		w("\tADDQ\t$34, AX")
-		w("\tADDQ\t$48, R11")
+		w("\tADDQ\t$144, R11")
 		w("\tDECL\tR12")
 		w("\tJNZ\t%sg4blk", p)
 		w("%sg4store:", p)
@@ -423,26 +455,10 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		w("\tTESTL\tR12, R12")
 		w("\tJZ\t%sg1store", p)
 		w("%sg1blk:", p)
-		w("\tVPXOR\tX0, X0, X0")
-		for k := 0; k < 8; k++ {
-			w("\tVPBROADCASTD\t%d(R11), X5", 4*k)
-			w("\tVMOVDQU\t%d(R13), X4", 8+16*k)
-			fmt.Fprintf(&b, "\tVPXOR ·%s(SB), X4, X4\n", biasSym)
-			w("\tVPDPBUSD\tX5, X4, X0")
-		}
-		w("\tVMOVD\t(AX), X6")
-		w("\tVCVTPH2PS\tX6, X6")
-		w("\tVPSHUFD\t$0x00, X6, X6")
-		w("\tVPSUBD\t32(R11), X0, X0")
-		w("\tVCVTDQ2PS\tX0, X0")
-		w("\tVMOVQ\t(R13), X7")
-		w("\tVCVTPH2PS\tX7, X7")
-		w("\tVMULPS\tX6, X7, X7")
-		w("\tVMULPS\tX7, X0, X0")
-		w("\tVADDPS\tX0, X8, X8")
+		vnniBlock([]string{"R13"})
 		w("\tADDQ\t$136, R13")
 		w("\tADDQ\t$34, AX")
-		w("\tADDQ\t$48, R11")
+		w("\tADDQ\t$144, R11")
 		w("\tDECL\tR12")
 		w("\tJNZ\t%sg1blk", p)
 		w("%sg1store:", p)
@@ -452,8 +468,8 @@ func x64RepackGemvKernel(sym, trapSym string, offs *ModuleOffsets, pool *ConstPo
 		w("\tJMP\t%sg1", p)
 		w("%spassend:", p)
 	}
-	fmt.Fprintf(&b, "vgvy:\n\tVMOVDQU ·%s(SB), X15\n", onesSym)
-	chunkLoop("vgv", vnniPre, 48, vnniPass)
+	fmt.Fprintf(&b, "vgvy:\n\tVMOVDQU ·%s(SB), X15\n\tVBROADCASTI128 ·%s(SB), Y13\n", onesSym, biasSym)
+	chunkLoop("vgv", vnniPre, 144, vnniPass)
 
 	w("gvdone:")
 	w("\tVZEROUPPER")
