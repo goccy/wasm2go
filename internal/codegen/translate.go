@@ -157,27 +157,18 @@ type Options struct {
 	// gate it and validate with token-level equivalence instead of
 	// byte-equality probes.
 	FastMath bool
-	// DisableRepackGemm opts out of the repack GEMM retarget: under
-	// FastMath, the asm bundle replaces an exported dbg_gemm_q8_0_4x4
-	// body wholesale with a native 4x4 tile kernel; this switch keeps
-	// the transformed wasm lowering instead. It exists for A/B
-	// comparison and fault isolation of that one replacement.
-	DisableRepackGemm bool
-	// VecDotPairEntry opts into vec_dot row/column pairing: it names
-	// the per-type trait-table entry (the source runtime's type-enum
-	// value) whose self-dot should run two rows and columns per call
-	// (see the nrc2 recognizer's package comment for the verified
-	// structural contract). Zero — the default — disables the scan
-	// and leaves every module untouched.
-	VecDotPairEntry int
-	// VecDotRows additionally batches the verified vec_dot's caller
-	// row loops: the translator emits a row-looped companion of the
-	// verified function and rewrites matching driver loops into one
-	// guarded companion call per chunk (the original loop stays as
-	// the guard-miss branch, so semantics are preserved for every
-	// runtime type). Requires VecDotPairEntry; off by default and
-	// inert without it.
-	VecDotRows bool
+	// KernelOverrides is the path of a kernel-override manifest: asm
+	// bodies the project that produced the wasm supplies for exported
+	// leaf functions, wrapped by the asm bundle in a fixed ABI and
+	// dispatched on CPU features (see docs/kernel-overrides.md). Empty
+	// disables the mechanism. The transpiler never inspects what a body
+	// computes; it validates the manifest against the module.
+	KernelOverrides string
+	// NoInlineExports lists exported functions that must stay out of
+	// line: the asm bundle replaces their bodies (kernel overrides), and
+	// an inlined copy would leave that replacement unreachable. The
+	// transpile package fills it from the manifest.
+	NoInlineExports []string
 	// FuseDebug prints SIMD fusion diagnostics to stderr: failed
 	// window-trial refusals and loop-upgrade rejections, tagged by
 	// the refusing check. Diagnosis only; no effect on output.
@@ -239,12 +230,6 @@ type Result struct {
 	// functions extracted there (see internal/ssa/outline.go). The asm
 	// bundle keeps their pure-Go bodies on every GOARCH.
 	Outlined map[string][]string
-	// Nrc2VecDot / Nrc2Companion name the paired vec_dot and its
-	// paired-tile companion when the row/column pairing rewrite fired
-	// (see nrc2.go); empty when off. The asm bundle may retarget the
-	// fast-math feature body's companion call to a native tile kernel.
-	Nrc2VecDot    string
-	Nrc2Companion string
 	// OutlinedSigs maps each extracted function name to its signature,
 	// letting the asm bundle transform its body like a translated
 	// function.
@@ -288,6 +273,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		return Result{}, fmt.Errorf("wasm2go: Options.Package is required")
 	}
 	fuseDebugEnabled = opts.FuseDebug
+	lower.SetNoInlineExports(m, opts.NoInlineExports)
 	if m.Memory64() {
 		for _, mem := range m.Memories {
 			// A shared memory is allocated at its ceiling once (see the
@@ -340,6 +326,14 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		if len(m.Memories) > 0 {
 			t.helpers["gcasmMemProbe"] = true
 		}
+	}
+	// Kernel overrides: their bodies read the linear-memory base and
+	// size through the probe's offsets and trap through the SIMD
+	// out-of-bounds helper, so both must exist even in a module that
+	// has no SIMD (the SIMD path emits them anyway).
+	if opts.KernelOverrides != "" && len(m.Memories) > 0 {
+		t.helpers["gcasmMemProbe"] = true
+		t.helpers["wasm_trap_simd_oob"] = true
 	}
 	// SSA pipeline is always on; an unsupported wasm feature is a hard
 	// error from Translate (the legacy direct-opcode compiler is gone).
@@ -445,9 +439,6 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		}
 	}
 	t.collectImportModules()
-	if t.opts.VecDotPairEntry > 0 {
-		t.scanVecDotPairing()
-	}
 
 	// BulkExportPrefix with zero matches is almost always a typo;
 	// surface a warning so the caller can fix it instead of silently
@@ -593,10 +584,6 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if len(t.directAsmSSA) > 0 {
 		res.DirectAsmGlobals = t.moduleGlobalOffsets()
 		res.DirectAsmExc = t.moduleExcOffsets()
-	}
-	if t.nrc2 != nil {
-		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
-		res.Nrc2Companion = t.nrc2CompanionName()
 	}
 	if err := t.checkStaleF16Table(); err != nil {
 		return Result{}, err
@@ -1020,10 +1007,6 @@ type translator struct {
 	// function is reachable from an entry point. nil ⇒ keep every
 	// function (KeepDeadFuncs, or no module parsed yet).
 	reachable map[uint32]bool
-
-	// nrc2 is the verified vec_dot traits entry when the row/column
-	// pairing rewrite is active (see nrc2.go); nil ⇒ feature off.
-	nrc2 *nrc2Info
 }
 
 // funcReachable reports whether the function at the given global index
@@ -2490,7 +2473,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				}})
 				continue
 			}
-			raws = append(raws, rawSeg{memOff: off, bytes: t.nrc2SegBytes(i, ds.Bytes)})
+			raws = append(raws, rawSeg{memOff: off, bytes: ds.Bytes})
 		}
 		sort.Slice(raws, func(i, j int) bool { return raws[i].memOff < raws[j].memOff })
 		// Seed dataEnd with the active segments' extent. Passive segments are
@@ -2840,34 +2823,11 @@ func (t *translator) emitOneDefinedFunction(funcIdx uint32) ([]ast.Decl, error) 
 	// the splitter does not yet recognise, so this is a no-op until
 	// that gap is closed (either by emitting a Go switch from the
 	// chain or by introducing a BlockSwitch SSA op).
-	if t.opts.VecDotRows && t.nrc2 != nil {
-		t.rewriteVecDotRowLoops(body)
-	}
-	var rowsDecl ast.Decl
-	if t.opts.VecDotRows && t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
-		// Clone before the prelude prepend: the companion pins nrc
-		// to 1, so the paired-tile dispatch would be dead weight.
-		clone, cerr := cloneBlockStmt(body)
-		if cerr != nil {
-			return nil, fmt.Errorf("vec-dot-rows companion: %w", cerr)
-		}
-		rowsDecl = t.rowsCompanion(clone)
-	}
-	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
-		// The paired-tile prelude and its companion (see nrc2.go).
-		body.List = append([]ast.Stmt{t.nrc2Prelude()}, body.List...)
-	}
 	out := []ast.Decl{&ast.FuncDecl{
 		Name: newID(fnName),
 		Type: t.funcSignature(ft, true /*withModuleParam*/),
 		Body: body,
 	}}
-	if t.nrc2 != nil && funcIdx == t.nrc2.funcIdx {
-		out = append(out, t.nrc2Companion())
-	}
-	if rowsDecl != nil {
-		out = append(out, rowsDecl)
-	}
 	outlined, err := t.emitOutlinedDecls()
 	if err != nil {
 		return nil, fmt.Errorf("ssa: function %d (%s): %w", funcIdx, fnName, err)

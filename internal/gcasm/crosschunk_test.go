@@ -42,7 +42,7 @@ func buildMultiChunk(t *testing.T, fixture, importPath string) map[string][]byte
 	for name, data := range res.Files {
 		treeIn[name] = data
 	}
-	files, _, err := Build(mod, buf.Bytes(), treeIn, importPath, nil, nil, nil, nil, nil, Config{})
+	files, _, err := Build(mod, buf.Bytes(), treeIn, importPath, nil, nil, nil, nil, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestCrossChunkDirectAsmCallSymbols(t *testing.T) {
 	for name, data := range res.Files {
 		treeIn[name] = data
 	}
-	files, stats, err := Build(mod, buf.Bytes(), treeIn, importPath, nil, nil, nil, nil, nil,
+	files, stats, err := Build(mod, buf.Bytes(), treeIn, importPath, nil, nil, nil, nil,
 		Config{DirectAsm: directAsm, DirectAsmGlobals: res.DirectAsmGlobals})
 	if err != nil {
 		t.Fatal(err)
@@ -224,7 +224,7 @@ func finalBundleTreeAt(t *testing.T, fixture, importPath string, chunkBytes int)
 	for name, data := range res.Files {
 		tree[name] = data
 	}
-	delta, _, err := Build(mod, buf.Bytes(), tree, importPath, nil, nil, nil, nil, nil, Config{})
+	delta, _, err := Build(mod, buf.Bytes(), tree, importPath, nil, nil, nil, nil, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

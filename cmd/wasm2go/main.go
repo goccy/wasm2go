@@ -44,10 +44,8 @@ func main() {
 	fuseLoopUnroll := flag.Int("fuse-loop-unroll", 0, "in-splice unroll factor for fused loops (2..8; 0 disables)")
 	noF16Table := flag.Bool("no-f16-table", false, "disable the f16-table-keyed rewrites (the table address is auto-detected from the module; this switch turns the rewrites off entirely)")
 	fastMath := flag.Bool("fast-math", false, "allow asm splices that trade wasm bit-exactness for native-style rounding (SDOT raw grouping, FMA, SMMLA pairing)")
-	noRepackGemm := flag.Bool("no-repack-gemm", false, "keep the transformed wasm lowering for an exported dbg_gemm_q8_0_4x4 instead of the native tile-kernel retarget (A/B comparison; the retarget itself requires -fast-math)")
+	kernelOverrides := flag.String("kernel-overrides", "", "path of a kernel-override manifest: asm bodies the wasm's own project supplies for exported leaf functions (see docs/kernel-overrides.md)")
 	fuseDebug := flag.Bool("fuse-debug", false, "print SIMD fusion diagnostics (failed window trials and loop-upgrade rejections) to stderr")
-	vecDotPairEntry := flag.Int("vec-dot-pair-entry", 0, "trait-table entry index whose self vec_dot should pair rows/columns (0 disables; structural verification decides whether it applies)")
-	vecDotRows := flag.Bool("vec-dot-rows", false, "batch the verified vec_dot's caller row loops through a row-looped companion (requires -vec-dot-pair-entry)")
 	directAsm := flag.String("direct-asm", "", "comma-separated function names (FnN / outlined FnNlH) to emit via the direct-asm backend instead of the gc-listing transform; unsupported functions fall back per function")
 	flag.Parse()
 
@@ -106,11 +104,9 @@ func main() {
 		FuseLoopUnroll:      *fuseLoopUnroll,
 		DisableF16Table:     *noF16Table,
 		FastMath:            *fastMath,
-		DisableRepackGemm:   *noRepackGemm,
+		KernelOverrides:     *kernelOverrides,
 		FuseDebug:           *fuseDebug,
-		VecDotPairEntry:     *vecDotPairEntry,
 		DirectAsmFuncs:      splitCommaList(*directAsm),
-		VecDotRows:          *vecDotRows,
 	}
 
 	if wantsMulti {

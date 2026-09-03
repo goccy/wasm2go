@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	"github.com/goccy/wasm2go/internal/asmgen"
 	"github.com/goccy/wasm2go/internal/codegen"
@@ -74,6 +75,21 @@ func Parse(r io.Reader) (*Module, error) {
 // every measured configuration.
 func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	var mainBuf bytes.Buffer
+	// Kernel overrides: validate the project's manifest against the
+	// module up front, and pin its exports out of line before lowering.
+	var kov *gcasm.KernelOverrides
+	if opts.KernelOverrides != "" {
+		var err error
+		if kov, err = gcasm.LoadKernelOverrides(opts.KernelOverrides, m); err != nil {
+			return Result{}, err
+		}
+		names := make([]string, 0, len(kov.Kernels))
+		for name := range kov.Kernels {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		opts.NoInlineExports = append(append([]string(nil), opts.NoInlineExports...), names...)
+	}
 	res, err := codegen.Translate(&mainBuf, m, opts)
 	if err != nil {
 		return res, err
@@ -100,10 +116,6 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	synthSigs := map[string]gcasm.SynthSig{}
 	for name, sig := range res.OutlinedSigs {
 		synthSigs[name] = gcasm.SynthSig{Params: sig.Params, Result: sig.Result, Packed: sig.Packed}
-	}
-	var nrc2 *gcasm.Nrc2Spec
-	if res.Nrc2VecDot != "" {
-		nrc2 = &gcasm.Nrc2Spec{VecDot: res.Nrc2VecDot, Companion: res.Nrc2Companion}
 	}
 	var directAsm map[string]gcasm.DirectAsmFn
 	for name, df := range res.DirectAsmSSA {
@@ -134,13 +146,13 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 			Vals:    res.DirectAsmExc.Vals,
 		}
 	}
-	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, nrc2, gcasm.Config{
-		FastMath:          opts.FastMath,
-		DisableRepackGemm: opts.DisableRepackGemm,
-		FuseLoopUnroll:    opts.FuseLoopUnroll,
-		DirectAsm:         directAsm,
-		DirectAsmGlobals:  res.DirectAsmGlobals,
-		DirectAsmExc:      directAsmExc,
+	gcasmFiles, gstats, err := gcasm.Build(m, mainBuf.Bytes(), treeIn, opts.OutputImportPath, res.FusedSimd, res.FusedLoops, res.Outlined, synthSigs, gcasm.Config{
+		FastMath:         opts.FastMath,
+		KernelOverrides:  kov,
+		FuseLoopUnroll:   opts.FuseLoopUnroll,
+		DirectAsm:        directAsm,
+		DirectAsmGlobals: res.DirectAsmGlobals,
+		DirectAsmExc:     directAsmExc,
 	})
 	if err != nil {
 		return res, fmt.Errorf("gcasm backend: %w", err)

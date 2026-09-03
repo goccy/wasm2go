@@ -311,10 +311,6 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		res.DirectAsmGlobals = t.moduleGlobalOffsets()
 		res.DirectAsmExc = t.moduleExcOffsets()
 	}
-	if t.nrc2 != nil {
-		res.Nrc2VecDot = t.funcName(t.nrc2.funcIdx)
-		res.Nrc2Companion = t.nrc2CompanionName()
-	}
 	if err := t.checkStaleF16Table(); err != nil {
 		return Result{}, err
 	}

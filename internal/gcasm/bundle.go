@@ -45,7 +45,10 @@ type BuildStats struct {
 	// the retained SSA (internal/asmgen) instead of the listing
 	// transform; DirectAsmFallback counts retained functions the
 	// direct emitter declined (they took the transform path).
-	DirectAsm         int
+	DirectAsm int
+	// KernelOverrides counts functions whose feature bodies came from
+	// the project's kernel-override manifest (see kernelov.go).
+	KernelOverrides   int
 	DirectAsmFallback int
 }
 
@@ -73,26 +76,7 @@ type SynthSig struct {
 	Packed bool
 }
 
-// repackGemmExport resolves the repack GEMM retarget target: llama-wasm
-// exports its wasm-shaped q8_0x4 GEMM under a stable debug name so the
-// transpiler can swap the whole body for a native 4x4 tile kernel (see
-// a64RepackGemmKernel / x64RepackGemmKernel). FastMath only — the
-// kernel fuses the per-block scale multiply-accumulate — and subject
-// to the DisableRepackGemm opt-out. Returns the FnN symbol, or ""
-// when the retarget is off or the export is absent.
-func repackGemmExport(mod *wasm.Module, cfg Config) string {
-	if !cfg.FastMath || cfg.DisableRepackGemm {
-		return ""
-	}
-	for _, e := range mod.Exports {
-		if e.Kind == wasm.ExportFunc && e.Name == "dbg_gemm_q8_0_4x4" {
-			return fmt.Sprintf("Fn%d", e.Index)
-		}
-	}
-	return ""
-}
-
-func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string, fused map[string]*simdfuse.Tree, fusedLoops map[string]*simdfuse.Loop, outlined map[string][]string, synth map[string]SynthSig, nrc2 *Nrc2Spec, cfg Config) (map[string][]byte, *BuildStats, error) {
+func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importPath string, fused map[string]*simdfuse.Tree, fusedLoops map[string]*simdfuse.Loop, outlined map[string][]string, synth map[string]SynthSig, cfg Config) (map[string][]byte, *BuildStats, error) {
 	all := map[string][]byte{}
 	if len(mainSrc) > 0 {
 		all["gen.go"] = mainSrc
@@ -102,7 +86,16 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	}
 	pure := PureFilter(all)
 
-	repackGemmFn := repackGemmExport(mod, cfg)
+	// Kernel overrides by function symbol: the translator names a
+	// defined function fn<idx> in single-package output and Fn<idx>
+	// (exported across chunks) in multi-package output.
+	kov := map[string]*KernelOverride{}
+	if cfg.KernelOverrides != nil {
+		for _, k := range cfg.KernelOverrides.Kernels {
+			kov[fmt.Sprintf("Fn%d", k.FuncIdx)] = k
+			kov[fmt.Sprintf("fn%d", k.FuncIdx)] = k
+		}
+	}
 
 	// Capture tree.
 	dir, err := os.MkdirTemp("", "gcasm-capture-*")
@@ -287,7 +280,7 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			if len(pfns) == 0 {
 				continue
 			}
-			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, nrc2, repackGemmFn, cfg)
+			files, err := buildPkg(mod, importPath, rel, pfns, ac.dm, pkgSigs, fnKinds, isFallbackSig, fnOwnerByArch[spec.name], pure, archStats, spec, modOffs, fused, fusedLoops, outlined[rel], synth, kov, cfg)
 			if err != nil {
 				return nil, nil, fmt.Errorf("gcasm bundle %s/%s: %w", pkgOrRoot(rel), spec.name, err)
 			}
@@ -680,8 +673,7 @@ func buildPkg(
 	fusedLoops map[string]*simdfuse.Loop,
 	outlinedNames []string,
 	synth map[string]SynthSig,
-	nrc2 *Nrc2Spec,
-	repackGemmFn string,
+	kov map[string]*KernelOverride,
 	cfg Config,
 ) (map[string][]byte, error) {
 	directSSA := cfg.DirectAsm
@@ -898,13 +890,18 @@ func buildPkg(
 		}
 		sig := declSig(rel, name, declParams, hasRes, res, synth)
 		// Synthetic bodies take the same feature-gated twin split as
-		// wasm functions: the batched-rows companion clones a kernel
-		// whose body selects SDOT/AVX2 forms, so running its plain
-		// symbol on a baseline CPU would fault. (Outlined extraction
-		// bodies historically never contained gated instructions, so
-		// including them here is a no-op for them.)
-		if arch.gatedMarker != "" &&
-			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker) {
+		// wasm functions (outlined extraction bodies historically never
+		// contained gated instructions, so including them is a no-op).
+		// A kernel override rides the same split: the override bodies
+		// become the feature-selected symbols and the lowered body,
+		// transformed with PortableSIMD, stays as the baseline twin.
+		ko, isKO := kov[name]
+		isKO = isKO && modOffs != nil && len(ko.Bodies[arch.name]) > 0
+		if isKO && strings.Contains(body, arch.jtMarker) {
+			return nil, fmt.Errorf("transform %s: kernel override %s: the lowered body carries a jump table, which the override split does not support", f.Name, ko.Export)
+		}
+		if isKO || (arch.gatedMarker != "" &&
+			strings.Contains(body, arch.gatedMarker) && !strings.Contains(body, arch.jtMarker)) {
 			// Feature-gated body: the feature symbol keeps this body, a
 			// baseline twin is transformed with PortableSIMD, and a
 			// NOSPLIT tail-jump stub under the original name dispatches
@@ -939,72 +936,54 @@ func buildPkg(
 			if m == nil {
 				return nil, fmt.Errorf("transform %s: no arg size in the TEXT header", f.Name)
 			}
-			// vec_dot row/column pairing: under fast-math the arm64
-			// FEATURE body's companion call goes to the native 2x2
-			// SMMLA tile kernel; the portable twin and every other
-			// backend keep the bit-exact Go companion. The kernel and
-			// its declaration follow the module's pointer width — the
-			// LP64 companion takes i64 pointers and strides.
-			// Repack GEMM: the feature body is replaced WHOLESALE by
-			// the native 4x4 tile kernel (a64: by-element SDOT under
-			// the dotprod gate; x64: AVX2 with a VNNI entry branch
-			// under the AVX2 gate). The portable twin keeps the
-			// transformed wasm body, and the existing dual-body stub
-			// dispatches between them.
-			if repackGemmFn != "" && name == repackGemmFn && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
+			if isKO {
+				if want := abi0ArgBytes(mod.FuncTypeOf(ko.FuncIdx)); m[1] != strconv.Itoa(want) {
+					return nil, fmt.Errorf("transform %s: kernel override %s: the lowered body declares a %s-byte argument frame, the ABI rule gives %d", f.Name, ko.Export, m[1], want)
+				}
 				trapSym := "wasm_trap_simd_oob"
 				if rel != "" && rel != "base" {
 					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
 				}
-				wide := mod.Memory64()
-				if arch.name == "amd64" {
-					featBody = x64RepackGemmKernel(featSym, trapSym, modOffs, pool, wide)
-					if !mirrorVars["gcasmHasAVX512VNNI"] {
-						mirrorVars["gcasmHasAVX512VNNI"] = true
-						vnniRef := "HasAVX512VNNI"
-						if rel != "" && rel != "base" {
-							vnniRef = "base." + vnniRef
+				var levels [][2]string
+				baseSym := portSym
+				for _, kb := range ko.Bodies[arch.name] {
+					bsym := name + "kov" + kb.Feature
+					asmB.WriteString(kernelOverrideText(arch.name, bsym, trapSym, modOffs, kb, m[1]))
+					asmB.WriteString("\n")
+					fmt.Fprintf(&declFns, "func %s%s\n", bsym, sig)
+					featureVar := ""
+					for _, l := range kernelFeatureLevels[arch.name] {
+						if l.name == kb.Feature {
+							featureVar = l.featureVar
 						}
-						fmt.Fprintf(&declFns, "// gcasmHasAVX512VNNI mirrors %s for the tile kernels'\n// entry branches (asm reads package-local data only).\nvar gcasmHasAVX512VNNI = %s\n\n", vnniRef, vnniRef)
 					}
-				} else {
-					featBody = a64RepackGemmKernel(featSym, trapSym, modOffs, wide)
-				}
-			}
-			if nrc2 != nil && name == nrc2.VecDot && (arch.name == "arm64" || arch.name == "amd64") && modOffs != nil && modOffs.Cfg.FastMath {
-				fastSym := nrc2.Companion + "fast"
-				retargeted := strings.ReplaceAll(featBody, "·"+nrc2.Companion+"(SB)", "·"+fastSym+"(SB)")
-				if retargeted == featBody {
-					return nil, fmt.Errorf("transform %s: companion call %s not found in the feature body", f.Name, nrc2.Companion)
-				}
-				featBody = retargeted
-				trapSym := "wasm_trap_simd_oob"
-				if rel != "" && rel != "base" {
-					trapSym = "gcasmFwdH_base_Wasm_trap_simd_oob"
-				}
-				wide := mod.Memory64()
-				if arch.name == "amd64" {
-					asmB.WriteString(x64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
-					// The kernel branches to its VNNI loop on a
-					// package-local mirror of the base feature var
-					// (asm reads package-local data only).
-					if !mirrorVars["gcasmHasAVX512VNNI"] {
-						mirrorVars["gcasmHasAVX512VNNI"] = true
-						vnniRef := "HasAVX512VNNI"
+					if featureVar == "" {
+						baseSym = bsym
+						continue
+					}
+					mirror := "gcasm" + featureVar
+					if !mirrorVars[mirror] {
+						mirrorVars[mirror] = true
+						ref := featureVar
 						if rel != "" && rel != "base" {
-							vnniRef = "base." + vnniRef
+							ref = "base." + ref
 						}
-						fmt.Fprintf(&declFns, "// gcasmHasAVX512VNNI mirrors %s for the tile kernel's\n// entry branch (asm reads package-local data only).\nvar gcasmHasAVX512VNNI = %s\n\n", vnniRef, vnniRef)
+						fmt.Fprintf(&declFns, "// %s mirrors %s for the feature-dispatch stubs\n// (asm reads package-local data only).\nvar %s = %s\n\n", mirror, ref, mirror, ref)
 					}
-				} else {
-					asmB.WriteString(a64Nrc2Kernel(fastSym, trapSym, modOffs, wide))
+					levels = append(levels, [2]string{mirror, bsym})
 				}
+				asmB.WriteString(kernelDispatchStub(arch.name, name, levels, baseSym, m[1]))
 				asmB.WriteString("\n")
-				argType := "int32"
-				if wide {
-					argType = "int64"
+				if baseSym == portSym {
+					asmB.WriteString(portBody)
+					asmB.WriteString("\n")
+					fmt.Fprintf(&declFns, "func %s%s\n", portSym, sig)
 				}
-				fmt.Fprintf(&declFns, "func %s(m %s, l0 int32, l1 %s, l2 %s, l3 %s, l4 %s, l5 %s, l6 %s)\n", fastSym, moduleTypeName(rel), argType, argType, argType, argType, argType, argType)
+				fmt.Fprintf(&declFns, "func %s%s\n", name, sig)
+				textNames[name] = true
+				stats.Transformed++
+				stats.KernelOverrides++
+				continue
 			}
 			mirrorVar := "gcasm" + arch.featureVar
 			asmB.WriteString(arch.dispatchStub(name, featSym, portSym, mirrorVar, m[1]))
