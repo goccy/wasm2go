@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/goccy/wasm2go/internal/simdfuse"
+	"github.com/goccy/wasm2go/internal/ssa"
 )
 
 func mustExpr(t *testing.T, src string) ast.Expr {
@@ -129,5 +130,36 @@ func TestWordOperandIdent(t *testing.T) {
 	}
 	if _, ok := wordOperandIdent(mustExpr(t, "v1+v2")); ok {
 		t.Fatal("binary expr accepted as word operand")
+	}
+}
+
+// compactDeadNodes must leave no forward references: the gather
+// rewrite appends its collapsed load after the f16x4_cvt that consumes
+// it, and the pure twin body emits nodes in list order.
+func TestCompactDeadNodesHoistsForwardOperands(t *testing.T) {
+	fb := &fusedTreeBuilder{}
+	fb.nodes = []simdfuse.Node{
+		{Op: "f16x4_cvt", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: 3}}},
+		{Op: "f32x4_mul", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: 0}, {Kind: simdfuse.ArgPairIn, Index: 0}}},
+		{Op: "v128_load32_zero", Args: []simdfuse.Arg{{Kind: simdfuse.ArgConst, Const: 64}, {Kind: simdfuse.ArgConst, Const: 0}}}, // dead
+		{Op: "v128_load16x4_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgConst, Const: 128}, {Kind: simdfuse.ArgConst, Const: 0}}},
+	}
+	fb.nodeVals = make([]*ssa.Value, len(fb.nodes))
+	roots := fb.compactDeadNodes([]int{1})
+	if len(fb.nodes) != 3 {
+		t.Fatalf("live nodes = %d, want 3 (dead load32_zero dropped): %+v", len(fb.nodes), fb.nodes)
+	}
+	for i, nd := range fb.nodes {
+		for _, a := range nd.Args {
+			if a.Kind == simdfuse.ArgNode && a.Index >= i {
+				t.Fatalf("node %d %s references node %d at or after itself: %+v", i, nd.Op, a.Index, fb.nodes)
+			}
+		}
+	}
+	if fb.nodes[0].Op != "v128_load16x4_u" || fb.nodes[1].Op != "f16x4_cvt" || fb.nodes[2].Op != "f32x4_mul" {
+		t.Fatalf("order = %s %s %s, want load, cvt, mul", fb.nodes[0].Op, fb.nodes[1].Op, fb.nodes[2].Op)
+	}
+	if len(roots) != 1 || roots[0] != 2 {
+		t.Fatalf("roots = %v, want [2]", roots)
 	}
 }
