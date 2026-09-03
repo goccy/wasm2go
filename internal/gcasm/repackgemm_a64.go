@@ -42,15 +42,15 @@ const (
 //
 //	sdot vAcc_r.4s, vWeights.16b, vActs.4b[r]
 //
-// Both nests keep the wasm gemm's own per-element arithmetic on every
-// output: exact i32 column sum -> f32 -> x (dcol * drow) -> + running
-// sum, in block order (the same sequence the fused GEMV loops
-// execute, so the batched and single-row paths stay as close as the
-// wasm semantics themselves — prompt batch-size invariance depends on
-// it). Larger K than the scratch holds runs as chunks that accumulate
-// into the output rows in place, in the same block order. FastMath-
-// gated only because the retarget replaces the verified wasm lowering
-// wholesale.
+// The SDOT nest keeps the wasm gemm's own per-element arithmetic on
+// every output: exact i32 column sum -> f32 -> x (dcol * drow) -> +
+// running sum, in block order. The SMMLA nest keeps the exact i32 sums
+// and the block order but fuses the row scale into the accumulate
+// ((f32(sum) * dcol) * drow with one rounding), the native-style
+// rounding the FastMath gate admits; the block tail was 36% of the
+// kernel's time and the fused form is three ops per tile. Larger K than
+// the scratch holds runs as chunks that accumulate into the output
+// rows in place, in the same block order.
 //
 // C signature (see llama-wasm's arch/wasm/repack.cpp):
 //
@@ -126,6 +126,9 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	}
 	fmulV := func(d, n, m int) {
 		word(0x6E20DC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmul v%d.4s, v%d.4s, v%d.4s", d, n, m))
+	}
+	fmlaV := func(d, n, m int) {
+		word(0x4E20CC00|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fmla v%d.4s, v%d.4s, v%d.4s", d, n, m))
 	}
 	faddV := func(d, n, m int) {
 		word(0x4E20D400|uint32(m)<<16|uint32(n)<<5|uint32(d), fmt.Sprintf("fadd v%d.4s, v%d.4s, v%d.4s", d, n, m))
@@ -302,13 +305,16 @@ func a64RepackGemmKernel(sym, trapSym string, offs *ModuleOffsets, wide bool) st
 	fcvtl(17, 17)
 	zip1S(22, 17, 17)
 	zip2S(23, 17, 17)
-	// tile(rp, cp): f32 += f32(i32) * (drow_rp * dcol_cp)
+	// tile(rp, cp): f32 += (f32(i32) * dcol_cp) * drow_rp — the column
+	// scale by multiply, the row scale fused into the accumulate
+	// (one rounding; fast-math, as the f32 GEMM). This block tail was
+	// 36% of the kernel's time measured with it removed, so it pays
+	// to keep it at three ops per tile.
 	for i := 0; i < 8; i++ {
 		rp, cp := i/2, i%2
-		fmulV(16, 18+cp, 20+rp)
 		scvtf(i, i)
-		fmulV(i, i, 16)
-		faddV(24+i, 24+i, i)
+		fmulV(i, i, 18+cp)
+		fmlaV(24+i, i, 20+rp)
 	}
 	w("\tADD\t$136, R16, R16")
 	w("\tADD\t$136, R17, R17")
