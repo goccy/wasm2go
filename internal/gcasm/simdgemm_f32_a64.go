@@ -57,6 +57,18 @@ var kernelRetargetTable = []kernelRetarget{
 		a64:      a64VecSwigluKernel,
 		x64:      x64VecSwigluKernel,
 	},
+	{
+		export:   "dbg_vec_dot_f16",
+		argBytes: func(wide bool) int { _, n := vecDotF16Args(wide); return n },
+		a64:      a64VecDotF16Kernel,
+		x64:      x64VecDotF16Kernel,
+	},
+	{
+		export:   "dbg_vec_mad_f16_f32",
+		argBytes: func(wide bool) int { _, n := vecMadF16F32Args(wide); return n },
+		a64:      a64VecMadF16F32Kernel,
+		x64:      x64VecMadF16F32Kernel,
+	},
 }
 
 // kernelRetargetExports resolves the retarget table against the

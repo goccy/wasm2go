@@ -17,9 +17,11 @@ func TestKernelRetargetExports(t *testing.T) {
 		{Name: "dbg_vec_soft_max_f32", Kind: wasm.ExportFunc, Index: 13},
 		{Name: "dbg_vec_swiglu_f32", Kind: wasm.ExportFunc, Index: 14},
 		{Name: "dbg_gemv_q8_0_4x4", Kind: wasm.ExportFunc, Index: 15},
+		{Name: "dbg_vec_dot_f16", Kind: wasm.ExportFunc, Index: 16},
+		{Name: "dbg_vec_mad_f16_f32", Kind: wasm.ExportFunc, Index: 17},
 	}}
 	got := kernelRetargetExports(mod, Config{FastMath: true})
-	if len(got) != 4 || got["Fn13"].export != "dbg_vec_soft_max_f32" || got["Fn14"].export != "dbg_vec_swiglu_f32" || got["Fn15"].export != "dbg_gemv_q8_0_4x4" {
+	if len(got) != 6 || got["Fn16"].argBytes(true) != 68 || got["Fn16"].argBytes(false) != 40 || got["Fn17"].argBytes(true) != 36 || got["Fn17"].argBytes(false) != 24 || got["Fn13"].export != "dbg_vec_soft_max_f32" || got["Fn14"].export != "dbg_vec_swiglu_f32" || got["Fn15"].export != "dbg_gemv_q8_0_4x4" {
 		t.Fatalf("retargets = %v", got)
 	}
 	if got["Fn13"].argBytes(true) != 48 || got["Fn13"].argBytes(false) != 32 || got["Fn14"].argBytes(true) != 40 || got["Fn14"].argBytes(false) != 24 {
