@@ -105,13 +105,12 @@ func analyzeModuleForInline(mod *wasm.Module) *inlineAnalysis {
 	// Exported retarget anchors: pin them out-of-line so the gcasm
 	// backend's by-name kernel retarget lands on a live body. The
 	// engine names these dbg_* by convention.
-	// Only the batched GEMMs are pinned (the q8_0 repack tile and the
-	// f32 flash-attention micro-GEMM): the GEMV runs at nrows=1 in
-	// the decode hot path, where its per-call overhead outweighs the
-	// tile benefit, so it stays inlinable. The GEMM tiles earn their
-	// keep only when a caller batches four or more rows.
+	// Every dbg_ export is a retarget anchor (repack GEMM and GEMV, the
+	// f32 micro-GEMM, the vector exp kernels): each is replaced by a
+	// native kernel whose whole-loop efficiency dwarfs the call, so
+	// they all stay out of line.
 	for _, e := range mod.Exports {
-		if e.Kind == wasm.ExportFunc && (strings.HasPrefix(e.Name, "dbg_gemm_") || strings.HasPrefix(e.Name, "dbg_simd_gemm_") || strings.HasPrefix(e.Name, "dbg_vec_")) {
+		if e.Kind == wasm.ExportFunc && strings.HasPrefix(e.Name, "dbg_") {
 			if info, ok := a.fns[e.Index]; ok {
 				info.noInline = true
 			}

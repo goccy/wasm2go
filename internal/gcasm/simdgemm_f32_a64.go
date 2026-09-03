@@ -21,9 +21,11 @@ type kernelRetarget struct {
 
 // kernelRetargetTable lists the exports llama-wasm publishes for
 // retargeting: ggml's simd_gemm (the tiled flash-attention QK^T / PV
-// micro-GEMM) and the vector exp kernels behind soft_max and swiglu.
-// All three reproduce the wasm arithmetic up to fused multiply-adds
-// (native-style rounding, which the FastMath gate admits).
+// micro-GEMM), the q8_0x4 repack GEMV (decode's matmul) and the
+// vector exp kernels behind soft_max and swiglu. All reproduce the
+// wasm arithmetic up to fused multiply-adds (native-style rounding,
+// which the FastMath gate admits); the GEMV keeps the wasm's exact
+// per-block order.
 var kernelRetargetTable = []kernelRetarget{
 	{
 		export:   "dbg_simd_gemm_f32",
@@ -34,6 +36,14 @@ var kernelRetargetTable = []kernelRetarget{
 		x64: func(sym, trapSym string, offs *ModuleOffsets, _ *ConstPool, wide bool) string {
 			return x64SimdGemmF32Kernel(sym, trapSym, offs, wide)
 		},
+	},
+	{
+		export:   "dbg_gemv_q8_0_4x4",
+		argBytes: func(wide bool) int { _, n := repackGemmArgs(wide); return n },
+		a64: func(sym, trapSym string, offs *ModuleOffsets, _ *ConstPool, wide bool) string {
+			return a64RepackGemvKernel(sym, trapSym, offs, wide)
+		},
+		x64: x64RepackGemvKernel,
 	},
 	{
 		export:   "dbg_vec_soft_max_f32",
