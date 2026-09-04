@@ -78,11 +78,15 @@ type AsmOverrideBody struct {
 // may declare, most specific first. The first entry of each list that
 // the running CPU supports wins; the baseline entry (last) needs no
 // check. The mirror names are the base package's CPU feature vars.
+// The arm64 levels are independent features (FEAT_FHM, FEAT_I8MM,
+// FEAT_DotProd), not a ladder: a body is only chosen when its own
+// feature is present, the order just decides which of several present
+// bodies runs.
 var overrideFeatureLevels = map[string][]struct {
 	name       string
 	featureVar string // "" for the architecture baseline
 }{
-	"arm64": {{"i8mm", "CPUI8MM"}, {"dotprod", "CPUDotProd"}, {"neon", ""}},
+	"arm64": {{"fhm", "CPUFHM"}, {"i8mm", "CPUI8MM"}, {"dotprod", "CPUDotProd"}, {"neon", ""}},
 	"amd64": {{"avx512vnni", "HasAVX512VNNI"}, {"avx2", "HasAVX2"}, {"sse4", ""}},
 }
 

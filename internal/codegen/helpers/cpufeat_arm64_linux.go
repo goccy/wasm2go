@@ -19,6 +19,10 @@ var CPUDotProd = detectDotProd()
 // M1), so the two are detected separately.
 var CPUI8MM = detectI8MM()
 
+// CPUFHM reports FEAT_FHM (FMLAL/FMLSL: f16 products accumulated in
+// f32). Bodies that keep f16 operands unwidened dispatch on it.
+var CPUFHM = detectFHM()
+
 func detectDotProd() bool {
 	// AT_HWCAP (16), HWCAP_ASIMDDP (bit 20).
 	return auxvBit(16, 20)
@@ -27,6 +31,11 @@ func detectDotProd() bool {
 func detectI8MM() bool {
 	// AT_HWCAP2 (26), HWCAP2_I8MM (bit 13).
 	return auxvBit(26, 13)
+}
+
+func detectFHM() bool {
+	// AT_HWCAP (16), HWCAP_ASIMDFHM (bit 23).
+	return auxvBit(16, 23)
 }
 
 // auxvBit reports bit `bit` of the auxiliary-vector entry `key`:

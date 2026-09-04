@@ -13,12 +13,20 @@ var CPUDotProd = detectDotProd()
 // why it is detected apart from CPUDotProd.
 var CPUI8MM = detectI8MM()
 
+// CPUFHM reports FEAT_FHM (FMLAL/FMLSL: f16 products accumulated in
+// f32). Bodies that keep f16 operands unwidened dispatch on it.
+var CPUFHM = detectFHM()
+
 func detectDotProd() bool {
 	return sysctlFeature("hw.optional.arm.FEAT_DotProd")
 }
 
 func detectI8MM() bool {
 	return sysctlFeature("hw.optional.arm.FEAT_I8MM")
+}
+
+func detectFHM() bool {
+	return sysctlFeature("hw.optional.arm.FEAT_FHM")
 }
 
 func sysctlFeature(name string) bool {
