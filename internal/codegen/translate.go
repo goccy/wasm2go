@@ -3668,6 +3668,24 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 			}},
 		})
 	}
+	// spinAgents is shared between threadLaunch (any memory-bearing module
+	// carries the threads helpers) and spinRelax: the live spawned-agent
+	// gauge the guard compares with GOMAXPROCS.
+	if t.helpers["spinRelax"] || len(t.mod.Memories) > 0 {
+		out = append(out, &ast.GenDecl{
+			Tok: token.VAR,
+			Specs: []ast.Spec{&ast.ValueSpec{
+				Names: []*ast.Ident{newID("spinAgents")},
+				Type:  newID("int32"),
+			}},
+		}, &ast.GenDecl{
+			Tok: token.VAR,
+			Specs: []ast.Spec{&ast.ValueSpec{
+				Names: []*ast.Ident{newID("spinOversubscribed")},
+				Type:  newID("uint32"),
+			}},
+		})
+	}
 	// The wasmExc type is not a FuncDecl, so pull it in explicitly whenever the
 	// module throws or catches. In multi-package mode the type lives in base and
 	// must be exported (WasmExc) so chunk packages can name it; single-package

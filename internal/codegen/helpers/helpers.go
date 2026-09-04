@@ -1594,11 +1594,40 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 // aggregate spin time — rare on an uncontended box, automatically
 // more frequent when oversubscription makes the spins long.
 //
+// When the instance runs more agents than the scheduler has processors
+// (spinAgents, maintained by threadLaunch, against GOMAXPROCS), a spinner
+// holds a processor that a runnable agent needs: every cold call yields
+// then. A barrier the guest spins on is only released once every agent
+// has arrived, and the arriving agents are exactly the ones waiting for
+// a processor, so the 1/64 rate turns each barrier into milliseconds of
+// scheduling latency (measured: n_threads twice the core count, decode
+// fell to 1/100 of the single-thread rate). Native ggml with an OpenMP
+// barrier degrades gracefully in the same setting; this is its
+// equivalent. The check is one atomic load: spinOversubscribed is
+// recomputed by threadLaunch (and agent exit) from the gauge and
+// GOMAXPROCS, because runtime.GOMAXPROCS takes sched.lock and eight
+// spinners asking it at cold-call rate measured a 3% decode loss on an
+// uncontended box.
+//
 //go:noinline
 func spinRelax() {
-	if atomic.AddUint32(&spinRelaxColdCalls, 1)&63 == 0 {
+	n := atomic.AddUint32(&spinRelaxColdCalls, 1)
+	if n&63 == 0 || atomic.LoadUint32(&spinOversubscribed) != 0 {
 		runtime.Gosched()
 	}
+}
+
+// spinAgentsAdd moves the live spawned-agent gauge by delta and
+// refreshes spinOversubscribed: the spawner itself is the extra
+// goroutine, so the instance is oversubscribed once the spawned agents
+// alone reach GOMAXPROCS.
+func spinAgentsAdd(delta int32) {
+	agents := atomic.AddInt32(&spinAgents, delta)
+	var over uint32
+	if int(agents) >= runtime.GOMAXPROCS(0) {
+		over = 1
+	}
+	atomic.StoreUint32(&spinOversubscribed, over)
 }
 
 // ----- wasm32 atomic helpers (named by the lowering) -----------------------
@@ -2456,8 +2485,10 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 	// malloc'ed inside the shared memory.
 	child := new(Module)
 	*child = *m
+	spinAgentsAdd(1)
 	go func() {
 		defer m.threads.wg.Done()
+		defer spinAgentsAdd(-1)
 		// A trap on any wasm thread traps the whole instance (wasi-threads
 		// semantics): surface WHERE it happened, then let it take the
 		// process down instead of silently unwinding the goroutine.
