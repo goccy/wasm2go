@@ -1590,9 +1590,16 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 // every cold call still measured double-digit scheduler churn
 // (pthread_cond_signal — wakep — at 30% of the profile) on
 // barrier-heavy workloads, where waiting IS most of a worker's time.
-// One yield per 64 cold calls keeps donation proportional to
-// aggregate spin time — rare on an uncontended box, automatically
-// more frequent when oversubscription makes the spins long.
+// One yield per 64 cold calls kept donation proportional to aggregate
+// spin time, but on an uncontended box every yield still wakes an
+// idle scheduler thread (wakep -> pthread_cond_signal) that spins in
+// findRunnable and parks again: at n_threads = 4 on a 10-core host that
+// churn was 60% of the CPU samples of a decode step, and on a 4-core
+// host it takes cores from the workers themselves. With every agent on
+// its own processor there is nobody to donate the core to, so the
+// uncontended rate is now one yield per 1024 cold calls (tens of
+// milliseconds of spinning, sysmon's own preemption granularity, kept
+// for host goroutines); oversubscription yields on every cold call.
 //
 // When the instance runs more agents than the scheduler has processors
 // (spinAgents, maintained by threadLaunch, against GOMAXPROCS), a spinner
@@ -1612,7 +1619,7 @@ func atomicRmwCmpxchg64_32uAt(m *Module, ea uint64, expected, replacement int64)
 //go:noinline
 func spinRelax() {
 	n := atomic.AddUint32(&spinRelaxColdCalls, 1)
-	if n&63 == 0 || atomic.LoadUint32(&spinOversubscribed) != 0 {
+	if atomic.LoadUint32(&spinOversubscribed) != 0 || n&1023 == 0 {
 		runtime.Gosched()
 	}
 }
