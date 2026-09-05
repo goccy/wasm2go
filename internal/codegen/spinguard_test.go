@@ -57,6 +57,11 @@ func TestSpinGuardInjection(t *testing.T) {
 	if !strings.Contains(all, "func spinRelax(") {
 		t.Error("spinRelax helper source not included")
 	}
+	// The guard's oversubscription gauge is package state the helper
+	// extraction cannot carry: the runtime template must declare it.
+	if !strings.Contains(all, "var spinAgents int32") || !strings.Contains(all, "var spinOversubscribed uint32") {
+		t.Error("spinAgents gauge / spinOversubscribed flag not declared alongside spinRelax")
+	}
 }
 
 // TestSpinGuardRuns compiles and runs the guarded output: the wait
