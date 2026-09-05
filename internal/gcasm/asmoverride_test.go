@@ -54,10 +54,11 @@ func TestLoadAsmOverrides(t *testing.T) {
     "bodies": [
       {"arch": "arm64", "feature": "neon", "frame": 0, "file": "dot_neon.s"},
       {"arch": "arm64", "feature": "i8mm", "frame": 16, "file": "dot_i8mm.s"},
+      {"arch": "arm64", "feature": "fhm", "frame": 16, "file": "dot_fhm.s"},
       {"arch": "amd64", "feature": "avx2", "frame": 8, "file": "dot_avx2.s"}
     ]
   }]
-}`, map[string]string{"dot_neon.s": ovrGoodBody, "dot_i8mm.s": ovrGoodBody, "dot_avx2.s": "\tRET\n"})
+}`, map[string]string{"dot_neon.s": ovrGoodBody, "dot_i8mm.s": ovrGoodBody, "dot_fhm.s": ovrGoodBody, "dot_avx2.s": "\tRET\n"})
 	ovr, err := LoadAsmOverrides(p, ovrModule(true))
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +68,7 @@ func TestLoadAsmOverrides(t *testing.T) {
 		t.Fatalf("function = %+v", ov)
 	}
 	// Bodies sorted most specific first, baseline last.
-	if got := []string{ov.Bodies["arm64"][0].Feature, ov.Bodies["arm64"][1].Feature}; got[0] != "i8mm" || got[1] != "neon" {
+	if got := []string{ov.Bodies["arm64"][0].Feature, ov.Bodies["arm64"][1].Feature, ov.Bodies["arm64"][2].Feature}; got[0] != "fhm" || got[1] != "i8mm" || got[2] != "neon" {
 		t.Fatalf("arm64 body order = %v", got)
 	}
 	if len(ov.Bodies["amd64"]) != 1 || ov.Bodies["amd64"][0].Frame != 8 {
