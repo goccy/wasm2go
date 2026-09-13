@@ -56,7 +56,7 @@ func Parse(r io.Reader) (*Module, error) {
 		if _, err := io.ReadFull(br, raw); err != nil {
 			return nil, fmt.Errorf("section %d: read payload: %w", id, err)
 		}
-		sr := &readerAt{r: bufio.NewReader(bytes.NewReader(raw))}
+		sr := &readerAt{r: bytes.NewReader(raw)}
 		if err := parseSection(m, id, sr, raw); err != nil {
 			return nil, fmt.Errorf("section %d: %w", id, err)
 		}
@@ -141,8 +141,8 @@ func parseTypeSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("type section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("type section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Types = make([]FuncType, n)
 	for i := uint32(0); i < n; i++ {
@@ -167,8 +167,8 @@ func readFuncType(r byteReader) (FuncType, error) {
 	if err != nil {
 		return FuncType{}, err
 	}
-	if np > maxVectorLen {
-		return FuncType{}, fmt.Errorf("functype params count %d exceeds %d-element cap", np, maxVectorLen)
+	if np > vecCap(r) {
+		return FuncType{}, fmt.Errorf("functype params count %d exceeds %d-element cap", np, vecCap(r))
 	}
 	params := make([]ValType, np)
 	for i := uint32(0); i < np; i++ {
@@ -182,8 +182,8 @@ func readFuncType(r byteReader) (FuncType, error) {
 	if err != nil {
 		return FuncType{}, err
 	}
-	if nr > maxVectorLen {
-		return FuncType{}, fmt.Errorf("functype results count %d exceeds %d-element cap", nr, maxVectorLen)
+	if nr > vecCap(r) {
+		return FuncType{}, fmt.Errorf("functype results count %d exceeds %d-element cap", nr, vecCap(r))
 	}
 	results := make([]ValType, nr)
 	for i := uint32(0); i < nr; i++ {
@@ -233,8 +233,8 @@ func parseImportSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("import section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("import section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Imports = make([]Import, n)
 	for i := uint32(0); i < n; i++ {
@@ -309,8 +309,8 @@ func parseTagSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("tag section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("tag section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Tags = make([]Tag, n)
 	for i := uint32(0); i < n; i++ {
@@ -332,8 +332,8 @@ func parseFunctionSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("function section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("function section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Functions = make([]Function, n)
 	for i := uint32(0); i < n; i++ {
@@ -351,8 +351,8 @@ func parseTableSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("table section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("table section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Tables = make([]TableType, n)
 	for i := uint32(0); i < n; i++ {
@@ -374,8 +374,8 @@ func parseMemorySection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("memory section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("memory section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Memories = make([]MemoryType, n)
 	for i := uint32(0); i < n; i++ {
@@ -393,8 +393,8 @@ func parseGlobalSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("global section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("global section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Globals = make([]Global, n)
 	for i := uint32(0); i < n; i++ {
@@ -423,8 +423,8 @@ func parseExportSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("export section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("export section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Exports = make([]Export, n)
 	for i := uint32(0); i < n; i++ {
@@ -450,8 +450,8 @@ func parseElementSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("element section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("element section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Elements = make([]ElementSegment, 0, n)
 	for i := uint32(0); i < n; i++ {
@@ -470,8 +470,8 @@ func parseElementSection(m *Module, r byteReader) error {
 			if err != nil {
 				return err
 			}
-			if cnt > maxVectorLen {
-				return fmt.Errorf("element[%d]: count %d exceeds %d-byte cap", i, cnt, maxVectorLen)
+			if cnt > vecCap(r) {
+				return fmt.Errorf("element[%d]: count %d exceeds %d-byte cap", i, cnt, vecCap(r))
 			}
 			idxs := make([]uint32, cnt)
 			for j := range idxs {
@@ -507,8 +507,8 @@ func parseElementSection(m *Module, r byteReader) error {
 			if err != nil {
 				return err
 			}
-			if cnt > maxVectorLen {
-				return fmt.Errorf("element[%d]: count %d exceeds %d-byte cap", i, cnt, maxVectorLen)
+			if cnt > vecCap(r) {
+				return fmt.Errorf("element[%d]: count %d exceeds %d-byte cap", i, cnt, vecCap(r))
 			}
 			idxs := make([]uint32, cnt)
 			for j := range idxs {
@@ -560,8 +560,8 @@ func parseDataSection(m *Module, r byteReader) error {
 	if err != nil {
 		return err
 	}
-	if n > maxVectorLen {
-		return fmt.Errorf("data section: count %d exceeds %d-element cap", n, maxVectorLen)
+	if n > vecCap(r) {
+		return fmt.Errorf("data section: count %d exceeds %d-element cap", n, vecCap(r))
 	}
 	m.Datas = make([]DataSegment, 0, n)
 	for i := uint32(0); i < n; i++ {
@@ -711,3 +711,29 @@ type readerAt struct {
 
 func (a *readerAt) Read(p []byte) (int, error) { return a.r.Read(p) }
 func (a *readerAt) ReadByte() (byte, error)    { return a.r.ReadByte() }
+
+// bytesRemaining reports how many bytes are still available to read, when the
+// underlying reader knows (a section payload is backed by a *bytes.Reader). It
+// returns -1 when the size is unknown (e.g. the streaming top-level reader).
+func (a *readerAt) bytesRemaining() int {
+	if l, ok := a.r.(interface{ Len() int }); ok {
+		return l.Len()
+	}
+	return -1
+}
+
+// vecCap returns the maximum plausible element count for a vector decoded from
+// r: every vec element occupies at least one byte on the wire, so a count
+// larger than the bytes remaining in the enclosing section payload is invalid
+// and would only serve to make the decoder pre-allocate a huge slice from a
+// tiny input. When the remaining size is unknown, fall back to maxVectorLen.
+func vecCap(r byteReader) uint32 {
+	if ra, ok := r.(*readerAt); ok {
+		if rem := ra.bytesRemaining(); rem >= 0 {
+			if uint64(rem) < uint64(maxVectorLen) {
+				return uint32(rem)
+			}
+		}
+	}
+	return maxVectorLen
+}
