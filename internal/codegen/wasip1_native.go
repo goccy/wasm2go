@@ -568,22 +568,45 @@ func (f *memFile) ReadDir(n int) ([]os.DirEntry, error) {
 // wasiOpen is one entry in WasiStubs' fd table. Stdio entries are nil-file
 // markers (writes go to the OS handles directly via the WasiStubs fields).
 // The conn arm carries a net.Conn for sockets opened via Sock_accept.
+//
+// An entry can be referenced from several table slots (dup/dup2) and, after
+// Fork, from the tables of several WasiStubs that each have their own lock.
+// The fields that change after the entry is created (conn, fdflags, dirCache,
+// refs) are therefore guarded by the entry's own mu; the others are immutable.
+// mu is a leaf lock: it may be taken while a WasiStubs.mu is held, never the
+// other way round, and it is never held across blocking I/O.
 type wasiOpen struct {
+	mu       sync.Mutex
 	f        File
-	conn     net.Conn
+	conn     net.Conn // guarded by mu; read it through netConn
 	listener net.Listener
 	isDir    bool
-	isSocket bool   // created by Sock_socket, may not yet have a conn
-	path     string // guest path relative to the preopen root
-	fdflags  int32  // last fdflags set via Path_open or Fd_fdstat_set_flags
-	dirCache []os.DirEntry
+	isSocket bool          // created by Sock_socket, may not yet have a conn
+	path     string        // guest path relative to the preopen root
+	fdflags  int32         // last fdflags set via Path_open or Fd_fdstat_set_flags; guarded by mu
+	dirCache []os.DirEntry // guarded by mu
 	// stdio marks an alias of an interpreter stream (1/2/3 = the
 	// configured stdin/stdout/stderr; 0 = not an alias). Fd_dup of a bare
 	// fd 0/1/2 creates one; closing it never touches the real stream.
 	stdio int8
-	// refs counts EXTRA table slots sharing this entry (dup/dup2):
-	// closeWasiOpen only closes the descriptor when it reaches zero.
+	// refs counts EXTRA table slots sharing this entry (dup/dup2 in one
+	// instance, plus every slot of a forked instance): closeWasiOpen only
+	// closes the descriptor when it reaches zero. Guarded by mu.
 	refs int32
+}
+
+// netConn returns the connection attached to a socket entry, or nil.
+func (op *wasiOpen) netConn() net.Conn {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	return op.conn
+}
+
+// addRef records one more table slot referring to op.
+func (op *wasiOpen) addRef() {
+	op.mu.Lock()
+	op.refs++
+	op.mu.Unlock()
 }
 
 // WasiStubs is the default Go-native implementation of wasi_snapshot_preview1.
@@ -642,11 +665,22 @@ type WasiStubs struct {
 	// SetFS swaps in an alternative (e.g. an in-memory FS) so each module can
 	// see a private, arbitrary filesystem.
 	fsys FS
-	// procs tracks host processes spawned via Proc_spawn, keyed by the pid
-	// handed back to the guest. nextPID is the handle counter (kept distinct
-	// from real OS pids — the guest only ever sees these tokens).
-	procs   map[int32]*wasiProc
-	nextPID int32
+	// procs tracks the processes this instance may wait for — host
+	// processes spawned via Proc_spawn and embedder-run processes registered
+	// via NewProc / Proc_fork — keyed by the pid handed back to the guest.
+	procs map[int32]*wasiProc
+	// pids allocates the pid tokens (kept distinct from real OS pids — the
+	// guest only ever sees these tokens). It is created on first use and
+	// shared with every instance derived through Fork, so a token is unique
+	// across a whole fork family.
+	pids *wasiPIDs
+	// procFinished is closed, and dropped so the next waiter makes a fresh
+	// one, whenever a process in procs finishes. Proc_wait_any blocks on it
+	// instead of polling. Guarded by mu.
+	procFinished chan struct{}
+	// forkHook, when non-nil, is the embedder's implementation of fork,
+	// called by Proc_fork. See SetForkHook.
+	forkHook func(parent *Module, child *WasiStubs, pid int32, exited func(status int32)) (kill func(sig int32) error, err error)
 	// execHook, when non-nil, gates every Proc_spawn with the resolved
 	// executable path and argv; returning false denies the spawn (EACCES).
 	// This is the outbound-process whitelist control point — the analogue of
@@ -655,15 +689,39 @@ type WasiStubs struct {
 	execHook func(path string, argv []string) bool
 }
 
-// wasiProc is a host process spawned by Proc_spawn. A background goroutine
-// Waits on the command and publishes the encoded POSIX status, so Proc_wait
-// can support both the blocking (options 0) and non-blocking (WNOHANG) forms
-// without holding the WasiStubs lock across the child's lifetime.
+// wasiProc is a process the guest can wait for: a host process spawned by
+// Proc_spawn (cmd != nil), or a process the embedder runs itself, registered
+// through NewProc / Proc_fork (cmd == nil). Whoever runs the process publishes
+// the encoded POSIX status and closes done, so Proc_wait can support both the
+// blocking (options 0) and non-blocking (WNOHANG) forms without holding the
+// WasiStubs lock across the child's lifetime.
 type wasiProc struct {
 	cmd    *exec.Cmd
 	done   chan struct{}
 	status int32 // POSIX wait status, valid once done is closed
+	// kill delivers a signal to an embedder-run process (Proc_kill). nil
+	// when the embedder gave none. Guarded by the owning WasiStubs.mu.
+	kill func(sig int32) error
 }
+
+// wasiPIDs hands out pid tokens. One allocator is shared by every WasiStubs
+// of a fork family, each of which has its own lock, hence the separate mutex.
+type wasiPIDs struct {
+	mu   sync.Mutex
+	next int32
+}
+
+// alloc returns the next unused pid token.
+func (p *wasiPIDs) alloc() int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pid := p.next
+	p.next++
+	return pid
+}
+
+// wasiFirstPID is the first pid token a fresh instance hands out.
+const wasiFirstPID int32 = 1000
 
 // DefaultWASI returns a WasiStubs configured for typical CLI use: real
 // stdio, os.Args, os.Environ(), wall + monotonic clocks. Consumers who
@@ -683,7 +741,6 @@ func DefaultWASI() *WasiStubs {
 		preopenDir: "/",
 		fsys:       osFS{root: "/"},
 		procs:      map[int32]*wasiProc{},
-		nextPID:    1000,
 	}
 }
 
@@ -774,6 +831,168 @@ func (w *WasiStubs) SetExecHook(hook func(path string, argv []string) bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.execHook = hook
+}
+
+// SetForkHook installs the embedder's implementation of fork, called by
+// Proc_fork. Without a hook Proc_fork reports ENOSYS. Pass nil to clear.
+//
+// The hook runs synchronously inside the guest's proc_fork call, on the
+// guest's goroutine and without w.mu held, so the guest is stopped while it
+// runs: this is where the embedder snapshots the guest (parent is the calling
+// module) into a new module instance. Its arguments are
+//
+//   - child: the host state for that new instance (see Fork). It becomes the
+//     embedder's to own; call child.CloseAll once the child has finished.
+//   - pid: the token the parent's guest will know the child by.
+//   - exited: to be called with the child's POSIX wait status when it ends —
+//     (code&0xff)<<8 for a normal exit, the signal number in the low 7 bits
+//     for a death by signal. It may be called from any goroutine; only its
+//     first call has an effect.
+//
+// The hook returns the function Proc_kill uses to deliver a signal to the
+// child (nil when the child cannot be signalled; see NewProc for how it is
+// called), or an error when the child could not be created. On an error the
+// hook must not have started the child: Proc_fork then releases child's
+// descriptors, forgets pid and reports EAGAIN.
+func (w *WasiStubs) SetForkHook(hook func(parent *Module, child *WasiStubs, pid int32, exited func(status int32)) (kill func(sig int32) error, err error)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.forkHook = hook
+}
+
+// Fork returns the host state for a forked copy of the guest, with fork(2)
+// semantics:
+//
+//   - the configuration is the same: stdio streams, args, environment,
+//     filesystem backend, clock origin and every hook;
+//   - the fd table has the same fd numbers, and each slot refers to the SAME
+//     open descriptor as the corresponding slot of w, so the two instances
+//     share the file offset, and the underlying file, connection or listener
+//     is closed only when the last slot referring to it, in any instance, is
+//     closed;
+//   - the process table is empty: a child does not inherit its parent's
+//     children. Pid tokens stay unique across w, the result and everything
+//     later forked from either.
+//
+// The result is independent of w from then on (its own lock, its own fd
+// numbering) and is meant to back a second module instance running on
+// another goroutine. Release its descriptors with CloseAll when that instance
+// is done.
+func (w *WasiStubs) Fork() *WasiStubs {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	child := &WasiStubs{
+		stdin:       w.stdin,
+		stdout:      w.stdout,
+		stderr:      w.stderr,
+		fdTable:     make(map[int32]*wasiOpen, len(w.fdTable)),
+		nextFD:      w.nextFD,
+		args:        w.args,
+		env:         w.env,
+		monoStart:   w.monoStart,
+		preopenDir:  w.preopenDir,
+		fsHook:      w.fsHook,
+		netHook:     w.netHook,
+		dialHook:    w.dialHook,
+		resolveHook: w.resolveHook,
+		fsys:        w.fsys,
+		procs:       map[int32]*wasiProc{},
+		pids:        w.pidsLocked(),
+		execHook:    w.execHook,
+		forkHook:    w.forkHook,
+	}
+	if w.resolvedHosts != nil {
+		child.resolvedHosts = make(map[string]string, len(w.resolvedHosts))
+		for ip, host := range w.resolvedHosts {
+			child.resolvedHosts[ip] = host
+		}
+	}
+	for fd, op := range w.fdTable {
+		op.addRef()
+		child.fdTable[fd] = op
+	}
+	return child
+}
+
+// CloseAll closes every fd of this instance, as if the guest had called
+// fd_close on each: a descriptor shared with another slot or another instance
+// (dup, Fork) stays open until its last reference goes. It lets an embedder
+// dispose of the host state of a finished instance, typically a forked child.
+// Calling it again is a no-op. The close errors are joined.
+func (w *WasiStubs) CloseAll() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var err error
+	for fd, op := range w.fdTable {
+		err = errors.Join(err, closeWasiOpen(op))
+		delete(w.fdTable, fd)
+	}
+	return err
+}
+
+// pidsLocked returns the pid allocator, creating it on first use. Caller
+// holds w.mu.
+func (w *WasiStubs) pidsLocked() *wasiPIDs {
+	if w.pids == nil {
+		w.pids = &wasiPIDs{next: wasiFirstPID}
+	}
+	return w.pids
+}
+
+// addProcLocked registers proc under a fresh pid token. Caller holds w.mu.
+func (w *WasiStubs) addProcLocked(proc *wasiProc) int32 {
+	if w.procs == nil {
+		w.procs = map[int32]*wasiProc{}
+	}
+	pid := w.pidsLocked().alloc()
+	w.procs[pid] = proc
+	return pid
+}
+
+// finishProc publishes the wait status of proc and wakes every waiter.
+// It must be called exactly once per process.
+func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
+	proc.status = status
+	close(proc.done)
+	// Proc_wait_any scans the table and picks up procFinished under one hold
+	// of w.mu, so a finish is either seen by its scan or closes the channel
+	// it then blocks on.
+	w.mu.Lock()
+	if w.procFinished != nil {
+		close(w.procFinished)
+		w.procFinished = nil
+	}
+	w.mu.Unlock()
+}
+
+// NewProc registers a process that the embedder runs itself (not a host
+// process started by Proc_spawn) so the guest can wait for it and signal it
+// like any other child. It returns the pid token to hand to the guest, and
+// exited, which the embedder calls with the POSIX wait status when the
+// process ends: (code&0xff)<<8 for a normal exit, the signal number in the
+// low 7 bits for a death by signal. exited may be called from any goroutine;
+// only its first call has an effect.
+//
+// kill, when non-nil, is called by Proc_kill to deliver a signal. It is not
+// called for signal 0, nor when the process is already known to have
+// finished, and it runs without w.mu held, possibly while exited is being
+// called on another goroutine. With a nil kill the process cannot be
+// signalled.
+func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(status int32)) {
+	proc := &wasiProc{done: make(chan struct{}), kill: kill}
+	w.mu.Lock()
+	pid = w.addProcLocked(proc)
+	w.mu.Unlock()
+	return pid, w.procExitFunc(proc)
+}
+
+// procExitFunc returns the function that reports the end of an embedder-run
+// process.
+func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
+	var once sync.Once
+	return func(status int32) {
+		once.Do(func() { w.finishProc(proc, status) })
+	}
 }
 
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
@@ -891,27 +1110,19 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	proc := &wasiProc{cmd: cmd, done: make(chan struct{})}
 	go func() {
 		werr := cmd.Wait()
-		proc.status = encodeWaitStatus(cmd.ProcessState)
+		status := encodeWaitStatus(cmd.ProcessState)
 		// A non-zero exit or signal surfaces as *exec.ExitError and is the
 		// normal path (status already encoded from ProcessState above). Any
 		// OTHER error means the wait itself failed; report a 127 exit.
 		var exitErr *exec.ExitError
 		if werr != nil && !errors.As(werr, &exitErr) {
-			proc.status = int32(127) << 8
+			status = int32(127) << 8
 		}
-		close(proc.done)
+		w.finishProc(proc, status)
 	}()
 
 	w.mu.Lock()
-	if w.procs == nil {
-		w.procs = map[int32]*wasiProc{}
-	}
-	if w.nextPID == 0 {
-		w.nextPID = 1000
-	}
-	pid := w.nextPID
-	w.nextPID++
-	w.procs[pid] = proc
+	pid := w.addProcLocked(proc)
 	w.mu.Unlock()
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
@@ -1009,6 +1220,168 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 	delete(w.procs, pid)
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
+	return _wasiESUCCESS
+}
+
+// Proc_wait_any is a NON-STANDARD host import (name "proc_wait_any") backing
+// the bridge's wait() / waitpid(-1): it waits for ANY process of this
+// instance — spawned by Proc_spawn or run by the embedder (NewProc,
+// Proc_fork) — to finish, removes it from the process table, and writes its
+// pid token at pidOutPtr and its POSIX wait status at statusOutPtr. When
+// several have finished, the one with the lowest pid is reported. options is
+// the waitpid() options mask; with bit 0 (WNOHANG) the call does not block.
+// Returns 0, or a negative errno: ECHILD when the instance has no process at
+// all, EAGAIN when WNOHANG is set and none of them has finished yet.
+func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr int32) int32 {
+	pidOut := w.memSlice(m, pidOutPtr, 4)
+	statusOut := w.memSlice(m, statusOutPtr, 4)
+	if pidOut == nil || statusOut == nil {
+		return -_wasiEFAULT
+	}
+	const wnohang = 1
+	for {
+		w.mu.Lock()
+		if len(w.procs) == 0 {
+			w.mu.Unlock()
+			return -_wasiECHILD
+		}
+		var (
+			pid  int32
+			proc *wasiProc
+		)
+		for p, pr := range w.procs {
+			select {
+			case <-pr.done:
+				if proc == nil || p < pid {
+					pid, proc = p, pr
+				}
+			default:
+			}
+		}
+		if proc != nil {
+			delete(w.procs, pid)
+			w.mu.Unlock()
+			binary.LittleEndian.PutUint32(pidOut, uint32(pid))
+			binary.LittleEndian.PutUint32(statusOut, uint32(proc.status))
+			return _wasiESUCCESS
+		}
+		if options&wnohang != 0 {
+			w.mu.Unlock()
+			return -_wasiEAGAIN
+		}
+		// Taken under the same hold of w.mu as the scan above: a process
+		// that finishes from here on closes exactly this channel.
+		if w.procFinished == nil {
+			w.procFinished = make(chan struct{})
+		}
+		finished := w.procFinished
+		w.mu.Unlock()
+		<-finished
+	}
+}
+
+// Proc_fork is a NON-STANDARD host import (name "proc_fork") backing the
+// bridge's fork(). The fork itself is the embedder's: Proc_fork prepares the
+// child's host state (Fork) and its pid token, then calls the hook installed
+// with SetForkHook, which snapshots the stopped guest into a new module
+// instance and starts it. The hook has returned before Proc_fork does. On
+// success the child's pid token is written at pidOutPtr — only then, so a
+// snapshot taken by the hook does not contain it; making the child's own
+// fork() return 0 is the embedder's job. The child is then a process of this
+// instance: Proc_wait / Proc_wait_any reap it, Proc_kill signals it.
+//
+// Returns 0, or a negative errno: ENOSYS when no hook is installed, EAGAIN
+// when the hook failed (the child's descriptors are released and the pid is
+// forgotten).
+func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
+	out := w.memSlice(m, pidOutPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	hook := w.forkHook
+	w.mu.Unlock()
+	if hook == nil {
+		return -_wasiENOSYS
+	}
+	child := w.Fork()
+	proc := &wasiProc{done: make(chan struct{})}
+	w.mu.Lock()
+	pid := w.addProcLocked(proc)
+	w.mu.Unlock()
+	kill, err := hook(m, child, pid, w.procExitFunc(proc))
+	if err != nil {
+		// The child never ran, so every descriptor it holds is one it
+		// shares with w: this drops the references and normally closes
+		// nothing.
+		closeErr := child.CloseAll()
+		w.mu.Lock()
+		delete(w.procs, pid)
+		w.mu.Unlock()
+		if closeErr != nil {
+			return -mapOSError(closeErr)
+		}
+		return -_wasiEAGAIN
+	}
+	w.mu.Lock()
+	proc.kill = kill
+	w.mu.Unlock()
+	binary.LittleEndian.PutUint32(out, uint32(pid))
+	return _wasiESUCCESS
+}
+
+// Proc_kill is a NON-STANDARD host import (name "proc_kill") backing the
+// bridge's kill() for a pid token of this instance. sig is the POSIX signal
+// number; 0 only probes that the process exists.
+//
+//   - A host process (Proc_spawn) receives the signal through the OS.
+//   - An embedder-run process (NewProc, Proc_fork) receives it through the
+//     kill function the embedder registered. Without one the process exists
+//     but cannot be signalled, which is reported as EPERM.
+//   - A process that has finished but has not been waited for yet is a
+//     zombie: as with kill(2), signalling it succeeds and does nothing.
+//
+// Returns 0, or a negative errno: ESRCH for an unknown pid, EINVAL for a
+// negative signal number or one the host rejects, EPERM when the signal
+// could not be delivered.
+func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
+	if sig < 0 {
+		return -_wasiEINVAL
+	}
+	w.mu.Lock()
+	proc := w.procs[pid]
+	var kill func(sig int32) error
+	if proc != nil {
+		kill = proc.kill
+	}
+	w.mu.Unlock()
+	if proc == nil {
+		return -_wasiESRCH
+	}
+	select {
+	case <-proc.done:
+		return _wasiESUCCESS
+	default:
+	}
+	if proc.cmd != nil {
+		// Signal 0 is passed through as well: the OS answers the probe.
+		err := proc.cmd.Process.Signal(syscall.Signal(sig))
+		switch {
+		case err == nil, errors.Is(err, os.ErrProcessDone):
+			// ErrProcessDone: it finished after the probe of done above.
+			return _wasiESUCCESS
+		case errors.Is(err, syscall.EINVAL):
+			return -_wasiEINVAL
+		default:
+			return -_wasiEPERM
+		}
+	}
+	if sig == 0 {
+		return _wasiESUCCESS
+	}
+	if kill == nil || kill(sig) != nil {
+		return -_wasiEPERM
+	}
 	return _wasiESUCCESS
 }
 
@@ -1216,6 +1589,7 @@ const (
 	_wasiENOSYS       int32 = 52
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
+	_wasiESRCH        int32 = 71
 )
 
 // mapOSError turns an os/filesystem error into a wasi errno. Used by the
@@ -1412,17 +1786,22 @@ func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 // joins any Close errors so callers can map them to a wasi errno
 // instead of silently dropping the failure.
 func closeWasiOpen(op *wasiOpen) error {
+	op.mu.Lock()
 	if op.refs > 0 {
-		// another table slot still references this descriptor (dup/dup2)
+		// another table slot, of this instance (dup/dup2) or of a forked
+		// one, still references this descriptor
 		op.refs--
+		op.mu.Unlock()
 		return nil
 	}
+	conn := op.conn
+	op.mu.Unlock()
 	var err error
 	if op.f != nil {
 		err = errors.Join(err, op.f.Close())
 	}
-	if op.conn != nil {
-		err = errors.Join(err, op.conn.Close())
+	if conn != nil {
+		err = errors.Join(err, conn.Close())
 	}
 	if op.listener != nil {
 		err = errors.Join(err, op.listener.Close())
@@ -1465,6 +1844,7 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	if fd >= 0 && fd <= 2 {
 		ftype = 2 // character device for stdio
 	} else if op := w.fdTable[fd]; op != nil {
+		op.mu.Lock()
 		if op.isDir {
 			ftype = 3
 		} else if op.conn != nil {
@@ -1473,6 +1853,7 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 			ftype = 6
 		}
 		fdflags = uint16(op.fdflags)
+		op.mu.Unlock()
 	} else if fd == 3 {
 		ftype = 3 // preopen "/"
 	} else if fd >= 4 {
@@ -1501,7 +1882,9 @@ func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
 		return _wasiEBADF
 	}
 	if op != nil {
+		op.mu.Lock()
 		op.fdflags = flags
+		op.mu.Unlock()
 	}
 	w.mu.Unlock()
 	// Go's stdlib does not expose a portable equivalent of fcntl
@@ -1768,8 +2151,8 @@ func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
 	if op.f != nil {
 		return op.f, op
 	}
-	if op.conn != nil {
-		return op.conn, op
+	if conn := op.netConn(); conn != nil {
+		return conn, op
 	}
 	return nil, op
 }
@@ -1796,8 +2179,8 @@ func (w *WasiStubs) fdDstLocked(fd int32) (io.Writer, *wasiOpen) {
 	if op.f != nil {
 		return op.f, op
 	}
-	if op.conn != nil {
-		return op.conn, op
+	if conn := op.netConn(); conn != nil {
+		return conn, op
 	}
 	return nil, op
 }
@@ -2097,7 +2480,7 @@ func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
 	nfd := w.nextFD
 	w.nextFD++
 	w.fdTable[nfd] = op
-	op.refs++
+	op.addRef()
 	binary.LittleEndian.PutUint32(out, uint32(nfd))
 	return _wasiESUCCESS
 }
@@ -2123,7 +2506,7 @@ func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 		closeErr = closeWasiOpen(dst)
 	}
 	w.fdTable[to] = src
-	src.refs++
+	src.addRef()
 	if closeErr != nil {
 		return mapOSError(closeErr)
 	}
@@ -2160,7 +2543,14 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 
 // readDirCached lazily caches the directory listing on first
 // Fd_readdir, so paged reads (cookie-driven) walk the same snapshot.
-func (op *wasiOpen) readDirCached() ([]os.DirEntry, error) {
+// With rewind the snapshot is taken afresh. The returned slice is never
+// modified afterwards, so it stays valid after a later rewind.
+func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if rewind {
+		op.dirCache = nil
+	}
 	if op.dirCache != nil {
 		return op.dirCache, nil
 	}
@@ -2239,10 +2629,7 @@ func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int
 	// cookie == 0 is the wasi-libc rewinddir signal — invalidate any
 	// snapshot so a fresh Readdir picks up entries created or removed
 	// since the previous call.
-	if cookie == 0 {
-		op.dirCache = nil
-	}
-	entries, err := op.readDirCached()
+	entries, err := op.readDirCached(cookie == 0)
 	if err != nil {
 		return 0, mapOSError(err)
 	}
@@ -2787,7 +3174,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 					}
 				}
 			}
-		} else if op.conn != nil {
+		} else if op.netConn() != nil {
 			// Go's stdlib does not expose a portable readiness probe
 			// on *net.Conn that distinguishes "ready" from "would-
 			// block" without consuming bytes. Report the event as
@@ -2870,7 +3257,7 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	if op == nil || !op.isSocket {
 		return -_wasiENOTSOCK
 	}
-	if op.conn != nil {
+	if op.netConn() != nil {
 		return -_wasiEISCONN
 	}
 	p := int(uint16(port))
@@ -2884,8 +3271,21 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	w.mu.Lock()
 	// The fd may have been closed concurrently; re-check before attaching.
 	if cur := w.fdTable[fd]; cur == op {
-		op.conn = conn
+		// A forked instance sharing this socket may have connected it in
+		// the meantime; the first connection stays.
+		op.mu.Lock()
+		connected := op.conn != nil
+		if !connected {
+			op.conn = conn
+		}
+		op.mu.Unlock()
 		w.mu.Unlock()
+		if connected {
+			if cerr := conn.Close(); cerr != nil {
+				return mapOSError(cerr)
+			}
+			return -_wasiEISCONN
+		}
 		return _wasiESUCCESS
 	}
 	w.mu.Unlock()
@@ -2933,7 +3333,11 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	w.mu.Lock()
 	op := w.fdTable[fd]
 	w.mu.Unlock()
-	if op == nil || op.conn == nil {
+	var conn net.Conn
+	if op != nil {
+		conn = op.netConn()
+	}
+	if conn == nil {
 		return _wasiENOTSOCK
 	}
 	iovBytes := uint64(uint32(riDataLen)) * 8
@@ -2958,7 +3362,7 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		if buf == nil {
 			return _wasiEFAULT
 		}
-		n, err := op.conn.Read(buf)
+		n, err := conn.Read(buf)
 		total += uint32(n)
 		if err != nil {
 			break
@@ -2976,7 +3380,11 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	w.mu.Lock()
 	op := w.fdTable[fd]
 	w.mu.Unlock()
-	if op == nil || op.conn == nil {
+	var conn net.Conn
+	if op != nil {
+		conn = op.netConn()
+	}
+	if conn == nil {
 		return _wasiENOTSOCK
 	}
 	iovBytes := uint64(uint32(siDataLen)) * 8
@@ -2996,7 +3404,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 		if buf == nil {
 			return _wasiEFAULT
 		}
-		n, err := op.conn.Write(buf)
+		n, err := conn.Write(buf)
 		total += uint32(n)
 		if err != nil {
 			break
@@ -3010,18 +3418,22 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	w.mu.Lock()
 	op := w.fdTable[fd]
 	w.mu.Unlock()
-	if op == nil || op.conn == nil {
+	var conn net.Conn
+	if op != nil {
+		conn = op.netConn()
+	}
+	if conn == nil {
 		return _wasiENOTSOCK
 	}
 	type shutdowner interface {
 		CloseRead() error
 		CloseWrite() error
 	}
-	sh, ok := op.conn.(shutdowner)
+	sh, ok := conn.(shutdowner)
 	if !ok {
 		// Generic conn: just close it. Surface a failure via the wasi
 		// errno so the guest can see write-on-broken-socket failures.
-		if err := op.conn.Close(); err != nil {
+		if err := conn.Close(); err != nil {
 			return mapOSError(err)
 		}
 		return _wasiESUCCESS
@@ -3106,6 +3518,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"WasiExitError": true,
 			"wasiOpen":      true,
 			"wasiProc":      true,
+			"wasiPIDs":      true,
 			"WasiStubs":     true,
 			"dotDirEntry":   true,
 			"FS":            true,
