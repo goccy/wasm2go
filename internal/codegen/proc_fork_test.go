@@ -313,6 +313,54 @@ func TestWasi_CloseAll(t *testing.T) {
 	}
 }
 
+func TestWasi_FdClosefrom(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	keepRead, keepWrite := newTestPipe(t, w, m)
+	goRead, goWrite := newTestPipe(t, w, m)
+	child := w.Fork()
+
+	// The child gives up everything from the second pipe on; the first
+	// pipe, numbered lower, stays.
+	if rc := child.Fd_closefrom(m, goRead); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_closefrom rc=%d", rc)
+	}
+	for _, fd := range []int32{goRead, goWrite} {
+		if _, open := child.fdTable[fd]; open {
+			t.Errorf("child fd %d survived closefrom", fd)
+		}
+	}
+	for _, fd := range []int32{keepRead, keepWrite} {
+		if _, open := child.fdTable[fd]; !open {
+			t.Errorf("child fd %d below the bound was closed", fd)
+		}
+	}
+	// The parent's slots are untouched and still usable.
+	if rc := fdWriteString(w, m, goWrite, "ok"); rc != _wasiESUCCESS {
+		t.Fatalf("parent write rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, goRead, 16); rc != _wasiESUCCESS || got != "ok" {
+		t.Fatalf("parent read = %q rc=%d", got, rc)
+	}
+	// Once the parent closes its write end too, the reader sees
+	// end-of-file: the child holds no reference any more.
+	if rc := w.Fd_close(m, goWrite); rc != _wasiESUCCESS {
+		t.Fatalf("parent close rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, goRead, 16); rc != _wasiESUCCESS || got != "" {
+		t.Fatalf("read after last writer closed = %q rc=%d, want end-of-file", got, rc)
+	}
+	// Closing from 0 empties the table; doing it again is harmless.
+	if rc := child.Fd_closefrom(m, 0); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_closefrom(0) rc=%d", rc)
+	}
+	if len(child.fdTable) != 0 {
+		t.Errorf("child still has %d fds", len(child.fdTable))
+	}
+	if rc := child.Fd_closefrom(m, 0); rc != _wasiESUCCESS {
+		t.Fatalf("second Fd_closefrom(0) rc=%d", rc)
+	}
+}
+
 func TestWasi_NewProcWait(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	const statusOff int32 = 4004

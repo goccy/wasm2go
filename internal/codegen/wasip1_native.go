@@ -930,6 +930,31 @@ func (w *WasiStubs) CloseAll() error {
 	return err
 }
 
+// Fd_closefrom is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_closefrom") backing closefrom(): it closes every fd numbered
+// lowFd or higher, each as fd_close would. A guest emulating exec needs it:
+// the process it started has its own descriptors, and the fds this instance
+// still holds — close-on-exec ones included — must go, or a peer waiting for
+// end-of-file on one of them waits for as long as the command runs. Returns
+// 0, or a positive errno for the first close that failed (every fd in range
+// is closed regardless).
+func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var err error
+	for fd, op := range w.fdTable {
+		if fd < lowFd {
+			continue
+		}
+		err = errors.Join(err, closeWasiOpen(op))
+		delete(w.fdTable, fd)
+	}
+	if err != nil {
+		return mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
 // pidsLocked returns the pid allocator, creating it on first use. Caller
 // holds w.mu.
 func (w *WasiStubs) pidsLocked() *wasiPIDs {
