@@ -593,6 +593,78 @@ type wasiOpen struct {
 	// instance, plus every slot of a forked instance): closeWasiOpen only
 	// closes the descriptor when it reaches zero. Guarded by mu.
 	refs int32
+	// ahead is input a readiness probe took out of the stream: the only
+	// portable way to learn that a pipe or socket is readable is to read
+	// it (see pollReadable). Reads of this descriptor drain ahead before
+	// they touch the stream. aheadEnd is the end of input a probe ran into
+	// (io.EOF or a read failure), reported once ahead is drained. Both
+	// guarded by mu.
+	ahead    []byte
+	aheadEnd error
+	// probing serializes readiness probes of this stream, so two probes
+	// cannot append the chunks they read to ahead out of order.
+	probing sync.Mutex
+}
+
+// deadlineReader is a stream whose blocking read can be bounded: a pipe, a
+// socket, a terminal. Regular files are not (they never block), and say so
+// by refusing the deadline.
+type deadlineReader interface {
+	Read(p []byte) (int, error)
+	SetReadDeadline(t time.Time) error
+}
+
+// pollProbeGrace bounds a probe that must not wait: long enough for the
+// read to be attempted, which is all a "what is ready right now" poll needs.
+const pollProbeGrace = 200 * time.Microsecond
+
+// takeAhead serves a read from the input a readiness probe already took. ok
+// is false when there is none and the read must go to the stream.
+func (op *wasiOpen) takeAhead(bufs [][]byte) (n uint64, ok bool) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if len(op.ahead) == 0 {
+		// A probe that hit end of input leaves a zero-byte read behind.
+		return 0, op.aheadEnd != nil
+	}
+	for _, buf := range bufs {
+		c := copy(buf, op.ahead)
+		op.ahead = op.ahead[c:]
+		n += uint64(c)
+		if len(op.ahead) == 0 {
+			op.ahead = nil
+			break
+		}
+	}
+	return n, true
+}
+
+// aheadReady reports whether a read would return without blocking because
+// of probed input, and how many bytes are waiting.
+func (op *wasiOpen) aheadReady() (ready bool, pending int) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	return len(op.ahead) > 0 || op.aheadEnd != nil, len(op.ahead)
+}
+
+// probeRead reads src once — the caller has set the read deadline — and
+// keeps what arrives in ahead. It reports whether the descriptor is now
+// readable.
+func (op *wasiOpen) probeRead(src deadlineReader) bool {
+	op.probing.Lock()
+	defer op.probing.Unlock()
+	if ready, _ := op.aheadReady(); ready {
+		return true
+	}
+	buf := make([]byte, 32<<10)
+	n, err := src.Read(buf)
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	op.ahead = append(op.ahead, buf[:n]...)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		op.aheadEnd = err
+	}
+	return len(op.ahead) > 0 || op.aheadEnd != nil
 }
 
 // netConn returns the connection attached to a socket entry, or nil.
@@ -2095,8 +2167,15 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	_ = op
-	binary.LittleEndian.PutUint32(nreadSlice, uint32(readVec(src, bufs)))
+	var n uint64
+	served := false
+	if op != nil {
+		n, served = op.takeAhead(bufs)
+	}
+	if !served {
+		n = readVec(src, bufs)
+	}
+	binary.LittleEndian.PutUint32(nreadSlice, uint32(n))
 	return _wasiESUCCESS
 }
 
@@ -2135,6 +2214,14 @@ func readVec(src io.Reader, bufs [][]byte) uint64 {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := src.Read(buf)
+		// A read deadline on a stream is only ever set by a readiness
+		// probe, possibly of another instance sharing the descriptor
+		// (pollReadable); it is not this read's and is cleared as soon as
+		// that probe ends.
+		for n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+			runtime.Gosched()
+			n, err = src.Read(buf)
+		}
 		total += uint64(n)
 		if err != nil || n < len(buf) {
 			break
@@ -3159,60 +3246,188 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 	}
 
-	// fd subscriptions report their (optimistic) readiness immediately, so
-	// when any are present the clock subscription must NOT be slept first —
-	// that would turn every select/poll carrying a timeout into a wait for
-	// the full timeout. The clock paces the call only when it is the sole
-	// kind of subscription, and its "timeout fired" event is suppressed
-	// while ready fds are being reported (a real poll returns ready fds
-	// without also claiming the timeout expired).
-	if minClockNs > 0 && len(fdEvents) == 0 {
+	// Decide which fd subscriptions are ready. A descriptor whose read
+	// cannot block — a regular file, anything written to, a listener, a
+	// stream this host cannot probe — is ready at once, as it always was.
+	// A stream whose read CAN block (pipe, socket, terminal) is ready only
+	// when input is actually there: reporting it ready regardless sends a
+	// guest multiplexing two pipes into a blocking read of the idle one
+	// while the busy one fills up and its writer stalls.
+	ready := make([]bool, len(fdEvents))
+	errnos := make([]int32, len(fdEvents))
+	ops := make([]*wasiOpen, len(fdEvents))
+	var probes []pollProbe
+	probeOf := map[*wasiOpen]int{}
+	probeIndex := make([]int, len(fdEvents))
+	anyReady := false
+	for i, ev := range fdEvents {
+		probeIndex[i] = -1
+		w.mu.Lock()
+		if ev.isRead && ev.fd == 0 && w.fdTable != nil {
+			// give bare stdin a table entry to keep probed input in
+			w.dupSourceLocked(0)
+		}
+		src, op := w.fdSrcLocked(ev.fd)
+		known := op != nil || (ev.fd >= 0 && ev.fd <= 2)
+		w.mu.Unlock()
+		ops[i] = op
+		if !known {
+			errnos[i] = _wasiEBADF
+			ready[i], anyReady = true, true
+			continue
+		}
+		stream, bounded := src.(deadlineReader)
+		if !ev.isRead || op == nil || !bounded {
+			ready[i], anyReady = true, true
+			continue
+		}
+		if pending, _ := op.aheadReady(); pending {
+			ready[i], anyReady = true, true
+			continue
+		}
+		if at, seen := probeOf[op]; seen {
+			probeIndex[i] = at
+			continue
+		}
+		probeOf[op] = len(probes)
+		probeIndex[i] = len(probes)
+		probes = append(probes, pollProbe{op: op, src: stream})
+	}
+
+	if len(probes) > 0 {
+		// How long the probes may wait: not at all when something is
+		// ready already, until the timeout when there is one, otherwise
+		// until input arrives.
+		var deadline time.Time
+		switch {
+		case anyReady:
+			deadline = time.Now().Add(pollProbeGrace)
+		case minClockNs >= 0:
+			wait := time.Duration(minClockNs)
+			if wait < pollProbeGrace {
+				wait = pollProbeGrace
+			}
+			deadline = time.Now().Add(wait)
+		}
+		pollReadable(probes, deadline)
+		for i := range fdEvents {
+			if at := probeIndex[i]; at >= 0 && probes[at].ready {
+				ready[i], anyReady = true, true
+			}
+		}
+	} else if minClockNs > 0 && !anyReady {
+		// The clock paces the call only when nothing else can end it.
 		time.Sleep(time.Duration(minClockNs))
 	}
 
 	written := int32(0)
 	for _, ev := range clockEvents {
-		if ev.etype == 0 && len(fdEvents) > 0 {
+		// A poll returns its ready fds without also claiming that the
+		// timeout expired.
+		if ev.etype == 0 && anyReady {
 			continue
 		}
 		writeEvent(events[written:written+32], ev.userdata, ev.etype, 0, 0)
 		written += 32
 	}
-	for _, ev := range fdEvents {
-		w.mu.Lock()
-		op := w.fdTable[ev.fd]
-		w.mu.Unlock()
-		var errno int32
+	for i, ev := range fdEvents {
+		if !ready[i] {
+			continue
+		}
 		var nbytes uint64
-		if op == nil {
-			errno = _wasiEBADF
-		} else if op.f != nil {
-			// Real file: report ready and pass through the file's
-			// current size as the readable byte count (best-effort).
-			if ev.isRead {
+		if op := ops[i]; op != nil && ev.isRead && errnos[i] == 0 {
+			if _, pending := op.aheadReady(); pending > 0 {
+				nbytes = uint64(pending)
+			} else if op.f != nil && probeIndex[i] < 0 {
+				// Regular file: pass through the bytes left to read
+				// (best-effort; the read itself reports the real state).
 				if st, err := op.f.Stat(); err == nil {
-					// Best-effort: skip the byte-count hint if Seek
-					// fails. nbytes is advisory, callers will surface
-					// the real state via the actual Read.
 					if cur, err := op.f.Seek(0, 1); err == nil && st.Size() > cur {
 						nbytes = uint64(st.Size() - cur)
 					}
 				}
 			}
-		} else if op.netConn() != nil {
-			// Go's stdlib does not expose a portable readiness probe
-			// on *net.Conn that distinguishes "ready" from "would-
-			// block" without consuming bytes. Report the event as
-			// ready so the guest's downstream Read/Write call can
-			// surface the real state.
-			_ = minClockNs
 		}
-		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(errno), nbytes)
+		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(errnos[i]), nbytes)
 		written += 32
 	}
 
 	binary.LittleEndian.PutUint32(nev, uint32(written/32))
 	return _wasiESUCCESS
+}
+
+// pollProbe is one stream poll_oneoff has to probe for input.
+type pollProbe struct {
+	op    *wasiOpen
+	src   deadlineReader
+	ready bool
+}
+
+// pollReadable waits until one of the streams has input (or reached its
+// end), or until deadline — the zero time means no limit — and records
+// which are readable. The readiness test is a read: whatever arrives is
+// kept on the descriptor and handed to the guest's next read of it.
+//
+// A stream that refuses a read deadline is one whose read does not block
+// (a regular file behind an *os.File), and counts as readable.
+func pollReadable(probes []pollProbe, deadline time.Time) {
+	var armed []*pollProbe
+	for i := range probes {
+		pr := &probes[i]
+		if err := pr.src.SetReadDeadline(deadline); err != nil {
+			pr.ready = true
+			continue
+		}
+		armed = append(armed, pr)
+	}
+	// Leave no deadline behind: later reads of these streams must block.
+	defer func() {
+		for _, pr := range armed {
+			_ = pr.src.SetReadDeadline(time.Time{})
+		}
+	}()
+	if len(armed) == 0 {
+		return
+	}
+	if len(armed) < len(probes) {
+		// Something is readable already: the others only get the time it
+		// takes to look.
+		grace := time.Now().Add(pollProbeGrace)
+		for _, pr := range armed {
+			_ = pr.src.SetReadDeadline(grace)
+		}
+	}
+	if len(armed) == 1 {
+		armed[0].ready = armed[0].op.probeRead(armed[0].src)
+		return
+	}
+	var wg sync.WaitGroup
+	hit := make(chan struct{}, len(armed))
+	for _, pr := range armed {
+		wg.Add(1)
+		go func(pr *pollProbe) {
+			defer wg.Done()
+			if pr.ready = pr.op.probeRead(pr.src); pr.ready {
+				hit <- struct{}{}
+			}
+		}(pr)
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-hit:
+		// One is readable: stop waiting on the rest. Their reads end at
+		// once, keeping whatever they had already received.
+		now := time.Now()
+		for _, pr := range armed {
+			_ = pr.src.SetReadDeadline(now)
+		}
+		<-done
+	case <-done:
+	}
 }
 
 func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64) {
@@ -3387,7 +3602,16 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		if buf == nil {
 			return _wasiEFAULT
 		}
+		if got, served := op.takeAhead([][]byte{buf}); served {
+			total += uint32(got)
+			break
+		}
 		n, err := conn.Read(buf)
+		for n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+			// another instance's readiness probe; see readVec
+			runtime.Gosched()
+			n, err = conn.Read(buf)
+		}
 		total += uint32(n)
 		if err != nil {
 			break
@@ -3540,21 +3764,23 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		// stand-in, the embed vars, this very function, etc.) is
 		// stripped.
 		keepTypeNames: map[string]bool{
-			"WasiExitError": true,
-			"wasiOpen":      true,
-			"wasiProc":      true,
-			"wasiPIDs":      true,
-			"WasiStubs":     true,
-			"dotDirEntry":   true,
-			"FS":            true,
-			"File":          true,
-			"osFS":          true,
-			"chtimesFS":     true,
-			"MemFS":         true,
-			"memFile":       true,
-			"memNode":       true,
-			"memFileInfo":   true,
-			"memDirEntry":   true,
+			"WasiExitError":  true,
+			"wasiOpen":       true,
+			"wasiProc":       true,
+			"wasiPIDs":       true,
+			"deadlineReader": true,
+			"pollProbe":      true,
+			"WasiStubs":      true,
+			"dotDirEntry":    true,
+			"FS":             true,
+			"File":           true,
+			"osFS":           true,
+			"chtimesFS":      true,
+			"MemFS":          true,
+			"memFile":        true,
+			"memNode":        true,
+			"memFileInfo":    true,
+			"memDirEntry":    true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                  true,
@@ -3569,6 +3795,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"totalBytesPlusNul":       true,
 			"putStrVec64":             true,
 			"readVec":                 true,
+			"pollReadable":            true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
