@@ -284,6 +284,23 @@ func (s *SharedImage) Memory(ceiling int) ([]byte, error) {
 	return mmapImage(s.f, ceiling)
 }
 
+// Close releases the image itself. Mappings already handed out by Memory stay
+// valid — each holds its own reference to the pages — but no further mapping
+// can be made. An image that serves one instance (a snapshot taken to fork a
+// running instance, say) is closed as soon as that instance is mapped, so the
+// image's file does not outlive its only use. Idempotent.
+func (s *SharedImage) Close() error {
+	if s.f == nil {
+		return nil
+	}
+	err := s.f.Close()
+	s.f = nil
+	if s.err == nil {
+		s.err = fmt.Errorf("wasm2go: the shared memory image is closed")
+	}
+	return err
+}
+
 // UnmapMemory releases a mapping returned by SharedImage.Memory. Calling it on
 // a slice that did not come from there is a no-op on platforms without mmap
 // and undefined otherwise, so do not.

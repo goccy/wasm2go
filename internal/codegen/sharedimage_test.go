@@ -156,6 +156,17 @@ func main() {
 	fmt.Printf("a=%q\n", string([]byte{byte(a.Peek(1024)), byte(a.Peek(1025))}))
 	a.Poke(1024, 'X')
 	fmt.Printf("after poke a=%d b=%d\n", a.Peek(1024), b.Peek(1024))
+
+	// Closing the image leaves the instances already mapped from it intact
+	// and refuses new mappings.
+	if err := snap.Close(); err != nil {
+		panic(err)
+	}
+	b.Poke(1025, 'Y')
+	fmt.Printf("after close a=%d b=%d\n", a.Peek(1025), b.Peek(1025))
+	_, err := snap.Memory(4 * 65536)
+	fmt.Println("mapping a closed image fails:", err != nil)
+	fmt.Println("second close:", snap.Close())
 }
 `
 	out := runGoSnippetWithAux(t, buf.String(), main,
@@ -166,6 +177,9 @@ func main() {
 		"marker a 42 b 42",
 		`a="he"`,
 		"after poke a=88 b=104",
+		"after close a=101 b=89",
+		"mapping a closed image fails: true",
+		"second close: <nil>",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in output:\n%s", want, out)
