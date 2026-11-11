@@ -331,41 +331,101 @@ func TestSignal_ChildEndPostsSIGCHLD(t *testing.T) {
 	}
 }
 
-func TestSignal_Alarm(t *testing.T) {
+// setTimer replaces the guest's interval timer and returns what was left of
+// the one before and its interval.
+func setTimer(t *testing.T, w *WasiStubs, m *Module, value, interval time.Duration) (left, every time.Duration) {
+	t.Helper()
+	if rc := w.Proc_itimer(m, 1, int64(value), int64(interval), sigValueOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_itimer(set) rc=%d", rc)
+	}
+	return time.Duration(binary.LittleEndian.Uint64(m.memory[sigValueOff:])),
+		time.Duration(binary.LittleEndian.Uint64(m.memory[sigValueOff+8:]))
+}
+
+// timerState reads the guest's interval timer without changing it.
+func timerState(t *testing.T, w *WasiStubs, m *Module) (left, every time.Duration) {
+	t.Helper()
+	if rc := w.Proc_itimer(m, 0, 0, 0, sigValueOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_itimer(get) rc=%d", rc)
+	}
+	return time.Duration(binary.LittleEndian.Uint64(m.memory[sigValueOff:])),
+		time.Duration(binary.LittleEndian.Uint64(m.memory[sigValueOff+8:]))
+}
+
+func TestSignal_TimerFiresOnce(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGALRM)
-	alarm := func(seconds int32) uint32 {
-		t.Helper()
-		if rc := w.Proc_alarm(m, seconds, sigValueOff); rc != _wasiESUCCESS {
-			t.Fatalf("Proc_alarm rc=%d", rc)
-		}
-		return readU32(m.memory, int(sigValueOff))
+	if left, every := setTimer(t, w, m, 100*time.Second, 0); left != 0 || every != 0 {
+		t.Fatalf("the first timer reported %v left (every %v) of none", left, every)
 	}
-	if left := alarm(100); left != 0 {
-		t.Fatalf("first alarm reported %d seconds left of none", left)
+	if left, _ := timerState(t, w, m); left <= 99*time.Second || left > 100*time.Second {
+		t.Fatalf("a timer of 100s has %v left", left)
 	}
-	if left := alarm(1); left != 100 {
-		t.Fatalf("replacing the alarm reported %d seconds left, want 100", left)
+	if left, _ := setTimer(t, w, m, 300*time.Millisecond, 0); left <= 99*time.Second || left > 100*time.Second {
+		t.Fatalf("replacing the timer reported %v left, want about 100s", left)
 	}
 	start := time.Now()
 	if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
-		t.Fatalf("sleep under an alarm rc=%d, want EINTR", rc)
+		t.Fatalf("sleep under a timer rc=%d, want EINTR", rc)
 	}
-	if d := time.Since(start); d < 900*time.Millisecond || d > 10*time.Second {
-		t.Fatalf("the alarm fired after %v, want about 1s", d)
+	if d := time.Since(start); d < 250*time.Millisecond || d > 10*time.Second {
+		t.Fatalf("the timer fired after %v, want about 300ms", d)
 	}
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
 		t.Fatalf("taken = %#x, want SIGALRM", got)
 	}
-	if left := alarm(0); left != 0 {
-		t.Fatalf("%d seconds left after the alarm fired", left)
+	if left, every := timerState(t, w, m); left != 0 || every != 0 {
+		t.Fatalf("%v left (every %v) after a one-shot timer fired", left, every)
 	}
-	// A cancelled alarm never fires.
-	alarm(1)
-	if left := alarm(0); left != 1 {
-		t.Fatalf("cancelling reported %d seconds left, want 1", left)
+	// A disarmed timer never fires.
+	setTimer(t, w, m, 300*time.Millisecond, 0)
+	if left, _ := setTimer(t, w, m, 0, 0); left <= 0 || left > 300*time.Millisecond {
+		t.Fatalf("disarming reported %v left, want up to 300ms", left)
 	}
-	if rc := sleepPoll(w, m, 1300*time.Millisecond); rc != _wasiESUCCESS {
-		t.Fatalf("sleep after cancelling the alarm rc=%d", rc)
+	if rc := sleepPoll(w, m, 600*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep after disarming the timer rc=%d", rc)
+	}
+}
+
+func TestSignal_TimerRepeatsAtItsInterval(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGALRM)
+	setTimer(t, w, m, 50*time.Millisecond, 100*time.Millisecond)
+	if left, every := timerState(t, w, m); left <= 0 || left > 50*time.Millisecond || every != 100*time.Millisecond {
+		t.Fatalf("state = %v left, every %v; want up to 50ms, every 100ms", left, every)
+	}
+	start := time.Now()
+	for firing := 1; firing <= 3; firing++ {
+		if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
+			t.Fatalf("sleep before firing %d rc=%d, want EINTR", firing, rc)
+		}
+		if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+			t.Fatalf("firing %d: taken = %#x, want SIGALRM", firing, got)
+		}
+	}
+	// 50ms, then 150ms and 250ms.
+	if d := time.Since(start); d < 240*time.Millisecond || d > 10*time.Second {
+		t.Fatalf("three firings took %v, want about 250ms", d)
+	}
+	if _, every := timerState(t, w, m); every != 100*time.Millisecond {
+		t.Fatalf("the interval is %v after three firings, want 100ms", every)
+	}
+	if _, every := setTimer(t, w, m, 0, 0); every != 100*time.Millisecond {
+		t.Fatalf("disarming reported an interval of %v, want 100ms", every)
+	}
+	if rc := sleepPoll(w, m, 300*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep after disarming the repeating timer rc=%d", rc)
+	}
+}
+
+func TestSignal_TimerRejectsNegativeTimes(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGALRM)
+	if rc := w.Proc_itimer(m, 1, -1, 0, sigValueOff); rc != -_wasiEINVAL {
+		t.Fatalf("negative value rc=%d, want -EINVAL", rc)
+	}
+	if rc := w.Proc_itimer(m, 1, 1, -1, sigValueOff); rc != -_wasiEINVAL {
+		t.Fatalf("negative interval rc=%d, want -EINVAL", rc)
+	}
+	if left, _ := timerState(t, w, m); left != 0 {
+		t.Fatalf("a refused call set a timer with %v left", left)
 	}
 }
 
@@ -416,9 +476,7 @@ func TestSignal_InterruptsWaitingFlock(t *testing.T) {
 
 func TestSignal_ForkedStateStartsWithoutSignals(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1)
-	if rc := w.Proc_alarm(m, 100, sigValueOff); rc != _wasiESUCCESS {
-		t.Fatalf("Proc_alarm rc=%d", rc)
-	}
+	setTimer(t, w, m, 100*time.Second, 0)
 	w.PostSignal(wasiSIGUSR1)
 	child := w.Fork()
 	defer child.CloseAll()
@@ -429,8 +487,8 @@ func TestSignal_ForkedStateStartsWithoutSignals(t *testing.T) {
 	if got := takeSignals(t, child, cm); got != 0 {
 		t.Fatalf("the forked guest inherited pending signals: %#x", got)
 	}
-	if rc := child.Proc_alarm(cm, 0, sigValueOff); rc != _wasiESUCCESS || readU32(cm.memory, int(sigValueOff)) != 0 {
-		t.Fatalf("the forked guest inherited the alarm (rc=%d, %d seconds left)", rc, readU32(cm.memory, int(sigValueOff)))
+	if left, _ := timerState(t, child, cm); left != 0 {
+		t.Fatalf("the forked guest inherited the timer (%v left)", left)
 	}
 	// The parent's are untouched.
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
@@ -464,9 +522,7 @@ func TestSignal_PostedToAForkedGuestBeforeItRegisters(t *testing.T) {
 
 func TestSignal_CloseAllEndsDelivery(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGALRM)
-	if rc := w.Proc_alarm(m, 1, sigValueOff); rc != _wasiESUCCESS {
-		t.Fatalf("Proc_alarm rc=%d", rc)
-	}
+	setTimer(t, w, m, time.Second, time.Second)
 	if err := w.CloseAll(); err != nil {
 		t.Fatalf("CloseAll: %v", err)
 	}
@@ -474,10 +530,10 @@ func TestSignal_CloseAllEndsDelivery(t *testing.T) {
 	m.memory = nil
 	w.PostSignal(wasiSIGALRM)
 	w.mu.Lock()
-	alarm := w.sig.alarm
+	timer := w.sig.timer
 	w.mu.Unlock()
-	if alarm != nil {
-		t.Fatal("the alarm survived CloseAll")
+	if timer != nil {
+		t.Fatal("the timer survived CloseAll")
 	}
 }
 

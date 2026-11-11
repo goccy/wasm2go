@@ -1283,7 +1283,7 @@ func (w *WasiStubs) SetForkHook(hook func(parent *Module, child *WasiStubs, pid 
 //   - the process table is empty: a child does not inherit its parent's
 //     children. Pid tokens stay unique across w, the result and everything
 //     later forked from either;
-//   - no signal is pending and no alarm is set, and the guest has not
+//   - no signal is pending and no interval timer is set, and the guest has not
 //     registered for signals: the copy of the guest that runs on the result
 //     registers and reports its dispositions (the ones it inherited) itself.
 //
@@ -1336,7 +1336,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 // fd_close on each: a descriptor shared with another slot or another instance
 // (dup, Fork) stays open until its last reference goes. It lets an embedder
 // dispose of the host state of a finished instance, typically a forked child.
-// It also ends signal delivery to the instance — the alarm is cancelled, and
+// It also ends signal delivery to the instance — the interval timer is disarmed, and
 // PostSignal drops what it is given from here on — so the guest's memory
 // can be released afterwards.
 // Calling it again is a no-op. The close errors are joined.
@@ -4834,9 +4834,13 @@ type wasiSignals struct {
 	// wake ends the blocking call in progress early. Set by beginBlocking,
 	// called (once) by PostSignal.
 	wake func()
-	// alarm is the running alarm timer and alarmAt the time it fires.
-	alarm   *time.Timer
-	alarmAt time.Time
+	// timer is the running real-time interval timer (setitimer's
+	// ITIMER_REAL, which alarm and ualarm set as well), timerAt the time it
+	// fires next, and timerEvery the interval at which it fires again after
+	// that: 0 for a timer that fires once.
+	timer      *time.Timer
+	timerAt    time.Time
+	timerEvery time.Duration
 	// relay receives the host process's signals that the guest handles,
 	// relayed is the set it is subscribed to, and hostIgnored the set the
 	// host process ignores on the guest's behalf. See syncHostSignalsLocked.
@@ -5035,52 +5039,96 @@ func (w *WasiStubs) Proc_signal_take(m *Module, maskPtr int32) int32 {
 	return _wasiESUCCESS
 }
 
-// Proc_alarm is a NON-STANDARD host import (name "proc_alarm") backing
-// alarm(): SIGALRM is posted to the guest once, seconds from now; 0 only
-// cancels. An earlier alarm is cancelled, and the whole seconds it had left
-// (rounded up) are written at remainingPtr. Returns 0 or a negative errno.
-func (w *WasiStubs) Proc_alarm(m *Module, seconds, remainingPtr int32) int32 {
-	out := w.memSlice(m, remainingPtr, 4)
+// Proc_itimer is a NON-STANDARD host import (name "proc_itimer"): the
+// instance's real-time interval timer, which backs setitimer(ITIMER_REAL),
+// getitimer, alarm and ualarm.
+//
+// The state of the timer before the call is written at oldPtr as two
+// little-endian u64 of nanoseconds: the time until it fires next (0 when it
+// is not set) and the interval at which it fires again after that (0 for a
+// timer that fires once). When set is non-zero the timer is then replaced:
+// SIGALRM is posted to the guest value nanoseconds from now, and every
+// interval nanoseconds after that when interval is not 0; a value of 0 only
+// disarms the timer. With set 0 the call only reports.
+//
+// Returns 0, or a negative errno: EINVAL for a negative time.
+func (w *WasiStubs) Proc_itimer(m *Module, set int32, value, interval int64, oldPtr int32) int32 {
+	out := w.memSlice(m, oldPtr, 16)
 	if out == nil {
 		return -_wasiEFAULT
 	}
+	if set != 0 && (value < 0 || interval < 0) {
+		return -_wasiEINVAL
+	}
 	w.mu.Lock()
-	binary.LittleEndian.PutUint32(out, w.stopAlarmLocked())
-	if seconds != 0 {
-		wait := time.Duration(uint32(seconds)) * time.Second
-		var timer *time.Timer
-		timer = time.AfterFunc(wait, func() {
-			w.mu.Lock()
-			due := w.sig.alarm == timer
-			if due {
-				w.sig.alarm = nil
-			}
-			w.mu.Unlock()
-			if due {
-				w.PostSignal(wasiSIGALRM)
-			}
-		})
-		w.sig.alarm, w.sig.alarmAt = timer, time.Now().Add(wait)
+	left, every := w.timerStateLocked()
+	if set != 0 {
+		w.stopTimerLocked()
+		if value > 0 {
+			w.startTimerLocked(time.Duration(value), time.Duration(interval))
+		}
 	}
 	w.mu.Unlock()
+	binary.LittleEndian.PutUint64(out[0:], uint64(left))
+	binary.LittleEndian.PutUint64(out[8:], uint64(every))
 	return _wasiESUCCESS
 }
 
-// stopAlarmLocked cancels the alarm, if one is set, and returns the whole
-// seconds it had left, rounded up. Caller holds w.mu.
-func (w *WasiStubs) stopAlarmLocked() (remaining uint32) {
+// timerStateLocked returns the time until the interval timer fires next and
+// its reload interval; both are 0 when no timer is set. Caller holds w.mu.
+func (w *WasiStubs) timerStateLocked() (left, every time.Duration) {
 	s := &w.sig
-	if s.alarm == nil {
-		return 0
+	if s.timer == nil {
+		return 0, 0
 	}
-	s.alarm.Stop()
-	s.alarm = nil
-	left := time.Until(s.alarmAt)
+	left = time.Until(s.timerAt)
 	if left <= 0 {
-		// It was about to fire; alarm(2) never reports 0 for a set alarm.
-		return 1
+		// It is about to fire; a set timer never reports that it is not.
+		left = 1
 	}
-	return uint32((left + time.Second - 1) / time.Second)
+	return left, s.timerEvery
+}
+
+// startTimerLocked sets the interval timer: it fires after value, and then
+// every every when that is not 0. Each firing posts SIGALRM. Firings the
+// host was late for are not made up one by one — the signal would only be
+// pending once anyway. Caller holds w.mu and has stopped any earlier timer.
+func (w *WasiStubs) startTimerLocked(value, every time.Duration) {
+	var timer *time.Timer
+	timer = time.AfterFunc(value, func() {
+		w.mu.Lock()
+		s := &w.sig
+		due := s.timer == timer
+		if due {
+			if s.timerEvery > 0 {
+				now := time.Now()
+				next := s.timerAt.Add(s.timerEvery)
+				if !next.After(now) {
+					next = now.Add(s.timerEvery)
+				}
+				s.timerAt = next
+				timer.Reset(next.Sub(now))
+			} else {
+				s.timer = nil
+			}
+		}
+		w.mu.Unlock()
+		if due {
+			w.PostSignal(wasiSIGALRM)
+		}
+	})
+	w.sig.timer, w.sig.timerAt, w.sig.timerEvery = timer, time.Now().Add(value), every
+}
+
+// stopTimerLocked disarms the interval timer, if one is set. Caller holds
+// w.mu.
+func (w *WasiStubs) stopTimerLocked() {
+	s := &w.sig
+	if s.timer == nil {
+		return
+	}
+	s.timer.Stop()
+	s.timer, s.timerEvery = nil, 0
 }
 
 // Proc_terminate is a NON-STANDARD host import (name "proc_terminate"): the
@@ -5094,7 +5142,7 @@ func (w *WasiStubs) Proc_terminate(m *Module, sig int32) {
 // detachSignalsLocked ends signal delivery to this instance: nothing may
 // touch the guest's memory once it is being torn down. Caller holds w.mu.
 func (w *WasiStubs) detachSignalsLocked() {
-	w.stopAlarmLocked()
+	w.stopTimerLocked()
 	s := &w.sig
 	s.flagModule, s.flagAddr = nil, 0
 	s.handled, s.ignored, s.blocked, s.pending = 0, 0, 0, 0
