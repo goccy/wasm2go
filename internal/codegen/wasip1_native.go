@@ -54,6 +54,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -1035,6 +1036,9 @@ type WasiStubs struct {
 	// guest, and the host process's mask is shared by all of them. Use it
 	// through createMode. Guarded by mu.
 	umask *os.FileMode
+	// hostProcess records that the guest program is the host process (see
+	// SetHostProcess). Guarded by mu.
+	hostProcess bool
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
@@ -1066,6 +1070,13 @@ func (p *wasiPIDs) alloc() int32 {
 	pid := p.next
 	p.next++
 	return pid
+}
+
+// allocated reports whether pid is a token this allocator has handed out.
+func (p *wasiPIDs) allocated(pid int32) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return pid >= wasiFirstPID && pid < p.next
 }
 
 // wasiFirstPID is the first pid token a fresh instance hands out.
@@ -1210,7 +1221,8 @@ func (w *WasiStubs) SetForkHook(hook func(parent *Module, child *WasiStubs, pid 
 // semantics:
 //
 //   - the configuration is the same: stdio streams, args, environment,
-//     filesystem backend, clock origin and every hook;
+//     filesystem backend, clock origin, every hook and the identity
+//     (SetHostProcess);
 //   - the fd table has the same fd numbers — an fd closed in w, fd 0, 1 or
 //     2 included, is closed in the result — and each slot refers to the SAME
 //     open descriptor as the corresponding slot of w, so the two instances
@@ -1246,6 +1258,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		pids:        w.pidsLocked(),
 		execHook:    w.execHook,
 		forkHook:    w.forkHook,
+		hostProcess: w.hostProcess,
 	}
 	if w.umask != nil {
 		mask := *w.umask
@@ -1734,19 +1747,24 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 }
 
 // Proc_kill is a NON-STANDARD host import (name "proc_kill") backing the
-// bridge's kill() for a pid token of this instance. sig is the POSIX signal
-// number; 0 only probes that the process exists.
+// bridge's kill() for a process other than the caller. sig is the guest's
+// signal number (Linux numbering, which is wasi-libc's); 0 only probes that
+// the process exists.
 //
-//   - A host process (Proc_spawn) receives the signal through the OS.
+//   - A host process (Proc_spawn) receives the signal through the OS, under
+//     the number the host has for that signal.
 //   - An embedder-run process (NewProc, Proc_fork) receives it through the
 //     kill function the embedder registered. Without one the process exists
 //     but cannot be signalled, which is reported as EPERM.
 //   - A process that has finished but has not been waited for yet is a
 //     zombie: as with kill(2), signalling it succeeds and does nothing.
+//   - A pid that is not a process of this instance names a process of the
+//     host when the guest is the host process (SetHostProcess), and nothing
+//     otherwise; see killOutside.
 //
 // Returns 0, or a negative errno: ESRCH for an unknown pid, EINVAL for a
-// negative signal number or one the host rejects, EPERM when the signal
-// could not be delivered.
+// negative signal number or one the host has no signal for, EPERM when the
+// signal could not be delivered.
 func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	if sig < 0 {
 		return -_wasiEINVAL
@@ -1759,7 +1777,7 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	}
 	w.mu.Unlock()
 	if proc == nil {
-		return -_wasiESRCH
+		return w.killOutside(pid, sig)
 	}
 	select {
 	case <-proc.done:
@@ -1767,8 +1785,12 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	default:
 	}
 	if proc.cmd != nil {
+		hostSig, known := hostSignalOf(sig)
+		if !known {
+			return -_wasiEINVAL
+		}
 		// Signal 0 is passed through as well: the OS answers the probe.
-		err := proc.cmd.Process.Signal(syscall.Signal(sig))
+		err := proc.cmd.Process.Signal(hostSig)
 		switch {
 		case err == nil, errors.Is(err, os.ErrProcessDone):
 			// ErrProcessDone: it finished after the probe of done above.
@@ -1788,17 +1810,53 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	return _wasiESUCCESS
 }
 
+// killOutside signals a process that is not one of this instance's. Only a
+// guest that is the host process can reach any: pid is then a process id of
+// the host, unless it is a pid token of this fork family — a token never
+// names a host process, whatever the host uses the same number for.
+// Process groups (pid <= 0) are not reachable.
+func (w *WasiStubs) killOutside(pid, sig int32) int32 {
+	w.mu.Lock()
+	host := w.hostProcess
+	token := w.pidsLocked().allocated(pid)
+	w.mu.Unlock()
+	if !host || token || pid <= 0 {
+		return -_wasiESRCH
+	}
+	hostSig, known := hostSignalOf(sig)
+	if !known {
+		return -_wasiEINVAL
+	}
+	err := signalHostProcess(int(pid), hostSig)
+	switch {
+	case err == nil:
+		return _wasiESUCCESS
+	case errors.Is(err, syscall.ESRCH), errors.Is(err, errors.ErrUnsupported):
+		return -_wasiESRCH
+	case errors.Is(err, syscall.EINVAL):
+		return -_wasiEINVAL
+	default:
+		return -_wasiEPERM
+	}
+}
+
 // encodeWaitStatus turns a Go ProcessState into a POSIX wait status int (the
 // raw value os.waitstatus_to_exitcode decodes): a normal exit N becomes
 // (N&0xff)<<8 (WIFEXITED); a signal becomes the low-7-bits signal number
-// (WIFSIGNALED).
+// (WIFSIGNALED), in the guest's numbering.
 func encodeWaitStatus(st *os.ProcessState) int32 {
 	if st == nil {
 		return 0
 	}
 	if ws, ok := st.Sys().(syscall.WaitStatus); ok {
 		if ws.Signaled() {
-			return int32(ws.Signal()) & 0x7f
+			if sig := guestSignalOf(ws.Signal()); sig != 0 {
+				return sig
+			}
+			// A signal the guest has no number for: all that can be said is
+			// that a signal ended the process, and SIGKILL says the least
+			// about which.
+			return wasiSIGKILL
 		}
 		return int32(ws.ExitStatus()&0xff) << 8
 	}
@@ -1998,6 +2056,7 @@ const (
 	_wasiENOSYS       int32 = 52
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
+	_wasiERANGE       int32 = 68
 	_wasiESRCH        int32 = 71
 )
 
@@ -3911,7 +3970,11 @@ func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
 	if err != nil {
 		return mapOSError(err)
 	}
-	if err := p.Signal(syscall.Signal(sig)); err != nil {
+	hostSig, known := hostSignalOf(sig)
+	if !known {
+		return _wasiEINVAL
+	}
+	if err := p.Signal(hostSig); err != nil {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
@@ -4186,6 +4249,276 @@ func writeFilestat(out []byte, st os.FileInfo) {
 	binary.LittleEndian.PutUint64(out[56:], uint64(posix.ctime.UnixNano()))
 }
 
+// The guest's signal numbers are Linux's, which is what wasi-libc's
+// <signal.h> defines. A host has its own (SIGUSR1 is 10 here and 30 on
+// macOS), so a number never crosses to or from the host OS as it is:
+// hostSignalOf and guestSignalOf translate it by the signal's identity.
+const (
+	wasiSIGHUP    int32 = 1
+	wasiSIGINT    int32 = 2
+	wasiSIGQUIT   int32 = 3
+	wasiSIGILL    int32 = 4
+	wasiSIGTRAP   int32 = 5
+	wasiSIGABRT   int32 = 6
+	wasiSIGBUS    int32 = 7
+	wasiSIGFPE    int32 = 8
+	wasiSIGKILL   int32 = 9
+	wasiSIGUSR1   int32 = 10
+	wasiSIGSEGV   int32 = 11
+	wasiSIGUSR2   int32 = 12
+	wasiSIGPIPE   int32 = 13
+	wasiSIGALRM   int32 = 14
+	wasiSIGTERM   int32 = 15
+	wasiSIGCHLD   int32 = 17
+	wasiSIGCONT   int32 = 18
+	wasiSIGSTOP   int32 = 19
+	wasiSIGTSTP   int32 = 20
+	wasiSIGTTIN   int32 = 21
+	wasiSIGTTOU   int32 = 22
+	wasiSIGURG    int32 = 23
+	wasiSIGXCPU   int32 = 24
+	wasiSIGXFSZ   int32 = 25
+	wasiSIGVTALRM int32 = 26
+	wasiSIGPROF   int32 = 27
+	wasiSIGWINCH  int32 = 28
+	wasiSIGIO     int32 = 29
+	wasiSIGSYS    int32 = 31
+)
+
+// ----- process identity -------------------------------------------------------
+
+// SetHostProcess declares that the guest program IS the host process, the
+// way a command-line tool built around one instance is. With it
+//
+//   - the process and parent process ids, the user and group ids and the
+//     user and group databases the guest sees are the host's (Proc_ids,
+//     Proc_groups, Proc_user_by_id, ...);
+//   - a signal the host process receives and the guest handles is posted to
+//     the guest (see PostSignal), and a signal the guest ignores is ignored
+//     by the host process;
+//   - Proc_kill reaches host processes that are not processes of this
+//     instance.
+//
+// Without it (the default) the guest is an isolated process of its own:
+// pid 42, parent 1, user and group 0, empty user and group databases, and
+// no way to signal anything but its own processes.
+//
+// An instance derived through Fork keeps the identity — the same user, the
+// same databases, the same reach of Proc_kill — but is not the host process:
+// signals the host process receives go to the instance SetHostProcess was
+// called on.
+func (w *WasiStubs) SetHostProcess(on bool) {
+	w.mu.Lock()
+	w.hostProcess = on
+	w.mu.Unlock()
+}
+
+// hostIdentity reports whether the guest sees the host's identity.
+func (w *WasiStubs) hostIdentity() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.hostProcess
+}
+
+// The identity an isolated guest has: the values wasi-libc's own emulation
+// reports.
+const (
+	wasiIsolatedPID  = 42
+	wasiIsolatedPPID = 1
+)
+
+// Proc_ids is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "proc_ids") backing getpid, getppid and the getuid family. It writes
+// six little-endian u32 at outPtr: pid, ppid, uid, euid, gid, egid. Returns
+// 0 or a negative errno.
+func (w *WasiStubs) Proc_ids(m *Module, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 24)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	ids := [6]uint32{wasiIsolatedPID, wasiIsolatedPPID, 0, 0, 0, 0}
+	if w.hostIdentity() {
+		ids = [6]uint32{
+			uint32(os.Getpid()), uint32(os.Getppid()),
+			uint32(os.Getuid()), uint32(os.Geteuid()),
+			uint32(os.Getgid()), uint32(os.Getegid()),
+		}
+	}
+	for i, id := range ids {
+		binary.LittleEndian.PutUint32(out[i*4:], id)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_groups is a NON-STANDARD host import (name "proc_groups") backing
+// getgroups. It writes the number of supplementary group ids at countPtr
+// and, when capacity (a count of u32 slots at bufPtr) is enough for all of
+// them, the ids themselves. Returns 0, or a negative errno: ERANGE when
+// capacity is non-zero and too small (the count is still written).
+func (w *WasiStubs) Proc_groups(m *Module, bufPtr, capacity, countPtr int32) int32 {
+	countOut := w.memSlice(m, countPtr, 4)
+	if countOut == nil || capacity < 0 {
+		return -_wasiEFAULT
+	}
+	var groups []int
+	if w.hostIdentity() {
+		var err error
+		if groups, err = os.Getgroups(); err != nil {
+			return -mapOSError(err)
+		}
+	}
+	binary.LittleEndian.PutUint32(countOut, uint32(len(groups)))
+	if capacity == 0 {
+		return _wasiESUCCESS
+	}
+	if int(capacity) < len(groups) {
+		return -_wasiERANGE
+	}
+	buf := w.memSlice(m, bufPtr, int32(len(groups))*4)
+	if buf == nil {
+		return -_wasiEFAULT
+	}
+	for i, gid := range groups {
+		binary.LittleEndian.PutUint32(buf[i*4:], uint32(gid))
+	}
+	return _wasiESUCCESS
+}
+
+// appendWasiString appends s as a little-endian u32 length followed by its
+// bytes: the form every string in a record handed to the guest takes.
+func appendWasiString(rec []byte, s string) []byte {
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(len(s)))
+	return append(rec, s...)
+}
+
+// writeWasiRecord hands a variable-length record to the guest: its size is
+// written at neededPtr, and the record at bufPtr when bufLen bytes are
+// enough for it. Returns 0, or a negative errno: ERANGE when the buffer is
+// too small — the guest then calls again with one of the size it was told.
+func (w *WasiStubs) writeWasiRecord(m *Module, rec []byte, bufPtr, bufLen, neededPtr int32) int32 {
+	needed := w.memSlice(m, neededPtr, 4)
+	if needed == nil || bufLen < 0 {
+		return -_wasiEFAULT
+	}
+	binary.LittleEndian.PutUint32(needed, uint32(len(rec)))
+	if int(bufLen) < len(rec) {
+		return -_wasiERANGE
+	}
+	buf := w.memSlice(m, bufPtr, int32(len(rec)))
+	if buf == nil {
+		return -_wasiEFAULT
+	}
+	copy(buf, rec)
+	return _wasiESUCCESS
+}
+
+// userRecord encodes an entry of the user database: u32 uid, u32 gid, then
+// the login name, the real name, the home directory and the shell as
+// strings (appendWasiString). The shell is always empty: the host's user
+// lookup (os/user) does not report one. ok is false when the entry's ids are
+// not numbers, as on a host whose user ids are not POSIX ones.
+func userRecord(u *user.User) (rec []byte, ok bool) {
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, false
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return nil, false
+	}
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(uid))
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(gid))
+	rec = appendWasiString(rec, u.Username)
+	rec = appendWasiString(rec, u.Name)
+	rec = appendWasiString(rec, u.HomeDir)
+	rec = appendWasiString(rec, "")
+	return rec, true
+}
+
+// writeUser answers a user lookup: the record of u, or ENOENT when the
+// lookup found no such user (err != nil) or the instance has no user
+// database.
+func (w *WasiStubs) writeUser(m *Module, u *user.User, err error, bufPtr, bufLen, neededPtr int32) int32 {
+	if err != nil {
+		return -_wasiENOENT
+	}
+	rec, ok := userRecord(u)
+	if !ok {
+		return -_wasiENOENT
+	}
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_user_by_id is a NON-STANDARD host import (name "proc_user_by_id")
+// backing getpwuid. It looks uid up in the host's user database and hands
+// back its record (userRecord, through writeWasiRecord). Returns 0, or a
+// negative errno: ENOENT when there is no such user — always, for an
+// instance that is not the host process — and ERANGE when the buffer is too
+// small.
+func (w *WasiStubs) Proc_user_by_id(m *Module, uid, bufPtr, bufLen, neededPtr int32) int32 {
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	u, err := user.LookupId(strconv.FormatUint(uint64(uint32(uid)), 10))
+	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_user_by_name is a NON-STANDARD host import (name "proc_user_by_name")
+// backing getpwnam: Proc_user_by_id for the login name at (namePtr,
+// nameLen).
+func (w *WasiStubs) Proc_user_by_name(m *Module, namePtr, nameLen, bufPtr, bufLen, neededPtr int32) int32 {
+	name := w.memSlice(m, namePtr, nameLen)
+	if name == nil {
+		return -_wasiEFAULT
+	}
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	u, err := user.Lookup(string(name))
+	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+}
+
+// writeGroup answers a group lookup with the group's record: u32 gid, then
+// the group name as a string (appendWasiString). The host's group lookup
+// (os/user) does not report a group's members, so the record carries none.
+func (w *WasiStubs) writeGroup(m *Module, g *user.Group, err error, bufPtr, bufLen, neededPtr int32) int32 {
+	if err != nil {
+		return -_wasiENOENT
+	}
+	gid, err := strconv.ParseUint(g.Gid, 10, 32)
+	if err != nil {
+		return -_wasiENOENT
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(gid))
+	rec = appendWasiString(rec, g.Name)
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_group_by_id is a NON-STANDARD host import (name "proc_group_by_id")
+// backing getgrgid; see Proc_user_by_id and writeGroup.
+func (w *WasiStubs) Proc_group_by_id(m *Module, gid, bufPtr, bufLen, neededPtr int32) int32 {
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	g, err := user.LookupGroupId(strconv.FormatUint(uint64(uint32(gid)), 10))
+	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_group_by_name is a NON-STANDARD host import (name
+// "proc_group_by_name") backing getgrnam; see Proc_user_by_name and
+// writeGroup.
+func (w *WasiStubs) Proc_group_by_name(m *Module, namePtr, nameLen, bufPtr, bufLen, neededPtr int32) int32 {
+	name := w.memSlice(m, namePtr, nameLen)
+	if name == nil {
+		return -_wasiEFAULT
+	}
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	g, err := user.LookupGroup(string(name))
+	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Codegen plumbing — the rest of the file weaves the live WasiStubs
 // implementation into translated output.
@@ -4255,6 +4588,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"totalBytesPlusNul":       true,
 			"putStrVec64":             true,
 			"readVec":                 true,
+			"appendWasiString":        true,
+			"userRecord":              true,
 			"pollReadable":            true,
 			"writeVec":                true,
 			"Args_get":                true,
@@ -4368,6 +4703,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"net",
 		"os",
 		"os/exec",
+		"os/user",
 		"path/filepath",
 		"runtime",
 		"sort",

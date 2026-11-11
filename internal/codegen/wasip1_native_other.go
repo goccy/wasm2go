@@ -5,6 +5,7 @@ package codegen
 import (
 	"errors"
 	"os"
+	"syscall"
 )
 
 // processUmask is the file mode creation mask of the host process. This
@@ -21,5 +22,24 @@ func osFileStat(sys any) (fileStat, bool) {
 // flockOSFile applies flock(2) to a file of the host process, which this
 // platform does not offer.
 func flockOSFile(f *os.File, lock FileLock, wait bool) error {
+	return errors.ErrUnsupported
+}
+
+// hostSignalOf returns the host's signal for a guest signal number. The
+// runtime does not know this platform's signals, so only number 0, the
+// existence probe of kill, has one.
+func hostSignalOf(sig int32) (hostSig syscall.Signal, known bool) {
+	return 0, sig == 0
+}
+
+// guestSignalOf returns the guest's number for a host signal, or 0 when the
+// guest has none for it — always, on this platform.
+func guestSignalOf(hostSig syscall.Signal) int32 {
+	return 0
+}
+
+// signalHostProcess sends a signal to a process of the host, which the
+// runtime cannot do on this platform.
+func signalHostProcess(pid int, sig syscall.Signal) error {
 	return errors.ErrUnsupported
 }

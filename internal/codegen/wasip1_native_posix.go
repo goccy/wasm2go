@@ -68,3 +68,64 @@ func flockOSFile(f *os.File, lock FileLock, wait bool) error {
 	}
 	return lockErr
 }
+
+// hostSignals maps the guest's signal numbers to the host's signals; see
+// hostSignalOf.
+var hostSignals = map[int32]syscall.Signal{
+	wasiSIGHUP:    syscall.SIGHUP,
+	wasiSIGINT:    syscall.SIGINT,
+	wasiSIGQUIT:   syscall.SIGQUIT,
+	wasiSIGILL:    syscall.SIGILL,
+	wasiSIGTRAP:   syscall.SIGTRAP,
+	wasiSIGABRT:   syscall.SIGABRT,
+	wasiSIGBUS:    syscall.SIGBUS,
+	wasiSIGFPE:    syscall.SIGFPE,
+	wasiSIGKILL:   syscall.SIGKILL,
+	wasiSIGUSR1:   syscall.SIGUSR1,
+	wasiSIGSEGV:   syscall.SIGSEGV,
+	wasiSIGUSR2:   syscall.SIGUSR2,
+	wasiSIGPIPE:   syscall.SIGPIPE,
+	wasiSIGALRM:   syscall.SIGALRM,
+	wasiSIGTERM:   syscall.SIGTERM,
+	wasiSIGCHLD:   syscall.SIGCHLD,
+	wasiSIGCONT:   syscall.SIGCONT,
+	wasiSIGSTOP:   syscall.SIGSTOP,
+	wasiSIGTSTP:   syscall.SIGTSTP,
+	wasiSIGTTIN:   syscall.SIGTTIN,
+	wasiSIGTTOU:   syscall.SIGTTOU,
+	wasiSIGURG:    syscall.SIGURG,
+	wasiSIGXCPU:   syscall.SIGXCPU,
+	wasiSIGXFSZ:   syscall.SIGXFSZ,
+	wasiSIGVTALRM: syscall.SIGVTALRM,
+	wasiSIGPROF:   syscall.SIGPROF,
+	wasiSIGWINCH:  syscall.SIGWINCH,
+	wasiSIGIO:     syscall.SIGIO,
+	wasiSIGSYS:    syscall.SIGSYS,
+}
+
+// hostSignalOf returns the host's signal for a guest signal number. Number
+// 0, the existence probe of kill, is the same everywhere. known is false for
+// a signal this host does not have.
+func hostSignalOf(sig int32) (hostSig syscall.Signal, known bool) {
+	if sig == 0 {
+		return 0, true
+	}
+	hostSig, known = hostSignals[sig]
+	return hostSig, known
+}
+
+// guestSignalOf returns the guest's number for a host signal, or 0 when the
+// guest has none for it.
+func guestSignalOf(hostSig syscall.Signal) int32 {
+	for sig, candidate := range hostSignals {
+		if candidate == hostSig {
+			return sig
+		}
+	}
+	return 0
+}
+
+// signalHostProcess sends a signal to a process of the host.
+func signalHostProcess(pid int, sig syscall.Signal) error {
+	return syscall.Kill(pid, sig)
+}
