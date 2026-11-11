@@ -1394,11 +1394,11 @@ func TestWasi_DefaultWASI(t *testing.T) {
 
 // ─── Codegen side: ensure emitter still works ────────────────────────
 
-func TestWasip1EmitNoAuxFiles(t *testing.T) {
-	// The wasi runtime is one file now: everything is in
-	// wasip1_native.go and uses Go's high-level stdlib so no per-
-	// platform companion files are needed. The emitter must not
-	// register any aux file.
+func TestWasip1EmitPlatformCompanions(t *testing.T) {
+	// The wasi runtime is wasip1_native.go plus the companions holding
+	// what the Go stdlib only offers per platform. Each companion must
+	// come out as a file of the output package that still carries its
+	// build constraint, and together they must cover every platform.
 	tr := &translator{
 		opts:            Options{Package: "x", OutputImportPath: "ex/x"},
 		importedModules: []string{"wasi_snapshot_preview1"},
@@ -1411,12 +1411,38 @@ func TestWasip1EmitNoAuxFiles(t *testing.T) {
 	if len(imports) == 0 {
 		t.Fatalf("no imports returned")
 	}
-	if len(tr.auxFiles) != 0 {
-		var names []string
-		for k := range tr.auxFiles {
-			names = append(names, k)
+	companions := tr.emitWasip1Platform("x")
+	wantConstraints := map[string]string{
+		"wasip1_native_posix.go":  "darwin || linux",
+		"wasip1_native_linux.go":  "linux",
+		"wasip1_native_darwin.go": "darwin",
+		"wasip1_native_other.go":  "!darwin && !linux",
+	}
+	if len(companions) != len(wantConstraints) {
+		t.Fatalf("companions = %d files, want %d", len(companions), len(wantConstraints))
+	}
+	for name, constraint := range wantConstraints {
+		src, ok := companions[name]
+		if !ok {
+			t.Errorf("%s is not emitted", name)
+			continue
 		}
-		t.Fatalf("unexpected aux files registered: %v", names)
+		f, err := parser.ParseFile(token.NewFileSet(), name, src, parser.ParseComments)
+		if err != nil {
+			t.Errorf("%s does not parse: %v", name, err)
+			continue
+		}
+		if f.Name.Name != "x" {
+			t.Errorf("%s is in package %s, want x", name, f.Name.Name)
+		}
+		if !strings.HasPrefix(string(src), "//go:build "+constraint+"\n") {
+			t.Errorf("%s does not start with the build constraint %q", name, constraint)
+		}
+	}
+
+	// A module that does not import wasi gets none of it.
+	if got := (&translator{fset: token.NewFileSet()}).emitWasip1Platform("x"); got != nil {
+		t.Errorf("companions emitted without a wasi import: %d files", len(got))
 	}
 }
 
@@ -1461,30 +1487,36 @@ func TestWasi_ResolveFiletimes(t *testing.T) {
 	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Open(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := f.Close(); err != nil {
-			t.Errorf("close f: %v", err)
-		}
-	})
 	// Set explicit times; check resolveFiletimes echoes them.
-	at, mt, err := resolveFiletimes(uint64(time.Unix(100, 0).UnixNano()), uint64(time.Unix(200, 0).UnixNano()), 0x1|0x4, f)
-	if err != nil {
-		t.Fatalf("resolveFiletimes (explicit): %v", err)
+	if filetimesNeedCurrent(0x1 | 0x4) {
+		t.Fatal("explicit atime and mtime should not need the current times")
 	}
+	at, mt := resolveFiletimes(uint64(time.Unix(100, 0).UnixNano()), uint64(time.Unix(200, 0).UnixNano()), 0x1|0x4, nil)
 	if at.Unix() != 100 || mt.Unix() != 200 {
 		t.Fatalf("resolveFiletimes returned %v / %v", at, mt)
 	}
 	// ATIME_NOW + MTIME_NOW.
-	at, mt, err = resolveFiletimes(0, 0, 0x2|0x8, f)
-	if err != nil {
-		t.Fatalf("resolveFiletimes (NOW): %v", err)
-	}
+	at, mt = resolveFiletimes(0, 0, 0x2|0x8, nil)
 	if time.Since(at) > time.Second || time.Since(mt) > time.Second {
 		t.Fatalf("resolveFiletimes NOW too old: %v %v", at, mt)
+	}
+	// A time that is not being set keeps its current value.
+	if err := os.Chtimes(p, time.Unix(300, 0), time.Unix(400, 0)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filetimesNeedCurrent(0x4) {
+		t.Fatal("setting only the mtime should need the current times")
+	}
+	at, mt = resolveFiletimes(0, uint64(time.Unix(500, 0).UnixNano()), 0x4, st)
+	if mt.Unix() != 500 {
+		t.Fatalf("mtime = %v, want 500", mt)
+	}
+	if _, ok := osFileStat(st.Sys()); ok && at.Unix() != 300 {
+		t.Fatalf("atime = %v, want it kept at 300", at)
 	}
 }
 

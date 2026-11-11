@@ -178,10 +178,10 @@ func TestWasi_PathChmodAndFilestatMode(t *testing.T) {
 		t.Fatalf("stat of missing file rc=%d, want negative errno", rc)
 	}
 
-	// A backend without Chmod support reports ENOSYS.
+	// Every backend changes modes; one that lacks the file says so.
 	w.fsys = NewMemFS()
-	if rc := w.Path_chmod(m, pathOff, 5, 0o600); rc != -_wasiENOSYS {
-		t.Fatalf("MemFS Path_chmod rc=%d, want -ENOSYS", rc)
+	if rc := w.Path_chmod(m, pathOff, 5, 0o600); rc != -_wasiENOENT {
+		t.Fatalf("MemFS Path_chmod of a missing file rc=%d, want -ENOENT", rc)
 	}
 }
 

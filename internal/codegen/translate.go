@@ -564,11 +564,13 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	for name, content := range shared {
-		if t.auxFiles == nil {
-			t.auxFiles = map[string][]byte{}
+	for _, aux := range []map[string][]byte{shared, t.emitWasip1Platform(opts.Package)} {
+		for name, content := range aux {
+			if t.auxFiles == nil {
+				t.auxFiles = map[string][]byte{}
+			}
+			t.auxFiles[name] = content
 		}
-		t.auxFiles[name] = content
 	}
 	res, err := finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
 	if err != nil {

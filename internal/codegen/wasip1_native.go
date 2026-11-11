@@ -30,11 +30,15 @@
 // File layout: this file is real, compilable Go and is also //go:embed-ed
 // so the same code that the codegen test suite exercises is the code that
 // gets written into generated output. Everything goes through the Go
-// stdlib (os, time, syscall, net) so no per-platform companion files
-// or third-party dependencies are needed.
+// stdlib (os, time, syscall, net), so no third-party dependencies are
+// needed. The few operations the stdlib only offers per platform — reading
+// the owner, link count and times out of a stat result, flock, the process
+// umask — live in the wasip1_native_<platform>.go companions, which are
+// emitted next to the generated output with their build constraints.
 package codegen
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	_ "embed"
@@ -117,9 +121,27 @@ func itoa32(v int32) string {
 type FS interface {
 	// OpenFile mirrors os.OpenFile: flag is O_RDONLY/O_WRONLY/O_RDWR optionally
 	// OR'd with O_CREATE/O_EXCL/O_TRUNC/O_APPEND. The returned File must
-	// support the operations the mode implies.
+	// support the operations the mode implies. perm is the mode a file this
+	// call creates ends up with: the guest's umask is already applied to it,
+	// so a backend on a real filesystem must not let its own process umask
+	// narrow it further.
 	OpenFile(name string, flag int, perm os.FileMode) (File, error)
+	// Mkdir creates a directory whose mode is perm, exactly as for OpenFile.
 	Mkdir(name string, perm os.FileMode) error
+	// Chmod sets the permission bits of name, and its setuid, setgid and
+	// sticky bits from the corresponding os.FileMode flags.
+	Chmod(name string, mode os.FileMode) error
+	// Chtimes sets the access and modification times of name.
+	Chtimes(name string, atime, mtime time.Time) error
+	// Flock applies or releases an advisory lock on f, a file this FS
+	// opened, with the semantics of flock(2): the lock belongs to the open
+	// file, so everything that shares f shares the lock, while another open
+	// of the same file — by anyone — competes for it. A shared lock excludes
+	// exclusive ones; an exclusive lock excludes every other. With wait
+	// false, a lock that cannot be granted at once fails with
+	// syscall.EAGAIN; with wait true the call blocks until it is granted.
+	// Closing f releases the lock.
+	Flock(f File, lock FileLock, wait bool) error
 	Remove(name string) error
 	Rename(oldName, newName string) error
 	Stat(name string) (os.FileInfo, error)
@@ -142,12 +164,86 @@ type File interface {
 	ReadDir(n int) ([]os.DirEntry, error)
 	Sync() error
 	Truncate(size int64) error
+	// Chmod sets the mode of the open file, as FS.Chmod does by name.
+	Chmod(mode os.FileMode) error
 	Name() string
+}
+
+// FileLock is the kind of advisory lock FS.Flock applies.
+type FileLock int
+
+const (
+	// FileUnlock releases the lock held through the open file.
+	FileUnlock FileLock = iota
+	// FileLockShared is a lock any number of open files can hold together.
+	FileLockShared
+	// FileLockExclusive is a lock a single open file holds alone.
+	FileLockExclusive
+)
+
+// fileStat is what POSIX stat reports about a file beyond os.FileInfo. A
+// backend's FileInfo carries it as its Sys value: the in-memory backend as a
+// *fileStat, a backend on the host filesystem as whatever the os package
+// provides, which fileStatOf reads through the platform companion.
+type fileStat struct {
+	dev, ino, nlink uint64
+	uid, gid        uint32
+	atime, ctime    time.Time
+}
+
+// fileStatOf returns the POSIX metadata of the file fi describes. A FileInfo
+// that carries none describes a file with a single link, owned by uid and gid
+// 0, whose three times are its modification time.
+func fileStatOf(fi os.FileInfo) fileStat {
+	if st, ok := fi.Sys().(*fileStat); ok {
+		return *st
+	}
+	if st, ok := osFileStat(fi.Sys()); ok {
+		return st
+	}
+	return fileStat{nlink: 1, atime: fi.ModTime(), ctime: fi.ModTime()}
+}
+
+// unixFileMode converts the permission and setuid/setgid/sticky bits of a
+// POSIX mode_t into an os.FileMode.
+func unixFileMode(bits uint32) os.FileMode {
+	mode := os.FileMode(bits & 0o777)
+	if bits&0o4000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	if bits&0o2000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if bits&0o1000 != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
+}
+
+// unixModeBits is the inverse of unixFileMode: the low twelve bits of the
+// POSIX mode_t of a file whose mode is mode.
+func unixModeBits(mode os.FileMode) uint32 {
+	bits := uint32(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		bits |= 0o4000
+	}
+	if mode&os.ModeSetgid != 0 {
+		bits |= 0o2000
+	}
+	if mode&os.ModeSticky != 0 {
+		bits |= 0o1000
+	}
+	return bits
 }
 
 // osFS is the default FS backend: a thin pass-through to the host filesystem,
 // scoped to root (the preopen directory). root "" or "/" means no rewriting.
 type osFS struct{ root string }
+
+// NewOSFS returns the FS backend of the host filesystem scoped to root: root
+// becomes the guest's root directory. An empty root or "/" is the host's own
+// root. It is the backend a WasiStubs uses until SetFS replaces it.
+func NewOSFS(root string) FS { return osFS{root: root} }
 
 func (o osFS) join(name string) string {
 	if o.root == "" || o.root == "/" {
@@ -155,22 +251,76 @@ func (o osFS) join(name string) string {
 	}
 	return filepath.Join(o.root, name)
 }
+
+// osCreateAttempts bounds how often osFS.OpenFile alternates between
+// creating a file and opening the one that is in the way.
+const osCreateAttempts = 4
+
 func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
-	f, err := os.OpenFile(o.join(name), flag, perm)
+	path := o.join(name)
+	if flag&os.O_CREATE != 0 && perm&processUmask != 0 {
+		// The process umask would take bits out of perm. A mode can only
+		// be put right on a file this call created, and only an exclusive
+		// create tells a new file from an existing one.
+		for i := 0; i < osCreateAttempts; i++ {
+			f, err := os.OpenFile(path, flag|os.O_EXCL, perm)
+			if err == nil {
+				if err := f.Chmod(perm); err != nil {
+					return nil, errors.Join(err, f.Close())
+				}
+				return f, nil
+			}
+			if flag&os.O_EXCL != 0 || !errors.Is(err, fs.ErrExist) {
+				return nil, err
+			}
+			f, err = os.OpenFile(path, flag&^os.O_CREATE, perm)
+			if err == nil {
+				return f, nil
+			}
+			if !errors.Is(err, fs.ErrNotExist) {
+				return nil, err
+			}
+			// The name exists and yet cannot be opened: the file went away
+			// in between, or the name is a symbolic link to nothing.
+		}
+	}
+	f, err := os.OpenFile(path, flag, perm)
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
 }
-func (o osFS) Mkdir(name string, perm os.FileMode) error { return os.Mkdir(o.join(name), perm) }
+func (o osFS) Mkdir(name string, perm os.FileMode) error {
+	path := o.join(name)
+	if err := os.Mkdir(path, perm); err != nil {
+		return err
+	}
+	if perm&processUmask == 0 {
+		return nil
+	}
+	// Give back the bits the process umask took, keeping what the parent
+	// directory passed down (a setgid bit).
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(path, fi.Mode()|perm)
+}
 func (o osFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(o.join(name), mode) }
-func (o osFS) Remove(name string) error                  { return os.Remove(o.join(name)) }
-func (o osFS) Rename(a, b string) error                  { return os.Rename(o.join(a), o.join(b)) }
-func (o osFS) Stat(name string) (os.FileInfo, error)     { return os.Stat(o.join(name)) }
-func (o osFS) Lstat(name string) (os.FileInfo, error)    { return os.Lstat(o.join(name)) }
-func (o osFS) Symlink(target, name string) error         { return os.Symlink(target, o.join(name)) }
-func (o osFS) Readlink(name string) (string, error)      { return os.Readlink(o.join(name)) }
-func (o osFS) Link(a, b string) error                    { return os.Link(o.join(a), o.join(b)) }
+func (o osFS) Flock(f File, lock FileLock, wait bool) error {
+	of, ok := f.(*os.File)
+	if !ok {
+		return syscall.EBADF
+	}
+	return flockOSFile(of, lock, wait)
+}
+func (o osFS) Remove(name string) error               { return os.Remove(o.join(name)) }
+func (o osFS) Rename(a, b string) error               { return os.Rename(o.join(a), o.join(b)) }
+func (o osFS) Stat(name string) (os.FileInfo, error)  { return os.Stat(o.join(name)) }
+func (o osFS) Lstat(name string) (os.FileInfo, error) { return os.Lstat(o.join(name)) }
+func (o osFS) Symlink(target, name string) error      { return os.Symlink(target, o.join(name)) }
+func (o osFS) Readlink(name string) (string, error)   { return os.Readlink(o.join(name)) }
+func (o osFS) Link(a, b string) error                 { return os.Link(o.join(a), o.join(b)) }
 
 // MemFS is an in-memory read/write FS. Each value is an independent tree, so
 // two interpreters given separate MemFS values cannot observe each other's
@@ -179,6 +329,9 @@ func (o osFS) Link(a, b string) error                    { return os.Link(o.join
 type MemFS struct {
 	mu   sync.Mutex
 	root *memNode
+	// lockReleased wakes the Flock calls waiting for a lock whenever one
+	// is released or downgraded. Created by the first waiter; guarded by mu.
+	lockReleased *sync.Cond
 }
 
 // NewMemFS returns an empty in-memory filesystem with a root directory.
@@ -194,6 +347,13 @@ type memNode struct {
 	modTime  time.Time
 	data     []byte
 	children map[string]*memNode
+	// unlinked is set once the node has no name in the tree any more (it
+	// was removed or replaced), which only its open files can still see:
+	// their stat reports a link count of zero.
+	unlinked bool
+	// locks holds the advisory lock of every open file that has one on
+	// this node (see MemFS.Flock).
+	locks map[*memFile]FileLock
 }
 
 func memSplit(name string) []string {
@@ -309,6 +469,7 @@ func (fsys *MemFS) Remove(name string) error {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrInvalid}
 	}
 	delete(parent.children, base)
+	n.unlinked = true
 	return nil
 }
 
@@ -329,6 +490,9 @@ func (fsys *MemFS) Rename(oldName, newName string) error {
 	}
 	delete(op.children, ob)
 	node.name = nb
+	if replaced, ok := np.children[nb]; ok && replaced != node {
+		replaced.unlinked = true
+	}
 	np.children[nb] = node
 	return nil
 }
@@ -352,7 +516,75 @@ func (fsys *MemFS) Readlink(name string) (string, error) {
 	return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
 }
 
-// Chtimes implements the optional chtimesFS capability.
+// Chmod sets the permission bits of name; a MemFS keeps no other mode bits.
+func (fsys *MemFS) Chmod(name string, mode os.FileMode) error {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	n, err := fsys.lookup(name)
+	if err != nil {
+		return &fs.PathError{Op: "chmod", Path: name, Err: err}
+	}
+	n.mode = n.mode&^0o777 | mode&0o777
+	return nil
+}
+
+// Flock implements FS.Flock for the files of this MemFS.
+func (fsys *MemFS) Flock(f File, lock FileLock, wait bool) error {
+	mf, ok := f.(*memFile)
+	if !ok || mf.fsys != fsys {
+		return syscall.EBADF
+	}
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	node := mf.node
+	if lock == FileUnlock {
+		mf.unlockLocked()
+		return nil
+	}
+	for node.lockConflicts(mf, lock) {
+		if !wait {
+			return syscall.EAGAIN
+		}
+		if fsys.lockReleased == nil {
+			fsys.lockReleased = sync.NewCond(&fsys.mu)
+		}
+		fsys.lockReleased.Wait()
+	}
+	if node.locks == nil {
+		node.locks = map[*memFile]FileLock{}
+	}
+	downgraded := node.locks[mf] == FileLockExclusive && lock == FileLockShared
+	node.locks[mf] = lock
+	if downgraded && fsys.lockReleased != nil {
+		fsys.lockReleased.Broadcast()
+	}
+	return nil
+}
+
+// lockConflicts reports whether an open file other than f holds a lock on n
+// that rules out f taking lock. Caller holds the MemFS lock.
+func (n *memNode) lockConflicts(f *memFile, lock FileLock) bool {
+	for holder, held := range n.locks {
+		if holder != f && (lock == FileLockExclusive || held == FileLockExclusive) {
+			return true
+		}
+	}
+	return false
+}
+
+// unlockLocked releases the lock f holds, if any, and wakes the waiters.
+// Caller holds the MemFS lock.
+func (f *memFile) unlockLocked() {
+	if _, held := f.node.locks[f]; !held {
+		return
+	}
+	delete(f.node.locks, f)
+	if f.fsys.lockReleased != nil {
+		f.fsys.lockReleased.Broadcast()
+	}
+}
+
+// Chtimes sets the modification time of name, the only time a MemFS keeps.
 func (fsys *MemFS) Chtimes(name string, _ time.Time, mtime time.Time) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
@@ -399,22 +631,28 @@ func (fsys *MemFS) WriteFile(name string, data []byte, perm os.FileMode) error {
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
+	if replaced, ok := parent.children[base]; ok {
+		replaced.unlinked = true
+	}
 	parent.children[base] = &memNode{name: base, mode: perm & 0o777, modTime: time.Now(), data: cp}
 	return nil
 }
 
 func (n *memNode) info() os.FileInfo {
+	fi := memFileInfo{name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime, unlinked: n.unlinked}
 	if n.dir {
-		return memFileInfo{name: n.name, mode: os.ModeDir | (n.mode & 0o777), modTime: n.modTime}
+		fi.size = 0
+		fi.mode |= os.ModeDir
 	}
-	return memFileInfo{name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime}
+	return fi
 }
 
 type memFileInfo struct {
-	name    string
-	size    int64
-	mode    os.FileMode
-	modTime time.Time
+	name     string
+	size     int64
+	mode     os.FileMode
+	modTime  time.Time
+	unlinked bool
 }
 
 func (fi memFileInfo) Name() string       { return fi.name }
@@ -422,7 +660,17 @@ func (fi memFileInfo) Size() int64        { return fi.size }
 func (fi memFileInfo) Mode() os.FileMode  { return fi.mode }
 func (fi memFileInfo) ModTime() time.Time { return fi.modTime }
 func (fi memFileInfo) IsDir() bool        { return fi.mode.IsDir() }
-func (fi memFileInfo) Sys() any           { return nil }
+
+// Sys reports the file's POSIX metadata: a MemFS has no hard links, so a
+// file has one link until it is removed, and it keeps no owner and no times
+// other than the modification time.
+func (fi memFileInfo) Sys() any {
+	st := &fileStat{nlink: 1, atime: fi.modTime, ctime: fi.modTime}
+	if fi.unlinked {
+		st.nlink = 0
+	}
+	return st
+}
 
 type memDirEntry struct{ n *memNode }
 
@@ -445,8 +693,23 @@ type memFile struct {
 }
 
 func (f *memFile) Name() string { return f.node.name }
-func (f *memFile) Close() error { return nil }
 func (f *memFile) Sync() error  { return nil }
+
+// Close releases the lock the file holds, if any.
+func (f *memFile) Close() error {
+	f.fsys.mu.Lock()
+	defer f.fsys.mu.Unlock()
+	f.unlockLocked()
+	return nil
+}
+
+// Chmod sets the permission bits of the open file.
+func (f *memFile) Chmod(mode os.FileMode) error {
+	f.fsys.mu.Lock()
+	defer f.fsys.mu.Unlock()
+	f.node.mode = f.node.mode&^0o777 | mode&0o777
+	return nil
+}
 
 func (f *memFile) Stat() (os.FileInfo, error) {
 	f.fsys.mu.Lock()
@@ -766,6 +1029,12 @@ type WasiStubs struct {
 	// dialHook for sockets. Spawning runs a HOST binary, so a sandbox that
 	// enables host processes should always install this.
 	execHook func(path string, argv []string) bool
+	// umask is the guest's file mode creation mask once it has set one
+	// (Proc_umask); nil means the host process's own mask applies. It is
+	// per instance because every instance is a process of its own to the
+	// guest, and the host process's mask is shared by all of them. Use it
+	// through createMode. Guarded by mu.
+	umask *os.FileMode
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
@@ -977,6 +1246,10 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		pids:        w.pidsLocked(),
 		execHook:    w.execHook,
 		forkHook:    w.forkHook,
+	}
+	if w.umask != nil {
+		mask := *w.umask
+		child.umask = &mask
 	}
 	if w.resolvedHosts != nil {
 		child.resolvedHosts = make(map[string]string, len(w.resolvedHosts))
@@ -1754,6 +2027,8 @@ func mapOSError(err error) int32 {
 		return _wasiEAGAIN
 	case errors.Is(err, syscall.EPIPE):
 		return _wasiEPIPE
+	case errors.Is(err, errors.ErrUnsupported):
+		return _wasiENOTSUP
 	}
 	return _wasiEIO
 }
@@ -2104,16 +2379,17 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
-	atime, mtime, err := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, op.f)
-	if err != nil {
-		return mapOSError(err)
-	}
-	// Applied only when the backend tracks timestamps (osFS does); a no-op
-	// success otherwise so timestamp-less backends don't fail the guest.
-	if cf, ok := fsys.(chtimesFS); ok {
-		if err := cf.Chtimes(op.path, atime, mtime); err != nil {
+	var current os.FileInfo
+	if filetimesNeedCurrent(fstFlags) {
+		st, err := op.f.Stat()
+		if err != nil {
 			return mapOSError(err)
 		}
+		current = st
+	}
+	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, current)
+	if err := fsys.Chtimes(op.path, atime, mtime); err != nil {
+		return mapOSError(err)
 	}
 	return _wasiESUCCESS
 }
@@ -2125,25 +2401,24 @@ func combine64(hi, lo int32) uint64 {
 	return (uint64(uint32(hi)) << 32) | uint64(uint32(lo))
 }
 
+// filetimesNeedCurrent reports whether a fstFlags bitmask leaves the access
+// or the modification time as it is (neither its explicit nor its "now" bit
+// is set), so that the file's current times have to be read first.
+func filetimesNeedCurrent(fstFlags int32) bool {
+	return fstFlags&(0x1|0x2) == 0 || fstFlags&(0x4|0x8) == 0
+}
+
 // resolveFiletimes decides the (atime, mtime) pair to apply given a
 // fstFlags bitmask. Bits 0x2 (ATIME_NOW) and 0x8 (MTIME_NOW) override the
-// explicit values with time.Now(). Unset ATIME/MTIME bits keep the
-// existing on-disk time, so f.Stat must succeed when those bits are
-// unset; the error is returned so the caller can surface it as a wasi
-// errno rather than silently writing epoch.
-func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f File) (time.Time, time.Time, error) {
+// explicit values with time.Now(). A time whose bits are both unset keeps
+// its value from current, the file's stat, which the caller supplies
+// whenever filetimesNeedCurrent says one is needed.
+func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, current os.FileInfo) (time.Time, time.Time) {
 	now := time.Now()
 	var atime, mtime time.Time
-	// We only need the current on-disk times when at least one of
-	// ATIME or MTIME is going to be preserved (its bit is unset).
-	needCurrent := fstFlags&(0x1|0x2) == 0 || fstFlags&(0x4|0x8) == 0
-	if needCurrent {
-		st, err := f.Stat()
-		if err != nil {
-			return time.Time{}, time.Time{}, err
-		}
-		atime = st.ModTime()
-		mtime = st.ModTime()
+	if current != nil {
+		atime = fileStatOf(current).atime
+		mtime = current.ModTime()
 	}
 	if fstFlags&0x1 != 0 {
 		atime = time.Unix(0, int64(atimNs))
@@ -2157,7 +2432,7 @@ func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f File) (time.Time,
 	if fstFlags&0x8 != 0 {
 		mtime = now
 	}
-	return atime, mtime, nil
+	return atime, mtime
 }
 
 func (w *WasiStubs) Fd_prestat_get(m *Module, fd, ptr int32) int32 {
@@ -2524,8 +2799,7 @@ func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32
 // Path_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "path_chmod") backing a bridge-provided chmod(): WASI preview1 has
 // no way to change file modes. The path at (pathPtr,pathLen) is
-// preopen-relative, like path_open's. Backends without chmod support
-// (MemFS keeps no modes) report ENOSYS. Returns 0 or a negative errno.
+// preopen-relative, like path_open's. Returns 0 or a negative errno.
 func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
 	if pathSlice == nil {
@@ -2534,16 +2808,228 @@ func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
 	w.mu.Lock()
 	fsys := w.fsys
 	w.mu.Unlock()
-	ch, ok := fsys.(interface {
-		Chmod(string, os.FileMode) error
-	})
-	if !ok {
-		return -_wasiENOSYS
-	}
-	if err := ch.Chmod(string(pathSlice), os.FileMode(uint32(mode)&0o7777)); err != nil {
+	if err := fsys.Chmod(string(pathSlice), unixFileMode(uint32(mode))); err != nil {
 		return -mapOSError(err)
 	}
 	return _wasiESUCCESS
+}
+
+// Fd_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_chmod") backing a bridge-provided fchmod(). Returns 0 or a
+// negative errno.
+func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if op.f == nil {
+		return -_wasiEINVAL
+	}
+	if err := op.f.Chmod(unixFileMode(uint32(mode))); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_umask is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "proc_umask") backing a bridge-provided umask(): it sets the
+// instance's file mode creation mask and returns the previous one. The
+// mask applies to every file and directory the instance creates from then
+// on, and a forked instance starts with its parent's (see Fork).
+func (w *WasiStubs) Proc_umask(m *Module, mask int32) int32 {
+	next := os.FileMode(uint32(mask) & 0o777)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	prev := processUmask
+	if w.umask != nil {
+		prev = *w.umask
+	}
+	w.umask = &next
+	return int32(prev)
+}
+
+// createMode returns the mode a file or directory the guest creates with
+// the requested mode gets: the instance's umask taken out of it.
+func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.umask != nil {
+		return requested &^ *w.umask
+	}
+	return requested &^ processUmask
+}
+
+// Path_open_mode is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "path_open_mode") backing a bridge-provided
+// open(): path_open cannot carry the mode argument of open(2), so every
+// file it creates gets the default 0666. This one takes the same arguments
+// for a preopen-relative path, plus that mode, and writes the new fd at
+// openedFdPtr. Returns 0 or a negative errno.
+func (w *WasiStubs) Path_open_mode(m *Module, dirflags, pathPtr, pathLen, oflags int32, fsRightsBase int64, fdflags, mode, openedFdPtr int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	outSlice := w.memSlice(m, openedFdPtr, 4)
+	if pathSlice == nil || outSlice == nil {
+		return -_wasiEFAULT
+	}
+	fd, errno := w.pathOpenMode(string(pathSlice), dirflags, oflags, fsRightsBase, fdflags, os.FileMode(uint32(mode)&0o777))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	binary.LittleEndian.PutUint32(outSlice, uint32(fd))
+	return _wasiESUCCESS
+}
+
+// Path_create_directory_mode is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "path_create_directory_mode") backing a
+// bridge-provided mkdir(): path_create_directory cannot carry the mode
+// argument of mkdir(2). The path is preopen-relative. Returns 0 or a
+// negative errno.
+func (w *WasiStubs) Path_create_directory_mode(m *Module, pathPtr, pathLen, mode int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	return -w.pathCreateDirectory(string(pathSlice), os.FileMode(uint32(mode)&0o777))
+}
+
+// pathCreateDirectory creates the directory rel with the requested mode,
+// less the instance's umask, and returns a wasi errno.
+func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
+	if !w.checkFS(rel, true) {
+		return _wasiEACCES
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	if err := fsys.Mkdir(rel, w.createMode(mode)); err != nil {
+		return mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Fd_flock is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_flock") backing a bridge-provided flock(). lock is 0 to unlock,
+// 1 for a shared and 2 for an exclusive lock; wait is non-zero when the
+// call may block until the lock is granted, and otherwise a lock held
+// elsewhere makes it fail with EAGAIN. The lock belongs to the open
+// descriptor: every fd that shares it (dup, fork) shares the lock, and the
+// lock goes when the last of them is closed. Returns 0 or a negative errno.
+func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
+	var kind FileLock
+	switch lock {
+	case 0:
+		kind = FileUnlock
+	case 1:
+		kind = FileLockShared
+	case 2:
+		kind = FileLockExclusive
+	default:
+		return -_wasiEINVAL
+	}
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	fsys := w.fsys
+	var stream any
+	if op != nil {
+		switch op.stdio {
+		case 1:
+			stream = w.stdin
+		case 2:
+			stream = w.stdout
+		case 3:
+			stream = w.stderr
+		}
+	}
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	var err error
+	switch {
+	case op.f != nil:
+		err = fsys.Flock(op.f, kind, wait != 0)
+	case op.stdio != 0:
+		// A standard stream is outside the FS backend. One that is a file
+		// of the host process is locked as such; any other (a buffer, a
+		// pipe to the embedder) has no other opener to exclude.
+		if f, ok := stream.(*os.File); ok {
+			err = flockOSFile(f, kind, wait != 0)
+		}
+	default:
+		return -_wasiEINVAL
+	}
+	if err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Path_filestat_ext is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "path_filestat_ext") backing a
+// bridge-provided stat/lstat: WASI's filestat carries neither permission
+// bits nor an owner, so the bridge merges them in from here. The path is
+// preopen-relative; follow selects stat vs lstat semantics. Writes three
+// little-endian u32 at outPtr — the low twelve mode bits, the uid, the gid
+// — and returns 0 or a negative errno.
+func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPtr int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	out := w.memSlice(m, outPtr, 12)
+	if pathSlice == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	var fi os.FileInfo
+	var err error
+	if follow != 0 {
+		fi, err = fsys.Stat(string(pathSlice))
+	} else {
+		fi, err = fsys.Lstat(string(pathSlice))
+	}
+	if err != nil {
+		return -mapOSError(err)
+	}
+	writeFilestatExt(out, fi)
+	return _wasiESUCCESS
+}
+
+// Fd_filestat_ext is Path_filestat_ext for an open file (module
+// wasi_snapshot_preview1, name "fd_filestat_ext"), backing a
+// bridge-provided fstat. An fd that is not a file of the FS backend (a
+// standard stream, a socket) reports EINVAL: there is nothing to add to
+// what fd_filestat_get says about it.
+func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 12)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if op.f == nil {
+		return -_wasiEINVAL
+	}
+	fi, err := op.f.Stat()
+	if err != nil {
+		return -mapOSError(err)
+	}
+	writeFilestatExt(out, fi)
+	return _wasiESUCCESS
+}
+
+// writeFilestatExt writes what Path_filestat_ext and Fd_filestat_ext
+// report about the file fi describes.
+func writeFilestatExt(out []byte, fi os.FileInfo) {
+	st := fileStatOf(fi)
+	binary.LittleEndian.PutUint32(out[0:], unixModeBits(fi.Mode()))
+	binary.LittleEndian.PutUint32(out[4:], st.uid)
+	binary.LittleEndian.PutUint32(out[8:], st.gid)
 }
 
 // Path_filestat_mode is a NON-STANDARD host import (module
@@ -2571,18 +3057,7 @@ func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, mode
 	if err != nil {
 		return -mapOSError(err)
 	}
-	mode := fi.Mode()
-	bits := uint32(mode.Perm())
-	if mode&os.ModeSetuid != 0 {
-		bits |= 0o4000
-	}
-	if mode&os.ModeSetgid != 0 {
-		bits |= 0o2000
-	}
-	if mode&os.ModeSticky != 0 {
-		bits |= 0o1000
-	}
-	binary.LittleEndian.PutUint32(out, bits)
+	binary.LittleEndian.PutUint32(out, unixModeBits(fi.Mode()))
 	return _wasiESUCCESS
 }
 
@@ -2835,10 +3310,25 @@ func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, ofla
 	return _wasiESUCCESS
 }
 
+// wasiDefaultFileMode and wasiDefaultDirMode are the modes path_open and
+// path_create_directory request for what they create, as open(2) and
+// mkdir(2) callers conventionally do: neither import has a mode argument.
+// The instance's umask is taken out of them like out of any other.
+const (
+	wasiDefaultFileMode os.FileMode = 0o666
+	wasiDefaultDirMode  os.FileMode = 0o777
+)
+
 // pathOpen is the layout-independent body of path_open: it resolves and
 // opens rel, registers the fd, and returns it. Callers own reading the
 // path and writing the opened fd at their ABI's pointer width.
 func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32) (int32, int32) {
+	return w.pathOpenMode(rel, dirflags, oflags, fsRightsBase, fdflags, wasiDefaultFileMode)
+}
+
+// pathOpenMode is pathOpen with the mode of open(2): a file the call
+// creates gets mode, less the instance's umask.
+func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
 	w.mu.Lock()
 	fsys := w.fsys
 	w.mu.Unlock()
@@ -2906,7 +3396,7 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 			return -1, _wasiENOENT
 		}
 	}
-	f, err := fsys.OpenFile(rel, flag, 0o644)
+	f, err := fsys.OpenFile(rel, flag, w.createMode(mode))
 	if err != nil {
 		return -1, mapOSError(err)
 	}
@@ -2935,16 +3425,7 @@ func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
-	if !w.checkFS(string(pathSlice), true) {
-		return _wasiEACCES
-	}
-	w.mu.Lock()
-	fsys := w.fsys
-	w.mu.Unlock()
-	if err := fsys.Mkdir(string(pathSlice), 0o755); err != nil {
-		return mapOSError(err)
-	}
-	return _wasiESUCCESS
+	return w.pathCreateDirectory(string(pathSlice), wasiDefaultDirMode)
 }
 
 func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -3058,7 +3539,6 @@ func (w *WasiStubs) Path_filestat_set_times(m *Module, dirFd, flags, pathPtr, pa
 	w.mu.Unlock()
 	rel := string(pathSlice)
 	follow := flags&0x1 != 0
-	now := time.Now()
 	var st os.FileInfo
 	var statErr error
 	if follow {
@@ -3069,34 +3549,11 @@ func (w *WasiStubs) Path_filestat_set_times(m *Module, dirFd, flags, pathPtr, pa
 	if statErr != nil {
 		return mapOSError(statErr)
 	}
-	atime := st.ModTime()
-	mtime := st.ModTime()
-	if fstFlags&0x1 != 0 {
-		atime = time.Unix(0, int64(atim))
-	}
-	if fstFlags&0x2 != 0 {
-		atime = now
-	}
-	if fstFlags&0x4 != 0 {
-		mtime = time.Unix(0, int64(mtim))
-	}
-	if fstFlags&0x8 != 0 {
-		mtime = now
-	}
-	// Times are only applied when the backend supports them (osFS does). A
-	// backend without timestamps (e.g. a minimal in-memory FS) treats this as
-	// a successful no-op rather than failing the guest.
-	if cf, ok := fsys.(chtimesFS); ok {
-		if err := cf.Chtimes(rel, atime, mtime); err != nil {
-			return mapOSError(err)
-		}
+	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, st)
+	if err := fsys.Chtimes(rel, atime, mtime); err != nil {
+		return mapOSError(err)
 	}
 	return _wasiESUCCESS
-}
-
-// chtimesFS is an optional FS capability for backends that track timestamps.
-type chtimesFS interface {
-	Chtimes(name string, atime, mtime time.Time) error
 }
 
 func (o osFS) Chtimes(name string, atime, mtime time.Time) error {
@@ -3699,13 +4156,12 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 }
 
 // writeFilestat populates the 64-byte WASI filestat structure from a
-// host os.FileInfo. The dev/ino fields come from the per-platform
-// wasiPlatformStatSys helper (unix returns Stat_t.Dev/.Ino; Windows
-// returns zeros).
+// backend's os.FileInfo. The device, inode, link count and the access and
+// status-change times are the POSIX metadata fileStatOf finds in it.
 func writeFilestat(out []byte, st os.FileInfo) {
-	// os.FileInfo does not expose dev/ino portably; report zeros.
-	binary.LittleEndian.PutUint64(out[0:], 0)
-	binary.LittleEndian.PutUint64(out[8:], 0)
+	posix := fileStatOf(st)
+	binary.LittleEndian.PutUint64(out[0:], posix.dev)
+	binary.LittleEndian.PutUint64(out[8:], posix.ino)
 	var ftype byte = 4
 	mode := st.Mode()
 	switch {
@@ -3723,12 +4179,11 @@ func writeFilestat(out []byte, st os.FileInfo) {
 		ftype = 2
 	}
 	out[16] = ftype
-	binary.LittleEndian.PutUint64(out[24:], 1) // nlink
+	binary.LittleEndian.PutUint64(out[24:], posix.nlink)
 	binary.LittleEndian.PutUint64(out[32:], uint64(st.Size()))
-	nanos := uint64(st.ModTime().UnixNano())
-	binary.LittleEndian.PutUint64(out[40:], nanos) // atim
-	binary.LittleEndian.PutUint64(out[48:], nanos) // mtim
-	binary.LittleEndian.PutUint64(out[56:], nanos) // ctim
+	binary.LittleEndian.PutUint64(out[40:], uint64(posix.atime.UnixNano()))
+	binary.LittleEndian.PutUint64(out[48:], uint64(st.ModTime().UnixNano()))
+	binary.LittleEndian.PutUint64(out[56:], uint64(posix.ctime.UnixNano()))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3773,7 +4228,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"FS":             true,
 			"File":           true,
 			"osFS":           true,
-			"chtimesFS":      true,
+			"FileLock":       true,
+			"fileStat":       true,
 			"MemFS":          true,
 			"memFile":        true,
 			"memNode":        true,
@@ -3785,6 +4241,12 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"DefaultWASI":             true,
 			"SetPreopenDir":           true,
 			"NewMemFS":                true,
+			"NewOSFS":                 true,
+			"fileStatOf":              true,
+			"unixFileMode":            true,
+			"unixModeBits":            true,
+			"filetimesNeedCurrent":    true,
+			"writeFilestatExt":        true,
 			"memSplit":                true,
 			"memSlice":                true,
 			"mapOSError":              true,
@@ -3917,6 +4379,40 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 	}
 
 	return decls, imports, nil
+}
+
+// The per-platform companions of this file, embedded as they are compiled
+// into this package.
+var (
+	//go:embed wasip1_native_posix.go
+	wasip1NativePosixRaw []byte
+	//go:embed wasip1_native_linux.go
+	wasip1NativeLinuxRaw []byte
+	//go:embed wasip1_native_darwin.go
+	wasip1NativeDarwinRaw []byte
+	//go:embed wasip1_native_other.go
+	wasip1NativeOtherRaw []byte
+)
+
+// emitWasip1Platform returns the per-platform companions of the native wasi
+// implementation — output filename → Go source for package pkg — or nil
+// when the module does not import wasi. They are written out as separate
+// files, next to the one that holds the emitWasip1Native declarations,
+// because their build constraints have to stay attached to them.
+func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
+	if !t.wasmImportsWasi() {
+		return nil
+	}
+	out := map[string][]byte{}
+	for name, raw := range map[string][]byte{
+		"wasip1_native_posix.go":  wasip1NativePosixRaw,
+		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
+		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
+		"wasip1_native_other.go":  wasip1NativeOtherRaw,
+	} {
+		out[name] = bytes.Replace(raw, []byte("\npackage codegen\n"), []byte("\npackage "+pkg+"\n"), 1)
+	}
+	return out
 }
 
 // codegenStripOpts is the allow-list flavour of strip: any top-level
