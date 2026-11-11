@@ -1955,13 +1955,20 @@ func encodeWaitStatus(st *os.ProcessState) int32 {
 	return int32(code&0xff) << 8
 }
 
-// mapExecError maps an exec.Command Start() failure to a wasi errno.
+// mapExecError maps an exec.Command Start() failure to a wasi errno. The
+// guest tells the failures apart as execvp does: a file that is not a program
+// (ENOEXEC) is handed to the shell, a path through something that is not a
+// directory (ENOTDIR) moves a PATH search on.
 func mapExecError(err error) int32 {
 	switch {
 	case errors.Is(err, exec.ErrNotFound), errors.Is(err, fs.ErrNotExist):
 		return _wasiENOENT
 	case errors.Is(err, fs.ErrPermission):
 		return _wasiEACCES
+	case errors.Is(err, syscall.ENOEXEC):
+		return _wasiENOEXEC
+	case errors.Is(err, syscall.ENOTDIR):
+		return _wasiENOTDIR
 	default:
 		return _wasiENOENT
 	}
@@ -2139,6 +2146,7 @@ const (
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
 	_wasiENOENT       int32 = 44
+	_wasiENOEXEC      int32 = 45
 	_wasiENOTDIR      int32 = 54
 	_wasiENOTSOCK     int32 = 57
 	_wasiENOTSUP      int32 = 58

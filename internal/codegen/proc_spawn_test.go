@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -111,6 +113,35 @@ func TestWasi_ProcSpawnNotFound(t *testing.T) {
 	argvOff := writeArgv(m, 2000, 3000, []string{"/no/such/binary-xyz"})
 	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiENOENT {
 		t.Fatalf("missing binary rc=%d, want -ENOENT", rc)
+	}
+}
+
+// A file that is executable but not a program, and a path through a file,
+// are reported as what they are: the guest's execvp acts on the difference.
+func TestWasi_ProcSpawnTellsFailuresApart(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("exec failure codes are checked on darwin and linux")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "no-interpreter-line")
+	if err := os.WriteFile(script, []byte("echo not a program\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	const pidOff int32 = 4000
+	for _, tc := range []struct {
+		path string
+		want int32
+	}{
+		{script, _wasiENOEXEC},
+		{filepath.Join(script, "below-a-file"), _wasiENOTDIR},
+		{filepath.Join(dir, "missing"), _wasiENOENT},
+	} {
+		pathOff := writeCStr(m, 1000, tc.path)
+		argvOff := writeArgv(m, 2000, 3000, []string{tc.path})
+		if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != -tc.want {
+			t.Errorf("Proc_spawn(%s) rc=%d, want %d", tc.path, rc, -tc.want)
+		}
 	}
 }
 
