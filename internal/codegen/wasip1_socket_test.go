@@ -43,7 +43,7 @@ func localName(t *testing.T, w *WasiStubs, m *Module, fd int32) sockName {
 // the port the host picked.
 func newListener(t *testing.T, w *WasiStubs, m *Module) (fd int32, port int32) {
 	t.Helper()
-	fd = w.Sock_socket(m, 0, 0)
+	fd = w.Sock_socket(m, 2, wasiSockTypeStream)
 	if rc := w.Sock_bind(m, fd, loopbackBE, 0); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_bind rc=%d", rc)
 	}
@@ -56,7 +56,7 @@ func newListener(t *testing.T, w *WasiStubs, m *Module) (fd int32, port int32) {
 // dialLoopback is socket + connect to 127.0.0.1:port.
 func dialLoopback(t *testing.T, w *WasiStubs, m *Module, port int32) int32 {
 	t.Helper()
-	fd := w.Sock_socket(m, 0, 0)
+	fd := w.Sock_socket(m, 2, wasiSockTypeStream)
 	if rc := w.Sock_connect(m, fd, loopbackBE, port); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_connect rc=%d", rc)
 	}
@@ -86,7 +86,7 @@ func sockRecv(w *WasiStubs, m *Module, fd int32) (string, int32) {
 
 func TestSocket_ServerAndClientInOneInstance(t *testing.T) {
 	w, m := newProcTestStubs(t)
-	server := w.Sock_socket(m, 0, 0)
+	server := w.Sock_socket(m, 2, wasiSockTypeStream)
 
 	// A new socket has the unspecified address and no peer.
 	if got := localName(t, w, m, server); got != (sockName{family: wasiSockFamilyIPv4}) {
@@ -115,7 +115,7 @@ func TestSocket_ServerAndClientInOneInstance(t *testing.T) {
 	}
 
 	// The port is taken.
-	other := w.Sock_socket(m, 0, 0)
+	other := w.Sock_socket(m, 2, wasiSockTypeStream)
 	if rc := w.Sock_bind(m, other, loopbackBE, int32(bound.port)); rc != -_wasiEADDRINUSE {
 		t.Fatalf("bind of a port in use rc=%d, want -EADDRINUSE", rc)
 	}
@@ -163,7 +163,7 @@ func TestSocket_ServerAndClientInOneInstance(t *testing.T) {
 
 func TestSocket_ListenWithoutBindPicksAPort(t *testing.T) {
 	w, m := newProcTestStubs(t)
-	server := w.Sock_socket(m, 0, 0)
+	server := w.Sock_socket(m, 2, wasiSockTypeStream)
 	if rc := w.Sock_listen(m, server, 1); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_listen rc=%d", rc)
 	}
@@ -184,7 +184,7 @@ func TestSocket_ListeningIsSubjectToTheNetworkPolicy(t *testing.T) {
 		asked = append(asked, op)
 		return op != "listen"
 	})
-	fd := w.Sock_socket(m, 0, 0)
+	fd := w.Sock_socket(m, 2, wasiSockTypeStream)
 	if rc := w.Sock_bind(m, fd, loopbackBE, 0); rc != -_wasiEACCES {
 		t.Fatalf("Sock_bind rc=%d, want -EACCES", rc)
 	}
@@ -215,7 +215,7 @@ func TestSocket_PollReportsAListenerOnlyWithAConnectionWaiting(t *testing.T) {
 	go func() {
 		time.Sleep(30 * time.Millisecond)
 		cw, cm := w, newForkTestModule()
-		fd := cw.Sock_socket(cm, 0, 0)
+		fd := cw.Sock_socket(cm, 2, wasiSockTypeStream)
 		cw.Sock_connect(cm, fd, loopbackBE, port)
 	}()
 	writeSubFd(m, pollSubsOff, 2, 1, server)
@@ -355,7 +355,7 @@ func TestSocket_ForkedInstanceAcceptsOnTheSharedListener(t *testing.T) {
 func TestSocket_BoundSocketConnectsFromItsAddress(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	server, port := newListener(t, w, m)
-	client := w.Sock_socket(m, 0, 0)
+	client := w.Sock_socket(m, 2, wasiSockTypeStream)
 	if rc := w.Sock_bind(m, client, loopbackBE, 0); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_bind rc=%d", rc)
 	}
@@ -377,7 +377,7 @@ func TestSocket_BoundSocketConnectsFromItsAddress(t *testing.T) {
 
 func TestSocket_Options(t *testing.T) {
 	w, m := newProcTestStubs(t)
-	fd := w.Sock_socket(m, 0, 0)
+	fd := w.Sock_socket(m, 2, wasiSockTypeStream)
 	get := func(option int32) (int32, int32) {
 		rc := w.Sock_getopt(m, fd, option, sockValueOff)
 		return int32(binary.LittleEndian.Uint32(m.memory[sockValueOff:])), rc

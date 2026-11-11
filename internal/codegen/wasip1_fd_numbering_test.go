@@ -64,7 +64,7 @@ func TestWasi_NewDescriptorsTakeLowestFreeNumber(t *testing.T) {
 	if got := dupTestFd(t, w, m, 0); got != 7 {
 		t.Fatalf("dup(0) = %d, want 7", got)
 	}
-	if got := w.Sock_socket(m, 0, 0); got != 8 {
+	if got := w.Sock_socket(m, 2, wasiSockTypeStream); got != 8 {
 		t.Fatalf("socket = %d, want 8", got)
 	}
 
@@ -77,7 +77,7 @@ func TestWasi_NewDescriptorsTakeLowestFreeNumber(t *testing.T) {
 	if got := createTestFile(t, w, "b.txt"); got != 7 {
 		t.Fatalf("open after closing 7 = %d, want 7", got)
 	}
-	if got := w.Sock_socket(m, 0, 0); got != 9 {
+	if got := w.Sock_socket(m, 2, wasiSockTypeStream); got != 9 {
 		t.Fatalf("socket with nothing free below = %d, want 9", got)
 	}
 
@@ -378,7 +378,7 @@ func TestWasi_HandBuiltStubsStartWithStandardDescriptors(t *testing.T) {
 	if r, wr := newTestPipe(t, &WasiStubs{}, m); r != 4 || wr != 5 {
 		t.Fatalf("pipe on fresh stubs = %d,%d, want 4,5", r, wr)
 	}
-	if fd := (&WasiStubs{}).Sock_socket(m, 0, 0); fd != 4 {
+	if fd := (&WasiStubs{}).Sock_socket(m, 2, wasiSockTypeStream); fd != 4 {
 		t.Fatalf("socket on fresh stubs = %d, want 4", fd)
 	}
 	if rc := (&WasiStubs{}).Fd_close(m, 1); rc != _wasiESUCCESS {
