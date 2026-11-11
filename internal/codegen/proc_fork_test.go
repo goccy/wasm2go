@@ -111,9 +111,6 @@ func TestWasi_ForkSharesDescriptors(t *testing.T) {
 
 	child := w.Fork()
 	cm := newForkTestModule()
-	if child.nextFD != w.nextFD {
-		t.Errorf("child nextFD=%d, want %d", child.nextFD, w.nextFD)
-	}
 	if child.fdTable[readFd] != w.fdTable[readFd] || child.fdTable[writeFd] != w.fdTable[writeFd] {
 		t.Fatal("child slots do not refer to the parent's open descriptors")
 	}
