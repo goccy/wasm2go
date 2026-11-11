@@ -868,7 +868,7 @@ type wasiOpen struct {
 	refs int32
 	// ahead is input a readiness probe took out of the stream: the only
 	// portable way to learn that a pipe or socket is readable is to read
-	// it (see pollReadable). Reads of this descriptor drain ahead before
+	// it (see pollReady). Reads of this descriptor drain ahead before
 	// they touch the stream. aheadEnd is the end of input a probe ran into
 	// (io.EOF or a read failure), reported once ahead is drained. Both
 	// guarded by mu.
@@ -880,9 +880,10 @@ type wasiOpen struct {
 	// sock is the state of a socket beyond its connection or listener;
 	// see wasiSocket. Guarded by mu; use it through socketLocked.
 	sock *wasiSocket
-	// blocks caches whether a read of f can block (see readBlocks): 0 not
-	// determined yet, 1 it can, 2 it cannot. Finding out takes a system
-	// call, and every read needs to know. Guarded by mu.
+	// blocks caches whether f is a stream, whose reads and writes can block
+	// (see fileIsStream): 0 not determined yet, 1 it is, 2 it is not.
+	// Finding out takes a system call, and every read and write needs to
+	// know. Guarded by mu.
 	blocks int8
 }
 
@@ -961,11 +962,18 @@ func (op *wasiOpen) readBlocks(src io.Reader) (deadlineReader, bool) {
 	if !isFile {
 		return stream, true
 	}
+	return stream, op.fileIsStream(file)
+}
+
+// fileIsStream reports whether file, the host file behind this entry, is a
+// stream — a pipe, a socket, a terminal — whose reads and writes can block,
+// and not a regular file, whose never do.
+func (op *wasiOpen) fileIsStream(file *os.File) bool {
 	const streamModes = os.ModeNamedPipe | os.ModeSocket | os.ModeCharDevice
 	if op.stdio != 0 {
 		// The instance stream can be replaced at any time: not cached.
 		fi, err := file.Stat()
-		return stream, err == nil && fi.Mode()&streamModes != 0
+		return err == nil && fi.Mode()&streamModes != 0
 	}
 	op.mu.Lock()
 	defer op.mu.Unlock()
@@ -975,7 +983,34 @@ func (op *wasiOpen) readBlocks(src io.Reader) (deadlineReader, bool) {
 			op.blocks = 1
 		}
 	}
-	return stream, op.blocks == 1
+	return op.blocks == 1
+}
+
+// streamWriter is a stream the host can write to without waiting in the
+// write itself, and whose wait for room it can bound: a pipe or a socket
+// the runtime polls.
+type streamWriter interface {
+	SetWriteDeadline(t time.Time) error
+	SyscallConn() (syscall.RawConn, error)
+}
+
+// writeBlocks is readBlocks for writing: it reports whether a write to dst,
+// the stream behind this entry, can block waiting for room, in which case
+// dst is a streamWriter. A regular file is not such a stream, and neither is
+// anything on a host where the runtime cannot write without waiting.
+func (op *wasiOpen) writeBlocks(dst io.Writer) (streamWriter, bool) {
+	if !hostStreamWrites {
+		return nil, false
+	}
+	stream, bounded := dst.(streamWriter)
+	if !bounded {
+		return nil, false
+	}
+	file, isFile := dst.(*os.File)
+	if !isFile {
+		return stream, true
+	}
+	return stream, op.fileIsStream(file)
 }
 
 // netConn returns the connection attached to a socket entry, or nil.
@@ -2712,7 +2747,7 @@ func readVec(src io.Reader, bufs [][]byte) uint64 {
 		n, err := src.Read(buf)
 		// A read deadline on a stream is only ever set by a readiness
 		// probe, possibly of another instance sharing the descriptor
-		// (pollReadable); it is not this read's and is cleared as soon as
+		// (pollReady); it is not this read's and is cleared as soon as
 		// that probe ends.
 		for n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
 			runtime.Gosched()
@@ -2727,17 +2762,183 @@ func readVec(src io.Reader, bufs [][]byte) uint64 {
 }
 
 // writeVec drains bufs into dst in order, stopping at the first failed
-// write; returns the bytes written. Shared like readVec.
-func writeVec(dst io.Writer, bufs [][]byte) uint64 {
+// write; returns the bytes written and that failure. Shared like readVec.
+func writeVec(dst io.Writer, bufs [][]byte) (uint64, error) {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := dst.Write(buf)
 		total += uint64(n)
 		if err != nil {
-			break
+			return total, err
 		}
 	}
-	return total
+	return total, nil
+}
+
+// writeFd writes bufs to dst, the destination of the entry op, the way
+// write(2) does: a stream takes what it has room for (see writeStream),
+// anything else takes all of it. A write that transferred nothing reports
+// why (see writeFailure); one that transferred something reports the count,
+// and the failure meets the guest's next write.
+func (w *WasiStubs) writeFd(op *wasiOpen, dst io.Writer, bufs [][]byte) (uint64, int32) {
+	if stream, blocks := op.writeBlocks(dst); blocks {
+		return w.writeStream(op, stream, bufs)
+	}
+	n, err := writeVec(dst, bufs)
+	if n == 0 && err != nil {
+		return 0, w.writeFailure(err)
+	}
+	return n, _wasiESUCCESS
+}
+
+// writeFailure turns a failed write into its errno. Writing to a pipe or
+// socket nobody reads from any more is EPIPE, and POSIX has the kernel send
+// the writer SIGPIPE as well: it is posted to the guest, whose disposition
+// decides — the default ends it, as it ends a process writing into a closed
+// pipe.
+func (w *WasiStubs) writeFailure(err error) int32 {
+	errno := mapNetError(err)
+	if errno == _wasiEPIPE {
+		w.PostSignal(wasiSIGPIPE)
+	}
+	return errno
+}
+
+// writeStream writes bufs to a stream whose write can block, as the guest
+// asked for it. A non-blocking descriptor (O_NONBLOCK) takes what there is
+// room for right now and reports EAGAIN when that is nothing. A blocking one
+// waits until everything is written; a signal posted to the guest meanwhile
+// ends the wait, with EINTR when nothing was written yet and the count
+// otherwise.
+func (w *WasiStubs) writeStream(op *wasiOpen, dst streamWriter, bufs [][]byte) (uint64, int32) {
+	rc, err := dst.SyscallConn()
+	if err != nil {
+		return 0, w.writeFailure(err)
+	}
+	nonblocking := op.nonblocking()
+	if !nonblocking && !w.beginBlocking(func() { _ = dst.SetWriteDeadline(time.Now()) }) {
+		return 0, _wasiEINTR
+	}
+	var total uint64
+	var failure error
+	full, cutShort := false, false
+write:
+	for _, buf := range bufs {
+		for len(buf) > 0 {
+			var n int
+			var again bool
+			var writeErr error
+			waitErr := rc.Write(func(fd uintptr) bool {
+				n, again, writeErr = writeRaw(fd, buf)
+				// A blocking write waits for room and tries again.
+				return nonblocking || !again
+			})
+			if errors.Is(waitErr, os.ErrDeadlineExceeded) {
+				if !nonblocking && w.interruptDue() {
+					cutShort = true
+					break write
+				}
+				// The deadline was a readiness probe's, possibly of another
+				// instance sharing the descriptor (pollReady); it is cleared
+				// as soon as that probe ends.
+				runtime.Gosched()
+				continue
+			}
+			if waitErr != nil {
+				failure = waitErr
+				break write
+			}
+			total += uint64(n)
+			buf = buf[n:]
+			if again {
+				full = true
+				break write
+			}
+			if writeErr != nil {
+				failure = writeErr
+				break write
+			}
+		}
+	}
+	if !nonblocking && w.endBlocking() {
+		// wake has set a deadline, which must not outlive this write.
+		_ = dst.SetWriteDeadline(time.Time{})
+	}
+	switch {
+	case total > 0:
+		return total, _wasiESUCCESS
+	case failure != nil:
+		return 0, w.writeFailure(failure)
+	case cutShort:
+		return 0, _wasiEINTR
+	case full:
+		return 0, _wasiEAGAIN
+	}
+	return 0, _wasiESUCCESS
+}
+
+// The ways poll_oneoff learns whether a descriptor can be written.
+const (
+	pollWriteReady = iota // a write returns at once, with data taken or an error
+	pollWriteNever        // nothing will ever make it writable
+	pollWriteProbe        // the host has to be asked, and waited on
+)
+
+// writeReadiness decides how poll_oneoff treats a subscription for writing
+// to the entry op, whose destination is dst (see fdDstLocked); stdin is the
+// instance's standard input. When the host has to be asked, stream is what
+// to ask about.
+//
+// A socket that listens, or is bound and not connected, never becomes
+// writable. The instance's standard input is writable when it is a host
+// stream open both ways, as a terminal is; a descriptor with nothing to
+// write to is never writable, except an unconnected socket, where a write
+// fails at once. Regular files and destinations the host cannot ask about
+// count as writable, as they always did.
+func (op *wasiOpen) writeReadiness(dst io.Writer, stdin io.Reader) (stream streamWriter, how int) {
+	if op.stdio == 1 {
+		dst, _ = stdin.(io.Writer)
+	}
+	if l, _ := op.netListener(); l != nil && op.netConn() == nil {
+		return nil, pollWriteNever
+	}
+	if dst == nil {
+		if op.isSocket {
+			return nil, pollWriteReady
+		}
+		return nil, pollWriteNever
+	}
+	stream, blocks := op.writeBlocks(dst)
+	if !blocks {
+		return nil, pollWriteReady
+	}
+	return stream, pollWriteProbe
+}
+
+// probeWritable waits — no longer than the write deadline the caller has
+// set — until a write to dst would not block, and reports whether it would
+// not. Nothing is written. A descriptor a write would fail on at once (the
+// reader of the pipe is gone) counts as writable, as it does for poll(2).
+func probeWritable(dst streamWriter) bool {
+	rc, err := dst.SyscallConn()
+	if err != nil {
+		return true // closed under us: the write reports it
+	}
+	// What is true right now does not depend on the deadline: a deadline
+	// that has passed by the time this runs must not hide a stream that
+	// has room.
+	writable := false
+	if err := rc.Control(func(fd uintptr) { writable = fdWritable(fd) }); err != nil || writable {
+		return true
+	}
+	err = rc.Write(func(fd uintptr) bool {
+		writable = fdWritable(fd)
+		return writable
+	})
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	return writable
 }
 
 // fdSrcLocked returns the io.Reader for fd and (when applicable) the
@@ -2911,7 +3112,7 @@ func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
 
 func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) int32 {
 	w.mu.Lock()
-	dst, _ := w.fdDstLocked(fd)
+	dst, op := w.fdDstLocked(fd)
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
 	nwrittenSlice := w.memSlice(m, nwrittenPtr, 4)
@@ -2922,8 +3123,9 @@ func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) in
 		binary.LittleEndian.PutUint32(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	binary.LittleEndian.PutUint32(nwrittenSlice, uint32(writeVec(dst, bufs)))
-	return _wasiESUCCESS
+	n, errno := w.writeFd(op, dst, bufs)
+	binary.LittleEndian.PutUint32(nwrittenSlice, uint32(n))
+	return errno
 }
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
@@ -3958,24 +4160,32 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 	}
 
-	// Decide which fd subscriptions are ready. A descriptor whose read
-	// cannot block — a regular file, anything written to, a listener, a
-	// stream this host cannot probe — is ready at once, as it always was.
-	// A stream whose read CAN block (pipe, socket, terminal) is ready only
-	// when input is actually there: reporting it ready regardless sends a
-	// guest multiplexing two pipes into a blocking read of the idle one
-	// while the busy one fills up and its writer stalls.
+	// Decide which fd subscriptions are ready. A descriptor whose read or
+	// write cannot block — a regular file, a stream this host cannot probe
+	// — is ready at once, as it always was. A stream whose read CAN block
+	// (pipe, socket, terminal) is ready only when input is actually there:
+	// reporting it ready regardless sends a guest multiplexing two pipes
+	// into a blocking read of the idle one while the busy one fills up and
+	// its writer stalls. Likewise a stream is writable only while it has
+	// room, and a listener or the read end of a pipe never is: an event
+	// loop told otherwise spins, or writes into a full pipe and stalls.
+	type probeKey struct {
+		op    *wasiOpen
+		write bool
+	}
 	ready := make([]bool, len(fdEvents))
 	errnos := make([]int32, len(fdEvents))
 	ops := make([]*wasiOpen, len(fdEvents))
 	var probes []pollProbe
-	probeOf := map[*wasiOpen]int{}
+	probeOf := map[probeKey]int{}
 	probeIndex := make([]int, len(fdEvents))
 	anyReady := false
 	for i, ev := range fdEvents {
 		probeIndex[i] = -1
 		w.mu.Lock()
 		src, op := w.fdSrcLocked(ev.fd)
+		dst, _ := w.fdDstLocked(ev.fd)
+		stdin := w.stdin
 		w.mu.Unlock()
 		ops[i] = op
 		if op == nil {
@@ -3983,18 +4193,39 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			ready[i], anyReady = true, true
 			continue
 		}
+		if !ev.isRead {
+			stream, how := op.writeReadiness(dst, stdin)
+			switch how {
+			case pollWriteReady:
+				ready[i], anyReady = true, true
+			case pollWriteProbe:
+				key := probeKey{op: op, write: true}
+				if at, seen := probeOf[key]; seen {
+					probeIndex[i] = at
+					continue
+				}
+				probeOf[key] = len(probes)
+				probeIndex[i] = len(probes)
+				probes = append(probes, pollProbe{
+					op:          op,
+					setDeadline: stream.SetWriteDeadline,
+					probe:       func() bool { return probeWritable(stream) },
+				})
+			}
+			continue
+		}
 		// A listening socket is readable when a connection is waiting.
-		if l, listening := op.netListener(); ev.isRead && listening {
+		if l, listening := op.netListener(); listening {
 			if bounded, canBound := l.(deadlineListener); canBound {
 				if op.acceptedReady() {
 					ready[i], anyReady = true, true
 					continue
 				}
-				if at, seen := probeOf[op]; seen {
+				if at, seen := probeOf[probeKey{op: op}]; seen {
 					probeIndex[i] = at
 					continue
 				}
-				probeOf[op] = len(probes)
+				probeOf[probeKey{op: op}] = len(probes)
 				probeIndex[i] = len(probes)
 				probes = append(probes, pollProbe{
 					op:          op,
@@ -4005,7 +4236,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			}
 		}
 		stream, bounded := src.(deadlineReader)
-		if !ev.isRead || !bounded {
+		if !bounded {
 			ready[i], anyReady = true, true
 			continue
 		}
@@ -4013,11 +4244,11 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			ready[i], anyReady = true, true
 			continue
 		}
-		if at, seen := probeOf[op]; seen {
+		if at, seen := probeOf[probeKey{op: op}]; seen {
 			probeIndex[i] = at
 			continue
 		}
-		probeOf[op] = len(probes)
+		probeOf[probeKey{op: op}] = len(probes)
 		probeIndex[i] = len(probes)
 		probes = append(probes, pollProbe{
 			op:          op,
@@ -4027,9 +4258,12 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 	}
 
 	// The call blocks the guest when nothing is ready yet and there is
-	// something to wait for; a signal posted meanwhile ends the wait.
+	// something to wait for; a signal posted meanwhile ends the wait. With
+	// descriptors that can never become ready and no timeout, a signal is
+	// all there is to wait for, as for poll(2).
+	onlySignal := !anyReady && len(probes) == 0 && minClockNs < 0 && len(fdEvents) > 0
 	var posted chan struct{}
-	if !anyReady && (len(probes) > 0 || minClockNs > 0) {
+	if !anyReady && (len(probes) > 0 || minClockNs > 0 || onlySignal) {
 		posted = make(chan struct{})
 		if !w.beginBlocking(func() { close(posted) }) {
 			return _wasiEINTR
@@ -4050,7 +4284,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			}
 			deadline = time.Now().Add(wait)
 		}
-		pollReadable(probes, deadline, posted)
+		pollReady(probes, deadline, posted)
 		for i := range fdEvents {
 			if at := probeIndex[i]; at >= 0 && probes[at].ready {
 				ready[i], anyReady = true, true
@@ -4064,6 +4298,8 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		case <-posted:
 			timer.Stop()
 		}
+	} else if onlySignal {
+		<-posted
 	}
 	if posted != nil && w.endBlocking() && !anyReady {
 		return _wasiEINTR
@@ -4106,10 +4342,10 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 }
 
 // pollProbe is one descriptor poll_oneoff has to probe for readiness: a
-// stream, for input, or a listening socket, for a connection. probe waits
-// for it — no longer than the deadline setDeadline has set — and reports
-// whether the descriptor is ready; what it took off the descriptor to find
-// out stays with the descriptor's entry.
+// stream, for input or for room to write, or a listening socket, for a
+// connection. probe waits for it — no longer than the deadline setDeadline
+// has set — and reports whether the descriptor is ready; what it took off
+// the descriptor to find out stays with the descriptor's entry.
 type pollProbe struct {
 	op          *wasiOpen
 	setDeadline func(t time.Time) error
@@ -4117,16 +4353,17 @@ type pollProbe struct {
 	ready       bool
 }
 
-// pollReadable waits until one of the streams has input (or reached its
-// end), or until deadline — the zero time means no limit — and records
-// which are readable. The readiness test is a read: whatever arrives is
-// kept on the descriptor and handed to the guest's next read of it.
+// pollReady waits until one of the probed descriptors is ready, or until
+// deadline — the zero time means no limit — and records which are. For
+// input the readiness test is a read: whatever arrives is kept on the
+// descriptor and handed to the guest's next read of it. For output the host
+// is asked, and nothing is written.
 //
-// A stream that refuses a read deadline is one whose read does not block
-// (a regular file behind an *os.File), and counts as readable.
+// A stream that refuses a deadline is one whose read or write does not
+// block (a regular file behind an *os.File), and counts as ready.
 //
 // cancel, when non-nil, ends the wait early once it is closed.
-func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
+func pollReady(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
 	var armed []*pollProbe
 	for i := range probes {
 		pr := &probes[i]
@@ -4448,33 +4685,19 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 		conn = op.netConn()
 	}
 	if conn == nil {
+		if op != nil && op.isSocket {
+			return _wasiENOTCONN
+		}
 		return _wasiENOTSOCK
 	}
-	iovBytes := uint64(uint32(siDataLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, siData, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, siData, siDataLen)
 	lenOut := w.memSlice(m, soDataLenPtr, 4)
-	if iovecs == nil || lenOut == nil {
+	if !ok || lenOut == nil {
 		return _wasiEFAULT
 	}
-	var total uint32
-	for i := int32(0); i < siDataLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := conn.Write(buf)
-		total += uint32(n)
-		if err != nil {
-			break
-		}
-	}
-	binary.LittleEndian.PutUint32(lenOut, total)
-	return _wasiESUCCESS
+	n, errno := w.writeFd(op, conn, bufs)
+	binary.LittleEndian.PutUint32(lenOut, uint32(n))
+	return errno
 }
 
 func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
@@ -5436,7 +5659,7 @@ read:
 				break read
 			}
 			// The deadline was a readiness probe's, possibly of another
-			// instance sharing the descriptor (pollReadable); it is cleared
+			// instance sharing the descriptor (pollReady); it is cleared
 			// as soon as that probe ends.
 			runtime.Gosched()
 			n, err = src.Read(buf)
@@ -5975,6 +6198,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"wasiProc":         true,
 			"wasiPIDs":         true,
 			"deadlineReader":   true,
+			"streamWriter":     true,
 			"pollProbe":        true,
 			"WasiStubs":        true,
 			"dotDirEntry":      true,
@@ -6014,7 +6238,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"mapNetError":             true,
 			"socketIPv4":              true,
 			"userRecord":              true,
-			"pollReadable":            true,
+			"pollReady":               true,
+			"probeWritable":           true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
@@ -6421,7 +6646,7 @@ func (w *WasiStubs) iovecSlices64(m *Module, iovs, iovsLen int64) ([][]byte, boo
 
 func (w *WasiStubs) Fd_write64(m *Module, fd int64, iovs int64, iovsLen int64, nwrittenPtr int64) int32 {
 	w.mu.Lock()
-	dst, _ := w.fdDstLocked(int32(fd))
+	dst, op := w.fdDstLocked(int32(fd))
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
 	// nwritten is a 64-bit __wasi_size_t.
@@ -6433,8 +6658,9 @@ func (w *WasiStubs) Fd_write64(m *Module, fd int64, iovs int64, iovsLen int64, n
 		binary.LittleEndian.PutUint64(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	binary.LittleEndian.PutUint64(nwrittenSlice, writeVec(dst, bufs))
-	return _wasiESUCCESS
+	n, errno := w.writeFd(op, dst, bufs)
+	binary.LittleEndian.PutUint64(nwrittenSlice, n)
+	return errno
 }
 
 func (w *WasiStubs) Proc_exit64(m *Module, code int64) {

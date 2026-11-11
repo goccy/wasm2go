@@ -45,6 +45,21 @@ func signalHostProcess(pid int, sig syscall.Signal) error {
 	return errors.ErrUnsupported
 }
 
+// hostStreamWrites says whether the host can write to a stream without
+// waiting in the write. The runtime does not know how on this platform, so
+// writes go through the stream's own Write and wait there.
+const hostStreamWrites = false
+
+// writeRaw writes to a descriptor without waiting, which the runtime cannot
+// do on this platform.
+func writeRaw(fd uintptr, p []byte) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+// fdWritable reports whether a write to the descriptor would return at
+// once. The runtime cannot ask on this platform; the write tells.
+func fdWritable(fd uintptr) bool { return true }
+
 // socketPair creates a pair of connected stream sockets, which the runtime
 // cannot do on this platform.
 func socketPair() (a, b net.Conn, err error) {

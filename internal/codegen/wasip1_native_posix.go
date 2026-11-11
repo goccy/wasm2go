@@ -132,6 +132,29 @@ func signalHostProcess(pid int, sig syscall.Signal) error {
 	return syscall.Kill(pid, sig)
 }
 
+// hostStreamWrites says that the host can write to a stream without waiting
+// in the write, and ask whether one has room: see writeRaw and fdWritable.
+const hostStreamWrites = true
+
+// writeRaw writes p to a descriptor the runtime polls (and so keeps in
+// non-blocking mode) once. again reports that the descriptor takes nothing
+// right now; otherwise n bytes were taken, or err says why not.
+func writeRaw(fd uintptr, p []byte) (n int, again bool, err error) {
+	for {
+		n, err = syscall.Write(int(fd), p)
+		if err == syscall.EINTR {
+			continue
+		}
+		if n < 0 {
+			n = 0
+		}
+		if err == syscall.EAGAIN {
+			return 0, true, nil
+		}
+		return n, false, err
+	}
+}
+
 // socketPair creates a pair of connected Unix-domain stream sockets.
 func socketPair() (a, b net.Conn, err error) {
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
