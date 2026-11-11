@@ -54,6 +54,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -74,6 +75,11 @@ import (
 type Module struct {
 	memory []byte
 }
+
+// accessMemory is the in-package stand-in for the runtime helper of the same
+// name, which runs f over the module's memory under the lock memory.grow
+// takes. The generated output has the real one; this one is not emitted.
+func accessMemory(m *Module, f func(mem []byte)) { f(m.memory) }
 
 // WasiExitError is the sentinel that the recover layer of SafeInvokeExport
 // promotes Proc_exit() panics into, so a wasm-level exit doesn't kill the
@@ -871,6 +877,10 @@ type wasiOpen struct {
 	// probing serializes readiness probes of this stream, so two probes
 	// cannot append the chunks they read to ahead out of order.
 	probing sync.Mutex
+	// blocks caches whether a read of f can block (see readBlocks): 0 not
+	// determined yet, 1 it can, 2 it cannot. Finding out takes a system
+	// call, and every read needs to know. Guarded by mu.
+	blocks int8
 }
 
 // deadlineReader is a stream whose blocking read can be bounded: a pipe, a
@@ -932,6 +942,37 @@ func (op *wasiOpen) probeRead(src deadlineReader) bool {
 		op.aheadEnd = err
 	}
 	return len(op.ahead) > 0 || op.aheadEnd != nil
+}
+
+// readBlocks reports whether a read of src, the stream behind this entry,
+// can block waiting for input — a pipe, a socket, a terminal — in which
+// case it is a deadlineReader whose deadline bounds the wait. A regular
+// file is not such a stream although *os.File has the method: its reads
+// return at once, and must never be reported as interrupted.
+func (op *wasiOpen) readBlocks(src io.Reader) (deadlineReader, bool) {
+	stream, bounded := src.(deadlineReader)
+	if !bounded {
+		return nil, false
+	}
+	file, isFile := src.(*os.File)
+	if !isFile {
+		return stream, true
+	}
+	const streamModes = os.ModeNamedPipe | os.ModeSocket | os.ModeCharDevice
+	if op.stdio != 0 {
+		// The instance stream can be replaced at any time: not cached.
+		fi, err := file.Stat()
+		return stream, err == nil && fi.Mode()&streamModes != 0
+	}
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.blocks == 0 {
+		op.blocks = 2
+		if fi, err := file.Stat(); err == nil && fi.Mode()&streamModes != 0 {
+			op.blocks = 1
+		}
+	}
+	return stream, op.blocks == 1
 }
 
 // netConn returns the connection attached to a socket entry, or nil.
@@ -1039,6 +1080,12 @@ type WasiStubs struct {
 	// hostProcess records that the guest program is the host process (see
 	// SetHostProcess). Guarded by mu.
 	hostProcess bool
+	// forked marks host state made by Fork: the instance it backs is a
+	// process of its own, never the host process, whatever hostProcess
+	// says about the identity it inherited. Immutable.
+	forked bool
+	// sig is the signal state; see wasiSignals. Guarded by mu.
+	sig wasiSignals
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
@@ -1231,7 +1278,10 @@ func (w *WasiStubs) SetForkHook(hook func(parent *Module, child *WasiStubs, pid 
 //     closed;
 //   - the process table is empty: a child does not inherit its parent's
 //     children. Pid tokens stay unique across w, the result and everything
-//     later forked from either.
+//     later forked from either;
+//   - no signal is pending and no alarm is set, and the guest has not
+//     registered for signals: the copy of the guest that runs on the result
+//     registers and reports its dispositions (the ones it inherited) itself.
 //
 // The result is independent of w from then on (its own lock, its own fd
 // numbering) and is meant to back a second module instance running on
@@ -1259,6 +1309,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		execHook:    w.execHook,
 		forkHook:    w.forkHook,
 		hostProcess: w.hostProcess,
+		forked:      true,
 	}
 	if w.umask != nil {
 		mask := *w.umask
@@ -1281,10 +1332,14 @@ func (w *WasiStubs) Fork() *WasiStubs {
 // fd_close on each: a descriptor shared with another slot or another instance
 // (dup, Fork) stays open until its last reference goes. It lets an embedder
 // dispose of the host state of a finished instance, typically a forked child.
+// It also ends signal delivery to the instance — the alarm is cancelled, and
+// PostSignal drops what it is given from here on — so the guest's memory
+// can be released afterwards.
 // Calling it again is a no-op. The close errors are joined.
 func (w *WasiStubs) CloseAll() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.detachSignalsLocked()
 	var err error
 	for fd, op := range w.fdsLocked() {
 		err = errors.Join(err, closeWasiOpen(op))
@@ -1386,6 +1441,8 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 		w.procFinished = nil
 	}
 	w.mu.Unlock()
+	// The parent is told, as the kernel tells a process whose child ended.
+	w.PostSignal(wasiSIGCHLD)
 }
 
 // NewProc registers a process that the embedder runs itself (not a host
@@ -1609,7 +1666,8 @@ func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 // (WNOHANG) makes it return without blocking when the child is still running
 // (the guest sees the documented "0 means no child ready" result, signalled
 // by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a negative
-// errno (ECHILD for an unknown pid).
+// errno: ECHILD for an unknown pid, EINTR when a signal was posted to the
+// guest before the process finished.
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
 	out := w.memSlice(m, statusOutPtr, 4)
 	if out == nil {
@@ -1629,8 +1687,8 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 			// Child still running; non-blocking caller gets EAGAIN.
 			return -_wasiEAGAIN
 		}
-	} else {
-		<-proc.done
+	} else if !w.awaitInterruptibly(proc.done) {
+		return -_wasiEINTR
 	}
 	w.mu.Lock()
 	delete(w.procs, pid)
@@ -1647,7 +1705,8 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 // several have finished, the one with the lowest pid is reported. options is
 // the waitpid() options mask; with bit 0 (WNOHANG) the call does not block.
 // Returns 0, or a negative errno: ECHILD when the instance has no process at
-// all, EAGAIN when WNOHANG is set and none of them has finished yet.
+// all, EAGAIN when WNOHANG is set and none of them has finished yet, EINTR
+// when a signal was posted to the guest before one finished.
 func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr int32) int32 {
 	pidOut := w.memSlice(m, pidOutPtr, 4)
 	statusOut := w.memSlice(m, statusOutPtr, 4)
@@ -1692,7 +1751,36 @@ func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr in
 		}
 		finished := w.procFinished
 		w.mu.Unlock()
-		<-finished
+		if !w.awaitInterruptibly(finished) {
+			return -_wasiEINTR
+		}
+	}
+}
+
+// awaitInterruptibly blocks the guest until done is closed. It reports false
+// when a signal posted to the guest ended the wait first; the caller then
+// returns EINTR. An event that has already happened is never reported as
+// interrupted.
+func (w *WasiStubs) awaitInterruptibly(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	posted := make(chan struct{})
+	if !w.beginBlocking(func() { close(posted) }) {
+		return false
+	}
+	select {
+	case <-done:
+	case <-posted:
+	}
+	w.endBlocking()
+	select {
+	case <-done:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2046,6 +2134,7 @@ const (
 	_wasiEBUSY        int32 = 10
 	_wasiEEXIST       int32 = 20
 	_wasiEFAULT       int32 = 21
+	_wasiEINTR        int32 = 27
 	_wasiEINVAL       int32 = 28
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
@@ -2544,7 +2633,14 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 		n, served = op.takeAhead(bufs)
 	}
 	if !served {
-		n = readVec(src, bufs)
+		if stream, blocks := op.readBlocks(src); blocks {
+			var interrupted bool
+			if n, interrupted = w.readInterruptibly(stream, bufs); interrupted {
+				return _wasiEINTR
+			}
+		} else {
+			n = readVec(src, bufs)
+		}
 	}
 	binary.LittleEndian.PutUint32(nreadSlice, uint32(n))
 	return _wasiESUCCESS
@@ -2974,7 +3070,8 @@ func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
 // call may block until the lock is granted, and otherwise a lock held
 // elsewhere makes it fail with EAGAIN. The lock belongs to the open
 // descriptor: every fd that shares it (dup, fork) shares the lock, and the
-// lock goes when the last of them is closed. Returns 0 or a negative errno.
+// lock goes when the last of them is closed. Returns 0 or a negative errno;
+// a waiting call ends with EINTR when a signal is posted to the guest.
 func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 	var kind FileLock
 	switch lock {
@@ -3005,25 +3102,59 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 	if op == nil {
 		return -_wasiEBADF
 	}
-	var err error
+	var try func() error
 	switch {
 	case op.f != nil:
-		err = fsys.Flock(op.f, kind, wait != 0)
+		try = func() error { return fsys.Flock(op.f, kind, false) }
 	case op.stdio != 0:
 		// A standard stream is outside the FS backend. One that is a file
 		// of the host process is locked as such; any other (a buffer, a
 		// pipe to the embedder) has no other opener to exclude.
-		if f, ok := stream.(*os.File); ok {
-			err = flockOSFile(f, kind, wait != 0)
+		f, ok := stream.(*os.File)
+		if !ok {
+			return _wasiESUCCESS
 		}
+		try = func() error { return flockOSFile(f, kind, false) }
 	default:
 		return -_wasiEINVAL
 	}
-	if err != nil {
-		return -mapOSError(err)
+	// A lock held elsewhere is waited for by trying again, at growing
+	// intervals: a blocked lock request cannot be withdrawn, and the wait
+	// has to end when a signal is posted to the guest.
+	retry := flockRetryMin
+	for {
+		err := try()
+		if err == nil {
+			return _wasiESUCCESS
+		}
+		if wait == 0 || kind == FileUnlock || !errors.Is(err, syscall.EAGAIN) {
+			return -mapOSError(err)
+		}
+		posted := make(chan struct{})
+		if !w.beginBlocking(func() { close(posted) }) {
+			return -_wasiEINTR
+		}
+		timer := time.NewTimer(retry)
+		select {
+		case <-timer.C:
+		case <-posted:
+			timer.Stop()
+		}
+		if w.endBlocking() {
+			return -_wasiEINTR
+		}
+		if retry *= 2; retry > flockRetryMax {
+			retry = flockRetryMax
+		}
 	}
-	return _wasiESUCCESS
 }
+
+// The interval at which a waiting Fd_flock tries again: it starts at the
+// minimum and doubles up to the maximum.
+const (
+	flockRetryMin = 500 * time.Microsecond
+	flockRetryMax = 20 * time.Millisecond
+)
 
 // Path_filestat_ext is a NON-STANDARD host import (module
 // wasi_snapshot_preview1, name "path_filestat_ext") backing a
@@ -3813,6 +3944,15 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		probes = append(probes, pollProbe{op: op, src: stream})
 	}
 
+	// The call blocks the guest when nothing is ready yet and there is
+	// something to wait for; a signal posted meanwhile ends the wait.
+	var posted chan struct{}
+	if !anyReady && (len(probes) > 0 || minClockNs > 0) {
+		posted = make(chan struct{})
+		if !w.beginBlocking(func() { close(posted) }) {
+			return _wasiEINTR
+		}
+	}
 	if len(probes) > 0 {
 		// How long the probes may wait: not at all when something is
 		// ready already, until the timeout when there is one, otherwise
@@ -3828,7 +3968,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			}
 			deadline = time.Now().Add(wait)
 		}
-		pollReadable(probes, deadline)
+		pollReadable(probes, deadline, posted)
 		for i := range fdEvents {
 			if at := probeIndex[i]; at >= 0 && probes[at].ready {
 				ready[i], anyReady = true, true
@@ -3836,7 +3976,15 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 	} else if minClockNs > 0 && !anyReady {
 		// The clock paces the call only when nothing else can end it.
-		time.Sleep(time.Duration(minClockNs))
+		timer := time.NewTimer(time.Duration(minClockNs))
+		select {
+		case <-timer.C:
+		case <-posted:
+			timer.Stop()
+		}
+	}
+	if posted != nil && w.endBlocking() && !anyReady {
+		return _wasiEINTR
 	}
 
 	written := int32(0)
@@ -3889,7 +4037,9 @@ type pollProbe struct {
 //
 // A stream that refuses a read deadline is one whose read does not block
 // (a regular file behind an *os.File), and counts as readable.
-func pollReadable(probes []pollProbe, deadline time.Time) {
+//
+// cancel, when non-nil, ends the wait early once it is closed.
+func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
 	var armed []*pollProbe
 	for i := range probes {
 		pr := &probes[i]
@@ -3916,7 +4066,7 @@ func pollReadable(probes []pollProbe, deadline time.Time) {
 			_ = pr.src.SetReadDeadline(grace)
 		}
 	}
-	if len(armed) == 1 {
+	if len(armed) == 1 && cancel == nil {
 		armed[0].ready = armed[0].op.probeRead(armed[0].src)
 		return
 	}
@@ -3936,15 +4086,21 @@ func pollReadable(probes []pollProbe, deadline time.Time) {
 		wg.Wait()
 		close(done)
 	}()
-	select {
-	case <-hit:
-		// One is readable: stop waiting on the rest. Their reads end at
-		// once, keeping whatever they had already received.
+	stop := func() {
+		// The reads end at once, keeping whatever they had already
+		// received.
 		now := time.Now()
 		for _, pr := range armed {
 			_ = pr.src.SetReadDeadline(now)
 		}
 		<-done
+	}
+	select {
+	case <-hit:
+		// One is readable: stop waiting on the rest.
+		stop()
+	case <-cancel:
+		stop()
 	case <-done:
 	}
 }
@@ -4112,7 +4268,7 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	if iovecs == nil || lenOut == nil || flagsOut == nil {
 		return _wasiEFAULT
 	}
-	var total uint32
+	bufs := make([][]byte, 0, riDataLen)
 	for i := int32(0); i < riDataLen; i++ {
 		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
 		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
@@ -4120,21 +4276,18 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		if buf == nil {
 			return _wasiEFAULT
 		}
-		if got, served := op.takeAhead([][]byte{buf}); served {
-			total += uint32(got)
-			break
-		}
-		n, err := conn.Read(buf)
-		for n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
-			// another instance's readiness probe; see readVec
-			runtime.Gosched()
-			n, err = conn.Read(buf)
-		}
-		total += uint32(n)
-		if err != nil {
-			break
+		bufs = append(bufs, buf)
+	}
+	// What a readiness probe already took comes first; a receive returns
+	// as soon as it has anything.
+	got, served := op.takeAhead(bufs)
+	if !served {
+		var interrupted bool
+		if got, interrupted = w.readInterruptibly(conn, bufs); interrupted {
+			return _wasiEINTR
 		}
 	}
+	total := uint32(got)
 	binary.LittleEndian.PutUint16(flagsOut, 0)
 	binary.LittleEndian.PutUint32(lenOut, total)
 	return _wasiESUCCESS
@@ -4311,6 +4464,7 @@ func (w *WasiStubs) SetHostProcess(on bool) {
 	w.mu.Lock()
 	w.hostProcess = on
 	w.mu.Unlock()
+	w.syncHostSignals()
 }
 
 // hostIdentity reports whether the guest sees the host's identity.
@@ -4519,6 +4673,435 @@ func (w *WasiStubs) Proc_group_by_name(m *Module, namePtr, nameLen, bufPtr, bufL
 	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
 }
 
+// ----- signals ----------------------------------------------------------------
+//
+// A guest cannot be interrupted: it is ordinary code on a goroutine. A
+// signal is therefore delivered the way an interpreter with deferred signal
+// handling takes one from its own C-level handler: the host records the
+// signal and raises a flag word in the guest's memory, the guest notices the
+// flag at its next safe point and takes the recorded signals
+// (Proc_signal_take), and a blocking host call the guest is waiting in ends
+// early with EINTR so that the safe point comes.
+//
+// What a signal does — run a handler, be ignored, end the process — is the
+// guest's business: it owns the dispositions and tells the host about them
+// (Proc_signal_dispositions) only so that the host can drop a signal nobody
+// would notice instead of interrupting a blocking call for it.
+//
+// Signal sets cross the boundary as 64-bit masks in which signal n is bit
+// n-1.
+
+// WasiSignalError is the panic value of a guest that ended by a signal
+// (Proc_terminate), the counterpart of WasiExitError: the recover layer of
+// SafeInvokeExport hands it to the caller as an error, which then knows the
+// instance is gone and which signal ended it. Signal is the guest's number
+// for the signal (Linux numbering).
+type WasiSignalError struct{ Signal int32 }
+
+func (e *WasiSignalError) Error() string {
+	return "wasi: terminated by signal " + itoa32(e.Signal)
+}
+
+// wasiSignals is the signal state of one instance. All of it is guarded by
+// the owning WasiStubs.mu.
+type wasiSignals struct {
+	// flagModule and flagAddr locate the guest's flag word, once the guest
+	// has registered it (Proc_signal_register). Until then there is no one
+	// to deliver a signal to, and PostSignal drops what it is given.
+	flagModule *Module
+	flagAddr   uint32
+	// handled, ignored and blocked are the dispositions the guest reported:
+	// the signals it has a handler for, the ones that have no effect on it
+	// (ignored explicitly or by their default action), and its signal mask.
+	handled, ignored, blocked uint64
+	// pending holds the posted signals the guest has not taken yet.
+	pending uint64
+	// interrupt records that a signal was posted and no blocking call has
+	// reported it yet: the next one (or the one in progress) ends with
+	// EINTR, once — as a system call does for one delivered signal.
+	interrupt bool
+	// wake ends the blocking call in progress early. Set by beginBlocking,
+	// called (once) by PostSignal.
+	wake func()
+	// alarm is the running alarm timer and alarmAt the time it fires.
+	alarm   *time.Timer
+	alarmAt time.Time
+	// relay receives the host process's signals that the guest handles,
+	// relayed is the set it is subscribed to, and hostIgnored the set the
+	// host process ignores on the guest's behalf. See syncHostSignalsLocked.
+	relay       chan os.Signal
+	relayed     uint64
+	hostIgnored uint64
+}
+
+// wasiSignalBit returns the mask bit of a signal number, or 0 for a number
+// that is not a signal's.
+func wasiSignalBit(sig int32) uint64 {
+	if sig < 1 || sig > 64 {
+		return 0
+	}
+	return uint64(1) << uint(sig-1)
+}
+
+// The signals whose default action is to do nothing to the process (the
+// stop signals among them: stopping has no meaning for a guest).
+const wasiDefaultIgnoredSignals = uint64(1)<<(17-1) | // SIGCHLD
+	uint64(1)<<(18-1) | // SIGCONT
+	uint64(1)<<(19-1) | // SIGSTOP
+	uint64(1)<<(20-1) | // SIGTSTP
+	uint64(1)<<(21-1) | // SIGTTIN
+	uint64(1)<<(22-1) | // SIGTTOU
+	uint64(1)<<(23-1) | // SIGURG
+	uint64(1)<<(28-1) // SIGWINCH
+
+// The signals whose default action is to end the process, but which do
+// nothing to a Go program that has not asked for them: the Go runtime catches
+// them and carries on. (SIGHUP, SIGINT and SIGTERM end a Go program as they
+// end any process; the signals of a fault, SIGPROF and SIGPIPE have a meaning
+// of their own to the runtime and are left to it unless the guest handles
+// them.)
+const wasiSignalsHeldByRuntime = uint64(1)<<(3-1) | // SIGQUIT
+	uint64(1)<<(10-1) | // SIGUSR1
+	uint64(1)<<(12-1) | // SIGUSR2
+	uint64(1)<<(14-1) | // SIGALRM
+	uint64(1)<<(24-1) | // SIGXCPU
+	uint64(1)<<(25-1) | // SIGXFSZ
+	uint64(1)<<(26-1) | // SIGVTALRM
+	uint64(1)<<(29-1) // SIGIO
+
+// PostSignal delivers a signal to the guest, as kill(2) does to a process.
+// sig is the guest's number for it (Linux numbering). It may be called from
+// any goroutine, at any time.
+//
+// The signal is dropped when the guest has not registered for signals or
+// ignores this one (explicitly or because that is the signal's default
+// action). Otherwise it is recorded for the guest to take. Unless the guest
+// has the signal blocked, its flag word is raised, and the blocking call it
+// is waiting in — or the next one it makes before taking the signal — ends
+// with EINTR.
+func (w *WasiStubs) PostSignal(sig int32) {
+	bit := wasiSignalBit(sig)
+	if bit == 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	s := &w.sig
+	if s.flagModule == nil || s.ignored&bit != 0 {
+		return
+	}
+	s.pending |= bit
+	if s.blocked&bit != 0 {
+		return
+	}
+	w.raiseSignalFlagLocked()
+	s.interrupt = true
+	if wake := s.wake; wake != nil {
+		s.wake = nil
+		wake()
+	}
+}
+
+// raiseSignalFlagLocked stores 1 in the guest's flag word. The guest runs on
+// another goroutine and may be growing its memory, hence accessMemory.
+// Caller holds w.mu.
+func (w *WasiStubs) raiseSignalFlagLocked() {
+	addr := uint64(w.sig.flagAddr)
+	accessMemory(w.sig.flagModule, func(mem []byte) {
+		if addr+4 <= uint64(len(mem)) {
+			binary.LittleEndian.PutUint32(mem[addr:], 1)
+		}
+	})
+}
+
+// beginBlocking is called by a host call that is about to block the guest.
+// It reports false when the call must not block at all because a posted
+// signal is waiting to be noticed: the call then returns EINTR. Otherwise
+// wake is registered: PostSignal calls it, once, from another goroutine and
+// with w.mu held, to end the wait. Every beginBlocking that returned true is
+// followed by endBlocking.
+func (w *WasiStubs) beginBlocking(wake func()) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.sig.interrupt {
+		w.sig.interrupt = false
+		return false
+	}
+	w.sig.wake = wake
+	return true
+}
+
+// endBlocking ends what beginBlocking started and reports whether a signal
+// was posted in between, in which case wake has run.
+func (w *WasiStubs) endBlocking() (interrupted bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sig.wake = nil
+	interrupted = w.sig.interrupt
+	w.sig.interrupt = false
+	return interrupted
+}
+
+// interruptDue reports whether a signal was posted since the blocking call
+// in progress began.
+func (w *WasiStubs) interruptDue() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sig.interrupt
+}
+
+// Proc_signal_register is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "proc_signal_register"). The guest names the
+// 32-bit word in its memory that the host sets to 1 whenever a signal is
+// waiting to be taken. A guest calls it whenever it may be running in a
+// module instance the host has not seen yet (a snapshot or fork copy of the
+// one that registered), so it is cheap: it returns 1 when this module and
+// address are already registered, and 0 when the registration is new — the
+// guest then reports its dispositions, which the host does not know either.
+func (w *WasiStubs) Proc_signal_register(m *Module, flagPtr int32) int32 {
+	if w.memSlice(m, flagPtr, 4) == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	s := &w.sig
+	if s.flagModule == m && s.flagAddr == uint32(flagPtr) {
+		return 1
+	}
+	s.flagModule, s.flagAddr = m, uint32(flagPtr)
+	return 0
+}
+
+// Proc_signal_dispositions is a NON-STANDARD host import (name
+// "proc_signal_dispositions"). The guest reports, as signal masks, the
+// signals it has a handler for, the signals that have no effect on it
+// (ignored explicitly or by default action) and the signals it has blocked,
+// every time one of the three changes. A pending signal that is now ignored
+// is discarded, as sigaction(2) does. Returns 0.
+func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocked int64) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	s := &w.sig
+	s.handled, s.ignored, s.blocked = uint64(handled), uint64(ignored), uint64(blocked)
+	s.pending &^= s.ignored
+	if s.flagModule != nil && s.pending&^s.blocked != 0 {
+		// Unblocked while pending: it is deliverable now.
+		w.raiseSignalFlagLocked()
+	}
+	w.syncHostSignalsLocked()
+	return _wasiESUCCESS
+}
+
+// Proc_signal_take is a NON-STANDARD host import (name "proc_signal_take").
+// It writes the mask of posted signals (u64) at maskPtr and forgets them:
+// from here on they are the guest's to deliver, or to hold while blocked.
+// Returns 0 or a negative errno.
+func (w *WasiStubs) Proc_signal_take(m *Module, maskPtr int32) int32 {
+	out := w.memSlice(m, maskPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	taken := w.sig.pending
+	w.sig.pending = 0
+	// The guest is at a safe point and has the signals: there is nothing
+	// left to interrupt a blocking call for.
+	w.sig.interrupt = false
+	w.mu.Unlock()
+	binary.LittleEndian.PutUint64(out, taken)
+	return _wasiESUCCESS
+}
+
+// Proc_alarm is a NON-STANDARD host import (name "proc_alarm") backing
+// alarm(): SIGALRM is posted to the guest once, seconds from now; 0 only
+// cancels. An earlier alarm is cancelled, and the whole seconds it had left
+// (rounded up) are written at remainingPtr. Returns 0 or a negative errno.
+func (w *WasiStubs) Proc_alarm(m *Module, seconds, remainingPtr int32) int32 {
+	out := w.memSlice(m, remainingPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	binary.LittleEndian.PutUint32(out, w.stopAlarmLocked())
+	if seconds != 0 {
+		wait := time.Duration(uint32(seconds)) * time.Second
+		var timer *time.Timer
+		timer = time.AfterFunc(wait, func() {
+			w.mu.Lock()
+			due := w.sig.alarm == timer
+			if due {
+				w.sig.alarm = nil
+			}
+			w.mu.Unlock()
+			if due {
+				w.PostSignal(wasiSIGALRM)
+			}
+		})
+		w.sig.alarm, w.sig.alarmAt = timer, time.Now().Add(wait)
+	}
+	w.mu.Unlock()
+	return _wasiESUCCESS
+}
+
+// stopAlarmLocked cancels the alarm, if one is set, and returns the whole
+// seconds it had left, rounded up. Caller holds w.mu.
+func (w *WasiStubs) stopAlarmLocked() (remaining uint32) {
+	s := &w.sig
+	if s.alarm == nil {
+		return 0
+	}
+	s.alarm.Stop()
+	s.alarm = nil
+	left := time.Until(s.alarmAt)
+	if left <= 0 {
+		// It was about to fire; alarm(2) never reports 0 for a set alarm.
+		return 1
+	}
+	return uint32((left + time.Second - 1) / time.Second)
+}
+
+// Proc_terminate is a NON-STANDARD host import (name "proc_terminate"): the
+// guest ends by signal sig, the default action of a signal it neither
+// handles nor ignores. It does not return; like Proc_exit it unwinds the
+// guest with a panic, whose value is a *WasiSignalError.
+func (w *WasiStubs) Proc_terminate(m *Module, sig int32) {
+	panic(&WasiSignalError{Signal: sig})
+}
+
+// detachSignalsLocked ends signal delivery to this instance: nothing may
+// touch the guest's memory once it is being torn down. Caller holds w.mu.
+func (w *WasiStubs) detachSignalsLocked() {
+	w.stopAlarmLocked()
+	s := &w.sig
+	s.flagModule, s.flagAddr = nil, 0
+	s.handled, s.ignored, s.blocked, s.pending = 0, 0, 0, 0
+	s.interrupt = false
+	w.syncHostSignalsLocked()
+}
+
+// syncHostSignals is syncHostSignalsLocked for a caller without w.mu.
+func (w *WasiStubs) syncHostSignals() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.syncHostSignalsLocked()
+}
+
+// syncHostSignalsLocked makes the host process's own signal handling follow
+// the guest's dispositions when the guest is the host process
+// (SetHostProcess) — and undoes all of it when it is not, or no longer:
+//
+//   - a signal the guest handles is caught and posted to the guest;
+//   - a signal the guest ignores explicitly is ignored by the host process;
+//   - any other signal is to do to the host process what it would do to the
+//     program. The Go runtime sees to that for some signals and not for
+//     others (wasiSignalsHeldByRuntime); the latter are caught and posted to
+//     the guest as well, whose default action then ends the guest by that
+//     signal (Proc_terminate), for the embedder to end the process likewise.
+//
+// SIGCHLD is not caught: the host posts it itself when a process of the
+// instance finishes, and the host process's own SIGCHLD reports the same
+// event (or one the guest has no part in). Signals the host does not have,
+// and SIGKILL and SIGSTOP, which cannot be caught, are skipped.
+//
+// Caller holds w.mu.
+func (w *WasiStubs) syncHostSignalsLocked() {
+	s := &w.sig
+	var relay, ignore uint64
+	if w.hostProcess && !w.forked && s.flagModule != nil {
+		uncatchable := wasiSignalBit(wasiSIGKILL) | wasiSignalBit(wasiSIGSTOP)
+		relay = (s.handled | wasiSignalsHeldByRuntime&^s.ignored) &^ (uncatchable | wasiSignalBit(wasiSIGCHLD))
+		ignore = s.ignored &^ (uncatchable | wasiDefaultIgnoredSignals)
+	}
+	// Ignoring or resetting a signal undoes a subscription to it, so this
+	// comes before the subscription is brought up to date.
+	if changed := ignore ^ s.hostIgnored; changed != 0 {
+		for sig := int32(1); sig <= 64; sig++ {
+			bit := wasiSignalBit(sig)
+			hostSig, known := hostSignalOf(sig)
+			if changed&bit == 0 || !known {
+				continue
+			}
+			if ignore&bit != 0 {
+				signal.Ignore(hostSig)
+			} else {
+				signal.Reset(hostSig)
+			}
+		}
+		s.hostIgnored = ignore
+	}
+	if relay == s.relayed {
+		return
+	}
+	// The new subscription is in place before the old one is dropped, so a
+	// signal that stays handled is caught throughout.
+	var relayTo chan os.Signal
+	var sigs []os.Signal
+	for sig := int32(1); sig <= 64; sig++ {
+		if hostSig, known := hostSignalOf(sig); known && relay&wasiSignalBit(sig) != 0 {
+			sigs = append(sigs, hostSig)
+		}
+	}
+	if len(sigs) > 0 {
+		relayTo = make(chan os.Signal, 64)
+		signal.Notify(relayTo, sigs...)
+		go w.relayHostSignals(relayTo)
+	}
+	if s.relay != nil {
+		signal.Stop(s.relay)
+		close(s.relay)
+	}
+	s.relay, s.relayed = relayTo, relay
+}
+
+// relayHostSignals posts the host process's signals arriving on from to the
+// guest, until from is closed.
+func (w *WasiStubs) relayHostSignals(from <-chan os.Signal) {
+	for received := range from {
+		hostSig, ok := received.(syscall.Signal)
+		if !ok {
+			continue
+		}
+		if sig := guestSignalOf(hostSig); sig != 0 {
+			w.PostSignal(sig)
+		}
+	}
+}
+
+// readInterruptibly is readVec for a stream whose read can block (a pipe, a
+// socket, a terminal): a signal posted while the read waits ends it.
+// interrupted is true when that happened before any byte arrived, and the
+// read is to be reported as EINTR.
+func (w *WasiStubs) readInterruptibly(src deadlineReader, bufs [][]byte) (total uint64, interrupted bool) {
+	if !w.beginBlocking(func() { _ = src.SetReadDeadline(time.Now()) }) {
+		return 0, true
+	}
+	cutShort := false
+read:
+	for _, buf := range bufs {
+		n, err := src.Read(buf)
+		for n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+			if w.interruptDue() {
+				cutShort = true
+				break read
+			}
+			// The deadline was a readiness probe's, possibly of another
+			// instance sharing the descriptor (pollReadable); it is cleared
+			// as soon as that probe ends.
+			runtime.Gosched()
+			n, err = src.Read(buf)
+		}
+		total += uint64(n)
+		if err != nil || n < len(buf) {
+			break
+		}
+	}
+	if w.endBlocking() {
+		// wake has set a deadline, which must not outlive this read.
+		_ = src.SetReadDeadline(time.Time{})
+	}
+	return total, cutShort && total == 0
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Codegen plumbing — the rest of the file weaves the live WasiStubs
 // implementation into translated output.
@@ -4550,24 +5133,26 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		// stand-in, the embed vars, this very function, etc.) is
 		// stripped.
 		keepTypeNames: map[string]bool{
-			"WasiExitError":  true,
-			"wasiOpen":       true,
-			"wasiProc":       true,
-			"wasiPIDs":       true,
-			"deadlineReader": true,
-			"pollProbe":      true,
-			"WasiStubs":      true,
-			"dotDirEntry":    true,
-			"FS":             true,
-			"File":           true,
-			"osFS":           true,
-			"FileLock":       true,
-			"fileStat":       true,
-			"MemFS":          true,
-			"memFile":        true,
-			"memNode":        true,
-			"memFileInfo":    true,
-			"memDirEntry":    true,
+			"WasiExitError":   true,
+			"WasiSignalError": true,
+			"wasiSignals":     true,
+			"wasiOpen":        true,
+			"wasiProc":        true,
+			"wasiPIDs":        true,
+			"deadlineReader":  true,
+			"pollProbe":       true,
+			"WasiStubs":       true,
+			"dotDirEntry":     true,
+			"FS":              true,
+			"File":            true,
+			"osFS":            true,
+			"FileLock":        true,
+			"fileStat":        true,
+			"MemFS":           true,
+			"memFile":         true,
+			"memNode":         true,
+			"memFileInfo":     true,
+			"memDirEntry":     true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                  true,
@@ -4589,6 +5174,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"putStrVec64":             true,
 			"readVec":                 true,
 			"appendWasiString":        true,
+			"wasiSignalBit":           true,
 			"userRecord":              true,
 			"pollReadable":            true,
 			"writeVec":                true,
@@ -4686,7 +5272,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		case *ast.FuncDecl:
 			fn := *dd
 			if multi {
-				fn.Body = capitalizeModuleFieldRefs(fn.Body)
+				// base/ exports the Module fields and the runtime helpers.
+				fn.Body = rewriteHelperBody(fn.Body, map[string]bool{"accessMemory": true})
 			}
 			decls = append(decls, &fn)
 		}
@@ -4703,6 +5290,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"net",
 		"os",
 		"os/exec",
+		"os/signal",
 		"os/user",
 		"path/filepath",
 		"runtime",
