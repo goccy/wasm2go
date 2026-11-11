@@ -1218,7 +1218,11 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		return -_wasiEACCES
 	}
 
-	cmd := exec.Command(path)
+	// path is a path, as posix_spawn's is: one without a slash names a file
+	// in the working directory. Looking a bare name up on PATH is
+	// posix_spawnp's job, and the PATH that counts is the guest's, so the
+	// guest's libc does it. (exec.Command would search the host process's.)
+	cmd := &exec.Cmd{Path: path}
 	if len(argv) > 0 {
 		cmd.Args = argv
 	} else {
