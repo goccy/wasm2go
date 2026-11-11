@@ -849,8 +849,8 @@ func (f *memFile) ReadDir(n int) ([]os.DirEntry, error) {
 type wasiOpen struct {
 	mu       sync.Mutex
 	f        File
-	conn     net.Conn // guarded by mu; read it through netConn
-	listener net.Listener
+	conn     net.Conn     // guarded by mu; read it through netConn
+	listener net.Listener // guarded by mu; read it through netListener
 	isDir    bool
 	isSocket bool          // created by Sock_socket, may not yet have a conn
 	path     string        // guest path relative to the preopen root
@@ -877,6 +877,9 @@ type wasiOpen struct {
 	// probing serializes readiness probes of this stream, so two probes
 	// cannot append the chunks they read to ahead out of order.
 	probing sync.Mutex
+	// sock is the state of a socket beyond its connection or listener;
+	// see wasiSocket. Guarded by mu; use it through socketLocked.
+	sock *wasiSocket
 	// blocks caches whether a read of f can block (see readBlocks): 0 not
 	// determined yet, 1 it can, 2 it cannot. Finding out takes a system
 	// call, and every read needs to know. Guarded by mu.
@@ -1189,9 +1192,10 @@ func (w *WasiStubs) SetFSAccessHook(hook func(path string, write bool) bool) {
 }
 
 // SetNetAccessHook installs a host-controlled network access policy.
-// hook is called with the operation name ("accept"/"recv"/"send")
-// before each socket operation; returning false denies it (EACCES).
-// Pass nil to clear (unrestricted, the default).
+// hook is called with the operation name before each socket operation;
+// returning false denies it (EACCES). The operations are "listen" (taking a
+// local address to accept connections on: Sock_bind, Sock_listen), "accept",
+// "recv" and "send". Pass nil to clear (unrestricted, the default).
 //
 // NOTE: WASI preview1 has no outbound connect or name resolution, so a
 // guest cannot initiate connections regardless of this hook; it governs
@@ -2129,32 +2133,39 @@ func (w *WasiStubs) memSlice(m *Module, off, n int32) []byte {
 
 // errno values used below (subset; see wasi-libc errno.h).
 const (
-	_wasiESUCCESS     int32 = 0
-	_wasiE2BIG        int32 = 1
-	_wasiEACCES       int32 = 2
-	_wasiEAFNOSUPPORT int32 = 5
-	_wasiEAGAIN       int32 = 6
-	_wasiEBADF        int32 = 8
-	_wasiECHILD       int32 = 12
-	_wasiECONNREFUSED int32 = 14
-	_wasiEISCONN      int32 = 33
-	_wasiEBUSY        int32 = 10
-	_wasiEEXIST       int32 = 20
-	_wasiEFAULT       int32 = 21
-	_wasiEINTR        int32 = 27
-	_wasiEINVAL       int32 = 28
-	_wasiEIO          int32 = 29
-	_wasiEISDIR       int32 = 31
-	_wasiENOENT       int32 = 44
-	_wasiENOEXEC      int32 = 45
-	_wasiENOTDIR      int32 = 54
-	_wasiENOTSOCK     int32 = 57
-	_wasiENOTSUP      int32 = 58
-	_wasiENOSYS       int32 = 52
-	_wasiEPERM        int32 = 63
-	_wasiEPIPE        int32 = 64
-	_wasiERANGE       int32 = 68
-	_wasiESRCH        int32 = 71
+	_wasiESUCCESS      int32 = 0
+	_wasiE2BIG         int32 = 1
+	_wasiEACCES        int32 = 2
+	_wasiEADDRINUSE    int32 = 3
+	_wasiEADDRNOTAVAIL int32 = 4
+	_wasiEAFNOSUPPORT  int32 = 5
+	_wasiEAGAIN        int32 = 6
+	_wasiEBADF         int32 = 8
+	_wasiECHILD        int32 = 12
+	_wasiECONNREFUSED  int32 = 14
+	_wasiECONNRESET    int32 = 15
+	_wasiENETUNREACH   int32 = 40
+	_wasiENOPROTOOPT   int32 = 50
+	_wasiENOTCONN      int32 = 53
+	_wasiETIMEDOUT     int32 = 73
+	_wasiEISCONN       int32 = 33
+	_wasiEBUSY         int32 = 10
+	_wasiEEXIST        int32 = 20
+	_wasiEFAULT        int32 = 21
+	_wasiEINTR         int32 = 27
+	_wasiEINVAL        int32 = 28
+	_wasiEIO           int32 = 29
+	_wasiEISDIR        int32 = 31
+	_wasiENOENT        int32 = 44
+	_wasiENOEXEC       int32 = 45
+	_wasiENOTDIR       int32 = 54
+	_wasiENOTSOCK      int32 = 57
+	_wasiENOTSUP       int32 = 58
+	_wasiENOSYS        int32 = 52
+	_wasiEPERM         int32 = 63
+	_wasiEPIPE         int32 = 64
+	_wasiERANGE        int32 = 68
+	_wasiESRCH         int32 = 71
 )
 
 // mapOSError turns an os/filesystem error into a wasi errno. Used by the
@@ -2361,7 +2372,11 @@ func closeWasiOpen(op *wasiOpen) error {
 		op.mu.Unlock()
 		return nil
 	}
-	conn := op.conn
+	conn, listener := op.conn, op.listener
+	var accepted []net.Conn
+	if op.sock != nil {
+		accepted, op.sock.accepted = op.sock.accepted, nil
+	}
 	op.mu.Unlock()
 	var err error
 	if op.f != nil {
@@ -2370,8 +2385,12 @@ func closeWasiOpen(op *wasiOpen) error {
 	if conn != nil {
 		err = errors.Join(err, conn.Close())
 	}
-	if op.listener != nil {
-		err = errors.Join(err, op.listener.Close())
+	if listener != nil {
+		err = errors.Join(err, listener.Close())
+	}
+	// connections a readiness probe accepted and nobody took
+	for _, c := range accepted {
+		err = errors.Join(err, c.Close())
 	}
 	return err
 }
@@ -2414,10 +2433,8 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 			ftype = 2 // a standard stream is a character device
 		} else if op.isDir {
 			ftype = 3
-		} else if op.conn != nil {
+		} else if op.conn != nil || op.listener != nil || op.isSocket {
 			ftype = 6 // socket_stream
-		} else if op.listener != nil {
-			ftype = 6
 		}
 		fdflags = uint16(op.fdflags)
 		op.mu.Unlock()
@@ -2642,9 +2659,9 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	}
 	if !served {
 		if stream, blocks := op.readBlocks(src); blocks {
-			var interrupted bool
-			if n, interrupted = w.readInterruptibly(stream, bufs); interrupted {
-				return _wasiEINTR
+			var errno int32
+			if n, errno = w.readStream(op, stream, bufs); errno != _wasiESUCCESS {
+				return errno
 			}
 		} else {
 			n = readVec(src, bufs)
@@ -3934,6 +3951,27 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			ready[i], anyReady = true, true
 			continue
 		}
+		// A listening socket is readable when a connection is waiting.
+		if l, listening := op.netListener(); ev.isRead && listening {
+			if bounded, canBound := l.(deadlineListener); canBound {
+				if op.acceptedReady() {
+					ready[i], anyReady = true, true
+					continue
+				}
+				if at, seen := probeOf[op]; seen {
+					probeIndex[i] = at
+					continue
+				}
+				probeOf[op] = len(probes)
+				probeIndex[i] = len(probes)
+				probes = append(probes, pollProbe{
+					op:          op,
+					setDeadline: bounded.SetDeadline,
+					probe:       func() bool { return op.probeAccept(bounded) },
+				})
+				continue
+			}
+		}
 		stream, bounded := src.(deadlineReader)
 		if !ev.isRead || !bounded {
 			ready[i], anyReady = true, true
@@ -3949,7 +3987,11 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 		probeOf[op] = len(probes)
 		probeIndex[i] = len(probes)
-		probes = append(probes, pollProbe{op: op, src: stream})
+		probes = append(probes, pollProbe{
+			op:          op,
+			setDeadline: stream.SetReadDeadline,
+			probe:       func() bool { return op.probeRead(stream) },
+		})
 	}
 
 	// The call blocks the guest when nothing is ready yet and there is
@@ -4031,11 +4073,16 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 	return _wasiESUCCESS
 }
 
-// pollProbe is one stream poll_oneoff has to probe for input.
+// pollProbe is one descriptor poll_oneoff has to probe for readiness: a
+// stream, for input, or a listening socket, for a connection. probe waits
+// for it — no longer than the deadline setDeadline has set — and reports
+// whether the descriptor is ready; what it took off the descriptor to find
+// out stays with the descriptor's entry.
 type pollProbe struct {
-	op    *wasiOpen
-	src   deadlineReader
-	ready bool
+	op          *wasiOpen
+	setDeadline func(t time.Time) error
+	probe       func() bool
+	ready       bool
 }
 
 // pollReadable waits until one of the streams has input (or reached its
@@ -4051,7 +4098,7 @@ func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}
 	var armed []*pollProbe
 	for i := range probes {
 		pr := &probes[i]
-		if err := pr.src.SetReadDeadline(deadline); err != nil {
+		if err := pr.setDeadline(deadline); err != nil {
 			pr.ready = true
 			continue
 		}
@@ -4060,7 +4107,7 @@ func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}
 	// Leave no deadline behind: later reads of these streams must block.
 	defer func() {
 		for _, pr := range armed {
-			_ = pr.src.SetReadDeadline(time.Time{})
+			_ = pr.setDeadline(time.Time{})
 		}
 	}()
 	if len(armed) == 0 {
@@ -4071,11 +4118,11 @@ func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}
 		// takes to look.
 		grace := time.Now().Add(pollProbeGrace)
 		for _, pr := range armed {
-			_ = pr.src.SetReadDeadline(grace)
+			_ = pr.setDeadline(grace)
 		}
 	}
 	if len(armed) == 1 && cancel == nil {
-		armed[0].ready = armed[0].op.probeRead(armed[0].src)
+		armed[0].ready = armed[0].probe()
 		return
 	}
 	var wg sync.WaitGroup
@@ -4084,7 +4131,7 @@ func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}
 		wg.Add(1)
 		go func(pr *pollProbe) {
 			defer wg.Done()
-			if pr.ready = pr.op.probeRead(pr.src); pr.ready {
+			if pr.ready = pr.probe(); pr.ready {
 				hit <- struct{}{}
 			}
 		}(pr)
@@ -4099,7 +4146,7 @@ func pollReadable(probes []pollProbe, deadline time.Time, cancel <-chan struct{}
 		// received.
 		now := time.Now()
 		for _, pr := range armed {
-			_ = pr.src.SetReadDeadline(now)
+			_ = pr.setDeadline(now)
 		}
 		<-done
 	}
@@ -4188,8 +4235,26 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	if hook != nil && !hook("tcp", host, ip, p) {
 		return -_wasiEACCES
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(p)), 30*time.Second)
+	dialer := net.Dialer{Timeout: 30 * time.Second}
+	if l, listening := op.netListener(); l != nil {
+		if listening {
+			return -_wasiEINVAL
+		}
+		// A socket that was bound and now connects: the connection leaves
+		// from the bound address, which the listener holding it gives up.
+		dialer.LocalAddr = l.Addr()
+		op.mu.Lock()
+		op.listener = nil
+		op.mu.Unlock()
+		if cerr := l.Close(); cerr != nil {
+			return -mapNetError(cerr)
+		}
+	}
+	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(p)))
 	if err != nil {
+		if errno := mapNetError(err); errno != _wasiEIO {
+			return -errno
+		}
 		return -_wasiECONNREFUSED
 	}
 	w.mu.Lock()
@@ -4220,9 +4285,13 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 }
 
 // Sock_accept accepts the next incoming TCP/Unix connection on the
-// listener associated with fd, registers it as a new wasiOpen with a
-// conn arm, and writes the new fd at fdOutPtr. Returns ENOTSOCK if fd
-// isn't a listener.
+// listener associated with fd, registers it as a new socket entry (with
+// flags as its fdflags), and writes the new fd at fdOutPtr. It waits for a
+// connection unless the listening socket is non-blocking, in which case it
+// reports EAGAIN when none is there. Returns 0 or an errno: ENOTSOCK if fd
+// isn't a listener, EINVAL for a socket the guest has bound but not
+// called listen on, EINTR when a signal is posted to the guest while it
+// waits.
 func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 	if !w.checkNet("accept") {
 		return _wasiEACCES
@@ -4234,15 +4303,49 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 	w.mu.Lock()
 	op := w.fdsLocked()[fd]
 	w.mu.Unlock()
-	if op == nil || op.listener == nil {
+	if op == nil {
+		// as Sock_recv and Sock_send report a descriptor that is not open
 		return _wasiENOTSOCK
 	}
-	conn, err := op.listener.Accept()
+	l, listening := op.netListener()
+	if l == nil {
+		if op.isSocket {
+			return _wasiEINVAL
+		}
+		return _wasiENOTSOCK
+	}
+	if op.isSocket && !listening {
+		return _wasiEINVAL
+	}
+	// What a readiness probe already accepted comes first.
+	conn, err, taken := op.takeAccepted()
+	if !taken {
+		bounded, canBound := l.(deadlineListener)
+		switch {
+		case !canBound:
+			conn, err = l.Accept()
+		case op.nonblocking():
+			// Long enough for the accept to be attempted, as for a
+			// readiness probe.
+			_ = bounded.SetDeadline(time.Now().Add(pollProbeGrace))
+			ready := op.probeAccept(l)
+			_ = bounded.SetDeadline(time.Time{})
+			if !ready {
+				return _wasiEAGAIN
+			}
+			conn, err, _ = op.takeAccepted()
+		default:
+			var interrupted bool
+			if conn, err, interrupted = w.acceptInterruptibly(bounded); interrupted {
+				return _wasiEINTR
+			}
+		}
+	}
 	if err != nil {
-		return mapOSError(err)
+		return mapNetError(err)
 	}
 	w.mu.Lock()
-	newFD := w.addFDLocked(&wasiOpen{conn: conn})
+	newFD := w.addFDLocked(&wasiOpen{conn: conn, isSocket: true, fdflags: flags})
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out, uint32(newFD))
 	return _wasiESUCCESS
@@ -4290,9 +4393,9 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	// as soon as it has anything.
 	got, served := op.takeAhead(bufs)
 	if !served {
-		var interrupted bool
-		if got, interrupted = w.readInterruptibly(conn, bufs); interrupted {
-			return _wasiEINTR
+		var errno int32
+		if got, errno = w.readStream(op, conn, bufs); errno != _wasiESUCCESS {
+			return errno
 		}
 	}
 	total := uint32(got)
@@ -5075,6 +5178,30 @@ func (w *WasiStubs) relayHostSignals(from <-chan os.Signal) {
 	}
 }
 
+// readStream reads from a stream whose read can block, as the guest asked
+// for it: a non-blocking descriptor (O_NONBLOCK) reports EAGAIN when no
+// input is there, a blocking one waits and reports EINTR when a signal is
+// posted to the guest meanwhile.
+func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
+	if !op.nonblocking() {
+		n, interrupted := w.readInterruptibly(src, bufs)
+		if interrupted {
+			return 0, _wasiEINTR
+		}
+		return n, _wasiESUCCESS
+	}
+	// The probe is the non-blocking read: it waits just long enough for
+	// the read to be attempted and keeps what arrives.
+	_ = src.SetReadDeadline(time.Now().Add(pollProbeGrace))
+	ready := op.probeRead(src)
+	_ = src.SetReadDeadline(time.Time{})
+	if !ready {
+		return 0, _wasiEAGAIN
+	}
+	n, _ := op.takeAhead(bufs)
+	return n, _wasiESUCCESS
+}
+
 // readInterruptibly is readVec for a stream whose read can block (a pipe, a
 // socket, a terminal): a signal posted while the read waits ends it.
 // interrupted is true when that happened before any byte arrived, and the
@@ -5110,6 +5237,486 @@ read:
 	return total, cutShort && total == 0
 }
 
+// ----- listening sockets, socket names and options ----------------------------
+
+// wasiSocket is what a socket entry (wasiOpen.isSocket) carries besides its
+// connection or listener. Guarded by the entry's mu.
+type wasiSocket struct {
+	// listening is set by Sock_listen: bind alone does not make a socket
+	// accept connections.
+	listening bool
+	// accepted holds connections a readiness probe took off the listener:
+	// the only portable way to learn that a listener has a connection
+	// waiting is to accept it (see probeAccept). Sock_accept hands these
+	// out first. acceptErr is a failure a probe ran into, reported by the
+	// next Sock_accept.
+	accepted  []net.Conn
+	acceptErr error
+	// options holds the option values the guest set (Sock_setopt), so that
+	// they read back as set whatever the host could do with them.
+	options map[int32]int32
+}
+
+// deadlineListener is a listener whose blocking accept can be bounded, as
+// the TCP and Unix listeners of package net can.
+type deadlineListener interface {
+	net.Listener
+	SetDeadline(t time.Time) error
+}
+
+// socketLocked returns the socket state of op, creating it on first use.
+// Caller holds op.mu.
+func (op *wasiOpen) socketLocked() *wasiSocket {
+	if op.sock == nil {
+		op.sock = &wasiSocket{}
+	}
+	return op.sock
+}
+
+// netListener returns the listener attached to a socket entry and whether
+// the guest has called listen on it.
+func (op *wasiOpen) netListener() (l net.Listener, listening bool) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	return op.listener, op.sock != nil && op.sock.listening
+}
+
+// takeAccepted returns a connection a readiness probe accepted, or the
+// failure one ran into; ok is false when there is neither.
+func (op *wasiOpen) takeAccepted() (conn net.Conn, err error, ok bool) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	s := op.sock
+	if s == nil {
+		return nil, nil, false
+	}
+	if len(s.accepted) > 0 {
+		conn = s.accepted[0]
+		s.accepted = s.accepted[1:]
+		return conn, nil, true
+	}
+	if s.acceptErr != nil {
+		err, s.acceptErr = s.acceptErr, nil
+		return nil, err, true
+	}
+	return nil, nil, false
+}
+
+// acceptedReady reports whether an accept would return without blocking
+// because of what a probe already took.
+func (op *wasiOpen) acceptedReady() bool {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	return op.sock != nil && (len(op.sock.accepted) > 0 || op.sock.acceptErr != nil)
+}
+
+// probeAccept accepts once from l — the caller has set the deadline — and
+// keeps a connection that arrives for the next Sock_accept. It reports
+// whether the listener is now ready for an accept.
+func (op *wasiOpen) probeAccept(l net.Listener) bool {
+	op.probing.Lock()
+	defer op.probing.Unlock()
+	if op.acceptedReady() {
+		return true
+	}
+	conn, err := l.Accept()
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return false
+	}
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	s := op.socketLocked()
+	if err != nil {
+		s.acceptErr = err
+	} else {
+		s.accepted = append(s.accepted, conn)
+	}
+	return true
+}
+
+// mapNetError turns a failure of package net into a wasi errno.
+func mapNetError(err error) int32 {
+	switch {
+	case err == nil:
+		return _wasiESUCCESS
+	case errors.Is(err, syscall.EADDRINUSE):
+		return _wasiEADDRINUSE
+	case errors.Is(err, syscall.EADDRNOTAVAIL):
+		return _wasiEADDRNOTAVAIL
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return _wasiECONNREFUSED
+	case errors.Is(err, syscall.ECONNRESET):
+		return _wasiECONNRESET
+	case errors.Is(err, syscall.ETIMEDOUT), errors.Is(err, os.ErrDeadlineExceeded):
+		return _wasiETIMEDOUT
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return _wasiENETUNREACH
+	case errors.Is(err, net.ErrClosed):
+		return _wasiEBADF
+	}
+	return mapOSError(err)
+}
+
+// socketIPv4 renders the address of a sock_bind / sock_connect call: ipBE
+// holds the four octets as they sat in sockaddr_in.sin_addr (the low byte is
+// the first octet).
+func socketIPv4(ipBE int32) string {
+	u := uint32(ipBE)
+	return fmt.Sprintf("%d.%d.%d.%d", u&0xff, (u>>8)&0xff, (u>>16)&0xff, (u>>24)&0xff)
+}
+
+// listenIPv4 opens the listening socket behind a bound guest socket, after
+// asking the network policy: listening is the "listen" operation of the hook
+// installed with SetNetAccessHook.
+func (w *WasiStubs) listenIPv4(ip string, port int) (net.Listener, int32) {
+	if !w.checkNet("listen") {
+		return nil, _wasiEACCES
+	}
+	l, err := net.Listen("tcp4", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		return nil, mapNetError(err)
+	}
+	return l, _wasiESUCCESS
+}
+
+// Sock_bind is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "sock_bind") backing bind() for an IPv4 stream socket: the socket
+// gets the local address ipBE:port (ipBE as in Sock_connect; port in host
+// byte order, 0 for one the host picks). The host's network API binds and
+// listens in one step, so the address is taken — and connections to it
+// queue — from here on; the guest's accept still needs its listen (see
+// Sock_listen). Subject to the network policy's "listen" operation. Returns
+// 0, or a negative errno: EADDRINUSE, EADDRNOTAVAIL, EACCES, EINVAL for a
+// socket that is already bound or connected.
+func (w *WasiStubs) Sock_bind(m *Module, fd, ipBE, port int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if !op.isSocket {
+		return -_wasiENOTSOCK
+	}
+	if l, _ := op.netListener(); l != nil || op.netConn() != nil {
+		return -_wasiEINVAL
+	}
+	l, errno := w.listenIPv4(socketIPv4(ipBE), int(uint16(port)))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	return -op.attachListener(l, false)
+}
+
+// attachListener makes l the listener of a socket entry, unless the entry
+// got one or a connection in the meantime (a forked instance shares it); l
+// is then closed and the call reports EINVAL. listening marks the socket as
+// listening as well.
+func (op *wasiOpen) attachListener(l net.Listener, listening bool) int32 {
+	op.mu.Lock()
+	if op.listener != nil || op.conn != nil {
+		op.mu.Unlock()
+		if err := l.Close(); err != nil {
+			return mapNetError(err)
+		}
+		return _wasiEINVAL
+	}
+	op.listener = l
+	if listening {
+		op.socketLocked().listening = true
+	}
+	op.mu.Unlock()
+	return _wasiESUCCESS
+}
+
+// Sock_listen is a NON-STANDARD host import (name "sock_listen") backing
+// listen(): the socket accepts connections from here on. A socket that was
+// not bound listens on a port the host picks, on every address, as listen(2)
+// has it. backlog is accepted and left to the host. Returns 0 or a negative
+// errno.
+func (w *WasiStubs) Sock_listen(m *Module, fd, backlog int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if !op.isSocket {
+		return -_wasiENOTSOCK
+	}
+	if op.netConn() != nil {
+		return -_wasiEINVAL
+	}
+	if l, _ := op.netListener(); l == nil {
+		l, errno := w.listenIPv4("0.0.0.0", 0)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		return -op.attachListener(l, true)
+	}
+	op.mu.Lock()
+	op.socketLocked().listening = true
+	op.mu.Unlock()
+	return _wasiESUCCESS
+}
+
+// The address families of a socket name handed to the guest.
+const (
+	wasiSockFamilyIPv4 = 1
+	wasiSockFamilyUnix = 2
+)
+
+// writeSockName writes a socket name at outPtr as three little-endian u32:
+// the family (wasiSockFamily*), the IPv4 address with its first octet in the
+// low byte, and the port. A name that is not an IPv4 one has only a family.
+func (w *WasiStubs) writeSockName(m *Module, addr net.Addr, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 12)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	var family, ip, port uint32
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		family = wasiSockFamilyIPv4
+		if v4 := a.IP.To4(); v4 != nil {
+			ip = binary.LittleEndian.Uint32(v4)
+		}
+		port = uint32(a.Port)
+	case *net.UnixAddr:
+		family = wasiSockFamilyUnix
+	case nil:
+		// a socket that is not bound yet: the unspecified address
+		family = wasiSockFamilyIPv4
+	default:
+		return -_wasiENOTSUP
+	}
+	binary.LittleEndian.PutUint32(out[0:], family)
+	binary.LittleEndian.PutUint32(out[4:], ip)
+	binary.LittleEndian.PutUint32(out[8:], port)
+	return _wasiESUCCESS
+}
+
+// Sock_getsockname is a NON-STANDARD host import (name "sock_getsockname")
+// backing getsockname(): the local name of the socket (see writeSockName) —
+// the address it listens on, the local end of its connection, or the
+// unspecified address while it has neither. Returns 0 or a negative errno.
+func (w *WasiStubs) Sock_getsockname(m *Module, fd, outPtr int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if conn := op.netConn(); conn != nil {
+		return w.writeSockName(m, conn.LocalAddr(), outPtr)
+	}
+	if l, _ := op.netListener(); l != nil {
+		return w.writeSockName(m, l.Addr(), outPtr)
+	}
+	if !op.isSocket {
+		return -_wasiENOTSOCK
+	}
+	return w.writeSockName(m, nil, outPtr)
+}
+
+// Sock_getpeername is a NON-STANDARD host import (name "sock_getpeername")
+// backing getpeername(): the name of the socket's peer (see writeSockName).
+// Returns 0, or a negative errno: ENOTCONN for a socket without a
+// connection.
+func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	conn := op.netConn()
+	if conn == nil {
+		if l, _ := op.netListener(); l == nil && !op.isSocket {
+			return -_wasiENOTSOCK
+		}
+		return -_wasiENOTCONN
+	}
+	return w.writeSockName(m, conn.RemoteAddr(), outPtr)
+}
+
+// The socket options the host knows, as the guest's shim names them to
+// Sock_setopt / Sock_getopt (the numbers libc gives the options differ from
+// libc to libc, so they are not used on this boundary).
+const (
+	wasiSockOptReuseAddr int32 = 1 // SO_REUSEADDR
+	wasiSockOptReusePort int32 = 2 // SO_REUSEPORT
+	wasiSockOptKeepAlive int32 = 3 // SO_KEEPALIVE
+	wasiSockOptNoDelay   int32 = 4 // TCP_NODELAY
+	wasiSockOptRcvBuf    int32 = 5 // SO_RCVBUF
+	wasiSockOptSndBuf    int32 = 6 // SO_SNDBUF
+	wasiSockOptLinger    int32 = 7 // SO_LINGER: seconds, or -1 for off
+	wasiSockOptError     int32 = 8 // SO_ERROR (read only)
+	wasiSockOptType      int32 = 9 // SO_TYPE (read only): 1 for a stream socket
+)
+
+// Sock_setopt is a NON-STANDARD host import (name "sock_setopt") backing
+// setsockopt() for the options above. The value is remembered and reads back
+// through Sock_getopt. What the host can act on is applied to the socket's
+// connection when it has one: keep-alive, no-delay, the buffer sizes and
+// linger. Address reuse is how the host binds every listener anyway. Returns
+// 0, or a negative errno: ENOPROTOOPT for an option that is unknown or read
+// only.
+func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if !op.isSocket && op.netConn() == nil {
+		return -_wasiENOTSOCK
+	}
+	var err error
+	tcp, _ := op.netConn().(*net.TCPConn)
+	switch option {
+	case wasiSockOptReuseAddr, wasiSockOptReusePort:
+	case wasiSockOptKeepAlive:
+		if tcp != nil {
+			err = tcp.SetKeepAlive(value != 0)
+		}
+	case wasiSockOptNoDelay:
+		if tcp != nil {
+			err = tcp.SetNoDelay(value != 0)
+		}
+	case wasiSockOptRcvBuf:
+		if tcp != nil {
+			err = tcp.SetReadBuffer(int(value))
+		}
+	case wasiSockOptSndBuf:
+		if tcp != nil {
+			err = tcp.SetWriteBuffer(int(value))
+		}
+	case wasiSockOptLinger:
+		if tcp != nil {
+			err = tcp.SetLinger(int(value))
+		}
+	default:
+		return -_wasiENOPROTOOPT
+	}
+	if err != nil {
+		return -mapNetError(err)
+	}
+	op.mu.Lock()
+	s := op.socketLocked()
+	if s.options == nil {
+		s.options = map[int32]int32{}
+	}
+	s.options[option] = value
+	op.mu.Unlock()
+	return _wasiESUCCESS
+}
+
+// Sock_getopt is a NON-STANDARD host import (name "sock_getopt") backing
+// getsockopt(): it writes the option's value (i32) at valuePtr — what the
+// guest set, or the option's initial value: 0, and -1 (off) for linger.
+// SO_ERROR is always 0: a failed operation reports its error itself. Returns
+// 0, or a negative errno: ENOPROTOOPT for an unknown option.
+func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
+	out := w.memSlice(m, valuePtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if !op.isSocket && op.netConn() == nil {
+		return -_wasiENOTSOCK
+	}
+	var value int32
+	switch option {
+	case wasiSockOptError:
+	case wasiSockOptType:
+		value = 1
+	case wasiSockOptReuseAddr, wasiSockOptReusePort, wasiSockOptKeepAlive, wasiSockOptNoDelay,
+		wasiSockOptRcvBuf, wasiSockOptSndBuf, wasiSockOptLinger:
+		if option == wasiSockOptLinger {
+			value = -1
+		}
+		op.mu.Lock()
+		if op.sock != nil {
+			if set, ok := op.sock.options[option]; ok {
+				value = set
+			}
+		}
+		op.mu.Unlock()
+	default:
+		return -_wasiENOPROTOOPT
+	}
+	binary.LittleEndian.PutUint32(out, uint32(value))
+	return _wasiESUCCESS
+}
+
+// Sock_pair is a NON-STANDARD host import (name "sock_pair") backing
+// socketpair(AF_UNIX, SOCK_STREAM): it creates a pair of connected stream
+// sockets and writes their two fds (i32 each) at fdsOutPtr. Returns 0 or a
+// negative errno (ENOTSUP on a host without socket pairs).
+func (w *WasiStubs) Sock_pair(m *Module, fdsOutPtr int32) int32 {
+	out := w.memSlice(m, fdsOutPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	a, b, err := socketPair()
+	if err != nil {
+		return -mapNetError(err)
+	}
+	w.mu.Lock()
+	afd := w.addFDLocked(&wasiOpen{conn: a, isSocket: true})
+	bfd := w.addFDLocked(&wasiOpen{conn: b, isSocket: true})
+	w.mu.Unlock()
+	binary.LittleEndian.PutUint32(out[0:], uint32(afd))
+	binary.LittleEndian.PutUint32(out[4:], uint32(bfd))
+	return _wasiESUCCESS
+}
+
+// wasiFdflagNonblock is the O_NONBLOCK bit of the fdflags (fd_fdstat_set_flags).
+const wasiFdflagNonblock int32 = 0x4
+
+// nonblocking reports whether the guest has set O_NONBLOCK on the entry.
+func (op *wasiOpen) nonblocking() bool {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	return op.fdflags&wasiFdflagNonblock != 0
+}
+
+// acceptInterruptibly accepts from l for a blocking socket: a signal posted
+// to the guest while the accept waits ends it, and interrupted is then true.
+func (w *WasiStubs) acceptInterruptibly(l deadlineListener) (conn net.Conn, err error, interrupted bool) {
+	if !w.beginBlocking(func() { _ = l.SetDeadline(time.Now()) }) {
+		return nil, nil, true
+	}
+	for {
+		conn, err = l.Accept()
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			break
+		}
+		if w.interruptDue() {
+			interrupted = true
+			break
+		}
+		// The deadline was a readiness probe's, possibly of another
+		// instance sharing the listener; it is cleared as soon as that
+		// probe ends.
+		runtime.Gosched()
+	}
+	if w.endBlocking() {
+		// wake has set a deadline, which must not outlive this accept.
+		_ = l.SetDeadline(time.Time{})
+	}
+	if conn != nil {
+		interrupted = false
+	}
+	return conn, err, interrupted
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Codegen plumbing — the rest of the file weaves the live WasiStubs
 // implementation into translated output.
@@ -5141,26 +5748,28 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		// stand-in, the embed vars, this very function, etc.) is
 		// stripped.
 		keepTypeNames: map[string]bool{
-			"WasiExitError":   true,
-			"WasiSignalError": true,
-			"wasiSignals":     true,
-			"wasiOpen":        true,
-			"wasiProc":        true,
-			"wasiPIDs":        true,
-			"deadlineReader":  true,
-			"pollProbe":       true,
-			"WasiStubs":       true,
-			"dotDirEntry":     true,
-			"FS":              true,
-			"File":            true,
-			"osFS":            true,
-			"FileLock":        true,
-			"fileStat":        true,
-			"MemFS":           true,
-			"memFile":         true,
-			"memNode":         true,
-			"memFileInfo":     true,
-			"memDirEntry":     true,
+			"WasiExitError":    true,
+			"WasiSignalError":  true,
+			"wasiSocket":       true,
+			"deadlineListener": true,
+			"wasiSignals":      true,
+			"wasiOpen":         true,
+			"wasiProc":         true,
+			"wasiPIDs":         true,
+			"deadlineReader":   true,
+			"pollProbe":        true,
+			"WasiStubs":        true,
+			"dotDirEntry":      true,
+			"FS":               true,
+			"File":             true,
+			"osFS":             true,
+			"FileLock":         true,
+			"fileStat":         true,
+			"MemFS":            true,
+			"memFile":          true,
+			"memNode":          true,
+			"memFileInfo":      true,
+			"memDirEntry":      true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                  true,
@@ -5183,6 +5792,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVec":                 true,
 			"appendWasiString":        true,
 			"wasiSignalBit":           true,
+			"mapNetError":             true,
+			"socketIPv4":              true,
 			"userRecord":              true,
 			"pollReadable":            true,
 			"writeVec":                true,

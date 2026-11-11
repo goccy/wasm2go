@@ -3,6 +3,8 @@
 package codegen
 
 import (
+	"errors"
+	"net"
 	"os"
 	"syscall"
 )
@@ -128,4 +130,30 @@ func guestSignalOf(hostSig syscall.Signal) int32 {
 // signalHostProcess sends a signal to a process of the host.
 func signalHostProcess(pid int, sig syscall.Signal) error {
 	return syscall.Kill(pid, sig)
+}
+
+// socketPair creates a pair of connected Unix-domain stream sockets.
+func socketPair() (a, b net.Conn, err error) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	conns := [2]net.Conn{}
+	for i, fd := range fds {
+		syscall.CloseOnExec(fd)
+		f := os.NewFile(uintptr(fd), "socketpair")
+		// FileConn works on a duplicate; the original is done with either way.
+		conn, connErr := net.FileConn(f)
+		err = errors.Join(err, connErr, f.Close())
+		conns[i] = conn
+	}
+	if err != nil {
+		for _, conn := range conns {
+			if conn != nil {
+				err = errors.Join(err, conn.Close())
+			}
+		}
+		return nil, nil, err
+	}
+	return conns[0], conns[1], nil
 }

@@ -940,6 +940,10 @@ func TestWasi_SockAcceptNotSocket(t *testing.T) {
 	if rc := w.Sock_accept(m, 99, 0, 0); rc != _wasiENOTSOCK {
 		t.Fatalf("expected ENOTSOCK, got %d", rc)
 	}
+	readFd, _ := newTestPipe(t, w, m)
+	if rc := w.Sock_accept(m, readFd, 0, 0); rc != _wasiENOTSOCK {
+		t.Fatalf("accept on a pipe: expected ENOTSOCK, got %d", rc)
+	}
 }
 
 // ─── Existing methods round-trip ────────────────────────────────────

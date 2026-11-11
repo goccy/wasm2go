@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"errors"
+	"net"
 	"os"
 	"syscall"
 )
@@ -42,4 +43,10 @@ func guestSignalOf(hostSig syscall.Signal) int32 {
 // runtime cannot do on this platform.
 func signalHostProcess(pid int, sig syscall.Signal) error {
 	return errors.ErrUnsupported
+}
+
+// socketPair creates a pair of connected stream sockets, which the runtime
+// cannot do on this platform.
+func socketPair() (a, b net.Conn, err error) {
+	return nil, nil, errors.ErrUnsupported
 }
