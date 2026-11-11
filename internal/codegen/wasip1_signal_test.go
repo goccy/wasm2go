@@ -423,7 +423,6 @@ func TestSignal_ForkedStateStartsWithoutSignals(t *testing.T) {
 	child := w.Fork()
 	defer child.CloseAll()
 	cm := newForkTestModule()
-	child.PostSignal(wasiSIGUSR1) // nobody registered: dropped
 	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
 		t.Fatalf("the forked guest's registration rc=%d, want 0 (new)", rc)
 	}
@@ -437,6 +436,30 @@ func TestSignal_ForkedStateStartsWithoutSignals(t *testing.T) {
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
 		t.Fatalf("parent taken = %#x, want %#x", got, want)
 	}
+}
+
+// A signal sent to a forked guest before it has run — and so before it has
+// registered — is not lost: it is there when the guest reports its
+// dispositions, unless those say the signal is ignored.
+func TestSignal_PostedToAForkedGuestBeforeItRegisters(t *testing.T) {
+	w, _ := newSignalGuest(t)
+	child := w.Fork()
+	defer child.CloseAll()
+	child.PostSignal(wasiSIGTERM)
+	child.PostSignal(wasiSIGCHLD)
+
+	cm := newForkTestModule()
+	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	setDispositions(t, child, cm, 0, wasiDefaultIgnoredSignals, 0)
+	if flag := signalFlag(cm); flag != 1 {
+		t.Fatalf("flag = %d once the forked guest is ready, want 1", flag)
+	}
+	if got, want := takeSignals(t, child, cm), signalMask(wasiSIGTERM); got != want {
+		t.Fatalf("taken = %#x, want SIGTERM only (%#x)", got, want)
+	}
+
 }
 
 func TestSignal_CloseAllEndsDelivery(t *testing.T) {

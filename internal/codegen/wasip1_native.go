@@ -4884,12 +4884,17 @@ const wasiSignalsHeldByRuntime = uint64(1)<<(3-1) | // SIGQUIT
 // sig is the guest's number for it (Linux numbering). It may be called from
 // any goroutine, at any time.
 //
-// The signal is dropped when the guest has not registered for signals or
-// ignores this one (explicitly or because that is the signal's default
-// action). Otherwise it is recorded for the guest to take. Unless the guest
+// The signal is dropped when the guest ignores it (explicitly or because
+// that is the signal's default action), and when no guest has registered for
+// signals. Otherwise it is recorded for the guest to take. Unless the guest
 // has the signal blocked, its flag word is raised, and the blocking call it
 // is waiting in — or the next one it makes before taking the signal — ends
 // with EINTR.
+//
+// The host state of a forked instance (Fork) is the exception to the
+// registration rule: the guest it is for exists from the moment of the fork
+// and registers as soon as it runs, so a signal posted in between — a parent
+// that kills its child right after forking it — is kept for it.
 func (w *WasiStubs) PostSignal(sig int32) {
 	bit := wasiSignalBit(sig)
 	if bit == 0 {
@@ -4898,7 +4903,13 @@ func (w *WasiStubs) PostSignal(sig int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s := &w.sig
-	if s.flagModule == nil || s.ignored&bit != 0 {
+	if s.flagModule == nil {
+		if w.forked {
+			s.pending |= bit
+		}
+		return
+	}
+	if s.ignored&bit != 0 {
 		return
 	}
 	s.pending |= bit
@@ -4996,7 +5007,8 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 	s.handled, s.ignored, s.blocked = uint64(handled), uint64(ignored), uint64(blocked)
 	s.pending &^= s.ignored
 	if s.flagModule != nil && s.pending&^s.blocked != 0 {
-		// Unblocked while pending: it is deliverable now.
+		// Deliverable now: unblocked while pending, or posted to a forked
+		// guest before it had registered.
 		w.raiseSignalFlagLocked()
 	}
 	w.syncHostSignalsLocked()
