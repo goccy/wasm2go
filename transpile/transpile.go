@@ -113,6 +113,12 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 	for name, data := range res.Files {
 		treeIn[name] = data
 	}
+	// The auxiliary files are part of the package: the main file calls into
+	// them (the per-platform companions of the wasi host), so the capture
+	// build needs them to compile.
+	for name, data := range res.AuxFiles {
+		treeIn[name] = data
+	}
 	synthSigs := map[string]gcasm.SynthSig{}
 	for name, sig := range res.OutlinedSigs {
 		synthSigs[name] = gcasm.SynthSig{Params: sig.Params, Result: sig.Result, Packed: sig.Packed}
