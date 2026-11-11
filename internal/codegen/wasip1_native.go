@@ -1157,6 +1157,9 @@ type WasiStubs struct {
 	// hostProcess records that the guest program is the host process (see
 	// SetHostProcess). Guarded by mu.
 	hostProcess bool
+	// localZone is the time zone of a guest that names none; see
+	// SetLocalZone. nil is UTC. Guarded by mu.
+	localZone *time.Location
 	// syslogger, when non-nil, is the system logger the guest's syslog(3)
 	// delivers to; see SetSyslogger. Guarded by mu.
 	syslogger Syslogger
@@ -1390,6 +1393,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		execHook:    w.execHook,
 		forkHook:    w.forkHook,
 		syslogger:   w.syslogger,
+		localZone:   w.localZone,
 		hostProcess: w.hostProcess,
 		forked:      true,
 	}
@@ -5202,6 +5206,391 @@ func (w *WasiStubs) Proc_group_by_name(m *Module, namePtr, nameLen, bufPtr, bufL
 	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
 }
 
+// ----- time zones -------------------------------------------------------------
+//
+// A guest's libc knows one time zone, UTC, and has no zone database. The
+// rules of a zone are the host's to know: the guest names the zone it wants
+// (the value of its TZ variable) and a moment, and Clock_zone answers what
+// holds in that zone at that moment — the offset from UTC, whether daylight
+// saving time is in effect, and the abbreviations in use.
+
+// SetLocalZone sets the time zone a guest is in when it names none (TZ is
+// not set): the embedder's choice, typically time.Local for a guest that
+// stands for the host process. nil, the default, is UTC.
+func (w *WasiStubs) SetLocalZone(loc *time.Location) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.localZone = loc
+}
+
+// wasiZoneMoment is what holds in a time zone at one moment.
+type wasiZoneMoment struct {
+	offset int    // seconds east of UTC
+	dst    bool   // daylight saving time is in effect
+	name   string // the abbreviation in use
+	// other is the offset under the opposite daylight-saving state at the
+	// nearest change, and equal to offset in a zone that has none.
+	other int
+	// stdOffset and stdName describe the zone's standard time around the
+	// moment; dstName is the abbreviation of its daylight saving time, ""
+	// when the zone has none there.
+	stdOffset        int
+	stdName, dstName string
+}
+
+// posixZoneRule is one date of a POSIX TZ string on which daylight saving
+// time starts or ends: Mm.w.d, Jn or n, with the time of day in seconds.
+type posixZoneRule struct {
+	kind         byte // 'M', 'J', or 'N' for the plain day number
+	month, week  int  // 'M': month 1..12, week 1..5 (5: the last)
+	day          int  // 'M': weekday 0..6 from Sunday; 'J': 1..365; 'N': 0..365
+	secondsOfDay int
+}
+
+// posixZone is a time zone given as a POSIX TZ string, such as "JST-9" or
+// "EST5EDT,M3.2.0,M11.1.0".
+type posixZone struct {
+	stdName, dstName string // dstName "": no daylight saving time
+	stdOffset        int    // seconds east of UTC
+	dstOffset        int
+	dstStart, dstEnd posixZoneRule
+}
+
+// posixZoneScanner reads a POSIX TZ string left to right.
+type posixZoneScanner struct {
+	s  string
+	ok bool
+}
+
+func (p *posixZoneScanner) peek() byte {
+	if len(p.s) == 0 {
+		return 0
+	}
+	return p.s[0]
+}
+
+func (p *posixZoneScanner) take(c byte) bool {
+	if p.peek() != c {
+		return false
+	}
+	p.s = p.s[1:]
+	return true
+}
+
+// name reads a zone abbreviation: three or more letters, or anything
+// between angle brackets.
+func (p *posixZoneScanner) name() string {
+	if p.take('<') {
+		end := strings.IndexByte(p.s, '>')
+		if end < 1 {
+			p.ok = false
+			return ""
+		}
+		name := p.s[:end]
+		p.s = p.s[end+1:]
+		return name
+	}
+	n := 0
+	for n < len(p.s) && (p.s[n] >= 'A' && p.s[n] <= 'Z' || p.s[n] >= 'a' && p.s[n] <= 'z') {
+		n++
+	}
+	if n < 3 {
+		p.ok = false
+		return ""
+	}
+	name := p.s[:n]
+	p.s = p.s[n:]
+	return name
+}
+
+// number reads an unsigned decimal number of at most max.
+func (p *posixZoneScanner) number(max int) int {
+	n, digits := 0, 0
+	for len(p.s) > 0 && p.s[0] >= '0' && p.s[0] <= '9' && digits < 4 {
+		n = n*10 + int(p.s[0]-'0')
+		p.s = p.s[1:]
+		digits++
+	}
+	if digits == 0 || n > max {
+		p.ok = false
+	}
+	return n
+}
+
+// clock reads [+-]hh[:mm[:ss]] as seconds.
+func (p *posixZoneScanner) clock(maxHours int) int {
+	sign := 1
+	if p.take('-') {
+		sign = -1
+	} else {
+		p.take('+')
+	}
+	seconds := p.number(maxHours) * 3600
+	if p.take(':') {
+		seconds += p.number(59) * 60
+		if p.take(':') {
+			seconds += p.number(59)
+		}
+	}
+	return sign * seconds
+}
+
+// rule reads one transition date with its optional time of day.
+func (p *posixZoneScanner) rule() posixZoneRule {
+	r := posixZoneRule{kind: 'N', secondsOfDay: 2 * 3600}
+	switch {
+	case p.take('M'):
+		r.kind = 'M'
+		r.month = p.number(12)
+		if !p.take('.') {
+			p.ok = false
+		}
+		r.week = p.number(5)
+		if !p.take('.') {
+			p.ok = false
+		}
+		r.day = p.number(6)
+		if r.month < 1 || r.week < 1 {
+			p.ok = false
+		}
+	case p.take('J'):
+		r.kind = 'J'
+		if r.day = p.number(365); r.day < 1 {
+			p.ok = false
+		}
+	default:
+		r.day = p.number(365)
+	}
+	if p.take('/') {
+		r.secondsOfDay = p.clock(167)
+	}
+	return r
+}
+
+// parsePosixZone reads a POSIX TZ string: std offset [dst [offset]
+// [,start[/time],end[/time]]]. An offset is what is added to local time to
+// get UTC, so a zone east of Greenwich has a negative one. Daylight saving
+// time is one hour ahead of standard time unless it has an offset of its
+// own, and follows the rules of the United States unless the string has
+// rules. ok is false for anything that is not such a string.
+func parsePosixZone(tz string) (zone *posixZone, ok bool) {
+	p := &posixZoneScanner{s: tz, ok: true}
+	z := &posixZone{}
+	z.stdName = p.name()
+	if !p.ok {
+		return nil, false
+	}
+	z.stdOffset = -p.clock(24)
+	if !p.ok {
+		return nil, false
+	}
+	if len(p.s) == 0 {
+		return z, true
+	}
+	z.dstName = p.name()
+	z.dstOffset = z.stdOffset + 3600
+	if c := p.peek(); p.ok && c != ',' && c != 0 {
+		z.dstOffset = -p.clock(24)
+	}
+	z.dstStart = posixZoneRule{kind: 'M', month: 3, week: 2, secondsOfDay: 2 * 3600}
+	z.dstEnd = posixZoneRule{kind: 'M', month: 11, week: 1, secondsOfDay: 2 * 3600}
+	if p.take(',') {
+		z.dstStart = p.rule()
+		if !p.take(',') {
+			p.ok = false
+		}
+		z.dstEnd = p.rule()
+	}
+	if !p.ok || len(p.s) != 0 {
+		return nil, false
+	}
+	return z, true
+}
+
+// localSeconds returns the rule's moment in the given year as seconds since
+// the epoch on a clock that is not adjusted for any zone.
+func (r posixZoneRule) localSeconds(year int) int64 {
+	var day time.Time
+	switch r.kind {
+	case 'M':
+		first := time.Date(year, time.Month(r.month), 1, 0, 0, 0, 0, time.UTC)
+		offset := (r.day - int(first.Weekday()) + 7) % 7
+		day = first.AddDate(0, 0, offset+7*(r.week-1))
+		if day.Month() != first.Month() {
+			// week 5 is the last such weekday of the month
+			day = day.AddDate(0, 0, -7)
+		}
+	case 'J':
+		// days 1..365, February 29 never counted
+		day = time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, r.day-1)
+		leap := year%4 == 0 && (year%100 != 0 || year%400 == 0)
+		if leap && r.day >= 60 {
+			day = day.AddDate(0, 0, 1)
+		}
+	default:
+		day = time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, r.day)
+	}
+	return day.Unix() + int64(r.secondsOfDay)
+}
+
+// inDST reports whether daylight saving time is in effect at utc (seconds
+// since the epoch).
+func (z *posixZone) inDST(utc int64) bool {
+	if z.dstName == "" {
+		return false
+	}
+	year := time.Unix(utc+int64(z.stdOffset), 0).UTC().Year()
+	start := z.dstStart.localSeconds(year) - int64(z.stdOffset)
+	end := z.dstEnd.localSeconds(year) - int64(z.dstOffset)
+	if start < end {
+		return utc >= start && utc < end
+	}
+	// the southern hemisphere: summer spans the turn of the year
+	return utc >= start || utc < end
+}
+
+// moment answers for a POSIX zone. With local set, t is a reading of the
+// zone's own clock rather than seconds since the epoch.
+func (z *posixZone) moment(t int64, local bool) wasiZoneMoment {
+	zm := wasiZoneMoment{stdOffset: z.stdOffset, stdName: z.stdName, dstName: z.dstName}
+	dst := false
+	if local {
+		// A reading that exists under both states, or under neither, is
+		// taken as standard time.
+		dst = z.inDST(t-int64(z.dstOffset)) && z.inDST(t-int64(z.stdOffset))
+	} else {
+		dst = z.inDST(t)
+	}
+	zm.offset, zm.name, zm.other = z.stdOffset, z.stdName, z.stdOffset
+	if z.dstName != "" {
+		zm.other = z.dstOffset
+	}
+	if dst {
+		zm.dst, zm.offset, zm.name, zm.other = true, z.dstOffset, z.dstName, z.stdOffset
+	}
+	return zm
+}
+
+// locationMoment answers for a zone of the host's zone database (or a fixed
+// one). With local set, t is a reading of the zone's own clock.
+func locationMoment(loc *time.Location, t int64, local bool) wasiZoneMoment {
+	at := time.Unix(t, 0).In(loc)
+	if local {
+		u := time.Unix(t, 0).UTC()
+		at = time.Date(u.Year(), u.Month(), u.Day(), u.Hour(), u.Minute(), u.Second(), 0, loc)
+	}
+	var zm wasiZoneMoment
+	zm.name, zm.offset = at.Zone()
+	zm.dst = at.IsDST()
+	zm.other, zm.stdOffset, zm.stdName = zm.offset, zm.offset, zm.name
+	// The period next to this one, later or else earlier, shows the other
+	// daylight-saving state when the zone has one at this time: a change
+	// more than a year away is history, or not decided yet.
+	start, end := at.ZoneBounds()
+	var neighbours []time.Time
+	if !end.IsZero() {
+		neighbours = append(neighbours, end)
+	}
+	if !start.IsZero() {
+		neighbours = append(neighbours, start.Add(-time.Second))
+	}
+	for _, n := range neighbours {
+		n = n.In(loc)
+		if apart := n.Sub(at); n.IsDST() == zm.dst || apart > 366*24*time.Hour || apart < -366*24*time.Hour {
+			continue
+		}
+		name, offset := n.Zone()
+		zm.other = offset
+		if zm.dst {
+			zm.stdName, zm.stdOffset, zm.dstName = name, offset, zm.name
+		} else {
+			zm.dstName = name
+		}
+		return zm
+	}
+	if zm.dst {
+		zm.dstName = zm.name
+	}
+	return zm
+}
+
+// zoneMoment resolves the zone a guest named and answers for it. No name
+// (TZ not set) is the embedder's local zone, UTC by default. A name is
+// looked up in the host's zone database first — ":Europe/Paris" and
+// "Europe/Paris" alike — and read as a POSIX TZ string otherwise; a name
+// that is neither is UTC, as it is for a C library.
+func (w *WasiStubs) zoneMoment(tz string, named bool, t int64, local bool) wasiZoneMoment {
+	if !named {
+		w.mu.Lock()
+		loc := w.localZone
+		w.mu.Unlock()
+		if loc == nil {
+			loc = time.UTC
+		}
+		return locationMoment(loc, t, local)
+	}
+	tz = strings.TrimPrefix(tz, ":")
+	if tz == "" {
+		return locationMoment(time.UTC, t, local)
+	}
+	if loc, err := time.LoadLocation(tz); err == nil && tz != "Local" {
+		return locationMoment(loc, t, local)
+	}
+	if zone, ok := parsePosixZone(tz); ok {
+		return zone.moment(t, local)
+	}
+	return locationMoment(time.UTC, t, local)
+}
+
+// wasiZoneNameSize is the space a zone abbreviation has in the record
+// Clock_zone writes, its terminating NUL included.
+const wasiZoneNameSize = 16
+
+// Clock_zone is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "clock_zone") backing the time zone side of a guest's libc
+// (localtime, mktime, strftime's %z and %Z, tzset). (tzPtr, tzLen) is the
+// zone the guest names — the value of its TZ variable — when hasTZ is
+// non-zero; see zoneMoment for what a name means. t is seconds since the
+// epoch, or with local non-zero a reading of the zone's own clock counted
+// the same way (what mktime starts from).
+//
+// It writes a 64-byte record at outPtr: four little-endian i32 — the offset
+// from UTC in seconds east, 1 when daylight saving time is in effect, the
+// offset under the opposite daylight-saving state, the offset of standard
+// time — and three NUL-terminated abbreviations of wasiZoneNameSize bytes
+// each: the one in use, standard time's, and daylight saving time's (empty
+// when the zone has none). Returns 0 or a negative errno.
+func (w *WasiStubs) Clock_zone(m *Module, tzPtr, tzLen, hasTZ int32, t int64, local, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 16+3*wasiZoneNameSize)
+	var tz []byte
+	if hasTZ != 0 {
+		tz = w.memSlice(m, tzPtr, tzLen)
+		if tz == nil && tzLen != 0 {
+			return -_wasiEFAULT
+		}
+	}
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	zm := w.zoneMoment(string(tz), hasTZ != 0, t, local != 0)
+	for i := range out {
+		out[i] = 0
+	}
+	binary.LittleEndian.PutUint32(out[0:], uint32(int32(zm.offset)))
+	if zm.dst {
+		binary.LittleEndian.PutUint32(out[4:], 1)
+	}
+	binary.LittleEndian.PutUint32(out[8:], uint32(int32(zm.other)))
+	binary.LittleEndian.PutUint32(out[12:], uint32(int32(zm.stdOffset)))
+	for i, name := range []string{zm.name, zm.stdName, zm.dstName} {
+		if len(name) > wasiZoneNameSize-1 {
+			name = name[:wasiZoneNameSize-1]
+		}
+		copy(out[16+i*wasiZoneNameSize:], name)
+	}
+	return _wasiESUCCESS
+}
+
 // ----- the system logger ------------------------------------------------------
 
 // Syslogger is a system logger as a guest's syslog(3) uses it. The embedder
@@ -6712,6 +7101,10 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"WasiExitError":    true,
 			"WasiSignalError":  true,
 			"Syslogger":        true,
+			"wasiZoneMoment":   true,
+			"posixZoneRule":    true,
+			"posixZone":        true,
+			"posixZoneScanner": true,
 			"SyslogMessage":    true,
 			"wasiSocket":       true,
 			"deadlineListener": true,
@@ -6758,6 +7151,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"appendWasiString":        true,
 			"wasiSignalBit":           true,
 			"syslogResult":            true,
+			"parsePosixZone":          true,
+			"locationMoment":          true,
 			"mapNetError":             true,
 			"socketIPv4":              true,
 			"userRecord":              true,
