@@ -608,3 +608,58 @@ func TestMemFS_ModesLinksAndTimes(t *testing.T) {
 		t.Fatalf("nlink of the renamed file = %d, want 1", got)
 	}
 }
+
+// A directory descriptor reports the path it was opened under, absolute in
+// the guest's filesystem; other descriptors have no such name.
+func TestWasi_FdPathNamesAnOpenDirectory(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	if errno := w.pathCreateDirectory("outer", 0o755); errno != _wasiESUCCESS {
+		t.Fatalf("mkdir outer errno=%d", errno)
+	}
+	if errno := w.pathCreateDirectory("outer/inner", 0o755); errno != _wasiESUCCESS {
+		t.Fatalf("mkdir outer/inner errno=%d", errno)
+	}
+	fdPath := func(fd, capacity int32) (string, int32) {
+		rc := w.Fd_path(m, fd, metaPathOff, capacity, metaOutOff)
+		if rc != 0 {
+			return "", rc
+		}
+		return string(m.memory[metaPathOff : metaPathOff+int32(readU32(m.memory, int(metaOutOff)))]), 0
+	}
+	const oDirectory = 0x2
+	dir, errno := w.pathOpen("outer/inner", 0x1, oDirectory, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open the directory errno=%d", errno)
+	}
+	if got, rc := fdPath(dir, 256); rc != 0 || got != "/outer/inner" {
+		t.Fatalf("Fd_path(directory) = %q rc=%d, want /outer/inner", got, rc)
+	}
+	root, errno := w.pathOpen("", 0x1, oDirectory, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open the root errno=%d", errno)
+	}
+	if got, rc := fdPath(root, 256); rc != 0 || got != "/" {
+		t.Fatalf("Fd_path(root) = %q rc=%d, want /", got, rc)
+	}
+	if got, rc := fdPath(wasiPreopenFD, 256); rc != 0 || got != "/" {
+		t.Fatalf("Fd_path(preopen) = %q rc=%d, want /", got, rc)
+	}
+	// A buffer that is too small learns the size it needs.
+	if _, rc := fdPath(dir, 4); rc != -_wasiERANGE || readU32(m.memory, int(metaOutOff)) != uint32(len("/outer/inner")) {
+		t.Fatalf("short buffer rc=%d needed=%d, want -ERANGE and %d", rc, readU32(m.memory, int(metaOutOff)), len("/outer/inner"))
+	}
+
+	if err := os.WriteFile(filepath.Join(w.preopenDir, "file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file := openTestFile(t, w, "file")
+	if _, rc := fdPath(file, 256); rc != -_wasiENOTDIR {
+		t.Fatalf("Fd_path(file) rc=%d, want -ENOTDIR", rc)
+	}
+	if _, rc := fdPath(1, 256); rc != -_wasiENOTDIR {
+		t.Fatalf("Fd_path(stdout) rc=%d, want -ENOTDIR", rc)
+	}
+	if _, rc := fdPath(99, 256); rc != -_wasiEBADF {
+		t.Fatalf("Fd_path(closed) rc=%d, want -EBADF", rc)
+	}
+}

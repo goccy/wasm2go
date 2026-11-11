@@ -3238,6 +3238,34 @@ func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Fd_path is a NON-STANDARD host import (module wasi_snapshot_preview1, name
+// "fd_path") backing fchdir(): a guest's libc keeps the working directory
+// as a path, so a directory that is known only by its descriptor has to be
+// named before it can become the working directory. The call hands back the
+// path fd was opened under, absolute in the guest's filesystem ("/" is the
+// preopen root), through writeWasiRecord. It is the name the directory had
+// when it was opened: a caller that needs the directory itself compares
+// what the name leads to now with fstat's answer.
+//
+// Returns 0, or a negative errno: EBADF, ENOTDIR for a descriptor that is
+// not a directory's, ERANGE when the buffer is too small.
+func (w *WasiStubs) Fd_path(m *Module, fd, bufPtr, bufLen, neededPtr int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil && fd != wasiPreopenFD {
+		return -_wasiEBADF
+	}
+	path := "/"
+	if op != nil {
+		if !op.isDir {
+			return -_wasiENOTDIR
+		}
+		path += op.path
+	}
+	return w.writeWasiRecord(m, []byte(path), bufPtr, bufLen, neededPtr)
+}
+
 // writeFilestatExt writes what Path_filestat_ext and Fd_filestat_ext
 // report about the file fi describes.
 func writeFilestatExt(out []byte, fi os.FileInfo) {
