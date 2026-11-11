@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -69,8 +70,13 @@ func fdFilestat(t *testing.T, w *WasiStubs, m *Module, fd int32) wasiFilestat {
 	return decodeFilestat(m.memory[metaOutOff:])
 }
 
-// filestatExt is what Path_filestat_ext and Fd_filestat_ext report.
+// filestatExt is what Path_filestat_ext and Fd_filestat_ext report, with the
+// low twelve mode bits in mode; extFileType reads the file type bits.
 type filestatExt struct{ mode, uid, gid uint32 }
+
+// extFileType returns the file type bits of the record a filestat_ext call
+// left at metaOutOff.
+func extFileType(m *Module) uint32 { return readU32(m.memory, int(metaOutOff)) & unixTypeMask }
 
 func pathFilestatExt(t *testing.T, w *WasiStubs, m *Module, name string) filestatExt {
 	t.Helper()
@@ -78,7 +84,7 @@ func pathFilestatExt(t *testing.T, w *WasiStubs, m *Module, name string) filesta
 	if rc := w.Path_filestat_ext(m, off, n, 1, metaOutOff); rc != 0 {
 		t.Fatalf("Path_filestat_ext(%s) rc=%d", name, rc)
 	}
-	return filestatExt{readU32(m.memory, int(metaOutOff)), readU32(m.memory, int(metaOutOff)+4), readU32(m.memory, int(metaOutOff)+8)}
+	return filestatExt{readU32(m.memory, int(metaOutOff)) & 0o7777, readU32(m.memory, int(metaOutOff)+4), readU32(m.memory, int(metaOutOff)+8)}
 }
 
 func fdFilestatExt(t *testing.T, w *WasiStubs, m *Module, fd int32) filestatExt {
@@ -86,7 +92,7 @@ func fdFilestatExt(t *testing.T, w *WasiStubs, m *Module, fd int32) filestatExt 
 	if rc := w.Fd_filestat_ext(m, fd, metaOutOff); rc != 0 {
 		t.Fatalf("Fd_filestat_ext(%d) rc=%d", fd, rc)
 	}
-	return filestatExt{readU32(m.memory, int(metaOutOff)), readU32(m.memory, int(metaOutOff)+4), readU32(m.memory, int(metaOutOff)+8)}
+	return filestatExt{readU32(m.memory, int(metaOutOff)) & 0o7777, readU32(m.memory, int(metaOutOff)+4), readU32(m.memory, int(metaOutOff)+8)}
 }
 
 // openTestFile opens an existing file for reading and writing and returns
@@ -225,10 +231,6 @@ func TestWasi_FilestatExtReportsModeAndOwner(t *testing.T) {
 		t.Fatalf("fd: %+v, want %+v", got, want)
 	}
 
-	// A descriptor that is not a file of the backend has nothing to report.
-	if rc := w.Fd_filestat_ext(m, 1, metaOutOff); rc != -_wasiEINVAL {
-		t.Errorf("stdout rc=%d, want -EINVAL", rc)
-	}
 	if rc := w.Fd_filestat_ext(m, 99, metaOutOff); rc != -_wasiEBADF {
 		t.Errorf("closed fd rc=%d, want -EBADF", rc)
 	}
@@ -662,4 +664,93 @@ func TestWasi_FdPathNamesAnOpenDirectory(t *testing.T) {
 	if _, rc := fdPath(99, 256); rc != -_wasiEBADF {
 		t.Fatalf("Fd_path(closed) rc=%d, want -EBADF", rc)
 	}
+}
+
+// Every file and descriptor has its POSIX file type: WASI's own for the
+// types WASI has, and the type bits of the filestat_ext record for all of
+// them, a FIFO included.
+func TestWasi_FileTypes(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	if err := os.WriteFile(filepath.Join(dir, "file"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	byPath := func(name string) (wasiType byte, posixType uint32) {
+		t.Helper()
+		wasiType = pathFilestat(t, w, m, name, true).filetype
+		pathFilestatExt(t, w, m, name)
+		return wasiType, extFileType(m)
+	}
+	byFd := func(fd int32) (wasiType byte, posixType uint32) {
+		t.Helper()
+		wasiType = fdFilestat(t, w, m, fd).filetype
+		fdFilestatExt(t, w, m, fd)
+		return wasiType, extFileType(m)
+	}
+	want := func(what string, gotWasi byte, gotPosix uint32, wantWasi byte, wantPosix uint32) {
+		t.Helper()
+		if gotWasi != wantWasi || gotPosix != wantPosix {
+			t.Errorf("%s: wasi type %d, posix type %#o; want %d, %#o", what, gotWasi, gotPosix, wantWasi, wantPosix)
+		}
+	}
+	wt, pt := byPath("file")
+	want("a regular file", wt, pt, 4, unixTypeRegular)
+	wt, pt = byPath("dir")
+	want("a directory", wt, pt, 3, unixTypeDir)
+	wt, pt = byPath("fifo")
+	want("a FIFO", wt, pt, 0, unixTypeFIFO)
+
+	// A character device is not a block device.
+	devices, dm := newTestStubs(t, "/")
+	off, n := putPath(dm, metaPathOff, "dev/null")
+	if rc := devices.Path_filestat_get(dm, 3, 1, off, n, metaOutOff); rc != _wasiESUCCESS {
+		t.Fatalf("Path_filestat_get(/dev/null) rc=%d", rc)
+	}
+	wt = decodeFilestat(dm.memory[metaOutOff:]).filetype
+	if rc := devices.Path_filestat_ext(dm, off, n, 1, metaOutOff); rc != 0 {
+		t.Fatalf("Path_filestat_ext(/dev/null) rc=%d", rc)
+	}
+	want("/dev/null", wt, extFileType(dm), 2, unixTypeChar)
+
+	// Descriptors: a pipe is a FIFO, a socket a socket.
+	readFd, writeFd := newTestPipe(t, w, m)
+	wt, pt = byFd(readFd)
+	want("the read end of a pipe", wt, pt, 0, unixTypeFIFO)
+	wt, pt = byFd(writeFd)
+	want("the write end of a pipe", wt, pt, 0, unixTypeFIFO)
+	sock := w.Sock_socket(m, 2, 1)
+	wt, pt = byFd(sock)
+	want("a socket", wt, pt, 6, unixTypeSocket)
+
+	// A standard stream the embedder supplied is a pipe to the guest; one
+	// that is a file of the host is that file.
+	wt, pt = byFd(1)
+	want("an embedder's stdout", wt, pt, 0, unixTypeFIFO)
+	out, err := os.Create(filepath.Join(dir, "out.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	w.SetStdout(out)
+	wt, pt = byFd(1)
+	want("stdout redirected to a file", wt, pt, 4, unixTypeRegular)
+	if got := fdFilestatExt(t, w, m, 1).uid; got != uint32(os.Getuid()) {
+		t.Errorf("the owner of a file-backed stdout = %d, want %d", got, os.Getuid())
+	}
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	w.SetStdin(null)
+	wt, pt = byFd(0)
+	want("stdin from /dev/null", wt, pt, 2, unixTypeChar)
 }

@@ -227,6 +227,41 @@ func unixFileMode(bits uint32) os.FileMode {
 	return mode
 }
 
+// The file type bits of a POSIX mode_t, with the values every Unix gives
+// them. They cross to the guest in a filestat_ext record, whose shim turns
+// them into its libc's own constants.
+const (
+	unixTypeMask    uint32 = 0o170000
+	unixTypeFIFO    uint32 = 0o010000
+	unixTypeChar    uint32 = 0o020000
+	unixTypeDir     uint32 = 0o040000
+	unixTypeBlock   uint32 = 0o060000
+	unixTypeRegular uint32 = 0o100000
+	unixTypeSymlink uint32 = 0o120000
+	unixTypeSocket  uint32 = 0o140000
+)
+
+// unixTypeBits returns the file type bits of the POSIX mode_t of a file
+// whose mode is mode. A character device has os.ModeDevice set as well, so
+// it is told apart from a block device first.
+func unixTypeBits(mode os.FileMode) uint32 {
+	switch {
+	case mode.IsDir():
+		return unixTypeDir
+	case mode&os.ModeSymlink != 0:
+		return unixTypeSymlink
+	case mode&os.ModeNamedPipe != 0:
+		return unixTypeFIFO
+	case mode&os.ModeSocket != 0:
+		return unixTypeSocket
+	case mode&os.ModeCharDevice != 0:
+		return unixTypeChar
+	case mode&os.ModeDevice != 0:
+		return unixTypeBlock
+	}
+	return unixTypeRegular
+}
+
 // unixModeBits is the inverse of unixFileMode: the low twelve bits of the
 // POSIX mode_t of a file whose mode is mode.
 func unixModeBits(mode os.FileMode) uint32 {
@@ -2542,20 +2577,27 @@ func (w *WasiStubs) Fd_filestat_get(m *Module, fd, ptr int32) int32 {
 		return _wasiEBADF
 	}
 	if op == nil || op.f == nil {
-		// Synthesise a minimal stat for a standard stream, the preopen
-		// or a socket.
+		if fi := w.streamFileInfo(op); fi != nil {
+			// A standard stream that is a file of the host is that
+			// file: a terminal, a pipe, a regular file it was
+			// redirected to.
+			writeFilestat(out, fi)
+			return _wasiESUCCESS
+		}
+		// Synthesise a minimal stat for the preopen, a socket, or a
+		// standard stream the embedder supplied.
 		for i := range out {
 			out[i] = 0
 		}
-		// Stay consistent with Fd_fdstat_get's filetype values: a
-		// standard stream is a character device (2); the preopen
-		// directory is a directory (3); everything else is left as
-		// "unknown" (0).
+		// The preopen is a directory (3) and a socket a stream socket
+		// (6). An embedder's stream is a pipe to the guest, which WASI
+		// has no file type for: it stays "unknown" (0) here, and
+		// Fd_filestat_ext names it.
 		switch {
 		case op == nil:
 			out[16] = 3
-		case op.stdio != 0:
-			out[16] = 2
+		case op.isSocket || op.netConn() != nil:
+			out[16] = 6
 		}
 		return _wasiESUCCESS
 	}
@@ -3390,10 +3432,11 @@ const (
 // Path_filestat_ext is a NON-STANDARD host import (module
 // wasi_snapshot_preview1, name "path_filestat_ext") backing a
 // bridge-provided stat/lstat: WASI's filestat carries neither permission
-// bits nor an owner, so the bridge merges them in from here. The path is
-// preopen-relative; follow selects stat vs lstat semantics. Writes three
-// little-endian u32 at outPtr — the low twelve mode bits, the uid, the gid
-// — and returns 0 or a negative errno.
+// bits nor an owner, and its file types have no FIFO, so the bridge merges
+// them in from here. The path is preopen-relative; follow selects stat vs
+// lstat semantics. Writes three little-endian u32 at outPtr — the POSIX
+// mode (the file type bits, unixType*, and the low twelve mode bits), the
+// uid, the gid — and returns 0 or a negative errno.
 func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPtr int32) int32 {
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
 	out := w.memSlice(m, outPtr, 12)
@@ -3417,11 +3460,14 @@ func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPt
 	return _wasiESUCCESS
 }
 
-// Fd_filestat_ext is Path_filestat_ext for an open file (module
+// Fd_filestat_ext is Path_filestat_ext for an open descriptor (module
 // wasi_snapshot_preview1, name "fd_filestat_ext"), backing a
-// bridge-provided fstat. An fd that is not a file of the FS backend (a
-// standard stream, a socket) reports EINVAL: there is nothing to add to
-// what fd_filestat_get says about it.
+// bridge-provided fstat. A descriptor that is not a file of the FS backend
+// is described as what it is to the guest: a standard stream that is a
+// file of the host as that file (a terminal, a pipe, a regular file), a
+// stream the embedder supplied as a pipe, a socket as a socket. The last
+// two have no file behind them; they belong to the guest's own user (see
+// SetHostProcess).
 func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
 	out := w.memSlice(m, outPtr, 12)
 	if out == nil {
@@ -3433,15 +3479,59 @@ func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
 	if op == nil {
 		return -_wasiEBADF
 	}
-	if op.f == nil {
-		return -_wasiEINVAL
+	fi := w.streamFileInfo(op)
+	if fi == nil && op.f != nil {
+		var err error
+		if fi, err = op.f.Stat(); err != nil {
+			return -mapOSError(err)
+		}
 	}
-	fi, err := op.f.Stat()
-	if err != nil {
-		return -mapOSError(err)
+	if fi != nil {
+		writeFilestatExt(out, fi)
+		return _wasiESUCCESS
 	}
-	writeFilestatExt(out, fi)
+	mode := unixTypeFIFO | 0o600
+	if op.isSocket || op.netConn() != nil {
+		mode = unixTypeSocket | 0o777
+	}
+	var uid, gid uint32
+	if w.hostIdentity() {
+		uid, gid = uint32(os.Getuid()), uint32(os.Getgid())
+	}
+	binary.LittleEndian.PutUint32(out[0:], mode)
+	binary.LittleEndian.PutUint32(out[4:], uid)
+	binary.LittleEndian.PutUint32(out[8:], gid)
 	return _wasiESUCCESS
+}
+
+// streamFileInfo describes the host file behind an entry that refers to a
+// standard stream of the instance, or returns nil when the entry is not a
+// standard stream or the stream is not a file of the host (an embedder's
+// reader or writer).
+func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
+	if op == nil || op.stdio == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	var stream any
+	switch op.stdio {
+	case 1:
+		stream = w.stdin
+	case 2:
+		stream = w.stdout
+	case 3:
+		stream = w.stderr
+	}
+	w.mu.Unlock()
+	file, isFile := stream.(*os.File)
+	if !isFile {
+		return nil
+	}
+	fi, err := file.Stat()
+	if err != nil {
+		return nil
+	}
+	return fi
 }
 
 // Fd_path is a NON-STANDARD host import (module wasi_snapshot_preview1, name
@@ -3476,7 +3566,7 @@ func (w *WasiStubs) Fd_path(m *Module, fd, bufPtr, bufLen, neededPtr int32) int3
 // report about the file fi describes.
 func writeFilestatExt(out []byte, fi os.FileInfo) {
 	st := fileStatOf(fi)
-	binary.LittleEndian.PutUint32(out[0:], unixModeBits(fi.Mode()))
+	binary.LittleEndian.PutUint32(out[0:], unixTypeBits(fi.Mode())|unixModeBits(fi.Mode()))
 	binary.LittleEndian.PutUint32(out[4:], st.uid)
 	binary.LittleEndian.PutUint32(out[8:], st.gid)
 }
@@ -4744,21 +4834,24 @@ func writeFilestat(out []byte, st os.FileInfo) {
 	posix := fileStatOf(st)
 	binary.LittleEndian.PutUint64(out[0:], posix.dev)
 	binary.LittleEndian.PutUint64(out[8:], posix.ino)
+	// WASI's file types: 1 block device, 2 character device, 3 directory,
+	// 4 regular file, 6 stream socket, 7 symbolic link. There is none for
+	// a FIFO, which is therefore "unknown" (0) here — not a socket — and
+	// gets its type from the filestat_ext record.
 	var ftype byte = 4
-	mode := st.Mode()
-	switch {
-	case mode.IsDir():
+	switch unixTypeBits(st.Mode()) {
+	case unixTypeDir:
 		ftype = 3
-	case mode&os.ModeSymlink != 0:
+	case unixTypeSymlink:
 		ftype = 7
-	case mode&os.ModeNamedPipe != 0:
+	case unixTypeFIFO:
+		ftype = 0
+	case unixTypeSocket:
 		ftype = 6
-	case mode&os.ModeSocket != 0:
-		ftype = 6
-	case mode&os.ModeDevice != 0:
-		ftype = 1
-	case mode&os.ModeCharDevice != 0:
+	case unixTypeChar:
 		ftype = 2
+	case unixTypeBlock:
+		ftype = 1
 	}
 	out[16] = ftype
 	binary.LittleEndian.PutUint64(out[24:], posix.nlink)
@@ -6222,6 +6315,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"fileStatOf":              true,
 			"unixFileMode":            true,
 			"unixModeBits":            true,
+			"unixTypeBits":            true,
 			"filetimesNeedCurrent":    true,
 			"writeFilestatExt":        true,
 			"memSplit":                true,
