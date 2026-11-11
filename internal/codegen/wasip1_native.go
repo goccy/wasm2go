@@ -1083,6 +1083,9 @@ type WasiStubs struct {
 	// hostProcess records that the guest program is the host process (see
 	// SetHostProcess). Guarded by mu.
 	hostProcess bool
+	// syslogger, when non-nil, is the system logger the guest's syslog(3)
+	// delivers to; see SetSyslogger. Guarded by mu.
+	syslogger Syslogger
 	// forked marks host state made by Fork: the instance it backs is a
 	// process of its own, never the host process, whatever hostProcess
 	// says about the identity it inherited. Immutable.
@@ -1312,6 +1315,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		pids:        w.pidsLocked(),
 		execHook:    w.execHook,
 		forkHook:    w.forkHook,
+		syslogger:   w.syslogger,
 		hostProcess: w.hostProcess,
 		forked:      true,
 	}
@@ -4812,6 +4816,130 @@ func (w *WasiStubs) Proc_group_by_name(m *Module, namePtr, nameLen, bufPtr, bufL
 	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
 }
 
+// ----- the system logger ------------------------------------------------------
+
+// Syslogger is a system logger as a guest's syslog(3) uses it. The embedder
+// supplies one with SetSyslogger; without one the guest has no system
+// logger, and its openlog and syslog fail.
+//
+// An instance and the instances forked from it share the Syslogger, each
+// calling it from its own goroutine.
+type Syslogger interface {
+	// Open is the guest's openlog: it reports whether messages from ident
+	// can be delivered. options and facility are as in SyslogMessage.
+	Open(ident string, options, facility int32) error
+	// Log delivers one message.
+	Log(msg SyslogMessage) error
+	// Close is the guest's closelog.
+	Close() error
+}
+
+// SyslogMessage is one message a guest logs, as syslog(3) takes it apart.
+type SyslogMessage struct {
+	// Severity is the level, 0 (emergency) to 7 (debug).
+	Severity int32
+	// Facility is the facility's number, 0 (kernel) to 23 (local7): the
+	// value syslog.h shifts left by three.
+	Facility int32
+	// Options are the openlog option flags: SyslogOptPID and the rest.
+	Options int32
+	// Ident is the tag openlog set, "" when the guest set none.
+	Ident string
+	// Message is the message text.
+	Message string
+}
+
+// The openlog option flags in SyslogMessage.Options and Syslogger.Open,
+// with the values the guest's shim passes (Linux's).
+const (
+	SyslogOptPID    int32 = 0x01 // LOG_PID: log the process id with each message
+	SyslogOptCons   int32 = 0x02 // LOG_CONS: write to the console when the logger fails
+	SyslogOptNDelay int32 = 0x08 // LOG_NDELAY: connect at openlog
+	SyslogOptPerror int32 = 0x20 // LOG_PERROR: the guest also writes the message to its stderr
+)
+
+// SetSyslogger gives the guest a system logger (nil takes it away).
+func (w *WasiStubs) SetSyslogger(l Syslogger) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.syslogger = l
+}
+
+// syslogResult turns the outcome of a Syslogger call into the result of a
+// syslog import.
+func syslogResult(err error) int32 {
+	if err == nil {
+		return _wasiESUCCESS
+	}
+	if errno := mapNetError(err); errno != _wasiEIO {
+		return -errno
+	}
+	return -_wasiEIO
+}
+
+// Proc_syslog_open is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "proc_syslog_open") backing openlog(): the
+// guest is about to log as (identPtr, identLen) with the given option flags
+// (SyslogOpt*) and default facility number. Returns 0 when the embedder's
+// Syslogger accepts, or a negative errno: ENOSYS when the instance has no
+// system logger, otherwise what the logger reported.
+func (w *WasiStubs) Proc_syslog_open(m *Module, identPtr, identLen, options, facility int32) int32 {
+	ident := w.memSlice(m, identPtr, identLen)
+	if ident == nil && identLen != 0 {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	l := w.syslogger
+	w.mu.Unlock()
+	if l == nil {
+		return -_wasiENOSYS
+	}
+	return syslogResult(l.Open(string(ident), options, facility))
+}
+
+// Proc_syslog is a NON-STANDARD host import (name "proc_syslog") backing
+// syslog(): one message, as the values syslog(3) works with — the severity
+// (0..7), the facility number (0..23), the option flags and ident of the
+// guest's openlog, and the message text. Returns 0 once the embedder's
+// Syslogger has taken the message, or a negative errno: ENOSYS when the
+// instance has no system logger, EINVAL for a severity or facility out of
+// range, otherwise what the logger reported.
+func (w *WasiStubs) Proc_syslog(m *Module, severity, facility, options, identPtr, identLen, msgPtr, msgLen int32) int32 {
+	ident := w.memSlice(m, identPtr, identLen)
+	text := w.memSlice(m, msgPtr, msgLen)
+	if (ident == nil && identLen != 0) || (text == nil && msgLen != 0) {
+		return -_wasiEFAULT
+	}
+	if severity < 0 || severity > 7 || facility < 0 || facility > 23 {
+		return -_wasiEINVAL
+	}
+	w.mu.Lock()
+	l := w.syslogger
+	w.mu.Unlock()
+	if l == nil {
+		return -_wasiENOSYS
+	}
+	return syslogResult(l.Log(SyslogMessage{
+		Severity: severity,
+		Facility: facility,
+		Options:  options,
+		Ident:    string(ident),
+		Message:  string(text),
+	}))
+}
+
+// Proc_syslog_close is a NON-STANDARD host import (name "proc_syslog_close")
+// backing closelog(). Returns 0, or a negative errno as Proc_syslog_open.
+func (w *WasiStubs) Proc_syslog_close(m *Module) int32 {
+	w.mu.Lock()
+	l := w.syslogger
+	w.mu.Unlock()
+	if l == nil {
+		return -_wasiENOSYS
+	}
+	return syslogResult(l.Close())
+}
+
 // ----- signals ----------------------------------------------------------------
 //
 // A guest cannot be interrupted: it is ordinary code on a goroutine. A
@@ -5838,6 +5966,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		keepTypeNames: map[string]bool{
 			"WasiExitError":    true,
 			"WasiSignalError":  true,
+			"Syslogger":        true,
+			"SyslogMessage":    true,
 			"wasiSocket":       true,
 			"deadlineListener": true,
 			"wasiSignals":      true,
@@ -5880,6 +6010,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVec":                 true,
 			"appendWasiString":        true,
 			"wasiSignalBit":           true,
+			"syslogResult":            true,
 			"mapNetError":             true,
 			"socketIPv4":              true,
 			"userRecord":              true,
