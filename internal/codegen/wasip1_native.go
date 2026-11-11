@@ -6157,13 +6157,21 @@ func (w *WasiStubs) syncHostSignalsLocked() {
 
 // relayHostSignals posts the host process's signals arriving on from to the
 // guest, until from is closed.
+//
+// SIGPIPE is the exception. The host process's SIGPIPE is the report of a
+// write that failed with EPIPE, and the guest's writes post the signal
+// themselves, at the write, where a process gets it (writeFailure). The
+// host's copy of the same event arrives later, on this goroutine, when the
+// guest may already have another disposition for the signal; so it is
+// dropped here. It is still caught while the guest handles SIGPIPE, which
+// keeps the Go runtime from ending the process over it.
 func (w *WasiStubs) relayHostSignals(from <-chan os.Signal) {
 	for received := range from {
 		hostSig, ok := received.(syscall.Signal)
 		if !ok {
 			continue
 		}
-		if sig := guestSignalOf(hostSig); sig != 0 {
+		if sig := guestSignalOf(hostSig); sig != 0 && sig != wasiSIGPIPE {
 			w.PostSignal(sig)
 		}
 	}

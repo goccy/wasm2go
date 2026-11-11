@@ -611,3 +611,39 @@ func TestSignal_HostProcessRelaysAndIgnores(t *testing.T) {
 		t.Fatalf("after CloseAll: relay=%v relayed=%#x ignored=%#x, want none", relay, relayed, ignored)
 	}
 }
+
+// The host process's own SIGPIPE is not passed on to the guest: a write of
+// the guest that fails with EPIPE posts the signal itself, once, at the
+// write, and the host's report of the same event must not arrive on top.
+func TestSignal_HostProcessSIGPIPEIsTheGuestsOwnWrite(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("the runtime maps signals on darwin and linux only")
+	}
+	skipWithoutStreamWrites(t)
+	w, m := newSignalGuest(t)
+	w.SetHostProcess(true)
+	setDispositions(t, w, m, signalMask(wasiSIGPIPE, wasiSIGUSR1), wasiDefaultIgnoredSignals, 0)
+	t.Cleanup(func() { w.CloseAll() })
+
+	readFd, writeFd := newTestPipe(t, w, m)
+	if rc := w.Fd_close(m, readFd); rc != _wasiESUCCESS {
+		t.Fatalf("close the read end rc=%d", rc)
+	}
+	if n, rc := writeChunk(w, m, writeFd); rc != _wasiEPIPE || n != 0 {
+		t.Fatalf("write without a reader: %d bytes rc=%d, want EPIPE", n, rc)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGPIPE); got != want {
+		t.Fatalf("taken = %#x, want SIGPIPE from the write", got)
+	}
+	// Whatever the host process received for that write has been relayed
+	// by the time a later signal is: only that one arrives.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGUSR1); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep rc=%d, want EINTR from the relayed SIGUSR1", rc)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("taken = %#x, want SIGUSR1 alone (%#x)", got, want)
+	}
+}
