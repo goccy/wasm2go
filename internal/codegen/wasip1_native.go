@@ -3561,6 +3561,63 @@ func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
 	return fi
 }
 
+// HostDescriptor returns the descriptor of the host process behind the
+// guest's descriptor fd, for code of the embedder that runs outside the
+// guest and has to hand a descriptor to the host's system calls: the guest's
+// numbers mean nothing there. ok is false when fd is not open or has no host
+// descriptor: a file of an in-memory filesystem, a standard stream the
+// embedder supplied as a reader or writer, a socket that is not connected,
+// bound or listening yet.
+//
+// The descriptor stays the runtime's: it is valid until the guest closes fd,
+// it must not be closed, and it is in whatever blocking mode the Go runtime
+// keeps it in (non-blocking for sockets and pipes), not the mode the guest
+// asked for.
+func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	var stream any
+	if op != nil {
+		switch op.stdio {
+		case 1:
+			stream = w.stdin
+		case 2:
+			stream = w.stdout
+		case 3:
+			stream = w.stderr
+		default:
+			if op.f != nil {
+				stream = op.f
+			}
+		}
+	}
+	w.mu.Unlock()
+	if op == nil {
+		return 0, false
+	}
+	if stream == nil {
+		if conn := op.netConn(); conn != nil {
+			stream = conn
+		} else if l, _ := op.netListener(); l != nil {
+			stream = l
+		}
+	}
+	raw, hasDescriptor := stream.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !hasDescriptor {
+		return 0, false
+	}
+	rc, err := raw.SyscallConn()
+	if err != nil {
+		return 0, false
+	}
+	if err := rc.Control(func(d uintptr) { hostFd = d }); err != nil {
+		return 0, false
+	}
+	return hostFd, true
+}
+
 // Fd_path is a NON-STANDARD host import (module wasi_snapshot_preview1, name
 // "fd_path") backing fchdir(): a guest's libc keeps the working directory
 // as a path, so a directory that is known only by its descriptor has to be
