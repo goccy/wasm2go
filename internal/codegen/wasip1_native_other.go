@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -129,3 +130,17 @@ func unboundUnixDatagram() (net.Conn, error) {
 // as well. The runtime cannot say on this platform: the socket stays as the
 // network API made it.
 func setIPv6Only(fd uintptr, only bool) error { return nil }
+
+// inheritedOnce lets one instance adopt the descriptors the process was
+// started with (AdoptInheritedDescriptors): they exist once.
+var inheritedOnce sync.Once
+
+// inheritedDescriptors returns the descriptors above the standard three
+// that the process was started with. The runtime cannot tell on this
+// platform: none.
+func inheritedDescriptors() []int { return nil }
+
+// adoptHostDescriptor makes an entry of the guest's descriptor table out of
+// a descriptor the process inherited, which the runtime cannot do on this
+// platform.
+func adoptHostDescriptor(fd int) *wasiOpen { return nil }

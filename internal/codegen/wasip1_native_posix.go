@@ -6,6 +6,9 @@ import (
 	"errors"
 	"net"
 	"os"
+	"sort"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -308,4 +311,105 @@ func setIPv6Only(fd uintptr, only bool) error {
 		value = 1
 	}
 	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, value)
+}
+
+// inheritedOnce lets one instance adopt the descriptors the process was
+// started with (AdoptInheritedDescriptors): they exist once.
+var inheritedOnce sync.Once
+
+// descriptorFlags returns what fcntl(fd, get) reports: the descriptor flags
+// for F_GETFD, the status flags for F_GETFL.
+func descriptorFlags(fd int, get int) (int, error) {
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(get), 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(flags), nil
+}
+
+// inheritedDescriptors returns the descriptors above the standard three
+// that the process was started with, in ascending order: the open ones that
+// are not close-on-exec. A descriptor that reaches a program through exec
+// is not, and every descriptor this process opens itself is — the Go
+// runtime and library see to that.
+func inheritedDescriptors() []int {
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		return nil
+	}
+	var fds []int
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil || fd <= 2 {
+			continue
+		}
+		// The descriptor the directory was read through is listed too: it
+		// is closed by now, or close-on-exec.
+		if flags, err := descriptorFlags(fd, syscall.F_GETFD); err != nil || flags&syscall.FD_CLOEXEC != 0 {
+			continue
+		}
+		fds = append(fds, fd)
+	}
+	sort.Ints(fds)
+	return fds
+}
+
+// adoptHostDescriptor makes an entry of the guest's descriptor table out of
+// a descriptor the process inherited, which the entry takes over. A socket
+// becomes the connection or the listening socket it is — the network API
+// works on a duplicate, and the inherited number is closed; anything else
+// is the file under its number, open for what the descriptor is open for.
+// nil when the descriptor cannot be used.
+func adoptHostDescriptor(fd int) *wasiOpen {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return nil
+	}
+	syscall.CloseOnExec(fd)
+	file := os.NewFile(uintptr(fd), "/dev/fd/"+strconv.Itoa(fd))
+	if st.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
+		defer file.Close()
+		op := &wasiOpen{isSocket: true}
+		typ, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_TYPE)
+		if err != nil {
+			return nil
+		}
+		op.dgram = typ == syscall.SOCK_DGRAM
+		if _, err := syscall.Getpeername(fd); err == nil || op.dgram {
+			conn, err := net.FileConn(file)
+			if err != nil {
+				return nil
+			}
+			op.conn = conn
+		} else {
+			// A stream socket without a peer is held as a bound socket is:
+			// through a listener, which accepts once the socket listens
+			// and gives its address up to a connect. Whether it listens
+			// already the host says where it can (SO_ACCEPTCONN); where it
+			// cannot, the socket counts as listening, and an accept on one
+			// that is not fails as the host fails it.
+			l, err := net.FileListener(file)
+			if err != nil {
+				return nil
+			}
+			if unix, isUnix := l.(*net.UnixListener); isUnix {
+				unix.SetUnlinkOnClose(false)
+			}
+			accepting, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ACCEPTCONN)
+			op.listener = l
+			op.sock = &wasiSocket{listening: err != nil || accepting != 0}
+		}
+		op.family = op.socketFamily()
+		return op
+	}
+	op := &wasiOpen{f: file, isDir: st.Mode&syscall.S_IFMT == syscall.S_IFDIR}
+	if flags, err := descriptorFlags(fd, syscall.F_GETFL); err == nil {
+		switch flags & syscall.O_ACCMODE {
+		case syscall.O_RDONLY:
+			op.noWrite = true
+		case syscall.O_WRONLY:
+			op.noRead = true
+		}
+	}
+	return op
 }
