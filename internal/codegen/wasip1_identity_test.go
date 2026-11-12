@@ -327,6 +327,33 @@ func TestProcKillNeverSendsATokenToTheHost(t *testing.T) {
 	}
 }
 
+// The pid tokens of a family whose first process is the host process are
+// numbers no process of the host has; a command's pid is its own.
+func TestHostProcessFamilyPids(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("needs /bin/sh")
+	}
+	w := DefaultWASI()
+	w.SetHostProcess(true)
+	m := newForkTestModule()
+	token, exited := w.NewProc(nil)
+	defer exited(0)
+	if token <= hostPIDLimit() {
+		t.Fatalf("pid token %d is within the host's pid range (up to %d)", token, hostPIDLimit())
+	}
+	pid := spawnTestCommand(t, w, m, "/bin/sh", "-c", "echo $$; exec sleep 5")
+	defer w.Proc_kill(m, pid, 9)
+	if pid <= 0 || pid > hostPIDLimit() {
+		t.Fatalf("a command's pid %d is not a pid of the host", pid)
+	}
+	if err := syscall.Kill(int(pid), 0); err != nil {
+		t.Fatalf("the host has no process %d: %v", pid, err)
+	}
+	if got := processGroup(t, w, 0); got != int32(syscall.Getpgrp()) {
+		t.Fatalf("group of the host process = %d, want %d", got, syscall.Getpgrp())
+	}
+}
+
 // A spawned process is signalled under the host's number for the signal.
 func TestProcKillMapsTheSignalForASpawnedProcess(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 )
 
 // processUmask is the file mode creation mask of the host process. This
@@ -61,6 +62,40 @@ func setHostProcessGroup(pid, pgid int) error {
 // this platform does not have.
 func newHostSession() (sid int, err error) {
 	return 0, errors.ErrUnsupported
+}
+
+// hostPIDLimit returns the highest pid a process of the host can have, or 0
+// when the runtime does not know this platform's.
+func hostPIDLimit() int32 { return 0 }
+
+// hostProcessTimes returns the CPU time of the host process and of its
+// children, which the runtime cannot read on this platform.
+func hostProcessTimes() (times [4]time.Duration, err error) {
+	return times, errors.ErrUnsupported
+}
+
+// hostPriority and setHostPriority read and set the nice value of processes
+// of the host, which this platform does not have.
+func hostPriority(which, who int) (int, error) { return 0, errors.ErrUnsupported }
+
+func setHostPriority(which, who, nice int) error { return errors.ErrUnsupported }
+
+// makeHostFIFO creates a FIFO in the host filesystem, which this platform
+// does not have.
+func makeHostFIFO(path string, perm os.FileMode) error { return errors.ErrUnsupported }
+
+// setHostIDs changes the user or group ids of the host process, which this
+// platform does not have.
+func setHostIDs(request int32, a, b, c int) error { return errors.ErrUnsupported }
+
+// setHostGroups sets the supplementary groups of the host process, which
+// this platform does not have.
+func setHostGroups(gids []int) error { return errors.ErrUnsupported }
+
+// hostSystemName returns what uname reports, which the runtime cannot ask
+// on this platform.
+func hostSystemName() (fields [5]string, err error) {
+	return fields, errors.ErrUnsupported
 }
 
 // hostStreamWrites says whether the host can write to a stream without

@@ -43,3 +43,41 @@ func fdWritable(fd uintptr) bool {
 func statTimes(st *syscall.Stat_t) (atime, ctime time.Time) {
 	return time.Unix(st.Atimespec.Unix()), time.Unix(st.Ctimespec.Unix())
 }
+
+// hostPIDLimit returns the highest pid a process of the host can have
+// (PID_MAX).
+func hostPIDLimit() int32 { return 99999 }
+
+// hostPriority returns the nice value of a process, a process group or a
+// user of the host.
+func hostPriority(which, who int) (int, error) {
+	return syscall.Getpriority(which, who)
+}
+
+// setHostRESUID and setHostRESGID set the real, effective and saved ids of
+// the host process. The system has no call that names the saved id: it
+// follows the effective one, and only that request can be met.
+func setHostRESUID(ruid, euid, suid int) error {
+	if suid != -1 && suid != euid {
+		return syscall.EINVAL
+	}
+	return syscall.Setreuid(ruid, euid)
+}
+
+func setHostRESGID(rgid, egid, sgid int) error {
+	if sgid != -1 && sgid != egid {
+		return syscall.EINVAL
+	}
+	return syscall.Setregid(rgid, egid)
+}
+
+// hostSystemName returns what uname reports: the system's name, the node's
+// name, the release, the version and the machine type.
+func hostSystemName() (fields [5]string, err error) {
+	for i, key := range [...]string{"kern.ostype", "kern.hostname", "kern.osrelease", "kern.version", "hw.machine"} {
+		if fields[i], err = syscall.Sysctl(key); err != nil {
+			return fields, err
+		}
+	}
+	return fields, nil
+}

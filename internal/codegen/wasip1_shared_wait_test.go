@@ -19,7 +19,7 @@ func sharedWaiters(t *testing.T, w *WasiStubs, n int) (instances []*WasiStubs, m
 		if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
 			t.Fatalf("Proc_signal_register rc=%d", rc)
 		}
-		setDispositions(t, child, cm, signalMask(wasiSIGTERM), wasiDefaultIgnoredSignals, 0)
+		setDispositions(t, child, cm, signalMask(wasiSIGTERM), 0, 0)
 		instances = append(instances, child)
 		modules = append(modules, cm)
 	}

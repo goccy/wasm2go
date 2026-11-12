@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 )
 
 // processUmask is the file mode creation mask of the host process. The only
@@ -147,6 +148,61 @@ func setHostProcessGroup(pid, pgid int) error {
 // newHostSession makes the host process the leader of a new session.
 func newHostSession() (sid int, err error) {
 	return syscall.Setsid()
+}
+
+// hostProcessTimes returns the CPU time of the host process — user, then
+// system — and of the children it has waited for.
+func hostProcessTimes() (times [4]time.Duration, err error) {
+	var self, children syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &self); err != nil {
+		return times, err
+	}
+	if err := syscall.Getrusage(syscall.RUSAGE_CHILDREN, &children); err != nil {
+		return times, err
+	}
+	return [4]time.Duration{
+		time.Duration(self.Utime.Nano()), time.Duration(self.Stime.Nano()),
+		time.Duration(children.Utime.Nano()), time.Duration(children.Stime.Nano()),
+	}, nil
+}
+
+// setHostPriority sets the nice value of processes of the host.
+func setHostPriority(which, who, nice int) error {
+	return syscall.Setpriority(which, who, nice)
+}
+
+// makeHostFIFO creates a FIFO in the host filesystem.
+func makeHostFIFO(path string, perm os.FileMode) error {
+	return syscall.Mkfifo(path, uint32(perm.Perm()))
+}
+
+// setHostIDs changes the user or group ids of the host process; see
+// Proc_setids for the requests.
+func setHostIDs(request int32, a, b, c int) error {
+	switch request {
+	case wasiSetUID:
+		return syscall.Setuid(a)
+	case wasiSetEUID:
+		return syscall.Seteuid(a)
+	case wasiSetREUID:
+		return syscall.Setreuid(a, b)
+	case wasiSetRESUID:
+		return setHostRESUID(a, b, c)
+	case wasiSetGID:
+		return syscall.Setgid(a)
+	case wasiSetEGID:
+		return syscall.Setegid(a)
+	case wasiSetREGID:
+		return syscall.Setregid(a, b)
+	case wasiSetRESGID:
+		return setHostRESGID(a, b, c)
+	}
+	return syscall.EINVAL
+}
+
+// setHostGroups sets the supplementary groups of the host process.
+func setHostGroups(gids []int) error {
+	return syscall.Setgroups(gids)
 }
 
 // hostStreamWrites says that the host can write to a stream without waiting

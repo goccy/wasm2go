@@ -26,7 +26,7 @@ func newSignalGuest(t *testing.T, handled ...int32) (*WasiStubs, *Module) {
 	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
 		t.Fatalf("first Proc_signal_register rc=%d, want 0 (new)", rc)
 	}
-	setDispositions(t, w, m, signalMask(handled...), wasiDefaultIgnoredSignals, 0)
+	setDispositions(t, w, m, signalMask(handled...), 0, 0)
 	return w, m
 }
 

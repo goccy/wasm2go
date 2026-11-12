@@ -1347,8 +1347,10 @@ type wasiProc struct {
 // them. One is shared by every WasiStubs of the family, each of which has
 // its own lock, hence the separate mutex.
 type wasiPIDs struct {
-	mu   sync.Mutex
-	next int32
+	mu sync.Mutex
+	// first is the first token of the family and next the one handed out
+	// next. first is immutable.
+	first, next int32
 	// procs holds every process of the family that exists: from the moment
 	// it can be signalled until it has been waited for, or has finished
 	// with nobody left to wait for it. An instance waits only for the
@@ -1395,10 +1397,11 @@ func (p *wasiPIDs) alloc() int32 {
 func (p *wasiPIDs) allocated(pid int32) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return pid >= wasiFirstPID && pid < p.next
+	return pid >= p.first && pid < p.next
 }
 
-// wasiFirstPID is the first pid token a fresh instance hands out.
+// wasiFirstPID is the first pid token a fresh instance hands out, unless the
+// guest is the host process (see pidsLocked).
 const wasiFirstPID int32 = 1000
 
 // DefaultWASI returns a WasiStubs configured for typical CLI use: real
@@ -1717,6 +1720,7 @@ func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
 		fd++
 	}
 	fds[fd] = op
+	delete(w.cloexec, fd)
 	return fd
 }
 
@@ -1724,7 +1728,16 @@ func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
 // holds w.mu.
 func (w *WasiStubs) pidsLocked() *wasiPIDs {
 	if w.pids == nil {
-		w.pids = &wasiPIDs{next: wasiFirstPID}
+		first := wasiFirstPID
+		if w.hostProcess {
+			// The guest sees the host's processes by their own pids — the
+			// commands it starts among them — so the tokens of the family
+			// are numbers no host process ever has.
+			if limit := hostPIDLimit(); limit >= first {
+				first = limit + 1
+			}
+		}
+		w.pids = &wasiPIDs{first: first, next: first}
 	}
 	return w.pids
 }
@@ -1769,7 +1782,11 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 		w.procFinished = nil
 	}
 	// A process whose parent instance is gone (CloseAll emptied the table)
-	// has nobody to wait for it: it does not stay behind as a zombie.
+	// has nobody to wait for it: it does not stay behind as a zombie. Nor
+	// does the child of a process that ignores SIGCHLD.
+	if w.sig.reapsChildren() {
+		w.reapFinishedLocked()
+	}
 	waitedFor := false
 	for _, pr := range w.procs {
 		if pr == proc {
@@ -1791,6 +1808,19 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 	w.mu.Unlock()
 	// The parent is told, as the kernel tells a process whose child ended.
 	w.PostSignal(wasiSIGCHLD)
+}
+
+// reapFinishedLocked forgets every process of this instance that has ended:
+// what happens to the children of a process that ignores SIGCHLD. Caller
+// holds w.mu.
+func (w *WasiStubs) reapFinishedLocked() {
+	for pid, proc := range w.procs {
+		select {
+		case <-proc.done:
+			w.dropProcLocked(pid)
+		default:
+		}
+	}
 }
 
 // NewProc registers a process that the embedder runs itself (not a host
@@ -1873,8 +1903,12 @@ func (w *WasiStubs) readCStrArray(m *Module, ptr int32) (out []string, ok bool) 
 // process: path is the executable, argv/envp are NUL-terminated char** in
 // linear memory. stdinFd/stdoutFd/stderrFd name the guest fds the child gets
 // as its fds 0/1/2 (see childReaderLocked); a negative one stands for the
-// instance's own stream. The new pid token is written at pidOutPtr. Returns
-// 0 or a negative errno.
+// instance's own stream. Every other descriptor of the guest that is not
+// marked close-on-exec (Fd_cloexec) is the child's too, under the same
+// number, when the host can hand it over (see inheritedFilesLocked). The
+// pid the guest knows the command by is written at pidOutPtr: the command's
+// own pid when the guest is the host process, a pid token otherwise.
+// Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	path, ok := w.readCStr(m, pathPtr)
 	if !ok || path == "" {
@@ -1905,7 +1939,16 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	cin := w.childReaderLocked(stdinFd)
 	cout := w.childWriterLocked(stdoutFd, w.stdout)
 	cerr := w.childWriterLocked(stderrFd, w.stderr)
+	inherited, borrowed := w.inheritedFilesLocked()
+	hostPID := w.hostProcess
 	w.mu.Unlock()
+	// The duplicates made for the child are this process's to close, once
+	// the child has its own.
+	defer func() {
+		for _, file := range borrowed {
+			_ = file.Close()
+		}
+	}()
 	if hook != nil && !hook(path, argv) {
 		return -_wasiEACCES
 	}
@@ -1935,6 +1978,7 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	// fd straight to the child; capture works by the guest reading the pipe's
 	// other end via Fd_read.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = cin, cout, cerr
+	cmd.ExtraFiles = inherited
 	if err := cmd.Start(); err != nil {
 		return -mapExecError(err)
 	}
@@ -1954,11 +1998,108 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	}()
 
 	w.mu.Lock()
-	pid := w.addProcLocked(proc)
+	var pid int32
+	if hostPID {
+		// The pid is the host's to give. One it gives again while the
+		// guest has not waited for the earlier command of that pid names
+		// the new command from here on.
+		pid = int32(cmd.Process.Pid)
+		if w.procs == nil {
+			w.procs = map[int32]*wasiProc{}
+		}
+		w.procs[pid] = proc
+	} else {
+		pid = w.addProcLocked(proc)
+	}
 	w.enterProcLocked(pid)
 	w.mu.Unlock()
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
+	return _wasiESUCCESS
+}
+
+// wasiInheritedFDLimit bounds the descriptor numbers a command inherits
+// beyond its standard streams.
+const wasiInheritedFDLimit int32 = 1024
+
+// inheritedFilesLocked returns what a command started now inherits besides
+// its standard streams, in the form os/exec takes it: entry i is the
+// command's descriptor 3+i, nil for a number the command does not get. A
+// descriptor is inherited when the guest has not marked it close-on-exec and
+// the host process holds it as a file, a pipe end or a socket; one that
+// exists only inside this runtime (a file of an in-memory filesystem) has
+// nothing a command could be given. borrowed are the duplicates made for
+// the purpose, which the caller closes once the command has started. Caller
+// holds w.mu.
+func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
+	for fd, op := range w.fdsLocked() {
+		if fd < 3 || fd >= wasiInheritedFDLimit || w.cloexec[fd] {
+			continue
+		}
+		var file *os.File
+		switch {
+		case op.stdio != 0:
+			stream := [...]any{w.stdin, w.stdout, w.stderr}[op.stdio-1]
+			file, _ = stream.(*os.File)
+		case op.f != nil:
+			file, _ = op.f.(*os.File)
+		default:
+			var socket interface{ File() (*os.File, error) }
+			if conn := op.netConn(); conn != nil {
+				socket, _ = conn.(interface{ File() (*os.File, error) })
+			} else if l, _ := op.netListener(); l != nil {
+				socket, _ = l.(interface{ File() (*os.File, error) })
+			}
+			if socket != nil {
+				if dup, err := socket.File(); err == nil {
+					file = dup
+					borrowed = append(borrowed, dup)
+				}
+			}
+		}
+		if file == nil {
+			continue
+		}
+		for int32(len(files)) <= fd-3 {
+			files = append(files, nil)
+		}
+		files[fd-3] = file
+	}
+	return files, borrowed
+}
+
+// Fd_cloexec is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_cloexec") backing fcntl's F_GETFD and F_SETFD: the close-on-exec
+// flag of a descriptor, which decides whether a command the guest starts
+// inherits it (Proc_spawn). The flag as it was is written at oldPtr (u32, 0
+// or 1); with set non-zero it then becomes value. It belongs to the
+// descriptor number, not to the open file: a duplicate starts without it.
+// Returns 0 or a negative errno.
+func (w *WasiStubs) Fd_cloexec(m *Module, fd, set, value, oldPtr int32) int32 {
+	out := w.memSlice(m, oldPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fdsLocked()[fd] == nil {
+		return -_wasiEBADF
+	}
+	old := uint32(0)
+	if w.cloexec[fd] {
+		old = 1
+	}
+	binary.LittleEndian.PutUint32(out, old)
+	if set != 0 {
+		if value != 0 {
+			if w.cloexec == nil {
+				w.cloexec = map[int32]bool{}
+			}
+			w.cloexec[fd] = true
+		} else {
+			delete(w.cloexec, fd)
+		}
+	}
 	return _wasiESUCCESS
 }
 
@@ -2016,7 +2157,8 @@ func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 // (WNOHANG) makes it return without blocking when the child is still running
 // (the guest sees the documented "0 means no child ready" result, signalled
 // by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a negative
-// errno: ECHILD for an unknown pid, EINTR when a signal was posted to the
+// errno: ECHILD for an unknown pid — and, when the guest ignores SIGCHLD,
+// once the process has finished — EINTR when a signal was posted to the
 // guest before the process finished.
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
 	out := w.memSlice(m, statusOutPtr, 4)
@@ -2042,7 +2184,12 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 	}
 	w.mu.Lock()
 	w.dropProcLocked(pid)
+	reaped := w.sig.reapsChildren()
 	w.mu.Unlock()
+	if reaped {
+		// The child of a process that ignores SIGCHLD left no status.
+		return -_wasiECHILD
+	}
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
 }
@@ -2066,6 +2213,9 @@ func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr in
 	const wnohang = 1
 	for {
 		w.mu.Lock()
+		if w.sig.reapsChildren() {
+			w.reapFinishedLocked()
+		}
 		if len(w.procs) == 0 {
 			w.mu.Unlock()
 			return -_wasiECHILD
@@ -2261,15 +2411,19 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 //
 //   - A host process (Proc_spawn) receives the signal through the OS, under
 //     the number the host has for that signal.
+//
 //   - An embedder-run process (NewProc, Proc_fork) receives it through the
 //     kill function the embedder registered. Without one the process exists
 //     but cannot be signalled, which is reported as EPERM.
+//
 //   - A process that has finished but has not been waited for yet is a
 //     zombie: as with kill(2), signalling it succeeds and does nothing.
+//
 //   - The process need not be the caller's child: any process of the fork
 //     family is reached by its pid — a sibling, the parent of a pseudo-process
 //     that is itself a fork child, a grandchild. (Waiting stays limited to
 //     the caller's own children.)
+//
 //   - A pid that is no process of the family names a process of the host
 //     when the guest is the host process (SetHostProcess), and nothing
 //     otherwise; see killOutside.
@@ -2603,8 +2757,13 @@ func mapOSError(err error) int32 {
 		return _wasiENOENT
 	case errors.Is(err, fs.ErrExist):
 		return _wasiEEXIST
+	case errors.Is(err, syscall.EPERM):
+		// before fs.ErrPermission, which stands for EACCES as well
+		return _wasiEPERM
 	case errors.Is(err, fs.ErrPermission):
 		return _wasiEACCES
+	case errors.Is(err, syscall.ESRCH):
+		return _wasiESRCH
 	case errors.Is(err, syscall.ENOTDIR):
 		return _wasiENOTDIR
 	case errors.Is(err, syscall.EISDIR):
@@ -4142,6 +4301,7 @@ func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 		closeErr = closeWasiOpen(dst)
 	}
 	w.fdsLocked()[to] = src
+	delete(w.cloexec, to)
 	src.addRef()
 	if closeErr != nil {
 		return mapOSError(closeErr)
@@ -4170,6 +4330,7 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 		closeErr = closeWasiOpen(dst)
 	}
 	w.fdsLocked()[to] = src
+	delete(w.cloexec, to)
 	delete(w.fdsLocked(), from)
 	if closeErr != nil {
 		return mapOSError(closeErr)
@@ -5486,7 +5647,9 @@ const (
 
 // Proc_ids is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "proc_ids") backing getpid, getppid and the getuid family. It writes
-// six little-endian u32 at outPtr: pid, ppid, uid, euid, gid, egid. Returns
+// six little-endian u32 at outPtr: pid, ppid, uid, euid, gid, egid. A
+// process made by Proc_fork has the pid it was forked under, and for a
+// parent the process that forked it until that one is gone, then 1. Returns
 // 0 or a negative errno.
 func (w *WasiStubs) Proc_ids(m *Module, outPtr int32) int32 {
 	out := w.memSlice(m, outPtr, 24)
@@ -5535,6 +5698,243 @@ func (w *WasiStubs) processID() (pid int32, alive bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.processIDLocked(), !w.ended
+}
+
+// ----- what the host process is and does ---------------------------------------
+
+// Proc_times is a NON-STANDARD host import (name "proc_times") backing
+// times(2): four little-endian u64 of nanoseconds are written at outPtr —
+// the user and system CPU time of the process, then those of the children
+// it has waited for. Every process of a fork family is part of one host
+// process, whose times these are. Returns 0, or a negative errno: ENOSYS on
+// a host that does not account for them.
+func (w *WasiStubs) Proc_times(m *Module, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 32)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	times, err := hostProcessTimes()
+	if err != nil {
+		return -_wasiENOSYS
+	}
+	for i, d := range times {
+		binary.LittleEndian.PutUint64(out[i*8:], uint64(d))
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_priority is a NON-STANDARD host import (name "proc_priority")
+// backing getpriority, setpriority and nice for a guest that is the host
+// process. which is PRIO_PROCESS (0), PRIO_PGRP (1) or PRIO_USER (2) and
+// who the id it applies to, 0 for the caller's own; a process of the fork
+// family is the host process. With set non-zero the nice value becomes
+// value; the nice value then in effect is written at outPtr (i32). Returns
+// 0, or a negative errno: ENOSYS for a guest that is not the host process,
+// which has no priority to speak of.
+func (w *WasiStubs) Proc_priority(m *Module, which, who, set, value, outPtr int32) int32 {
+	out := w.memSlice(m, outPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	host := w.hostProcess
+	self := w.processIDLocked()
+	token := w.pidsLocked().allocated(who)
+	w.mu.Unlock()
+	if !host {
+		return -_wasiENOSYS
+	}
+	if which == 0 && (who == self || token) {
+		who = 0
+	}
+	if set != 0 {
+		if err := setHostPriority(int(which), int(who), int(value)); err != nil {
+			return -mapOSError(err)
+		}
+	}
+	nice, err := hostPriority(int(which), int(who))
+	if err != nil {
+		return -mapOSError(err)
+	}
+	binary.LittleEndian.PutUint32(out, uint32(int32(nice)))
+	return _wasiESUCCESS
+}
+
+// Path_mkfifo is a NON-STANDARD host import (name "path_mkfifo") backing
+// mkfifo: it creates a FIFO at the preopen-relative path with the given
+// permission bits, less the instance's umask. Returns 0, or a negative
+// errno: ENOSYS when the filesystem of the instance has no FIFOs.
+func (w *WasiStubs) Path_mkfifo(m *Module, pathPtr, pathLen, mode int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	path := string(pathSlice)
+	if !w.checkFS(path, true) {
+		return -_wasiEACCES
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	maker, can := fsys.(interface {
+		Mkfifo(name string, perm os.FileMode) error
+	})
+	if !can {
+		return -_wasiENOSYS
+	}
+	if err := maker.Mkfifo(path, w.createMode(unixFileMode(uint32(mode)).Perm())); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			return -_wasiENOSYS
+		}
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Mkfifo creates a FIFO in the host filesystem.
+func (o osFS) Mkfifo(name string, perm os.FileMode) error {
+	return makeHostFIFO(o.join(name), perm)
+}
+
+// Chown changes the owner and group of a file of the host filesystem; -1
+// leaves an id as it is. With follow false a symbolic link itself is
+// changed, not the file it names.
+func (o osFS) Chown(name string, uid, gid int, follow bool) error {
+	if follow {
+		return os.Chown(o.join(name), uid, gid)
+	}
+	return os.Lchown(o.join(name), uid, gid)
+}
+
+// Path_chown is a NON-STANDARD host import (name "path_chown") backing
+// chown and lchown (follow 0) for the preopen-relative path; an id of -1
+// is left as it is. Returns 0, or a negative errno: ENOSYS when the
+// filesystem of the instance keeps no owners.
+func (w *WasiStubs) Path_chown(m *Module, pathPtr, pathLen, uid, gid, follow int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	path := string(pathSlice)
+	if !w.checkFS(path, true) {
+		return -_wasiEACCES
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	owner, can := fsys.(interface {
+		Chown(name string, uid, gid int, follow bool) error
+	})
+	if !can {
+		return -_wasiENOSYS
+	}
+	if err := owner.Chown(path, int(uid), int(gid), follow != 0); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			return -_wasiENOSYS
+		}
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Fd_chown is a NON-STANDARD host import (name "fd_chown") backing fchown.
+// Returns 0, or a negative errno: ENOSYS for a descriptor that is not a
+// file of the host.
+func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	file, isHostFile := op.f.(*os.File)
+	if !isHostFile {
+		return -_wasiENOSYS
+	}
+	if err := file.Chown(int(uid), int(gid)); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// The requests of Proc_setids.
+const (
+	wasiSetUID    int32 = iota // setuid(a)
+	wasiSetEUID                // seteuid(a)
+	wasiSetREUID               // setreuid(a, b)
+	wasiSetRESUID              // setresuid(a, b, c)
+	wasiSetGID                 // setgid(a)
+	wasiSetEGID                // setegid(a)
+	wasiSetREGID               // setregid(a, b)
+	wasiSetRESGID              // setresgid(a, b, c)
+)
+
+// Proc_setids is a NON-STANDARD host import (name "proc_setids") backing
+// the setuid and setgid families for a guest that is the host process:
+// request names the call (wasiSetUID ...) and a, b, c are its arguments, -1
+// for an id to leave alone. The ids are the host process's, so every
+// process of the fork family changes with it. Returns 0, or a negative
+// errno: ENOSYS for a guest that is not the host process.
+func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
+	if !w.hostIdentity() {
+		return -_wasiENOSYS
+	}
+	if err := setHostIDs(request, int(a), int(b), int(c)); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			return -_wasiENOSYS
+		}
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_setgroups is a NON-STANDARD host import (name "proc_setgroups")
+// backing setgroups for a guest that is the host process: count u32 group
+// ids at listPtr become the supplementary groups. Returns 0, or a negative
+// errno: ENOSYS for a guest that is not the host process.
+func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
+	if count < 0 || count > 65536 {
+		return -_wasiEINVAL
+	}
+	list := w.memSlice(m, listPtr, count*4)
+	if list == nil && count > 0 {
+		return -_wasiEFAULT
+	}
+	if !w.hostIdentity() {
+		return -_wasiENOSYS
+	}
+	gids := make([]int, count)
+	for i := range gids {
+		gids[i] = int(binary.LittleEndian.Uint32(list[i*4:]))
+	}
+	if err := setHostGroups(gids); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			return -_wasiENOSYS
+		}
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_uname is a NON-STANDARD host import (name "proc_uname") backing
+// uname and gethostname for a guest that is the host process. The record
+// (writeWasiRecord) is five strings: the system's name, the node's name on
+// the network, the release, the version and the machine type. Returns 0, or
+// a negative errno: ENOSYS for a guest that is not the host process — it is
+// a system of its own — and on a host that cannot say.
+func (w *WasiStubs) Proc_uname(m *Module, bufPtr, bufLen, neededPtr int32) int32 {
+	if !w.hostIdentity() {
+		return -_wasiENOSYS
+	}
+	fields, err := hostSystemName()
+	if err != nil {
+		return -_wasiENOSYS
+	}
+	var rec []byte
+	for _, field := range fields {
+		rec = appendWasiString(rec, field)
+	}
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
 }
 
 // ----- process groups ---------------------------------------------------------
@@ -6547,8 +6947,9 @@ type wasiSignals struct {
 	flagModule *Module
 	flagAddr   uint32
 	// handled, ignored and blocked are the dispositions the guest reported:
-	// the signals it has a handler for, the ones that have no effect on it
-	// (ignored explicitly or by their default action), and its signal mask.
+	// the signals it has a handler for, the ones it ignores explicitly
+	// (SIG_IGN), and its signal mask. A signal in neither of the first two
+	// has its default action; see discards.
 	handled, ignored, blocked uint64
 	// pending holds the posted signals the guest has not taken yet.
 	pending uint64
@@ -6572,6 +6973,19 @@ type wasiSignals struct {
 	relay       chan os.Signal
 	relayed     uint64
 	hostIgnored uint64
+}
+
+// discards returns the signals that have no effect on the guest: the ones it
+// ignores, and the ones left at a default action that is to do nothing.
+func (s *wasiSignals) discards() uint64 {
+	return s.ignored | wasiDefaultIgnoredSignals&^s.handled
+}
+
+// reapsChildren reports whether the guest ignores SIGCHLD explicitly. As
+// POSIX has it, a child of such a process leaves nothing to wait for when
+// it ends, and a wait reports ECHILD once no child is left running.
+func (s *wasiSignals) reapsChildren() bool {
+	return s.ignored&wasiSignalBit(wasiSIGCHLD) != 0
 }
 
 // wasiSignalBit returns the mask bit of a signal number, or 0 for a number
@@ -6638,7 +7052,7 @@ func (w *WasiStubs) PostSignal(sig int32) {
 		}
 		return
 	}
-	if s.ignored&bit != 0 {
+	if s.discards()&bit != 0 {
 		return
 	}
 	s.pending |= bit
@@ -6725,16 +7139,20 @@ func (w *WasiStubs) Proc_signal_register(m *Module, flagPtr int32) int32 {
 
 // Proc_signal_dispositions is a NON-STANDARD host import (name
 // "proc_signal_dispositions"). The guest reports, as signal masks, the
-// signals it has a handler for, the signals that have no effect on it
-// (ignored explicitly or by default action) and the signals it has blocked,
-// every time one of the three changes. A pending signal that is now ignored
-// is discarded, as sigaction(2) does. Returns 0.
+// signals it has a handler for, the signals it ignores explicitly (SIG_IGN)
+// and the signals it has blocked, every time one of the three changes. A
+// pending signal that now has no effect is discarded, as sigaction(2) does.
+// Ignoring SIGCHLD also gives up the children that have ended and were not
+// waited for (see wasiSignals.reapsChildren). Returns 0.
 func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocked int64) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s := &w.sig
 	s.handled, s.ignored, s.blocked = uint64(handled), uint64(ignored), uint64(blocked)
-	s.pending &^= s.ignored
+	s.pending &^= s.discards()
+	if s.reapsChildren() {
+		w.reapFinishedLocked()
+	}
 	if s.flagModule != nil && s.pending&^s.blocked != 0 {
 		// Deliverable now: unblocked while pending, or posted to a forked
 		// guest before it had registered.
