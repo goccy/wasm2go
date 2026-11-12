@@ -858,6 +858,27 @@ func TestWasi_ProcKillAcrossTheFamily(t *testing.T) {
 	_ = second
 }
 
+// The first process of an isolated family is known to its descendants by
+// the pid getppid reports, and takes their signals.
+func TestWasi_ProcKillTheIsolatedRoot(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	if rc := root.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	root.Proc_signal_dispositions(m, int64(wasiSignalBit(10)), 0, 0)
+	child, cm := root.Fork(), newForkTestModule()
+	if rc := child.Proc_kill(cm, wasiIsolatedPID, 10); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_kill of the root rc=%d", rc)
+	}
+	const maskOff int32 = 4200
+	if rc := root.Proc_signal_take(m, maskOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_signal_take rc=%d", rc)
+	}
+	if got := binary.LittleEndian.Uint64(m.memory[maskOff:]); got != wasiSignalBit(10) {
+		t.Errorf("signals the root took = %#x, want signal 10", got)
+	}
+}
+
 // The native stubs are spliced into generated bundles through an allow-list;
 // every declaration the fork support needs must survive it.
 func TestWasip1EmitKeepsForkSupport(t *testing.T) {

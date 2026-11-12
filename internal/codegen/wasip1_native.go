@@ -1444,6 +1444,22 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		op.addRef()
 		child.fdTable[fd] = op
 	}
+	if !w.forked && !w.hostProcess {
+		// The first process of an isolated family has a pid its
+		// descendants know (getppid), and they may signal it. (The pid of
+		// a guest that is the host process is the host's: a signal to it
+		// goes through the host, see killOutside.)
+		pids := w.pidsLocked()
+		if pids.find(wasiIsolatedPID) == nil {
+			pids.enter(wasiIsolatedPID, &wasiProc{
+				done: make(chan struct{}),
+				kill: func(sig int32) error {
+					w.PostSignal(sig)
+					return nil
+				},
+			})
+		}
+	}
 	return child
 }
 
