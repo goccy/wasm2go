@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -23,6 +24,19 @@ const (
 func newSignalGuest(t *testing.T, handled ...int32) (*WasiStubs, *Module) {
 	t.Helper()
 	w, m := newProcTestStubs(t)
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("first Proc_signal_register rc=%d, want 0 (new)", rc)
+	}
+	setDispositions(t, w, m, signalMask(handled...), 0, 0)
+	return w, m
+}
+
+// newSignalGuestIn is newSignalGuest with dir as the root of the guest's
+// filesystem.
+func newSignalGuestIn(t *testing.T, dir string, handled ...int32) (*WasiStubs, *Module) {
+	t.Helper()
+	w, m := newTestStubs(t, dir)
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
 		t.Fatalf("first Proc_signal_register rc=%d, want 0 (new)", rc)
 	}

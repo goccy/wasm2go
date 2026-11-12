@@ -2885,6 +2885,7 @@ const (
 	_wasiENOTSOCK        int32 = 57
 	_wasiENOTSUP         int32 = 58
 	_wasiENOSYS          int32 = 52
+	_wasiENXIO           int32 = 60
 	_wasiEPERM           int32 = 63
 	_wasiEPIPE           int32 = 64
 	_wasiEPROTONOSUPPORT int32 = 66
@@ -2923,6 +2924,8 @@ func mapOSError(err error) int32 {
 		return _wasiEAGAIN
 	case errors.Is(err, syscall.EPIPE):
 		return _wasiEPIPE
+	case errors.Is(err, syscall.ENXIO):
+		return _wasiENXIO
 	case errors.Is(err, errors.ErrUnsupported):
 		return _wasiENOTSUP
 	}
@@ -3478,6 +3481,14 @@ func (w *WasiStubs) iovecSlices(m *Module, iovs, iovsLen int32) ([][]byte, bool)
 // (EOF included) or short read; returns the bytes read. Shared by the
 // wasm32 and wasm64 fd_read bindings — only the iovec layout differs.
 func readVec(src io.Reader, bufs [][]byte) uint64 {
+	total, _ := readVecFailure(src, bufs)
+	return total
+}
+
+// readVecFailure is readVec that also returns the error that ended the
+// read, if one did.
+func readVecFailure(src io.Reader, bufs [][]byte) (uint64, error) {
+	var failure error
 	var total uint64
 	for _, buf := range bufs {
 		n, err := src.Read(buf)
@@ -3491,10 +3502,11 @@ func readVec(src io.Reader, bufs [][]byte) uint64 {
 		}
 		total += uint64(n)
 		if err != nil || n < len(buf) {
+			failure = err
 			break
 		}
 	}
-	return total
+	return total, failure
 }
 
 // writeVec drains bufs into dst in order, stopping at the first failed
@@ -4807,14 +4819,27 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	}
 	var f File
 	var err error
-	if fi, serr := fsys.Stat(rel); serr == nil && fi.Mode()&os.ModeNamedPipe != 0 &&
-		fdflags&wasiFdflagNonblock == 0 && flag&os.O_RDWR == 0 {
+	isFIFO := false
+	if fi, serr := fsys.Stat(rel); serr == nil {
+		isFIFO = fi.Mode()&os.ModeNamedPipe != 0
+	}
+	switch {
+	case isFIFO && fdflags&wasiFdflagNonblock == 0 && flag&os.O_RDWR == 0:
 		var errno int32
 		if f, errno = w.openFIFO(fsys, rel, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
-	} else if f, err = fsys.OpenFile(rel, flag, w.createMode(mode)); err != nil {
-		return -1, mapOSError(err)
+	case isFIFO && fdflags&wasiFdflagNonblock != 0:
+		// An open that does not wait is the host's own: a reader gets the
+		// FIFO whether or not anyone writes to it, a writer is refused
+		// (ENXIO) while nobody reads.
+		if f, err = fsys.OpenFile(rel, flag|syscall.O_NONBLOCK, w.createMode(mode)); err != nil {
+			return -1, mapOSError(err)
+		}
+	default:
+		if f, err = fsys.OpenFile(rel, flag, w.createMode(mode)); err != nil {
+			return -1, mapOSError(err)
+		}
 	}
 	st, statErr := f.Stat()
 	if statErr != nil {
@@ -4841,7 +4866,10 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 // open(2) does: it waits until the other end is open too, and a signal
 // posted to the guest ends the wait with EINTR. The host's open cannot be
 // called off, so it is made to return: the other end is opened for a
-// moment without waiting, and what the two calls opened is closed again.
+// moment without waiting, and what the two calls opened is closed again
+// before the guest is told — an open that was interrupted leaves no end of
+// the FIFO open behind, which the next open of the other end would take for
+// a peer.
 func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (File, int32) {
 	posted := make(chan struct{})
 	if !w.beginBlocking(func() { close(posted) }) {
@@ -4870,20 +4898,58 @@ func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (F
 	if flag&os.O_WRONLY != 0 {
 		other = os.O_RDONLY
 	}
-	end, endErr := fsys.OpenFile(rel, other|syscall.O_NONBLOCK, 0)
-	// Without the other end (the FIFO is gone from its name) the open
-	// stays where it is until someone else opens the FIFO, and is given
-	// up then.
-	go func() {
-		if r := <-result; r.err == nil {
-			_ = r.f.Close()
-		}
+	for {
+		end, endErr := fsys.OpenFile(rel, other|syscall.O_NONBLOCK, 0)
 		if endErr == nil {
+			// The other end is open: the host's open returns, now or as
+			// soon as it gets as far as looking for it.
+			r := <-result
 			_ = end.Close()
+			if r.err == nil {
+				_ = r.f.Close()
+			}
+			return nil, _wasiEINTR
 		}
-	}()
-	return nil, _wasiEINTR
+		// The other end is not to be had. A writer's end is refused
+		// (ENXIO) for as long as the host's open for reading has not got
+		// as far as waiting, which it will: the attempt is repeated. Any
+		// other failure stays (the FIFO is gone from its name): the open
+		// is left where it is until someone else opens the FIFO, and is
+		// given up then.
+		retry := errors.Is(endErr, syscall.ENXIO)
+		var again <-chan time.Time
+		if retry {
+			again = time.After(fifoUnblockRetry)
+		} else {
+			closed := make(chan time.Time)
+			close(closed)
+			again = closed
+		}
+		select {
+		case r := <-result:
+			if r.err != nil {
+				return nil, _wasiEINTR
+			}
+			// It returned by itself: a peer opened the FIFO meanwhile, and
+			// the open is done. The signal is still to be noticed.
+			w.keepInterrupt()
+			return r.f, _wasiESUCCESS
+		case <-again:
+		}
+		if !retry {
+			go func() {
+				if r := <-result; r.err == nil {
+					_ = r.f.Close()
+				}
+			}()
+			return nil, _wasiEINTR
+		}
+	}
 }
+
+// fifoUnblockRetry is how long openFIFO waits before it tries again to open
+// the other end of a FIFO whose open it has to make return.
+const fifoUnblockRetry = time.Millisecond
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
 	if dirFd != 3 {
@@ -7966,7 +8032,14 @@ func (w *WasiStubs) readStreamAs(op *wasiOpen, src deadlineReader, bufs [][]byte
 	ready, refused := op.probeRead(src, time.Now().Add(pollProbeGrace), nil)
 	if refused {
 		// A stream whose read cannot be bounded: all there is is the read.
-		return readVec(src, bufs), _wasiESUCCESS
+		// One the host itself opened without waiting (a FIFO the guest
+		// opened with O_NONBLOCK, where the host does not poll FIFOs) says
+		// that nothing is there.
+		n, err := readVecFailure(src, bufs)
+		if n == 0 && errors.Is(err, syscall.EAGAIN) {
+			return 0, _wasiEAGAIN
+		}
+		return n, _wasiESUCCESS
 	}
 	if !ready {
 		return 0, _wasiEAGAIN
@@ -10321,6 +10394,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"totalBytesPlusNul":         true,
 			"putStrVec64":               true,
 			"readVec":                   true,
+			"readVecFailure":            true,
 			"appendWasiString":          true,
 			"wasiSignalBit":             true,
 			"syslogResult":              true,

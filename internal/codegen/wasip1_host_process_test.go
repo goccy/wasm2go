@@ -268,3 +268,105 @@ func TestUnameAndPriorityAreTheHostProcesss(t *testing.T) {
 		t.Errorf("setuid to the current user rc=%d", rc)
 	}
 }
+
+// An open of a FIFO that a signal interrupts leaves nothing behind: when
+// the guest is told EINTR, no end of the FIFO is open any more — neither
+// the one it asked for nor the one that made the host's open return — so
+// the next open of the other end waits for a peer as the first did, and
+// does not meet a leftover.
+func TestOpenOfAFIFOInterruptedLeavesNoEndOpen(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newSignalGuestIn(t, dir, wasiSIGUSR1)
+	fifo := filepath.Join(dir, "queue")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeCStr(m, 1000, "queue")
+	const rightsRead, rightsWrite, fdOut = 1 << 1, 1 << 6, 200
+	for round := 0; round < 20; round++ {
+		// Open for reading with nobody writing: interrupted.
+		postSoon(w, wasiSIGUSR1)
+		if rc := w.Path_open(m, 3, 1, path, 5, 0, rightsRead, 0, 0, fdOut); rc != _wasiEINTR {
+			t.Fatalf("round %d: open for reading rc=%d, want EINTR", round, rc)
+		}
+		takeSignals(t, w, m)
+		// No reader is left: a writer that does not wait is refused.
+		if f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+			t.Fatalf("round %d: the FIFO still has a reader after the interrupted open for reading", round)
+		} else if !strings.Contains(err.Error(), syscall.ENXIO.Error()) {
+			t.Fatalf("round %d: open for writing without waiting: %v, want ENXIO", round, err)
+		}
+
+		// Open for writing with nobody reading: interrupted.
+		postSoon(w, wasiSIGUSR1)
+		if rc := w.Path_open(m, 3, 1, path, 5, 0, rightsWrite, 0, 0, fdOut); rc != _wasiEINTR {
+			t.Fatalf("round %d: open for writing rc=%d, want EINTR", round, rc)
+		}
+		takeSignals(t, w, m)
+		// No writer is left: a reader finds the end of input, not an
+		// empty FIFO that someone may still write to.
+		reader, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := syscall.Read(int(reader.Fd()), make([]byte, 1))
+		reader.Close()
+		if n != 0 || err != nil {
+			t.Fatalf("round %d: read after the interrupted open for writing = %d, %v: the FIFO still has a writer", round, n, err)
+		}
+	}
+	w.mu.Lock()
+	open := len(w.fdsLocked())
+	w.mu.Unlock()
+	if open != 3 {
+		t.Fatalf("%d descriptors are open after the interrupted opens, want the standard three", open)
+	}
+}
+
+// A FIFO opened with O_NONBLOCK is opened without waiting for the other
+// end: for reading it opens at once, for writing it is refused with ENXIO
+// while nobody reads and opens once somebody does.
+func TestOpenOfAFIFOWithoutWaiting(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newSignalGuestIn(t, dir)
+	if err := syscall.Mkfifo(filepath.Join(dir, "queue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := writeCStr(m, 1000, "queue")
+	const rightsRead, rightsWrite, fdOut = 1 << 1, 1 << 6, 200
+	done := make(chan int32, 1)
+	go func() { done <- w.Path_open(m, 3, 1, path, 5, 0, rightsWrite, 0, wasiFdflagNonblock, fdOut) }()
+	select {
+	case rc := <-done:
+		if rc != _wasiENXIO {
+			t.Fatalf("open for writing without waiting, nobody reading: rc=%d, want ENXIO", rc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the open for writing waited")
+	}
+	go func() { done <- w.Path_open(m, 3, 1, path, 5, 0, rightsRead, 0, wasiFdflagNonblock, fdOut) }()
+	select {
+	case rc := <-done:
+		if rc != _wasiESUCCESS {
+			t.Fatalf("open for reading without waiting rc=%d", rc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the open for reading waited")
+	}
+	readFd := int32(readU32(m.memory, fdOut))
+	if rc := w.Path_open(m, 3, 1, path, 5, 0, rightsWrite, 0, wasiFdflagNonblock, fdOut); rc != _wasiESUCCESS {
+		t.Fatalf("open for writing without waiting, somebody reading: rc=%d", rc)
+	}
+	writeFd := int32(readU32(m.memory, fdOut))
+	// Nothing has been written: the read does not wait either.
+	if _, rc := fdReadString(w, m, readFd, 8); rc != _wasiEAGAIN {
+		t.Fatalf("read of the empty FIFO rc=%d, want EAGAIN", rc)
+	}
+	if rc := fdWriteString(w, m, writeFd, "through"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, readFd, 8); rc != _wasiESUCCESS || got != "through" {
+		t.Fatalf("read = %q rc=%d", got, rc)
+	}
+}
