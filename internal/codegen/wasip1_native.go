@@ -1941,6 +1941,73 @@ func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr in
 	}
 }
 
+// Proc_exec is a NON-STANDARD host import (name "proc_exec") backing the
+// guest's exec. A guest cannot replace its process image, so it starts the
+// command (Proc_spawn), gives up its descriptors, and calls this to wait for
+// the command — pid — in the command's name: from here on the instance IS
+// the command to everyone else, and every signal posted to the instance
+// (PostSignal: Proc_kill from another process of the family, a relayed
+// signal of the host process, the instance's own timer) is sent on to the
+// command instead of being held for a guest that no longer runs. The guest's
+// own dispositions do not apply to the command, so none is dropped as
+// ignored or held back as blocked; what a signal does is the command's
+// business.
+//
+// The call returns when the command has ended, with its POSIX wait status at
+// statusOutPtr (the process is then reaped), or a negative errno: ECHILD
+// when pid is not a process of this instance, EINVAL when it is not a host
+// process.
+func (w *WasiStubs) Proc_exec(m *Module, pid, statusOutPtr int32) int32 {
+	out := w.memSlice(m, statusOutPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	proc := w.procs[pid]
+	if proc != nil && proc.cmd != nil {
+		// Every signal posted is one to pass on. Of the host process's own
+		// signals, the ones that would end a process are caught for that;
+		// the others (a terminal's job control, the runtime's own use of
+		// SIGURG) are not this instance's to repeat.
+		w.sig.handled, w.sig.ignored, w.sig.blocked = ^wasiDefaultIgnoredSignals, 0, 0
+		w.syncHostSignalsLocked()
+	}
+	w.mu.Unlock()
+	if proc == nil {
+		return -_wasiECHILD
+	}
+	if proc.cmd == nil {
+		return -_wasiEINVAL
+	}
+	for {
+		// The signals posted so far, the ones that arrived before the
+		// command was the process included.
+		w.mu.Lock()
+		pending := w.sig.pending
+		w.sig.pending = 0
+		w.sig.interrupt = false
+		w.mu.Unlock()
+		for sig := int32(1); sig <= 64; sig++ {
+			if pending&wasiSignalBit(sig) == 0 {
+				continue
+			}
+			if hostSig, known := hostSignalOf(sig); known {
+				// A command that has just ended cannot take it: nothing
+				// to report.
+				_ = proc.cmd.Process.Signal(hostSig)
+			}
+		}
+		if w.awaitInterruptibly(proc.done) {
+			break
+		}
+	}
+	w.mu.Lock()
+	w.dropProcLocked(pid)
+	w.mu.Unlock()
+	binary.LittleEndian.PutUint32(out, uint32(proc.status))
+	return _wasiESUCCESS
+}
+
 // awaitInterruptibly blocks the guest until done is closed. It reports false
 // when a signal posted to the guest ended the wait first; the caller then
 // returns EINTR. An event that has already happened is never reported as

@@ -879,6 +879,78 @@ func TestWasi_ProcKillTheIsolatedRoot(t *testing.T) {
 	}
 }
 
+// An instance that has turned into a command passes every signal it is
+// sent on to the command, and ends with the command's status.
+func TestWasi_ProcExecForwardsSignals(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	// The guest ignored SIGTERM while it ran; the command does not inherit
+	// that through this path, and the signal reaches it.
+	w.Proc_signal_dispositions(m, 0, int64(wasiSignalBit(wasiSIGTERM)), 0)
+
+	if rc := w.Proc_exec(m, 4242, statusOff); rc != -_wasiECHILD {
+		t.Errorf("exec of an unknown pid rc=%d, want -ECHILD", rc)
+	}
+	own, ownExited := w.NewProc(nil)
+	if rc := w.Proc_exec(m, own, statusOff); rc != -_wasiEINVAL {
+		t.Errorf("exec of an embedder-run process rc=%d, want -EINVAL", rc)
+	}
+	ownExited(0)
+
+	pid := spawnTestProc(t, w, m, "/bin/sleep", "30")
+	done := make(chan int32, 1)
+	go func() { done <- w.Proc_exec(m, pid, statusOff) }()
+	select {
+	case rc := <-done:
+		t.Fatalf("Proc_exec returned %d while the command runs", rc)
+	case <-time.After(100 * time.Millisecond):
+	}
+	w.PostSignal(wasiSIGTERM)
+	select {
+	case rc := <-done:
+		if rc != _wasiESUCCESS {
+			t.Fatalf("Proc_exec rc=%d", rc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the signal did not reach the command")
+	}
+	status := int32(readU32(m.memory, int(statusOff)))
+	if status&0x7f != wasiSIGTERM || status>>8 != 0 {
+		t.Errorf("status = %#x, want death by signal %d", status, wasiSIGTERM)
+	}
+	if rc := w.Proc_wait(m, pid, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("waiting for the command after exec rc=%d, want -ECHILD", rc)
+	}
+
+	// SIGKILL, and a signal posted before the call.
+	pid = spawnTestProc(t, w, m, "/bin/sleep", "30")
+	w.PostSignal(wasiSIGKILL)
+	go func() { done <- w.Proc_exec(m, pid, statusOff) }()
+	select {
+	case rc := <-done:
+		if rc != _wasiESUCCESS {
+			t.Fatalf("Proc_exec rc=%d", rc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a signal posted before exec did not reach the command")
+	}
+	if status := int32(readU32(m.memory, int(statusOff))); status&0x7f != wasiSIGKILL {
+		t.Errorf("status = %#x, want death by signal %d", status, wasiSIGKILL)
+	}
+
+	// A command that ends by itself.
+	pid = spawnTestProc(t, w, m, "/bin/sh", "-c", "exit 7")
+	if rc := w.Proc_exec(m, pid, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_exec rc=%d", rc)
+	}
+	if status := int32(readU32(m.memory, int(statusOff))); status != 7<<8 {
+		t.Errorf("status = %#x, want exit 7", status)
+	}
+}
+
 // The native stubs are spliced into generated bundles through an allow-list;
 // every declaration the fork support needs must survive it.
 func TestWasip1EmitKeepsForkSupport(t *testing.T) {
