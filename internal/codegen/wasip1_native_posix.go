@@ -132,6 +132,23 @@ func signalHostProcess(pid int, sig syscall.Signal) error {
 	return syscall.Kill(pid, sig)
 }
 
+// hostProcessGroup returns the process group of a process of the host, 0
+// naming the host process itself.
+func hostProcessGroup(pid int) (int, error) {
+	return syscall.Getpgid(pid)
+}
+
+// setHostProcessGroup moves a process of the host — 0 names the host
+// process itself — into a process group, 0 standing for a group of its own.
+func setHostProcessGroup(pid, pgid int) error {
+	return syscall.Setpgid(pid, pgid)
+}
+
+// newHostSession makes the host process the leader of a new session.
+func newHostSession() (sid int, err error) {
+	return syscall.Setsid()
+}
+
 // hostStreamWrites says that the host can write to a stream without waiting
 // in the write, and ask whether one has room: see writeRaw and fdWritable.
 const hostStreamWrites = true

@@ -318,7 +318,9 @@ func TestProcKillNeverSendsATokenToTheHost(t *testing.T) {
 	if rc := w.Proc_kill(m, pid, 0); rc != -_wasiESRCH {
 		t.Fatalf("probe of a reaped token rc=%d, want -ESRCH", rc)
 	}
-	for _, group := range []int32{0, -1, -pid} {
+	// Nor does it name a process group of the host: nobody is in the group
+	// of that number, and the caller is the family's only process.
+	for _, group := range []int32{-1, -pid} {
 		if rc := w.Proc_kill(m, group, 0); rc != -_wasiESRCH {
 			t.Fatalf("Proc_kill(%d) rc=%d, want -ESRCH", group, rc)
 		}

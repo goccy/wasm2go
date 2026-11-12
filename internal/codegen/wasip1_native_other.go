@@ -45,6 +45,24 @@ func signalHostProcess(pid int, sig syscall.Signal) error {
 	return errors.ErrUnsupported
 }
 
+// hostProcessGroup returns the process group of a process of the host,
+// which this platform does not have.
+func hostProcessGroup(pid int) (int, error) {
+	return 0, errors.ErrUnsupported
+}
+
+// setHostProcessGroup moves a process of the host into a process group,
+// which this platform does not have.
+func setHostProcessGroup(pid, pgid int) error {
+	return errors.ErrUnsupported
+}
+
+// newHostSession makes the host process the leader of a new session, which
+// this platform does not have.
+func newHostSession() (sid int, err error) {
+	return 0, errors.ErrUnsupported
+}
+
 // hostStreamWrites says whether the host can write to a stream without
 // waiting in the write. The runtime does not know how on this platform, so
 // writes go through the stream's own Write and wait there.
