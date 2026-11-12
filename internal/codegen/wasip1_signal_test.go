@@ -244,17 +244,60 @@ func TestSignal_InterruptsBlockingPipeRead(t *testing.T) {
 	if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "late" {
 		t.Fatalf("retried read = %q rc=%d, want %q", got, rc, "late")
 	}
-	// Input that is there is returned even with a signal waiting.
-	if rc := fdWriteString(w, m, writeFd, "more"); rc != _wasiESUCCESS {
-		t.Fatalf("write rc=%d", rc)
-	}
+}
+
+// A signal that is waiting for the guest to notice it interrupts the call
+// that would have to wait, not the one that can be carried out at once: a
+// pipe with room takes a write, input that is there is read, a connection
+// that is there is accepted — as the system calls behave for a process with
+// a signal pending.
+func TestSignal_PendingSignalLeavesACallThatNeedNotWaitAlone(t *testing.T) {
+	skipWithoutStreamWrites(t)
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	readFd, writeFd := newTestPipe(t, w, m)
+
 	w.PostSignal(wasiSIGUSR1)
-	if _, rc := fdReadString(w, m, readFd, 16); rc != _wasiEINTR {
-		t.Fatalf("read with a signal waiting rc=%d, want EINTR", rc)
+	if rc := fdWriteString(w, m, writeFd, "more"); rc != _wasiESUCCESS {
+		t.Fatalf("write to a pipe with room, a signal waiting: rc=%d, want success", rc)
 	}
 	if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "more" {
-		t.Fatalf("read after the interruption = %q rc=%d, want %q", got, rc, "more")
+		t.Fatalf("read of input that is there, a signal waiting = %q rc=%d, want %q", got, rc, "more")
 	}
+	// The signal is still waiting: the read that has nothing to read is
+	// interrupted, once.
+	start := time.Now()
+	if _, rc := fdReadString(w, m, readFd, 16); rc != _wasiEINTR {
+		t.Fatalf("read of an idle pipe, a signal waiting: rc=%d, want EINTR", rc)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the read ended after %v", d)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("taken = %#x, want SIGUSR1 (%#x)", got, want)
+	}
+
+	// The end of input is there to be read as well.
+	if rc := w.Fd_close(m, writeFd); rc != _wasiESUCCESS {
+		t.Fatalf("close rc=%d", rc)
+	}
+	w.PostSignal(wasiSIGUSR1)
+	if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "" {
+		t.Fatalf("read at the end of input, a signal waiting = %q rc=%d, want the end", got, rc)
+	}
+	takeSignals(t, w, m)
+
+	// A pipe without room: the write would have to wait, and is interrupted.
+	readFd, writeFd = newTestPipe(t, w, m)
+	fillNonBlocking(t, w, m, writeFd)
+	if rc := w.Fd_fdstat_set_flags(m, writeFd, 0); rc != _wasiESUCCESS {
+		t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+	}
+	w.PostSignal(wasiSIGUSR1)
+	if n, rc := writeChunk(w, m, writeFd); rc != _wasiEINTR || n != 0 {
+		t.Fatalf("write to a full pipe, a signal waiting: %d bytes rc=%d, want EINTR", n, rc)
+	}
+	takeSignals(t, w, m)
+	_ = readFd
 }
 
 func TestSignal_NeverInterruptsRegularFileRead(t *testing.T) {

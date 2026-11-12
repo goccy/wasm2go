@@ -3573,6 +3573,23 @@ func (w *WasiStubs) writeFailure(err error, flags int32) int32 {
 // otherwise. flags are those of a send (wasiMsg...): one that does not wait
 // is non-blocking whatever the descriptor says.
 func (w *WasiStubs) writeStream(op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
+	n, errno := w.writeStreamOnce(op, dst, bufs, flags)
+	if errno == _wasiEINTR {
+		// A signal interrupts a write that has to wait. What there is room
+		// for is written all the same, as write(2) takes it from a process
+		// with a signal pending — whether the signal was posted before the
+		// call or while it was on its way.
+		if n, errno := w.writeStreamOnce(op, dst, bufs, flags|wasiMsgDontWait); errno != _wasiEAGAIN {
+			w.keepInterrupt()
+			return n, errno
+		}
+	}
+	return n, errno
+}
+
+// writeStreamOnce is writeStream without the second look of an interrupted
+// write.
+func (w *WasiStubs) writeStreamOnce(op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
 	rc, err := dst.SyscallConn()
 	if err != nil {
 		return 0, w.writeFailure(err, flags)
@@ -7615,6 +7632,18 @@ func (w *WasiStubs) endBlocking() (interrupted bool) {
 	return interrupted
 }
 
+// keepInterrupt is called when a call that a signal had interrupted was
+// carried out after all, because it did not have to wait. The guest has not
+// noticed the signal yet, and nothing has told it: the next call that has
+// to wait is interrupted, as the one that was let through would have been.
+func (w *WasiStubs) keepInterrupt() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.sig.pending&^w.sig.blocked != 0 {
+		w.sig.interrupt = true
+	}
+}
+
 // interruptDue reports whether a signal was posted since the blocking call
 // in progress began.
 func (w *WasiStubs) interruptDue() bool {
@@ -7909,14 +7938,28 @@ func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) 
 // receive may ask not to wait on a descriptor that otherwise does.
 func (w *WasiStubs) readStreamAs(op *wasiOpen, src deadlineReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
 	if !nonblocking {
+		var n uint64
+		errno := _wasiESUCCESS
 		if limit, _ := op.timeouts(); limit > 0 {
-			return w.readWithin(op, src, bufs, limit)
+			n, errno = w.readWithin(op, src, bufs, limit)
+		} else if got, interrupted := w.readInterruptibly(op, src, bufs); interrupted {
+			errno = _wasiEINTR
+		} else {
+			n = got
 		}
-		n, interrupted := w.readInterruptibly(op, src, bufs)
-		if interrupted {
-			return 0, _wasiEINTR
+		if errno == _wasiEINTR {
+			// A signal interrupts a read that has to wait. Input that is
+			// there is read all the same, as read(2) returns it to a
+			// process with a signal pending — whether the signal was
+			// posted before the call or while it was on its way.
+			if ready, refused := op.probeRead(src, time.Now().Add(pollProbeGrace), nil); ready && !refused {
+				if got, served := op.takeAhead(bufs); served {
+					w.keepInterrupt()
+					return got, _wasiESUCCESS
+				}
+			}
 		}
-		return n, _wasiESUCCESS
+		return n, errno
 	}
 	// The probe is the non-blocking read: it waits just long enough for
 	// the read to be attempted and keeps what arrives.
@@ -9125,6 +9168,25 @@ func (op *wasiOpen) nonblocking() bool {
 // at the listener, or for a connection — ends it, and interrupted is then
 // true.
 func (w *WasiStubs) acceptInterruptibly(op *wasiOpen, l deadlineListener) (conn net.Conn, err error, interrupted bool) {
+	if conn, err, interrupted = w.acceptWaiting(op, l); !interrupted {
+		return conn, err, false
+	}
+	// A signal interrupts an accept that has to wait. A connection that is
+	// there is accepted all the same, as accept(2) hands it to a process
+	// with a signal pending — whether the signal was posted before the
+	// call or while it was on its way.
+	if op.probeAccept(l, time.Now().Add(pollProbeGrace), nil) {
+		if conn, err, taken := op.takeAccepted(); taken {
+			w.keepInterrupt()
+			return conn, err, false
+		}
+	}
+	return nil, nil, true
+}
+
+// acceptWaiting is acceptInterruptibly without the second look of an
+// interrupted accept.
+func (w *WasiStubs) acceptWaiting(op *wasiOpen, l deadlineListener) (conn net.Conn, err error, interrupted bool) {
 	if !w.awaitInputTurn(op) {
 		return nil, nil, true
 	}
