@@ -144,3 +144,20 @@ func inheritedDescriptors() []int { return nil }
 // a descriptor the process inherited, which the runtime cannot do on this
 // platform.
 func adoptHostDescriptor(fd int) *wasiOpen { return nil }
+
+// sendToOnConnected sends a datagram to an address on a connected datagram
+// socket, which the runtime cannot do on this platform: the socket is
+// connected.
+func sendToOnConnected(conn net.Conn, p []byte, to net.Addr, ipv6 bool) (int, error) {
+	return 0, syscall.EISCONN
+}
+
+// awaitHostExit waits until a host process has ended without taking it off
+// the process table, which the runtime cannot do on this platform: ended is
+// false, and the process is waited for at once.
+func awaitHostExit(pid int) (status int32, ended bool) { return 0, false }
+
+// hostMonotonic reads the host's monotonic clock, which the runtime cannot
+// do on this platform: the guest's clock counts from the start of the
+// instance.
+func hostMonotonic() (time.Duration, bool) { return 0, false }

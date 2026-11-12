@@ -413,3 +413,48 @@ func adoptHostDescriptor(fd int) *wasiOpen {
 	}
 	return op
 }
+
+// sendToOnConnected sends the datagram p to an address on the connected
+// datagram socket conn with the host's sendto, which package net does not
+// offer for a socket it knows to be connected. ipv6 says that the socket is
+// an IPv6 one, which names an IPv4 destination by its mapped address.
+func sendToOnConnected(conn net.Conn, p []byte, to net.Addr, ipv6 bool) (int, error) {
+	var sa syscall.Sockaddr
+	switch addr := to.(type) {
+	case *net.UDPAddr:
+		v4 := addr.IP.To4()
+		if v4 != nil && !ipv6 {
+			in := &syscall.SockaddrInet4{Port: addr.Port}
+			copy(in.Addr[:], v4)
+			sa = in
+		} else {
+			in := &syscall.SockaddrInet6{Port: addr.Port, ZoneId: scopeOfZone(addr.Zone)}
+			copy(in.Addr[:], addr.IP.To16())
+			sa = in
+		}
+	case *net.UnixAddr:
+		sa = &syscall.SockaddrUnix{Name: addr.Name}
+	default:
+		return 0, errors.ErrUnsupported
+	}
+	sc, ok := conn.(syscall.Conn)
+	if !ok {
+		return 0, errors.ErrUnsupported
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var failed error
+	err = rc.Write(func(fd uintptr) bool {
+		failed = syscall.Sendto(int(fd), p, 0, sa)
+		return failed != syscall.EAGAIN
+	})
+	if err != nil {
+		return 0, err
+	}
+	if failed != nil {
+		return 0, failed
+	}
+	return len(p), nil
+}

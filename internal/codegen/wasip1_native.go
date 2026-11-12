@@ -1335,6 +1335,9 @@ type WasiStubs struct {
 	// hostProcess records that the guest program is the host process (see
 	// SetHostProcess). Guarded by mu.
 	hostProcess bool
+	// hostIDs, when non-nil, is the embedder's way of changing the ids of
+	// the host process; see SetHostIDs. Guarded by mu.
+	hostIDs HostIDs
 	// localZone is the time zone of a guest that names none; see
 	// SetLocalZone. nil is UTC. Guarded by mu.
 	localZone *time.Location
@@ -1387,6 +1390,24 @@ type wasiProc struct {
 	// process group it is in is found there. nil for any other process.
 	// Set before the process is entered in the family's table.
 	inst *WasiStubs
+	// reap takes a host process (cmd) off the host's process table, once:
+	// when the guest has waited for it, or when nobody is left who could.
+	// Until then the process, though it has ended, keeps its pid — the
+	// host gives the number to no other process, so the status the guest
+	// has not collected yet cannot be mistaken for another command's.
+	reap sync.Once
+}
+
+// release lets the host forget a host process that has ended: see
+// wasiProc.reap. The wait returns at once when the process has ended, and
+// when it ends otherwise.
+func (proc *wasiProc) release() {
+	if proc.cmd == nil {
+		return
+	}
+	proc.reap.Do(func() {
+		go func() { _ = proc.cmd.Wait() }()
+	})
 }
 
 // wasiPIDs hands out pid tokens and knows the processes of a fork family by
@@ -1633,6 +1654,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		syslogger:   w.syslogger,
 		localZone:   w.localZone,
 		hostProcess: w.hostProcess,
+		hostIDs:     w.hostIDs,
 		forked:      true,
 		parent:      w,
 		pgid:        w.groupLocked(),
@@ -1701,6 +1723,7 @@ func (w *WasiStubs) CloseAll() error {
 	for pid, proc := range w.procs {
 		select {
 		case <-proc.done:
+			proc.release()
 			w.pidsLocked().leave(pid)
 		default:
 		}
@@ -1810,6 +1833,9 @@ func (w *WasiStubs) enterProcLocked(pid int32) {
 // dropProcLocked removes a process from this instance's table and from the
 // family's: it has been waited for, or it never ran. Caller holds w.mu.
 func (w *WasiStubs) dropProcLocked(pid int32) {
+	if proc := w.procs[pid]; proc != nil {
+		proc.release()
+	}
 	delete(w.procs, pid)
 	w.pidsLocked().leave(pid)
 }
@@ -1841,6 +1867,7 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 		}
 	}
 	if !waitedFor {
+		proc.release()
 		pids := w.pidsLocked()
 		pids.mu.Lock()
 		for pid, pr := range pids.procs {
@@ -2031,14 +2058,31 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 
 	proc := &wasiProc{cmd: cmd, done: make(chan struct{})}
 	go func() {
-		werr := cmd.Wait()
-		status := encodeWaitStatus(cmd.ProcessState)
-		// A non-zero exit or signal surfaces as *exec.ExitError and is the
-		// normal path (status already encoded from ProcessState above). Any
-		// OTHER error means the wait itself failed; report a 127 exit.
-		var exitErr *exec.ExitError
-		if werr != nil && !errors.As(werr, &exitErr) {
-			status = int32(127) << 8
+		// The command's end is learnt without taking the command off the
+		// host's process table where the host can tell that way: the pid
+		// stays the command's until the guest has waited (wasiProc.reap).
+		// That is for a command whose pid the guest knows as the host's,
+		// and whose streams are the host's own: one whose streams the
+		// runtime copies has ended for the guest when they are copied,
+		// which the wait in earnest sees to.
+		var status int32
+		ended := false
+		if hostPID && hostStream(cin) && hostStream(cout) && hostStream(cerr) {
+			status, ended = awaitHostExit(cmd.Process.Pid)
+		}
+		if !ended {
+			proc.reap.Do(func() {
+				werr := cmd.Wait()
+				status = encodeWaitStatus(cmd.ProcessState)
+				// A non-zero exit or signal surfaces as *exec.ExitError
+				// and is the normal path (status already encoded from
+				// ProcessState above). Any OTHER error means the wait
+				// itself failed; report a 127 exit.
+				var exitErr *exec.ExitError
+				if werr != nil && !errors.As(werr, &exitErr) {
+					status = int32(127) << 8
+				}
+			})
 		}
 		w.finishProc(proc, status)
 	}()
@@ -2046,9 +2090,11 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	w.mu.Lock()
 	var pid int32
 	if hostPID {
-		// The pid is the host's to give. One it gives again while the
-		// guest has not waited for the earlier command of that pid names
-		// the new command from here on.
+		// The pid is the host's to give. It gives the number to no other
+		// process before the guest has waited for this one, where the
+		// command stays on the host's process table until then
+		// (awaitHostExit); elsewhere a number given again names the new
+		// command from here on.
 		pid = int32(cmd.Process.Pid)
 		if w.procs == nil {
 			w.procs = map[int32]*wasiProc{}
@@ -2062,6 +2108,17 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
+}
+
+// hostStream reports whether a standard stream handed to a command is one
+// the command gets as it is — a file of the host, or none — and not one
+// the runtime copies to or from while the command runs.
+func hostStream(stream any) bool {
+	if stream == nil {
+		return true
+	}
+	_, isFile := stream.(*os.File)
+	return isFile
 }
 
 // wasiInheritedFDLimit bounds the descriptor numbers a command inherits
@@ -2982,9 +3039,19 @@ func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 	case 0: // CLOCK_REALTIME
 		return uint64(time.Now().UnixNano()), _wasiESUCCESS
 	case 1: // CLOCK_MONOTONIC
+		// A guest that is the host process reads the host's clock, as
+		// every process of the host does: it counts from the start of the
+		// system, and programs take its readings for large numbers. An
+		// isolated guest's clock counts from the start of the instance.
 		w.mu.Lock()
+		host := w.hostProcess
 		nanos := uint64(time.Since(w.monoStart).Nanoseconds())
 		w.mu.Unlock()
+		if host {
+			if reading, known := hostMonotonic(); known {
+				return uint64(reading.Nanoseconds()), _wasiESUCCESS
+			}
+		}
 		return nanos, _wasiESUCCESS
 	default:
 		return 0, _wasiEINVAL
@@ -4680,8 +4747,15 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 			return -1, _wasiENOENT
 		}
 	}
-	f, err := fsys.OpenFile(rel, flag, w.createMode(mode))
-	if err != nil {
+	var f File
+	var err error
+	if fi, serr := fsys.Stat(rel); serr == nil && fi.Mode()&os.ModeNamedPipe != 0 &&
+		fdflags&wasiFdflagNonblock == 0 && flag&os.O_RDWR == 0 {
+		var errno int32
+		if f, errno = w.openFIFO(fsys, rel, flag, w.createMode(mode)); errno != _wasiESUCCESS {
+			return -1, errno
+		}
+	} else if f, err = fsys.OpenFile(rel, flag, w.createMode(mode)); err != nil {
 		return -1, mapOSError(err)
 	}
 	st, statErr := f.Stat()
@@ -4703,6 +4777,54 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	})
 	w.mu.Unlock()
 	return fd, _wasiESUCCESS
+}
+
+// openFIFO opens a FIFO for reading or for writing the way a blocking
+// open(2) does: it waits until the other end is open too, and a signal
+// posted to the guest ends the wait with EINTR. The host's open cannot be
+// called off, so it is made to return: the other end is opened for a
+// moment without waiting, and what the two calls opened is closed again.
+func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (File, int32) {
+	posted := make(chan struct{})
+	if !w.beginBlocking(func() { close(posted) }) {
+		return nil, _wasiEINTR
+	}
+	type opened struct {
+		f   File
+		err error
+	}
+	result := make(chan opened, 1)
+	go func() {
+		f, err := fsys.OpenFile(rel, flag, perm)
+		result <- opened{f, err}
+	}()
+	select {
+	case r := <-result:
+		w.endBlocking()
+		if r.err != nil {
+			return nil, mapOSError(r.err)
+		}
+		return r.f, _wasiESUCCESS
+	case <-posted:
+	}
+	w.endBlocking()
+	other := os.O_WRONLY
+	if flag&os.O_WRONLY != 0 {
+		other = os.O_RDONLY
+	}
+	end, endErr := fsys.OpenFile(rel, other|syscall.O_NONBLOCK, 0)
+	// Without the other end (the FIFO is gone from its name) the open
+	// stays where it is until someone else opens the FIFO, and is given
+	// up then.
+	go func() {
+		if r := <-result; r.err == nil {
+			_ = r.f.Close()
+		}
+		if endErr == nil {
+			_ = end.Close()
+		}
+	}()
+	return nil, _wasiEINTR
 }
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -5973,6 +6095,64 @@ const (
 	wasiSetRESGID              // setresgid(a, b, c)
 )
 
+// HostIDs changes the user and group ids of the host process: the calls of
+// the setuid and setgid families, with their arguments (-1 for an id to
+// leave alone) and their errors (a syscall.Errno), and setgroups. An
+// embedder gives one (SetHostIDs) when its process changes its ids by
+// other means than the Go runtime's — a process linked with a C library
+// has to go through that library, which keeps the threads of the process
+// in step.
+type HostIDs interface {
+	Setuid(uid int) error
+	Seteuid(euid int) error
+	Setreuid(ruid, euid int) error
+	Setresuid(ruid, euid, suid int) error
+	Setgid(gid int) error
+	Setegid(egid int) error
+	Setregid(rgid, egid int) error
+	Setresgid(rgid, egid, sgid int) error
+	Setgroups(gids []int) error
+}
+
+// SetHostIDs makes ids the way the guest's setuid and setgid families and
+// setgroups change the ids of the host process (see HostIDs); nil is the
+// runtime's own way, the default. It matters for a guest that is the host
+// process (SetHostProcess) only: no other guest changes ids.
+func (w *WasiStubs) SetHostIDs(ids HostIDs) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.hostIDs = ids
+}
+
+// changeHostIDs is setHostIDs by the embedder's means when it gave some.
+func (w *WasiStubs) changeHostIDs(request int32, a, b, c int) error {
+	w.mu.Lock()
+	ids := w.hostIDs
+	w.mu.Unlock()
+	if ids == nil {
+		return setHostIDs(request, a, b, c)
+	}
+	switch request {
+	case wasiSetUID:
+		return ids.Setuid(a)
+	case wasiSetEUID:
+		return ids.Seteuid(a)
+	case wasiSetREUID:
+		return ids.Setreuid(a, b)
+	case wasiSetRESUID:
+		return ids.Setresuid(a, b, c)
+	case wasiSetGID:
+		return ids.Setgid(a)
+	case wasiSetEGID:
+		return ids.Setegid(a)
+	case wasiSetREGID:
+		return ids.Setregid(a, b)
+	case wasiSetRESGID:
+		return ids.Setresgid(a, b, c)
+	}
+	return syscall.EINVAL
+}
+
 // Proc_setids is a NON-STANDARD host import (name "proc_setids") backing
 // the setuid and setgid families for a guest that is the host process:
 // request names the call (wasiSetUID ...) and a, b, c are its arguments, -1
@@ -5983,7 +6163,7 @@ func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 	if !w.hostIdentity() {
 		return -_wasiENOSYS
 	}
-	if err := setHostIDs(request, int(a), int(b), int(c)); err != nil {
+	if err := w.changeHostIDs(request, int(a), int(b), int(c)); err != nil {
 		if errors.Is(err, errors.ErrUnsupported) {
 			return -_wasiENOSYS
 		}
@@ -6011,7 +6191,16 @@ func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
 	for i := range gids {
 		gids[i] = int(binary.LittleEndian.Uint32(list[i*4:]))
 	}
-	if err := setHostGroups(gids); err != nil {
+	w.mu.Lock()
+	ids := w.hostIDs
+	w.mu.Unlock()
+	var err error
+	if ids != nil {
+		err = ids.Setgroups(gids)
+	} else {
+		err = setHostGroups(gids)
+	}
+	if err != nil {
 		if errors.Is(err, errors.ErrUnsupported) {
 			return -_wasiENOSYS
 		}
@@ -8040,6 +8229,8 @@ func mapNetError(err error) int32 {
 		return _wasiECONNRESET
 	case errors.Is(err, syscall.ENOTCONN):
 		return _wasiENOTCONN
+	case errors.Is(err, syscall.EISCONN):
+		return _wasiEISCONN
 	case errors.Is(err, syscall.ETIMEDOUT), errors.Is(err, os.ErrDeadlineExceeded):
 		return _wasiETIMEDOUT
 	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
@@ -8764,9 +8955,9 @@ func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn datagramSocket, bufs [][]
 // local address yet gets one the host picks. Without an address — and on a
 // stream socket, where an address means nothing — it is a send to the
 // socket's peer. flags are the send's (wasiMsgDontWait, wasiMsgNoSignal).
-// Returns 0, or a negative errno: EISCONN for an address on a connected
-// datagram socket, ENOTCONN (EDESTADDRREQ's place) for none on an
-// unconnected one.
+// Returns 0, or a negative errno: ENOTCONN (EDESTADDRREQ's place) for no
+// address on an unconnected datagram socket, and for an address on a
+// connected one what the host's sendto says (see sendDatagram).
 func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, ipBE, port, sentPtr int32) int32 {
 	if !w.checkNet("send") {
 		return -_wasiEACCES
@@ -8799,9 +8990,6 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
-	if conn.RemoteAddr() != nil {
-		return -_wasiEISCONN
-	}
 	ip := socketIPv4(ipBE)
 	p := int(uint16(port))
 	w.mu.Lock()
@@ -8810,7 +8998,7 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 	if hook != nil && !hook("udp", host, ip, p) {
 		return -_wasiEACCES
 	}
-	n, err := conn.WriteTo(buf, &net.UDPAddr{IP: net.ParseIP(ip), Port: p})
+	n, err := sendDatagram(op, conn, buf, &net.UDPAddr{IP: net.ParseIP(ip), Port: p})
 	if err != nil {
 		return -w.writeFailure(err, flags)
 	}
@@ -9193,7 +9381,9 @@ func (w *WasiStubs) unixHostPath(name, path string) (string, int32) {
 // none.
 func (w *WasiStubs) unixGuestName(addr net.Addr) string {
 	a, _ := addr.(*net.UnixAddr)
-	if a == nil || a.Name == "" {
+	// The host's network API writes the leading NUL of an abstract name
+	// as '@', and so a socket without a name as "@" alone on Linux.
+	if a == nil || a.Name == "" || a.Name == "@" {
 		return ""
 	}
 	if a.Name[0] == '@' {
@@ -9724,9 +9914,6 @@ func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrP
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
-	if conn.RemoteAddr() != nil {
-		return -_wasiEISCONN
-	}
 	w.mu.Lock()
 	hook := w.dialHook
 	w.mu.Unlock()
@@ -9750,12 +9937,23 @@ func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrP
 		}
 		to = &net.UDPAddr{IP: a.ip, Port: a.port, Zone: a.zone()}
 	}
-	n, err := conn.WriteTo(buf, to)
+	n, err := sendDatagram(op, conn, buf, to)
 	if err != nil {
 		return -w.writeFailure(err, flags)
 	}
 	binary.LittleEndian.PutUint32(out, uint32(n))
 	return _wasiESUCCESS
+}
+
+// sendDatagram sends one datagram to an address on the datagram socket
+// conn of op. What an address means on a socket that is connected is the
+// host's sendto to say, and it is asked: Linux sends the datagram to the
+// address, the BSDs refuse it (EISCONN).
+func sendDatagram(op *wasiOpen, conn datagramSocket, buf []byte, to net.Addr) (int, error) {
+	if conn.RemoteAddr() == nil {
+		return conn.WriteTo(buf, to)
+	}
+	return sendToOnConnected(conn, buf, to, op.family == wasiSockFamilyIPv6)
 }
 
 // Sock_recvfrom_addr is a NON-STANDARD host import (name
@@ -9967,6 +10165,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		keepTypeNames: map[string]bool{
 			"WasiExitError":    true,
 			"WasiSignalError":  true,
+			"HostIDs":          true,
 			"Syslogger":        true,
 			"wasiZoneMoment":   true,
 			"posixZoneRule":    true,
@@ -10029,6 +10228,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"ipv4SockAddr":              true,
 			"scopeOfZone":               true,
 			"awaitDial":                 true,
+			"sendDatagram":              true,
 			"userRecord":                true,
 			"pollReady":                 true,
 			"probeWritable":             true,
@@ -10042,6 +10242,11 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"Clock_res_get":             true,
 			"Clock_time_get":            true,
 			"closeWasiOpen":             true,
+			"hostStream":                true,
+			"release":                   true,
+			"openFIFO":                  true,
+			"changeHostIDs":             true,
+			"SetHostIDs":                true,
 			"AdoptInheritedDescriptors": true,
 			"Fd_close":                  true,
 			"Fd_fdstat_get":             true,

@@ -3,6 +3,8 @@
 package codegen
 
 import (
+	"encoding/binary"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -80,4 +82,42 @@ func hostSystemName() (fields [5]string, err error) {
 		}
 	}
 	return fields, nil
+}
+
+// awaitHostExit waits until a host process has ended without taking it off
+// the process table, which the runtime cannot do on this platform: ended is
+// false, and the process is waited for at once.
+func awaitHostExit(pid int) (status int32, ended bool) { return 0, false }
+
+// The host's monotonic clock counts from the start of the system. The
+// system says when it started (kern.boottime), and the Go runtime measures
+// the time since this process first asked: the reading is the one plus the
+// other. systemUptime is the time the system had been up at processClock.
+var (
+	uptimeOnce   sync.Once
+	processClock time.Time
+	systemUptime time.Duration
+	uptimeKnown  bool
+)
+
+// hostMonotonic reads the host's monotonic clock (CLOCK_MONOTONIC).
+func hostMonotonic() (time.Duration, bool) {
+	uptimeOnce.Do(func() {
+		// a struct timeval: seconds and microseconds, 8 bytes each
+		raw, err := syscall.Sysctl("kern.boottime")
+		if err != nil || len(raw) < 12 {
+			return
+		}
+		// Sysctl takes the value for a string and drops a trailing NUL.
+		buf := make([]byte, 16)
+		copy(buf, raw)
+		booted := time.Unix(int64(binary.LittleEndian.Uint64(buf[0:])), int64(binary.LittleEndian.Uint32(buf[8:]))*1000)
+		processClock = time.Now()
+		systemUptime = processClock.Sub(booted)
+		uptimeKnown = systemUptime > 0
+	})
+	if !uptimeKnown {
+		return 0, false
+	}
+	return systemUptime + time.Since(processClock), true
 }

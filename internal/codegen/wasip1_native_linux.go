@@ -86,3 +86,52 @@ func hostSystemName() (fields [5]string, err error) {
 	}
 	return fields, nil
 }
+
+// awaitHostExit waits until the host process pid has ended and returns how,
+// as the POSIX wait status the guest is given (see encodeWaitStatus),
+// without taking the process off the process table: it stays there, its pid
+// its own, until it is waited for in earnest. ended is false when the host
+// could not wait that way.
+func awaitHostExit(pid int) (status int32, ended bool) {
+	// waitid(P_PID, pid, &info, WEXITED|WNOWAIT, NULL); package syscall has
+	// the call's number and not the call. The siginfo of a child's end
+	// holds si_code at offset 8 and si_status at offset 24.
+	const (
+		idPID      = 1
+		exited     = 4
+		noWait     = 0x1000000
+		codeExited = 1
+	)
+	var info [128]byte
+	for {
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, idPID, uintptr(pid),
+			uintptr(unsafe.Pointer(&info[0])), exited|noWait, 0, 0)
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return 0, false
+		}
+		break
+	}
+	code := *(*int32)(unsafe.Pointer(&info[8]))
+	value := *(*int32)(unsafe.Pointer(&info[24]))
+	if code == codeExited {
+		return (value & 0xff) << 8, true
+	}
+	// killed by a signal, with or without a core
+	if sig := guestSignalOf(syscall.Signal(value)); sig != 0 {
+		return sig, true
+	}
+	return wasiSIGKILL, true
+}
+
+// hostMonotonic reads the host's monotonic clock (CLOCK_MONOTONIC).
+func hostMonotonic() (time.Duration, bool) {
+	const clockMonotonic = 1
+	var ts syscall.Timespec
+	if _, _, errno := syscall.Syscall(syscall.SYS_CLOCK_GETTIME, clockMonotonic, uintptr(unsafe.Pointer(&ts)), 0); errno != 0 {
+		return 0, false
+	}
+	return time.Duration(ts.Sec)*time.Second + time.Duration(ts.Nsec), true
+}

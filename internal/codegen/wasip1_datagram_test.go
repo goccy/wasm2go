@@ -3,6 +3,7 @@ package codegen
 import (
 	"encoding/binary"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -126,7 +127,21 @@ func TestDatagram_ConnectedSocketSendsAndReceives(t *testing.T) {
 	if rc := fdWriteString(w, m, client, "by write"); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_write rc=%d", rc)
 	}
-	if _, rc := sendTo(w, m, client, "x", uint32(loopbackBE), port); rc != -_wasiEISCONN {
+	// An address on a connected socket is the host's sendto's to judge:
+	// Linux sends the datagram there, the BSDs refuse it.
+	elsewhere := newDatagramSocket(t, w, m)
+	if rc := w.Sock_bind(m, elsewhere, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("Sock_bind rc=%d", rc)
+	}
+	_, rc := sendTo(w, m, client, "to another address", uint32(loopbackBE), int32(localName(t, w, m, elsewhere).port))
+	if runtime.GOOS == "linux" {
+		if rc != 0 {
+			t.Fatalf("sendto with an address on a connected socket rc=%d", rc)
+		}
+		if got, _, rc := recvFrom(w, m, elsewhere, 64); rc != 0 || got != "to another address" {
+			t.Fatalf("the datagram to another address = %q rc=%d", got, rc)
+		}
+	} else if rc != -_wasiEISCONN {
 		t.Fatalf("sendto with an address on a connected socket rc=%d, want -EISCONN", rc)
 	}
 	got, from, rc := recvFrom(w, m, server, 64)
