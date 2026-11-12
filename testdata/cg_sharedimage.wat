@@ -55,4 +55,8 @@
     i32.store8)
 
   (func (export "marker") (result i32)
-    global.get $marker))
+    global.get $marker)
+
+  (func (export "grow") (param i32) (result i32)
+    local.get 0
+    memory.grow))

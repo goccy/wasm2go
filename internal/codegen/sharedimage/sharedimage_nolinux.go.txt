@@ -1,0 +1,22 @@
+//go:build !linux
+
+package {{.Pkg}}
+
+import (
+	"fmt"
+	"os"
+)
+
+// privatePagesKnown reports that the platform can tell which pages of a
+// private mapping the process has made its own. Here it cannot.
+const privatePagesKnown = false
+
+func privatePages(mem []byte) (runs []pageRun, total uint64, ok bool) {
+	return nil, 0, false
+}
+
+func remapImage(f *os.File, mem []byte) error {
+	return fmt.Errorf("wasm2go: a memory image cannot be mapped in place on this platform")
+}
+
+func newImageFile() (*os.File, error) { return newTempImageFile() }

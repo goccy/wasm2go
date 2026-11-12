@@ -1,0 +1,122 @@
+//go:build linux
+
+package {{.Pkg}}
+
+import (
+	"encoding/binary"
+	"fmt"
+	"os"
+	"runtime"
+	"syscall"
+	"unsafe"
+)
+
+// privatePagesKnown reports that the platform can tell which pages of a
+// private mapping the process has made its own (privatePages), and can put
+// a mapping in the place of another (remapImage): on the architectures
+// whose system call numbers imageSyscalls knows.
+const privatePagesKnown = runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
+
+// imageSyscalls returns the numbers of mmap and memfd_create: package
+// syscall has no call that maps at a given address, and no number for
+// memfd_create.
+func imageSyscalls() (mmap, memfdCreate uintptr) {
+	if runtime.GOARCH == "arm64" {
+		return 222, 279
+	}
+	return 9, 319 // amd64
+}
+
+// The bits of an entry of /proc/self/pagemap that privatePages reads
+// (Documentation/admin-guide/mm/pagemap.rst).
+const (
+	pagemapPresent = 1 << 63
+	pagemapSwapped = 1 << 62
+	pagemapFile    = 1 << 61 // a page of the mapped file, not a private copy
+)
+
+// privatePages finds the pages of mem, the head of a private mapping of an
+// image file, that are no longer the image's: the ones the process wrote to,
+// which the kernel replaced by private copies. It returns them as runs of
+// byte offsets into mem and their total length. ok is false when the kernel
+// does not say (no /proc, a kernel without the page map).
+func privatePages(mem []byte) (runs []pageRun, total uint64, ok bool) {
+	if !privatePagesKnown {
+		return nil, 0, false
+	}
+	if len(mem) == 0 {
+		return nil, 0, true
+	}
+	f, err := os.Open("/proc/self/pagemap")
+	if err != nil {
+		return nil, 0, false
+	}
+	defer f.Close()
+	page := uint64(os.Getpagesize())
+	start := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(mem))))
+	if start%page != 0 {
+		return nil, 0, false
+	}
+	pages := (uint64(len(mem)) + page - 1) / page
+	entries := make([]byte, 8*pages)
+	if n, err := f.ReadAt(entries, int64(start/page*8)); err != nil || n != len(entries) {
+		return nil, 0, false
+	}
+	for i := uint64(0); i < pages; i++ {
+		e := binary.LittleEndian.Uint64(entries[8*i:])
+		if e&(pagemapPresent|pagemapSwapped) == 0 || e&pagemapFile != 0 {
+			continue
+		}
+		from, to := i*page, min((i+1)*page, uint64(len(mem)))
+		total += to - from
+		if n := len(runs); n > 0 && runs[n-1].to == from {
+			runs[n-1].to = to
+		} else {
+			runs = append(runs, pageRun{from: from, to: to})
+		}
+	}
+	return runs, total, true
+}
+
+// remapImage replaces mem, a mapping that holds exactly what the head of f
+// holds, by a private mapping of f at the same address: nothing the process
+// reads there changes, and every page becomes the image's again.
+func remapImage(f *os.File, mem []byte) error {
+	if !privatePagesKnown {
+		return fmt.Errorf("wasm2go: a memory image cannot be mapped in place on this platform")
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() < int64(len(mem)) {
+		if err := f.Truncate(int64(len(mem))); err != nil {
+			return fmt.Errorf("wasm2go: sizing the memory image: %w", err)
+		}
+	}
+	addr := uintptr(unsafe.Pointer(unsafe.SliceData(mem)))
+	mmap, _ := imageSyscalls()
+	_, _, errno := syscall.Syscall6(mmap, addr, uintptr(len(mem)),
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_FIXED, f.Fd(), 0)
+	if errno != 0 {
+		return fmt.Errorf("wasm2go: mapping the memory image in place: %w", errno)
+	}
+	return nil
+}
+
+// newImageFile returns an empty file that has no name and lives in memory
+// only (memfd_create), so that the image is never written to a disk; where
+// the kernel has no such file, an unlinked temporary one.
+func newImageFile() (*os.File, error) {
+	if !privatePagesKnown {
+		return newTempImageFile()
+	}
+	_, nr := imageSyscalls()
+	name := []byte("wasm2go-image\x00")
+	const cloexec = 1 // MFD_CLOEXEC
+	fd, _, errno := syscall.Syscall(nr, uintptr(unsafe.Pointer(&name[0])), cloexec, 0)
+	if errno == 0 {
+		return os.NewFile(fd, "wasm2go-image"), nil
+	}
+	return newTempImageFile()
+}

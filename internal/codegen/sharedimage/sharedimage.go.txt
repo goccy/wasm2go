@@ -301,6 +301,129 @@ func (s *SharedImage) Close() error {
 	return err
 }
 
+// MemoryFork is the duplicate of a running instance's linear memory that
+// ForkMemory makes.
+type MemoryFork struct {
+	// Memory is a private mapping that holds what the instance's memory
+	// held, for a second instance (NewFromSnapshot with Size and Globals).
+	// Pass it to UnmapMemory when that instance is done.
+	Memory []byte
+	// Size is the instance's memory.size, in bytes.
+	Size uint64
+	// Globals are the instance's wasm globals.
+	Globals []uint64
+	// Image is the image Memory is a mapping of, for a later ForkMemory of
+	// the instance built on Memory. nil where an image is of no use for
+	// that (the platform cannot tell what an instance changed since).
+	Image *SharedImage
+	// Rebased reports that the forked instance's own memory was mapped
+	// onto Image as well: Image, not the image it was given, is what a
+	// later ForkMemory of it starts from.
+	Rebased bool
+}
+
+// forkRebaseShare decides when a fork makes a new image: when the pages the
+// instance changed since its image was made amount to more than one part in
+// forkRebaseShare of its memory. Below that the changed pages are copied for
+// each fork; above it one image is written, and what the following forks
+// copy starts from nothing again.
+const forkRebaseShare = 8
+
+// ForkMemory duplicates the linear memory of a running instance, for an
+// embedder that implements fork by giving a second instance the first one's
+// state. The instance must not be executing: the caller is the goroutine
+// that runs it (inside a host import, say).
+//
+// from is the image m's memory is a private mapping of (SharedImage.Memory,
+// or the Memory of an earlier MemoryFork), or nil when the memory is no such
+// mapping. Where the platform can tell which pages the instance has changed
+// since (Linux), the duplicate is a second private mapping of the same image
+// into which only those pages are copied, so a fork costs what the instance
+// changed, not what it holds. When that is a large part of the memory, or
+// cannot be told, the whole memory is written into a new image and the
+// duplicate maps it; the instance's own memory is then mapped onto the new
+// image too (Rebased), so that its next forks are cheap again. Without from
+// every fork writes the whole memory, and ceiling is the length of the
+// duplicate's mapping; with from the duplicate is as long as m's.
+//
+// The image is shared by the mappings made of it. Close an image when no
+// instance that may still be forked maps it.
+func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, error) {
+	if !mmapSupported {
+		return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+	}
+	// Writes from other goroutines (a signal's flag) go through
+	// accessMemory: holding the lock keeps them out of the gap between the
+	// copy and the remapping.
+	m.{{.MemMu}}.Lock()
+	defer m.{{.MemMu}}.Unlock()
+	size := m.{{.MemSize}}.Load()
+	mem := m.{{.Memory}}
+	fork := &MemoryFork{Size: size, Globals: {{.SaveGlobals}}(m)}
+	mapped := from != nil && from.f != nil
+	if mapped {
+		// A memory that grew is a shorter slice of its mapping.
+		mem = mem[:cap(mem)]
+		ceiling = len(mem)
+		if runs, changed, ok := privatePages(mem[:size]); ok && changed <= size/forkRebaseShare {
+			child, err := mmapImage(from.f, ceiling)
+			if err != nil {
+				return nil, err
+			}
+			for _, r := range runs {
+				copy(child[r.from:r.to], mem[r.from:r.to])
+			}
+			fork.Memory, fork.Image = child, from
+			return fork, nil
+		}
+	}
+	if uint64(ceiling) < size {
+		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the instance's memory (%d bytes)", ceiling, size)
+	}
+	f, err := newImageFile()
+	if err != nil {
+		return nil, fmt.Errorf("wasm2go: memory image: %w", err)
+	}
+	if _, err := f.Write(mem[:size]); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("wasm2go: memory image: %w", err)
+	}
+	child, err := mmapImage(f, ceiling)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	fork.Memory = child
+	if !privatePagesKnown {
+		// Nothing can tell later what an instance changed since: the image
+		// has served.
+		if err := f.Close(); err != nil {
+			unmapMemory(child)
+			return nil, fmt.Errorf("wasm2go: memory image: %w", err)
+		}
+		return fork, nil
+	}
+	fork.Image = &SharedImage{f: f, size: size, dataEnd: m.{{.DataEnd}}}
+	if mapped && remapImage(f, mem) == nil {
+		fork.Rebased = true
+	}
+	return fork, nil
+}
+
+// pageRun is a run of pages, as byte offsets into a mapping.
+type pageRun struct{ from, to uint64 }
+
+// newTempImageFile returns an empty temporary file that has no name any
+// more: the pages live as long as the descriptor or a mapping of it.
+func newTempImageFile() (*os.File, error) {
+	f, err := os.CreateTemp("", "wasm2go-image-*")
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Remove(f.Name())
+	return f, nil
+}
+
 // UnmapMemory releases a mapping returned by SharedImage.Memory. Calling it on
 // a slice that did not come from there is a no-op on platforms without mmap
 // and undefined otherwise, so do not.

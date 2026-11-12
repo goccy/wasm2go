@@ -26,11 +26,18 @@ var mmapTmpl string
 //go:embed sharedimage_nommap.go.txt
 var nommapTmpl string
 
+//go:embed sharedimage_linux.go.txt
+var linuxTmpl string
+
+//go:embed sharedimage_nolinux.go.txt
+var nolinuxTmpl string
+
 // Names are the identifiers the emitting package supplies.
 type Names struct {
 	Pkg     string // package clause of the generated files
 	Module  string // the Module type's name (always "Module" today)
 	Memory  string // Module's linear-memory field
+	MemMu   string // Module's memory lock field
 	MemSize string // Module's *atomic.Uint64 current-size field
 	DataEnd string // Module's data-segment-extent field
 
@@ -39,14 +46,17 @@ type Names struct {
 	SaveGlobals string
 }
 
-// Files renders the runtime: output filename → formatted Go source. The three
-// files split by platform (mmap / no mmap) and must be emitted together.
+// Files renders the runtime: output filename → formatted Go source. The
+// files split by platform (mmap / no mmap, and whether the pages a process
+// changed can be told) and must be emitted together.
 func Files(n Names) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	for name, src := range map[string]string{
 		"sharedimage.go":        coreTmpl,
 		"sharedimage_mmap.go":   mmapTmpl,
 		"sharedimage_nommap.go": nommapTmpl,
+		"sharedimage_linux.go":  linuxTmpl,
+		"sharedimage_other.go":  nolinuxTmpl,
 	} {
 		t, err := template.New(name).Parse(src)
 		if err != nil {

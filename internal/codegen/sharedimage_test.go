@@ -187,6 +187,143 @@ func main() {
 	}
 }
 
+// ForkMemory gives a second instance the state of a running one, whatever
+// the first one's memory is (a mapping of an image, or its own allocation)
+// and however much of it the instance changed since its image was made: the
+// duplicate holds every change made before the fork, and neither sees what
+// the other writes afterwards. An instance forks again and again, and so
+// does the instance built on a duplicate.
+func TestForkMemory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no mmap: the generated package cannot duplicate a memory")
+	}
+	bin := testfixture.Wasm(t, "cg_sharedimage")
+	parsed, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res, err := codegen.Translate(&buf, parsed, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const main = `package main
+
+import (
+	"fmt"
+
+	"gentest/pkg"
+)
+
+const ceiling = 4 * 65536
+
+// fork duplicates m, whose memory maps img, and returns the new instance
+// with the image each of the two maps afterwards.
+func fork(m *pkg.Module, img *pkg.SharedImage) (child *pkg.Module, parentImg, childImg *pkg.SharedImage) {
+	f, err := pkg.ForkMemory(m, img, ceiling)
+	if err != nil {
+		panic(err)
+	}
+	if f.Rebased && f.Image == nil {
+		panic("rebased onto no image")
+	}
+	parentImg = img
+	if f.Rebased {
+		parentImg = f.Image
+	}
+	return pkg.NewFromSnapshot(f.Memory, f.Size, f.Globals), parentImg, f.Image
+}
+
+func main() {
+	snap := pkg.NewSharedSnapshot(func() (*pkg.Module, error) { return pkg.New(), nil })
+	if err := snap.Err(); err != nil {
+		fmt.Println("snapshot:", err)
+		return
+	}
+	mem, err := snap.Memory(ceiling)
+	if err != nil {
+		panic(err)
+	}
+	a := pkg.NewFromSnapshot(mem, snap.Size(), snap.Globals())
+
+	// A small change, then a fork.
+	a.Poke(1024, 'X')
+	b, aImg, bImg := fork(a, snap)
+	fmt.Println("b inherits", b.Peek(1024), "start ran", b.Peek(100), "marker", b.Marker())
+	b.Poke(1024, 'Y')
+	a.Poke(1025, 'Z')
+	fmt.Println("after the fork a", a.Peek(1024), a.Peek(1025), "b", b.Peek(1024), b.Peek(1025))
+
+	// A change to most of the memory, then a fork: every page arrives.
+	for addr := int32(8192); addr < 2*65536; addr += 1024 {
+		a.Poke(addr, int32(addr/1024))
+	}
+	c, aImg, _ := fork(a, aImg)
+	ok := c.Peek(1024) == 'X' && c.Peek(1025) == 'Z'
+	for addr := int32(8192); addr < 2*65536; addr += 1024 {
+		ok = ok && c.Peek(addr) == int32(addr/1024)&0xff && a.Peek(addr) == int32(addr/1024)&0xff
+	}
+	fmt.Println("c inherits everything:", ok)
+	c.Poke(8192, 1)
+	fmt.Println("after the fork a", a.Peek(8192), "c", c.Peek(8192))
+
+	// The instance forks once more after that, with one more change.
+	a.Poke(2048, 'Q')
+	d, _, _ := fork(a, aImg)
+	fmt.Println("d inherits", d.Peek(1024), d.Peek(2048), d.Peek(8192), d.Peek(16384))
+	d.Poke(2048, 'R')
+	fmt.Println("after the fork a", a.Peek(2048), "d", d.Peek(2048))
+
+	// A memory that grew: the new page arrives, and the duplicate grows
+	// as far as the memory it duplicates may.
+	fmt.Println("a grows from", a.Grow(1))
+	a.Poke(2*65536+10, 'G')
+	g, _, _ := fork(a, aImg)
+	fmt.Println("g inherits", g.Peek(2*65536+10), g.Peek(1024), "grows from", g.Grow(1), "then", g.Grow(1))
+	g.Poke(3*65536+10, 'H')
+	fmt.Println("after the fork g", g.Peek(3*65536+10), "a grows from", a.Grow(1), "a", a.Peek(3*65536+10))
+
+	// The duplicate forks too.
+	e, _, _ := fork(b, bImg)
+	fmt.Println("e inherits", e.Peek(1024), e.Peek(1025))
+	e.Poke(1024, 'W')
+	fmt.Println("after the fork b", b.Peek(1024), "e", e.Peek(1024))
+
+	// An instance on its own allocation.
+	p := pkg.New()
+	p.Poke(1024, 'P')
+	q, _, _ := fork(p, nil)
+	fmt.Println("q inherits", q.Peek(1024), "start ran", q.Peek(100), "marker", q.Marker())
+	q.Poke(1024, 'S')
+	p.Poke(1025, 'T')
+	fmt.Println("after the fork p", p.Peek(1024), p.Peek(1025), "q", q.Peek(1024), q.Peek(1025))
+}
+`
+	out := runGoSnippetWithAux(t, buf.String(), main,
+		[]map[string][]byte{res.Sidecars, filesWithAux(res)}, res.AuxFiles)
+
+	for _, want := range []string{
+		"b inherits 88 start ran 1 marker 42",
+		"after the fork a 88 90 b 89 101",
+		"c inherits everything: true",
+		"after the fork a 8 c 1",
+		"d inherits 88 81 8 16",
+		"after the fork a 81 d 82",
+		"a grows from 2",
+		"g inherits 71 88 grows from 3 then -1",
+		"after the fork g 72 a grows from 3 a 0",
+		"e inherits 89 101",
+		"after the fork b 89 e 87",
+		"q inherits 80 start ran 1 marker 42",
+		"after the fork p 80 84 q 83 101",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output:\n%s", want, out)
+		}
+	}
+}
+
 func keysOf(m map[string][]byte) []string {
 	var out []string
 	for k := range m {
