@@ -768,6 +768,96 @@ func TestWasi_ForkFamilyPidsUnique(t *testing.T) {
 	}
 }
 
+// Any process of a fork family is signalled by its pid, whoever its parent
+// is; only its parent waits for it.
+func TestWasi_ProcKillAcrossTheFamily(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+	recorder := func(into *[]int32) func(sig int32) error {
+		return func(sig int32) error {
+			*into = append(*into, sig)
+			return nil
+		}
+	}
+
+	// root has two children; the first has a child of its own.
+	var toFirst, toSecond, toGrandchild []int32
+	firstPid, firstExited := root.NewProc(recorder(&toFirst))
+	first, firstModule := root.Fork(), newForkTestModule()
+	secondPid, secondExited := root.NewProc(recorder(&toSecond))
+	second, secondModule := root.Fork(), newForkTestModule()
+	grandchildPid, grandchildExited := first.NewProc(recorder(&toGrandchild))
+	grandchild, grandchildModule := first.Fork(), newForkTestModule()
+
+	// a sibling, a grandchild, the parent of a fork child, an uncle
+	if rc := second.Proc_kill(secondModule, firstPid, 10); rc != _wasiESUCCESS {
+		t.Errorf("sibling rc=%d", rc)
+	}
+	if rc := root.Proc_kill(m, grandchildPid, 12); rc != _wasiESUCCESS {
+		t.Errorf("grandchild rc=%d", rc)
+	}
+	if rc := grandchild.Proc_kill(grandchildModule, firstPid, 15); rc != _wasiESUCCESS {
+		t.Errorf("parent rc=%d", rc)
+	}
+	if rc := grandchild.Proc_kill(grandchildModule, secondPid, 1); rc != _wasiESUCCESS {
+		t.Errorf("uncle rc=%d", rc)
+	}
+	if rc := second.Proc_kill(secondModule, grandchildPid, 0); rc != _wasiESUCCESS {
+		t.Errorf("existence probe of a nephew rc=%d", rc)
+	}
+	if len(toFirst) != 2 || toFirst[0] != 10 || toFirst[1] != 15 {
+		t.Errorf("signals to the first child = %v, want [10 15]", toFirst)
+	}
+	if len(toSecond) != 1 || toSecond[0] != 1 {
+		t.Errorf("signals to the second child = %v, want [1]", toSecond)
+	}
+	if len(toGrandchild) != 1 || toGrandchild[0] != 12 {
+		t.Errorf("signals to the grandchild = %v, want [12]", toGrandchild)
+	}
+
+	// Waiting is the parent's alone.
+	if rc := second.Proc_wait(secondModule, firstPid, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("waiting for a sibling rc=%d, want -ECHILD", rc)
+	}
+	if rc := root.Proc_wait(m, grandchildPid, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("waiting for a grandchild rc=%d, want -ECHILD", rc)
+	}
+
+	// A finished process is a zombie for the whole family until its parent
+	// has waited for it, and nothing afterwards.
+	secondExited(0)
+	if rc := first.Proc_kill(firstModule, secondPid, 15); rc != _wasiESUCCESS {
+		t.Errorf("signalling a sibling's zombie rc=%d, want 0", rc)
+	}
+	if rc := root.Proc_wait(m, secondPid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if rc := first.Proc_kill(firstModule, secondPid, 15); rc != -_wasiESRCH {
+		t.Errorf("signalling a reaped sibling rc=%d, want -ESRCH", rc)
+	}
+	if len(toSecond) != 1 {
+		t.Errorf("signals to the second child after its end = %v", toSecond)
+	}
+
+	// A process outlives its parent: it stays reachable until it ends, and
+	// then nobody is left to wait for it.
+	if err := first.CloseAll(); err != nil {
+		t.Fatal(err)
+	}
+	firstExited(0)
+	if rc := root.Proc_kill(m, grandchildPid, 2); rc != _wasiESUCCESS {
+		t.Errorf("signalling an orphan rc=%d", rc)
+	}
+	if len(toGrandchild) != 2 || toGrandchild[1] != 2 {
+		t.Errorf("signals to the orphan = %v, want [12 2]", toGrandchild)
+	}
+	grandchildExited(0)
+	if rc := root.Proc_kill(m, grandchildPid, 0); rc != -_wasiESRCH {
+		t.Errorf("probing an orphan that ended rc=%d, want -ESRCH", rc)
+	}
+	_ = second
+}
+
 // The native stubs are spliced into generated bundles through an allow-list;
 // every declaration the fork support needs must survive it.
 func TestWasip1EmitKeepsForkSupport(t *testing.T) {

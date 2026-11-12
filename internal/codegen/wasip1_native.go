@@ -1182,15 +1182,48 @@ type wasiProc struct {
 	done   chan struct{}
 	status int32 // POSIX wait status, valid once done is closed
 	// kill delivers a signal to an embedder-run process (Proc_kill). nil
-	// when the embedder gave none. Guarded by the owning WasiStubs.mu.
+	// when the embedder gave none. It is set before the process is entered
+	// in the family's table (wasiPIDs.enter) and not changed afterwards.
 	kill func(sig int32) error
 }
 
-// wasiPIDs hands out pid tokens. One allocator is shared by every WasiStubs
-// of a fork family, each of which has its own lock, hence the separate mutex.
+// wasiPIDs hands out pid tokens and knows the processes of a fork family by
+// them. One is shared by every WasiStubs of the family, each of which has
+// its own lock, hence the separate mutex.
 type wasiPIDs struct {
 	mu   sync.Mutex
 	next int32
+	// procs holds every process of the family that exists: from the moment
+	// it can be signalled until it has been waited for, or has finished
+	// with nobody left to wait for it. An instance waits only for the
+	// processes in its own table (WasiStubs.procs), but it may signal any
+	// process whose pid it knows — a sibling, its parent's parent, a
+	// grandchild — and only its own children are in its own table.
+	procs map[int32]*wasiProc
+}
+
+// enter makes proc reachable by pid for every instance of the family.
+func (p *wasiPIDs) enter(pid int32, proc *wasiProc) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.procs == nil {
+		p.procs = map[int32]*wasiProc{}
+	}
+	p.procs[pid] = proc
+}
+
+// leave forgets the process known by pid.
+func (p *wasiPIDs) leave(pid int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.procs, pid)
+}
+
+// find returns the process of the family known by pid, or nil.
+func (p *wasiPIDs) find(pid int32) *wasiProc {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.procs[pid]
 }
 
 // alloc returns the next unused pid token.
@@ -1431,6 +1464,17 @@ func (w *WasiStubs) CloseAll() error {
 		err = errors.Join(err, closeWasiOpen(op))
 		delete(w.fdsLocked(), fd)
 	}
+	// Nobody is left to wait for this instance's processes: the finished
+	// ones are gone, and the running ones go when they finish (finishProc
+	// finds them missing from the table).
+	for pid, proc := range w.procs {
+		select {
+		case <-proc.done:
+			w.pidsLocked().leave(pid)
+		default:
+		}
+		delete(w.procs, pid)
+	}
 	return err
 }
 
@@ -1503,7 +1547,9 @@ func (w *WasiStubs) pidsLocked() *wasiPIDs {
 	return w.pids
 }
 
-// addProcLocked registers proc under a fresh pid token. Caller holds w.mu.
+// addProcLocked registers proc under a fresh pid token, as a process this
+// instance waits for. The family does not know it yet: see enterProcLocked.
+// Caller holds w.mu.
 func (w *WasiStubs) addProcLocked(proc *wasiProc) int32 {
 	if w.procs == nil {
 		w.procs = map[int32]*wasiProc{}
@@ -1511,6 +1557,20 @@ func (w *WasiStubs) addProcLocked(proc *wasiProc) int32 {
 	pid := w.pidsLocked().alloc()
 	w.procs[pid] = proc
 	return pid
+}
+
+// enterProcLocked makes the process registered under pid known to the whole
+// fork family, once everything Proc_kill needs of it is in place. Caller
+// holds w.mu.
+func (w *WasiStubs) enterProcLocked(pid int32) {
+	w.pidsLocked().enter(pid, w.procs[pid])
+}
+
+// dropProcLocked removes a process from this instance's table and from the
+// family's: it has been waited for, or it never ran. Caller holds w.mu.
+func (w *WasiStubs) dropProcLocked(pid int32) {
+	delete(w.procs, pid)
+	w.pidsLocked().leave(pid)
 }
 
 // finishProc publishes the wait status of proc and wakes every waiter.
@@ -1525,6 +1585,26 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 	if w.procFinished != nil {
 		close(w.procFinished)
 		w.procFinished = nil
+	}
+	// A process whose parent instance is gone (CloseAll emptied the table)
+	// has nobody to wait for it: it does not stay behind as a zombie.
+	waitedFor := false
+	for _, pr := range w.procs {
+		if pr == proc {
+			waitedFor = true
+			break
+		}
+	}
+	if !waitedFor {
+		pids := w.pidsLocked()
+		pids.mu.Lock()
+		for pid, pr := range pids.procs {
+			if pr == proc {
+				delete(pids.procs, pid)
+				break
+			}
+		}
+		pids.mu.Unlock()
 	}
 	w.mu.Unlock()
 	// The parent is told, as the kernel tells a process whose child ended.
@@ -1548,6 +1628,7 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 	proc := &wasiProc{done: make(chan struct{}), kill: kill}
 	w.mu.Lock()
 	pid = w.addProcLocked(proc)
+	w.enterProcLocked(pid)
 	w.mu.Unlock()
 	return pid, w.procExitFunc(proc)
 }
@@ -1692,6 +1773,7 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 
 	w.mu.Lock()
 	pid := w.addProcLocked(proc)
+	w.enterProcLocked(pid)
 	w.mu.Unlock()
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
@@ -1777,7 +1859,7 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 		return -_wasiEINTR
 	}
 	w.mu.Lock()
-	delete(w.procs, pid)
+	w.dropProcLocked(pid)
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
@@ -1820,7 +1902,7 @@ func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr in
 			}
 		}
 		if proc != nil {
-			delete(w.procs, pid)
+			w.dropProcLocked(pid)
 			w.mu.Unlock()
 			binary.LittleEndian.PutUint32(pidOut, uint32(pid))
 			binary.LittleEndian.PutUint32(statusOut, uint32(proc.status))
@@ -1906,7 +1988,7 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 		// nothing.
 		closeErr := child.CloseAll()
 		w.mu.Lock()
-		delete(w.procs, pid)
+		w.dropProcLocked(pid)
 		w.mu.Unlock()
 		if closeErr != nil {
 			return -mapOSError(closeErr)
@@ -1915,6 +1997,7 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 	}
 	w.mu.Lock()
 	proc.kill = kill
+	w.enterProcLocked(pid)
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
@@ -1932,8 +2015,12 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 //     but cannot be signalled, which is reported as EPERM.
 //   - A process that has finished but has not been waited for yet is a
 //     zombie: as with kill(2), signalling it succeeds and does nothing.
-//   - A pid that is not a process of this instance names a process of the
-//     host when the guest is the host process (SetHostProcess), and nothing
+//   - The process need not be the caller's child: any process of the fork
+//     family is reached by its pid — a sibling, the parent of a pseudo-process
+//     that is itself a fork child, a grandchild. (Waiting stays limited to
+//     the caller's own children.)
+//   - A pid that is no process of the family names a process of the host
+//     when the guest is the host process (SetHostProcess), and nothing
 //     otherwise; see killOutside.
 //
 // Returns 0, or a negative errno: ESRCH for an unknown pid, EINVAL for a
@@ -1944,15 +2031,12 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 		return -_wasiEINVAL
 	}
 	w.mu.Lock()
-	proc := w.procs[pid]
-	var kill func(sig int32) error
-	if proc != nil {
-		kill = proc.kill
-	}
+	proc := w.pidsLocked().find(pid)
 	w.mu.Unlock()
 	if proc == nil {
 		return w.killOutside(pid, sig)
 	}
+	kill := proc.kill
 	select {
 	case <-proc.done:
 		return _wasiESUCCESS
@@ -1984,11 +2068,11 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	return _wasiESUCCESS
 }
 
-// killOutside signals a process that is not one of this instance's. Only a
-// guest that is the host process can reach any: pid is then a process id of
-// the host, unless it is a pid token of this fork family — a token never
-// names a host process, whatever the host uses the same number for.
-// Process groups (pid <= 0) are not reachable.
+// killOutside signals a process that is not one of the fork family's. Only
+// a guest that is the host process can reach any: pid is then a process id
+// of the host, unless it is a pid token of this fork family — the token of a
+// process that is gone never names a host process, whatever the host uses
+// the same number for. Process groups (pid <= 0) are not reachable.
 func (w *WasiStubs) killOutside(pid, sig int32) int32 {
 	w.mu.Lock()
 	host := w.hostProcess
