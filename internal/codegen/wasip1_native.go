@@ -888,6 +888,12 @@ type wasiOpen struct {
 	listener net.Listener // guarded by mu; read it through netListener
 	isDir    bool
 	isSocket bool // created by Sock_socket, may not yet have a conn
+	// noRead and noWrite record the access mode the descriptor was opened
+	// with: a file opened for writing only cannot be read, the read end of
+	// a pipe cannot be written. Both false is a descriptor open both ways
+	// (a socket). They say nothing for a standard stream (stdio != 0),
+	// whose direction is its own; see access. Immutable.
+	noRead, noWrite bool
 	// dgram marks a datagram socket (UDP), as Sock_socket was asked for
 	// one: it decides how the socket binds, connects, sends and receives
 	// from before it has anything to tell by. Immutable.
@@ -1151,6 +1157,31 @@ func (op *wasiOpen) writeBlocks(dst io.Writer) (streamWriter, bool) {
 		return stream, true
 	}
 	return stream, op.fileIsStream(file)
+}
+
+// access reports whether the descriptor is open for reading and for
+// writing: what open(2) was asked for, the direction of a pipe end, of a
+// standard stream.
+func (op *wasiOpen) access() (read, write bool) {
+	switch op.stdio {
+	case 1:
+		return true, false
+	case 2, 3:
+		return false, true
+	}
+	return !op.noRead, !op.noWrite
+}
+
+// plainFile reports whether the entry is a file or directory of the
+// filesystem, as opposed to a stream (a pipe, a terminal, a socket): reads
+// and writes of it never wait, and poll reports it ready whatever it is
+// open for.
+func (op *wasiOpen) plainFile() bool {
+	if op.f == nil || op.stdio != 0 {
+		return false
+	}
+	file, isHostFile := op.f.(*os.File)
+	return !isHostFile || !op.fileIsStream(file)
 }
 
 // netConn returns the connection attached to a socket entry, or nil.
@@ -1937,8 +1968,8 @@ func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 		return -mapOSError(err)
 	}
 	w.mu.Lock()
-	rfd := w.addFDLocked(&wasiOpen{f: r})
-	wfd := w.addFDLocked(&wasiOpen{f: wr})
+	rfd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
+	wfd := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out[0:], uint32(rfd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(wfd))
@@ -2778,7 +2809,16 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	defer w.mu.Unlock()
 	var ftype byte = 4 // regular file
 	var fdflags uint16
+	// Every right is granted (the host process is the trust boundary),
+	// except that the rights to read and to write say what the descriptor
+	// is open for: it is how libc answers fcntl(F_GETFL).
+	rights := ^uint64(0)
 	if op := w.fdsLocked()[fd]; op != nil {
+		if read, write := op.access(); !read {
+			rights &^= wasiRightFdRead | wasiRightFdReaddir
+		} else if !write {
+			rights &^= wasiRightFdWrite
+		}
 		op.mu.Lock()
 		if op.stdio != 0 {
 			ftype = 2 // a standard stream is a character device
@@ -2799,11 +2839,17 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	out[0] = ftype
 	out[1] = 0
 	binary.LittleEndian.PutUint16(out[2:], fdflags)
-	// Grant all rights — we don't enforce per-fd rights.
-	binary.LittleEndian.PutUint64(out[8:], ^uint64(0))
+	binary.LittleEndian.PutUint64(out[8:], rights)
 	binary.LittleEndian.PutUint64(out[16:], ^uint64(0))
 	return _wasiESUCCESS
 }
+
+// The rights of fd_fdstat_get that tell what a descriptor is open for.
+const (
+	wasiRightFdRead    uint64 = 1 << 1
+	wasiRightFdWrite   uint64 = 1 << 6
+	wasiRightFdReaddir uint64 = 1 << 14
+)
 
 // Fd_fdstat_set_flags maps WASI fdflags to OS file-status flags via the
 // per-platform Fcntl wrapper. The flags are also cached on the wasiOpen
@@ -3340,6 +3386,10 @@ func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
 	if op == nil {
 		return nil, nil
 	}
+	if op.noRead {
+		// not open for reading: there is nothing to read from
+		return nil, op
+	}
 	if op.stdio == 1 {
 		return w.stdin, op
 	}
@@ -3358,6 +3408,10 @@ func (w *WasiStubs) fdDstLocked(fd int32) (io.Writer, *wasiOpen) {
 	op := w.fdsLocked()[fd]
 	if op == nil {
 		return nil, nil
+	}
+	if op.noWrite {
+		// not open for writing: there is nothing to write to
+		return nil, op
 	}
 	switch op.stdio {
 	case 2:
@@ -3378,7 +3432,7 @@ func (w *WasiStubs) Fd_pread(m *Module, fd, iovs, iovsLen int32, offset int64, n
 	w.mu.Lock()
 	op := w.fdsLocked()[fd]
 	w.mu.Unlock()
-	if op == nil || op.f == nil {
+	if op == nil || op.f == nil || op.noRead {
 		return _wasiEBADF
 	}
 	iovBytes := uint64(uint32(iovsLen)) * 8
@@ -3420,7 +3474,7 @@ func (w *WasiStubs) Fd_pwrite(m *Module, fd, iovs, iovsLen int32, offset int64, 
 	w.mu.Lock()
 	op := w.fdsLocked()[fd]
 	w.mu.Unlock()
-	if op == nil || op.f == nil {
+	if op == nil || op.f == nil || op.noWrite {
 		return _wasiEBADF
 	}
 	iovBytes := uint64(uint32(iovsLen)) * 8
@@ -4356,7 +4410,11 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		return -1, _wasiENOTDIR
 	}
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{f: f, isDir: isDir, path: rel, fdflags: fdflags})
+	fd := w.addFDLocked(&wasiOpen{
+		f: f, isDir: isDir, path: rel, fdflags: fdflags,
+		noRead:  flag&os.O_WRONLY != 0,
+		noWrite: flag&(os.O_WRONLY|os.O_RDWR) == 0,
+	})
 	w.mu.Unlock()
 	return fd, _wasiESUCCESS
 }
@@ -4686,6 +4744,16 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		if op == nil {
 			errnos[i] = _wasiEBADF
 			ready[i], anyReady = true, true
+			continue
+		}
+		// A stream that is not open in the direction asked about never
+		// becomes ready in it: the write end of a pipe has no input. A plain
+		// file is ready either way, and the read or write reports what it
+		// is open for.
+		if readable, writable := op.access(); (ev.isRead && !readable) || (!ev.isRead && !writable && op.stdio == 0) {
+			if op.plainFile() {
+				ready[i], anyReady = true, true
+			}
 			continue
 		}
 		if !ev.isRead {
