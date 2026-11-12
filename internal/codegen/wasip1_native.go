@@ -913,9 +913,9 @@ type wasiOpen struct {
 	// guarded by mu.
 	ahead    []byte
 	aheadEnd error
-	// probing serializes readiness probes of this stream, so two probes
-	// cannot append the chunks they read to ahead out of order.
-	probing sync.Mutex
+	// turn is the turn at this descriptor's input; see inputTurn. Made on
+	// first use; guarded by mu.
+	turn chan struct{}
 	// sock is the state of a socket beyond its connection or listener;
 	// see wasiSocket. Guarded by mu; use it through socketLocked.
 	sock *wasiSocket
@@ -967,24 +967,125 @@ func (op *wasiOpen) aheadReady() (ready bool, pending int) {
 	return len(op.ahead) > 0 || op.aheadEnd != nil, len(op.ahead)
 }
 
-// probeRead reads src once — the caller has set the read deadline — and
-// keeps what arrives in ahead. It reports whether the descriptor is now
-// readable.
-func (op *wasiOpen) probeRead(src deadlineReader) bool {
-	op.probing.Lock()
-	defer op.probing.Unlock()
-	if ready, _ := op.aheadReady(); ready {
-		return true
-	}
-	buf := make([]byte, 32<<10)
-	n, err := src.Read(buf)
+// inputTurn returns the channel that holds the turn at this descriptor's
+// input: whoever has put a value in it has the turn, and gives it back by
+// taking the value out (takeInputTurn, passInputTurn).
+//
+// A descriptor can be shared — by the slots of one instance (dup) and by the
+// instances of a fork family, each on a goroutine of its own. Reading a
+// stream, accepting from a listener and receiving a datagram all wait inside
+// a call of the host's that admits one caller at a time and queues the
+// others where nothing can call them back: a deadline ends the wait of the
+// one caller inside, not of the queue, and the caller it ends need not be
+// the one it was meant for. A guest queued that way could not be reached by
+// a signal.
+//
+// So the waiting is done in turns. Whoever is about to read, accept or
+// receive on a descriptor takes its turn first, in a select that a signal or
+// a timeout can end, and only the holder of the turn enters the host's call
+// and sets the deadline that bounds it. The turn also keeps what probes
+// take off the descriptor (ahead, the accepted connections, the datagram) in
+// the order it arrived.
+func (op *wasiOpen) inputTurn() chan struct{} {
 	op.mu.Lock()
 	defer op.mu.Unlock()
-	op.ahead = append(op.ahead, buf[:n]...)
-	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-		op.aheadEnd = err
+	if op.turn == nil {
+		op.turn = make(chan struct{}, 1)
 	}
-	return len(op.ahead) > 0 || op.aheadEnd != nil
+	return op.turn
+}
+
+// takeInputTurn waits for the turn at the descriptor's input and reports
+// whether it got it: not when until passed first (the zero time is no
+// limit), nor when stop was closed first.
+func (op *wasiOpen) takeInputTurn(until time.Time, stop <-chan struct{}) bool {
+	turn := op.inputTurn()
+	select {
+	case turn <- struct{}{}:
+		return true
+	default:
+	}
+	var expired <-chan time.Time
+	if !until.IsZero() {
+		timer := time.NewTimer(time.Until(until))
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case turn <- struct{}{}:
+		return true
+	case <-stop:
+	case <-expired:
+	}
+	return false
+}
+
+// passInputTurn gives the turn back.
+func (op *wasiOpen) passInputTurn() { <-op.inputTurn() }
+
+// probeInput is a readiness probe of the descriptor's input. It waits — no
+// longer than until (the zero time is no limit), and not after stop is
+// closed — first for the turn and then in attempt, which makes one read,
+// accept or receive and keeps what it got on the entry. kept reports whether
+// something is kept there, in which case the descriptor is ready.
+// setDeadline bounds the host call attempt makes.
+//
+// refused is true when the stream takes no deadline: nothing was attempted
+// then, and the caller decides what an unbounded read is worth to it.
+func (op *wasiOpen) probeInput(setDeadline func(time.Time) error, until time.Time, stop <-chan struct{}, kept func() bool, attempt func()) (ready, refused bool) {
+	if kept() {
+		return true, false
+	}
+	if !op.takeInputTurn(until, stop) {
+		return kept(), false
+	}
+	defer op.passInputTurn()
+	// Whoever had the turn before may have found something.
+	if kept() {
+		return true, false
+	}
+	if err := setDeadline(until); err != nil {
+		return false, true
+	}
+	if stop == nil {
+		attempt()
+	} else {
+		// stop ends the attempt in progress. The goroutine is gone before
+		// the deadline is cleared below, so no deadline is left behind.
+		attempted, watched := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(watched)
+			select {
+			case <-stop:
+				_ = setDeadline(time.Now())
+			case <-attempted:
+			}
+		}()
+		attempt()
+		close(attempted)
+		<-watched
+	}
+	_ = setDeadline(time.Time{})
+	return kept(), false
+}
+
+// probeRead reads src once, as probeInput describes, and keeps what arrives
+// in ahead. It reports whether the descriptor is now readable.
+func (op *wasiOpen) probeRead(src deadlineReader, until time.Time, stop <-chan struct{}) (ready, refused bool) {
+	kept := func() bool {
+		ready, _ := op.aheadReady()
+		return ready
+	}
+	return op.probeInput(src.SetReadDeadline, until, stop, kept, func() {
+		buf := make([]byte, 32<<10)
+		n, err := src.Read(buf)
+		op.mu.Lock()
+		defer op.mu.Unlock()
+		op.ahead = append(op.ahead, buf[:n]...)
+		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			op.aheadEnd = err
+		}
+	})
 }
 
 // readBlocks reports whether a read of src, the stream behind this entry,
@@ -3177,6 +3278,30 @@ func probeWritable(dst streamWriter) bool {
 	return writable
 }
 
+// probeWritableUntil is probeWritable bounded for a poll: it waits no longer
+// than until (the zero time is no limit), and not after stop is closed. A
+// stream that takes no deadline cannot be asked, and counts as writable.
+func probeWritableUntil(dst streamWriter, until time.Time, stop <-chan struct{}) bool {
+	if err := dst.SetWriteDeadline(until); err != nil {
+		return true
+	}
+	probed, watched := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watched)
+		select {
+		case <-stop:
+			_ = dst.SetWriteDeadline(time.Now())
+		case <-probed:
+		}
+	}()
+	writable := probeWritable(dst)
+	close(probed)
+	<-watched
+	// Leave no deadline behind: later writes to the stream must block.
+	_ = dst.SetWriteDeadline(time.Time{})
+	return writable
+}
+
 // fdSrcLocked returns the io.Reader for fd and (when applicable) the
 // wasiOpen it came from, or nil if fd is invalid. Caller must hold w.mu.
 func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
@@ -4548,9 +4673,10 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 				probeOf[key] = len(probes)
 				probeIndex[i] = len(probes)
 				probes = append(probes, pollProbe{
-					op:          op,
-					setDeadline: stream.SetWriteDeadline,
-					probe:       func() bool { return probeWritable(stream) },
+					op: op,
+					probe: func(until time.Time, stop <-chan struct{}) bool {
+						return probeWritableUntil(stream, until, stop)
+					},
 				})
 			}
 			continue
@@ -4569,9 +4695,10 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 				probeOf[probeKey{op: op}] = len(probes)
 				probeIndex[i] = len(probes)
 				probes = append(probes, pollProbe{
-					op:          op,
-					setDeadline: bounded.SetDeadline,
-					probe:       func() bool { return op.probeAccept(bounded) },
+					op: op,
+					probe: func(until time.Time, stop <-chan struct{}) bool {
+						return op.probeAccept(bounded, until, stop)
+					},
 				})
 				continue
 			}
@@ -4588,14 +4715,15 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			probeOf[probeKey{op: op}] = len(probes)
 			probeIndex[i] = len(probes)
 			probes = append(probes, pollProbe{
-				op:          op,
-				setDeadline: udp.SetReadDeadline,
-				probe:       func() bool { return op.probeDatagram(udp) },
+				op: op,
+				probe: func(until time.Time, stop <-chan struct{}) bool {
+					return op.probeDatagram(udp, until, stop)
+				},
 			})
 			continue
 		}
-		stream, bounded := src.(deadlineReader)
-		if !bounded {
+		stream, blocks := op.readBlocks(src)
+		if !blocks {
 			ready[i], anyReady = true, true
 			continue
 		}
@@ -4610,9 +4738,13 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		probeOf[probeKey{op: op}] = len(probes)
 		probeIndex[i] = len(probes)
 		probes = append(probes, pollProbe{
-			op:          op,
-			setDeadline: stream.SetReadDeadline,
-			probe:       func() bool { return op.probeRead(stream) },
+			op: op,
+			probe: func(until time.Time, stop <-chan struct{}) bool {
+				// A stream that takes no deadline cannot be asked: it
+				// counts as readable, and the read finds out.
+				ready, refused := op.probeRead(stream, until, stop)
+				return ready || refused
+			},
 		})
 	}
 
@@ -4702,14 +4834,14 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 
 // pollProbe is one descriptor poll_oneoff has to probe for readiness: a
 // stream, for input or for room to write, or a listening socket, for a
-// connection. probe waits for it — no longer than the deadline setDeadline
-// has set — and reports whether the descriptor is ready; what it took off
-// the descriptor to find out stays with the descriptor's entry.
+// connection. probe waits for it — no longer than until (the zero time is
+// no limit), and not after stop is closed — and reports whether the
+// descriptor is ready; what it took off the descriptor to find out stays
+// with the descriptor's entry.
 type pollProbe struct {
-	op          *wasiOpen
-	setDeadline func(t time.Time) error
-	probe       func() bool
-	ready       bool
+	op    *wasiOpen
+	probe func(until time.Time, stop <-chan struct{}) bool
+	ready bool
 }
 
 // pollReady waits until one of the probed descriptors is ready, or until
@@ -4718,74 +4850,38 @@ type pollProbe struct {
 // descriptor and handed to the guest's next read of it. For output the host
 // is asked, and nothing is written.
 //
-// A stream that refuses a deadline is one whose read or write does not
-// block (a regular file behind an *os.File), and counts as ready.
-//
 // cancel, when non-nil, ends the wait early once it is closed.
 func pollReady(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
-	var armed []*pollProbe
-	for i := range probes {
-		pr := &probes[i]
-		if err := pr.setDeadline(deadline); err != nil {
-			pr.ready = true
-			continue
-		}
-		armed = append(armed, pr)
-	}
-	// Leave no deadline behind: later reads of these streams must block.
-	defer func() {
-		for _, pr := range armed {
-			_ = pr.setDeadline(time.Time{})
-		}
-	}()
-	if len(armed) == 0 {
-		return
-	}
-	if len(armed) < len(probes) {
-		// Something is readable already: the others only get the time it
-		// takes to look.
-		grace := time.Now().Add(pollProbeGrace)
-		for _, pr := range armed {
-			_ = pr.setDeadline(grace)
-		}
-	}
-	if len(armed) == 1 && cancel == nil {
-		armed[0].ready = armed[0].probe()
+	if len(probes) == 1 && cancel == nil {
+		probes[0].ready = probes[0].probe(deadline, nil)
 		return
 	}
 	var wg sync.WaitGroup
-	hit := make(chan struct{}, len(armed))
-	for _, pr := range armed {
+	stop := make(chan struct{})
+	hit := make(chan struct{}, len(probes))
+	for i := range probes {
 		wg.Add(1)
 		go func(pr *pollProbe) {
 			defer wg.Done()
-			if pr.ready = pr.probe(); pr.ready {
+			if pr.ready = pr.probe(deadline, stop); pr.ready {
 				hit <- struct{}{}
 			}
-		}(pr)
+		}(&probes[i])
 	}
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
-	stop := func() {
-		// The reads end at once, keeping whatever they had already
-		// received.
-		now := time.Now()
-		for _, pr := range armed {
-			_ = pr.setDeadline(now)
-		}
-		<-done
-	}
 	select {
 	case <-hit:
-		// One is readable: stop waiting on the rest.
-		stop()
+		// One is ready: stop waiting on the rest. Their probes end at
+		// once, keeping whatever they had already received.
 	case <-cancel:
-		stop()
 	case <-done:
 	}
+	close(stop)
+	<-done
 }
 
 func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64) {
@@ -4971,16 +5067,16 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 		case op.nonblocking():
 			// Long enough for the accept to be attempted, as for a
 			// readiness probe.
-			_ = bounded.SetDeadline(time.Now().Add(pollProbeGrace))
-			ready := op.probeAccept(l)
-			_ = bounded.SetDeadline(time.Time{})
-			if !ready {
+			if !op.probeAccept(bounded, time.Now().Add(pollProbeGrace), nil) {
 				return _wasiEAGAIN
 			}
-			conn, err, _ = op.takeAccepted()
+			if conn, err, taken = op.takeAccepted(); !taken {
+				// another process sharing the listener took it first
+				return _wasiEAGAIN
+			}
 		default:
 			var interrupted bool
-			if conn, err, interrupted = w.acceptInterruptibly(bounded); interrupted {
+			if conn, err, interrupted = w.acceptInterruptibly(op, bounded); interrupted {
 				return _wasiEINTR
 			}
 		}
@@ -6407,7 +6503,7 @@ func (w *WasiStubs) relayHostSignals(from <-chan os.Signal) {
 // posted to the guest meanwhile.
 func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
 	if !op.nonblocking() {
-		n, interrupted := w.readInterruptibly(src, bufs)
+		n, interrupted := w.readInterruptibly(op, src, bufs)
 		if interrupted {
 			return 0, _wasiEINTR
 		}
@@ -6415,9 +6511,11 @@ func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) 
 	}
 	// The probe is the non-blocking read: it waits just long enough for
 	// the read to be attempted and keeps what arrives.
-	_ = src.SetReadDeadline(time.Now().Add(pollProbeGrace))
-	ready := op.probeRead(src)
-	_ = src.SetReadDeadline(time.Time{})
+	ready, refused := op.probeRead(src, time.Now().Add(pollProbeGrace), nil)
+	if refused {
+		// A stream whose read cannot be bounded: all there is is the read.
+		return readVec(src, bufs), _wasiESUCCESS
+	}
 	if !ready {
 		return 0, _wasiEAGAIN
 	}
@@ -6425,11 +6523,37 @@ func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) 
 	return n, _wasiESUCCESS
 }
 
+// awaitInputTurn takes the turn at op's input for a blocking call of the
+// guest's. It reports false when a signal posted to the guest ended the wait
+// first: the call is then to be reported as EINTR, and the turn is not held.
+func (w *WasiStubs) awaitInputTurn(op *wasiOpen) bool {
+	posted := make(chan struct{})
+	if !w.beginBlocking(func() { close(posted) }) {
+		return false
+	}
+	held := op.takeInputTurn(time.Time{}, posted)
+	if w.endBlocking() {
+		if held {
+			op.passInputTurn()
+		}
+		return false
+	}
+	return held
+}
+
 // readInterruptibly is readVec for a stream whose read can block (a pipe, a
-// socket, a terminal): a signal posted while the read waits ends it.
-// interrupted is true when that happened before any byte arrived, and the
-// read is to be reported as EINTR.
-func (w *WasiStubs) readInterruptibly(src deadlineReader, bufs [][]byte) (total uint64, interrupted bool) {
+// socket, a terminal): a signal posted while the read waits — for its turn
+// at the stream, or for input — ends it. interrupted is true when that
+// happened before any byte arrived, and the read is to be reported as EINTR.
+func (w *WasiStubs) readInterruptibly(op *wasiOpen, src deadlineReader, bufs [][]byte) (total uint64, interrupted bool) {
+	if !w.awaitInputTurn(op) {
+		return 0, true
+	}
+	defer op.passInputTurn()
+	// Whoever had the turn before may have left input behind.
+	if n, served := op.takeAhead(bufs); served {
+		return n, false
+	}
 	if !w.beginBlocking(func() { _ = src.SetReadDeadline(time.Now()) }) {
 		return 0, true
 	}
@@ -6442,10 +6566,9 @@ read:
 				cutShort = true
 				break read
 			}
-			// The deadline was a readiness probe's, possibly of another
-			// instance sharing the descriptor (pollReady); it is cleared
-			// as soon as that probe ends.
-			runtime.Gosched()
+			// Only the holder of the turn sets a deadline, so this one is
+			// not the stream's any more: it was left behind.
+			_ = src.SetReadDeadline(time.Time{})
 			n, err = src.Read(buf)
 		}
 		total += uint64(n)
@@ -6541,28 +6664,25 @@ func (op *wasiOpen) acceptedReady() bool {
 	return op.sock != nil && (len(op.sock.accepted) > 0 || op.sock.acceptErr != nil)
 }
 
-// probeAccept accepts once from l — the caller has set the deadline — and
-// keeps a connection that arrives for the next Sock_accept. It reports
-// whether the listener is now ready for an accept.
-func (op *wasiOpen) probeAccept(l net.Listener) bool {
-	op.probing.Lock()
-	defer op.probing.Unlock()
-	if op.acceptedReady() {
-		return true
-	}
-	conn, err := l.Accept()
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return false
-	}
-	op.mu.Lock()
-	defer op.mu.Unlock()
-	s := op.socketLocked()
-	if err != nil {
-		s.acceptErr = err
-	} else {
-		s.accepted = append(s.accepted, conn)
-	}
-	return true
+// probeAccept accepts once from l, as probeInput describes, and keeps a
+// connection that arrives for the next Sock_accept. It reports whether the
+// listener is now ready for an accept.
+func (op *wasiOpen) probeAccept(l deadlineListener, until time.Time, stop <-chan struct{}) bool {
+	ready, _ := op.probeInput(l.SetDeadline, until, stop, op.acceptedReady, func() {
+		conn, err := l.Accept()
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return
+		}
+		op.mu.Lock()
+		defer op.mu.Unlock()
+		s := op.socketLocked()
+		if err != nil {
+			s.acceptErr = err
+		} else {
+			s.accepted = append(s.accepted, conn)
+		}
+	})
+	return ready
 }
 
 // mapNetError turns a failure of package net into a wasi errno.
@@ -7052,20 +7172,15 @@ func (op *wasiOpen) takeDatagram() (data []byte, from *net.UDPAddr, err error, o
 	return nil, nil, nil, false
 }
 
-// probeDatagram receives one datagram from conn — the caller has set the
-// read deadline — and keeps it, with its sender, for the next receive. It
-// reports whether the socket is now ready for a receive. Only receiving
-// tells that a datagram is there, as only reading tells for a stream.
-func (op *wasiOpen) probeDatagram(conn *net.UDPConn) bool {
-	op.probing.Lock()
-	defer op.probing.Unlock()
-	if op.datagramReady() {
-		return true
-	}
+// keepDatagram receives one datagram from conn and keeps it, with its
+// sender, for the next receive; a receive that ran into the deadline keeps
+// nothing. The caller has the turn at op's input. Only receiving tells that
+// a datagram is there, as only reading tells for a stream.
+func (op *wasiOpen) keepDatagram(conn *net.UDPConn) {
 	buf := make([]byte, 1<<16) // no UDP datagram is larger
 	n, from, err := conn.ReadFromUDP(buf)
 	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return false
+		return
 	}
 	op.mu.Lock()
 	defer op.mu.Unlock()
@@ -7075,7 +7190,13 @@ func (op *wasiOpen) probeDatagram(conn *net.UDPConn) bool {
 	} else {
 		s.datagram, s.datagramFrom, s.hasDatagram = buf[:n], from, true
 	}
-	return true
+}
+
+// probeDatagram receives one datagram from conn, as probeInput describes,
+// and reports whether the socket is now ready for a receive.
+func (op *wasiOpen) probeDatagram(conn *net.UDPConn, until time.Time, stop <-chan struct{}) bool {
+	ready, _ := op.probeInput(conn.SetReadDeadline, until, stop, op.datagramReady, func() { op.keepDatagram(conn) })
+	return ready
 }
 
 // receiveDatagram takes one datagram off a datagram socket into bufs — what
@@ -7085,41 +7206,51 @@ func (op *wasiOpen) probeDatagram(conn *net.UDPConn) bool {
 // meanwhile.
 func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn *net.UDPConn, bufs [][]byte) (uint64, *net.UDPAddr, int32) {
 	data, from, err, taken := op.takeDatagram()
-	if !taken {
-		if op.nonblocking() {
-			// Long enough for the receive to be attempted, as for a
-			// readiness probe.
-			_ = conn.SetReadDeadline(time.Now().Add(pollProbeGrace))
-			ready := op.probeDatagram(conn)
-			_ = conn.SetReadDeadline(time.Time{})
-			if !ready {
-				return 0, nil, _wasiEAGAIN
-			}
-		} else {
-			if !w.beginBlocking(func() { _ = conn.SetReadDeadline(time.Now()) }) {
-				return 0, nil, _wasiEINTR
-			}
-			interrupted := false
-			for !op.probeDatagram(conn) {
-				if w.interruptDue() {
-					interrupted = true
-					break
+	if !taken && op.nonblocking() {
+		// Long enough for the receive to be attempted, as for a readiness
+		// probe.
+		if !op.probeDatagram(conn, time.Now().Add(pollProbeGrace), nil) {
+			return 0, nil, _wasiEAGAIN
+		}
+		if data, from, err, taken = op.takeDatagram(); !taken {
+			// another process sharing the socket took it first
+			return 0, nil, _wasiEAGAIN
+		}
+	}
+	for !taken {
+		if !w.awaitInputTurn(op) {
+			return 0, nil, _wasiEINTR
+		}
+		// Whoever had the turn before may have left a datagram behind.
+		interrupted := false
+		if !op.datagramReady() {
+			if w.beginBlocking(func() { _ = conn.SetReadDeadline(time.Now()) }) {
+				for {
+					op.keepDatagram(conn)
+					if op.datagramReady() {
+						break
+					}
+					if w.interruptDue() {
+						interrupted = true
+						break
+					}
+					// Only the holder of the turn sets a deadline, so this
+					// one was left behind.
+					_ = conn.SetReadDeadline(time.Time{})
 				}
-				// The deadline was a readiness probe's, possibly of another
-				// instance sharing the socket; it is cleared as soon as
-				// that probe ends.
-				runtime.Gosched()
-			}
-			if w.endBlocking() {
-				// wake has set a deadline, which must not outlive this
-				// receive.
-				_ = conn.SetReadDeadline(time.Time{})
-			}
-			if interrupted {
-				return 0, nil, _wasiEINTR
+				if w.endBlocking() {
+					// wake has set a deadline, which must not outlive this
+					// receive.
+					_ = conn.SetReadDeadline(time.Time{})
+				}
+			} else {
+				interrupted = true
 			}
 		}
-		data, from, err, _ = op.takeDatagram()
+		op.passInputTurn()
+		if data, from, err, taken = op.takeDatagram(); !taken && interrupted {
+			return 0, nil, _wasiEINTR
+		}
 	}
 	if err != nil {
 		return 0, nil, mapNetError(err)
@@ -7269,9 +7400,20 @@ func (op *wasiOpen) nonblocking() bool {
 	return op.fdflags&wasiFdflagNonblock != 0
 }
 
-// acceptInterruptibly accepts from l for a blocking socket: a signal posted
-// to the guest while the accept waits ends it, and interrupted is then true.
-func (w *WasiStubs) acceptInterruptibly(l deadlineListener) (conn net.Conn, err error, interrupted bool) {
+// acceptInterruptibly accepts from l, the listener of op, for a blocking
+// socket: a signal posted to the guest while the accept waits — for its turn
+// at the listener, or for a connection — ends it, and interrupted is then
+// true.
+func (w *WasiStubs) acceptInterruptibly(op *wasiOpen, l deadlineListener) (conn net.Conn, err error, interrupted bool) {
+	if !w.awaitInputTurn(op) {
+		return nil, nil, true
+	}
+	defer op.passInputTurn()
+	// Whoever had the turn before may have accepted a connection that
+	// nobody has taken.
+	if conn, err, taken := op.takeAccepted(); taken {
+		return conn, err, false
+	}
 	if !w.beginBlocking(func() { _ = l.SetDeadline(time.Now()) }) {
 		return nil, nil, true
 	}
@@ -7284,10 +7426,9 @@ func (w *WasiStubs) acceptInterruptibly(l deadlineListener) (conn net.Conn, err 
 			interrupted = true
 			break
 		}
-		// The deadline was a readiness probe's, possibly of another
-		// instance sharing the listener; it is cleared as soon as that
-		// probe ends.
-		runtime.Gosched()
+		// Only the holder of the turn sets a deadline, so this one is not
+		// the listener's any more: it was left behind.
+		_ = l.SetDeadline(time.Time{})
 	}
 	if w.endBlocking() {
 		// wake has set a deadline, which must not outlive this accept.
@@ -7390,6 +7531,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"userRecord":              true,
 			"pollReady":               true,
 			"probeWritable":           true,
+			"probeWritableUntil":      true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
