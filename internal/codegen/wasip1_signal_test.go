@@ -647,3 +647,62 @@ func TestSignal_HostProcessSIGPIPEIsTheGuestsOwnWrite(t *testing.T) {
 		t.Fatalf("taken = %#x, want SIGUSR1 alone (%#x)", got, want)
 	}
 }
+
+// A signal that a process of the fork family sends to the pid of the host
+// process is pending for the guest that is the host process when the kill
+// returns, as kill(2) has it — not some time later, when the host's own
+// delivery has come round. One the guest ignores is dropped, and one that
+// is the host process's to act on is not taken.
+func TestSignal_FamilySignalToTheHostProcessIsPendingAtOnce(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("the runtime maps signals on darwin and linux only")
+	}
+	w, m := newSignalGuest(t)
+	w.SetHostProcess(true)
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1), signalMask(wasiSIGUSR2), 0)
+	t.Cleanup(func() { w.CloseAll() })
+	child, cm := w.Fork(), newForkTestModule()
+	t.Cleanup(func() { child.CloseAll() })
+	grandchild := child.Fork()
+	t.Cleanup(func() { grandchild.CloseAll() })
+
+	self := int32(os.Getpid())
+	for i, sender := range []*WasiStubs{child, grandchild, child} {
+		if rc := sender.Proc_kill(cm, self, wasiSIGUSR1); rc != _wasiESUCCESS {
+			t.Fatalf("kill %d: Proc_kill of the host process rc=%d", i, rc)
+		}
+		if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+			t.Fatalf("kill %d: pending when the kill returned = %#x, want SIGUSR1 (%#x)", i, got, want)
+		}
+	}
+	// Ignored by the guest: nothing is pending, and nothing arrives.
+	if rc := child.Proc_kill(cm, self, wasiSIGUSR2); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_kill with an ignored signal rc=%d", rc)
+	}
+	if got := takeSignals(t, w, m); got != 0 {
+		t.Fatalf("pending after an ignored signal = %#x, want none", got)
+	}
+	// A signal the guest has blocked stays pending without interrupting it.
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1), signalMask(wasiSIGUSR2), signalMask(wasiSIGUSR1))
+	signalFlag(m)
+	if rc := child.Proc_kill(cm, self, wasiSIGUSR1); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_kill with a blocked signal rc=%d", rc)
+	}
+	if flag := signalFlag(m); flag != 0 {
+		t.Fatalf("the flag is raised for a blocked signal")
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("pending while blocked = %#x, want SIGUSR1 (%#x)", got, want)
+	}
+	// What ends or stops the host process is not the guest's to take.
+	for _, sig := range []int32{wasiSIGTERM, wasiSIGKILL, wasiSIGSTOP, wasiSIGCONT} {
+		if w.takeAsHostProcess(sig) {
+			t.Errorf("signal %d was taken for the guest, want it left to the host process", sig)
+		}
+	}
+	// Once the guest is gone there is nobody to take a signal.
+	w.CloseAll()
+	if w.takeAsHostProcess(wasiSIGUSR1) {
+		t.Error("a signal was taken for a guest that is gone")
+	}
+}

@@ -2598,6 +2598,9 @@ func (w *WasiStubs) killOutside(pid, sig int32) int32 {
 	if !known {
 		return -_wasiEINVAL
 	}
+	if int(pid) == os.Getpid() && w.firstOfFamily().takeAsHostProcess(sig) {
+		return _wasiESUCCESS
+	}
 	err := signalHostProcess(int(pid), hostSig)
 	switch {
 	case err == nil:
@@ -2609,6 +2612,44 @@ func (w *WasiStubs) killOutside(pid, sig int32) int32 {
 	default:
 		return -_wasiEPERM
 	}
+}
+
+// firstOfFamily returns the host state of the first process of the fork
+// family: the one that was not forked.
+func (w *WasiStubs) firstOfFamily() *WasiStubs {
+	for w.parent != nil {
+		w = w.parent
+	}
+	return w
+}
+
+// takeAsHostProcess is given a signal that a process of the fork family
+// sends to the pid of the host process, which is the pid of this guest. It
+// reports whether the signal has been dealt with here: one that the host
+// process would only hand on to the guest (see syncHostSignalsLocked) is
+// posted to the guest, and one the host process ignores for the guest is
+// dropped — at once, as kill(2) has a signal pending for its target by the
+// time it returns. The host's own route for such a signal ends at the same
+// place, but some time after the sender has gone on: a parent could be told
+// that its child had ended before it got the signal the child had sent it
+// first.
+//
+// Any other signal is for the host process to act on (it ends or stops the
+// process), and is not dealt with here; nor is any signal once the guest is
+// gone or before it has registered.
+func (w *WasiStubs) takeAsHostProcess(sig int32) bool {
+	bit := wasiSignalBit(sig)
+	uncatchable := wasiSignalBit(wasiSIGKILL) | wasiSignalBit(wasiSIGSTOP)
+	w.mu.Lock()
+	s := &w.sig
+	mine := w.hostProcess && !w.forked && !w.ended && s.flagModule != nil && bit&^uncatchable != 0
+	posted := mine && (s.handled|wasiSignalsHeldByRuntime&^s.ignored)&bit != 0
+	dropped := mine && s.hostIgnored&bit != 0
+	w.mu.Unlock()
+	if posted {
+		w.PostSignal(sig)
+	}
+	return posted || dropped
 }
 
 // encodeWaitStatus turns a Go ProcessState into a POSIX wait status int (the
