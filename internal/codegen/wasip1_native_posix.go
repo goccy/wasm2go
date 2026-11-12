@@ -323,6 +323,20 @@ func acceptRaw(fd uintptr) (conn net.Conn, again bool, err error) {
 	}
 }
 
+// peerFailure returns the errno getpeername(2) fails with on the host's
+// socket, and 0 when the socket has a peer: ENOTCONN, or EINVAL where the
+// host says that of a socket that was shut down. Any other failure is not
+// about the peer and counts as none.
+func peerFailure(fd uintptr) int32 {
+	switch _, err := syscall.Getpeername(int(fd)); err {
+	case syscall.ENOTCONN:
+		return _wasiENOTCONN
+	case syscall.EINVAL:
+		return _wasiEINVAL
+	}
+	return _wasiESUCCESS
+}
+
 // hostStreamWrites says that the host can write to a stream without waiting
 // in the write, and ask whether one has room: see writeRaw and fdWritable.
 const hostStreamWrites = true

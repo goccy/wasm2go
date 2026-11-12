@@ -459,3 +459,52 @@ func TestSocket_Pair(t *testing.T) {
 		t.Fatalf("after close b received %q rc=%d", got, rc)
 	}
 }
+
+// getpeername fails once a connection is over: the peer has closed it and
+// this side has shut its sending down. Until then it names the peer. A
+// program that receives for as long as the socket is connected ends that
+// way.
+func TestSocket_PeerNameUntilTheConnectionIsOver(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("the runtime asks the host about the peer on linux and darwin")
+	}
+	w, m := newProcTestStubs(t)
+	w.SetNetAccessHook(func(string) bool { return true })
+	listener, port := newListener(t, w, m)
+	client := dialLoopback(t, w, m, port)
+	server, rc := acceptOn(w, m, listener)
+	if rc != _wasiESUCCESS {
+		t.Fatalf("accept rc=%d", rc)
+	}
+	peerName := func() int32 { return w.Sock_getpeername(m, client, sockValueOff) }
+	if rc := peerName(); rc != 0 {
+		t.Fatalf("getpeername of the new connection rc=%d", rc)
+	}
+	if rc := sockSend(w, m, client, "request"); rc != _wasiESUCCESS {
+		t.Fatalf("send rc=%d", rc)
+	}
+	if rc := w.Sock_shutdown(m, client, 2 /* wr */); rc != _wasiESUCCESS {
+		t.Fatalf("shutdown rc=%d", rc)
+	}
+	if rc := peerName(); rc != 0 {
+		t.Fatalf("getpeername after shutting the sending side down rc=%d, want the peer", rc)
+	}
+	if got, rc := sockRecv(w, m, server); rc != _wasiESUCCESS || got != "request" {
+		t.Fatalf("server recv = %q rc=%d", got, rc)
+	}
+	if rc := sockSend(w, m, server, "reply"); rc != _wasiESUCCESS {
+		t.Fatalf("server send rc=%d", rc)
+	}
+	if rc := w.Fd_close(m, server); rc != _wasiESUCCESS {
+		t.Fatalf("server close rc=%d", rc)
+	}
+	if got, rc := sockRecv(w, m, client); rc != _wasiESUCCESS || got != "reply" {
+		t.Fatalf("client recv = %q rc=%d", got, rc)
+	}
+	if got, rc := sockRecv(w, m, client); rc != _wasiESUCCESS || got != "" {
+		t.Fatalf("client recv at the end = %q rc=%d", got, rc)
+	}
+	if rc := peerName(); rc != -_wasiENOTCONN && rc != -_wasiEINVAL {
+		t.Fatalf("getpeername of the connection that is over rc=%d, want -ENOTCONN (or the host's -EINVAL)", rc)
+	}
+}

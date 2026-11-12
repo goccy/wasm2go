@@ -8688,7 +8688,26 @@ func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
 		// a datagram socket that is bound and not connected
 		return -_wasiENOTCONN
 	}
+	if errno := op.peerLost(conn); errno != _wasiESUCCESS {
+		return -errno
+	}
 	return w.writeSockName(m, peer, outPtr)
+}
+
+// peerLost asks the host whether the stream connection conn of op still has
+// its peer, and returns 0 while it has. A connection that is over — closed
+// by the peer and shut down or reset on this side — has none: getpeername
+// fails from then on (ENOTCONN on Linux), and that is how a program learns
+// it (IO::Socket's connected, in a loop that receives for as long as the
+// socket is connected). The address package net remembers for the
+// connection does not tell.
+func (op *wasiOpen) peerLost(conn net.Conn) int32 {
+	if op.dgram {
+		return _wasiESUCCESS
+	}
+	errno := _wasiESUCCESS
+	hostDescriptor(conn, func(fd uintptr) { errno = peerFailure(fd) })
+	return errno
 }
 
 // The socket options the host knows, as the guest's shim names them to
@@ -10158,6 +10177,9 @@ func (w *WasiStubs) Sock_name(m *Module, fd, peer, addrPtr int32) int32 {
 		if conn == nil || conn.RemoteAddr() == nil {
 			// no connection, or a datagram socket that is not connected
 			return -_wasiENOTCONN
+		}
+		if errno := op.peerLost(conn); errno != _wasiESUCCESS {
+			return -errno
 		}
 		addr := conn.RemoteAddr()
 		if family == wasiSockFamilyUnix && remote == "" {

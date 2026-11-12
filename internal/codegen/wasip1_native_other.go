@@ -126,6 +126,11 @@ func acceptRaw(fd uintptr) (conn net.Conn, again bool, err error) {
 	return nil, false, errors.ErrUnsupported
 }
 
+// peerFailure returns the errno getpeername fails with on the host's
+// socket, which the runtime does not ask on this platform: the connection
+// counts as having its peer.
+func peerFailure(fd uintptr) int32 { return _wasiESUCCESS }
+
 // hostStreamWrites says whether the host can write to a stream without
 // waiting in the write. The runtime does not know how on this platform, so
 // writes go through the stream's own Write and wait there.
