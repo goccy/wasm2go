@@ -3174,9 +3174,15 @@ func (w *WasiStubs) writeStream(op *wasiOpen, dst streamWriter, bufs [][]byte, f
 	if !nonblocking && !w.beginBlocking(func() { _ = dst.SetWriteDeadline(time.Now()) }) {
 		return 0, _wasiEINTR
 	}
+	// A socket's send timeout bounds the wait for room.
+	var until time.Time
+	if _, limit := op.timeouts(); !nonblocking && limit > 0 {
+		until = time.Now().Add(limit)
+		_ = dst.SetWriteDeadline(until)
+	}
 	var total uint64
 	var failure error
-	full, cutShort := false, false
+	full, cutShort, timedOut := false, false, false
 write:
 	for _, buf := range bufs {
 		for len(buf) > 0 {
@@ -3191,6 +3197,10 @@ write:
 			if errors.Is(waitErr, os.ErrDeadlineExceeded) {
 				if !nonblocking && w.interruptDue() {
 					cutShort = true
+					break write
+				}
+				if !until.IsZero() && !time.Now().Before(until) {
+					timedOut = true
 					break write
 				}
 				// The deadline was a readiness probe's, possibly of another
@@ -3215,8 +3225,9 @@ write:
 			}
 		}
 	}
-	if !nonblocking && w.endBlocking() {
-		// wake has set a deadline, which must not outlive this write.
+	if (!nonblocking && w.endBlocking()) || !until.IsZero() {
+		// The deadline of wake, or of the send timeout, must not outlive
+		// this write.
 		_ = dst.SetWriteDeadline(time.Time{})
 	}
 	switch {
@@ -3226,7 +3237,7 @@ write:
 		return 0, w.writeFailure(failure, flags)
 	case cutShort:
 		return 0, _wasiEINTR
-	case full:
+	case full, timedOut:
 		return 0, _wasiEAGAIN
 	}
 	return 0, _wasiESUCCESS
@@ -5093,6 +5104,19 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 				return _wasiEAGAIN
 			}
 		default:
+			if limit, _ := op.timeouts(); limit > 0 {
+				errno := w.awaitWithin(limit, func(until time.Time, stop <-chan struct{}) bool {
+					return op.probeAccept(bounded, until, stop)
+				})
+				if errno != _wasiESUCCESS {
+					return errno
+				}
+				if conn, err, taken = op.takeAccepted(); !taken {
+					// another process sharing the listener took it first
+					return _wasiEAGAIN
+				}
+				break
+			}
 			var interrupted bool
 			if conn, err, interrupted = w.acceptInterruptibly(op, bounded); interrupted {
 				return _wasiEINTR
@@ -6526,6 +6550,9 @@ func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) 
 // receive may ask not to wait on a descriptor that otherwise does.
 func (w *WasiStubs) readStreamAs(op *wasiOpen, src deadlineReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
 	if !nonblocking {
+		if limit, _ := op.timeouts(); limit > 0 {
+			return w.readWithin(op, src, bufs, limit)
+		}
 		n, interrupted := w.readInterruptibly(op, src, bufs)
 		if interrupted {
 			return 0, _wasiEINTR
@@ -6543,6 +6570,43 @@ func (w *WasiStubs) readStreamAs(op *wasiOpen, src deadlineReader, bufs [][]byte
 		return 0, _wasiEAGAIN
 	}
 	n, _ := op.takeAhead(bufs)
+	return n, _wasiESUCCESS
+}
+
+// awaitWithin runs probe — a readiness probe of op's input, see probeInput —
+// for a blocking call that gives up after limit (the socket's receive
+// timeout). It returns 0 when the descriptor is ready, EAGAIN when the time
+// ran out, EINTR when a signal was posted to the guest first.
+func (w *WasiStubs) awaitWithin(limit time.Duration, probe func(until time.Time, stop <-chan struct{}) bool) int32 {
+	posted := make(chan struct{})
+	if !w.beginBlocking(func() { close(posted) }) {
+		return _wasiEINTR
+	}
+	ready := probe(time.Now().Add(limit), posted)
+	interrupted := w.endBlocking()
+	switch {
+	case ready:
+		return _wasiESUCCESS
+	case interrupted:
+		return _wasiEINTR
+	}
+	return _wasiEAGAIN
+}
+
+// readWithin is the blocking read of a socket with a receive timeout.
+func (w *WasiStubs) readWithin(op *wasiOpen, src deadlineReader, bufs [][]byte, limit time.Duration) (uint64, int32) {
+	errno := w.awaitWithin(limit, func(until time.Time, stop <-chan struct{}) bool {
+		ready, _ := op.probeRead(src, until, stop)
+		return ready
+	})
+	if errno != _wasiESUCCESS {
+		return 0, errno
+	}
+	n, served := op.takeAhead(bufs)
+	if !served {
+		// another process sharing the socket took the input first
+		return 0, _wasiEAGAIN
+	}
 	return n, _wasiESUCCESS
 }
 
@@ -6719,6 +6783,10 @@ type wasiSocket struct {
 	datagramFrom *net.UDPAddr
 	datagramErr  error
 	hasDatagram  bool
+	// receiveTimeout and sendTimeout are the socket's SO_RCVTIMEO and
+	// SO_SNDTIMEO (Sock_timeout): how long a blocking receive or accept, or
+	// a blocking send, waits before it gives up with EAGAIN. 0 is no limit.
+	receiveTimeout, sendTimeout time.Duration
 }
 
 // deadlineListener is a listener whose blocking accept can be bounded, as
@@ -7029,16 +7097,72 @@ func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
 // Sock_setopt / Sock_getopt (the numbers libc gives the options differ from
 // libc to libc, so they are not used on this boundary).
 const (
-	wasiSockOptReuseAddr int32 = 1 // SO_REUSEADDR
-	wasiSockOptReusePort int32 = 2 // SO_REUSEPORT
-	wasiSockOptKeepAlive int32 = 3 // SO_KEEPALIVE
-	wasiSockOptNoDelay   int32 = 4 // TCP_NODELAY
-	wasiSockOptRcvBuf    int32 = 5 // SO_RCVBUF
-	wasiSockOptSndBuf    int32 = 6 // SO_SNDBUF
-	wasiSockOptLinger    int32 = 7 // SO_LINGER: seconds, or -1 for off
-	wasiSockOptError     int32 = 8 // SO_ERROR (read only)
-	wasiSockOptType      int32 = 9 // SO_TYPE (read only): wasiSockTypeStream or wasiSockTypeDgram
+	wasiSockOptReuseAddr int32 = 1  // SO_REUSEADDR
+	wasiSockOptReusePort int32 = 2  // SO_REUSEPORT
+	wasiSockOptKeepAlive int32 = 3  // SO_KEEPALIVE
+	wasiSockOptNoDelay   int32 = 4  // TCP_NODELAY
+	wasiSockOptRcvBuf    int32 = 5  // SO_RCVBUF
+	wasiSockOptSndBuf    int32 = 6  // SO_SNDBUF
+	wasiSockOptLinger    int32 = 7  // SO_LINGER: seconds, or -1 for off
+	wasiSockOptError     int32 = 8  // SO_ERROR (read only)
+	wasiSockOptType      int32 = 9  // SO_TYPE (read only): wasiSockTypeStream or wasiSockTypeDgram
+	wasiSockOptAccepting int32 = 10 // SO_ACCEPTCONN (read only): 1 for a listening socket
 )
+
+// The two timeouts of a socket, as Sock_timeout names them.
+const (
+	wasiSockTimeoutReceive int32 = 1 // SO_RCVTIMEO
+	wasiSockTimeoutSend    int32 = 2 // SO_SNDTIMEO
+)
+
+// timeouts returns the socket's receive and send timeouts; 0 is no limit.
+func (op *wasiOpen) timeouts() (receive, send time.Duration) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.sock == nil {
+		return 0, 0
+	}
+	return op.sock.receiveTimeout, op.sock.sendTimeout
+}
+
+// Sock_timeout is a NON-STANDARD host import (name "sock_timeout") backing
+// SO_RCVTIMEO and SO_SNDTIMEO. which names the timeout (1 receive, 2 send).
+// The timeout before the call is written at oldPtr in nanoseconds (i64; 0 is
+// no limit); when set is non-zero it is then replaced by nanos. A blocking
+// receive or accept, or a blocking send, that has waited that long gives up
+// with EAGAIN. Returns 0, or a negative errno: EINVAL for another which or a
+// negative time.
+func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, oldPtr int32) int32 {
+	out := w.memSlice(m, oldPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	op := w.fdsLocked()[fd]
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if !op.isSocket && op.netConn() == nil {
+		return -_wasiENOTSOCK
+	}
+	if (which != wasiSockTimeoutReceive && which != wasiSockTimeoutSend) || (set != 0 && nanos < 0) {
+		return -_wasiEINVAL
+	}
+	op.mu.Lock()
+	sock := op.socketLocked()
+	timeout := &sock.receiveTimeout
+	if which == wasiSockTimeoutSend {
+		timeout = &sock.sendTimeout
+	}
+	old := *timeout
+	if set != 0 {
+		*timeout = time.Duration(nanos)
+	}
+	op.mu.Unlock()
+	binary.LittleEndian.PutUint64(out, uint64(old))
+	return _wasiESUCCESS
+}
 
 // Sock_setopt is a NON-STANDARD host import (name "sock_setopt") backing
 // setsockopt() for the options above. The value is remembered and reads back
@@ -7100,7 +7224,8 @@ func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 // Sock_getopt is a NON-STANDARD host import (name "sock_getopt") backing
 // getsockopt(): it writes the option's value (i32) at valuePtr — what the
 // guest set, or the option's initial value: 0, and -1 (off) for linger.
-// SO_ERROR is always 0: a failed operation reports its error itself. Returns
+// SO_ERROR is always 0: a failed operation reports its error itself.
+// SO_ACCEPTCONN is 1 for a socket that listens. Returns
 // 0, or a negative errno: ENOPROTOOPT for an unknown option.
 func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
 	out := w.memSlice(m, valuePtr, 4)
@@ -7119,6 +7244,10 @@ func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
 	var value int32
 	switch option {
 	case wasiSockOptError:
+	case wasiSockOptAccepting:
+		if _, listening := op.netListener(); listening {
+			value = 1
+		}
 	case wasiSockOptType:
 		value = wasiSockTypeStream
 		if op.dgram {
@@ -7327,6 +7456,18 @@ func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn *net.UDPConn, bufs [][]by
 		// probe.
 		if !op.probeDatagram(conn, time.Now().Add(pollProbeGrace), nil) {
 			return 0, nil, _wasiEAGAIN
+		}
+		if data, from, err, taken = op.takeDatagram(keep); !taken {
+			// another process sharing the socket took it first
+			return 0, nil, _wasiEAGAIN
+		}
+	}
+	if limit, _ := op.timeouts(); !taken && limit > 0 {
+		errno := w.awaitWithin(limit, func(until time.Time, stop <-chan struct{}) bool {
+			return op.probeDatagram(conn, until, stop)
+		})
+		if errno != _wasiESUCCESS {
+			return 0, nil, errno
 		}
 		if data, from, err, taken = op.takeDatagram(keep); !taken {
 			// another process sharing the socket took it first
