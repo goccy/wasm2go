@@ -196,6 +196,12 @@ type fileStat struct {
 	dev, ino, nlink uint64
 	uid, gid        uint32
 	atime, ctime    time.Time
+	// rdev is the device a character or block special file stands for,
+	// blksize the preferred block size for I/O on the file (0: the backend
+	// names none) and blocks the number of 512-byte blocks allocated to it.
+	rdev    uint64
+	blksize uint32
+	blocks  uint64
 }
 
 // fileStatOf returns the POSIX metadata of the file fi describes. A FileInfo
@@ -707,12 +713,16 @@ func (fi memFileInfo) IsDir() bool        { return fi.mode.IsDir() }
 // file has one link until it is removed, and it keeps no owner and no times
 // other than the modification time.
 func (fi memFileInfo) Sys() any {
-	st := &fileStat{nlink: 1, atime: fi.modTime, ctime: fi.modTime}
+	st := &fileStat{nlink: 1, atime: fi.modTime, ctime: fi.modTime,
+		blksize: memBlockSize, blocks: uint64(fi.size+511) / 512}
 	if fi.unlinked {
 		st.nlink = 0
 	}
 	return st
 }
+
+// memBlockSize is the block size an in-memory file reports for I/O.
+const memBlockSize = 4096
 
 type memDirEntry struct{ n *memNode }
 
@@ -4094,7 +4104,7 @@ const (
 // uid, the gid — and returns 0 or a negative errno.
 func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPtr int32) int32 {
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	out := w.memSlice(m, outPtr, 12)
+	out := w.memSlice(m, outPtr, wasiFilestatExtSize)
 	if pathSlice == nil || out == nil {
 		return -_wasiEFAULT
 	}
@@ -4124,7 +4134,7 @@ func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPt
 // two have no file behind them; they belong to the guest's own user (see
 // SetHostProcess).
 func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 12)
+	out := w.memSlice(m, outPtr, wasiFilestatExtSize)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -4274,6 +4284,11 @@ func (w *WasiStubs) Fd_path(m *Module, fd, bufPtr, bufLen, neededPtr int32) int3
 	return w.writeWasiRecord(m, []byte(path), bufPtr, bufLen, neededPtr)
 }
 
+// wasiFilestatExtSize is the size of the record Path_filestat_ext and
+// Fd_filestat_ext write: u32 mode, uid, gid and block size, then u64 device
+// of a special file and number of 512-byte blocks.
+const wasiFilestatExtSize = 32
+
 // writeFilestatExt writes what Path_filestat_ext and Fd_filestat_ext
 // report about the file fi describes.
 func writeFilestatExt(out []byte, fi os.FileInfo) {
@@ -4281,6 +4296,9 @@ func writeFilestatExt(out []byte, fi os.FileInfo) {
 	binary.LittleEndian.PutUint32(out[0:], unixTypeBits(fi.Mode())|unixModeBits(fi.Mode()))
 	binary.LittleEndian.PutUint32(out[4:], st.uid)
 	binary.LittleEndian.PutUint32(out[8:], st.gid)
+	binary.LittleEndian.PutUint32(out[12:], st.blksize)
+	binary.LittleEndian.PutUint64(out[16:], st.rdev)
+	binary.LittleEndian.PutUint64(out[24:], st.blocks)
 }
 
 // Path_filestat_mode is a NON-STANDARD host import (module

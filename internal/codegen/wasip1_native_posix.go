@@ -37,6 +37,10 @@ func osFileStat(sys any) (fileStat, bool) {
 		gid:   st.Gid,
 		atime: atime,
 		ctime: ctime,
+		// the widths of these differ from host to host
+		rdev:    uint64(st.Rdev),
+		blksize: uint32(st.Blksize),
+		blocks:  uint64(st.Blocks),
 	}, true
 }
 

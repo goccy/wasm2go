@@ -754,3 +754,47 @@ func TestWasi_FileTypes(t *testing.T) {
 	wt, pt = byFd(0)
 	want("stdin from /dev/null", wt, pt, 2, unixTypeChar)
 }
+
+// The extended stat record names the block size, the blocks allocated and,
+// for a special file, the device it stands for.
+func TestFilestatExtBlocksAndDevice(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "data"), make([]byte, 10000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	record := func(name string) (blksize uint32, rdev, blocks uint64) {
+		t.Helper()
+		off := writeCStr(m, 1000, name)
+		if rc := w.Path_filestat_ext(m, off, int32(len(name)), 1, metaOutOff); rc != 0 {
+			t.Fatalf("Path_filestat_ext(%s) rc=%d", name, rc)
+		}
+		out := m.memory[metaOutOff:]
+		return binary.LittleEndian.Uint32(out[12:]), binary.LittleEndian.Uint64(out[16:]), binary.LittleEndian.Uint64(out[24:])
+	}
+	blksize, rdev, blocks := record("data")
+	if blksize == 0 || blocks == 0 || rdev != 0 {
+		t.Fatalf("a file of 10000 bytes: block size %d, %d blocks, device %d", blksize, blocks, rdev)
+	}
+	if blocks*512 < 10000 {
+		t.Fatalf("%d blocks of 512 bytes do not hold the file", blocks)
+	}
+	// In memory a file has blocks too.
+	mem := NewMemFS()
+	if err := mem.WriteFile("data", make([]byte, 10000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.SetFS(mem)
+	if blksize, _, blocks := record("data"); blksize == 0 || blocks != 20 {
+		t.Fatalf("in memory: block size %d, %d blocks; want a block size and 20 blocks", blksize, blocks)
+	}
+	// The null device of the host stands for a device.
+	host := DefaultWASI()
+	off := writeCStr(m, 1000, "dev/null")
+	if rc := host.Path_filestat_ext(m, off, 8, 1, metaOutOff); rc != 0 {
+		t.Skipf("the host has no /dev/null: rc=%d", rc)
+	}
+	if rdev := binary.LittleEndian.Uint64(m.memory[metaOutOff+16:]); rdev == 0 {
+		t.Fatal("/dev/null stands for no device")
+	}
+}
