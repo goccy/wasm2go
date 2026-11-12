@@ -370,3 +370,103 @@ func TestOpenOfAFIFOWithoutWaiting(t *testing.T) {
 		t.Fatalf("read = %q rc=%d", got, rc)
 	}
 }
+
+// A readiness probe that has no time left still finds what is there: input
+// in a pipe, a datagram, a connection waiting at a listener. The time a
+// probe is given bounds its wait, not its look — a probe that is scheduled
+// late must not report a descriptor that is ready as not ready.
+func TestProbeWithNoTimeLeftFindsWhatIsThere(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	w.SetNetAccessHook(func(string) bool { return true })
+	past := func() time.Time { return time.Now().Add(-time.Second) }
+	entry := func(fd int32) *wasiOpen {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.fdsLocked()[fd]
+	}
+
+	// a pipe
+	readFd, writeFd := newTestPipe(t, w, m)
+	op := entry(readFd)
+	w.mu.Lock()
+	src, _ := w.fdSrcLocked(readFd)
+	w.mu.Unlock()
+	stream, blocks := op.readBlocks(src)
+	if !blocks {
+		t.Fatal("the read end of a pipe is not a stream")
+	}
+	if ready, _ := op.probeRead(stream, past(), nil); ready {
+		t.Fatal("an empty pipe is ready")
+	}
+	if rc := fdWriteString(w, m, writeFd, "input"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	if ready, refused := op.probeRead(stream, past(), nil); !ready || refused {
+		t.Fatalf("a pipe with input: ready=%v refused=%v, want ready", ready, refused)
+	}
+	if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "input" {
+		t.Fatalf("read = %q rc=%d", got, rc)
+	}
+	// the end of input is there to be found as well
+	if rc := w.Fd_close(m, writeFd); rc != _wasiESUCCESS {
+		t.Fatalf("close rc=%d", rc)
+	}
+	if ready, _ := op.probeRead(stream, past(), nil); !ready {
+		t.Fatal("a pipe at its end is not ready")
+	}
+	if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "" {
+		t.Fatalf("read at the end = %q rc=%d", got, rc)
+	}
+
+	// a datagram socket
+	server := newDatagramSocket(t, w, m)
+	if rc := w.Sock_bind(m, server, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("Sock_bind rc=%d", rc)
+	}
+	serverName := localName(t, w, m, server)
+	sop := entry(server)
+	dgram, _ := sop.netConn().(datagramSocket)
+	if dgram == nil {
+		t.Fatal("the bound datagram socket has no host socket")
+	}
+	if sop.probeDatagram(dgram, past(), nil) {
+		t.Fatal("a datagram socket nothing was sent to is ready")
+	}
+	client := newDatagramSocket(t, w, m)
+	if sent, rc := sendTo(w, m, client, "datagram", uint32(loopbackBE), int32(serverName.port)); rc != 0 || sent != 8 {
+		t.Fatalf("sendto: %d bytes rc=%d", sent, rc)
+	}
+	clientName := localName(t, w, m, client)
+	if !sop.probeDatagram(dgram, past(), nil) {
+		t.Fatal("a datagram socket with a datagram waiting is not ready")
+	}
+	if got, from, rc := recvFrom(w, m, server, 64); rc != 0 || got != "datagram" || from.port != clientName.port || from.ip != uint32(loopbackBE) {
+		t.Fatalf("recvfrom = %q from %+v rc=%d, want the datagram from port %d", got, from, rc, clientName.port)
+	}
+
+	// a listening socket
+	listener, port := newListener(t, w, m)
+	lop := entry(listener)
+	l, _ := lop.netListener()
+	bounded, _ := l.(deadlineListener)
+	if bounded == nil {
+		t.Fatal("the listener cannot be bounded")
+	}
+	if lop.probeAccept(bounded, past(), nil) {
+		t.Fatal("a listener nobody connected to is ready")
+	}
+	conn := dialLoopback(t, w, m, port)
+	if !lop.probeAccept(bounded, past(), nil) {
+		t.Fatal("a listener with a connection waiting is not ready")
+	}
+	accepted, rc := acceptOn(w, m, listener)
+	if rc != _wasiESUCCESS {
+		t.Fatalf("accept rc=%d", rc)
+	}
+	if rc := sockSend(w, m, conn, "over"); rc != _wasiESUCCESS {
+		t.Fatalf("send rc=%d", rc)
+	}
+	if got, rc := sockRecv(w, m, accepted); rc != _wasiESUCCESS || got != "over" {
+		t.Fatalf("recv on the accepted connection = %q rc=%d", got, rc)
+	}
+}

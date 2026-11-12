@@ -1082,9 +1082,19 @@ func (op *wasiOpen) passInputTurn() { <-op.inputTurn() }
 // something is kept there, in which case the descriptor is ready.
 // setDeadline bounds the host call attempt makes.
 //
+// Before it waits, the probe looks: look makes the same read, accept or
+// receive without waiting and reports whether it could (the host has a way,
+// and the descriptor is one that can be asked). What is there right now is
+// found that way whatever time the probe has — a deadline cannot say it: one
+// that has passed by the time the host's call is entered ends the call
+// before it has asked, and a probe that may not wait would report input that
+// is there as missing whenever it was not scheduled in time. A probe with no
+// more time than pollProbeGrace was only to look, and does not wait once it
+// has.
+//
 // refused is true when the stream takes no deadline: nothing was attempted
 // then, and the caller decides what an unbounded read is worth to it.
-func (op *wasiOpen) probeInput(setDeadline func(time.Time) error, until time.Time, stop <-chan struct{}, kept func() bool, attempt func()) (ready, refused bool) {
+func (op *wasiOpen) probeInput(setDeadline func(time.Time) error, until time.Time, stop <-chan struct{}, kept func() bool, look func() bool, attempt func()) (ready, refused bool) {
 	if kept() {
 		return true, false
 	}
@@ -1095,6 +1105,14 @@ func (op *wasiOpen) probeInput(setDeadline func(time.Time) error, until time.Tim
 	// Whoever had the turn before may have found something.
 	if kept() {
 		return true, false
+	}
+	if look() {
+		if kept() {
+			return true, false
+		}
+		if !until.IsZero() && time.Until(until) <= pollProbeGrace {
+			return false, false
+		}
 	}
 	if err := setDeadline(until); err != nil {
 		return false, true
@@ -1128,7 +1146,24 @@ func (op *wasiOpen) probeRead(src deadlineReader, until time.Time, stop <-chan s
 		ready, _ := op.aheadReady()
 		return ready
 	}
-	return op.probeInput(src.SetReadDeadline, until, stop, kept, func() {
+	look := func() bool {
+		buf := make([]byte, 32<<10)
+		n, again, err, looked := readNow(src, buf)
+		if !looked || again {
+			return looked
+		}
+		op.mu.Lock()
+		defer op.mu.Unlock()
+		op.ahead = append(op.ahead, buf[:n]...)
+		switch {
+		case err != nil:
+			op.aheadEnd = os.NewSyscallError("read", err)
+		case n == 0:
+			op.aheadEnd = io.EOF
+		}
+		return true
+	}
+	return op.probeInput(src.SetReadDeadline, until, stop, kept, look, func() {
 		buf := make([]byte, 32<<10)
 		n, err := src.Read(buf)
 		op.mu.Lock()
@@ -1138,6 +1173,40 @@ func (op *wasiOpen) probeRead(src deadlineReader, until time.Time, stop <-chan s
 			op.aheadEnd = err
 		}
 	})
+}
+
+// hostDescriptor runs use on the descriptor of the host behind stream — a
+// file, connection or listener of the host's — and reports whether it did:
+// not when stream is no such thing, or is closed.
+func hostDescriptor(stream any, use func(fd uintptr)) bool {
+	conn, ok := stream.(syscall.Conn)
+	if !ok {
+		return false
+	}
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		return false
+	}
+	return rc.Control(use) == nil
+}
+
+// readNow reads from src once without waiting. looked is false when that
+// cannot be done: the host has no way (hostInputNow), or src is not a
+// descriptor of the host's that returns from a read with nothing to read.
+// Otherwise again says that nothing is there right now, and n and err are
+// the read's: no bytes and no error is the end of input.
+func readNow(src any, p []byte) (n int, again bool, err error, looked bool) {
+	if !hostInputNow {
+		return 0, false, nil, false
+	}
+	asked := hostDescriptor(src, func(fd uintptr) {
+		if descriptorWaits(fd) {
+			return
+		}
+		n, again, err = readRaw(fd, p)
+		looked = true
+	})
+	return n, again, err, asked && looked
 }
 
 // readBlocks reports whether a read of src, the stream behind this entry,
@@ -8354,7 +8423,34 @@ func (op *wasiOpen) acceptedReady() bool {
 // connection that arrives for the next Sock_accept. It reports whether the
 // listener is now ready for an accept.
 func (op *wasiOpen) probeAccept(l deadlineListener, until time.Time, stop <-chan struct{}) bool {
-	ready, _ := op.probeInput(l.SetDeadline, until, stop, op.acceptedReady, func() {
+	look := func() bool {
+		if !hostInputNow {
+			return false
+		}
+		var conn net.Conn
+		var again, looked bool
+		var err error
+		asked := hostDescriptor(l, func(fd uintptr) {
+			if descriptorWaits(fd) {
+				return
+			}
+			conn, again, err = acceptRaw(fd)
+			looked = true
+		})
+		if !asked || !looked || again {
+			return asked && looked
+		}
+		op.mu.Lock()
+		defer op.mu.Unlock()
+		s := op.socketLocked()
+		if err != nil {
+			s.acceptErr = err
+		} else {
+			s.accepted = append(s.accepted, conn)
+		}
+		return true
+	}
+	ready, _ := op.probeInput(l.SetDeadline, until, stop, op.acceptedReady, look, func() {
 		conn, err := l.Accept()
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			return
@@ -9000,11 +9096,7 @@ func (op *wasiOpen) takeDatagram(keep bool) (data []byte, from net.Addr, err err
 // nothing. The caller has the turn at op's input. Only receiving tells that
 // a datagram is there, as only reading tells for a stream.
 func (op *wasiOpen) keepDatagram(conn datagramSocket) {
-	size := 1 << 16 // no UDP datagram is larger
-	if op.family == wasiSockFamilyUnix {
-		size = 1 << 18 // nor a Unix-domain one, with the usual send buffers
-	}
-	buf := make([]byte, size)
+	buf := make([]byte, op.datagramRoom())
 	n, from, err := conn.ReadFrom(buf)
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		return
@@ -9022,8 +9114,46 @@ func (op *wasiOpen) keepDatagram(conn datagramSocket) {
 // probeDatagram receives one datagram from conn, as probeInput describes,
 // and reports whether the socket is now ready for a receive.
 func (op *wasiOpen) probeDatagram(conn datagramSocket, until time.Time, stop <-chan struct{}) bool {
-	ready, _ := op.probeInput(conn.SetReadDeadline, until, stop, op.datagramReady, func() { op.keepDatagram(conn) })
+	look := func() bool {
+		if !hostInputNow {
+			return false
+		}
+		buf := make([]byte, op.datagramRoom())
+		var n int
+		var from net.Addr
+		var again, looked bool
+		var err error
+		asked := hostDescriptor(conn, func(fd uintptr) {
+			if descriptorWaits(fd) {
+				return
+			}
+			n, from, again, err = receiveRaw(fd, buf)
+			looked = true
+		})
+		if !asked || !looked || again {
+			return asked && looked
+		}
+		op.mu.Lock()
+		defer op.mu.Unlock()
+		s := op.socketLocked()
+		if err != nil {
+			s.datagramErr = os.NewSyscallError("recvfrom", err)
+		} else {
+			s.datagram, s.datagramFrom, s.hasDatagram = buf[:n], from, true
+		}
+		return true
+	}
+	ready, _ := op.probeInput(conn.SetReadDeadline, until, stop, op.datagramReady, look, func() { op.keepDatagram(conn) })
 	return ready
+}
+
+// datagramRoom is the size of the buffer a datagram of the socket is
+// received into: no datagram is larger.
+func (op *wasiOpen) datagramRoom() int {
+	if op.family == wasiSockFamilyUnix {
+		return 1 << 18 // a Unix-domain one, with the usual send buffers
+	}
+	return 1 << 16 // UDP
 }
 
 // receiveDatagram takes one datagram off a datagram socket into bufs — what
@@ -10395,6 +10525,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"putStrVec64":               true,
 			"readVec":                   true,
 			"readVecFailure":            true,
+			"hostDescriptor":            true,
+			"readNow":                   true,
 			"appendWasiString":          true,
 			"wasiSignalBit":             true,
 			"syslogResult":              true,

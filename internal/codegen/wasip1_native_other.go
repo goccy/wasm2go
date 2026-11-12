@@ -99,6 +99,33 @@ func hostSystemName() (fields [5]string, err error) {
 	return fields, errors.ErrUnsupported
 }
 
+// hostInputNow says whether the host can read, receive and accept on a
+// descriptor without waiting in the call. The runtime does not know how on
+// this platform: a readiness probe bounds the call by a deadline instead.
+const hostInputNow = false
+
+// descriptorWaits reports whether a call on the descriptor waits when there
+// is nothing for it, which the runtime cannot tell on this platform.
+func descriptorWaits(fd uintptr) bool { return true }
+
+// readRaw reads from a descriptor without waiting, which the runtime cannot
+// do on this platform.
+func readRaw(fd uintptr, p []byte) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+// receiveRaw receives a datagram without waiting, which the runtime cannot
+// do on this platform.
+func receiveRaw(fd uintptr, p []byte) (n int, from net.Addr, again bool, err error) {
+	return 0, nil, false, errors.ErrUnsupported
+}
+
+// acceptRaw accepts a connection without waiting, which the runtime cannot
+// do on this platform.
+func acceptRaw(fd uintptr) (conn net.Conn, again bool, err error) {
+	return nil, false, errors.ErrUnsupported
+}
+
 // hostStreamWrites says whether the host can write to a stream without
 // waiting in the write. The runtime does not know how on this platform, so
 // writes go through the stream's own Write and wait there.

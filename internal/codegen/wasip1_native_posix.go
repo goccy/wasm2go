@@ -229,6 +229,100 @@ func setHostGroups(gids []int) (err error) {
 	return syscall.Setgroups(gids)
 }
 
+// hostInputNow says that the host can read, receive and accept on a
+// descriptor without waiting in the call: see readRaw, receiveRaw and
+// acceptRaw.
+const hostInputNow = true
+
+// descriptorWaits reports whether a call on the descriptor waits when there
+// is nothing for it: it is not in non-blocking mode, which the descriptors
+// the runtime polls are. Such a descriptor cannot be asked what is there.
+func descriptorWaits(fd uintptr) bool {
+	flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
+	return err != nil || flags&syscall.O_NONBLOCK == 0
+}
+
+// readRaw reads from a descriptor that does not wait, once. again reports
+// that nothing is there right now; otherwise n bytes were read (none at the
+// end of input), or err says why not.
+func readRaw(fd uintptr, p []byte) (n int, again bool, err error) {
+	for {
+		n, err = syscall.Read(int(fd), p)
+		if err == syscall.EINTR {
+			continue
+		}
+		if n < 0 {
+			n = 0
+		}
+		if err == syscall.EAGAIN {
+			return 0, true, nil
+		}
+		return n, false, err
+	}
+}
+
+// receiveRaw receives one datagram from a socket that does not wait, into
+// p, with the address it came from as package net names it (nil when the
+// sender has none). again reports that no datagram is there right now.
+func receiveRaw(fd uintptr, p []byte) (n int, from net.Addr, again bool, err error) {
+	for {
+		var sender syscall.Sockaddr
+		n, sender, err = syscall.Recvfrom(int(fd), p, 0)
+		if err == syscall.EINTR {
+			continue
+		}
+		if n < 0 {
+			n = 0
+		}
+		if err == syscall.EAGAIN {
+			return 0, nil, true, nil
+		}
+		switch a := sender.(type) {
+		case *syscall.SockaddrInet4:
+			from = &net.UDPAddr{IP: net.IP(a.Addr[:]).To4(), Port: a.Port}
+		case *syscall.SockaddrInet6:
+			zone := ""
+			if a.ZoneId != 0 {
+				zone = strconv.FormatUint(uint64(a.ZoneId), 10)
+				if ifc, ierr := net.InterfaceByIndex(int(a.ZoneId)); ierr == nil {
+					zone = ifc.Name
+				}
+			}
+			from = &net.UDPAddr{IP: net.IP(a.Addr[:]), Port: a.Port, Zone: zone}
+		case *syscall.SockaddrUnix:
+			if a.Name != "" {
+				from = &net.UnixAddr{Name: a.Name, Net: "unixgram"}
+			}
+		}
+		return n, from, false, err
+	}
+}
+
+// acceptRaw accepts one connection from a listening socket that does not
+// wait. again reports that no connection is there right now.
+func acceptRaw(fd uintptr) (conn net.Conn, again bool, err error) {
+	for {
+		nfd, _, aerr := syscall.Accept(int(fd))
+		switch aerr {
+		case nil:
+		case syscall.EINTR:
+			continue
+		case syscall.EAGAIN, syscall.ECONNABORTED:
+			// one that was taken back before it was accepted is not there
+			return nil, true, nil
+		default:
+			return nil, false, os.NewSyscallError("accept", aerr)
+		}
+		syscall.CloseOnExec(nfd)
+		// The connection of package net is made on a duplicate, which it
+		// puts in the mode it needs.
+		file := os.NewFile(uintptr(nfd), "")
+		conn, err = net.FileConn(file)
+		_ = file.Close()
+		return conn, false, err
+	}
+}
+
 // hostStreamWrites says that the host can write to a stream without waiting
 // in the write, and ask whether one has room: see writeRaw and fdWritable.
 const hostStreamWrites = true
