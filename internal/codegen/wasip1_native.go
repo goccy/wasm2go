@@ -6068,6 +6068,124 @@ func (w *WasiStubs) Proc_setenv(m *Module, namePtr, nameLen, valuePtr, valueLen,
 	return _wasiESUCCESS
 }
 
+// ----- network databases -------------------------------------------------------
+
+// wasiService is one entry of the services database.
+type wasiService struct {
+	name    string
+	aliases []string
+	port    int
+	proto   string
+}
+
+// hostServicesFile is the services database of a Unix host, services(5):
+// one service per line — its name, port/protocol, and aliases — with
+// comments from a # to the end of the line.
+const hostServicesFile = "/etc/services"
+
+// findHostService returns the first entry of the host's services database
+// that match accepts. The file is read anew for every lookup: lookups are
+// rare, and the file is the host's to change.
+func findHostService(match func(wasiService) bool) (found wasiService, ok bool) {
+	raw, err := os.ReadFile(hostServicesFile)
+	if err != nil {
+		return found, false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if at := strings.IndexByte(line, '#'); at >= 0 {
+			line = line[:at]
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		portText, proto, isPair := strings.Cut(fields[1], "/")
+		port, err := strconv.Atoi(portText)
+		if !isPair || err != nil {
+			continue
+		}
+		entry := wasiService{name: fields[0], aliases: fields[2:], port: port, proto: proto}
+		if match(entry) {
+			return entry, true
+		}
+	}
+	return found, false
+}
+
+// Sock_service is a NON-STANDARD host import (name "sock_service") backing
+// getservbyname and getservbyport for a guest that is the host process: the
+// service called name (by its name or an alias) when byPort is 0, or the
+// service on port otherwise, for the protocol proto when that is not
+// empty. The record (writeWasiRecord) is the port (u32), the name, the
+// protocol, the number of aliases (u32) and the aliases, strings as
+// appendWasiString writes them. Returns 0, or a negative errno: ENOENT when
+// there is no such service — as for every guest that is not the host
+// process, which has no services database.
+func (w *WasiStubs) Sock_service(m *Module, namePtr, nameLen, port, byPort, protoPtr, protoLen, bufPtr, bufLen, neededPtr int32) int32 {
+	nameBytes := w.memSlice(m, namePtr, nameLen)
+	protoBytes := w.memSlice(m, protoPtr, protoLen)
+	if nameBytes == nil || protoBytes == nil {
+		return -_wasiEFAULT
+	}
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	name, proto := string(nameBytes), string(protoBytes)
+	entry, ok := findHostService(func(s wasiService) bool {
+		if proto != "" && s.proto != proto {
+			return false
+		}
+		if byPort != 0 {
+			return s.port == int(port)
+		}
+		if s.name == name {
+			return true
+		}
+		for _, alias := range s.aliases {
+			if alias == name {
+				return true
+			}
+		}
+		return false
+	})
+	if !ok {
+		return -_wasiENOENT
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(entry.port))
+	rec = appendWasiString(rec, entry.name)
+	rec = appendWasiString(rec, entry.proto)
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(len(entry.aliases)))
+	for _, alias := range entry.aliases {
+		rec = appendWasiString(rec, alias)
+	}
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// Sock_reverse is a NON-STANDARD host import (name "sock_reverse") backing
+// gethostbyaddr and getnameinfo: the name of the host that has the IPv4
+// address ipBE (as it sits in s_addr), as the host's resolver knows it. The
+// record (writeWasiRecord) is the name, without a length prefix. The lookup
+// is subject to the resolve hook, which is asked about the address in
+// dotted form. Returns 0, or a negative errno: ENOENT when the address has
+// no name, EACCES when the hook refuses.
+func (w *WasiStubs) Sock_reverse(m *Module, ipBE, bufPtr, bufLen, neededPtr int32) int32 {
+	ip := socketIPv4(ipBE)
+	w.mu.Lock()
+	hook := w.resolveHook
+	w.mu.Unlock()
+	if hook != nil && !hook(ip) {
+		return -_wasiEACCES
+	}
+	names, err := net.LookupAddr(ip)
+	if err != nil || len(names) == 0 {
+		return -_wasiENOENT
+	}
+	// The resolver answers with a fully qualified name, which ends in the
+	// root's dot; a host's name is written without it.
+	name := strings.TrimSuffix(names[0], ".")
+	return w.writeWasiRecord(m, []byte(name), bufPtr, bufLen, neededPtr)
+}
+
 // ----- process groups ---------------------------------------------------------
 //
 // The processes of a fork family are goroutines of one host process, so the
@@ -8738,6 +8856,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"posixZoneScanner": true,
 			"SyslogMessage":    true,
 			"wasiSocket":       true,
+			"wasiService":      true,
 			"deadlineListener": true,
 			"wasiSignals":      true,
 			"wasiOpen":         true,
@@ -8790,6 +8909,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"pollReady":               true,
 			"probeWritable":           true,
 			"takeTurn":                true,
+			"findHostService":         true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
