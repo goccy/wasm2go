@@ -5937,6 +5937,57 @@ func (w *WasiStubs) Proc_uname(m *Module, bufPtr, bufLen, neededPtr int32) int32
 	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
 }
 
+// Proc_chdir is a NON-STANDARD host import (name "proc_chdir"). The working
+// directory of a guest is kept by its libc; the guest reports every change
+// here, and when it is the host process the host process follows — code of
+// the host that runs for the program (a native extension, a library it
+// loads) then finds the directory the program is in. path is absolute.
+//
+// The processes of a fork family share the one host process, which has one
+// working directory: it is the first process's. A forked process's change
+// stays its own.
+//
+// Returns 0 or a negative errno.
+func (w *WasiStubs) Proc_chdir(m *Module, pathPtr, pathLen int32) int32 {
+	path := w.memSlice(m, pathPtr, pathLen)
+	if path == nil {
+		return -_wasiEFAULT
+	}
+	if !w.isHostProcess() {
+		return _wasiESUCCESS
+	}
+	if err := os.Chdir(string(path)); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_setenv is a NON-STANDARD host import (name "proc_setenv"), the
+// counterpart of Proc_chdir for the environment: the guest reports every
+// variable it sets (hasValue non-zero) or removes, and when it is the host
+// process the host process's environment follows. A forked process's
+// change stays its own. Returns 0 or a negative errno.
+func (w *WasiStubs) Proc_setenv(m *Module, namePtr, nameLen, valuePtr, valueLen, hasValue int32) int32 {
+	name := w.memSlice(m, namePtr, nameLen)
+	value := w.memSlice(m, valuePtr, valueLen)
+	if name == nil || (value == nil && hasValue != 0) {
+		return -_wasiEFAULT
+	}
+	if !w.isHostProcess() {
+		return _wasiESUCCESS
+	}
+	var err error
+	if hasValue != 0 {
+		err = os.Setenv(string(name), string(value))
+	} else {
+		err = os.Unsetenv(string(name))
+	}
+	if err != nil {
+		return -_wasiEINVAL
+	}
+	return _wasiESUCCESS
+}
+
 // ----- process groups ---------------------------------------------------------
 //
 // The processes of a fork family are goroutines of one host process, so the
