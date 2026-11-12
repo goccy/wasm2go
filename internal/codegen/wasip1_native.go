@@ -919,9 +919,10 @@ type wasiOpen struct {
 	// guarded by mu.
 	ahead    []byte
 	aheadEnd error
-	// turn is the turn at this descriptor's input; see inputTurn. Made on
-	// first use; guarded by mu.
-	turn chan struct{}
+	// turn is the turn at this descriptor's input and outTurn the turn at
+	// its output; see inputTurn. Made on first use; guarded by mu.
+	turn    chan struct{}
+	outTurn chan struct{}
 	// sock is the state of a socket beyond its connection or listener;
 	// see wasiSocket. Guarded by mu; use it through socketLocked.
 	sock *wasiSocket
@@ -1001,11 +1002,40 @@ func (op *wasiOpen) inputTurn() chan struct{} {
 	return op.turn
 }
 
+// outputTurn returns the channel that holds the turn at this descriptor's
+// output. Writing to a stream that is full waits inside a call of the host's
+// as reading an empty one does, with the same queue behind the one caller
+// it admits; writers and the probes that ask whether a write would wait
+// therefore take turns the way readers do (inputTurn). The two directions
+// have a turn each: a process waiting for input on a socket does not keep
+// another from writing to it.
+func (op *wasiOpen) outputTurn() chan struct{} {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.outTurn == nil {
+		op.outTurn = make(chan struct{}, 1)
+	}
+	return op.outTurn
+}
+
 // takeInputTurn waits for the turn at the descriptor's input and reports
 // whether it got it: not when until passed first (the zero time is no
 // limit), nor when stop was closed first.
 func (op *wasiOpen) takeInputTurn(until time.Time, stop <-chan struct{}) bool {
-	turn := op.inputTurn()
+	return takeTurn(op.inputTurn(), until, stop)
+}
+
+// takeOutputTurn is takeInputTurn for the descriptor's output.
+func (op *wasiOpen) takeOutputTurn(until time.Time, stop <-chan struct{}) bool {
+	return takeTurn(op.outputTurn(), until, stop)
+}
+
+// passOutputTurn gives the turn at the descriptor's output back.
+func (op *wasiOpen) passOutputTurn() { <-op.outputTurn() }
+
+// takeTurn waits for a turn and reports whether it got it: not when until
+// passed first (the zero time is no limit), nor when stop was closed first.
+func takeTurn(turn chan struct{}, until time.Time, stop <-chan struct{}) bool {
 	select {
 	case turn <- struct{}{}:
 		return true
@@ -3417,13 +3447,30 @@ func (w *WasiStubs) writeStream(op *wasiOpen, dst streamWriter, bufs [][]byte, f
 		return 0, w.writeFailure(err, flags)
 	}
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
-	if !nonblocking && !w.beginBlocking(func() { _ = dst.SetWriteDeadline(time.Now()) }) {
-		return 0, _wasiEINTR
-	}
-	// A socket's send timeout bounds the wait for room.
+	// A socket's send timeout bounds the wait, for the turn and for room.
 	var until time.Time
 	if _, limit := op.timeouts(); !nonblocking && limit > 0 {
 		until = time.Now().Add(limit)
+	}
+	// Only the holder of the turn at the stream's output enters the host's
+	// write and sets the deadline that bounds it.
+	if nonblocking {
+		// Long enough for a writer that is not waiting to be done; one that
+		// waits for room has found the stream full.
+		if !op.takeOutputTurn(time.Now().Add(pollProbeGrace), nil) {
+			return 0, _wasiEAGAIN
+		}
+	} else if held, interrupted := w.awaitOutputTurn(op, until); !held {
+		if interrupted {
+			return 0, _wasiEINTR
+		}
+		return 0, _wasiEAGAIN // the send timeout
+	}
+	defer op.passOutputTurn()
+	if !nonblocking && !w.beginBlocking(func() { _ = dst.SetWriteDeadline(time.Now()) }) {
+		return 0, _wasiEINTR
+	}
+	if !until.IsZero() {
 		_ = dst.SetWriteDeadline(until)
 	}
 	var total uint64
@@ -3449,10 +3496,9 @@ write:
 					timedOut = true
 					break write
 				}
-				// The deadline was a readiness probe's, possibly of another
-				// instance sharing the descriptor (pollReady); it is cleared
-				// as soon as that probe ends.
-				runtime.Gosched()
+				// Only the holder of the turn sets a deadline, so this one
+				// is not the stream's any more: it was left behind.
+				_ = dst.SetWriteDeadline(until)
 				continue
 			}
 			if waitErr != nil {
@@ -3554,9 +3600,16 @@ func probeWritable(dst streamWriter) bool {
 }
 
 // probeWritableUntil is probeWritable bounded for a poll: it waits no longer
-// than until (the zero time is no limit), and not after stop is closed. A
-// stream that takes no deadline cannot be asked, and counts as writable.
-func probeWritableUntil(dst streamWriter, until time.Time, stop <-chan struct{}) bool {
+// than until (the zero time is no limit), and not after stop is closed —
+// first for the turn at the output of op, whose stream dst is, then for
+// room. A stream that takes no deadline cannot be asked, and counts as
+// writable.
+func (op *wasiOpen) probeWritableUntil(dst streamWriter, until time.Time, stop <-chan struct{}) bool {
+	if !op.takeOutputTurn(until, stop) {
+		// Whoever holds the turn is waiting for room: there is none.
+		return false
+	}
+	defer op.passOutputTurn()
 	if err := dst.SetWriteDeadline(until); err != nil {
 		return true
 	}
@@ -4974,7 +5027,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 				probes = append(probes, pollProbe{
 					op: op,
 					probe: func(until time.Time, stop <-chan struct{}) bool {
-						return probeWritableUntil(stream, until, stop)
+						return op.probeWritableUntil(stream, until, stop)
 					},
 				})
 			}
@@ -5174,8 +5227,17 @@ func pollReady(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
 	}()
 	select {
 	case <-hit:
-		// One is ready: stop waiting on the rest. Their probes end at
-		// once, keeping whatever they had already received.
+		// One is ready: stop waiting on the rest, once they have had the
+		// time a probe needs to find what is ready right now — a poll
+		// reports every descriptor that is ready, not the first. Their
+		// probes then end at once, keeping whatever they had received.
+		grace := time.NewTimer(pollProbeGrace)
+		select {
+		case <-done:
+		case <-cancel:
+		case <-grace.C:
+		}
+		grace.Stop()
 	case <-cancel:
 	case <-done:
 	}
@@ -7599,6 +7661,26 @@ func (w *WasiStubs) receiveStream(op *wasiOpen, conn net.Conn, bufs [][]byte, fl
 	}
 }
 
+// awaitOutputTurn takes the turn at op's output for a blocking write of the
+// guest's, waiting no longer than until (the zero time is no limit). held is
+// false when the turn was not taken: because a signal posted to the guest
+// ended the wait (interrupted, to be reported as EINTR), or because the time
+// was up.
+func (w *WasiStubs) awaitOutputTurn(op *wasiOpen, until time.Time) (held, interrupted bool) {
+	posted := make(chan struct{})
+	if !w.beginBlocking(func() { close(posted) }) {
+		return false, true
+	}
+	held = op.takeOutputTurn(until, posted)
+	if w.endBlocking() {
+		if held {
+			op.passOutputTurn()
+		}
+		return false, true
+	}
+	return held, false
+}
+
 // awaitInputTurn takes the turn at op's input for a blocking call of the
 // guest's. It reports false when a signal posted to the guest ended the wait
 // first: the call is then to be reported as EINTR, and the turn is not held.
@@ -8689,7 +8771,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"userRecord":              true,
 			"pollReady":               true,
 			"probeWritable":           true,
-			"probeWritableUntil":      true,
+			"takeTurn":                true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
