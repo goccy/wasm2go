@@ -2764,7 +2764,7 @@ const (
 	_wasiENOPROTOOPT     int32 = 50
 	_wasiENOTCONN        int32 = 53
 	_wasiETIMEDOUT       int32 = 73
-	_wasiEISCONN         int32 = 33
+	_wasiEISCONN         int32 = 30
 	_wasiEBUSY           int32 = 10
 	_wasiEEXIST          int32 = 20
 	_wasiEFAULT          int32 = 21
