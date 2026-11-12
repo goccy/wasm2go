@@ -178,7 +178,18 @@ func makeHostFIFO(path string, perm os.FileMode) error {
 
 // setHostIDs changes the user or group ids of the host process; see
 // Proc_setids for the requests.
-func setHostIDs(request int32, a, b, c int) error {
+//
+// The ids are per thread to the kernel of some hosts, and the Go runtime
+// changes them on every thread of the process — which it refuses to do, by
+// panicking, in a program that is linked with a C runtime it does not
+// control. The change is then one this process cannot make
+// (errors.ErrUnsupported).
+func setHostIDs(request int32, a, b, c int) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.ErrUnsupported
+		}
+	}()
 	switch request {
 	case wasiSetUID:
 		return syscall.Setuid(a)
@@ -200,8 +211,14 @@ func setHostIDs(request int32, a, b, c int) error {
 	return syscall.EINVAL
 }
 
-// setHostGroups sets the supplementary groups of the host process.
-func setHostGroups(gids []int) error {
+// setHostGroups sets the supplementary groups of the host process, with the
+// limitation setHostIDs has.
+func setHostGroups(gids []int) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.ErrUnsupported
+		}
+	}()
 	return syscall.Setgroups(gids)
 }
 
