@@ -3018,7 +3018,7 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	served := false
 	if udp, isDatagram := src.(*net.UDPConn); isDatagram && op.dgram {
 		var errno int32
-		if n, _, errno = w.receiveDatagram(op, udp, bufs); errno != _wasiESUCCESS {
+		if n, _, errno = w.receiveDatagram(op, udp, bufs, 0); errno != _wasiESUCCESS {
 			return errno
 		}
 		served = true
@@ -3110,6 +3110,22 @@ func writeVec(dst io.Writer, bufs [][]byte) (uint64, error) {
 // why (see writeFailure); one that transferred something reports the count,
 // and the failure meets the guest's next write.
 func (w *WasiStubs) writeFd(op *wasiOpen, dst io.Writer, bufs [][]byte) (uint64, int32) {
+	return w.sendFd(op, dst, bufs, 0)
+}
+
+// The flags of one send or receive on a socket: what the MSG_ flags of
+// send(2) and recv(2) ask for, in the host's own numbering (libc's numbers
+// differ from libc to libc). The first two are the bits WASI's sock_recv
+// has for them.
+const (
+	wasiMsgPeek     int32 = 1 // receive: what is received stays where it is
+	wasiMsgWaitAll  int32 = 2 // receive: wait until the buffer is full
+	wasiMsgDontWait int32 = 4 // this call does not wait, whatever O_NONBLOCK says
+	wasiMsgNoSignal int32 = 8 // send: a broken connection is EPIPE without SIGPIPE
+)
+
+// sendFd is writeFd for one send on a socket, with its flags (wasiMsg...).
+func (w *WasiStubs) sendFd(op *wasiOpen, dst io.Writer, bufs [][]byte, flags int32) (uint64, int32) {
 	if op.dgram && len(bufs) > 1 {
 		// One write is one datagram, however many pieces it comes in.
 		var whole []byte
@@ -3119,11 +3135,11 @@ func (w *WasiStubs) writeFd(op *wasiOpen, dst io.Writer, bufs [][]byte) (uint64,
 		bufs = [][]byte{whole}
 	}
 	if stream, blocks := op.writeBlocks(dst); blocks {
-		return w.writeStream(op, stream, bufs)
+		return w.writeStream(op, stream, bufs, flags)
 	}
 	n, err := writeVec(dst, bufs)
 	if n == 0 && err != nil {
-		return 0, w.writeFailure(err)
+		return 0, w.writeFailure(err, flags)
 	}
 	return n, _wasiESUCCESS
 }
@@ -3132,10 +3148,11 @@ func (w *WasiStubs) writeFd(op *wasiOpen, dst io.Writer, bufs [][]byte) (uint64,
 // socket nobody reads from any more is EPIPE, and POSIX has the kernel send
 // the writer SIGPIPE as well: it is posted to the guest, whose disposition
 // decides — the default ends it, as it ends a process writing into a closed
-// pipe.
-func (w *WasiStubs) writeFailure(err error) int32 {
+// pipe. A send that asked for no signal (wasiMsgNoSignal in flags) gets the
+// errno alone.
+func (w *WasiStubs) writeFailure(err error, flags int32) int32 {
 	errno := mapNetError(err)
-	if errno == _wasiEPIPE {
+	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 {
 		w.PostSignal(wasiSIGPIPE)
 	}
 	return errno
@@ -3146,13 +3163,14 @@ func (w *WasiStubs) writeFailure(err error) int32 {
 // room for right now and reports EAGAIN when that is nothing. A blocking one
 // waits until everything is written; a signal posted to the guest meanwhile
 // ends the wait, with EINTR when nothing was written yet and the count
-// otherwise.
-func (w *WasiStubs) writeStream(op *wasiOpen, dst streamWriter, bufs [][]byte) (uint64, int32) {
+// otherwise. flags are those of a send (wasiMsg...): one that does not wait
+// is non-blocking whatever the descriptor says.
+func (w *WasiStubs) writeStream(op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
 	rc, err := dst.SyscallConn()
 	if err != nil {
-		return 0, w.writeFailure(err)
+		return 0, w.writeFailure(err, flags)
 	}
-	nonblocking := op.nonblocking()
+	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
 	if !nonblocking && !w.beginBlocking(func() { _ = dst.SetWriteDeadline(time.Now()) }) {
 		return 0, _wasiEINTR
 	}
@@ -3205,7 +3223,7 @@ write:
 	case total > 0:
 		return total, _wasiESUCCESS
 	case failure != nil:
-		return 0, w.writeFailure(failure)
+		return 0, w.writeFailure(failure, flags)
 	case cutShort:
 		return 0, _wasiEINTR
 	case full:
@@ -5129,8 +5147,11 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		}
 		bufs = append(bufs, buf)
 	}
+	// ri_flags has two bits, RECV_PEEK and RECV_WAITALL: wasiMsgPeek and
+	// wasiMsgWaitAll.
+	flags := riFlags & (wasiMsgPeek | wasiMsgWaitAll)
 	if udp, isDatagram := conn.(*net.UDPConn); isDatagram && op.dgram {
-		n, _, errno := w.receiveDatagram(op, udp, bufs)
+		n, _, errno := w.receiveDatagram(op, udp, bufs, flags)
 		if errno != _wasiESUCCESS {
 			return errno
 		}
@@ -5138,14 +5159,9 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		binary.LittleEndian.PutUint32(lenOut, uint32(n))
 		return _wasiESUCCESS
 	}
-	// What a readiness probe already took comes first; a receive returns
-	// as soon as it has anything.
-	got, served := op.takeAhead(bufs)
-	if !served {
-		var errno int32
-		if got, errno = w.readStream(op, conn, bufs); errno != _wasiESUCCESS {
-			return errno
-		}
+	got, errno := w.receiveStream(op, conn, bufs, flags)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	total := uint32(got)
 	binary.LittleEndian.PutUint16(flagsOut, 0)
@@ -5175,6 +5191,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	if !ok || lenOut == nil {
 		return _wasiEFAULT
 	}
+	// WASI defines no flags for a send; siFlags is always 0.
 	n, errno := w.writeFd(op, conn, bufs)
 	binary.LittleEndian.PutUint32(lenOut, uint32(n))
 	return errno
@@ -5216,7 +5233,7 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 		shErr = errors.Join(shErr, sh.CloseWrite())
 	}
 	if shErr != nil {
-		return mapOSError(shErr)
+		return mapNetError(shErr)
 	}
 	return _wasiESUCCESS
 }
@@ -6502,7 +6519,13 @@ func (w *WasiStubs) relayHostSignals(from <-chan os.Signal) {
 // input is there, a blocking one waits and reports EINTR when a signal is
 // posted to the guest meanwhile.
 func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
-	if !op.nonblocking() {
+	return w.readStreamAs(op, src, bufs, op.nonblocking())
+}
+
+// readStreamAs is readStream with the blocking mode given by the caller: a
+// receive may ask not to wait on a descriptor that otherwise does.
+func (w *WasiStubs) readStreamAs(op *wasiOpen, src deadlineReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
+	if !nonblocking {
 		n, interrupted := w.readInterruptibly(op, src, bufs)
 		if interrupted {
 			return 0, _wasiEINTR
@@ -6521,6 +6544,93 @@ func (w *WasiStubs) readStream(op *wasiOpen, src deadlineReader, bufs [][]byte) 
 	}
 	n, _ := op.takeAhead(bufs)
 	return n, _wasiESUCCESS
+}
+
+// awaitAhead waits until input of the stream src is kept on op (ahead, or
+// the end of input), without taking any of it: what a receive that only
+// looks needs. It returns 0, EAGAIN when nothing is there and the call does
+// not wait, or EINTR when a signal was posted to the guest first.
+func (w *WasiStubs) awaitAhead(op *wasiOpen, src deadlineReader, nonblocking bool) int32 {
+	for {
+		if ready, _ := op.aheadReady(); ready {
+			return _wasiESUCCESS
+		}
+		if nonblocking {
+			if ready, _ := op.probeRead(src, time.Now().Add(pollProbeGrace), nil); !ready {
+				return _wasiEAGAIN
+			}
+			return _wasiESUCCESS
+		}
+		posted := make(chan struct{})
+		if !w.beginBlocking(func() { close(posted) }) {
+			return _wasiEINTR
+		}
+		ready, refused := op.probeRead(src, time.Time{}, posted)
+		interrupted := w.endBlocking()
+		switch {
+		case ready:
+			return _wasiESUCCESS
+		case interrupted:
+			return _wasiEINTR
+		case refused:
+			// A stream whose read cannot be bounded cannot be looked at
+			// without reading it.
+			return _wasiENOTSUP
+		}
+	}
+}
+
+// peekAhead copies the input kept on op into bufs without taking it.
+func (op *wasiOpen) peekAhead(bufs [][]byte) (n uint64) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	rest := op.ahead
+	for _, buf := range bufs {
+		c := copy(buf, rest)
+		rest = rest[c:]
+		n += uint64(c)
+	}
+	return n
+}
+
+// receiveStream is one receive on a connected stream socket, with its flags
+// (wasiMsg...): input a probe already took comes first; a receive that only
+// looks leaves everything in place; one that waits for all of it returns
+// short only at the end of input or when a signal ends the wait.
+func (w *WasiStubs) receiveStream(op *wasiOpen, conn net.Conn, bufs [][]byte, flags int32) (uint64, int32) {
+	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
+	if flags&wasiMsgPeek != 0 {
+		if errno := w.awaitAhead(op, conn, nonblocking); errno != _wasiESUCCESS {
+			return 0, errno
+		}
+		return op.peekAhead(bufs), _wasiESUCCESS
+	}
+	var total uint64
+	for {
+		n, served := op.takeAhead(bufs)
+		if !served {
+			var errno int32
+			if n, errno = w.readStreamAs(op, conn, bufs, nonblocking); errno != _wasiESUCCESS {
+				if total > 0 {
+					return total, _wasiESUCCESS
+				}
+				return 0, errno
+			}
+		}
+		total += n
+		if flags&wasiMsgWaitAll == 0 || n == 0 || nonblocking {
+			return total, _wasiESUCCESS
+		}
+		// Drop what is filled; go on when room is left.
+		for len(bufs) > 0 && n >= uint64(len(bufs[0])) {
+			n -= uint64(len(bufs[0]))
+			bufs = bufs[1:]
+		}
+		if len(bufs) == 0 {
+			return total, _wasiESUCCESS
+		}
+		bufs[0] = bufs[0][n:]
+	}
 }
 
 // awaitInputTurn takes the turn at op's input for a blocking call of the
@@ -6698,6 +6808,8 @@ func mapNetError(err error) int32 {
 		return _wasiECONNREFUSED
 	case errors.Is(err, syscall.ECONNRESET):
 		return _wasiECONNRESET
+	case errors.Is(err, syscall.ENOTCONN):
+		return _wasiENOTCONN
 	case errors.Is(err, syscall.ETIMEDOUT), errors.Is(err, os.ErrDeadlineExceeded):
 		return _wasiETIMEDOUT
 	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
@@ -7152,8 +7264,9 @@ func (op *wasiOpen) datagramReady() bool {
 }
 
 // takeDatagram hands out the datagram a probe took, or the failure one ran
-// into; ok is false when there is neither.
-func (op *wasiOpen) takeDatagram() (data []byte, from *net.UDPAddr, err error, ok bool) {
+// into; ok is false when there is neither. With keep the datagram stays
+// where it is, for a receive that only looks.
+func (op *wasiOpen) takeDatagram(keep bool) (data []byte, from *net.UDPAddr, err error, ok bool) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	s := op.sock
@@ -7162,7 +7275,9 @@ func (op *wasiOpen) takeDatagram() (data []byte, from *net.UDPAddr, err error, o
 	}
 	if s.hasDatagram {
 		data, from = s.datagram, s.datagramFrom
-		s.datagram, s.datagramFrom, s.hasDatagram = nil, nil, false
+		if !keep {
+			s.datagram, s.datagramFrom, s.hasDatagram = nil, nil, false
+		}
 		return data, from, nil, true
 	}
 	if s.datagramErr != nil {
@@ -7203,16 +7318,17 @@ func (op *wasiOpen) probeDatagram(conn *net.UDPConn, until time.Time, stop <-cha
 // does not fit is dropped, as recv does — and returns its size as received
 // and its sender. A non-blocking socket reports EAGAIN when none is there; a
 // blocking one waits, and reports EINTR when a signal is posted to the guest
-// meanwhile.
-func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn *net.UDPConn, bufs [][]byte) (uint64, *net.UDPAddr, int32) {
-	data, from, err, taken := op.takeDatagram()
-	if !taken && op.nonblocking() {
+// meanwhile. flags are the receive's (wasiMsgPeek, wasiMsgDontWait).
+func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn *net.UDPConn, bufs [][]byte, flags int32) (uint64, *net.UDPAddr, int32) {
+	keep := flags&wasiMsgPeek != 0
+	data, from, err, taken := op.takeDatagram(keep)
+	if !taken && (op.nonblocking() || flags&wasiMsgDontWait != 0) {
 		// Long enough for the receive to be attempted, as for a readiness
 		// probe.
 		if !op.probeDatagram(conn, time.Now().Add(pollProbeGrace), nil) {
 			return 0, nil, _wasiEAGAIN
 		}
-		if data, from, err, taken = op.takeDatagram(); !taken {
+		if data, from, err, taken = op.takeDatagram(keep); !taken {
 			// another process sharing the socket took it first
 			return 0, nil, _wasiEAGAIN
 		}
@@ -7248,7 +7364,7 @@ func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn *net.UDPConn, bufs [][]by
 			}
 		}
 		op.passInputTurn()
-		if data, from, err, taken = op.takeDatagram(); !taken && interrupted {
+		if data, from, err, taken = op.takeDatagram(keep); !taken && interrupted {
 			return 0, nil, _wasiEINTR
 		}
 	}
@@ -7271,8 +7387,9 @@ func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn *net.UDPConn, bufs [][]by
 // subject to the dial policy with the network "udp"; a socket that has no
 // local address yet gets one the host picks. Without an address — and on a
 // stream socket, where an address means nothing — it is a send to the
-// socket's peer. Returns 0, or a negative errno: EISCONN for an address on a
-// connected datagram socket, ENOTCONN (EDESTADDRREQ's place) for none on an
+// socket's peer. flags are the send's (wasiMsgDontWait, wasiMsgNoSignal).
+// Returns 0, or a negative errno: EISCONN for an address on a connected
+// datagram socket, ENOTCONN (EDESTADDRREQ's place) for none on an
 // unconnected one.
 func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, ipBE, port, sentPtr int32) int32 {
 	if !w.checkNet("send") {
@@ -7298,7 +7415,7 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 		if conn == nil || (op.dgram && conn.RemoteAddr() == nil) {
 			return -_wasiENOTCONN
 		}
-		n, errno := w.writeFd(op, conn, [][]byte{buf})
+		n, errno := w.sendFd(op, conn, [][]byte{buf}, flags)
 		binary.LittleEndian.PutUint32(out, uint32(n))
 		return -errno
 	}
@@ -7319,7 +7436,7 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 	}
 	n, err := conn.WriteToUDP(buf, &net.UDPAddr{IP: net.ParseIP(ip), Port: p})
 	if err != nil {
-		return -w.writeFailure(err)
+		return -w.writeFailure(err, flags)
 	}
 	binary.LittleEndian.PutUint32(out, uint32(n))
 	return _wasiESUCCESS
@@ -7330,7 +7447,8 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 // (u32) at receivedPtr and the sender's name at namePtr (see writeSockName;
 // a name of family 0 when there is none to give). A datagram socket hands
 // over one datagram, cut to the buffer, and names who sent it; a stream
-// socket receives like Sock_recv and names its peer. Returns 0, or a
+// socket receives like Sock_recv and names its peer. flags are the
+// receive's (wasiMsgPeek, wasiMsgWaitAll, wasiMsgDontWait). Returns 0, or a
 // negative errno: EAGAIN on a non-blocking socket with nothing to receive,
 // EINTR when a signal is posted to the guest while it waits.
 func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr, receivedPtr int32) int32 {
@@ -7360,7 +7478,7 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 		if errno != _wasiESUCCESS {
 			return -errno
 		}
-		n, from, errno := w.receiveDatagram(op, conn, [][]byte{buf})
+		n, from, errno := w.receiveDatagram(op, conn, [][]byte{buf}, flags)
 		if errno != _wasiESUCCESS {
 			return -errno
 		}
@@ -7374,12 +7492,9 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 	if conn == nil {
 		return -_wasiENOTCONN
 	}
-	n, served := op.takeAhead([][]byte{buf})
-	if !served {
-		var errno int32
-		if n, errno = w.readStream(op, conn, [][]byte{buf}); errno != _wasiESUCCESS {
-			return -errno
-		}
+	n, errno := w.receiveStream(op, conn, [][]byte{buf}, flags)
+	if errno != _wasiESUCCESS {
+		return -errno
 	}
 	binary.LittleEndian.PutUint32(out, uint32(n))
 	if peer := conn.RemoteAddr(); peer != nil {
