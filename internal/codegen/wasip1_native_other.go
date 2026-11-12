@@ -113,8 +113,19 @@ func writeRaw(fd uintptr, p []byte) (n int, again bool, err error) {
 // once. The runtime cannot ask on this platform; the write tells.
 func fdWritable(fd uintptr) bool { return true }
 
-// socketPair creates a pair of connected stream sockets, which the runtime
-// cannot do on this platform.
-func socketPair() (a, b net.Conn, err error) {
+// socketPair creates a pair of connected sockets, which the runtime cannot
+// do on this platform.
+func socketPair(dgram bool) (a, b net.Conn, err error) {
 	return nil, nil, errors.ErrUnsupported
 }
+
+// unboundUnixDatagram creates a Unix-domain datagram socket that has no
+// name, which the runtime cannot do on this platform.
+func unboundUnixDatagram() (net.Conn, error) {
+	return nil, errors.ErrUnsupported
+}
+
+// setIPv6Only makes an IPv6 socket take IPv6 traffic only, or IPv4 traffic
+// as well. The runtime cannot say on this platform: the socket stays as the
+// network API made it.
+func setIPv6Only(fd uintptr, only bool) error { return nil }

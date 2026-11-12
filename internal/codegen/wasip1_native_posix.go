@@ -249,9 +249,14 @@ func writeRaw(fd uintptr, p []byte) (n int, again bool, err error) {
 	}
 }
 
-// socketPair creates a pair of connected Unix-domain stream sockets.
-func socketPair() (a, b net.Conn, err error) {
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+// socketPair creates a pair of connected Unix-domain sockets: stream
+// sockets, or datagram sockets with dgram.
+func socketPair(dgram bool) (a, b net.Conn, err error) {
+	typ := syscall.SOCK_STREAM
+	if dgram {
+		typ = syscall.SOCK_DGRAM
+	}
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, typ, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -273,4 +278,34 @@ func socketPair() (a, b net.Conn, err error) {
 		return nil, nil, err
 	}
 	return conns[0], conns[1], nil
+}
+
+// unboundUnixDatagram creates a Unix-domain datagram socket that has no
+// name: package net makes none without binding or connecting it.
+func unboundUnixDatagram() (net.Conn, error) {
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return nil, err
+	}
+	syscall.CloseOnExec(fd)
+	f := os.NewFile(uintptr(fd), "unixgram")
+	// FileConn works on a duplicate; the original is done with either way.
+	conn, err := net.FileConn(f)
+	if err = errors.Join(err, f.Close()); err != nil {
+		if conn != nil {
+			err = errors.Join(err, conn.Close())
+		}
+		return nil, err
+	}
+	return conn, nil
+}
+
+// setIPv6Only makes the IPv6 socket fd take IPv6 traffic only, or IPv4
+// traffic as well (IPV6_V6ONLY).
+func setIPv6Only(fd uintptr, only bool) error {
+	value := 0
+	if only {
+		value = 1
+	}
+	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, value)
 }
