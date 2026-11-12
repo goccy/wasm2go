@@ -1801,6 +1801,67 @@ func (w *WasiStubs) CloseAll() error {
 	return err
 }
 
+// KillCommands ends the commands this instance started and has not waited
+// for (the host processes of Proc_spawn): each one still running is killed,
+// as by SIGKILL, and the call returns when all of them have ended and the
+// host has taken them off its process table. They stay in the instance's
+// process table with the status they ended with.
+//
+// A command with a standard stream that the runtime copies (one that is not
+// a file of the host) is killed and not waited for: it has ended for the
+// guest only when its streams are at their end, which a process it started
+// and left behind can hold off for as long as it likes. The host takes it
+// off its process table as soon as it is dead all the same.
+//
+// It is for an embedder that ends an instance without letting it run on —
+// one it has posted SIGKILL to — and may be called while the guest is still
+// running on another goroutine.
+func (w *WasiStubs) KillCommands() {
+	w.mu.Lock()
+	var commands []*wasiProc
+	for _, proc := range w.procs {
+		if proc.cmd != nil {
+			commands = append(commands, proc)
+		}
+	}
+	w.mu.Unlock()
+	for _, proc := range commands {
+		select {
+		case <-proc.done:
+		default:
+			// A command that has just ended cannot be killed: nothing to
+			// report.
+			_ = proc.cmd.Process.Kill()
+		}
+	}
+	for _, proc := range commands {
+		cmd := proc.cmd
+		if !hostStream(cmd.Stdin) || !hostStream(cmd.Stdout) || !hostStream(cmd.Stderr) {
+			continue
+		}
+		<-proc.done
+		proc.reap.Do(func() { _ = cmd.Wait() })
+	}
+}
+
+// CloseDescriptors closes every fd of this instance, each as fd_close
+// would, and nothing else: the instance stays what it is to the processes
+// of its family and keeps receiving signals. It is for an embedder that
+// has killed an instance whose guest may still be running on another
+// goroutine; the guest finds every descriptor closed. CloseAll is still to
+// be called once the guest is no longer running. The close errors are
+// joined.
+func (w *WasiStubs) CloseDescriptors() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var err error
+	for fd, op := range w.fdsLocked() {
+		err = errors.Join(err, closeWasiOpen(op))
+		delete(w.fdsLocked(), fd)
+	}
+	return err
+}
+
 // Fd_closefrom is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "fd_closefrom") backing closefrom(): it closes every fd numbered
 // lowFd or higher, each as fd_close would. A guest emulating exec needs it:
@@ -2077,6 +2138,11 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	}
 
 	w.mu.Lock()
+	if w.sig.killPending() {
+		// A process that has been killed starts nothing more.
+		w.mu.Unlock()
+		return -_wasiEINTR
+	}
 	hook := w.execHook
 	cin := w.childReaderLocked(stdinFd)
 	cout := w.childWriterLocked(stdoutFd, w.stdout)
@@ -2173,7 +2239,14 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		pid = w.addProcLocked(proc)
 	}
 	w.enterProcLocked(pid)
+	killed := w.sig.killPending()
 	w.mu.Unlock()
+	if killed {
+		// SIGKILL was posted while the command was being started, and
+		// whoever posted it may have looked for this instance's commands
+		// (KillCommands) before this one was among them.
+		_ = cmd.Process.Kill()
+	}
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
@@ -7641,6 +7714,12 @@ func (s *wasiSignals) discards() uint64 {
 	return s.ignored | wasiDefaultIgnoredSignals&^s.handled
 }
 
+// killPending reports whether SIGKILL has been posted and the guest has
+// not taken it yet: the guest is on its way to its end.
+func (s *wasiSignals) killPending() bool {
+	return s.pending&wasiSignalBit(wasiSIGKILL) != 0
+}
+
 // reapsChildren reports whether the guest ignores SIGCHLD explicitly. As
 // POSIX has it, a child of such a process leaves nothing to wait for when
 // it ends, and a wait reports ECHILD once no child is left running.
@@ -7745,10 +7824,14 @@ func (w *WasiStubs) raiseSignalFlagLocked() {
 // wake is registered: PostSignal calls it, once, from another goroutine and
 // with w.mu held, to end the wait. Every beginBlocking that returned true is
 // followed by endBlocking.
+//
+// SIGKILL is noticed by ending: until the guest has taken it, no call of
+// its blocks, however many it makes on the way to the point where it takes
+// its signals.
 func (w *WasiStubs) beginBlocking(wake func()) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.sig.interrupt {
+	if w.sig.interrupt || w.sig.killPending() {
 		w.sig.interrupt = false
 		return false
 	}
@@ -7762,7 +7845,7 @@ func (w *WasiStubs) endBlocking() (interrupted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sig.wake = nil
-	interrupted = w.sig.interrupt
+	interrupted = w.sig.interrupt || w.sig.killPending()
 	w.sig.interrupt = false
 	return interrupted
 }
