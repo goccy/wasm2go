@@ -7,6 +7,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // fdWritable reports whether a write to the descriptor would return at
@@ -120,4 +121,17 @@ func hostMonotonic() (time.Duration, bool) {
 		return 0, false
 	}
 	return systemUptime + time.Since(processClock), true
+}
+
+// defaultSignalAction gives a signal its default action in the kernel,
+// behind the Go runtime's back: sigaction with an action of zeros, which is
+// SIG_DFL with no flags and an empty mask. Package syscall has the call's
+// number and not the call.
+func defaultSignalAction(sig syscall.Signal) error {
+	var action [64]byte
+	if _, _, errno := syscall.Syscall(syscall.SYS_SIGACTION, uintptr(sig),
+		uintptr(unsafe.Pointer(&action[0])), 0); errno != 0 {
+		return errno
+	}
+	return nil
 }

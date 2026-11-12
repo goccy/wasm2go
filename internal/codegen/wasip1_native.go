@@ -7965,6 +7965,26 @@ func (w *WasiStubs) detachSignalsLocked() {
 	w.syncHostSignalsLocked()
 }
 
+// restoreHostSignal gives a signal the host process ignores (signal.Ignore)
+// the action it has in a Go program that never touched it. Package signal
+// has no way back from Ignore: Reset leaves the signal ignored — for the
+// process, and for every command it starts from then on, which inherits
+// the ignoring — and a subscription that is taken and dropped again puts
+// the runtime's handler back for most signals but not for SIGHUP and
+// SIGINT, which the runtime leaves ignored when it finds them so. So the
+// kernel is told first that the signal has its default action
+// (defaultSignalAction), and the runtime then installs its handler over
+// that, as it did when the program started.
+func restoreHostSignal(sig syscall.Signal) {
+	if err := defaultSignalAction(sig); err != nil {
+		signal.Reset(sig)
+		return
+	}
+	taken := make(chan os.Signal, 1)
+	signal.Notify(taken, sig)
+	signal.Stop(taken)
+}
+
 // syncHostSignals is syncHostSignalsLocked for a caller without w.mu.
 func (w *WasiStubs) syncHostSignals() {
 	w.mu.Lock()
@@ -8010,7 +8030,7 @@ func (w *WasiStubs) syncHostSignalsLocked() {
 			if ignore&bit != 0 {
 				signal.Ignore(hostSig)
 			} else {
-				signal.Reset(hostSig)
+				restoreHostSignal(hostSig)
 			}
 		}
 		s.hostIgnored = ignore
@@ -10548,6 +10568,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVec":                   true,
 			"readVecFailure":            true,
 			"hostDescriptor":            true,
+			"restoreHostSignal":         true,
 			"readNow":                   true,
 			"appendWasiString":          true,
 			"wasiSignalBit":             true,

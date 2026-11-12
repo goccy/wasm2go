@@ -135,3 +135,17 @@ func hostMonotonic() (time.Duration, bool) {
 	}
 	return time.Duration(ts.Sec)*time.Second + time.Duration(ts.Nsec), true
 }
+
+// defaultSignalAction gives a signal its default action in the kernel,
+// behind the Go runtime's back: rt_sigaction with an action of zeros, which
+// is SIG_DFL with no flags and an empty mask whatever the layout of the
+// structure. Package syscall has the call's number and not the call.
+func defaultSignalAction(sig syscall.Signal) error {
+	var action [64]byte
+	const maskSize = 8 // the kernel's signal set
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(sig),
+		uintptr(unsafe.Pointer(&action[0])), 0, maskSize, 0, 0); errno != 0 {
+		return errno
+	}
+	return nil
+}

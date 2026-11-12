@@ -41,6 +41,10 @@ func guestSignalOf(hostSig syscall.Signal) int32 {
 	return 0
 }
 
+// defaultSignalAction gives a signal its default action in the kernel,
+// which the runtime cannot do on this platform.
+func defaultSignalAction(sig syscall.Signal) error { return errors.ErrUnsupported }
+
 // signalHostProcess sends a signal to a process of the host, which the
 // runtime cannot do on this platform.
 func signalHostProcess(pid int, sig syscall.Signal) error {

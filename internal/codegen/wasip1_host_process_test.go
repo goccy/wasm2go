@@ -5,8 +5,11 @@ package codegen
 import (
 	"encoding/binary"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -468,5 +471,41 @@ func TestProbeWithNoTimeLeftFindsWhatIsThere(t *testing.T) {
 	}
 	if got, rc := sockRecv(w, m, accepted); rc != _wasiESUCCESS || got != "over" {
 		t.Fatalf("recv on the accepted connection = %q rc=%d", got, rc)
+	}
+}
+
+// A signal the guest ignores is ignored by the host process, and by the
+// commands it starts meanwhile, which inherit that. When the guest stops
+// ignoring the signal, and when the instance is closed, the signal has its
+// default action again: for the host process, and for a command started
+// from then on.
+func TestHostProcessStopsIgnoringWhatTheGuestStopsIgnoring(t *testing.T) {
+	// whether a command started now survives the signal it sends itself
+	inherits := func(sig syscall.Signal) bool {
+		return exec.Command("/bin/sh", "-c", "kill -"+strconv.Itoa(int(sig))+" $$; exit 0").Run() == nil
+	}
+	for _, sig := range []int32{wasiSIGHUP, wasiSIGINT, wasiSIGTERM, wasiSIGUSR2} {
+		hostSig, _ := hostSignalOf(sig)
+		if inherits(hostSig) {
+			t.Skipf("the test process was started with signal %d ignored", sig)
+		}
+		w, m := newSignalGuest(t)
+		w.SetHostProcess(true)
+		setDispositions(t, w, m, 0, signalMask(sig), 0)
+		if !inherits(hostSig) {
+			t.Errorf("signal %d: a command started while the guest ignores it does not ignore it", sig)
+		}
+		setDispositions(t, w, m, 0, 0, 0)
+		if inherits(hostSig) {
+			t.Errorf("signal %d: still ignored by a command after the guest stopped ignoring it", sig)
+		}
+		if signal.Ignored(hostSig) {
+			t.Errorf("signal %d: still ignored by the host process after the guest stopped ignoring it", sig)
+		}
+		setDispositions(t, w, m, 0, signalMask(sig), 0)
+		w.CloseAll()
+		if inherits(hostSig) {
+			t.Errorf("signal %d: still ignored by a command after the instance was closed", sig)
+		}
 	}
 }
