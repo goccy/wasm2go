@@ -340,3 +340,51 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 	return 0, _wasiENOSYS
 }
 func (a wasiSockAddr) hostSockaddr(unixPath string) syscall.Sockaddr { return nil }
+
+// Terminals: this platform has none the runtime can ask.
+const (
+	hostTakeTerminal  = 0
+	hostLeaveTerminal = 0
+)
+
+func hostTerminalRequest(request uint32) bool { return false }
+func hostIoctlRoom(request uint32) int        { return 0 }
+func hostIoctlBuffer(fd int, request uint32, buf []byte) (int, error) {
+	return -1, errors.ErrUnsupported
+}
+func hostIoctlValue(fd int, request uint32, value uintptr) (int, error) {
+	return -1, errors.ErrUnsupported
+}
+func hostTerminalAttributes(fd int, record []byte) error { return errors.ErrUnsupported }
+func setHostTerminalAttributes(fd int, actions int32, record []byte) error {
+	return errors.ErrUnsupported
+}
+func hostTerminalSpeed(record []byte, output bool) uint32 { return 0 }
+func setHostTerminalSpeed(record []byte, output bool, speed uint32) error {
+	return errors.ErrUnsupported
+}
+func hostTerminalControl(fd int, what, arg int32) error             { return errors.ErrUnsupported }
+func hostTerminalGroup(fd int) (int, error)                         { return -1, errors.ErrUnsupported }
+func setHostTerminalGroup(fd, pgrp int) error                       { return errors.ErrUnsupported }
+func commandTerminal(path string, files []any) *syscall.SysProcAttr { return nil }
+
+const hostOpenNoTerminal = 0
+
+func (w *WasiStubs) takeOpenedTerminalLocked(op *wasiOpen)            {}
+func (w *WasiStubs) Tty_getattr(m *Module, fd, recordPtr int32) int32 { return -_wasiENOSYS }
+func (w *WasiStubs) Tty_name(m *Module, fd, bufPtr, bufLen, lenPtr int32) int32 {
+	return -_wasiENOSYS
+}
+func (w *WasiStubs) Tty_setattr(m *Module, fd, actions, recordPtr int32) int32 {
+	return -_wasiENOSYS
+}
+func (w *WasiStubs) Tty_speed(m *Module, recordPtr, output, set, speed, outPtr int32) int32 {
+	return -_wasiENOSYS
+}
+func (w *WasiStubs) Tty_control(m *Module, fd, what, arg int32) int32 { return -_wasiENOSYS }
+func (w *WasiStubs) Tty_pgrp(m *Module, fd, set, pgrp, outPtr int32) int32 {
+	return -_wasiENOSYS
+}
+func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, resultPtr int32) int32 {
+	return -_wasiENOSYS
+}

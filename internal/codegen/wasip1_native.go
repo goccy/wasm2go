@@ -1435,6 +1435,19 @@ type WasiStubs struct {
 	// otherwise. A forked process always has a number here, its parent's
 	// group at the time of the fork until it changes it. Guarded by mu.
 	pgid int32
+	// sessionLeader records that a forked process started a session of
+	// its own (setsid), and terminal is the controlling terminal of a
+	// forked process when that is not the host process's: the path of the
+	// terminal it took (TIOCSCTTY), or the empty string for none (after
+	// setsid or TIOCNOTTY). nil stands for the host process's. The host
+	// keeps one session and one controlling terminal for the whole host
+	// process, so these cannot be the host's to keep; a forked process
+	// starts with its parent's terminal. Guarded by mu.
+	sessionLeader bool
+	terminal      *string
+	// execNext records that the next command the process starts is the
+	// one it becomes (Proc_exec_next). Guarded by mu.
+	execNext bool
 	// cloexec holds the descriptor numbers the guest has marked
 	// close-on-exec (Fd_cloexec). A number that is given to a new
 	// descriptor starts unmarked. Guarded by mu.
@@ -1744,6 +1757,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		parent:      w,
 		pgid:        w.groupLocked(),
 		standard:    w.standard,
+		terminal:    w.terminal,
 	}
 	if len(w.cloexec) > 0 {
 		child.cloexec = make(map[int32]bool, len(w.cloexec))
@@ -2221,6 +2235,13 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		return -_wasiEINTR
 	}
 	hook := w.execHook
+	// A command the process becomes takes the session the process leads,
+	// and its terminal (see Proc_exec_next).
+	leads, terminal := w.execNext && w.sessionLeader, ""
+	if leads && w.terminal != nil {
+		terminal = *w.terminal
+	}
+	w.execNext = false
 	inherited, borrowed := w.inheritedFilesLocked()
 	cin := w.childReaderLocked(stdinFd)
 	cout := w.childWriterLocked(stdoutFd, w.stdout)
@@ -2284,6 +2305,13 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	// other end via Fd_read.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = cin, cout, cerr
 	cmd.ExtraFiles = inherited
+	if leads {
+		files := []any{cin, cout, cerr}
+		for _, file := range inherited {
+			files = append(files, file)
+		}
+		cmd.SysProcAttr = commandTerminal(terminal, files)
+	}
 	if err := cmd.Start(); err != nil {
 		return -mapExecError(err)
 	}
@@ -3195,11 +3223,13 @@ const (
 	_wasiEINVAL          int32 = 28
 	_wasiEIO             int32 = 29
 	_wasiEISDIR          int32 = 31
+	_wasiENODEV          int32 = 43
 	_wasiENOENT          int32 = 44
 	_wasiENOEXEC         int32 = 45
 	_wasiENOTDIR         int32 = 54
 	_wasiENOTSOCK        int32 = 57
 	_wasiENOTSUP         int32 = 58
+	_wasiENOTTY          int32 = 59
 	_wasiENOSYS          int32 = 52
 	_wasiENXIO           int32 = 60
 	_wasiEPERM           int32 = 63
@@ -5181,6 +5211,17 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 // creates gets mode, less the instance's umask.
 func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
 	w.mu.Lock()
+	if w.terminal != nil && w.hostDescriptorsLocked() && strings.TrimPrefix(rel, "/") == "dev/tty" {
+		// /dev/tty is the controlling terminal of whoever opens it. That
+		// of a forked process which changed its own is the runtime's to
+		// name: the host would open the host process's.
+		if *w.terminal == "" {
+			w.mu.Unlock()
+			return -1, _wasiENXIO
+		}
+		rel = strings.TrimPrefix(*w.terminal, "/")
+	}
+	forked := w.forked
 	fsys := w.fsys
 	// A file of the host filesystem is opened as a descriptor of the host
 	// process when those are the guest's. A backend that has no such file
@@ -5234,6 +5275,13 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	}
 	// NONBLOCK (0x4) doesn't translate directly via os.OpenFile; we
 	// store it on the wasiOpen so Fd_fdstat_get reflects it.
+	if forked {
+		// Where the open of a terminal can make it the controlling
+		// terminal of the process, the process would be the host
+		// process: a forked process's is the runtime's to keep (see
+		// takeOpenedTerminalLocked).
+		flag |= hostOpenNoTerminal
+	}
 
 	// Consult the host filesystem policy before touching the disk. An
 	// open counts as a write when it requests write access or asks to
@@ -5311,6 +5359,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		if err != nil {
 			return -1, mapOSError(errors.Join(err, f.Close()))
 		}
+		w.takeOpenedTerminalLocked(op)
 		return fd, _wasiESUCCESS
 	}
 	return w.addFDLocked(op), _wasiESUCCESS
@@ -7342,7 +7391,26 @@ func (w *WasiStubs) Proc_setsid(m *Module, outPtr int32) int32 {
 		return -_wasiEPERM
 	}
 	w.pgid = self
+	// A new session has no controlling terminal.
+	none := ""
+	w.sessionLeader, w.terminal = true, &none
 	binary.LittleEndian.PutUint32(out, uint32(self))
+	return _wasiESUCCESS
+}
+
+// Proc_exec_next is a NON-STANDARD host import (name "proc_exec_next"): with
+// on non-zero the guest says that the next command it starts (Proc_spawn) is
+// the one it becomes, as exec does (Proc_exec follows); with on zero it
+// takes that back, when the command could not be started before the host
+// was asked. What the process made of its session within the runtime is
+// the command's for real: a process that leads a session of its own is
+// replaced by a command that leads one, with the terminal the process took
+// for its controlling terminal. A command started for any other reason is a
+// child like any other.
+func (w *WasiStubs) Proc_exec_next(m *Module, on int32) int32 {
+	w.mu.Lock()
+	w.execNext = on != 0
+	w.mu.Unlock()
 	return _wasiESUCCESS
 }
 
@@ -8430,6 +8498,14 @@ func (w *WasiStubs) Proc_signal_take(m *Module, maskPtr int32) int32 {
 	binary.LittleEndian.PutUint64(out, taken)
 	return _wasiESUCCESS
 }
+
+// What Tty_control does, by number.
+const (
+	terminalDrain int32 = iota
+	terminalFlow
+	terminalFlush
+	terminalBreak
+)
 
 // Proc_itimer is a NON-STANDARD host import (name "proc_itimer"): the
 // instance's real-time interval timer, which backs setitimer(ITIMER_REAL),
@@ -11478,6 +11554,8 @@ var (
 	wasip1NativeHostFDRaw []byte
 	//go:embed wasip1_native_hostsock.go
 	wasip1NativeHostSockRaw []byte
+	//go:embed wasip1_native_terminal.go
+	wasip1NativeTerminalRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_linux_headers.go
@@ -11505,6 +11583,7 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 		"wasip1_native_other.go":    wasip1NativeOtherRaw,
 		"wasip1_native_hostfd.go":   wasip1NativeHostFDRaw,
 		"wasip1_native_hostsock.go": wasip1NativeHostSockRaw,
+		"wasip1_native_terminal.go": wasip1NativeTerminalRaw,
 
 		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,

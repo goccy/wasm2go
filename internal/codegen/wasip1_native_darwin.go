@@ -239,3 +239,169 @@ func hostAccept(fd int) (int, error) {
 	syscall.CloseOnExec(nfd)
 	return nfd, nil
 }
+
+// hostTerminalRequest reports whether request is one of the terminal's:
+// the requests of group 't'.
+func hostTerminalRequest(request uint32) bool { return byte(request>>8) == 't' }
+
+// hostIoctlRoom returns how large the buffer of a request has to be: the
+// size the request carries in its number (IOCPARM_LEN).
+func hostIoctlRoom(request uint32) int { return int(request >> 16 & 0x1fff) }
+
+// hostTerminalAttributes is tcgetattr(3) into the guest's record. The flag
+// words and the speeds are wider here than the record's; what they hold
+// fits.
+func hostTerminalAttributes(fd int, record []byte) error {
+	var t syscall.Termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.TIOCGETA, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return errno
+	}
+	binary.LittleEndian.PutUint32(record[guestTermiosIflag:], uint32(t.Iflag))
+	binary.LittleEndian.PutUint32(record[guestTermiosOflag:], uint32(t.Oflag))
+	binary.LittleEndian.PutUint32(record[guestTermiosCflag:], uint32(t.Cflag))
+	binary.LittleEndian.PutUint32(record[guestTermiosLflag:], uint32(t.Lflag))
+	record[guestTermiosLine] = 0
+	cc := record[guestTermiosCc : guestTermiosCc+guestTermiosNCCS]
+	clear(cc)
+	copy(cc, t.Cc[:])
+	binary.LittleEndian.PutUint32(record[guestTermiosIspeed:], uint32(t.Ispeed))
+	binary.LittleEndian.PutUint32(record[guestTermiosOspeed:], uint32(t.Ospeed))
+	return nil
+}
+
+// setHostTerminalAttributes is tcsetattr(3) from the guest's record:
+// actions is TCSANOW, TCSADRAIN or TCSAFLUSH, with TCSASOFT or not.
+func setHostTerminalAttributes(fd int, actions int32, record []byte) error {
+	const soft = 0x10 // TCSASOFT: the hardware settings stay as they are
+	t := syscall.Termios{
+		Iflag:  uint64(binary.LittleEndian.Uint32(record[guestTermiosIflag:])),
+		Oflag:  uint64(binary.LittleEndian.Uint32(record[guestTermiosOflag:])),
+		Cflag:  uint64(binary.LittleEndian.Uint32(record[guestTermiosCflag:])),
+		Lflag:  uint64(binary.LittleEndian.Uint32(record[guestTermiosLflag:])),
+		Ispeed: uint64(binary.LittleEndian.Uint32(record[guestTermiosIspeed:])),
+		Ospeed: uint64(binary.LittleEndian.Uint32(record[guestTermiosOspeed:])),
+	}
+	copy(t.Cc[:], record[guestTermiosCc:guestTermiosCc+guestTermiosNCCS])
+	if actions&soft != 0 {
+		t.Cflag |= 0x1 // CIGNORE
+	}
+	var request uintptr
+	switch actions &^ soft {
+	case 0:
+		request = syscall.TIOCSETA
+	case 1:
+		request = syscall.TIOCSETAW
+	case 2:
+		request = syscall.TIOCSETAF
+	default:
+		return syscall.EINVAL
+	}
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), request, uintptr(unsafe.Pointer(&t)))
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+}
+
+// hostTerminalSpeed is cfgetispeed(3) and cfgetospeed(3) on the guest's
+// record.
+func hostTerminalSpeed(record []byte, output bool) uint32 {
+	if output {
+		return binary.LittleEndian.Uint32(record[guestTermiosOspeed:])
+	}
+	return binary.LittleEndian.Uint32(record[guestTermiosIspeed:])
+}
+
+// setHostTerminalSpeed is cfsetispeed(3) and cfsetospeed(3) on the guest's
+// record.
+func setHostTerminalSpeed(record []byte, output bool, speed uint32) error {
+	if output {
+		binary.LittleEndian.PutUint32(record[guestTermiosOspeed:], speed)
+	} else {
+		binary.LittleEndian.PutUint32(record[guestTermiosIspeed:], speed)
+	}
+	return nil
+}
+
+// hostTerminalControl is tcdrain(3), tcflow(3), tcflush(3) and
+// tcsendbreak(3), in the order of terminalDrain: arg is the action of
+// tcflow, the queue of tcflush, the duration of tcsendbreak (which this
+// system does not look at).
+func hostTerminalControl(fd int, what, arg int32) error {
+	var err error
+	switch what {
+	case terminalDrain:
+		_, err = hostIoctlValue(fd, syscall.TIOCDRAIN, 0)
+	case terminalFlow:
+		switch arg {
+		case 1: // TCOOFF
+			_, err = hostIoctlValue(fd, syscall.TIOCSTOP, 0)
+		case 2: // TCOON
+			_, err = hostIoctlValue(fd, syscall.TIOCSTART, 0)
+		case 3, 4: // TCIOFF, TCION: the terminal's own STOP or START character is sent
+			var record [guestTermiosSize]byte
+			if err = hostTerminalAttributes(fd, record[:]); err != nil {
+				break
+			}
+			const stop, start, disabled = 13, 12, 0xff // VSTOP, VSTART, _POSIX_VDISABLE
+			c := record[guestTermiosCc+stop]
+			if arg == 4 {
+				c = record[guestTermiosCc+start]
+			}
+			if c != disabled {
+				_, err = syscall.Write(fd, []byte{c})
+			}
+		default:
+			err = syscall.EINVAL
+		}
+	case terminalFlush:
+		var which [4]byte
+		switch arg {
+		case 1: // TCIFLUSH: what was received (FREAD)
+			binary.NativeEndian.PutUint32(which[:], 0x1)
+		case 2: // TCOFLUSH: what is to be sent (FWRITE)
+			binary.NativeEndian.PutUint32(which[:], 0x2)
+		case 3: // TCIOFLUSH
+			binary.NativeEndian.PutUint32(which[:], 0x3)
+		default:
+			return syscall.EINVAL
+		}
+		_, err = hostIoctlBuffer(fd, syscall.TIOCFLUSH, which[:])
+	case terminalBreak:
+		if _, err = hostIoctlValue(fd, syscall.TIOCSBRK, 0); err != nil {
+			break
+		}
+		time.Sleep(400 * time.Millisecond)
+		_, err = hostIoctlValue(fd, syscall.TIOCCBRK, 0)
+	default:
+		err = syscall.EINVAL
+	}
+	return err
+}
+
+// hostOpenTakesTerminal: a terminal becomes a controlling terminal by
+// request only here (TIOCSCTTY), never by being opened.
+const hostOpenTakesTerminal = false
+
+// hostTerminalOfMaster returns the path of the terminal whose master side
+// fd is; ok is false for any other descriptor. Only the master side says
+// the name of the other (TIOCPTYGNAME), and it is never a controlling
+// terminal itself.
+func hostTerminalOfMaster(fd int) (path string, ok bool) {
+	const name = 0x40807453 // TIOCPTYGNAME
+	var buf [128]byte
+	if _, err := hostIoctlBuffer(fd, name, buf[:]); err != nil {
+		return "", false
+	}
+	for i, c := range buf {
+		if c == 0 {
+			return string(buf[:i]), i > 0
+		}
+	}
+	return "", false
+}

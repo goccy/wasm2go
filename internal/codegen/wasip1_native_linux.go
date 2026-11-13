@@ -3,6 +3,7 @@
 package codegen
 
 import (
+	"encoding/binary"
 	"os"
 	"strconv"
 	"strings"
@@ -241,4 +242,162 @@ func hostDup2(from, to int) error {
 func hostAccept(fd int) (int, error) {
 	nfd, _, err := syscall.Accept4(fd, syscall.SOCK_CLOEXEC)
 	return nfd, err
+}
+
+// hostGenericTerminal reports whether this architecture numbers what belongs
+// to a terminal — the requests, the bits of the flag words, the places of
+// the control characters, the speeds — the way most architectures of linux
+// do (asm-generic): the numbers the guest's own header has. The others
+// (powerpc, mips) have numbers of their own; a guest is refused the
+// settings of a terminal there, rather than given them under numbers that
+// mean something else.
+const hostGenericTerminal = syscall.TCGETS == 0x5401
+
+// Requests about a terminal's settings that package syscall does not have
+// on every architecture, as asm-generic numbers them, and the bits of
+// c_cflag that hold the speed (CBAUD).
+const (
+	genericTCSBRK  = 0x5409
+	genericTCXONC  = 0x540a
+	genericTCFLSH  = 0x540b
+	genericTCSBRKP = 0x5425
+	genericCBAUD   = 0x100f
+)
+
+// hostTerminalRequest reports whether request is one of the terminal's:
+// linux numbers those in the group of TIOCSCTTY (0x54) and, on the
+// architectures that took numbers from BSD, in the groups TIOCGWINSZ and
+// TCGETS are in.
+func hostTerminalRequest(request uint32) bool {
+	group := byte(request >> 8)
+	return group == byte(syscall.TIOCSCTTY>>8&0xff) || group == byte(syscall.TIOCGWINSZ>>8&0xff) || group == byte(syscall.TCGETS>>8&0xff)
+}
+
+// hostIoctlRoom returns how large the buffer of a request has to be. The
+// requests of a terminal do not say how much they read or write here; none
+// reads or writes more than this.
+func hostIoctlRoom(request uint32) int { return 256 }
+
+// hostTerminalAttributes is tcgetattr(3) into the guest's record.
+func hostTerminalAttributes(fd int, record []byte) error {
+	if !hostGenericTerminal {
+		return syscall.ENOSYS
+	}
+	var t syscall.Termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.TCGETS, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return errno
+	}
+	binary.LittleEndian.PutUint32(record[guestTermiosIflag:], t.Iflag)
+	binary.LittleEndian.PutUint32(record[guestTermiosOflag:], t.Oflag)
+	binary.LittleEndian.PutUint32(record[guestTermiosCflag:], t.Cflag)
+	binary.LittleEndian.PutUint32(record[guestTermiosLflag:], t.Lflag)
+	record[guestTermiosLine] = t.Line
+	cc := record[guestTermiosCc : guestTermiosCc+guestTermiosNCCS]
+	clear(cc)
+	copy(cc, t.Cc[:])
+	// The speed is in c_cflag; the C library keeps it in these two as
+	// well.
+	binary.LittleEndian.PutUint32(record[guestTermiosIspeed:], t.Cflag&genericCBAUD)
+	binary.LittleEndian.PutUint32(record[guestTermiosOspeed:], t.Cflag&genericCBAUD)
+	return nil
+}
+
+// setHostTerminalAttributes is tcsetattr(3) from the guest's record:
+// actions is TCSANOW, TCSADRAIN or TCSAFLUSH.
+func setHostTerminalAttributes(fd int, actions int32, record []byte) error {
+	if !hostGenericTerminal {
+		return syscall.ENOSYS
+	}
+	if actions < 0 || actions > 2 {
+		return syscall.EINVAL
+	}
+	t := syscall.Termios{
+		Iflag: binary.LittleEndian.Uint32(record[guestTermiosIflag:]),
+		Oflag: binary.LittleEndian.Uint32(record[guestTermiosOflag:]),
+		Cflag: binary.LittleEndian.Uint32(record[guestTermiosCflag:]),
+		Lflag: binary.LittleEndian.Uint32(record[guestTermiosLflag:]),
+		Line:  record[guestTermiosLine],
+	}
+	copy(t.Cc[:], record[guestTermiosCc:guestTermiosCc+guestTermiosNCCS])
+	// TCSETS, TCSETSW and TCSETSF follow one another.
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(syscall.TCSETS+int(actions)), uintptr(unsafe.Pointer(&t)))
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+}
+
+// hostTerminalSpeed is cfgetispeed(3) and cfgetospeed(3) on the guest's
+// record: the speed is the one in c_cflag, for input as for output.
+func hostTerminalSpeed(record []byte, output bool) uint32 {
+	return binary.LittleEndian.Uint32(record[guestTermiosCflag:]) & genericCBAUD
+}
+
+// setHostTerminalSpeed is cfsetispeed(3) and cfsetospeed(3) on the guest's
+// record. An input speed of 0 is the output's, and changes nothing.
+func setHostTerminalSpeed(record []byte, output bool, speed uint32) error {
+	if !hostGenericTerminal {
+		return syscall.ENOSYS
+	}
+	if speed&^genericCBAUD != 0 {
+		return syscall.EINVAL
+	}
+	if !output && speed == 0 {
+		return nil
+	}
+	cflag := binary.LittleEndian.Uint32(record[guestTermiosCflag:])&^genericCBAUD | speed
+	binary.LittleEndian.PutUint32(record[guestTermiosCflag:], cflag)
+	binary.LittleEndian.PutUint32(record[guestTermiosIspeed:], speed)
+	binary.LittleEndian.PutUint32(record[guestTermiosOspeed:], speed)
+	return nil
+}
+
+// hostTerminalControl is tcdrain(3), tcflow(3), tcflush(3) and
+// tcsendbreak(3), in the order of terminalDrain: arg is the action of
+// tcflow, the queue of tcflush, the duration of tcsendbreak.
+func hostTerminalControl(fd int, what, arg int32) error {
+	if !hostGenericTerminal {
+		return syscall.ENOSYS
+	}
+	var err error
+	switch what {
+	case terminalDrain:
+		_, err = hostIoctlValue(fd, genericTCSBRK, 1)
+	case terminalFlow:
+		_, err = hostIoctlValue(fd, genericTCXONC, uintptr(arg))
+	case terminalFlush:
+		_, err = hostIoctlValue(fd, genericTCFLSH, uintptr(arg))
+	case terminalBreak:
+		if arg <= 0 {
+			_, err = hostIoctlValue(fd, genericTCSBRK, 0)
+		} else {
+			_, err = hostIoctlValue(fd, genericTCSBRKP, uintptr(arg))
+		}
+	default:
+		err = syscall.EINVAL
+	}
+	return err
+}
+
+// hostOpenTakesTerminal: a process that leads a session and has no
+// controlling terminal gets the terminal it opens for one here, unless it
+// opens it with O_NOCTTY.
+const hostOpenTakesTerminal = true
+
+// hostTerminalOfMaster returns the path of the terminal whose master side
+// fd is; ok is false for any other descriptor. Only the master side says
+// which pseudo-terminal it is (TIOCGPTN), and it is never a controlling
+// terminal itself.
+func hostTerminalOfMaster(fd int) (path string, ok bool) {
+	const number = 0x80045430 // TIOCGPTN
+	var n [4]byte
+	if _, err := hostIoctlBuffer(fd, number, n[:]); err != nil {
+		return "", false
+	}
+	return "/dev/pts/" + strconv.Itoa(int(binary.NativeEndian.Uint32(n[:]))), true
 }
