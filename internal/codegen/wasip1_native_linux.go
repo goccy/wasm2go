@@ -160,8 +160,13 @@ const hostPipeBuf = 4096
 // hostFIONREAD is the ioctl request that asks how many bytes can be read.
 const hostFIONREAD = 0x541B
 
-// hostTerminalSettings is the ioctl request for the settings of a terminal.
-const hostTerminalSettings = syscall.TCGETS
+// hostTerminal is isatty(3): a terminal answers the request for its
+// settings.
+func hostTerminal(fd int) bool {
+	var settings syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.TCGETS, uintptr(unsafe.Pointer(&settings)))
+	return errno == 0
+}
 
 // hostSendFlags are the flags of every send the runtime makes for the
 // guest: it does not wait in the call, and a broken connection is reported
@@ -183,6 +188,16 @@ func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
 	n, _, errno := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)),
 		uintptr(unsafe.Pointer(limit)), 0, 0, 0)
 	return int(n), errno
+}
+
+// hostDescriptorPath returns the path of the file a descriptor is open on,
+// where the host tells.
+func hostDescriptorPath(fd int) (string, bool) {
+	path, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
+	if err != nil || !strings.HasPrefix(path, "/") {
+		return "", false
+	}
+	return path, true
 }
 
 // hostDup2 is dup2(2) for two different descriptors.

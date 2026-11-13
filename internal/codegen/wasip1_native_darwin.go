@@ -146,8 +146,18 @@ const hostPipeBuf = 512
 // hostFIONREAD is the ioctl request that asks how many bytes can be read.
 const hostFIONREAD = 0x4004667f
 
-// hostTerminalSettings is the ioctl request for the settings of a terminal.
-const hostTerminalSettings = syscall.TIOCGETA
+// hostTerminal is isatty(3), which asks the device for its type here
+// (FIODTYPE): the master side of a pseudo-terminal is a terminal to it
+// before it answers a request for terminal settings.
+func hostTerminal(fd int) bool {
+	const (
+		deviceType     = 0x4004667a // FIODTYPE
+		deviceTerminal = 3          // D_TTY
+	)
+	var kind int32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), deviceType, uintptr(unsafe.Pointer(&kind)))
+	return errno == 0 && kind == deviceTerminal
+}
 
 // hostSendFlags are the flags of every send the runtime makes for the
 // guest: it does not wait in the call. (A broken connection raises SIGPIPE
@@ -167,6 +177,21 @@ func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
 	}
 	n, _, errno := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)), uintptr(ms))
 	return int(n), errno
+}
+
+// hostDescriptorPath returns the path of the file a descriptor is open on,
+// where the host tells.
+func hostDescriptorPath(fd int) (string, bool) {
+	var buf [1024]byte // MAXPATHLEN
+	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_GETPATH, uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
+		return "", false
+	}
+	for i, c := range buf {
+		if c == 0 {
+			return string(buf[:i]), i > 0
+		}
+	}
+	return "", false
 }
 
 // hostDup2 is dup2(2) for two different descriptors.

@@ -78,8 +78,10 @@ func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 		fsys:       osFS{root: dir},
 	}
 	if hostSuite {
-		// The guest's descriptors are the host process's; the ones a test
+		// The guest's descriptors are the host process's — not the ones
+		// the test process has open for itself — and the ones a test
 		// leaves open go with the test.
+		KeepRuntimeDescriptorsHigh()
 		w.hostProcess = true
 		t.Cleanup(func() { _ = w.CloseAll() })
 	}

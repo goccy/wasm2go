@@ -1950,9 +1950,19 @@ func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 }
 
 // openLocked returns the entry the guest knows as descriptor fd, or nil
-// when it has none. Caller holds w.mu.
+// when it has none. A guest whose descriptors are the host process's has
+// every descriptor of the process that is nobody else's: for one it did
+// not open itself — code outside the guest did, a native library — the
+// entry is made from what the host says about the number right now, for
+// this one use (outsideHostLocked). Caller holds w.mu.
 func (w *WasiStubs) openLocked(fd int32) *wasiOpen {
-	return w.fdsLocked()[fd]
+	if op := w.fdsLocked()[fd]; op != nil {
+		return op
+	}
+	if w.hostDescriptorsLocked() {
+		return w.outsideHostLocked(fd)
+	}
+	return nil
 }
 
 // rootNumberLocked reports whether fd, a number the instance has no entry
@@ -2401,6 +2411,22 @@ func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
 		}
 		files[fd-3] = file
 	}
+	if w.hostDescriptorsLocked() {
+		// What code outside the guest left open for a command to inherit
+		// is part of what the guest has, and so of what the command gets.
+		for _, fd := range w.inheritableOutsideLocked() {
+			file := fd.childFile()
+			if file == nil {
+				continue
+			}
+			borrowed = append(borrowed, file)
+			at := fd.fd.Load() - 3
+			for int32(len(files)) <= at {
+				files = append(files, nil)
+			}
+			files[at] = file
+		}
+	}
 	return files, borrowed
 }
 
@@ -2418,8 +2444,23 @@ func (w *WasiStubs) Fd_cloexec(m *Module, fd, set, value, oldPtr int32) int32 {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.openLocked(fd) == nil {
-		return -_wasiEBADF
+	if w.fdsLocked()[fd] == nil {
+		// A descriptor that is not in the table can be one the guest has
+		// all the same (openLocked): its flag is the host's own.
+		op := w.openLocked(fd)
+		if op == nil {
+			return -_wasiEBADF
+		}
+		was, err := op.host().closeOnExec(set != 0, value != 0)
+		if err != nil {
+			return -mapOSError(err)
+		}
+		old := uint32(0)
+		if was {
+			old = 1
+		}
+		binary.LittleEndian.PutUint32(out, old)
+		return _wasiESUCCESS
 	}
 	old := uint32(0)
 	if w.cloexec[fd] {
@@ -4692,16 +4733,24 @@ func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
 
 // HostDescriptor returns the descriptor of the host process behind the
 // guest's descriptor fd, for code of the embedder that runs outside the
-// guest and has to hand a descriptor to the host's system calls: the guest's
-// numbers mean nothing there. ok is false when fd is not open or has no host
-// descriptor: a file of an in-memory filesystem, a standard stream the
-// embedder supplied as a reader or writer, a socket that is not connected,
-// bound or listening yet.
+// guest and has to hand a descriptor to the host's system calls. ok is false
+// when fd is not open or has no host descriptor: a file of an in-memory
+// filesystem, a standard stream the embedder supplied as a reader or
+// writer, a socket that is not connected, bound or listening yet.
 //
-// The descriptor stays the runtime's: it is valid until the guest closes fd,
-// it must not be closed, and it is in whatever blocking mode the Go runtime
-// keeps it in (non-blocking for sockets and pipes), not the mode the guest
-// asked for.
+// For a guest whose descriptors are the host process's (SetHostProcess) the
+// answer is fd itself: the number means the same on both sides, and the
+// descriptor is in the blocking mode the guest set. The one exception is a
+// descriptor the instance holds under a number that is another's for the
+// process — its own file where another process of the family still has
+// one, or in place of a standard descriptor it was not given: that one has
+// no number outside the guest, and ok is false.
+//
+// For any other guest the guest's numbers mean nothing outside it, and the
+// descriptor returned stays the runtime's: it is valid until the guest
+// closes fd, it must not be closed, and it is in whatever blocking mode the
+// Go runtime keeps it in (non-blocking for sockets and pipes), not the mode
+// the guest asked for.
 func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -6426,16 +6475,31 @@ const (
 //     the guest (see PostSignal), and a signal the guest ignores is ignored
 //     by the host process;
 //   - Proc_kill reaches host processes that are not processes of this
-//     instance.
+//     instance;
+//   - on Linux and macOS the guest's descriptors are the host process's:
+//     descriptor N of the guest is descriptor N of the process, a new one
+//     gets the lowest number the process has free, the blocking mode is the
+//     open file's, and a descriptor that code outside the guest opened is
+//     the guest's to use under its number (wasip1_native_hostfd.go). Every
+//     descriptor of the process is within the guest's reach that way,
+//     except those of another instance, those the runtime holds for itself
+//     — what was open and close-on-exec when the first instance became the
+//     host process, and every number from half the descriptor limit up —
+//     and the standard descriptors when the instance's streams are not
+//     those: an embedder that keeps descriptors of its own while such a
+//     guest runs opens them before, or duplicates them above that limit.
+//     The standard descriptors the guest was given are put back as they
+//     were when the instance ends (CloseAll).
 //
 // Without it (the default) the guest is an isolated process of its own:
-// pid 42, parent 1, user and group 0, empty user and group databases, and
-// no way to signal anything but its own processes.
+// pid 42, parent 1, user and group 0, empty user and group databases, no
+// way to signal anything but its own processes, and descriptors of its own
+// that are not the host's.
 //
 // An instance derived through Fork keeps the identity — the same user, the
-// same databases, the same reach of Proc_kill — but is not the host process:
-// signals the host process receives go to the instance SetHostProcess was
-// called on.
+// same databases, the same reach of Proc_kill, the same descriptors — but
+// is not the host process: signals the host process receives go to the
+// instance SetHostProcess was called on.
 func (w *WasiStubs) SetHostProcess(on bool) {
 	if on {
 		KeepRuntimeDescriptorsHigh()
@@ -6456,9 +6520,10 @@ func (w *WasiStubs) SetHostProcess(on bool) {
 // closes them. They are the process's, so one instance gets them: the first
 // that asks, and a later call does nothing.
 //
-// The number of the preopened root (3) is not the guest's to use: a
-// descriptor inherited under that number is left alone, out of the guest's
-// reach.
+// For a guest with descriptors of its own, the number of the preopened root
+// (3) is not the guest's to use: a descriptor inherited under that number
+// is left alone, out of the guest's reach. A guest whose descriptors are
+// the host process's has it like the others.
 func (w *WasiStubs) AdoptInheritedDescriptors() {
 	inheritedOnce.Do(func() {
 		for _, fd := range inheritedDescriptors() {

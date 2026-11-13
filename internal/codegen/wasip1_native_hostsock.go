@@ -239,12 +239,12 @@ func (w *WasiStubs) acceptHost(op *wasiOpen, h *hostFile) (*wasiOpen, int32) {
 			return nil, errno
 		}
 		// Whoever finds a connection waiting takes it: see hostCallTurn.
-		hostCallTurn.Lock()
+		hostCallTurn(fd).Lock()
 		nfd, err := -1, error(syscall.EAGAIN)
 		if hostReadyNow(fd, hostPollIn) != 0 {
 			nfd, err = hostAccept(fd)
 		}
-		hostCallTurn.Unlock()
+		hostCallTurn(fd).Unlock()
 		nonblocking, listening := false, true
 		if err == syscall.EAGAIN {
 			if flags, ferr := descriptorFlags(fd, syscall.F_GETFL); ferr == nil {
@@ -335,13 +335,13 @@ func (w *WasiStubs) connectHost(op *wasiOpen, h *hostFile, sa syscall.Sockaddr) 
 		if errno != _wasiESUCCESS {
 			return errno
 		}
-		hostCallTurn.Lock()
+		hostCallTurn(fd).Lock()
 		err := syscall.SetNonblock(fd, true)
 		if err == nil {
 			err = syscall.Connect(fd, sa)
 			_ = syscall.SetNonblock(fd, false)
 		}
-		hostCallTurn.Unlock()
+		hostCallTurn(fd).Unlock()
 		h.release()
 		switch err {
 		case nil:

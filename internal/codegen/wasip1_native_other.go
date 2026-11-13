@@ -273,6 +273,9 @@ func KeepRuntimeDescriptorsHigh() {}
 func (w *WasiStubs) hostDescriptorsLocked() bool                 { return false }
 func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen     { return &wasiOpen{stdio: stdio} }
 func (w *WasiStubs) freeNumberLocked() int32                     { return 0 }
+func (w *WasiStubs) outsideHostLocked(fd int32) *wasiOpen        { return nil }
+func (w *WasiStubs) inheritableOutsideLocked() []*hostFile       { return nil }
+func (h *hostFile) closeOnExec(set, value bool) (bool, error)    { return false, errors.ErrUnsupported }
 func (w *WasiStubs) closeHostWakerLocked()                       {}
 func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) { return -1, errors.ErrUnsupported }
 func (w *WasiStubs) dupHostLocked(op *wasiOpen) (int32, error)   { return -1, errors.ErrUnsupported }

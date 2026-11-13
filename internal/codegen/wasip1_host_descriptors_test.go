@@ -23,6 +23,9 @@ func newHostGuest(t *testing.T, dir string) (*WasiStubs, *Module) {
 	t.Helper()
 	w, m := newTestStubs(t, dir)
 	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	// As SetHostProcess does: what the test process has open for itself is
+	// not the guest's.
+	KeepRuntimeDescriptorsHigh()
 	w.hostProcess = true
 	t.Cleanup(func() { _ = w.CloseAll() })
 	return w, m
@@ -424,7 +427,9 @@ func TestHostDescriptors_ACommandGetsTheGuestsTable(t *testing.T) {
 	if rc := w.Fd_cloexec(m, hidden, 1, 1, 5300); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_cloexec rc=%d", rc)
 	}
-	script := "cat <&" + itoa32(in) + " >&" + itoa32(out) + "; if (: >&" + itoa32(hidden) + ") 2>/dev/null; then echo leaked >&" + itoa32(out) + "; fi"
+	// The descriptors are named by their files in /dev/fd: not every shell
+	// takes a number of two digits in a redirection.
+	script := "cat /dev/fd/" + itoa32(in) + " > /dev/fd/" + itoa32(out) + "; if test -e /dev/fd/" + itoa32(hidden) + "; then echo leaked > /dev/fd/" + itoa32(out) + "; fi"
 	pid := spawnTestProc(t, w, m, "/bin/sh", "-c", script)
 	const statusOff int32 = 5400
 	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
@@ -525,6 +530,7 @@ func TestHostDescriptors_StandardDescriptorsAreTheProcesssAndAreGivenBack(t *tes
 	w, m := newTestStubs(t, dir)
 	// The instance's standard output is the process's own.
 	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), os.Stdout, &bytes.Buffer{}
+	KeepRuntimeDescriptorsHigh()
 	w.hostProcess = true
 	before := descriptorIdentity(t, 1)
 
@@ -670,5 +676,200 @@ func TestHostDescriptors_SocketsAnswerAsTheHost(t *testing.T) {
 	closeTestFd(t, w, m, server)
 	if _, err := syscall.Getsockname(int(server)); err != syscall.EBADF {
 		t.Fatalf("the host's socket after the guest closed it: %v", err)
+	}
+}
+
+// A descriptor that code outside the guest made — a native library — is
+// the guest's under its number, like one it opened itself.
+func TestHostDescriptors_ADescriptorMadeOutsideTheGuestIsTheGuests(t *testing.T) {
+	// The host names a directory by its path without symbolic links.
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, m := newHostGuest(t, dir)
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatal(err)
+	}
+	r, wr := int32(p[0]), int32(p[1])
+	// The guest finds both ends, for what they are open for.
+	if got := fdFiletype(t, w, m, r); got != 4 {
+		t.Fatalf("file type of the pipe = %d", got)
+	}
+	if rc := fdWriteString(w, m, r, "x"); rc != _wasiEBADF {
+		t.Fatalf("write to the read end rc=%d, want EBADF", rc)
+	}
+	if rc := fdWriteString(w, m, wr, "through"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, r, 16); rc != _wasiESUCCESS || got != "through" {
+		t.Fatalf("read = %q rc=%d", got, rc)
+	}
+	guestIsHost(t, w, r)
+	// Its close-on-exec flag is the host's own, read and set.
+	if rc := w.Fd_cloexec(m, r, 1, 1, 5300); rc != _wasiESUCCESS || readU32(m.memory, 5300) != 0 {
+		t.Fatalf("Fd_cloexec rc=%d flag=%d, want the flag clear", rc, readU32(m.memory, 5300))
+	}
+	if flags, err := descriptorFlags(int(r), syscall.F_GETFD); err != nil || flags&syscall.FD_CLOEXEC == 0 {
+		t.Fatalf("the flag the guest set is not the host's (%#x, %v)", flags, err)
+	}
+	if rc := w.Fd_cloexec(m, r, 0, 0, 5300); rc != _wasiESUCCESS || readU32(m.memory, 5300) != 1 {
+		t.Fatalf("Fd_cloexec rc=%d flag=%d, want the flag set", rc, readU32(m.memory, 5300))
+	}
+	// The guest waits on it and duplicates it like any other.
+	writeSubClock(m, pollSubsOff, 1, int64(20*time.Millisecond))
+	writeSubFd(m, pollSubsOff+48, 2, 1 /* fd_read */, r)
+	wantUserdata(t, pollUserdata(t, w, m, 2), 1)
+	dup := dupTestFd(t, w, m, wr)
+	if rc := fdWriteString(w, m, dup, "again"); rc != _wasiESUCCESS {
+		t.Fatalf("write to the duplicate rc=%d", rc)
+	}
+	// Closing it closes the host's.
+	closeTestFd(t, w, m, r)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(r), &st); err != syscall.EBADF {
+		t.Fatalf("the descriptor after the guest closed it: %v", err)
+	}
+
+	// A command the guest starts inherits a descriptor that code outside
+	// the guest left for commands to inherit, though the guest never used
+	// it, and not one that is close-on-exec.
+	if _, err := os.Stat("/bin/sh"); err == nil {
+		var left, kept [2]int
+		if err := syscall.Pipe(left[:]); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Pipe(kept[:]); err != nil {
+			t.Fatal(err)
+		}
+		syscall.CloseOnExec(kept[1])
+		// The descriptors are named by their files in /dev/fd: not every
+		// shell takes a number of two digits in a redirection.
+		out := "/dev/fd/" + itoa32(int32(left[1]))
+		script := "echo inherited > " + out + "; if test -e /dev/fd/" + itoa32(int32(kept[1])) + "; then echo leaked > " + out + "; fi"
+		pid := spawnTestProc(t, w, m, "/bin/sh", "-c", script)
+		if rc := w.Proc_wait(m, pid, 0, 5400); rc != _wasiESUCCESS || readU32(m.memory, 5400) != 0 {
+			t.Fatalf("the command: Proc_wait rc=%d status=%#x", rc, readU32(m.memory, 5400))
+		}
+		closeTestFd(t, w, m, int32(left[1]))
+		buf := make([]byte, 64)
+		n, _ := syscall.Read(left[0], buf)
+		if string(buf[:n]) != "inherited\n" {
+			t.Fatalf("the command wrote %q to the inherited descriptor", buf[:n])
+		}
+		for _, fd := range []int{left[0], kept[0], kept[1]} {
+			_ = syscall.Close(fd)
+		}
+		// The code that made a descriptor may close it and get the number
+		// again for something else: the guest finds what is there now.
+		reused, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fd := range reused {
+			if got := fdFiletype(t, w, m, int32(fd)); got != 5 {
+				t.Fatalf("descriptor %d, now a datagram socket, has file type %d", fd, got)
+			}
+			_ = syscall.Close(fd)
+		}
+	}
+
+	// A socket, with what it is.
+	pair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syscall.Write(pair[1], []byte("on a socket")); err != nil {
+		t.Fatal(err)
+	}
+	if got, rc := sockRecv(w, m, int32(pair[0])); rc != _wasiESUCCESS || got != "on a socket" {
+		t.Fatalf("Sock_recv on a socket made outside = %q rc=%d", got, rc)
+	}
+	if got := nameOf(t, w, m, int32(pair[0]), 0); got.family != wasiSockFamilyUnix {
+		t.Fatalf("family of the socket = %d", got.family)
+	}
+
+	// A directory, with its name.
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := syscall.Open(filepath.Join(dir, "sub"), syscall.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rc := w.Fd_path(m, int32(sub), metaPathOff, 256, metaOutOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_path of a directory opened outside rc=%d", rc)
+	}
+	if got := string(m.memory[metaPathOff : metaPathOff+int32(readU32(m.memory, int(metaOutOff)))]); got != "/sub" {
+		t.Fatalf("Fd_path = %q, want /sub", got)
+	}
+}
+
+// What is not the guest's to take: a number that is not open, another
+// guest's descriptor, the runtime's, and a standard descriptor of the
+// process that the instance was not given.
+func TestHostDescriptors_OtherDescriptorsAreOutOfReach(t *testing.T) {
+	w, m := newHostGuest(t, t.TempDir())
+	other, om := newHostGuest(t, t.TempDir())
+	theirs := createTestFile(t, other, "theirs.txt")
+	for name, fd := range map[string]int32{"another guest's descriptor": theirs, "a number that is not open": 250} {
+		if rc := w.Fd_fdstat_get(m, fd, 5200); rc != _wasiEBADF {
+			t.Errorf("%s: Fd_fdstat_get rc=%d, want EBADF", name, rc)
+		}
+		if rc := w.Fd_close(m, fd); rc != _wasiEBADF {
+			t.Errorf("%s: Fd_close rc=%d, want EBADF", name, rc)
+		}
+	}
+	if rc := fdWriteString(other, om, theirs, "still theirs"); rc != _wasiESUCCESS {
+		t.Fatalf("the other guest's descriptor after this one asked for it: write rc=%d", rc)
+	}
+	// The runtime's waker.
+	readFd, _ := newTestPipe(t, w, m)
+	writeSubClock(m, pollSubsOff, 1, int64(time.Millisecond))
+	writeSubFd(m, pollSubsOff+48, 2, 1, readFd)
+	pollUserdata(t, w, m, 2)
+	w.mu.Lock()
+	waker := w.waker
+	w.mu.Unlock()
+	if rc := w.Fd_close(m, int32(waker.r)); rc != _wasiEBADF {
+		t.Fatalf("Fd_close of a descriptor of the runtime rc=%d, want EBADF", rc)
+	}
+	// Standard output of the process: the instance's is a buffer.
+	before := descriptorIdentity(t, 1)
+	closeTestFd(t, w, m, 1)
+	if rc := w.Fd_fdstat_get(m, 1, 5200); rc != _wasiEBADF {
+		t.Fatalf("Fd_fdstat_get(1) after the guest closed its own rc=%d, want EBADF", rc)
+	}
+	if after := descriptorIdentity(t, 1); after != before {
+		t.Fatalf("descriptor 1 of the process changed")
+	}
+}
+
+// A terminal is a terminal to the guest's libc, which tells one by what
+// fd_fdstat_get says: a character device that cannot be sought on.
+func TestHostDescriptors_ATerminalIsToldFromOtherDevices(t *testing.T) {
+	w, m := newHostGuest(t, "/")
+	seekable := func(fd int32) (filetype byte, seek bool) {
+		t.Helper()
+		if rc := w.Fd_fdstat_get(m, fd, 5200); rc != _wasiESUCCESS {
+			t.Fatalf("Fd_fdstat_get(%d) rc=%d", fd, rc)
+		}
+		rights := readU64(m.memory, 5208)
+		return m.memory[5200], rights&(wasiRightFdSeek|wasiRightFdTell) != 0
+	}
+	null, errno := w.pathOpen("dev/null", 1, 0, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open /dev/null errno=%d", errno)
+	}
+	if filetype, seek := seekable(null); filetype != 2 || !seek {
+		t.Fatalf("/dev/null: file type %d, may seek %v; want a character device that may", filetype, seek)
+	}
+	pty, errno := w.pathOpen("dev/ptmx", 1, 0, 1<<1|1<<6, 0)
+	if errno != _wasiESUCCESS {
+		t.Skipf("no pseudo-terminal to open (errno %d)", errno)
+	}
+	if filetype, seek := seekable(pty); filetype != 2 || seek {
+		t.Fatalf("a pseudo-terminal: file type %d, may seek %v; want a character device that may not", filetype, seek)
 	}
 }

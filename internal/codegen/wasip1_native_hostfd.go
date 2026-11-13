@@ -64,21 +64,30 @@ var hostTable struct {
 	open map[int]*wasiOpen
 	// reserved holds the descriptors below floor that the runtime has for
 	// itself: the ones the Go runtime made its poller and its signal
-	// delivery with. No guest gets at them by number.
-	reserved map[int]struct{}
+	// delivery with, and what else the process had open for itself when
+	// its first guest became the host process. No guest gets at them by
+	// number. Each is recorded with what it was (hostIdentity): a number
+	// whose descriptor was closed since, and given to something else, is
+	// the runtime's no longer.
+	reserved map[int]hostIdentity
 	// floor is the lowest number the runtime gives a descriptor of its
 	// own that it can place (see hostFloor). From there up every number is
 	// the runtime's.
 	floor int
 }
 
-// hostCallTurn is held while a descriptor is asked whether a call on it
-// would wait and, if not, while the call is made: of all the guests in the
-// process that wait for the same pipe or listening socket, the one that
-// finds it ready is the one that reads or accepts, and no other gets in
-// between and is left waiting inside the host's call, where no signal
-// reaches it.
-var hostCallTurn sync.Mutex
+// hostCallTurns are held, one per descriptor number, while a descriptor is
+// asked whether a call on it would wait and, if not, while the call is
+// made: of all the guests in the process that wait for the same pipe or
+// listening socket, the one that finds it ready is the one that reads or
+// accepts, and no other gets in between and is left waiting inside the
+// host's call, where no signal reaches it. Numbers share a lock in groups;
+// a call that does wait after all — something outside the process took
+// what was there — holds up the descriptors of its group only.
+var hostCallTurns [64]sync.Mutex
+
+// hostCallTurn returns the lock for calls on descriptor fd.
+func hostCallTurn(fd int) *sync.Mutex { return &hostCallTurns[uint(fd)%uint(len(hostCallTurns))] }
 
 // hostFloor returns the lowest number for a descriptor the runtime makes
 // for itself: well above what a program's own descriptors reach, so that
@@ -100,13 +109,35 @@ func hostFloor() int {
 	return hostTable.floor
 }
 
+// hostIdentity is what tells the file a descriptor is open on from the one
+// another descriptor is open on, as far as fstat does: device, inode and
+// type.
+type hostIdentity struct {
+	dev, ino uint64
+	mode     uint32
+}
+
+// hostIdentityOf returns the identity of what descriptor fd is open on; ok
+// is false when it is not open.
+func hostIdentityOf(fd int) (id hostIdentity, ok bool) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return id, false
+	}
+	return hostIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino), mode: uint32(st.Mode) & syscall.S_IFMT}, true
+}
+
 // hostReserve records that fd is a descriptor of the runtime's own.
 func hostReserve(fd int) {
+	id, ok := hostIdentityOf(fd)
+	if !ok {
+		return
+	}
 	hostTable.mu.Lock()
 	if hostTable.reserved == nil {
-		hostTable.reserved = map[int]struct{}{}
+		hostTable.reserved = map[int]hostIdentity{}
 	}
-	hostTable.reserved[fd] = struct{}{}
+	hostTable.reserved[fd] = id
 	hostTable.mu.Unlock()
 }
 
@@ -645,7 +676,7 @@ func (fi *hostFileInfo) Mode() os.FileMode {
 }
 
 // terminal reports whether the descriptor is a terminal: a character
-// device that answers the request for its terminal settings.
+// device the host takes for one (isatty).
 func (h *hostFile) terminal() bool {
 	if h.kind != syscall.S_IFCHR {
 		return false
@@ -655,9 +686,7 @@ func (h *hostFile) terminal() bool {
 		return false
 	}
 	defer h.release()
-	var settings syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), hostTerminalSettings, uintptr(unsafe.Pointer(&settings)))
-	return errno == 0
+	return hostTerminal(fd)
 }
 
 // statusFlags returns the file status flags of the descriptor (F_GETFL).
@@ -982,6 +1011,90 @@ type hostStandard struct {
 	kept [3]int
 }
 
+// outsideHostLocked returns an entry for descriptor fd of the host process,
+// which the instance's table does not have, when the descriptor is open and
+// the instance's to have (hostNumberFreeLocked): one that code outside the
+// guest made. It returns nil otherwise — the number is not open, or it is
+// another process's or the runtime's, and the guest gets EBADF.
+//
+// The entry is not kept. The table holds what the guest opened; a
+// descriptor from outside it is whatever that code has under the number at
+// the moment — it may close the descriptor and open another under the same
+// number without the runtime hearing of it — so the host is asked each
+// time, and nothing is remembered that could be out of date. The guest
+// uses the descriptor like its own all the same: it reads, writes and waits
+// on it, duplicates it (the duplicate is an entry of the table), and closes
+// it, which closes the host's. Its close-on-exec flag is the host's.
+// Caller holds w.mu.
+func (w *WasiStubs) outsideHostLocked(fd int32) *wasiOpen {
+	if fd < 0 || !w.hostNumberFreeLocked(int(fd)) {
+		return nil
+	}
+	op, err := newHostOpen(int(fd), "")
+	if err != nil {
+		return nil
+	}
+	if op.isDir {
+		// The directory has a name, which fchdir needs.
+		if path, ok := hostDescriptorPath(int(fd)); ok {
+			op.host().path = path
+			if named, can := w.fsys.(interface {
+				HostName(path string) (string, bool)
+			}); can {
+				if name, known := named.HostName(path); known {
+					op.path = name
+				}
+			}
+		}
+	}
+	return op
+}
+
+// inheritableOutsideLocked returns the descriptors of the host process
+// that the instance's table does not have and that a command the guest
+// starts inherits: the open ones that are the instance's to have and are
+// not close-on-exec, which is how code outside the guest leaves a
+// descriptor it means a command to get. Caller holds w.mu.
+func (w *WasiStubs) inheritableOutsideLocked() []*hostFile {
+	fds := w.fdsLocked()
+	var out []*hostFile
+	for _, fd := range openDescriptors() {
+		if fd <= 2 || int32(fd) >= wasiInheritedFDLimit {
+			continue
+		}
+		if _, known := fds[int32(fd)]; known || !w.hostNumberFreeLocked(fd) {
+			continue
+		}
+		if flags, err := descriptorFlags(fd, syscall.F_GETFD); err != nil || flags&syscall.FD_CLOEXEC != 0 {
+			continue
+		}
+		out = append(out, newHostFile(fd, 0, ""))
+	}
+	return out
+}
+
+// closeOnExec returns the close-on-exec flag of the descriptor, and sets it
+// to value first when set is true.
+func (h *hostFile) closeOnExec(set, value bool) (was bool, err error) {
+	fd, err := h.hold()
+	if err != nil {
+		return false, err
+	}
+	defer h.release()
+	flags, err := descriptorFlags(fd, syscall.F_GETFD)
+	if err != nil {
+		return false, err
+	}
+	was = flags&syscall.FD_CLOEXEC != 0
+	if set && value != was {
+		flags ^= syscall.FD_CLOEXEC
+		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_SETFD, uintptr(flags)); errno != 0 {
+			return was, errno
+		}
+	}
+	return was, nil
+}
+
 // hostEnter records op as the entry that is descriptor fd. An entry that
 // was known under the number is gone: the host gives a number out again
 // only once the descriptor that had it is closed, so that one was closed
@@ -1005,7 +1118,15 @@ func hostEnter(fd int, op *wasiOpen) {
 func hostOwner(fd int) (op *wasiOpen, reserved bool) {
 	hostTable.mu.Lock()
 	defer hostTable.mu.Unlock()
-	_, reserved = hostTable.reserved[fd]
+	if was, recorded := hostTable.reserved[fd]; recorded {
+		if now, open := hostIdentityOf(fd); open && now == was {
+			reserved = true
+		} else {
+			// The runtime's descriptor is gone; the number is free again,
+			// or something else's.
+			delete(hostTable.reserved, fd)
+		}
+	}
 	return hostTable.open[fd], reserved
 }
 
@@ -1372,7 +1493,7 @@ func (h *hostFile) receiveNow(bufs [][]byte, flags int32) (n uint64, from syscal
 		if h.socket() {
 			got, from, err = syscall.Recvfrom(fd, buf, hostMsgFlags(flags)|syscall.MSG_DONTWAIT)
 		} else {
-			hostCallTurn.Lock()
+			hostCallTurn(fd).Lock()
 			if hostReadyNow(fd, hostPollIn) != 0 {
 				got, err = syscall.Read(fd, buf)
 			} else if mode, ferr := descriptorFlags(fd, syscall.F_GETFL); ferr == nil && mode&syscall.O_NONBLOCK != 0 {
@@ -1384,7 +1505,7 @@ func (h *hostFile) receiveNow(bufs [][]byte, flags int32) (n uint64, from syscal
 			} else {
 				got, err = 0, syscall.EAGAIN
 			}
-			hostCallTurn.Unlock()
+			hostCallTurn(fd).Unlock()
 		}
 		if err != syscall.EINTR {
 			break
@@ -1502,9 +1623,9 @@ func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, blocking bool) (n int,
 			// what the host has room for.
 			n, err = syscall.Write(fd, p)
 		} else {
-			hostCallTurn.Lock()
+			hostCallTurn(fd).Lock()
 			if hostReadyNow(fd, hostPollOut) == 0 {
-				hostCallTurn.Unlock()
+				hostCallTurn(fd).Unlock()
 				return 0, true, nil
 			}
 			chunk := p
@@ -1512,7 +1633,7 @@ func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, blocking bool) (n int,
 				chunk = chunk[:hostWriteChunk]
 			}
 			n, err = syscall.Write(fd, chunk)
-			hostCallTurn.Unlock()
+			hostCallTurn(fd).Unlock()
 		}
 		if err != syscall.EINTR {
 			break
@@ -1544,7 +1665,14 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 		}
 		bufs = [][]byte{whole}
 	}
-	nonblocking := flags&wasiMsgDontWait != 0 || h.nonblocking()
+	// A send on a socket never waits in the host's call, so the mode of a
+	// socket is asked only once it has no room; how a pipe is written
+	// depends on its mode from the start.
+	nonblocking := flags&wasiMsgDontWait != 0
+	asked := nonblocking
+	if !h.socket() && !asked {
+		nonblocking, asked = h.nonblocking(), true
+	}
 	var total uint64
 	var until time.Time
 	for i := 0; i < len(bufs); {
@@ -1566,6 +1694,9 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 				i++
 			}
 			continue
+		}
+		if !asked {
+			nonblocking, asked = h.nonblocking(), true
 		}
 		if nonblocking {
 			if total > 0 {
