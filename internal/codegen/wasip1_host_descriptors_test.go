@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -378,17 +379,126 @@ func TestHostDescriptors_ForkedProcessesShareNumbersUntilTheyDiverge(t *testing.
 		t.Fatalf("the child's file holds %q", got)
 	}
 
-	// The parent closes a descriptor the child still has: the host keeps
-	// it for the child, and the parent's next descriptor is elsewhere.
-	kept := createTestFile(t, w, "kept.txt")
-	grandchild := w.Fork()
-	defer grandchild.CloseAll()
-	closeTestFd(t, w, m, kept)
-	if rc := fdWriteString(grandchild, cm, kept, "still open"); rc != _wasiESUCCESS {
-		t.Fatalf("write through a descriptor the parent closed rc=%d", rc)
+}
+
+// A new descriptor has the lowest number that is free for the process that
+// makes it, whatever the other processes of the family hold: a program that
+// closes its standard output and opens a file gets the file as descriptor 1.
+// Where a forked process still has its own descriptor under that number, the
+// host keeps that one for it, and the new file is under the number in the
+// process that opened it only.
+func TestHostDescriptors_ANewDescriptorTakesTheNumberAnotherProcessStillHolds(t *testing.T) {
+	const out int32 = 5300
+	for _, tc := range []struct {
+		name string
+		// make returns the descriptors a call makes.
+		make func(t *testing.T, w *WasiStubs, m *Module) []int32
+	}{
+		{"open", func(t *testing.T, w *WasiStubs, m *Module) []int32 {
+			return []int32{createTestFile(t, w, "next.txt")}
+		}},
+		{"dup", func(t *testing.T, w *WasiStubs, m *Module) []int32 {
+			if rc := w.Fd_dup(m, 0, out); rc != _wasiESUCCESS {
+				t.Fatalf("Fd_dup rc=%d", rc)
+			}
+			return []int32{int32(binary.LittleEndian.Uint32(m.memory[out:]))}
+		}},
+		{"pipe", func(t *testing.T, w *WasiStubs, m *Module) []int32 {
+			if rc := w.Pipe(m, out); rc != 0 {
+				t.Fatalf("Pipe rc=%d", rc)
+			}
+			return []int32{int32(binary.LittleEndian.Uint32(m.memory[out:])), int32(binary.LittleEndian.Uint32(m.memory[out+4:]))}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			w, m := newHostGuest(t, dir)
+			// Standard input that is a descriptor of the host, for dup.
+			source := createTestFile(t, w, "source.txt")
+			if rc := w.Fd_dup2(m, source, 0); rc != _wasiESUCCESS {
+				t.Fatalf("Fd_dup2 onto 0 rc=%d", rc)
+			}
+			closeTestFd(t, w, m, source)
+			kept := createTestFile(t, w, "kept.txt")
+			above := createTestFile(t, w, "above.txt")
+			child := w.Fork()
+			defer child.CloseAll()
+			cm := newForkTestModule()
+
+			// The parent closes a descriptor the child still has.
+			closeTestFd(t, w, m, kept)
+			made := tc.make(t, w, m)
+			lowest := made[0]
+			for _, fd := range made {
+				if fd < lowest {
+					lowest = fd
+				}
+			}
+			if lowest != kept {
+				t.Fatalf("after closing %d the parent's new descriptors are %v: the lowest free number is %d", kept, made, kept)
+			}
+			// The child's descriptor is what it was, and is the host's
+			// under the number; the parent's has none outside the parent.
+			if rc := fdWriteString(child, cm, kept, "still open"); rc != _wasiESUCCESS {
+				t.Fatalf("child's write through the descriptor the parent closed rc=%d", rc)
+			}
+			if got, _ := os.ReadFile(filepath.Join(dir, "kept.txt")); string(got) != "still open" {
+				t.Fatalf("the child's file holds %q", got)
+			}
+			if !sameFile(t, guestIsHost(t, child, kept), filepath.Join(dir, "kept.txt")) {
+				t.Fatalf("descriptor %d of the host is no longer the child's file", kept)
+			}
+			if host, ok := w.HostDescriptor(kept); ok {
+				t.Fatalf("the parent's own file under %d is descriptor %d of the host", kept, host)
+			}
+			guestIsHost(t, w, above)
+
+			// Once every process has closed the descriptor, the number is
+			// free in the process, and the next descriptor is the host's
+			// under its number.
+			closeTestFd(t, child, cm, kept)
+			closeTestFd(t, w, m, kept)
+			if again := createTestFile(t, child, "again.txt"); again != kept {
+				t.Fatalf("the child's next descriptor is %d, want %d", again, kept)
+			} else {
+				guestIsHost(t, child, again)
+			}
+		})
 	}
-	if next := createTestFile(t, w, "next.txt"); next == kept {
-		t.Fatalf("the parent got number %d again while its child still uses it", kept)
+}
+
+// What a forked process does to a standard descriptor is its own: it closes
+// standard output and opens a file, which is its descriptor 1, and the
+// parent's standard output is untouched.
+func TestHostDescriptors_AForkedProcessReopensStandardOutput(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newHostGuest(t, dir)
+	// A standard output that is a descriptor of the host, as a program run
+	// as the process has: a file in place of the stream of the embedder's.
+	first := createTestFile(t, w, "stdout.txt")
+	if rc := w.Fd_dup2(m, first, 1); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dup2 onto 1 rc=%d", rc)
+	}
+	closeTestFd(t, w, m, first)
+	child := w.Fork()
+	defer child.CloseAll()
+	cm := newForkTestModule()
+
+	closeTestFd(t, child, cm, 1)
+	if fd := createTestFile(t, child, "child.txt"); fd != 1 {
+		t.Fatalf("the child's file after closing standard output is descriptor %d, want 1", fd)
+	}
+	if rc := fdWriteString(child, cm, 1, "child"); rc != _wasiESUCCESS {
+		t.Fatalf("child write rc=%d", rc)
+	}
+	if rc := fdWriteString(w, m, 1, "parent"); rc != _wasiESUCCESS {
+		t.Fatalf("parent write rc=%d", rc)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "stdout.txt")); string(got) != "parent" {
+		t.Fatalf("the parent's standard output holds %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "child.txt")); string(got) != "child" {
+		t.Fatalf("the child's file holds %q", got)
 	}
 }
 
@@ -569,6 +679,104 @@ func TestHostDescriptors_StandardDescriptorsAreTheProcesssAndAreGivenBack(t *tes
 	}
 }
 
+// A forked process that ends while its family runs on closes what it has
+// under the numbers of the standard descriptors like its other descriptors:
+// the number is free in the process again, and the process that next closes
+// its standard output and opens a file gets the file as descriptor 1 of the
+// host. When the first process ends, the host process has its own standard
+// output back.
+func TestHostDescriptors_AForkedProcessThatEndsFreesTheStandardNumbers(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	// The instance's standard output is the process's own.
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), os.Stdout, &bytes.Buffer{}
+	KeepRuntimeDescriptorsHigh()
+	w.hostProcess = true
+	before := descriptorIdentity(t, 1)
+	ended := false
+	defer func() {
+		if !ended {
+			_ = w.CloseAll()
+		}
+	}()
+
+	// The program captures its standard output in a file, then forks.
+	capture := createTestFile(t, w, "capture.txt")
+	if rc := w.Fd_dup2(m, capture, 1); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dup2 rc=%d", rc)
+	}
+	closeTestFd(t, w, m, capture)
+	child := w.Fork()
+	cm := newForkTestModule()
+
+	// Each of the two puts a file of its own in the place of standard
+	// output: the parent first, while the child still has the capture
+	// there, then the child, which is the last to close it.
+	closeTestFd(t, w, m, 1)
+	if fd := createTestFile(t, w, "parent.txt"); fd != 1 {
+		_ = child.CloseAll()
+		t.Fatalf("the parent's file is descriptor %d, want 1", fd)
+	}
+	closeTestFd(t, child, cm, 1)
+	if fd := createTestFile(t, child, "child.txt"); fd != 1 {
+		_ = child.CloseAll()
+		t.Fatalf("the child's file is descriptor %d, want 1", fd)
+	}
+	if !sameFile(t, guestIsHost(t, child, 1), filepath.Join(dir, "child.txt")) {
+		_ = child.CloseAll()
+		t.Fatalf("descriptor 1 of the host is not the child's file")
+	}
+
+	// The child ends: nothing is left under the number.
+	if err := child.CloseAll(); err != nil {
+		t.Fatalf("the child's CloseAll: %v", err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(1, &st); err != syscall.EBADF {
+		t.Fatalf("after the forked process ended, fstat(1) = %v, want EBADF", err)
+	}
+	closeTestFd(t, w, m, 1)
+	if fd := createTestFile(t, w, "again.txt"); fd != 1 {
+		t.Fatalf("the parent's next file is descriptor %d, want 1", fd)
+	}
+	if !sameFile(t, guestIsHost(t, w, 1), filepath.Join(dir, "again.txt")) {
+		t.Fatalf("descriptor 1 of the host is not the parent's file")
+	}
+
+	ended = true
+	if err := w.CloseAll(); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+	if after := descriptorIdentity(t, 1); after != before {
+		t.Fatalf("descriptor 1 of the process is %v after the first process ended, was %v", after, before)
+	}
+}
+
+// A forked process that outlives the first process of its family leaves the
+// standard descriptors alone when it ends: they are the host process's
+// again.
+func TestHostDescriptors_AForkedProcessThatOutlivesTheFirstLeavesStandardOutput(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := newTestStubs(t, dir)
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), os.Stdout, &bytes.Buffer{}
+	KeepRuntimeDescriptorsHigh()
+	w.hostProcess = true
+	before := descriptorIdentity(t, 1)
+	if host, ok := w.HostDescriptor(1); !ok || host != 1 {
+		t.Fatalf("standard output is descriptor %d of the host (%v), want 1", host, ok)
+	}
+	child := w.Fork()
+	if err := w.CloseAll(); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+	if err := child.CloseAll(); err != nil {
+		t.Fatalf("the child's CloseAll: %v", err)
+	}
+	if after := descriptorIdentity(t, 1); after != before {
+		t.Fatalf("descriptor 1 of the process is %v after the family ended, was %v", after, before)
+	}
+}
+
 func TestHostDescriptors_StandardDescriptorsOfTheProcessAreNotTakenUnasked(t *testing.T) {
 	dir := t.TempDir()
 	// The instance's standard streams are the embedder's: descriptors 0, 1
@@ -576,7 +784,9 @@ func TestHostDescriptors_StandardDescriptorsOfTheProcessAreNotTakenUnasked(t *te
 	w, m := newHostGuest(t, dir)
 	before := descriptorIdentity(t, 1)
 	file := createTestFile(t, w, "out.txt")
-	for _, guest := range []*WasiStubs{w, w.Fork()} {
+	child := w.Fork()
+	t.Cleanup(func() { _ = child.CloseAll() })
+	for _, guest := range []*WasiStubs{w, child} {
 		if rc := guest.Fd_dup2(m, file, 1); rc != _wasiESUCCESS {
 			t.Fatalf("Fd_dup2 rc=%d", rc)
 		}

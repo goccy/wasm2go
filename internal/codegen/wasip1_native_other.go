@@ -254,6 +254,8 @@ type hostStandard struct{}
 
 func (w *WasiStubs) restoreStandardLocked() {}
 
+func (w *WasiStubs) leavesStandardLocked() bool { return true }
+
 // hostPollSet would be the descriptors of the host one poll_oneoff asks
 // about; it stays empty.
 type hostPollSet struct{}

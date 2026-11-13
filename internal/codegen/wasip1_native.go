@@ -1799,8 +1799,9 @@ func (w *WasiStubs) CloseAll() error {
 	w.ended = true
 	w.detachSignalsLocked()
 	var err error
+	leave := w.leavesStandardLocked()
 	for fd, op := range w.fdsLocked() {
-		err = errors.Join(err, endWasiOpen(op))
+		err = errors.Join(err, endWasiOpen(op, leave))
 		delete(w.fdsLocked(), fd)
 	}
 	w.closeHostWakerLocked()
@@ -1874,8 +1875,9 @@ func (w *WasiStubs) CloseDescriptors() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var err error
+	leave := w.leavesStandardLocked()
 	for fd, op := range w.fdsLocked() {
-		err = errors.Join(err, endWasiOpen(op))
+		err = errors.Join(err, endWasiOpen(op, leave))
 		delete(w.fdsLocked(), fd)
 	}
 	return err
@@ -3488,11 +3490,14 @@ func closeWasiOpen(op *wasiOpen) error {
 }
 
 // endWasiOpen is closeWasiOpen for an instance that ends, as opposed to a
-// guest that closes a descriptor: the standard descriptors of the host
-// process stay open when the last instance that has them goes. The host
-// process is still there, and reports through them.
-func endWasiOpen(op *wasiOpen) error {
-	op.leaveStandard()
+// guest that closes a descriptor: with leaveStandard, the standard
+// descriptors of the host process stay open when the last instance that
+// has them goes. The host process is still there, and reports through
+// them.
+func endWasiOpen(op *wasiOpen, leaveStandard bool) error {
+	if leaveStandard {
+		op.leaveStandard()
+	}
 	return closeWasiOpen(op)
 }
 

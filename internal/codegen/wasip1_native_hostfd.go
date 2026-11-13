@@ -1059,15 +1059,37 @@ func (w *WasiStubs) restoreStandardLocked() {
 		_ = syscall.Close(kept)
 	}
 	syscall.ForkLock.RUnlock()
+	w.standard.returned.Store(true)
 	w.standard = nil
+}
+
+// leavesStandardLocked reports whether the instance, when it ends, leaves
+// open what it has under the numbers of the standard descriptors of the
+// host process (endWasiOpen). The first process of a family does: it gives
+// the process its descriptors back in their place. A forked process that
+// ends while the family runs on closes them like its other descriptors —
+// they are files of the program's, and a number that stayed taken by
+// nobody would not be the lowest free one for the process that next closes
+// its standard output and opens a file. Once the first process has given
+// the descriptors back, what is under the numbers is the host process's
+// again, and a forked process that outlived it leaves it alone. Caller
+// holds w.mu.
+func (w *WasiStubs) leavesStandardLocked() bool {
+	return !w.forked || w.standard == nil || w.standard.returned.Load()
 }
 
 // hostStandard is the standard descriptors of the host process an instance
 // took over: duplicates of 0, 1 and 2 as they were, -1 for one it did not
-// take. The processes forked from the instance share the record; it does
+// take. The processes forked from the instance share the record; kept does
 // not change once the instance's table is set up.
 type hostStandard struct {
 	kept [3]int
+	// returned is set when the first process of the family has put the
+	// descriptors back (restoreStandardLocked). The forked processes ask
+	// it when they end (leavesStandardLocked); they cannot ask the first
+	// process itself, whose lock is not theirs to take from under their
+	// own.
+	returned atomic.Bool
 }
 
 // madeOutside reports whether the descriptor is one that code outside the
@@ -1240,10 +1262,26 @@ func hostOwner(fd int) (op *wasiOpen, reserved bool) {
 
 // addHostFDLocked enters op, a new entry that is a descriptor of the host
 // process, in the instance's table and returns the number the guest knows
-// it by: the descriptor's own. Only when the instance has something else
-// under that number — a stream of the embedder's, a descriptor it got
-// under a number of the host's that another process holds — is the
-// descriptor moved to a number that is free for both. Caller holds w.mu.
+// it by: the lowest number that is free for the instance, as POSIX has it
+// for every new descriptor. A program counts on that — it closes its
+// standard output and opens the file that is to take its place.
+//
+// Almost always that number is the descriptor's own: the host gave it the
+// lowest number that is free in the process. The two differ where the
+// instance's table and the process's do not agree:
+//
+//   - a lower number is free for the instance while another process of the
+//     family still has its descriptor there (a parent closed what its fork
+//     child still uses, or the other way round). The instance gets that
+//     number, and the descriptor is moved above the range programs use: it
+//     has no number outside the guest, like the file dup2 puts under such
+//     a number (dup2HostLocked);
+//   - the instance has something else under the descriptor's number — a
+//     stream of the embedder's, a file it holds under a number that was
+//     another process's. The descriptor is moved to the instance's lowest
+//     free number, where that is free in the process as well.
+//
+// Caller holds w.mu.
 func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 	h := op.host()
 	fd, err := h.number()
@@ -1259,41 +1297,79 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 			at.fd.CompareAndSwap(int32(fd), -1)
 			_ = closeWasiOpen(in)
 			delete(fds, int32(fd))
-		} else {
-			var passed []int
-			moved := -1
-			for from := fd + 1; ; {
-				nfd, err := hostDup(fd, from)
-				if err != nil {
-					break
-				}
-				if fds[int32(nfd)] == nil {
-					moved = nfd
-					break
-				}
-				passed = append(passed, nfd)
-				from = nfd + 1
-			}
-			for _, nfd := range passed {
-				_ = syscall.Close(nfd)
-			}
-			if moved < 0 {
-				return -1, syscall.EMFILE
+		}
+	}
+	number, floor := -1, hostFloor()
+	for n := 0; number < 0; n++ {
+		if n >= floor {
+			return -1, syscall.EMFILE
+		}
+		if fds[int32(n)] != nil {
+			continue
+		}
+		if n == fd {
+			number = n
+			break
+		}
+		if w.othersNumberLocked(n) {
+			moved, err := hostDup(fd, floor)
+			if err != nil {
+				return -1, err
 			}
 			_ = syscall.Close(fd)
 			h.fd.Store(int32(moved))
-			fd = moved
+			hostEnter(moved, op)
+			fds[int32(n)] = op
+			delete(w.cloexec, int32(n))
+			return int32(n), nil
 		}
+		if n < fd {
+			// Open in the process and nobody's among the guests: the
+			// runtime's, or one that code outside the guest made, which is
+			// the instance's under this number once it is used.
+			continue
+		}
+		// Above the descriptor's own number, which the instance has
+		// something else under: the number is free when the process has
+		// nothing there.
+		moved, err := hostDup(fd, n)
+		if err != nil {
+			return -1, err
+		}
+		if moved != n {
+			_ = syscall.Close(moved)
+			continue
+		}
+		_ = syscall.Close(fd)
+		h.fd.Store(int32(moved))
+		number = moved
 	}
-	if fd <= 2 {
+	if number <= 2 {
 		// A standard descriptor is the host process's as well, and code
 		// outside the guest that starts a command counts on handing it on.
-		hostKeepOnExec(fd)
+		hostKeepOnExec(number)
 	}
-	hostEnter(fd, op)
-	fds[int32(fd)] = op
-	delete(w.cloexec, int32(fd))
-	return int32(fd), nil
+	hostEnter(number, op)
+	fds[int32(number)] = op
+	delete(w.cloexec, int32(number))
+	return int32(number), nil
+}
+
+// othersNumberLocked reports whether fd, a number the instance's table has
+// nothing under, is in the process the descriptor of somebody the instance
+// never sees there: another guest's entry (a process of the family that
+// still has what this one closed), or a standard descriptor of the process
+// that the instance was not given. Such a number is free for the instance,
+// and what it puts there has no number outside it. A descriptor of the
+// runtime's own is not one of these — no guest gets that number — and
+// neither is one that code outside the guest made, which is the instance's
+// under its number. Caller holds w.mu.
+func (w *WasiStubs) othersNumberLocked(fd int) bool {
+	if fd <= 2 && (w.standard == nil || w.standard.kept[fd] < 0) {
+		return true
+	}
+	owner, reserved := hostOwner(fd)
+	return owner != nil && !reserved
 }
 
 // hostKeepOnExec clears the close-on-exec flag of a descriptor.
