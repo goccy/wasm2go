@@ -77,9 +77,22 @@ func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 		preopenDir: dir,
 		fsys:       osFS{root: dir},
 	}
+	if hostSuite {
+		// The guest's descriptors are the host process's; the ones a test
+		// leaves open go with the test.
+		w.hostProcess = true
+		t.Cleanup(func() { _ = w.CloseAll() })
+	}
 	m := &Module{memory: make([]byte, 1<<16)}
 	return w, m
 }
+
+// hostSuite makes newTestStubs return host state whose descriptors are the
+// host process's, as SetHostProcess does where the platform has that (the
+// identity is set without it: SetHostProcess would also take over the test
+// process's signals). It is set while the tests of a guest's behaviour are
+// run again on such a guest.
+var hostSuite bool
 
 // readU32 / readU64 / writeRel are tiny helpers for the test cases.
 func readU32(b []byte, off int) uint32 { return binary.LittleEndian.Uint32(b[off:]) }
@@ -1417,11 +1430,12 @@ func TestWasip1EmitPlatformCompanions(t *testing.T) {
 	}
 	companions := tr.emitWasip1Platform("x")
 	wantConstraints := map[string]string{
-		"wasip1_native_posix.go":  "darwin || linux",
-		"wasip1_native_linux.go":  "linux",
-		"wasip1_native_darwin.go": "darwin",
-		"wasip1_native_other.go":  "!darwin && !linux",
-		"wasip1_native_hostfd.go": "darwin || linux",
+		"wasip1_native_posix.go":    "darwin || linux",
+		"wasip1_native_linux.go":    "linux",
+		"wasip1_native_darwin.go":   "darwin",
+		"wasip1_native_other.go":    "!darwin && !linux",
+		"wasip1_native_hostfd.go":   "darwin || linux",
+		"wasip1_native_hostsock.go": "darwin || linux",
 
 		"wasip1_hostnumbers_linux.go":           "linux",
 		"wasip1_hostnumbers_linux_headers.go":   "linux && !(mips || mipsle || mips64 || mips64le)",

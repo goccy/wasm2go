@@ -146,6 +146,9 @@ const hostPipeBuf = 512
 // hostFIONREAD is the ioctl request that asks how many bytes can be read.
 const hostFIONREAD = 0x4004667f
 
+// hostTerminalSettings is the ioctl request for the settings of a terminal.
+const hostTerminalSettings = syscall.TIOCGETA
+
 // hostSendFlags are the flags of every send the runtime makes for the
 // guest: it does not wait in the call. (A broken connection raises SIGPIPE
 // in the host process as well as the error; the Go runtime ignores it.)

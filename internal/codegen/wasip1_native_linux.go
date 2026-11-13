@@ -160,6 +160,9 @@ const hostPipeBuf = 4096
 // hostFIONREAD is the ioctl request that asks how many bytes can be read.
 const hostFIONREAD = 0x541B
 
+// hostTerminalSettings is the ioctl request for the settings of a terminal.
+const hostTerminalSettings = syscall.TCGETS
+
 // hostSendFlags are the flags of every send the runtime makes for the
 // guest: it does not wait in the call, and a broken connection is reported
 // to the guest alone (see writeFailure), not to the host process.

@@ -644,6 +644,22 @@ func (fi *hostFileInfo) Mode() os.FileMode {
 	return mode
 }
 
+// terminal reports whether the descriptor is a terminal: a character
+// device that answers the request for its terminal settings.
+func (h *hostFile) terminal() bool {
+	if h.kind != syscall.S_IFCHR {
+		return false
+	}
+	fd, err := h.hold()
+	if err != nil {
+		return false
+	}
+	defer h.release()
+	var settings syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), hostTerminalSettings, uintptr(unsafe.Pointer(&settings)))
+	return errno == 0
+}
+
 // statusFlags returns the file status flags of the descriptor (F_GETFL).
 func (h *hostFile) statusFlags() (int, error) {
 	fd, err := h.hold()
@@ -768,10 +784,6 @@ func inheritedHostDescriptor(fd int) *wasiOpen {
 	if err != nil {
 		return nil
 	}
-	if op.isSocket {
-		// A socket is taken over through the host's network API.
-		return nil
-	}
 	syscall.CloseOnExec(fd)
 	return op
 }
@@ -856,6 +868,11 @@ func newHostOpen(fd int, path string) (*wasiOpen, error) {
 		op.isSocket = true
 		if typ, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_TYPE); err == nil {
 			op.dgram = typ == syscall.SOCK_DGRAM
+		}
+		if _, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ACCEPTCONN); err != nil && !op.dgram {
+			// Whether a stream socket that came from elsewhere listens the
+			// host does not say here: see hostListening.
+			op.sock = &wasiSocket{listening: true}
 		}
 		op.family = wasiSockFamilyIPv4
 		if sa, err := syscall.Getsockname(fd); err == nil {
@@ -1125,7 +1142,7 @@ func (op *wasiOpen) hostCopy(nfd int) *wasiOpen {
 	}
 	op.mu.Lock()
 	if op.sock != nil {
-		dup.sock = &wasiSocket{unixLocal: op.sock.unixLocal, unixPeer: op.sock.unixPeer}
+		dup.sock = &wasiSocket{listening: op.sock.listening, unixLocal: op.sock.unixLocal, unixPeer: op.sock.unixPeer}
 	}
 	op.mu.Unlock()
 	return dup
@@ -1460,9 +1477,10 @@ func (w *WasiStubs) readHost(h *hostFile, bufs [][]byte) (uint64, int32) {
 	return n, errno
 }
 
-// hostWriteChunk is how much is written at a time to a pipe or terminal in
-// blocking mode: what the host takes without waiting once it reports the
-// descriptor writable (PIPE_BUF).
+// hostWriteChunk is how much is written at a time to a pipe in blocking
+// mode: what the host takes without waiting once it reports the pipe
+// writable (PIPE_BUF). A write of more would wait inside the host's call
+// for the reader, where no signal reaches it.
 const hostWriteChunk = hostPipeBuf
 
 // sendNow writes or sends p to the descriptor without waiting, at address
@@ -1490,7 +1508,7 @@ func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, blocking bool) (n int,
 				return 0, true, nil
 			}
 			chunk := p
-			if len(chunk) > hostWriteChunk {
+			if h.kind == syscall.S_IFIFO && len(chunk) > hostWriteChunk {
 				chunk = chunk[:hostWriteChunk]
 			}
 			n, err = syscall.Write(fd, chunk)

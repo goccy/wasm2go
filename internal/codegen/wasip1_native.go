@@ -3495,6 +3495,12 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 		op.mu.Lock()
 		if h := op.host(); h != nil {
 			ftype = h.filetype(op.dgram)
+			if h.terminal() {
+				// What tells a terminal from another character device to
+				// a libc that has only this record to go by: it cannot be
+				// sought on.
+				rights &^= wasiRightFdSeek | wasiRightFdTell
+			}
 		} else if op.stdio != 0 {
 			ftype = 2 // a standard stream is a character device
 		} else if op.isDir {
@@ -3525,6 +3531,8 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 // The rights of fd_fdstat_get that tell what a descriptor is open for.
 const (
 	wasiRightFdRead    uint64 = 1 << 1
+	wasiRightFdSeek    uint64 = 1 << 2
+	wasiRightFdTell    uint64 = 1 << 5
 	wasiRightFdWrite   uint64 = 1 << 6
 	wasiRightFdReaddir uint64 = 1 << 14
 )
@@ -6028,9 +6036,27 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	if typ != wasiSockTypeStream && typ != wasiSockTypeDgram {
 		return -_wasiEPROTONOSUPPORT
 	}
+	return w.openSocket(wasiSockFamilyIPv4, typ)
+}
+
+// openSocket makes a socket of the family and type and returns its fd, or
+// a negative errno. A guest whose descriptors are the host process's gets
+// a socket of the host's at once; any other gets an entry that has a host
+// socket as soon as it needs one.
+func (w *WasiStubs) openSocket(family, typ int32) int32 {
+	w.mu.Lock()
+	host := w.hostDescriptorsLocked()
+	w.mu.Unlock()
+	if host {
+		fds, errno := w.openHostSockets(family, typ, false)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		return fds[0]
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{isSocket: true, dgram: typ == wasiSockTypeDgram, family: wasiSockFamilyIPv4})
+	return w.addFDLocked(&wasiOpen{isSocket: true, dgram: typ == wasiSockTypeDgram, family: family})
 }
 
 // The socket types of Sock_socket and of the SO_TYPE option.
@@ -6083,6 +6109,23 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 	}
 	if op.dgram {
 		return _wasiENOTSUP // EOPNOTSUPP: a datagram socket takes no connections
+	}
+	if h := op.host(); h != nil {
+		accepted, errno := w.acceptHost(op, h)
+		if errno != _wasiESUCCESS {
+			return errno
+		}
+		if flags&wasiFdflagNonblock != 0 {
+			_ = accepted.host().setFdflags(flags)
+		}
+		w.mu.Lock()
+		newFD, err := w.addHostFDLocked(accepted)
+		w.mu.Unlock()
+		if err != nil {
+			return mapOSError(errors.Join(err, accepted.f.Close()))
+		}
+		binary.LittleEndian.PutUint32(out, uint32(newFD))
+		return _wasiESUCCESS
 	}
 	l, listening := op.netListener()
 	if l == nil {
@@ -6159,7 +6202,7 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	if op != nil {
 		conn = op.netConn()
 	}
-	if conn == nil {
+	if conn == nil && op.host() == nil {
 		return _wasiENOTSOCK
 	}
 	iovBytes := uint64(uint32(riDataLen)) * 8
@@ -6189,6 +6232,18 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	// ri_flags has two bits, RECV_PEEK and RECV_WAITALL: wasiMsgPeek and
 	// wasiMsgWaitAll.
 	flags := riFlags & (wasiMsgPeek | wasiMsgWaitAll)
+	if h := op.host(); h != nil {
+		if !h.socket() {
+			return _wasiENOTSOCK
+		}
+		n, _, errno := w.receiveHost(h, bufs, flags)
+		if errno != _wasiESUCCESS {
+			return errno
+		}
+		binary.LittleEndian.PutUint16(flagsOut, 0)
+		binary.LittleEndian.PutUint32(lenOut, uint32(n))
+		return _wasiESUCCESS
+	}
 	if dg, isDatagram := conn.(datagramSocket); isDatagram && op.dgram {
 		n, _, errno := w.receiveDatagram(op, dg, bufs, flags)
 		if errno != _wasiESUCCESS {
@@ -6219,7 +6274,8 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	if op != nil {
 		conn = op.netConn()
 	}
-	if conn == nil {
+	h := op.host()
+	if conn == nil && h == nil {
 		if op != nil && op.isSocket {
 			return _wasiENOTCONN
 		}
@@ -6229,6 +6285,14 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	lenOut := w.memSlice(m, soDataLenPtr, 4)
 	if !ok || lenOut == nil {
 		return _wasiEFAULT
+	}
+	if h != nil {
+		if !h.socket() {
+			return _wasiENOTSOCK
+		}
+		n, errno := w.sendHost(op, h, bufs, nil, 0)
+		binary.LittleEndian.PutUint32(lenOut, uint32(n))
+		return errno
 	}
 	// WASI defines no flags for a send; siFlags is always 0.
 	n, errno := w.writeFd(op, conn, bufs)
@@ -6240,6 +6304,9 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
+	if h := op.host(); h != nil {
+		return w.shutdownHost(h, how)
+	}
 	var conn net.Conn
 	if op != nil {
 		conn = op.netConn()
@@ -9024,6 +9091,12 @@ func (w *WasiStubs) Sock_listen(m *Module, fd, backlog int32) int32 {
 	if op.dgram {
 		return -_wasiENOTSUP // EOPNOTSUPP
 	}
+	if h := op.host(); h != nil {
+		if !w.checkNet("listen") {
+			return -_wasiEACCES
+		}
+		return -w.listenHost(op, h, backlog)
+	}
 	if op.netConn() != nil {
 		return -_wasiEINVAL
 	}
@@ -9101,6 +9174,13 @@ func (w *WasiStubs) Sock_getsockname(m *Module, fd, outPtr int32) int32 {
 	if op == nil {
 		return -_wasiEBADF
 	}
+	if h := op.host(); h != nil {
+		addr, errno := op.hostSocketName(h, false)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		return w.writeSockName(m, addr, outPtr)
+	}
 	if conn := op.netConn(); conn != nil {
 		return w.writeSockName(m, conn.LocalAddr(), outPtr)
 	}
@@ -9123,6 +9203,13 @@ func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
+	}
+	if h := op.host(); h != nil {
+		addr, errno := op.hostSocketName(h, true)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		return w.writeSockName(m, addr, outPtr)
 	}
 	conn := op.netConn()
 	if conn == nil {
@@ -9215,6 +9302,14 @@ func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, o
 	if (which != wasiSockTimeoutReceive && which != wasiSockTimeoutSend) || (set != 0 && nanos < 0) {
 		return -_wasiEINVAL
 	}
+	if h := op.host(); h != nil {
+		old, errno := w.timeoutHost(h, which, set != 0, nanos)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		binary.LittleEndian.PutUint64(out, uint64(old))
+		return _wasiESUCCESS
+	}
 	op.mu.Lock()
 	sock := op.socketLocked()
 	timeout := &sock.receiveTimeout
@@ -9246,6 +9341,9 @@ func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 	}
 	if !op.isSocket && op.netConn() == nil {
 		return -_wasiENOTSOCK
+	}
+	if h := op.host(); h != nil {
+		return -w.setoptHost(op, h, option, value)
 	}
 	var err error
 	tcp, _ := op.netConn().(*net.TCPConn)
@@ -9317,6 +9415,14 @@ func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
 	if !op.isSocket && op.netConn() == nil {
 		return -_wasiENOTSOCK
 	}
+	if h := op.host(); h != nil {
+		value, errno := w.getoptHost(op, h, option)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		binary.LittleEndian.PutUint32(out, uint32(value))
+		return _wasiESUCCESS
+	}
 	var value int32
 	switch option {
 	case wasiSockOptError:
@@ -9361,17 +9467,41 @@ func (w *WasiStubs) Sock_pair(m *Module, fdsOutPtr int32) int32 {
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	a, b, err := socketPair(false)
-	if err != nil {
-		return -mapNetError(err)
+	afd, bfd, errno := w.openSocketPair(false)
+	if errno != _wasiESUCCESS {
+		return -errno
 	}
-	w.mu.Lock()
-	afd := w.addFDLocked(&wasiOpen{conn: a, isSocket: true, family: wasiSockFamilyUnix})
-	bfd := w.addFDLocked(&wasiOpen{conn: b, isSocket: true, family: wasiSockFamilyUnix})
-	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out[0:], uint32(afd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(bfd))
 	return _wasiESUCCESS
+}
+
+// openSocketPair makes a pair of connected Unix-domain sockets, of stream
+// or of datagram sockets, and returns their fds, or an errno.
+func (w *WasiStubs) openSocketPair(dgram bool) (afd, bfd, errno int32) {
+	w.mu.Lock()
+	host := w.hostDescriptorsLocked()
+	w.mu.Unlock()
+	if host {
+		typ := wasiSockTypeStream
+		if dgram {
+			typ = wasiSockTypeDgram
+		}
+		fds, errno := w.openHostSockets(wasiSockFamilyUnix, typ, true)
+		if errno != _wasiESUCCESS {
+			return -1, -1, errno
+		}
+		return fds[0], fds[1], _wasiESUCCESS
+	}
+	a, b, err := socketPair(dgram)
+	if err != nil {
+		return -1, -1, mapNetError(err)
+	}
+	w.mu.Lock()
+	afd = w.addFDLocked(&wasiOpen{conn: a, isSocket: true, dgram: dgram, family: wasiSockFamilyUnix})
+	bfd = w.addFDLocked(&wasiOpen{conn: b, isSocket: true, dgram: dgram, family: wasiSockFamilyUnix})
+	w.mu.Unlock()
+	return afd, bfd, _wasiESUCCESS
 }
 
 // ----- datagram sockets -------------------------------------------------------
@@ -9731,17 +9861,19 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 	if !op.isSocket && op.netConn() == nil {
 		return -_wasiENOTSOCK
 	}
+	h := op.host()
 	if !op.dgram || hasAddr == 0 {
+		if h != nil {
+			n, errno := w.sendHost(op, h, [][]byte{buf}, nil, flags)
+			binary.LittleEndian.PutUint32(out, uint32(n))
+			return -errno
+		}
 		conn := op.netConn()
 		if conn == nil || (op.dgram && conn.RemoteAddr() == nil) {
 			return -_wasiENOTCONN
 		}
 		n, errno := w.sendFd(op, conn, [][]byte{buf}, flags)
 		binary.LittleEndian.PutUint32(out, uint32(n))
-		return -errno
-	}
-	conn, errno := op.datagramConn()
-	if errno != _wasiESUCCESS {
 		return -errno
 	}
 	ip := socketIPv4(ipBE)
@@ -9751,6 +9883,15 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 	w.mu.Unlock()
 	if hook != nil && !hook("udp", host, ip, p) {
 		return -_wasiEACCES
+	}
+	if h != nil {
+		n, errno := w.sendHost(op, h, [][]byte{buf}, ipv4SockAddr(ipBE, port).hostSockaddr(""), flags)
+		binary.LittleEndian.PutUint32(out, uint32(n))
+		return -errno
+	}
+	conn, errno := op.datagramConn()
+	if errno != _wasiESUCCESS {
+		return -errno
 	}
 	n, err := sendDatagram(op, conn, buf, &net.UDPAddr{IP: net.ParseIP(ip), Port: p})
 	if err != nil {
@@ -9790,6 +9931,19 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 	}
 	for i := range name {
 		name[i] = 0
+	}
+	if h := op.host(); h != nil {
+		n, from, errno := w.receiveFromHost(op, h, buf, flags)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		binary.LittleEndian.PutUint32(out, uint32(n))
+		if from != nil {
+			if rc := w.writeSockName(m, from, namePtr); rc != -_wasiENOTSUP {
+				return rc
+			}
+		}
+		return _wasiESUCCESS
 	}
 	if op.dgram {
 		conn, errno := op.datagramConn()
@@ -10238,9 +10392,7 @@ func (w *WasiStubs) Sock_open(m *Module, family, typ int32) int32 {
 	if typ != wasiSockTypeStream && typ != wasiSockTypeDgram {
 		return -_wasiEPROTONOSUPPORT
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{isSocket: true, dgram: typ == wasiSockTypeDgram, family: family})
+	return w.openSocket(family, typ)
 }
 
 // listenIP opens the listening socket behind a bound guest socket of an IP
@@ -10281,6 +10433,20 @@ func (op *wasiOpen) unspecifiedAddr() wasiSockAddr {
 func (w *WasiStubs) bindSocket(op *wasiOpen, a wasiSockAddr, path string) int32 {
 	if a.family != op.family {
 		return _wasiEAFNOSUPPORT
+	}
+	if h := op.host(); h != nil {
+		// Having a local address is being a server on the host's network.
+		if !w.checkNet("listen") {
+			return _wasiEACCES
+		}
+		host := ""
+		if a.family == wasiSockFamilyUnix {
+			var errno int32
+			if host, errno = w.unixHostPath(a.name, path); errno != _wasiESUCCESS {
+				return errno
+			}
+		}
+		return w.bindHost(op, h, a, host)
 	}
 	if l, _ := op.netListener(); l != nil || op.netConn() != nil {
 		return _wasiEINVAL
@@ -10536,7 +10702,9 @@ func (w *WasiStubs) connectSocket(op *wasiOpen, a wasiSockAddr, path string) int
 			return errno
 		}
 		peer := &net.UnixAddr{Name: host, Net: network}
-		if op.dgram {
+		if h := op.host(); h != nil {
+			errno = w.connectHost(op, h, a.hostSockaddr(host))
+		} else if op.dgram {
 			errno = w.connectDatagram(op, peer)
 		} else {
 			var local net.Addr
@@ -10564,10 +10732,16 @@ func (w *WasiStubs) connectSocket(op *wasiOpen, a wasiSockAddr, path string) int
 		if hook != nil && !hook("udp", host, ip, a.port) {
 			return _wasiEACCES
 		}
+		if h := op.host(); h != nil {
+			return w.connectHost(op, h, a.hostSockaddr(""))
+		}
 		return w.connectDatagram(op, &net.UDPAddr{IP: a.ip, Port: a.port, Zone: a.zone()})
 	}
 	if hook != nil && !hook("tcp", host, ip, a.port) {
 		return _wasiEACCES
+	}
+	if h := op.host(); h != nil {
+		return w.connectHost(op, h, a.hostSockaddr(""))
 	}
 	network := "tcp4"
 	if a.family == wasiSockFamilyIPv6 && a.ip.To4() == nil {
@@ -10623,6 +10797,20 @@ func (w *WasiStubs) Sock_name(m *Module, fd, peer, addrPtr int32) int32 {
 		local, remote = op.sock.unixLocal, op.sock.unixPeer
 	}
 	op.mu.Unlock()
+	if h := op.host(); h != nil {
+		addr, errno := op.hostSocketName(h, peer != 0)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		name := local
+		if peer != 0 {
+			name = remote
+		}
+		if family == wasiSockFamilyUnix && name == "" {
+			name = w.unixGuestName(addr)
+		}
+		return w.writeSockAddr(m, addrPtr, family, addr, name)
+	}
 	conn := op.netConn()
 	if peer != 0 {
 		if conn == nil || conn.RemoteAddr() == nil {
@@ -10669,7 +10857,13 @@ func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrP
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
+	h := op.host()
 	if !op.dgram || addrPtr == 0 {
+		if h != nil {
+			n, errno := w.sendHost(op, h, [][]byte{buf}, nil, flags)
+			binary.LittleEndian.PutUint32(out, uint32(n))
+			return -errno
+		}
 		conn := op.netConn()
 		if conn == nil || (op.dgram && conn.RemoteAddr() == nil) {
 			return -_wasiENOTCONN
@@ -10689,9 +10883,11 @@ func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrP
 	if a.family != op.family {
 		return -_wasiEAFNOSUPPORT
 	}
-	conn, errno := op.datagramConn()
-	if errno != _wasiESUCCESS {
-		return -errno
+	var conn datagramSocket
+	if h == nil {
+		if conn, errno = op.datagramConn(); errno != _wasiESUCCESS {
+			return -errno
+		}
 	}
 	w.mu.Lock()
 	hook := w.dialHook
@@ -10705,6 +10901,11 @@ func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrP
 		if errno != _wasiESUCCESS {
 			return -errno
 		}
+		if h != nil {
+			n, errno := w.sendHost(op, h, [][]byte{buf}, a.hostSockaddr(host), flags)
+			binary.LittleEndian.PutUint32(out, uint32(n))
+			return -errno
+		}
 		to = &net.UnixAddr{Name: host, Net: "unixgram"}
 	} else {
 		ip := a.ipText()
@@ -10713,6 +10914,11 @@ func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrP
 		w.mu.Unlock()
 		if hook != nil && !hook("udp", host, ip, a.port) {
 			return -_wasiEACCES
+		}
+		if h != nil {
+			n, errno := w.sendHost(op, h, [][]byte{buf}, a.hostSockaddr(""), flags)
+			binary.LittleEndian.PutUint32(out, uint32(n))
+			return -errno
 		}
 		to = &net.UDPAddr{IP: a.ip, Port: a.port, Zone: a.zone()}
 	}
@@ -10759,7 +10965,13 @@ func (w *WasiStubs) Sock_recvfrom_addr(m *Module, fd, bufPtr, bufLen, flags, add
 	}
 	family := op.socketFamily()
 	var from net.Addr
-	if op.dgram {
+	if h := op.host(); h != nil {
+		var n uint64
+		if n, from, errno = w.receiveFromHost(op, h, buf, flags); errno != _wasiESUCCESS {
+			return -errno
+		}
+		binary.LittleEndian.PutUint32(out, uint32(n))
+	} else if op.dgram {
 		conn, errno := op.datagramConn()
 		if errno != _wasiESUCCESS {
 			return -errno
@@ -10816,15 +11028,10 @@ func (w *WasiStubs) Sock_socketpair(m *Module, family, typ, fdsOutPtr int32) int
 	if typ != wasiSockTypeStream && typ != wasiSockTypeDgram {
 		return -_wasiEPROTONOSUPPORT
 	}
-	dgram := typ == wasiSockTypeDgram
-	a, b, err := socketPair(dgram)
-	if err != nil {
-		return -mapNetError(err)
+	afd, bfd, errno := w.openSocketPair(typ == wasiSockTypeDgram)
+	if errno != _wasiESUCCESS {
+		return -errno
 	}
-	w.mu.Lock()
-	afd := w.addFDLocked(&wasiOpen{conn: a, isSocket: true, dgram: dgram, family: wasiSockFamilyUnix})
-	bfd := w.addFDLocked(&wasiOpen{conn: b, isSocket: true, dgram: dgram, family: wasiSockFamilyUnix})
-	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out[0:], uint32(afd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(bfd))
 	return _wasiESUCCESS
@@ -11167,6 +11374,8 @@ var (
 	wasip1NativeOtherRaw []byte
 	//go:embed wasip1_native_hostfd.go
 	wasip1NativeHostFDRaw []byte
+	//go:embed wasip1_native_hostsock.go
+	wasip1NativeHostSockRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_linux_headers.go
@@ -11188,11 +11397,12 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 	}
 	out := map[string][]byte{}
 	for name, raw := range map[string][]byte{
-		"wasip1_native_posix.go":  wasip1NativePosixRaw,
-		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
-		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
-		"wasip1_native_other.go":  wasip1NativeOtherRaw,
-		"wasip1_native_hostfd.go": wasip1NativeHostFDRaw,
+		"wasip1_native_posix.go":    wasip1NativePosixRaw,
+		"wasip1_native_linux.go":    wasip1NativeLinuxRaw,
+		"wasip1_native_darwin.go":   wasip1NativeDarwinRaw,
+		"wasip1_native_other.go":    wasip1NativeOtherRaw,
+		"wasip1_native_hostfd.go":   wasip1NativeHostFDRaw,
+		"wasip1_native_hostsock.go": wasip1NativeHostSockRaw,
 
 		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,

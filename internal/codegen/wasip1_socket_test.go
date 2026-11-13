@@ -397,7 +397,13 @@ func TestSocket_Options(t *testing.T) {
 		if rc := w.Sock_setopt(m, fd, option, value); rc != _wasiESUCCESS {
 			t.Errorf("set option %d rc=%d", option, rc)
 		}
-		if v, rc := get(option); rc != _wasiESUCCESS || v != value {
+		v, rc := get(option)
+		if hostSuite && (option == wasiSockOptRcvBuf || option == wasiSockOptSndBuf) && v > value {
+			// The size of a buffer of the host's socket is the host's to
+			// round up (Linux reports twice what was asked for).
+			v = value
+		}
+		if rc != _wasiESUCCESS || v != value {
 			t.Errorf("option %d reads back %d rc=%d, want %d", option, v, rc, value)
 		}
 	}

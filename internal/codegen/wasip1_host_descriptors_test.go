@@ -592,3 +592,83 @@ func TestHostDescriptors_StandardDescriptorsOfTheProcessAreNotTakenUnasked(t *te
 		t.Fatalf("the file holds %q", got)
 	}
 }
+
+// A socket is the host's socket from the moment it is made: the number is
+// the host's, its mode and its options are the kernel's, and where hosts
+// differ the guest gets the answer of the host it runs on.
+func TestHostDescriptors_SocketsAnswerAsTheHost(t *testing.T) {
+	w, m := newHostGuest(t, t.TempDir())
+	listener, port := newListener(t, w, m)
+	host := guestIsHost(t, w, listener)
+	if typ, err := syscall.GetsockoptInt(host, syscall.SOL_SOCKET, syscall.SO_TYPE); err != nil || typ != syscall.SOCK_STREAM {
+		t.Fatalf("descriptor %d of the host is not the stream socket (%d, %v)", host, typ, err)
+	}
+	if sa, err := syscall.Getsockname(host); err != nil || sa.(*syscall.SockaddrInet4).Port != int(port) {
+		t.Fatalf("the host's socket is bound to %v (%v), the guest's to port %d", sa, err, port)
+	}
+	client := dialLoopback(t, w, m, port)
+	server, rc := acceptOn(w, m, listener)
+	if rc != _wasiESUCCESS {
+		t.Fatalf("Sock_accept rc=%d", rc)
+	}
+	for _, fd := range []int32{client, server} {
+		if hostStatusFlags(t, guestIsHost(t, w, fd))&syscall.O_NONBLOCK != 0 {
+			t.Fatalf("socket %d is in non-blocking mode", fd)
+		}
+	}
+	// Code outside the guest reads what the guest sent, through the number.
+	if rc := sockSend(w, m, client, "to native code"); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_send rc=%d", rc)
+	}
+	buf := make([]byte, 32)
+	if n, err := syscall.Read(int(server), buf); err != nil || string(buf[:n]) != "to native code" {
+		t.Fatalf("read on the host's descriptor = %q, %v", buf[:n], err)
+	}
+	// And the guest what that code sends.
+	if _, err := syscall.Write(int(server), []byte("from native code")); err != nil {
+		t.Fatal(err)
+	}
+	if got, rc := sockRecv(w, m, client); rc != _wasiESUCCESS || got != "from native code" {
+		t.Fatalf("Sock_recv = %q rc=%d", got, rc)
+	}
+	// An option the guest sets is the socket's.
+	if rc := w.Sock_setopt(m, client, wasiSockOptKeepAlive, 1); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_setopt rc=%d", rc)
+	}
+	if v, err := syscall.GetsockoptInt(int(client), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE); err != nil || v == 0 {
+		t.Fatalf("SO_KEEPALIVE of the host's socket = %d, %v", v, err)
+	}
+	// A timeout the guest sets is the socket's, and ends its own wait.
+	if rc := w.Sock_timeout(m, client, wasiSockTimeoutReceive, 1, int64(60*time.Millisecond), sockValueOff); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_timeout rc=%d", rc)
+	}
+	if got := hostSocketTimeout(int(client), syscall.SO_RCVTIMEO); got < 50*time.Millisecond || got > 100*time.Millisecond {
+		t.Fatalf("SO_RCVTIMEO of the host's socket = %v", got)
+	}
+	start := time.Now()
+	if _, rc := sockRecv(w, m, client); rc != _wasiEAGAIN {
+		t.Fatalf("receive with a timeout rc=%d, want EAGAIN", rc)
+	}
+	if d := time.Since(start); d < 40*time.Millisecond || d > 2*time.Second {
+		t.Fatalf("the receive gave up after %v", d)
+	}
+	// A datagram without a destination fails with the host's own error.
+	lonely := newDatagramSocket(t, w, m)
+	want := mapOSError(syscall.Sendto(guestIsHost(t, w, lonely), []byte("x"), 0, nil))
+	if rc := sockSend(w, m, lonely, "x"); rc != want || rc == _wasiESUCCESS {
+		t.Fatalf("send on an unconnected datagram socket rc=%d, the host says %d", rc, want)
+	}
+	// What poll says of a socket that is neither connected nor listening
+	// is the host's answer too.
+	fresh := w.Sock_socket(m, 2, wasiSockTypeStream)
+	ask := [1]hostPoll{{fd: int32(guestIsHost(t, w, fresh)), events: hostPollOut}}
+	hostPollUntil(ask[:], time.Now())
+	if ok, rc := pollWritable(w, m, fresh, 0); rc != _wasiESUCCESS || ok != hostPollReady(false, ask[0].revents) {
+		t.Fatalf("an unconnected socket polled writable=%v rc=%d, the host says %#x", ok, rc, ask[0].revents)
+	}
+	// Closing the guest's descriptor closes the host's socket.
+	closeTestFd(t, w, m, server)
+	if _, err := syscall.Getsockname(int(server)); err != syscall.EBADF {
+		t.Fatalf("the host's socket after the guest closed it: %v", err)
+	}
+}

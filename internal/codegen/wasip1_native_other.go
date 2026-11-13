@@ -231,6 +231,7 @@ type hostFile struct {
 }
 
 func (h *hostFile) waits() bool               { return false }
+func (h *hostFile) terminal() bool            { return false }
 func (h *hostFile) nonblocking() bool         { return false }
 func (h *hostFile) fdflags() int32            { return 0 }
 func (h *hostFile) setFdflags(int32) error    { return errors.ErrUnsupported }
@@ -291,3 +292,44 @@ func (o osFS) OpenDescriptor(name string, flag int, perm os.FileMode) (File, err
 func hostPipe() (r, wr *wasiOpen, err error) { return nil, nil, errors.ErrUnsupported }
 
 func inheritedHostDescriptor(fd int) *wasiOpen { return nil }
+
+func (h *hostFile) socket() bool { return false }
+
+func (w *WasiStubs) openHostSockets(family, typ int32, pair bool) ([]int32, int32) {
+	return nil, _wasiENOSYS
+}
+func (w *WasiStubs) bindHost(op *wasiOpen, h *hostFile, a wasiSockAddr, unixPath string) int32 {
+	return _wasiENOSYS
+}
+func (w *WasiStubs) listenHost(op *wasiOpen, h *hostFile, backlog int32) int32 {
+	return _wasiENOSYS
+}
+func (w *WasiStubs) acceptHost(op *wasiOpen, h *hostFile) (*wasiOpen, int32) {
+	return nil, _wasiENOSYS
+}
+func (w *WasiStubs) connectHost(op *wasiOpen, h *hostFile, sa syscall.Sockaddr) int32 {
+	return _wasiENOSYS
+}
+func (w *WasiStubs) shutdownHost(h *hostFile, how int32) int32 { return _wasiENOSYS }
+func (op *wasiOpen) hostSocketName(h *hostFile, peer bool) (net.Addr, int32) {
+	return nil, _wasiENOSYS
+}
+func (w *WasiStubs) timeoutHost(h *hostFile, which int32, set bool, nanos int64) (time.Duration, int32) {
+	return 0, _wasiENOSYS
+}
+func (w *WasiStubs) setoptHost(op *wasiOpen, h *hostFile, option, value int32) int32 {
+	return _wasiENOSYS
+}
+func (w *WasiStubs) getoptHost(op *wasiOpen, h *hostFile, option int32) (value, errno int32) {
+	return 0, _wasiENOSYS
+}
+func (w *WasiStubs) receiveHost(h *hostFile, bufs [][]byte, flags int32) (uint64, syscall.Sockaddr, int32) {
+	return 0, nil, _wasiENOSYS
+}
+func (w *WasiStubs) receiveFromHost(op *wasiOpen, h *hostFile, buf []byte, flags int32) (uint64, net.Addr, int32) {
+	return 0, nil, _wasiENOSYS
+}
+func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscall.Sockaddr, flags int32) (uint64, int32) {
+	return 0, _wasiENOSYS
+}
+func (a wasiSockAddr) hostSockaddr(unixPath string) syscall.Sockaddr { return nil }

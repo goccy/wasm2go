@@ -430,7 +430,13 @@ func TestSocketFamily_NonBlockingConnect(t *testing.T) {
 	if rc := w.Sock_getopt(m, client, wasiSockOptError, sockValueOff); rc != _wasiESUCCESS || readU32(m.memory, int(sockValueOff)) != 0 {
 		t.Fatalf("SO_ERROR after a connect that succeeded = %d rc=%d", readU32(m.memory, int(sockValueOff)), rc)
 	}
-	if rc := w.Sock_connect_addr(m, client, addrOff, 0, 0); rc != -_wasiEISCONN {
+	rc = w.Sock_connect_addr(m, client, addrOff, 0, 0)
+	if hostSuite && rc == _wasiESUCCESS {
+		// The host's socket may report the attempt's success to the first
+		// connect after it (Linux), and the connection to the next.
+		rc = w.Sock_connect_addr(m, client, addrOff, 0, 0)
+	}
+	if rc != -_wasiEISCONN {
 		t.Fatalf("connect of a connected socket rc=%d, want -EISCONN", rc)
 	}
 	if got := nameOf(t, w, m, client, 1); got.port != uint32(port) {
