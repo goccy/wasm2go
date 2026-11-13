@@ -1421,6 +1421,7 @@ func TestWasip1EmitPlatformCompanions(t *testing.T) {
 		"wasip1_native_linux.go":  "linux",
 		"wasip1_native_darwin.go": "darwin",
 		"wasip1_native_other.go":  "!darwin && !linux",
+		"wasip1_native_hostfd.go": "darwin || linux",
 
 		"wasip1_hostnumbers_linux.go":           "linux",
 		"wasip1_hostnumbers_linux_headers.go":   "linux && !(mips || mipsle || mips64 || mips64le)",

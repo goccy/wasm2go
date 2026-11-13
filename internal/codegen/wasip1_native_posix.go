@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"sync"
 	"syscall"
@@ -441,24 +440,16 @@ func descriptorFlags(fd int, get int) (int, error) {
 // is not, and every descriptor this process opens itself is — the Go
 // runtime and library see to that.
 func inheritedDescriptors() []int {
-	entries, err := os.ReadDir("/dev/fd")
-	if err != nil {
-		return nil
-	}
 	var fds []int
-	for _, entry := range entries {
-		fd, err := strconv.Atoi(entry.Name())
-		if err != nil || fd <= 2 {
+	for _, fd := range openDescriptors() {
+		if fd <= 2 {
 			continue
 		}
-		// The descriptor the directory was read through is listed too: it
-		// is closed by now, or close-on-exec.
 		if flags, err := descriptorFlags(fd, syscall.F_GETFD); err != nil || flags&syscall.FD_CLOEXEC != 0 {
 			continue
 		}
 		fds = append(fds, fd)
 	}
-	sort.Ints(fds)
 	return fds
 }
 

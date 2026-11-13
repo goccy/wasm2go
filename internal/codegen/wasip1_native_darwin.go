@@ -135,3 +135,56 @@ func defaultSignalAction(sig syscall.Signal) error {
 	}
 	return nil
 }
+
+// statModTime returns the modification time of a stat result.
+func statModTime(st *syscall.Stat_t) time.Time { return time.Unix(st.Mtimespec.Unix()) }
+
+// hostPipeBuf is PIPE_BUF: what a pipe that reports itself writable takes
+// without waiting.
+const hostPipeBuf = 512
+
+// hostFIONREAD is the ioctl request that asks how many bytes can be read.
+const hostFIONREAD = 0x4004667f
+
+// hostSendFlags are the flags of every send the runtime makes for the
+// guest: it does not wait in the call. (A broken connection raises SIGPIPE
+// in the host process as well as the error; the Go runtime ignores it.)
+const hostSendFlags = syscall.MSG_DONTWAIT
+
+// hostPollCall is poll(2): it waits no longer than timeout, and without
+// limit when timeout is negative.
+func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
+	ms := -1
+	if timeout >= 0 {
+		ms = int((timeout + time.Millisecond - 1) / time.Millisecond)
+	}
+	var first *hostPoll
+	if len(fds) > 0 {
+		first = &fds[0]
+	}
+	n, _, errno := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)), uintptr(ms))
+	return int(n), errno
+}
+
+// hostDup2 is dup2(2) for two different descriptors.
+func hostDup2(from, to int) error {
+	for {
+		err := syscall.Dup2(from, to)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
+}
+
+// hostAccept is accept(2) with the new descriptor close-on-exec. The call
+// can wait — the connection that was there can be gone again — so it is
+// made without the lock process creation takes, and the flag is set after
+// it.
+func hostAccept(fd int) (int, error) {
+	nfd, _, err := syscall.Accept(fd)
+	if err != nil {
+		return -1, err
+	}
+	syscall.CloseOnExec(nfd)
+	return nfd, nil
+}

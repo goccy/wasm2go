@@ -1295,6 +1295,9 @@ func (op *wasiOpen) plainFile() bool {
 	if op.f == nil || op.stdio != 0 {
 		return false
 	}
+	if h := op.host(); h != nil {
+		return !h.waits()
+	}
 	file, isHostFile := op.f.(*os.File)
 	return !isHostFile || !op.fileIsStream(file)
 }
@@ -1438,6 +1441,19 @@ type WasiStubs struct {
 	cloexec map[int32]bool
 	// sig is the signal state; see wasiSignals. Guarded by mu.
 	sig wasiSignals
+	// waker is what ends the wait of a call of the guest's that waits for
+	// descriptors of the host process, when a signal is posted (see
+	// awaitHost): nothing else reaches a wait inside the host's poll. Made
+	// on first use, nil until then and on a host without such waits.
+	// Guarded by mu.
+	waker *hostWaker
+	// standard is the standard descriptors of the host process as they
+	// were before the guest had them, for an instance that has them as its
+	// own (see restoreStandardLocked): what the guest does to descriptors
+	// 0, 1 and 2 it does to the process's, and nothing else remembers what
+	// they were. nil for an instance that took none; a forked instance has
+	// its parent's. Guarded by mu.
+	standard *hostStandard
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
@@ -1727,6 +1743,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		forked:      true,
 		parent:      w,
 		pgid:        w.groupLocked(),
+		standard:    w.standard,
 	}
 	if len(w.cloexec) > 0 {
 		child.cloexec = make(map[int32]bool, len(w.cloexec))
@@ -1783,9 +1800,11 @@ func (w *WasiStubs) CloseAll() error {
 	w.detachSignalsLocked()
 	var err error
 	for fd, op := range w.fdsLocked() {
-		err = errors.Join(err, closeWasiOpen(op))
+		err = errors.Join(err, endWasiOpen(op))
 		delete(w.fdsLocked(), fd)
 	}
+	w.closeHostWakerLocked()
+	w.restoreStandardLocked()
 	// Nobody is left to wait for this instance's processes: the finished
 	// ones are gone, and the running ones go when they finish (finishProc
 	// finds them missing from the table).
@@ -1856,7 +1875,7 @@ func (w *WasiStubs) CloseDescriptors() error {
 	defer w.mu.Unlock()
 	var err error
 	for fd, op := range w.fdsLocked() {
-		err = errors.Join(err, closeWasiOpen(op))
+		err = errors.Join(err, endWasiOpen(op))
 		delete(w.fdsLocked(), fd)
 	}
 	return err
@@ -1888,8 +1907,23 @@ func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
 }
 
 // wasiPreopenFD is the fd of the preopened root directory. It is not a
-// table entry and is never handed out for a new descriptor.
+// table entry and is never handed out for a new descriptor — except to a
+// guest whose descriptors are the host process's, for which 3 is a number
+// like any other (see rootNumberLocked).
 const wasiPreopenFD int32 = 3
+
+// wasiRootFD is a second number of the preopened root directory, which a
+// guest's libc can resolve its paths against instead of wasiPreopenFD: one
+// that no descriptor ever has, so that the root directory is in nobody's
+// way. A libc finds the preopened directory under wasiPreopenFD (that is
+// where WASI has it start looking); one that knows this number names the
+// root by it from then on, in the path calls and where it asks what the
+// directory may be opened for (fd_fdstat_get), and leaves 3 alone.
+const wasiRootFD int32 = 0x7ffffff0
+
+// rootDirFD reports whether fd, the directory descriptor of a path call,
+// names the preopened root directory.
+func rootDirFD(fd int32) bool { return fd == wasiPreopenFD || fd == wasiRootFD }
 
 // fdsLocked returns the fd table. On first use it sets the table up with
 // fds 0, 1 and 2 referring to the instance's stdin, stdout and stderr; from
@@ -1897,6 +1931,15 @@ const wasiPreopenFD int32 = 3
 // Caller holds w.mu.
 func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 	if w.fdTable == nil {
+		if w.hostDescriptorsLocked() {
+			// The standard descriptors of the host process, where the
+			// instance's streams are those.
+			w.fdTable = map[int32]*wasiOpen{}
+			for stdio := int8(1); stdio <= 3; stdio++ {
+				w.fdTable[int32(stdio)-1] = w.hostStandardLocked(stdio)
+			}
+			return w.fdTable
+		}
 		w.fdTable = map[int32]*wasiOpen{
 			0: {stdio: 1},
 			1: {stdio: 2},
@@ -1906,17 +1949,41 @@ func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 	return w.fdTable
 }
 
+// openLocked returns the entry the guest knows as descriptor fd, or nil
+// when it has none. Caller holds w.mu.
+func (w *WasiStubs) openLocked(fd int32) *wasiOpen {
+	return w.fdsLocked()[fd]
+}
+
+// rootNumberLocked reports whether fd, a number the instance has no entry
+// for, is the preopened root directory to a call that asks about the
+// descriptor itself (fd_fdstat_get, fd_filestat_get). wasiRootFD always is.
+// wasiPreopenFD is for a guest with descriptors of its own; for a guest
+// whose descriptors are the host process's, 3 is a number like any other —
+// free for the host to give out, and not open until it does. Caller holds
+// w.mu.
+func (w *WasiStubs) rootNumberLocked(fd int32) bool {
+	return fd == wasiRootFD || (fd == wasiPreopenFD && !w.hostDescriptorsLocked())
+}
+
 // addFDLocked stores op under the lowest fd number not in use, as POSIX
 // requires of open, pipe, dup, socket and accept, and returns that number.
-// Caller holds w.mu.
+// In an instance whose descriptors are the host process's, a number the
+// host has in use is not free either: the entry is not a descriptor of the
+// host (those come in through addHostFDLocked, under their own numbers) and
+// must not be mistaken for one. Caller holds w.mu.
 func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
 	fds := w.fdsLocked()
 	fd := int32(0)
-	for {
-		if _, used := fds[fd]; !used && fd != wasiPreopenFD {
-			break
+	if w.hostDescriptorsLocked() {
+		fd = w.freeNumberLocked()
+	} else {
+		for {
+			if _, used := fds[fd]; !used && fd != wasiPreopenFD {
+				break
+			}
+			fd++
 		}
-		fd++
 	}
 	fds[fd] = op
 	delete(w.cloexec, fd)
@@ -2144,10 +2211,30 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		return -_wasiEINTR
 	}
 	hook := w.execHook
+	inherited, borrowed := w.inheritedFilesLocked()
 	cin := w.childReaderLocked(stdinFd)
 	cout := w.childWriterLocked(stdoutFd, w.stdout)
 	cerr := w.childWriterLocked(stderrFd, w.stderr)
-	inherited, borrowed := w.inheritedFilesLocked()
+	// A descriptor of the host process is handed over as it is, whatever
+	// it is open for: as a duplicate, closed once the command has its own.
+	if file, host := w.hostChildFileLocked(stdinFd); host {
+		cin = nil
+		if file != nil {
+			cin, borrowed = file, append(borrowed, file)
+		}
+	}
+	if file, host := w.hostChildFileLocked(stdoutFd); host {
+		cout = nil
+		if file != nil {
+			cout, borrowed = file, append(borrowed, file)
+		}
+	}
+	if file, host := w.hostChildFileLocked(stderrFd); host {
+		cerr = nil
+		if file != nil {
+			cerr, borrowed = file, append(borrowed, file)
+		}
+	}
 	hostPID := w.hostProcess
 	w.mu.Unlock()
 	// The duplicates made for the child are this process's to close, once
@@ -2283,6 +2370,10 @@ func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
 		}
 		var file *os.File
 		switch {
+		case op.host() != nil:
+			if file = op.host().childFile(); file != nil {
+				borrowed = append(borrowed, file)
+			}
 		case op.stdio != 0:
 			stream := [...]any{w.stdin, w.stdout, w.stderr}[op.stdio-1]
 			file, _ = stream.(*os.File)
@@ -2327,7 +2418,7 @@ func (w *WasiStubs) Fd_cloexec(m *Module, fd, set, value, oldPtr int32) int32 {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.fdsLocked()[fd] == nil {
+	if w.openLocked(fd) == nil {
 		return -_wasiEBADF
 	}
 	old := uint32(0)
@@ -2362,6 +2453,21 @@ func (w *WasiStubs) childReaderLocked(fd int32) io.Reader {
 	return src
 }
 
+// hostChildFileLocked returns what a command gets for the guest's fd when
+// that is a descriptor of the host process (host is true): a duplicate of
+// it for package os/exec to hand over, which the caller closes, or nil when
+// the descriptor is gone. Caller holds w.mu.
+func (w *WasiStubs) hostChildFileLocked(fd int32) (file *os.File, host bool) {
+	if fd < 0 {
+		return nil, false
+	}
+	h := w.openLocked(fd).host()
+	if h == nil {
+		return nil, false
+	}
+	return h.childFile(), true
+}
+
 // childWriterLocked is the stdout/stderr counterpart of childReaderLocked;
 // inherited is the instance stream a negative fd asks for.
 func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
@@ -2383,14 +2489,34 @@ func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	r, wr, err := os.Pipe()
-	if err != nil {
-		return -mapOSError(err)
-	}
 	w.mu.Lock()
-	rfd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
-	wfd := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
+	host := w.hostDescriptorsLocked()
 	w.mu.Unlock()
+	var rfd, wfd int32
+	if host {
+		rop, wop, err := hostPipe()
+		if err != nil {
+			return -mapOSError(err)
+		}
+		w.mu.Lock()
+		rfd, err = w.addHostFDLocked(rop)
+		if err == nil {
+			wfd, err = w.addHostFDLocked(wop)
+		}
+		w.mu.Unlock()
+		if err != nil {
+			return -mapOSError(errors.Join(err, closeWasiOpen(rop), closeWasiOpen(wop)))
+		}
+	} else {
+		r, wr, err := os.Pipe()
+		if err != nil {
+			return -mapOSError(err)
+		}
+		w.mu.Lock()
+		rfd = w.addFDLocked(&wasiOpen{f: r, noWrite: true})
+		wfd = w.addFDLocked(&wasiOpen{f: wr, noRead: true})
+		w.mu.Unlock()
+	}
 	binary.LittleEndian.PutUint32(out[0:], uint32(rfd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(wfd))
 	return _wasiESUCCESS
@@ -3315,10 +3441,19 @@ func closeWasiOpen(op *wasiOpen) error {
 	return err
 }
 
+// endWasiOpen is closeWasiOpen for an instance that ends, as opposed to a
+// guest that closes a descriptor: the standard descriptors of the host
+// process stay open when the last instance that has them goes. The host
+// process is still there, and reports through them.
+func endWasiOpen(op *wasiOpen) error {
+	op.leaveStandard()
+	return closeWasiOpen(op)
+}
+
 func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	if op == nil {
 		return _wasiEBADF
 	}
@@ -3351,14 +3486,16 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	// except that the rights to read and to write say what the descriptor
 	// is open for: it is how libc answers fcntl(F_GETFL).
 	rights := ^uint64(0)
-	if op := w.fdsLocked()[fd]; op != nil {
+	if op := w.openLocked(fd); op != nil {
 		if read, write := op.access(); !read {
 			rights &^= wasiRightFdRead | wasiRightFdReaddir
 		} else if !write {
 			rights &^= wasiRightFdWrite
 		}
 		op.mu.Lock()
-		if op.stdio != 0 {
+		if h := op.host(); h != nil {
+			ftype = h.filetype(op.dgram)
+		} else if op.stdio != 0 {
 			ftype = 2 // a standard stream is a character device
 		} else if op.isDir {
 			ftype = 3
@@ -3369,7 +3506,10 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 		}
 		fdflags = uint16(op.fdflags)
 		op.mu.Unlock()
-	} else if fd == wasiPreopenFD {
+		if h := op.host(); h != nil {
+			fdflags = uint16(h.fdflags())
+		}
+	} else if w.rootNumberLocked(fd) {
 		ftype = 3 // preopen "/"
 	} else {
 		return _wasiEBADF
@@ -3397,10 +3537,14 @@ const (
 // internally.
 func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return _wasiEBADF
+	}
+	if h := op.host(); h != nil {
+		// The flags are those of the host's open file.
+		return mapOSError(h.setFdflags(flags))
 	}
 	op.mu.Lock()
 	op.fdflags = flags
@@ -3421,7 +3565,7 @@ func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
 func (w *WasiStubs) Fd_fdstat_set_rights(m *Module, fd int32, rightsBase, rightsInherit int64) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.fdsLocked()[fd] == nil {
+	if w.openLocked(fd) == nil {
 		return _wasiEBADF
 	}
 	return _wasiESUCCESS
@@ -3434,9 +3578,10 @@ func (w *WasiStubs) Fd_filestat_get(m *Module, fd, ptr int32) int32 {
 		return _wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
+	root := op == nil && w.rootNumberLocked(fd)
 	w.mu.Unlock()
-	if op == nil && fd != wasiPreopenFD {
+	if op == nil && !root {
 		return _wasiEBADF
 	}
 	if op == nil || op.f == nil {
@@ -3476,7 +3621,7 @@ func (w *WasiStubs) Fd_filestat_get(m *Module, fd, ptr int32) int32 {
 
 func (w *WasiStubs) Fd_filestat_set_size(m *Module, fd int32, size int64) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return _wasiEBADF
@@ -3492,7 +3637,7 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	// atim/mtim are wasi `timestamp` (u64 nanoseconds) — a single i64 each
 	// at the wasm ABI, matching the import signature the transpiler derives.
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	fsys := w.fsys
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
@@ -3600,7 +3745,13 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	}
 	var n uint64
 	served := false
-	if dg, isDatagram := src.(datagramSocket); isDatagram && op != nil && op.dgram {
+	if h := op.host(); h != nil {
+		var errno int32
+		if n, errno = w.readHost(h, bufs); errno != _wasiESUCCESS {
+			return errno
+		}
+		served = true
+	} else if dg, isDatagram := src.(datagramSocket); isDatagram && op != nil && op.dgram {
 		var errno int32
 		if n, _, errno = w.receiveDatagram(op, dg, bufs, 0); errno != _wasiESUCCESS {
 			return errno
@@ -3969,7 +4120,7 @@ func (op *wasiOpen) probeWritableUntil(dst streamWriter, until time.Time, stop <
 func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
 	// The table decides what an fd is, fd 0 included: an entry for the
 	// instance's stdin reads from the stream configured right now.
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	if op == nil {
 		return nil, nil
 	}
@@ -3992,7 +4143,7 @@ func (w *WasiStubs) fdSrcLocked(fd int32) (io.Reader, *wasiOpen) {
 // fdDstLocked returns the io.Writer for fd or nil if fd is invalid.
 // Caller must hold w.mu.
 func (w *WasiStubs) fdDstLocked(fd int32) (io.Writer, *wasiOpen) {
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	if op == nil {
 		return nil, nil
 	}
@@ -4017,7 +4168,7 @@ func (w *WasiStubs) fdDstLocked(fd int32) (io.Writer, *wasiOpen) {
 
 func (w *WasiStubs) Fd_pread(m *Module, fd, iovs, iovsLen int32, offset int64, nreadPtr int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil || op.noRead {
 		return _wasiEBADF
@@ -4059,7 +4210,7 @@ func (w *WasiStubs) Fd_pread(m *Module, fd, iovs, iovsLen int32, offset int64, n
 
 func (w *WasiStubs) Fd_pwrite(m *Module, fd, iovs, iovsLen int32, offset int64, nwrittenPtr int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil || op.noWrite {
 		return _wasiEBADF
@@ -4110,7 +4261,7 @@ func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr
 // wasm32 and wasm64 bindings.
 func (w *WasiStubs) fdSeek(fd int32, offset int64, whence int) (int64, int32) {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return 0, _wasiEBADF
@@ -4128,7 +4279,7 @@ func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
 		return _wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return _wasiEBADF
@@ -4154,13 +4305,19 @@ func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) in
 		binary.LittleEndian.PutUint32(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	n, errno := w.writeFd(op, dst, bufs)
+	var n uint64
+	var errno int32
+	if h := op.host(); h != nil {
+		n, errno = w.writeHost(op, h, bufs)
+	} else {
+		n, errno = w.writeFd(op, dst, bufs)
+	}
 	binary.LittleEndian.PutUint32(nwrittenSlice, uint32(n))
 	return errno
 }
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return _wasiEBADF
@@ -4173,7 +4330,7 @@ func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 
 func (w *WasiStubs) Fd_datasync(m *Module, fd int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return _wasiEBADF
@@ -4188,7 +4345,7 @@ func (w *WasiStubs) Fd_datasync(m *Module, fd int32) int32 {
 
 func (w *WasiStubs) Fd_advise(m *Module, fd int32, offset, length int64, advice int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return _wasiEBADF
@@ -4200,7 +4357,7 @@ func (w *WasiStubs) Fd_advise(m *Module, fd int32, offset, length int64, advice 
 
 func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil {
 		return _wasiEBADF
@@ -4236,7 +4393,7 @@ func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
 // negative errno.
 func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -4347,7 +4504,7 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 		return -_wasiEINVAL
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	fsys := w.fsys
 	var stream any
 	if op != nil {
@@ -4366,6 +4523,8 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 	}
 	var try func() error
 	switch {
+	case op.host() != nil:
+		try = func() error { return op.host().flock(kind) }
 	case op.f != nil:
 		try = func() error { return fsys.Flock(op.f, kind, false) }
 	case op.stdio != 0:
@@ -4463,7 +4622,7 @@ func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -4537,7 +4696,7 @@ func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
 // asked for.
 func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	var stream any
 	if op != nil {
 		switch op.stdio {
@@ -4555,6 +4714,15 @@ func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
 	}
 	w.mu.Unlock()
 	if op == nil {
+		return 0, false
+	}
+	if h := op.host(); h != nil {
+		// The guest's number is the host's, except where the instance has
+		// its own file under a number another process still uses: that one
+		// has no number outside the guest.
+		if number := h.fd.Load(); number == fd {
+			return uintptr(number), true
+		}
 		return 0, false
 	}
 	if stream == nil {
@@ -4593,9 +4761,10 @@ func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
 // not a directory's, ERANGE when the buffer is too small.
 func (w *WasiStubs) Fd_path(m *Module, fd, bufPtr, bufLen, neededPtr int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
+	root := op == nil && w.rootNumberLocked(fd)
 	w.mu.Unlock()
-	if op == nil && fd != wasiPreopenFD {
+	if op == nil && !root {
 		return -_wasiEBADF
 	}
 	path := "/"
@@ -4665,9 +4834,17 @@ func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	if op == nil {
 		return _wasiEBADF
+	}
+	if op.host() != nil {
+		nfd, err := w.dupHostLocked(op)
+		if err != nil {
+			return mapOSError(err)
+		}
+		binary.LittleEndian.PutUint32(out, uint32(nfd))
+		return _wasiESUCCESS
 	}
 	nfd := w.addFDLocked(op)
 	op.addRef()
@@ -4681,12 +4858,15 @@ func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
 func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	src := w.fdsLocked()[from]
+	src := w.openLocked(from)
 	if src == nil {
 		return _wasiEBADF
 	}
 	if from == to {
 		return _wasiESUCCESS
+	}
+	if src.host() != nil {
+		return mapOSError(w.dup2HostLocked(src, to))
 	}
 	var closeErr error
 	if dst := w.fdsLocked()[to]; dst != nil {
@@ -4711,14 +4891,23 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 		// Renumbering an fd onto itself is a no-op. We must NOT close
 		// the entry at "to" here — that would destroy the live fd the
 		// caller is trying to keep.
-		if _, ok := w.fdsLocked()[from]; ok {
+		if w.openLocked(from) != nil {
 			return _wasiESUCCESS
 		}
 		return _wasiEBADF
 	}
-	src, ok := w.fdsLocked()[from]
-	if !ok {
+	src := w.openLocked(from)
+	if src == nil {
 		return _wasiEBADF
+	}
+	if src.host() != nil {
+		// The number is the host's: the descriptor is duplicated onto the
+		// new one and closed under the old.
+		if err := w.dup2HostLocked(src, to); err != nil {
+			return mapOSError(err)
+		}
+		delete(w.fdsLocked(), from)
+		return mapOSError(closeWasiOpen(src))
 	}
 	var closeErr error
 	if dst, ok2 := w.fdsLocked()[to]; ok2 {
@@ -4813,7 +5002,7 @@ func (w *WasiStubs) Fd_readdir(m *Module, fd, buf, buflen int32, cookie int64, b
 // so wasm32 and wasm64 share it; only the bufused out-pointer differs.
 func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int32) {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil || !op.isDir {
 		return 0, _wasiEBADF
@@ -4889,7 +5078,7 @@ func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int
 // using os.OpenFile. Callers that need a sandbox should provide their
 // own Wasi_snapshot_preview1Imports implementation via NewWithWASI.
 func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags int32, fsRightsBase, fsRightsInherit int64, fdflags, openedFdPtr int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -4926,6 +5115,22 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
 	w.mu.Lock()
 	fsys := w.fsys
+	// A file of the host filesystem is opened as a descriptor of the host
+	// process when those are the guest's. A backend that has no such file
+	// under the name (errors.ErrUnsupported) opens it its own way.
+	openFile := fsys.OpenFile
+	hostFS, onHost := fsys.(interface {
+		OpenDescriptor(name string, flag int, perm os.FileMode) (File, error)
+	})
+	if onHost = onHost && w.hostDescriptorsLocked(); onHost {
+		openFile = func(name string, flag int, perm os.FileMode) (File, error) {
+			f, err := hostFS.OpenDescriptor(name, flag, perm)
+			if errors.Is(err, errors.ErrUnsupported) {
+				return fsys.OpenFile(name, flag&^syscall.O_NONBLOCK, perm)
+			}
+			return f, err
+		}
+	}
 	w.mu.Unlock()
 
 	// Decode rights into access mode. WASI rights bits: 0=FD_DATASYNC,
@@ -5000,18 +5205,19 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	switch {
 	case isFIFO && fdflags&wasiFdflagNonblock == 0 && flag&os.O_RDWR == 0:
 		var errno int32
-		if f, errno = w.openFIFO(fsys, rel, flag, w.createMode(mode)); errno != _wasiESUCCESS {
+		if f, errno = w.openFIFO(openFile, rel, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
-	case isFIFO && fdflags&wasiFdflagNonblock != 0:
+	case (isFIFO || onHost) && fdflags&wasiFdflagNonblock != 0:
 		// An open that does not wait is the host's own: a reader gets the
 		// FIFO whether or not anyone writes to it, a writer is refused
-		// (ENXIO) while nobody reads.
-		if f, err = fsys.OpenFile(rel, flag|syscall.O_NONBLOCK, w.createMode(mode)); err != nil {
+		// (ENXIO) while nobody reads. A descriptor of the host's is in the
+		// mode it was opened in, whatever it is.
+		if f, err = openFile(rel, flag|syscall.O_NONBLOCK, w.createMode(mode)); err != nil {
 			return -1, mapOSError(err)
 		}
 	default:
-		if f, err = fsys.OpenFile(rel, flag, w.createMode(mode)); err != nil {
+		if f, err = openFile(rel, flag, w.createMode(mode)); err != nil {
 			return -1, mapOSError(err)
 		}
 	}
@@ -5026,14 +5232,21 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		}
 		return -1, _wasiENOTDIR
 	}
-	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{
+	op := &wasiOpen{
 		f: f, isDir: isDir, path: rel, fdflags: fdflags,
 		noRead:  flag&os.O_WRONLY != 0,
 		noWrite: flag&(os.O_WRONLY|os.O_RDWR) == 0,
-	})
-	w.mu.Unlock()
-	return fd, _wasiESUCCESS
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if op.host() != nil {
+		fd, err := w.addHostFDLocked(op)
+		if err != nil {
+			return -1, mapOSError(errors.Join(err, f.Close()))
+		}
+		return fd, _wasiESUCCESS
+	}
+	return w.addFDLocked(op), _wasiESUCCESS
 }
 
 // openFIFO opens a FIFO for reading or for writing the way a blocking
@@ -5044,7 +5257,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 // before the guest is told — an open that was interrupted leaves no end of
 // the FIFO open behind, which the next open of the other end would take for
 // a peer.
-func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (File, int32) {
+func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMode) (File, error), rel string, flag int, perm os.FileMode) (File, int32) {
 	posted := make(chan struct{})
 	if !w.beginBlocking(func() { close(posted) }) {
 		return nil, _wasiEINTR
@@ -5055,7 +5268,7 @@ func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (F
 	}
 	result := make(chan opened, 1)
 	go func() {
-		f, err := fsys.OpenFile(rel, flag, perm)
+		f, err := openFile(rel, flag, perm)
 		result <- opened{f, err}
 	}()
 	select {
@@ -5073,7 +5286,7 @@ func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (F
 		other = os.O_RDONLY
 	}
 	for {
-		end, endErr := fsys.OpenFile(rel, other|syscall.O_NONBLOCK, 0)
+		end, endErr := openFile(rel, other|syscall.O_NONBLOCK, 0)
 		if endErr == nil {
 			// The other end is open: the host's open returns, now or as
 			// soon as it gets as far as looking for it.
@@ -5126,7 +5339,7 @@ func (w *WasiStubs) openFIFO(fsys FS, rel string, flag int, perm os.FileMode) (F
 const fifoUnblockRetry = time.Millisecond
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -5137,7 +5350,7 @@ func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int
 }
 
 func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -5165,7 +5378,7 @@ func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) i
 }
 
 func (w *WasiStubs) Path_remove_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -5190,7 +5403,7 @@ func (w *WasiStubs) Path_remove_directory(m *Module, dirFd, pathPtr, pathLen int
 }
 
 func (w *WasiStubs) Path_rename(m *Module, oldFd, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int32) int32 {
-	if oldFd != 3 || newFd != 3 {
+	if !rootDirFD(oldFd) || !rootDirFD(newFd) {
 		return _wasiEBADF
 	}
 	oldSlice := w.memSlice(m, oldPathPtr, oldPathLen)
@@ -5208,7 +5421,7 @@ func (w *WasiStubs) Path_rename(m *Module, oldFd, oldPathPtr, oldPathLen, newFd,
 }
 
 func (w *WasiStubs) Path_filestat_get(m *Module, dirFd, flags, pathPtr, pathLen, outPtr int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -5235,7 +5448,7 @@ func (w *WasiStubs) Path_filestat_get(m *Module, dirFd, flags, pathPtr, pathLen,
 }
 
 func (w *WasiStubs) Path_filestat_set_times(m *Module, dirFd, flags, pathPtr, pathLen int32, atim, mtim int64, fstFlags int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -5269,7 +5482,7 @@ func (o osFS) Chtimes(name string, atime, mtime time.Time) error {
 }
 
 func (w *WasiStubs) Path_link(m *Module, oldFd, oldFlags, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int32) int32 {
-	if oldFd != 3 || newFd != 3 {
+	if !rootDirFD(oldFd) || !rootDirFD(newFd) {
 		return _wasiEBADF
 	}
 	oldSlice := w.memSlice(m, oldPathPtr, oldPathLen)
@@ -5287,7 +5500,7 @@ func (w *WasiStubs) Path_link(m *Module, oldFd, oldFlags, oldPathPtr, oldPathLen
 }
 
 func (w *WasiStubs) Path_symlink(m *Module, targetPtr, targetLen, dirFd, linkPathPtr, linkPathLen int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	targetSlice := w.memSlice(m, targetPtr, targetLen)
@@ -5305,7 +5518,7 @@ func (w *WasiStubs) Path_symlink(m *Module, targetPtr, targetLen, dirFd, linkPat
 }
 
 func (w *WasiStubs) Path_readlink(m *Module, dirFd, pathPtr, pathLen, buf, buflen, bufusedPtr int32) int32 {
-	if dirFd != 3 {
+	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice(m, pathPtr, pathLen)
@@ -5435,6 +5648,9 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 	ready := make([]bool, len(fdEvents))
 	errnos := make([]int32, len(fdEvents))
 	ops := make([]*wasiOpen, len(fdEvents))
+	// The descriptors of the host process among them are asked about
+	// together, in one poll(2).
+	var hostSet hostPollSet
 	var probes []pollProbe
 	probeOf := map[probeKey]int{}
 	probeIndex := make([]int, len(fdEvents))
@@ -5458,6 +5674,13 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		// is open for.
 		if readable, writable := op.access(); (ev.isRead && !readable) || (!ev.isRead && !writable && op.stdio == 0) {
 			if op.plainFile() {
+				ready[i], anyReady = true, true
+			}
+			continue
+		}
+		if h := op.host(); h != nil {
+			if !hostSet.add(i, h, ev.isRead) {
+				errnos[i] = _wasiEBADF
 				ready[i], anyReady = true, true
 			}
 			continue
@@ -5583,9 +5806,39 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 	// something to wait for; a signal posted meanwhile ends the wait. With
 	// descriptors that can never become ready and no timeout, a signal is
 	// all there is to wait for, as for poll(2).
-	onlySignal := !anyReady && len(probes) == 0 && minClockNs < 0 && len(fdEvents) > 0
+	hostWaited := false
+	markHost := func(sub int) { ready[sub], anyReady = true, true }
+	if !hostSet.empty() {
+		hostSet.look()
+		hostSet.ready(markHost)
+		switch {
+		case anyReady || minClockNs == 0:
+		case len(probes) == 0:
+			// Nothing but descriptors of the host to wait for: the wait is
+			// the host's poll, which a signal posted to the guest ends.
+			var until time.Time
+			if minClockNs > 0 {
+				until = time.Now().Add(time.Duration(minClockNs))
+			}
+			errno := hostSet.await(w, until)
+			hostSet.ready(markHost)
+			if errno == _wasiEINTR {
+				return _wasiEINTR
+			}
+			hostWaited = true
+		default:
+			// They are waited for next to the streams that are probed.
+			probes = append(probes, pollProbe{
+				probe: func(until time.Time, stop <-chan struct{}) bool {
+					hostSet.awaitStoppable(until, stop)
+					return hostSet.ready(func(int) {})
+				},
+			})
+		}
+	}
+	onlySignal := !anyReady && !hostWaited && len(probes) == 0 && minClockNs < 0 && len(fdEvents) > 0
 	var posted chan struct{}
-	if !anyReady && (len(probes) > 0 || minClockNs > 0 || onlySignal) {
+	if !anyReady && !hostWaited && (len(probes) > 0 || minClockNs > 0 || onlySignal) {
 		posted = make(chan struct{})
 		if !w.beginBlocking(func() { close(posted) }) {
 			return _wasiEINTR
@@ -5612,7 +5865,8 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 				ready[i], anyReady = true, true
 			}
 		}
-	} else if minClockNs > 0 && !anyReady {
+		hostSet.ready(markHost)
+	} else if minClockNs > 0 && !anyReady && !hostWaited {
 		// The clock paces the call only when nothing else can end it.
 		timer := time.NewTimer(time.Duration(minClockNs))
 		select {
@@ -5643,7 +5897,9 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 		var nbytes uint64
 		if op := ops[i]; op != nil && ev.isRead && errnos[i] == 0 {
-			if _, pending := op.aheadReady(); pending > 0 {
+			if h := op.host(); h != nil && h.waits() {
+				nbytes = h.pending()
+			} else if _, pending := op.aheadReady(); pending > 0 {
 				nbytes = uint64(pending)
 			} else if op.f != nil && probeIndex[i] < 0 {
 				// Regular file: pass through the bytes left to read
@@ -5794,7 +6050,7 @@ const (
 // socket do. Sock_connect_addr is the same for an address of any family.
 func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || !op.isSocket {
 		return -_wasiENOTSOCK
@@ -5819,7 +6075,7 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 		return _wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		// as Sock_recv and Sock_send report a descriptor that is not open
@@ -5897,7 +6153,7 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		return _wasiEACCES
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	var conn net.Conn
 	if op != nil {
@@ -5957,7 +6213,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 		return _wasiEACCES
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	var conn net.Conn
 	if op != nil {
@@ -5982,7 +6238,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 
 func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	var conn net.Conn
 	if op != nil {
@@ -6114,6 +6370,9 @@ const (
 // signals the host process receives go to the instance SetHostProcess was
 // called on.
 func (w *WasiStubs) SetHostProcess(on bool) {
+	if on {
+		KeepRuntimeDescriptorsHigh()
+	}
 	w.mu.Lock()
 	w.hostProcess = on
 	w.mu.Unlock()
@@ -6136,7 +6395,18 @@ func (w *WasiStubs) SetHostProcess(on bool) {
 func (w *WasiStubs) AdoptInheritedDescriptors() {
 	inheritedOnce.Do(func() {
 		for _, fd := range inheritedDescriptors() {
-			if int32(fd) == wasiPreopenFD {
+			w.mu.Lock()
+			host := w.hostDescriptorsLocked()
+			w.mu.Unlock()
+			if host {
+				// The descriptor is the guest's as it is, under its number.
+				if op := inheritedHostDescriptor(fd); op != nil {
+					w.mu.Lock()
+					_, _ = w.addHostFDLocked(op)
+					w.mu.Unlock()
+					continue
+				}
+			} else if int32(fd) == wasiPreopenFD {
 				continue
 			}
 			op := adoptHostDescriptor(fd)
@@ -6366,7 +6636,7 @@ func (w *WasiStubs) Path_chown(m *Module, pathPtr, pathLen, uid, gid, follow int
 // file of the host.
 func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -8703,7 +8973,7 @@ func ipv4SockAddr(ipBE, port int32) wasiSockAddr {
 // an address of any family.
 func (w *WasiStubs) Sock_bind(m *Module, fd, ipBE, port int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -8743,7 +9013,7 @@ func (op *wasiOpen) attachListener(l net.Listener, listening bool) int32 {
 // negative errno.
 func (w *WasiStubs) Sock_listen(m *Module, fd, backlog int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -8826,7 +9096,7 @@ func (w *WasiStubs) writeSockName(m *Module, addr net.Addr, outPtr int32) int32 
 // unspecified address while it has neither. Returns 0 or a negative errno.
 func (w *WasiStubs) Sock_getsockname(m *Module, fd, outPtr int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -8849,7 +9119,7 @@ func (w *WasiStubs) Sock_getsockname(m *Module, fd, outPtr int32) int32 {
 // connection.
 func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -8934,7 +9204,7 @@ func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, o
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -8969,7 +9239,7 @@ func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, o
 // only.
 func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -9039,7 +9309,7 @@ func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -9452,7 +9722,7 @@ func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, i
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	hook := w.dialHook
 	w.mu.Unlock()
 	if op == nil {
@@ -9510,7 +9780,7 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return -_wasiEBADF
@@ -9558,6 +9828,9 @@ const wasiFdflagNonblock int32 = 0x4
 
 // nonblocking reports whether the guest has set O_NONBLOCK on the entry.
 func (op *wasiOpen) nonblocking() bool {
+	if h := op.host(); h != nil {
+		return h.nonblocking()
+	}
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	return op.fdflags&wasiFdflagNonblock != 0
@@ -9939,7 +10212,7 @@ func (w *WasiStubs) readSockPath(m *Module, ptr, n int32) (path string, ok bool)
 // descriptor that is not open (EBADF) or not a socket (ENOTSOCK).
 func (w *WasiStubs) socketEntry(fd int32) (*wasiOpen, int32) {
 	w.mu.Lock()
-	op := w.fdsLocked()[fd]
+	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil {
 		return nil, _wasiEBADF
@@ -10706,6 +10979,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                    true,
+			"rootDirFD":                 true,
 			"DefaultWASI":               true,
 			"SetPreopenDir":             true,
 			"NewMemFS":                  true,
@@ -10753,6 +11027,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"Clock_res_get":             true,
 			"Clock_time_get":            true,
 			"closeWasiOpen":             true,
+			"endWasiOpen":               true,
 			"hostStream":                true,
 			"release":                   true,
 			"openFIFO":                  true,
@@ -10890,6 +11165,8 @@ var (
 	wasip1NativeDarwinRaw []byte
 	//go:embed wasip1_native_other.go
 	wasip1NativeOtherRaw []byte
+	//go:embed wasip1_native_hostfd.go
+	wasip1NativeHostFDRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_linux_headers.go
@@ -10915,6 +11192,7 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
 		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
 		"wasip1_native_other.go":  wasip1NativeOtherRaw,
+		"wasip1_native_hostfd.go": wasip1NativeHostFDRaw,
 
 		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,
@@ -11353,7 +11631,7 @@ func (w *WasiStubs) Fd_readdir64(m *Module, fd, buf, buflen, cookie, bufusedPtr 
 }
 
 func (w *WasiStubs) Path_open64(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, fsRightsInherit, fdflags, openedFdPtr int64) int32 {
-	if int32(dirFd) != 3 {
+	if !rootDirFD(int32(dirFd)) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice64(m, pathPtr, pathLen)
@@ -11371,7 +11649,7 @@ func (w *WasiStubs) Path_open64(m *Module, dirFd, dirflags, pathPtr, pathLen, of
 }
 
 func (w *WasiStubs) Path_filestat_get64(m *Module, dirFd, flags, pathPtr, pathLen, outPtr int64) int32 {
-	if int32(dirFd) != 3 {
+	if !rootDirFD(int32(dirFd)) {
 		return _wasiEBADF
 	}
 	pathSlice := w.memSlice64(m, pathPtr, pathLen)

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -216,3 +217,77 @@ func wasiErrno(e syscall.Errno) (int32, bool) { return 0, false }
 // hostErrnoKnown reports whether the host's error numbers are known by
 // name on this platform: they are not.
 func hostErrnoKnown() bool { return false }
+
+// The descriptor layer of a guest that is the host process — the guest's
+// descriptors being the host's, number for number — does not exist on this
+// platform: such a guest has descriptors of its own, as every guest has.
+// What follows is what the rest of the runtime names of that layer.
+
+// hostFile would be a descriptor of the host process as the file of an
+// entry; no entry has one here.
+type hostFile struct {
+	File
+	fd atomic.Int32
+}
+
+func (h *hostFile) waits() bool               { return false }
+func (h *hostFile) nonblocking() bool         { return false }
+func (h *hostFile) fdflags() int32            { return 0 }
+func (h *hostFile) setFdflags(int32) error    { return errors.ErrUnsupported }
+func (h *hostFile) filetype(dgram bool) byte  { return 0 }
+func (h *hostFile) flock(lock FileLock) error { return errors.ErrUnsupported }
+func (h *hostFile) pending() uint64           { return 0 }
+func (h *hostFile) childFile() *os.File       { return nil }
+
+// host returns the descriptor of the host process the entry is: none.
+func (op *wasiOpen) host() *hostFile { return nil }
+
+func (op *wasiOpen) leaveStandard() {}
+
+// hostWaker would end a wait in the host's poll.
+type hostWaker struct{}
+
+// hostStandard would be the standard descriptors of the host process an
+// instance took over.
+type hostStandard struct{}
+
+func (w *WasiStubs) restoreStandardLocked() {}
+
+// hostPollSet would be the descriptors of the host one poll_oneoff asks
+// about; it stays empty.
+type hostPollSet struct{}
+
+func (s *hostPollSet) add(sub int, h *hostFile, read bool) bool             { return false }
+func (s *hostPollSet) empty() bool                                          { return true }
+func (s *hostPollSet) look()                                                {}
+func (s *hostPollSet) ready(mark func(sub int)) bool                        { return false }
+func (s *hostPollSet) await(w *WasiStubs, until time.Time) int32            { return _wasiENOSYS }
+func (s *hostPollSet) awaitStoppable(until time.Time, stop <-chan struct{}) {}
+
+// KeepRuntimeDescriptorsHigh keeps the Go runtime's own descriptors above
+// the numbers a program's descriptors get, where the guest's descriptors
+// can be the host's: not on this platform.
+func KeepRuntimeDescriptorsHigh() {}
+
+func (w *WasiStubs) hostDescriptorsLocked() bool                 { return false }
+func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen     { return &wasiOpen{stdio: stdio} }
+func (w *WasiStubs) freeNumberLocked() int32                     { return 0 }
+func (w *WasiStubs) closeHostWakerLocked()                       {}
+func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) { return -1, errors.ErrUnsupported }
+func (w *WasiStubs) dupHostLocked(op *wasiOpen) (int32, error)   { return -1, errors.ErrUnsupported }
+func (w *WasiStubs) dup2HostLocked(src *wasiOpen, to int32) error {
+	return errors.ErrUnsupported
+}
+func (w *WasiStubs) readHost(h *hostFile, bufs [][]byte) (uint64, int32) { return 0, _wasiENOSYS }
+func (w *WasiStubs) writeHost(op *wasiOpen, h *hostFile, bufs [][]byte) (uint64, int32) {
+	return 0, _wasiENOSYS
+}
+
+// OpenDescriptor would open a file as a descriptor of the host process.
+func (o osFS) OpenDescriptor(name string, flag int, perm os.FileMode) (File, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func hostPipe() (r, wr *wasiOpen, err error) { return nil, nil, errors.ErrUnsupported }
+
+func inheritedHostDescriptor(fd int) *wasiOpen { return nil }

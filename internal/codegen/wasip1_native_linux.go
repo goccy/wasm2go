@@ -149,3 +149,51 @@ func defaultSignalAction(sig syscall.Signal) error {
 	}
 	return nil
 }
+
+// statModTime returns the modification time of a stat result.
+func statModTime(st *syscall.Stat_t) time.Time { return time.Unix(st.Mtim.Unix()) }
+
+// hostPipeBuf is PIPE_BUF: what a pipe that reports itself writable takes
+// without waiting.
+const hostPipeBuf = 4096
+
+// hostFIONREAD is the ioctl request that asks how many bytes can be read.
+const hostFIONREAD = 0x541B
+
+// hostSendFlags are the flags of every send the runtime makes for the
+// guest: it does not wait in the call, and a broken connection is reported
+// to the guest alone (see writeFailure), not to the host process.
+const hostSendFlags = syscall.MSG_DONTWAIT | syscall.MSG_NOSIGNAL
+
+// hostPollCall is poll(2): it waits no longer than timeout, and without
+// limit when timeout is negative.
+func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
+	var limit *syscall.Timespec
+	if timeout >= 0 {
+		ts := syscall.NsecToTimespec(int64(timeout))
+		limit = &ts
+	}
+	var first *hostPoll
+	if len(fds) > 0 {
+		first = &fds[0]
+	}
+	n, _, errno := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)),
+		uintptr(unsafe.Pointer(limit)), 0, 0, 0)
+	return int(n), errno
+}
+
+// hostDup2 is dup2(2) for two different descriptors.
+func hostDup2(from, to int) error {
+	for {
+		err := syscall.Dup3(from, to, 0)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
+}
+
+// hostAccept is accept(2) with the new descriptor close-on-exec.
+func hostAccept(fd int) (int, error) {
+	nfd, _, err := syscall.Accept4(fd, syscall.SOCK_CLOEXEC)
+	return nfd, err
+}
