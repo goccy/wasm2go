@@ -574,9 +574,10 @@ func (w *WasiStubs) getoptHost(op *wasiOpen, h *hostFile, option int32) (value, 
 }
 
 // receiveFromHost is recvfrom(2) for a socket of the host's: one receive
-// into buf with the flags of a receive (wasiMsg...), and the name of who
-// sent it — the sender of a datagram, the peer of a stream socket — or nil
-// when there is none to give.
+// into buf with the flags of a receive (wasiMsg...), and the name the host
+// gives for who sent it — the sender of a datagram; for a stream socket
+// what the host's recvfrom says, which on most hosts is nothing — or nil
+// when there is none.
 func (w *WasiStubs) receiveFromHost(op *wasiOpen, h *hostFile, buf []byte, flags int32) (uint64, net.Addr, int32) {
 	if !h.socket() {
 		return 0, nil, _wasiENOTSOCK
@@ -584,14 +585,6 @@ func (w *WasiStubs) receiveFromHost(op *wasiOpen, h *hostFile, buf []byte, flags
 	n, from, errno := w.receiveHost(h, [][]byte{buf}, flags)
 	if errno != _wasiESUCCESS {
 		return 0, nil, errno
-	}
-	if !op.dgram {
-		if fd, errno := h.holdSocket(); errno == _wasiESUCCESS {
-			if peer, err := syscall.Getpeername(fd); err == nil {
-				from = peer
-			}
-			h.release()
-		}
 	}
 	return n, hostNetAddr(from, op.dgram), _wasiESUCCESS
 }

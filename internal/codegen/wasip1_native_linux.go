@@ -157,6 +157,33 @@ func statModTime(st *syscall.Stat_t) time.Time { return time.Unix(st.Mtim.Unix()
 // without waiting.
 const hostPipeBuf = 4096
 
+// hostBeside opens a second descriptor on the pipe fd is an end of, with an
+// open file of its own in non-blocking mode, for what fd is open for, and
+// places it among the runtime's own descriptors. It returns -1 when it
+// cannot; never says that it never will for this descriptor (the host has
+// no /proc, or does not let the process open the pipe), as opposed to not
+// right now (a FIFO nobody reads from yet).
+func hostBeside(fd int) (beside int, never bool) {
+	flags, err := descriptorFlags(fd, syscall.F_GETFL)
+	if err != nil {
+		return -1, false
+	}
+	opened, err := syscall.Open("/proc/self/fd/"+strconv.Itoa(fd), flags&syscall.O_ACCMODE|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err != syscall.ENXIO && err != syscall.EINTR && err != syscall.EMFILE && err != syscall.ENFILE
+	}
+	beside, err = hostDup(opened, hostFloor())
+	_ = syscall.Close(opened)
+	if err != nil {
+		return -1, false
+	}
+	return beside, false
+}
+
+// hostPipeRoom returns how much a pipe that reports itself writable takes
+// without waiting, as far as the host says: PIPE_BUF.
+func hostPipeRoom(fd int) int { return hostPipeBuf }
+
 // hostFIONREAD is the ioctl request that asks how many bytes can be read.
 const hostFIONREAD = 0x541B
 

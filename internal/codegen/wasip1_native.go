@@ -1951,18 +1951,16 @@ func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 
 // openLocked returns the entry the guest knows as descriptor fd, or nil
 // when it has none. A guest whose descriptors are the host process's has
-// every descriptor of the process that is nobody else's: for one it did
-// not open itself — code outside the guest did, a native library — the
-// entry is made from what the host says about the number right now, for
-// this one use (outsideHostLocked). Caller holds w.mu.
+// every descriptor of the process that is nobody else's: one it did not
+// open itself — code outside the guest did, a native library — becomes an
+// entry of its table when it is first used (hostOpenLocked). Caller holds
+// w.mu.
 func (w *WasiStubs) openLocked(fd int32) *wasiOpen {
-	if op := w.fdsLocked()[fd]; op != nil {
-		return op
-	}
+	op := w.fdsLocked()[fd]
 	if w.hostDescriptorsLocked() {
-		return w.outsideHostLocked(fd)
+		return w.hostOpenLocked(fd, op)
 	}
-	return nil
+	return op
 }
 
 // rootNumberLocked reports whether fd, a number the instance has no entry
@@ -2378,6 +2376,13 @@ func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
 		if fd < 3 || fd >= wasiInheritedFDLimit || w.cloexec[fd] {
 			continue
 		}
+		if h := op.host(); h.madeOutside() {
+			// The flag is the host's own (Fd_cloexec), and so is whether
+			// the descriptor is still what the entry was made for.
+			if marked, err := h.closeOnExec(false, false); err != nil || marked || !h.current() {
+				continue
+			}
+		}
 		var file *os.File
 		switch {
 		case op.host() != nil:
@@ -2444,14 +2449,14 @@ func (w *WasiStubs) Fd_cloexec(m *Module, fd, set, value, oldPtr int32) int32 {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.fdsLocked()[fd] == nil {
-		// A descriptor that is not in the table can be one the guest has
-		// all the same (openLocked): its flag is the host's own.
-		op := w.openLocked(fd)
-		if op == nil {
-			return -_wasiEBADF
-		}
-		was, err := op.host().closeOnExec(set != 0, value != 0)
+	op := w.openLocked(fd)
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if h := op.host(); h.madeOutside() {
+		// The flag of a descriptor that code outside the guest made is
+		// the host's own: that code set it, and reads it.
+		was, err := h.closeOnExec(set != 0, value != 0)
 		if err != nil {
 			return -mapOSError(err)
 		}
@@ -6484,10 +6489,10 @@ const (
 //     descriptor of the process is within the guest's reach that way,
 //     except those of another instance, those the runtime holds for itself
 //     — what was open and close-on-exec when the first instance became the
-//     host process, and every number from half the descriptor limit up —
+//     host process, and every number from 1024 up (hostFloor) —
 //     and the standard descriptors when the instance's streams are not
 //     those: an embedder that keeps descriptors of its own while such a
-//     guest runs opens them before, or duplicates them above that limit.
+//     guest runs opens them before, or duplicates them to 1024 or above.
 //     The standard descriptors the guest was given are put back as they
 //     were when the instance ends (CloseAll).
 //

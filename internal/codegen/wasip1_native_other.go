@@ -270,15 +270,17 @@ func (s *hostPollSet) awaitStoppable(until time.Time, stop <-chan struct{}) {}
 // can be the host's: not on this platform.
 func KeepRuntimeDescriptorsHigh() {}
 
-func (w *WasiStubs) hostDescriptorsLocked() bool                 { return false }
-func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen     { return &wasiOpen{stdio: stdio} }
-func (w *WasiStubs) freeNumberLocked() int32                     { return 0 }
-func (w *WasiStubs) outsideHostLocked(fd int32) *wasiOpen        { return nil }
-func (w *WasiStubs) inheritableOutsideLocked() []*hostFile       { return nil }
-func (h *hostFile) closeOnExec(set, value bool) (bool, error)    { return false, errors.ErrUnsupported }
-func (w *WasiStubs) closeHostWakerLocked()                       {}
-func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) { return -1, errors.ErrUnsupported }
-func (w *WasiStubs) dupHostLocked(op *wasiOpen) (int32, error)   { return -1, errors.ErrUnsupported }
+func (w *WasiStubs) hostDescriptorsLocked() bool                     { return false }
+func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen         { return &wasiOpen{stdio: stdio} }
+func (w *WasiStubs) freeNumberLocked() int32                         { return 0 }
+func (w *WasiStubs) hostOpenLocked(fd int32, op *wasiOpen) *wasiOpen { return op }
+func (h *hostFile) madeOutside() bool                                { return false }
+func (h *hostFile) current() bool                                    { return false }
+func (w *WasiStubs) inheritableOutsideLocked() []*hostFile           { return nil }
+func (h *hostFile) closeOnExec(set, value bool) (bool, error)        { return false, errors.ErrUnsupported }
+func (w *WasiStubs) closeHostWakerLocked()                           {}
+func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error)     { return -1, errors.ErrUnsupported }
+func (w *WasiStubs) dupHostLocked(op *wasiOpen) (int32, error)       { return -1, errors.ErrUnsupported }
 func (w *WasiStubs) dup2HostLocked(src *wasiOpen, to int32) error {
 	return errors.ErrUnsupported
 }

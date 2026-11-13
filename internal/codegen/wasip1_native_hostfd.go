@@ -89,14 +89,24 @@ var hostCallTurns [64]sync.Mutex
 // hostCallTurn returns the lock for calls on descriptor fd.
 func hostCallTurn(fd int) *sync.Mutex { return &hostCallTurns[uint(fd)%uint(len(hostCallTurns))] }
 
+// hostFloorNumber is where the runtime's own descriptors start when the
+// process may have that many: above the numbers a program's descriptors
+// usually get and above what select(2) takes, so that the lowest free
+// number is the same for the guest as for the host — and no higher,
+// because the host's table of the process's descriptors is as long as the
+// highest number in use, and is copied for every process the program
+// starts. The runtime of a memory image (sharedimage) places its files by
+// the same rule: they have to be at or above this floor.
+const hostFloorNumber = 1024
+
 // hostFloor returns the lowest number for a descriptor the runtime makes
-// for itself: well above what a program's own descriptors reach, so that
-// the lowest free number is the same for the guest as for the host.
+// for itself: hostFloorNumber, or half of what the process may have open
+// when that is less.
 func hostFloor() int {
 	hostTable.mu.Lock()
 	defer hostTable.mu.Unlock()
 	if hostTable.floor == 0 {
-		floor := 1 << 16
+		floor := hostFloorNumber
 		var limit syscall.Rlimit
 		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err == nil && limit.Cur/2 < uint64(floor) {
 			floor = int(limit.Cur / 2)
@@ -276,6 +286,25 @@ type hostFile struct {
 	// perhaps, whose file a call under the old number would then reach.
 	// Waiting for a descriptor is not a call on it and is done without.
 	closing sync.RWMutex
+	// beside is, for a pipe, a second descriptor on the same pipe that the
+	// runtime reads and writes through instead: one with an open file of
+	// its own, in non-blocking mode, where the host can make one
+	// (hostBeside). A read or write through it never waits and takes what
+	// there is or what fits, whatever the mode of the guest's descriptor —
+	// which stays as the guest set it for everyone else who has it. Without
+	// it the runtime has to ask whether the pipe is ready and then write no
+	// more than the host takes for certain, a piece at a time. 0 until it
+	// is asked for, -1 when there is none to be had; closed with the
+	// descriptor. It cannot be derived: it is a descriptor.
+	beside atomic.Int32
+	// outside marks a descriptor that code outside the guest made (a
+	// native library) and the guest took in by its number, and made is
+	// what it was open on then. That code can close the descriptor and get
+	// the number again for something else without the runtime hearing of
+	// it, so the entry is believed only while the host still has the same
+	// thing under the number (current). Both immutable.
+	outside bool
+	made    hostIdentity
 }
 
 // newHostFile returns the file for descriptor fd of the given type.
@@ -309,6 +338,30 @@ func (h *hostFile) number() (int, error) {
 		return -1, syscall.EBADF
 	}
 	return fd, nil
+}
+
+// pipeBeside returns the descriptor beside the pipe fd (see beside), which
+// it makes on first use, or -1 when the descriptor is no pipe or there is
+// none. The caller holds the descriptor (hold).
+func (h *hostFile) pipeBeside(fd int) int {
+	if h.kind != syscall.S_IFIFO {
+		return -1
+	}
+	if beside := h.beside.Load(); beside != 0 {
+		return int(beside)
+	}
+	made, never := hostBeside(fd)
+	if made < 0 {
+		if never {
+			h.beside.CompareAndSwap(0, -1)
+		}
+		return -1
+	}
+	if !h.beside.CompareAndSwap(0, int32(made)) {
+		_ = syscall.Close(made)
+		return int(h.beside.Load())
+	}
+	return made
 }
 
 // waits reports whether a read or write of the descriptor can wait: it is a
@@ -428,6 +481,9 @@ func (h *hostFile) Seek(offset int64, whence int) (int64, error) {
 func (h *hostFile) Close() error {
 	h.closing.Lock()
 	defer h.closing.Unlock()
+	if beside := h.beside.Swap(-1); beside > 0 {
+		_ = syscall.Close(int(beside))
+	}
 	fd := int(h.fd.Swap(-1))
 	if fd < 0 {
 		return nil
@@ -444,6 +500,9 @@ func (h *hostFile) Close() error {
 func (h *hostFile) leave() {
 	h.closing.Lock()
 	defer h.closing.Unlock()
+	if beside := h.beside.Swap(-1); beside > 0 {
+		_ = syscall.Close(int(beside))
+	}
 	if fd := int(h.fd.Swap(-1)); fd >= 0 {
 		hostForget(fd, h)
 	}
@@ -1011,29 +1070,78 @@ type hostStandard struct {
 	kept [3]int
 }
 
-// outsideHostLocked returns an entry for descriptor fd of the host process,
-// which the instance's table does not have, when the descriptor is open and
-// the instance's to have (hostNumberFreeLocked): one that code outside the
-// guest made. It returns nil otherwise — the number is not open, or it is
-// another process's or the runtime's, and the guest gets EBADF.
+// madeOutside reports whether the descriptor is one that code outside the
+// guest made (see outside); false for no descriptor.
+func (h *hostFile) madeOutside() bool { return h != nil && h.outside }
+
+// current reports whether the host still has under the number what the
+// entry was made for.
+func (h *hostFile) current() bool {
+	fd := int(h.fd.Load())
+	if fd < 0 {
+		return false
+	}
+	now, open := hostIdentityOf(fd)
+	return open && now == h.made
+}
+
+// hostOpenLocked returns the entry the guest knows as descriptor fd, given
+// what the instance's table has under the number (op, or nil).
 //
-// The entry is not kept. The table holds what the guest opened; a
-// descriptor from outside it is whatever that code has under the number at
-// the moment — it may close the descriptor and open another under the same
-// number without the runtime hearing of it — so the host is asked each
-// time, and nothing is remembered that could be out of date. The guest
-// uses the descriptor like its own all the same: it reads, writes and waits
-// on it, duplicates it (the duplicate is an entry of the table), and closes
-// it, which closes the host's. Its close-on-exec flag is the host's.
-// Caller holds w.mu.
-func (w *WasiStubs) outsideHostLocked(fd int32) *wasiOpen {
+// An entry for a descriptor the guest opened is what it is. One for a
+// descriptor that code outside the guest made is believed while the host
+// still has the same thing under the number; when it has not — that code
+// closed the descriptor, or the number went to something else — the entry
+// is dropped, without closing anything, and the number is looked at afresh.
+// A number the table does not have is taken in when the descriptor is open
+// and the instance's to have (takeInOutsideLocked). Caller holds w.mu.
+func (w *WasiStubs) hostOpenLocked(fd int32, op *wasiOpen) *wasiOpen {
+	if op != nil {
+		h := op.host()
+		if !h.madeOutside() || h.current() {
+			return op
+		}
+		h.leave()
+		delete(w.fdsLocked(), fd)
+		delete(w.cloexec, fd)
+	}
+	return w.takeInOutsideLocked(fd)
+}
+
+// takeInOutsideLocked makes the entry for descriptor fd of the host
+// process, which the instance's table does not have, when the descriptor
+// is open and the instance's to have (hostNumberFreeLocked): one that code
+// outside the guest made. It returns nil otherwise — the number is not
+// open, or it is another process's or the runtime's, and the guest gets
+// EBADF.
+//
+// The descriptor is the guest's from then on like one it opened: it reads,
+// writes and waits on it, duplicates it, and closes it, which closes the
+// host's; a process forked from the guest shares it, and it stays open
+// until the last of them has closed it. What sets it apart is kept on the
+// entry (hostFile.outside): its close-on-exec flag is the host's own, and
+// the entry is checked against the host before every use. Caller holds
+// w.mu.
+func (w *WasiStubs) takeInOutsideLocked(fd int32) *wasiOpen {
 	if fd < 0 || !w.hostNumberFreeLocked(int(fd)) {
+		return nil
+	}
+	made, open := hostIdentityOf(int(fd))
+	if !open {
 		return nil
 	}
 	op, err := newHostOpen(int(fd), "")
 	if err != nil {
 		return nil
 	}
+	h := op.host()
+	h.outside, h.made = true, made
+	// Nothing of the runtime's is put beside a descriptor that may be
+	// closed without the runtime hearing of it.
+	h.beside.Store(-1)
+	hostEnter(int(fd), op)
+	w.fdsLocked()[fd] = op
+	delete(w.cloexec, fd)
 	if op.isDir {
 		// The directory has a name, which fchdir needs.
 		if path, ok := hostDescriptorPath(int(fd)); ok {
@@ -1492,6 +1600,8 @@ func (h *hostFile) receiveNow(bufs [][]byte, flags int32) (n uint64, from syscal
 	for {
 		if h.socket() {
 			got, from, err = syscall.Recvfrom(fd, buf, hostMsgFlags(flags)|syscall.MSG_DONTWAIT)
+		} else if beside := h.pipeBeside(fd); beside >= 0 {
+			got, err = syscall.Read(beside, buf)
 		} else {
 			hostCallTurn(fd).Lock()
 			if hostReadyNow(fd, hostPollIn) != 0 {
@@ -1598,18 +1708,12 @@ func (w *WasiStubs) readHost(h *hostFile, bufs [][]byte) (uint64, int32) {
 	return n, errno
 }
 
-// hostWriteChunk is how much is written at a time to a pipe in blocking
-// mode: what the host takes without waiting once it reports the pipe
-// writable (PIPE_BUF). A write of more would wait inside the host's call
-// for the reader, where no signal reaches it.
-const hostWriteChunk = hostPipeBuf
-
 // sendNow writes or sends p to the descriptor without waiting, at address
 // to when there is one. again reports that the descriptor takes nothing
-// right now; otherwise n bytes were taken, or err says why not. blocking
-// says that the open file is in blocking mode, where a write of more than
-// the host takes at once would wait.
-func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, blocking bool) (n int, again bool, err error) {
+// right now; otherwise n bytes were taken, or err says why not.
+// nonblocking tells whether the open file is in non-blocking mode; it is
+// asked only where the answer decides how the write is made.
+func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, nonblocking func() bool) (n int, again bool, err error) {
 	fd, err := h.hold()
 	if err != nil {
 		return 0, false, err
@@ -1618,21 +1722,28 @@ func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, blocking bool) (n int,
 	for {
 		if h.socket() {
 			n, err = syscall.SendmsgN(fd, p, nil, to, hostSendFlags)
-		} else if !blocking {
+		} else if beside := h.pipeBeside(fd); beside >= 0 {
+			n, err = syscall.Write(beside, p)
+		} else if (h.kind != syscall.S_IFIFO || len(p) > hostPipeBuf) && nonblocking() {
 			// In non-blocking mode the write does not wait, and takes
 			// what the host has room for.
 			n, err = syscall.Write(fd, p)
 		} else {
+			// A write in blocking mode waits in the host's call unless
+			// the descriptor is writable and, for a pipe, the write is no
+			// larger than what a writable pipe takes for certain.
 			hostCallTurn(fd).Lock()
 			if hostReadyNow(fd, hostPollOut) == 0 {
 				hostCallTurn(fd).Unlock()
 				return 0, true, nil
 			}
-			chunk := p
-			if h.kind == syscall.S_IFIFO && len(chunk) > hostWriteChunk {
-				chunk = chunk[:hostWriteChunk]
+			piece := p
+			if h.kind == syscall.S_IFIFO && len(piece) > hostPipeBuf {
+				if room := hostPipeRoom(fd); len(piece) > room {
+					piece = piece[:room]
+				}
 			}
-			n, err = syscall.Write(fd, chunk)
+			n, err = syscall.Write(fd, piece)
 			hostCallTurn(fd).Unlock()
 		}
 		if err != syscall.EINTR {
@@ -1665,13 +1776,16 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 		}
 		bufs = [][]byte{whole}
 	}
-	// A send on a socket never waits in the host's call, so the mode of a
-	// socket is asked only once it has no room; how a pipe is written
-	// depends on its mode from the start.
+	// The mode of the open file is asked when it matters: when the
+	// descriptor has no room, and before a write that would wait in the
+	// host's call in blocking mode (sendNow).
 	nonblocking := flags&wasiMsgDontWait != 0
 	asked := nonblocking
-	if !h.socket() && !asked {
-		nonblocking, asked = h.nonblocking(), true
+	mode := func() bool {
+		if !asked {
+			nonblocking, asked = h.nonblocking(), true
+		}
+		return nonblocking
 	}
 	var total uint64
 	var until time.Time
@@ -1681,7 +1795,7 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 			i++
 			continue
 		}
-		n, again, err := h.sendNow(buf, to, !nonblocking)
+		n, again, err := h.sendNow(buf, to, mode)
 		if err != nil {
 			if total > 0 {
 				return total, _wasiESUCCESS
@@ -1695,10 +1809,7 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 			}
 			continue
 		}
-		if !asked {
-			nonblocking, asked = h.nonblocking(), true
-		}
-		if nonblocking {
+		if mode() {
 			if total > 0 {
 				return total, _wasiESUCCESS
 			}

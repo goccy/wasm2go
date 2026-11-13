@@ -143,6 +143,29 @@ func statModTime(st *syscall.Stat_t) time.Time { return time.Unix(st.Mtimespec.U
 // without waiting.
 const hostPipeBuf = 512
 
+// hostBeside would open a second descriptor on a pipe with an open file of
+// its own. This host has no way: opening the descriptor's name in /dev/fd
+// duplicates the descriptor, open file and mode included.
+func hostBeside(fd int) (beside int, never bool) { return -1, true }
+
+// hostPipeRoom returns how much a pipe that reports itself writable takes
+// without waiting. fstat of a pipe says here how large its buffer is and
+// how much of it is filled; what is not filled is taken at once. When the
+// answer is not within what a pipe can hold, the room is PIPE_BUF, which a
+// writable pipe has for certain.
+func hostPipeRoom(fd int) int {
+	const largest = 64 << 10 // BIG_PIPE_SIZE
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return hostPipeBuf
+	}
+	room := int64(st.Blksize) - st.Size
+	if room < hostPipeBuf || room > largest {
+		return hostPipeBuf
+	}
+	return int(room)
+}
+
 // hostFIONREAD is the ioctl request that asks how many bytes can be read.
 const hostFIONREAD = 0x4004667f
 

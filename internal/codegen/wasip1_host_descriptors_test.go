@@ -775,6 +775,35 @@ func TestHostDescriptors_ADescriptorMadeOutsideTheGuestIsTheGuests(t *testing.T)
 		}
 	}
 
+	// A process forked from the guest shares a descriptor the guest took
+	// in: closing it in the child leaves the parent's open, and the host's
+	// descriptor goes when the last of them has closed it.
+	var shared [2]int
+	if err := syscall.Pipe(shared[:]); err != nil {
+		t.Fatal(err)
+	}
+	if rc := fdWriteString(w, m, int32(shared[1]), "before the fork,"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	child := w.Fork()
+	cm := newForkTestModule()
+	if rc := fdWriteString(child, cm, int32(shared[1]), "from the child"); rc != _wasiESUCCESS {
+		t.Fatalf("the child's write rc=%d", rc)
+	}
+	closeTestFd(t, child, cm, int32(shared[1]))
+	if rc := fdWriteString(w, m, int32(shared[1]), ",after"); rc != _wasiESUCCESS {
+		t.Fatalf("the parent's write after the child closed the descriptor rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, int32(shared[0]), 64); rc != _wasiESUCCESS || got != "before the fork,from the child,after" {
+		t.Fatalf("read = %q rc=%d", got, rc)
+	}
+	_ = child.CloseAll()
+	closeTestFd(t, w, m, int32(shared[1]))
+	if err := syscall.Fstat(shared[1], &st); err != syscall.EBADF {
+		t.Fatalf("the descriptor after the last of them closed it: %v", err)
+	}
+	closeTestFd(t, w, m, int32(shared[0]))
+
 	// A socket, with what it is.
 	pair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
@@ -871,5 +900,57 @@ func TestHostDescriptors_ATerminalIsToldFromOtherDevices(t *testing.T) {
 	}
 	if filetype, seek := seekable(pty); filetype != 2 || seek {
 		t.Fatalf("a pseudo-terminal: file type %d, may seek %v; want a character device that may not", filetype, seek)
+	}
+}
+
+// Whatever the runtime reads and writes a pipe through, the pipe ends when
+// the guest closes its descriptors: nothing of the runtime's keeps an end
+// open, and the mode of the guest's descriptors is as the guest left it.
+func TestHostDescriptors_APipeEndsWhenTheGuestClosesIt(t *testing.T) {
+	w, m := newHostGuest(t, t.TempDir())
+	readFd, writeFd := newTestPipe(t, w, m)
+	for i := 0; i < 3; i++ {
+		if rc := fdWriteString(w, m, writeFd, "data"); rc != _wasiESUCCESS {
+			t.Fatalf("write rc=%d", rc)
+		}
+		if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "data" {
+			t.Fatalf("read = %q rc=%d", got, rc)
+		}
+	}
+	for _, fd := range []int32{readFd, writeFd} {
+		if hostStatusFlags(t, int(fd))&syscall.O_NONBLOCK != 0 {
+			t.Fatalf("descriptor %d is in non-blocking mode after the guest used it", fd)
+		}
+	}
+	// The writer goes: a reader outside the guest is at the end of input.
+	reader, err := syscall.Dup(int(readFd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(reader)
+	closeTestFd(t, w, m, writeFd)
+	if err := syscall.SetNonblock(reader, true); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	if n, err := syscall.Read(reader, buf); n != 0 || err != nil {
+		t.Fatalf("read after the guest closed the write end = %d, %v; want the end of input", n, err)
+	}
+	// The reader goes: a writer outside the guest has nobody to write to.
+	r2, w2 := newTestPipe(t, w, m)
+	if rc := fdWriteString(w, m, w2, "x"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, r2, 4); rc != _wasiESUCCESS || got != "x" {
+		t.Fatalf("read = %q rc=%d", got, rc)
+	}
+	writer, err := syscall.Dup(int(w2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(writer)
+	closeTestFd(t, w, m, r2)
+	if _, err := syscall.Write(writer, []byte("y")); err != syscall.EPIPE {
+		t.Fatalf("write after the guest closed the read end: %v, want EPIPE", err)
 	}
 }
