@@ -116,7 +116,7 @@ func newImageFile() (*os.File, error) {
 	const cloexec = 1 // MFD_CLOEXEC
 	fd, _, errno := syscall.Syscall(nr, uintptr(unsafe.Pointer(&name[0])), cloexec, 0)
 	if errno == 0 {
-		return os.NewFile(fd, "wasm2go-image"), nil
+		return raiseImageFile(os.NewFile(fd, "wasm2go-image")), nil
 	}
 	return newTempImageFile()
 }

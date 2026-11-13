@@ -1,0 +1,10 @@
+//go:build !darwin && !linux
+
+package {{.Pkg}}
+
+import "os"
+
+// raiseImageFile would move the descriptor of an image file out of the
+// numbers a program's own descriptors get; on this platform no guest has
+// the host's descriptor numbers, and the file stays as it is.
+func raiseImageFile(f *os.File) *os.File { return f }

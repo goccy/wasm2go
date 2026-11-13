@@ -32,6 +32,12 @@ var linuxTmpl string
 //go:embed sharedimage_nolinux.go.txt
 var nolinuxTmpl string
 
+//go:embed sharedimage_high.go.txt
+var highTmpl string
+
+//go:embed sharedimage_nohigh.go.txt
+var nohighTmpl string
+
 // Names are the identifiers the emitting package supplies.
 type Names struct {
 	Pkg     string // package clause of the generated files
@@ -47,8 +53,9 @@ type Names struct {
 }
 
 // Files renders the runtime: output filename → formatted Go source. The
-// files split by platform (mmap / no mmap, and whether the pages a process
-// changed can be told) and must be emitted together.
+// files split by platform (mmap / no mmap, whether the pages a process
+// changed can be told, and whether an image file's descriptor is kept out
+// of the low numbers) and must be emitted together.
 func Files(n Names) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	for name, src := range map[string]string{
@@ -57,6 +64,8 @@ func Files(n Names) (map[string][]byte, error) {
 		"sharedimage_nommap.go": nommapTmpl,
 		"sharedimage_linux.go":  linuxTmpl,
 		"sharedimage_other.go":  nolinuxTmpl,
+		"sharedimage_high.go":   highTmpl,
+		"sharedimage_nohigh.go": nohighTmpl,
 	} {
 		t, err := template.New(name).Parse(src)
 		if err != nil {

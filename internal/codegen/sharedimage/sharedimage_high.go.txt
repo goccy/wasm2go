@@ -1,0 +1,36 @@
+//go:build darwin || linux
+
+package {{.Pkg}}
+
+import (
+	"os"
+	"syscall"
+)
+
+// raiseImageFile moves the descriptor of an image file out of the numbers
+// a program's own descriptors get, and returns the file under its new
+// number. A guest that is the host process has the host's descriptor
+// numbers, lowest free first: a file the runtime keeps open for itself
+// would take a number the program expects to get, and would be within the
+// reach of a program that closes every descriptor it did not open. The new
+// number is in the upper quarter of what the process may have open, above
+// where the WASI host puts its own descriptors and stops taking numbers for
+// the guest's. Where the descriptor cannot be moved, the file stays as it
+// is.
+func raiseImageFile(f *os.File) *os.File {
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		return f
+	}
+	floor := limit.Cur / 4 * 3
+	if floor > 1<<20 {
+		floor = 1 << 20
+	}
+	fd, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), syscall.F_DUPFD_CLOEXEC, uintptr(floor))
+	if errno != 0 {
+		return f
+	}
+	name := f.Name()
+	_ = f.Close()
+	return os.NewFile(fd, name)
+}

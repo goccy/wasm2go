@@ -134,13 +134,10 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 	if !mmapSupported {
 		return &SharedImage{err: fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")}
 	}
-	f, err := os.CreateTemp("", "wasm2go-image-*")
+	f, err := newTempImageFile()
 	if err != nil {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
-	// Unlink now: the image must never be reachable by name. The pages live
-	// as long as we hold the descriptor.
-	_ = os.Remove(f.Name())
 	if err := f.Truncate(int64(ceiling)); err != nil {
 		f.Close()
 		return &SharedImage{err: fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)}
@@ -235,13 +232,10 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 		globals = {{.SaveGlobals}}(m)
 	}
 
-	f, err := os.CreateTemp("", "wasm2go-image-*")
+	f, err := newTempImageFile()
 	if err != nil {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
-	// Unlink now: the image must never be reachable by name. The pages live
-	// as long as we hold the descriptor.
-	_ = os.Remove(f.Name())
 	if _, err := f.Write(img); err != nil {
 		f.Close()
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
@@ -414,14 +408,16 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 type pageRun struct{ from, to uint64 }
 
 // newTempImageFile returns an empty temporary file that has no name any
-// more: the pages live as long as the descriptor or a mapping of it.
+// more — the image must never be reachable by name: the pages live as long
+// as the descriptor or a mapping of it. The descriptor is one of the
+// runtime's own, out of the way of a program's (raiseImageFile).
 func newTempImageFile() (*os.File, error) {
 	f, err := os.CreateTemp("", "wasm2go-image-*")
 	if err != nil {
 		return nil, err
 	}
 	_ = os.Remove(f.Name())
-	return f, nil
+	return raiseImageFile(f), nil
 }
 
 // UnmapMemory releases a mapping returned by SharedImage.Memory. Calling it on
