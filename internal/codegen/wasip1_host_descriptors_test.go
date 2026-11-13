@@ -381,13 +381,12 @@ func TestHostDescriptors_ForkedProcessesShareNumbersUntilTheyDiverge(t *testing.
 
 }
 
-// A new descriptor has the lowest number that is free for the process that
-// makes it, whatever the other processes of the family hold: a program that
-// closes its standard output and opens a file gets the file as descriptor 1.
-// Where a forked process still has its own descriptor under that number, the
-// host keeps that one for it, and the new file is under the number in the
-// process that opened it only.
-func TestHostDescriptors_ANewDescriptorTakesTheNumberAnotherProcessStillHolds(t *testing.T) {
+// A new descriptor above the standard ones is a descriptor of the host
+// under its number, whatever the other processes of the family hold: the
+// number is what a program hands to a native library. A parent that closed
+// a descriptor its fork child still has does not get that number for its
+// next one — under it the host has the child's file.
+func TestHostDescriptors_ANewDescriptorIsTheHostsWhileAnotherProcessHoldsALowerNumber(t *testing.T) {
 	const out int32 = 5300
 	for _, tc := range []struct {
 		name string
@@ -428,17 +427,14 @@ func TestHostDescriptors_ANewDescriptorTakesTheNumberAnotherProcessStillHolds(t 
 			// The parent closes a descriptor the child still has.
 			closeTestFd(t, w, m, kept)
 			made := tc.make(t, w, m)
-			lowest := made[0]
 			for _, fd := range made {
-				if fd < lowest {
-					lowest = fd
+				if fd == kept {
+					t.Fatalf("after closing %d the parent's new descriptors are %v: under %d the host has the child's file", kept, made, kept)
 				}
-			}
-			if lowest != kept {
-				t.Fatalf("after closing %d the parent's new descriptors are %v: the lowest free number is %d", kept, made, kept)
+				guestIsHost(t, w, fd)
 			}
 			// The child's descriptor is what it was, and is the host's
-			// under the number; the parent's has none outside the parent.
+			// under the number.
 			if rc := fdWriteString(child, cm, kept, "still open"); rc != _wasiESUCCESS {
 				t.Fatalf("child's write through the descriptor the parent closed rc=%d", rc)
 			}
@@ -448,16 +444,12 @@ func TestHostDescriptors_ANewDescriptorTakesTheNumberAnotherProcessStillHolds(t 
 			if !sameFile(t, guestIsHost(t, child, kept), filepath.Join(dir, "kept.txt")) {
 				t.Fatalf("descriptor %d of the host is no longer the child's file", kept)
 			}
-			if host, ok := w.HostDescriptor(kept); ok {
-				t.Fatalf("the parent's own file under %d is descriptor %d of the host", kept, host)
-			}
 			guestIsHost(t, w, above)
 
 			// Once every process has closed the descriptor, the number is
 			// free in the process, and the next descriptor is the host's
 			// under its number.
 			closeTestFd(t, child, cm, kept)
-			closeTestFd(t, w, m, kept)
 			if again := createTestFile(t, child, "again.txt"); again != kept {
 				t.Fatalf("the child's next descriptor is %d, want %d", again, kept)
 			} else {

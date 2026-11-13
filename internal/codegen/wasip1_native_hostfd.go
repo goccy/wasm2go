@@ -1262,24 +1262,31 @@ func hostOwner(fd int) (op *wasiOpen, reserved bool) {
 
 // addHostFDLocked enters op, a new entry that is a descriptor of the host
 // process, in the instance's table and returns the number the guest knows
-// it by: the lowest number that is free for the instance, as POSIX has it
-// for every new descriptor. A program counts on that — it closes its
-// standard output and opens the file that is to take its place.
+// it by.
 //
-// Almost always that number is the descriptor's own: the host gave it the
-// lowest number that is free in the process. The two differ where the
-// instance's table and the process's do not agree:
+// Above the standard descriptors that number is always the descriptor's
+// own, the lowest that is free for the instance and in the process. A
+// number above 2 means nothing but the descriptor, and a program hands it
+// to code outside the guest as that: a native library is given fileno of a
+// socket and reads the descriptor of the host under that number. A number
+// another process of the family still has its descriptor under is
+// therefore not given out, although the instance has nothing there — the
+// parent that closed the connection its fork child serves gets the next
+// number for the connection it accepts next, not the child's.
 //
-//   - a lower number is free for the instance while another process of the
-//     family still has its descriptor there (a parent closed what its fork
-//     child still uses, or the other way round). The instance gets that
-//     number, and the descriptor is moved above the range programs use: it
-//     has no number outside the guest, like the file dup2 puts under such
-//     a number (dup2HostLocked);
-//   - the instance has something else under the descriptor's number — a
-//     stream of the embedder's, a file it holds under a number that was
-//     another process's. The descriptor is moved to the instance's lowest
-//     free number, where that is free in the process as well.
+// 0, 1 and 2 mean the standard streams by their numbers, and a program
+// counts on getting them: it closes its standard output and opens the file
+// that is to take its place. There the number is the lowest that is free
+// for the instance, as POSIX has it, also where another process of the
+// family (or the host process itself, for a standard descriptor the
+// instance was not given) still has a descriptor under it: the descriptor
+// is moved above the range programs use and has no number outside the
+// guest, like the file dup2 puts under such a number (dup2HostLocked).
+//
+// Where the instance has something else under the descriptor's own number
+// (a stream of the embedder's, a file it holds under a number that was
+// another process's), the descriptor is moved to the instance's lowest
+// free number that is free in the process as well.
 //
 // Caller holds w.mu.
 func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
@@ -1311,7 +1318,7 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 			number = n
 			break
 		}
-		if w.othersNumberLocked(n) {
+		if n <= 2 && w.othersNumberLocked(n) {
 			moved, err := hostDup(fd, floor)
 			if err != nil {
 				return -1, err
@@ -1324,9 +1331,10 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 			return int32(n), nil
 		}
 		if n < fd {
-			// Open in the process and nobody's among the guests: the
-			// runtime's, or one that code outside the guest made, which is
-			// the instance's under this number once it is used.
+			// Open in the process: another process of the family has
+			// its descriptor there, or it is the runtime's, or one that
+			// code outside the guest made, which is the instance's under
+			// this number once it is used.
 			continue
 		}
 		// Above the descriptor's own number, which the instance has
@@ -1355,15 +1363,15 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 	return int32(number), nil
 }
 
-// othersNumberLocked reports whether fd, a number the instance's table has
-// nothing under, is in the process the descriptor of somebody the instance
-// never sees there: another guest's entry (a process of the family that
-// still has what this one closed), or a standard descriptor of the process
-// that the instance was not given. Such a number is free for the instance,
-// and what it puts there has no number outside it. A descriptor of the
-// runtime's own is not one of these — no guest gets that number — and
-// neither is one that code outside the guest made, which is the instance's
-// under its number. Caller holds w.mu.
+// othersNumberLocked reports whether fd, the number of a standard
+// descriptor that the instance's table has nothing under, is in the process
+// the descriptor of somebody the instance never sees there: another guest's
+// entry (a process of the family that still has what this one closed), or
+// a standard descriptor of the process that the instance was not given.
+// Such a number is free for the instance, and what it puts there has no
+// number outside it. A descriptor of the runtime's own is not one of these
+// — no guest gets that number — and neither is one that code outside the
+// guest made, which is the instance's under its number. Caller holds w.mu.
 func (w *WasiStubs) othersNumberLocked(fd int) bool {
 	if fd <= 2 && (w.standard == nil || w.standard.kept[fd] < 0) {
 		return true
