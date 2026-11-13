@@ -3035,12 +3035,44 @@ const (
 	_wasiESRCH           int32 = 71
 )
 
+// wasiErrnoHostOnly marks an errno the guest is given as an error number of
+// the host's that wasi has no number for (EHOSTDOWN, ENOTBLK, ENODATA): the
+// number is in the bits below the mark. No wasi errno has the bit (they end
+// at 76), and the marked value fits the 16 bits of a wasi errno. A guest
+// that shows its program the host's numbers shows the number; any other
+// guest treats a marked errno as EIO, which is what such an error was
+// reported as before.
+const wasiErrnoHostOnly int32 = 0x4000
+
+// wasiHostOnlyErrno returns the marked errno for an error number of the
+// host's that wasi has none for; ok is false for a number that cannot be
+// carried, and where the host's errors are not told apart by number at all
+// (no table of them: see wasiErrno).
+func wasiHostOnlyErrno(number syscall.Errno) (errno int32, ok bool) {
+	if !hostErrnoKnown() || number <= 0 || int64(number) >= int64(wasiErrnoHostOnly) {
+		return 0, false
+	}
+	return wasiErrnoHostOnly | int32(number), true
+}
+
 // mapOSError turns an os/filesystem error into a wasi errno. Used by the
 // path-based syscalls so any os.PathError surfaces as the appropriate
 // guest-visible code instead of a coarse EIO.
 func mapOSError(err error) int32 {
 	if err == nil {
 		return _wasiESUCCESS
+	}
+	// The error number of the system call that failed says exactly which
+	// error it is; what follows tells only the kinds package os knows
+	// apart.
+	var number syscall.Errno
+	if errors.As(err, &number) {
+		if wasi, ok := wasiErrno(number); ok {
+			return wasi
+		}
+		if hostOnly, ok := wasiHostOnlyErrno(number); ok {
+			return hostOnly
+		}
 	}
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -6698,6 +6730,49 @@ func (w *WasiStubs) group() int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.groupLocked()
+}
+
+// Host_numbering is a NON-STANDARD host import (name "host_numbering"): it
+// tells the guest whose numbers its program sees. 0: the numbers of the
+// guest's own C library. 1: the host operating system's, which the guest
+// obtains with host_number_at; so for a guest that is the host process
+// (SetHostProcess) and for the processes it forks.
+func (w *WasiStubs) Host_numbering(m *Module) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.hostProcess {
+		return 1
+	}
+	return 0
+}
+
+// Host_number_at is a NON-STANDARD host import (name "host_number_at"): the
+// index-th number of a family of the host operating system's numbers. The
+// families are numbered as in the wasip1_hostnumbers_* tables (1 is the
+// error numbers). The name the number has in C is written at namePtr (at
+// most nameCap bytes, no terminator) and its length at nameLenPtr (u32);
+// the number at valuePtr (i64). Returns 0, or a negative errno: ENOENT
+// past the last number of the family (at index 0: the host has no table of
+// it), ERANGE for a name longer than nameCap.
+func (w *WasiStubs) Host_number_at(m *Module, family, index, namePtr, nameCap, nameLenPtr, valuePtr int32) int32 {
+	table := hostNumberTable(family)
+	if index < 0 || int(index) >= len(table) {
+		return -_wasiENOENT
+	}
+	number := table[index]
+	if int64(len(number.name)) > int64(nameCap) {
+		return -_wasiERANGE
+	}
+	name := w.memSlice(m, namePtr, int32(len(number.name)))
+	nameLen := w.memSlice(m, nameLenPtr, 4)
+	value := w.memSlice(m, valuePtr, 8)
+	if name == nil || nameLen == nil || value == nil {
+		return -_wasiEFAULT
+	}
+	copy(name, number.name)
+	binary.LittleEndian.PutUint32(nameLen, uint32(len(number.name)))
+	binary.LittleEndian.PutUint64(value, uint64(number.value))
+	return 0
 }
 
 // isHostProcess reports whether the instance is the host process itself:
@@ -10644,6 +10719,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"memSplit":                  true,
 			"memSlice":                  true,
 			"mapOSError":                true,
+			"wasiHostOnlyErrno":         true,
 			"mapExecError":              true,
 			"encodeWaitStatus":          true,
 			"totalBytesPlusNul":         true,
@@ -10814,6 +10890,14 @@ var (
 	wasip1NativeDarwinRaw []byte
 	//go:embed wasip1_native_other.go
 	wasip1NativeOtherRaw []byte
+	//go:embed wasip1_hostnumbers_linux.go
+	wasip1HostNumbersLinuxRaw []byte
+	//go:embed wasip1_hostnumbers_linux_headers.go
+	wasip1HostNumbersLinuxHeadersRaw []byte
+	//go:embed wasip1_hostnumbers_linux_noheaders.go
+	wasip1HostNumbersLinuxNoHeadersRaw []byte
+	//go:embed wasip1_hostnumbers_darwin.go
+	wasip1HostNumbersDarwinRaw []byte
 )
 
 // emitWasip1Platform returns the per-platform companions of the native wasi
@@ -10831,6 +10915,11 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
 		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
 		"wasip1_native_other.go":  wasip1NativeOtherRaw,
+
+		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
+		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,
+		"wasip1_hostnumbers_linux_noheaders.go": wasip1HostNumbersLinuxNoHeadersRaw,
+		"wasip1_hostnumbers_darwin.go":          wasip1HostNumbersDarwinRaw,
 	} {
 		out[name] = bytes.Replace(raw, []byte("\npackage codegen\n"), []byte("\npackage "+pkg+"\n"), 1)
 	}

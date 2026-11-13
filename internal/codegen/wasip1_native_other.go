@@ -197,3 +197,22 @@ func awaitHostExit(pid int) (status int32, ended bool) { return 0, false }
 // do on this platform: the guest's clock counts from the start of the
 // instance.
 func hostMonotonic() (time.Duration, bool) { return 0, false }
+
+// hostNumber is a number of the operating system under its name in C.
+type hostNumber struct {
+	name  string
+	value int64
+}
+
+// hostNumberTable returns the numbers of a family of the host's numbers:
+// none on this platform, where a guest keeps the numbers of its C library.
+func hostNumberTable(family int32) []hostNumber { return nil }
+
+// wasiErrno returns the wasi errno of an error number of the host, and
+// whether wasi has that error; on this platform the errors are told apart
+// by what package os makes of them.
+func wasiErrno(e syscall.Errno) (int32, bool) { return 0, false }
+
+// hostErrnoKnown reports whether the host's error numbers are known by
+// name on this platform: they are not.
+func hostErrnoKnown() bool { return false }
