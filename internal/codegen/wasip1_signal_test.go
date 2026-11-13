@@ -473,6 +473,65 @@ func TestSignal_TimerRepeatsAtItsInterval(t *testing.T) {
 	}
 }
 
+// A wait that ends by its timeout after the moment the interval timer was
+// set for finds the signal posted, whether or not the host's own timer has
+// run by then: the two happen in the order of their times. The test stands
+// in for a host timer that is late by setting the timer far ahead and then
+// moving the moment it is due into the past.
+func TestSignal_TimerDueBeforeAWaitEndsIsPostedFirst(t *testing.T) {
+	overdue := func(w *WasiStubs) {
+		w.mu.Lock()
+		w.sig.timerAt = time.Now().Add(-time.Millisecond)
+		w.mu.Unlock()
+	}
+
+	// The wait was in progress when the timer came due.
+	w, m := newSignalGuest(t, wasiSIGALRM)
+	setTimer(t, w, m, time.Hour, 0)
+	if !w.beginBlocking(func() {}) {
+		t.Fatal("a wait before the timer is due did not begin")
+	}
+	overdue(w)
+	if !w.endBlocking() {
+		t.Fatal("a wait that ended after the timer was due was not interrupted")
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+		t.Fatalf("taken = %#x, want SIGALRM", got)
+	}
+	if left, every := timerState(t, w, m); left != 0 || every != 0 {
+		t.Fatalf("%v left (every %v) after a one-shot timer fired", left, every)
+	}
+
+	// The timer was due before the wait began.
+	w, m = newSignalGuest(t, wasiSIGALRM)
+	setTimer(t, w, m, time.Hour, 0)
+	overdue(w)
+	if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep after the timer was due rc=%d, want EINTR", rc)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+		t.Fatalf("taken = %#x, want SIGALRM", got)
+	}
+
+	// A repeating timer goes on at its interval, and is posted once.
+	w, m = newSignalGuest(t, wasiSIGALRM)
+	setTimer(t, w, m, time.Hour, time.Hour)
+	overdue(w)
+	if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep after the repeating timer was due rc=%d, want EINTR", rc)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+		t.Fatalf("taken = %#x, want SIGALRM", got)
+	}
+	if left, every := timerState(t, w, m); left <= 59*time.Minute || left > time.Hour || every != time.Hour {
+		t.Fatalf("state = %v left, every %v; want about an hour, every hour", left, every)
+	}
+	if rc := sleepPoll(w, m, 50*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep before the next firing rc=%d", rc)
+	}
+	setTimer(t, w, m, 0, 0)
+}
+
 func TestSignal_TimerRejectsNegativeTimes(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGALRM)
 	if rc := w.Proc_itimer(m, 1, -1, 0, sigValueOff); rc != -_wasiEINVAL {

@@ -8265,12 +8265,17 @@ const wasiSignalsHeldByRuntime = uint64(1)<<(3-1) | // SIGQUIT
 // and registers as soon as it runs, so a signal posted in between — a parent
 // that kills its child right after forking it — is kept for it.
 func (w *WasiStubs) PostSignal(sig int32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.postSignalLocked(sig)
+}
+
+// postSignalLocked is PostSignal for a caller that holds w.mu.
+func (w *WasiStubs) postSignalLocked(sig int32) {
 	bit := wasiSignalBit(sig)
 	if bit == 0 {
 		return
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	s := &w.sig
 	if s.flagModule == nil {
 		if w.forked {
@@ -8318,6 +8323,7 @@ func (w *WasiStubs) raiseSignalFlagLocked() {
 func (w *WasiStubs) beginBlocking(wake func()) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.fireDueTimerLocked()
 	if w.sig.interrupt || w.sig.killPending() {
 		w.sig.interrupt = false
 		return false
@@ -8332,6 +8338,7 @@ func (w *WasiStubs) endBlocking() (interrupted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sig.wake = nil
+	w.fireDueTimerLocked()
 	interrupted = w.sig.interrupt || w.sig.killPending()
 	w.sig.interrupt = false
 	return interrupted
@@ -8479,30 +8486,50 @@ func (w *WasiStubs) timerStateLocked() (left, every time.Duration) {
 // host was late for are not made up one by one — the signal would only be
 // pending once anyway. Caller holds w.mu and has stopped any earlier timer.
 func (w *WasiStubs) startTimerLocked(value, every time.Duration) {
+	// The moment is taken before the host's timer is set, so that the
+	// host's timer never runs ahead of it.
+	at := time.Now().Add(value)
 	var timer *time.Timer
 	timer = time.AfterFunc(value, func() {
 		w.mu.Lock()
-		s := &w.sig
-		due := s.timer == timer
-		if due {
-			if s.timerEvery > 0 {
-				now := time.Now()
-				next := s.timerAt.Add(s.timerEvery)
-				if !next.After(now) {
-					next = now.Add(s.timerEvery)
-				}
-				s.timerAt = next
-				timer.Reset(next.Sub(now))
-			} else {
-				s.timer = nil
-			}
-		}
-		w.mu.Unlock()
-		if due {
-			w.PostSignal(wasiSIGALRM)
+		defer w.mu.Unlock()
+		if w.sig.timer == timer {
+			w.fireDueTimerLocked()
 		}
 	})
-	w.sig.timer, w.sig.timerAt, w.sig.timerEvery = timer, time.Now().Add(value), every
+	w.sig.timer, w.sig.timerAt, w.sig.timerEvery = timer, at, every
+}
+
+// fireDueTimerLocked makes the firing of the interval timer whose time has
+// come: SIGALRM is posted, and the timer is set for its next firing or is
+// over. The host's own timer does this when it runs, which is some time
+// after the moment it was set for; a blocking call of the guest's does it
+// when it begins and when it ends, so that the guest sees the two in the
+// order of their times — a wait that ended by a timeout later than the
+// timer's time ends after the signal was posted, as it does when a kernel
+// keeps both (alarm(1); sleep(1) finds its handler run when sleep is over).
+// Caller holds w.mu.
+func (w *WasiStubs) fireDueTimerLocked() {
+	s := &w.sig
+	if s.timer == nil {
+		return
+	}
+	now := time.Now()
+	if s.timerAt.After(now) {
+		return
+	}
+	if s.timerEvery > 0 {
+		next := s.timerAt.Add(s.timerEvery)
+		if !next.After(now) {
+			next = now.Add(s.timerEvery)
+		}
+		s.timerAt = next
+		s.timer.Reset(next.Sub(now))
+	} else {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	w.postSignalLocked(wasiSIGALRM)
 }
 
 // stopTimerLocked disarms the interval timer, if one is set. Caller holds
