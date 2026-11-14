@@ -388,3 +388,7 @@ func (w *WasiStubs) Tty_pgrp(m *Module, fd, set, pgrp, outPtr int32) int32 {
 func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, resultPtr int32) int32 {
 	return -_wasiENOSYS
 }
+
+// forwardSIGPIPEToIgnore has nothing to do on a platform whose signals the
+// runtime does not follow.
+func forwardSIGPIPEToIgnore() {}

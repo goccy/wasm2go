@@ -6562,6 +6562,7 @@ const (
 func (w *WasiStubs) SetHostProcess(on bool) {
 	if on {
 		KeepRuntimeDescriptorsHigh()
+		forwardSIGPIPEToIgnore()
 	}
 	w.mu.Lock()
 	w.hostProcess = on
@@ -8642,16 +8643,24 @@ func (w *WasiStubs) detachSignalsLocked() {
 // the action it has in a Go program that never touched it. Package signal
 // has no way back from Ignore: Reset leaves the signal ignored — for the
 // process, and for every command it starts from then on, which inherits
-// the ignoring — and a subscription that is taken and dropped again puts
-// the runtime's handler back for most signals but not for SIGHUP and
-// SIGINT, which the runtime leaves ignored when it finds them so. So the
-// kernel is told first that the signal has its default action
-// (defaultSignalAction), and the runtime then installs its handler over
-// that, as it did when the program started.
+// the ignoring. A subscription that is taken and dropped again puts the
+// runtime's handler back, over the ignoring, for every signal but SIGHUP
+// and SIGINT: those two the runtime leaves ignored when it finds them so
+// (it respects an ignoring the process may have inherited). For those two
+// the kernel is told first that the signal has its default action
+// (defaultSignalAction), and the runtime then does what it did when the
+// program started.
+//
+// No other signal goes through its default action on the way: the process
+// can get the signal at any moment, and for some the default action ends
+// it — SIGPIPE comes at every write of the process (another process of the
+// family, the runtime, a library) into a closed pipe.
 func restoreHostSignal(sig syscall.Signal) {
-	if err := defaultSignalAction(sig); err != nil {
-		signal.Reset(sig)
-		return
+	if sig == syscall.SIGHUP || sig == syscall.SIGINT {
+		if err := defaultSignalAction(sig); err != nil {
+			signal.Reset(sig)
+			return
+		}
 	}
 	taken := make(chan os.Signal, 1)
 	signal.Notify(taken, sig)

@@ -474,6 +474,53 @@ func TestProbeWithNoTimeLeftFindsWhatIsThere(t *testing.T) {
 	}
 }
 
+// A guest that takes to ignoring SIGPIPE and stops again does not end the
+// host process on the way: neither the signal's default action nor the
+// action the Go runtime forwards a signal to while it is not handling it
+// (the default action, unless forwardSIGPIPEToIgnore has run) is in place
+// at any moment. The process writes into closed pipes all the while —
+// another process of the family, the runtime, a library — and the default
+// action of SIGPIPE ends a process at such a write.
+//
+// Linux only: on darwin, a Go program that has SIGPIPE ignored and taken
+// back over and over while it writes into a closed pipe dies of SIGBUS
+// inside the runtime, with no code of the runtime here involved (a program
+// of a few lines that calls signal.Ignore, signal.Notify and signal.Stop in
+// a loop does).
+func TestHostProcessStopsIgnoringSIGPIPEWithoutEndingOnTheWay(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("darwin's Go runtime does not survive SIGPIPE taken back over and over while it comes")
+	}
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = syscall.Close(p[0])
+	defer syscall.Close(p[1])
+	w, m := newSignalGuest(t)
+	w.SetHostProcess(true)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = syscall.Write(p[1], []byte("x"))
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		setDispositions(t, w, m, 0, signalMask(wasiSIGPIPE), 0)
+		setDispositions(t, w, m, 0, 0, 0)
+	}
+	close(stop)
+	<-done
+	w.CloseAll()
+}
+
 // A signal the guest ignores is ignored by the host process, and by the
 // commands it starts meanwhile, which inherit that. When the guest stops
 // ignoring the signal, and when the instance is closed, the signal has its

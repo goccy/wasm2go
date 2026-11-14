@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
 	"syscall"
@@ -650,3 +651,24 @@ func wasiErrno(e syscall.Errno) (int32, bool) {
 // hostErrnoKnown reports whether the host's error numbers are known by
 // name on this platform (see wasiErrno).
 func hostErrnoKnown() bool { return len(wasiErrnoOfHost()) > 0 }
+
+var sigpipeForwardedToIgnore sync.Once
+
+// forwardSIGPIPEToIgnore makes the Go runtime's action for a SIGPIPE it is
+// not handling at that moment "ignore". The runtime forwards such a signal
+// to the action the process had when the runtime took the signal over —
+// the default action for SIGPIPE, which ends the process. signal.Ignore
+// stops the handling before it has the kernel ignore the signal, so a
+// SIGPIPE in between ends the process: one that a write of another process
+// of the family, of the runtime or of a library into a closed pipe raises
+// while the guest takes to ignoring SIGPIPE. A subscription taken after an
+// Ignore records "ignore" as the action it replaces, and every Ignore after
+// that forwards there. So the runtime does that once, when the guest
+// becomes the host process and before its program runs, and gives SIGPIPE
+// back the handling a Go program has for it.
+func forwardSIGPIPEToIgnore() {
+	sigpipeForwardedToIgnore.Do(func() {
+		signal.Ignore(syscall.SIGPIPE)
+		restoreHostSignal(syscall.SIGPIPE)
+	})
+}
