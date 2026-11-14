@@ -2096,7 +2096,7 @@ func (o osFS) OpenDescriptor(name string, flag int, perm os.FileMode) (File, err
 		}
 		return newHostFile(fd, uint32(st.Mode), path), nil
 	}
-	if flag&os.O_CREATE != 0 && perm&processUmask != 0 {
+	if flag&os.O_CREATE != 0 && perm&processUmask() != 0 {
 		// See osFS.OpenFile.
 		for i := 0; i < osCreateAttempts; i++ {
 			fd, err := open(flag | os.O_EXCL)

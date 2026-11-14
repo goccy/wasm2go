@@ -9,19 +9,32 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// processUmask is the file mode creation mask of the host process. The only
-// way to read it is to set it, so it is read once, while the program is
-// still initializing its packages and nothing creates files concurrently.
-var processUmask = readProcessUmask()
+// hostUmask is the file mode creation mask of the host process. The only
+// way to read the mask is to set it, so it is read once, while the program
+// is still initializing its packages and nothing creates files
+// concurrently; after that the runtime changes it only through
+// setProcessUmask, which keeps this value with it.
+var hostUmask atomic.Uint32
 
-func readProcessUmask() os.FileMode {
+func init() {
 	mask := syscall.Umask(0)
 	syscall.Umask(mask)
-	return os.FileMode(mask) & 0o777
+	hostUmask.Store(uint32(mask) & 0o777)
+}
+
+// processUmask returns the file mode creation mask of the host process.
+func processUmask() os.FileMode { return os.FileMode(hostUmask.Load()) }
+
+// setProcessUmask makes mask the file mode creation mask of the host
+// process.
+func setProcessUmask(mask os.FileMode) {
+	syscall.Umask(int(mask & 0o777))
+	hostUmask.Store(uint32(mask & 0o777))
 }
 
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the

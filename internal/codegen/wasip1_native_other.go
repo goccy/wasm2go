@@ -13,9 +13,13 @@ import (
 	"time"
 )
 
-// processUmask is the file mode creation mask of the host process. This
-// platform has none the runtime can read, so none is applied.
-var processUmask os.FileMode
+// processUmask returns the file mode creation mask of the host process.
+// This platform has none the runtime can read, so none is applied.
+func processUmask() os.FileMode { return 0 }
+
+// setProcessUmask would make mask the host process's file mode creation
+// mask; this platform has none.
+func setProcessUmask(mask os.FileMode) {}
 
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
 // os package returned. This platform's carries none the runtime knows how to

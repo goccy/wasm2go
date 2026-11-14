@@ -72,3 +72,62 @@ func TestHostProcessFollowsDirectoryAndEnvironment(t *testing.T) {
 		t.Fatal("the variable was not removed from the host process")
 	}
 }
+
+// hostCreatedMode creates a file the way code of the host does (not through
+// the guest) and returns its permission bits.
+func hostCreatedMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Mode().Perm()
+}
+
+// The host process follows the file mode creation mask of the guest that is
+// it, and of no other process of the family: a file that code of the host
+// creates for the program (a native extension's) gets the program's mask.
+func TestHostProcessFollowsUmask(t *testing.T) {
+	start := processUmask()
+	defer setProcessUmask(start)
+	dir := t.TempDir()
+	w, m := newProcTestStubs(t)
+
+	// an isolated guest: the host process keeps its mask
+	w.Proc_umask(m, 0o077)
+	if got := processUmask(); got != start {
+		t.Fatalf("the host process followed an isolated guest's umask: %o, want %o", got, start)
+	}
+	if got, want := hostCreatedMode(t, filepath.Join(dir, "isolated")), 0o666&^start; got != want {
+		t.Fatalf("file the host created = %o, want %o", got, want)
+	}
+
+	w.SetHostProcess(true)
+	defer w.SetHostProcess(false)
+	// a forked process: its mask is its own
+	child := w.Fork()
+	defer child.CloseAll()
+	child.Proc_umask(m, 0o007)
+	if got := processUmask(); got != start {
+		t.Fatalf("the host process followed a forked process's umask: %o, want %o", got, start)
+	}
+
+	if prev := w.Proc_umask(m, 0o070); os.FileMode(prev) != 0o077 {
+		t.Fatalf("umask returned %o, want the guest's previous mask 077", prev)
+	}
+	if got := processUmask(); got != 0o070 {
+		t.Fatalf("umask of the host process = %o, want 070", got)
+	}
+	if got := hostCreatedMode(t, filepath.Join(dir, "followed")); got != 0o606 {
+		t.Fatalf("file the host created = %o, want 606", got)
+	}
+	// the guest's own files are created as before
+	if got := os.FileMode(createWithMode(t, w, m, "guest", 0o666)); got != 0o606 {
+		t.Fatalf("file the guest created = %o, want 606", got)
+	}
+}

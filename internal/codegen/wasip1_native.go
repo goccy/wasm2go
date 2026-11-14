@@ -306,7 +306,7 @@ const osCreateAttempts = 4
 
 func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	path := o.join(name)
-	if flag&os.O_CREATE != 0 && perm&processUmask != 0 {
+	if flag&os.O_CREATE != 0 && perm&processUmask() != 0 {
 		// The process umask would take bits out of perm. A mode can only
 		// be put right on a file this call created, and only an exclusive
 		// create tells a new file from an existing one.
@@ -343,7 +343,7 @@ func (o osFS) Mkdir(name string, perm os.FileMode) error {
 	if err := os.Mkdir(path, perm); err != nil {
 		return err
 	}
-	if perm&processUmask == 0 {
+	if perm&processUmask() == 0 {
 		return nil
 	}
 	// Give back the bits the process umask took, keeping what the parent
@@ -4501,15 +4501,23 @@ func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
 // instance's file mode creation mask and returns the previous one. The
 // mask applies to every file and directory the instance creates from then
 // on, and a forked instance starts with its parent's (see Fork).
+//
+// When the guest is the host process (SetHostProcess) the host process
+// follows, as it does the working directory (Proc_chdir): code of the host
+// that runs for the program (a native extension creating a file) creates
+// with the mask the program set. A forked process's mask stays its own.
 func (w *WasiStubs) Proc_umask(m *Module, mask int32) int32 {
 	next := os.FileMode(uint32(mask) & 0o777)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	prev := processUmask
+	prev := processUmask()
 	if w.umask != nil {
 		prev = *w.umask
 	}
 	w.umask = &next
+	if w.hostProcess && !w.forked {
+		setProcessUmask(next)
+	}
 	return int32(prev)
 }
 
@@ -4521,7 +4529,7 @@ func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
 	if w.umask != nil {
 		return requested &^ *w.umask
 	}
-	return requested &^ processUmask
+	return requested &^ processUmask()
 }
 
 // Path_open_mode is a NON-STANDARD host import (module

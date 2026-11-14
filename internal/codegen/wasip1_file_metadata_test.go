@@ -288,12 +288,16 @@ func mkdirWithMode(t *testing.T, w *WasiStubs, m *Module, name string, mode int3
 // and requires every one to end up with its requested mode less the umask.
 func exerciseCreationModes(t *testing.T, w *WasiStubs, m *Module) {
 	t.Helper()
+	// A guest that is the host process takes the host process's mask with
+	// it (Proc_umask); the next test starts from the mask this one found.
+	start := processUmask()
+	defer setProcessUmask(start)
 	// Until the guest sets a umask, the host process's applies.
-	if got, want := createWithMode(t, w, m, "inherited", 0o666), uint32(0o666&^processUmask); got != want {
+	if got, want := createWithMode(t, w, m, "inherited", 0o666), uint32(0o666&^start); got != want {
 		t.Errorf("file under the process umask: %o, want %o", got, want)
 	}
-	if prev := w.Proc_umask(m, 0o027); os.FileMode(prev) != processUmask {
-		t.Errorf("first umask returned %o, want the process umask %o", prev, processUmask)
+	if prev := w.Proc_umask(m, 0o027); os.FileMode(prev) != start {
+		t.Errorf("first umask returned %o, want the process umask %o", prev, start)
 	}
 	if prev := w.Proc_umask(m, 0o027); prev != 0o027 {
 		t.Errorf("second umask returned %o, want 027", prev)
@@ -365,7 +369,7 @@ func TestWasi_CreationModeAppliesUmaskOnMemFS(t *testing.T) {
 
 func TestWasi_CreateThroughDanglingSymlinkUnderLooseUmask(t *testing.T) {
 	skipWithoutPOSIXFiles(t)
-	if processUmask == 0 {
+	if processUmask() == 0 {
 		t.Skip("the process umask takes no bits out of a mode")
 	}
 	dir := t.TempDir()
