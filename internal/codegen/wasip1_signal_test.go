@@ -223,6 +223,83 @@ func TestSignal_PendingSignalEndsTheNextBlockingCallAtOnce(t *testing.T) {
 	}
 }
 
+// While the guest runs code outside it (a native library it called), a
+// signal posted for it interrupts that code through what its runner
+// registered, once per signal; the guest's own blocking calls that follow
+// are not interrupted by it, and it is noticed as any signal is. A signal
+// the guest blocks or discards does nothing to the code; a blocking call of
+// the guest's own made from inside the code (a callback) is ended as
+// always. Registrations nest.
+func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGUSR2)
+	var outer, inner int
+	if prev := w.SetOutsideInterrupt(func() { outer++ }); prev != nil {
+		t.Fatal("something was registered before the first registration")
+	}
+	w.PostSignal(wasiSIGUSR1)
+	if outer != 1 {
+		t.Fatalf("interrupt called %d times for one signal, want 1", outer)
+	}
+	if flag := signalFlag(m); flag != 1 {
+		t.Fatalf("flag = %d, want 1", flag)
+	}
+	start := time.Now()
+	if rc := sleepPoll(w, m, 40*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("a sleep after the signal interrupted the code outside rc=%d, want success", rc)
+	}
+	if d := time.Since(start); d < 30*time.Millisecond {
+		t.Fatalf("the sleep ended after %v", d)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("taken = %#x, want %#x", got, want)
+	}
+
+	// Blocked, and discarded by default.
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1, wasiSIGUSR2), 0, signalMask(wasiSIGUSR2))
+	w.PostSignal(wasiSIGUSR2)
+	w.PostSignal(wasiSIGCHLD)
+	if outer != 1 {
+		t.Fatalf("interrupt called for a blocked or discarded signal (%d calls)", outer)
+	}
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1, wasiSIGUSR2), 0, 0)
+	takeSignals(t, w, m)
+	signalFlag(m)
+
+	// A blocking call of the guest's made from inside the code.
+	postSoon(w, wasiSIGUSR1)
+	if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("a callback's sleep rc=%d, want EINTR", rc)
+	}
+	if outer != 1 {
+		t.Fatalf("interrupt called while a blocking call of the guest's waited (%d calls)", outer)
+	}
+	takeSignals(t, w, m)
+
+	// Nesting.
+	if prev := w.SetOutsideInterrupt(func() { inner++ }); prev == nil {
+		t.Fatal("the outer registration was not returned")
+	} else {
+		w.PostSignal(wasiSIGUSR1)
+		if inner != 1 || outer != 1 {
+			t.Fatalf("calls inner=%d outer=%d, want 1 1", inner, outer)
+		}
+		w.SetOutsideInterrupt(prev)
+	}
+	w.PostSignal(wasiSIGUSR1)
+	if inner != 1 || outer != 2 {
+		t.Fatalf("after the inner code returned: calls inner=%d outer=%d, want 1 2", inner, outer)
+	}
+	w.SetOutsideInterrupt(nil)
+	w.PostSignal(wasiSIGUSR1)
+	if outer != 2 {
+		t.Fatalf("interrupt called after the code returned (%d calls)", outer)
+	}
+	// With nothing outside, the signal is left for the next blocking call.
+	if rc := sleepPoll(w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep with a signal waiting rc=%d, want EINTR", rc)
+	}
+}
+
 func TestSignal_InterruptsPollOnAnIdlePipe(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1)
 	readFd, writeFd := newTestPipe(t, w, m)

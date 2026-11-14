@@ -8249,6 +8249,11 @@ type wasiSignals struct {
 	// wake ends the blocking call in progress early. Set by beginBlocking,
 	// called (once) by PostSignal.
 	wake func()
+	// outside interrupts the code outside the guest that the guest is
+	// running at the moment, if any (SetOutsideInterrupt): the host learns
+	// of such code only from the one who runs it, and only that one knows
+	// how to interrupt it.
+	outside func()
 	// timer is the running real-time interval timer (setitimer's
 	// ITIMER_REAL, which alarm and ualarm set as well), timerAt the time it
 	// fires next, and timerEvery the interval at which it fires again after
@@ -8364,7 +8369,39 @@ func (w *WasiStubs) postSignalLocked(sig int32) {
 	if wake := s.wake; wake != nil {
 		s.wake = nil
 		wake()
+	} else if s.outside != nil {
+		// The guest is in code outside it: the signal interrupts that
+		// code where it stands — a system call it is waiting in ends with
+		// EINTR — and is noticed when the code has returned, as a signal
+		// delivered while a process runs a library's code is. It has
+		// interrupted the call in progress: the guest's own blocking
+		// calls that follow do not end by it.
+		s.interrupt = false
+		s.outside()
 	}
+}
+
+// SetOutsideInterrupt registers interrupt as what a signal posted for the
+// guest does while the guest runs code outside it: code the host runs for
+// the guest on its goroutine that has not returned yet — a native library
+// the guest called, say, which may be waiting in a system call. A signal
+// interrupts a process's system call wherever the process is; the guest's
+// own blocking calls are ended by the host, code outside the guest by
+// interrupt, which ends a system call that code is waiting in (or does
+// nothing when it is in none). PostSignal calls it, from another goroutine
+// and with the signal state locked, for each signal it posts that the guest
+// neither blocks nor discards while no blocking call of the guest's own is
+// waiting. nil registers nothing.
+//
+// It returns what was registered before, for the caller to put back when
+// the code returns: such code can call back into the guest, which can run
+// code outside it again. Once SetOutsideInterrupt has returned, an
+// interrupt that was replaced is not called any more.
+func (w *WasiStubs) SetOutsideInterrupt(interrupt func()) (previous func()) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	previous, w.sig.outside = w.sig.outside, interrupt
+	return previous
 }
 
 // raiseSignalFlagLocked stores 1 in the guest's flag word. The guest runs on
