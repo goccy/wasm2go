@@ -10435,6 +10435,76 @@ func (w *WasiStubs) writeSockAddr(m *Module, ptr int32, family int32, addr net.A
 	return _wasiESUCCESS
 }
 
+// writeSockAddrRecord writes a into rec as an address record.
+func writeSockAddrRecord(rec []byte, a wasiSockAddr) {
+	for i := range rec {
+		rec[i] = 0
+	}
+	binary.LittleEndian.PutUint32(rec[0:], uint32(a.family))
+	switch a.family {
+	case wasiSockFamilyUnix:
+		binary.LittleEndian.PutUint32(rec[28:], uint32(len(a.name)))
+		copy(rec[32:32+wasiSockAddrNameMax], a.name)
+	case wasiSockFamilyIPv6:
+		binary.LittleEndian.PutUint32(rec[4:], uint32(a.port))
+		copy(rec[8:24], a.ip.To16())
+		binary.LittleEndian.PutUint32(rec[24:], a.scope)
+	case wasiSockFamilyIPv4:
+		binary.LittleEndian.PutUint32(rec[4:], uint32(a.port))
+		copy(rec[8:12], a.ip.To4())
+	}
+}
+
+// Sock_addr_to_host is a NON-STANDARD host import (name
+// "sock_addr_to_host"): the address of the record at recordPtr as the
+// host's C library has it in a struct sockaddr — the bytes a native library
+// of the host's makes and takes, and so the packed addresses a guest that
+// is the host process shows its program. The bytes are written at outPtr,
+// which has room for outCap, and their number at outLenPtr (u32). Returns 0
+// or a negative errno: EAFNOSUPPORT for a record of no family the host has,
+// ERANGE where the room is too small.
+func (w *WasiStubs) Sock_addr_to_host(m *Module, recordPtr, outPtr, outCap, outLenPtr int32) int32 {
+	a, errno := w.readSockAddr(m, recordPtr)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	raw := hostSockaddrBytes(a)
+	if raw == nil {
+		return -_wasiEAFNOSUPPORT
+	}
+	if outCap < 0 || len(raw) > int(outCap) {
+		return -_wasiERANGE
+	}
+	out := w.memSlice(m, outPtr, int32(len(raw)))
+	lenOut := w.memSlice(m, outLenPtr, 4)
+	if out == nil || lenOut == nil {
+		return -_wasiEFAULT
+	}
+	copy(out, raw)
+	binary.LittleEndian.PutUint32(lenOut, uint32(len(raw)))
+	return _wasiESUCCESS
+}
+
+// Sock_addr_from_host is a NON-STANDARD host import (name
+// "sock_addr_from_host"), the reverse of Sock_addr_to_host: the struct
+// sockaddr of the host's C library in the inLen bytes at inPtr, as an
+// address record at recordPtr. Returns 0 or a negative errno: EAFNOSUPPORT
+// for a family the records have no form for (the bytes are no address of
+// the guest's then), EINVAL for bytes too few for their family.
+func (w *WasiStubs) Sock_addr_from_host(m *Module, inPtr, inLen, recordPtr int32) int32 {
+	in := w.memSlice(m, inPtr, inLen)
+	rec := w.memSlice(m, recordPtr, wasiSockAddrSize)
+	if in == nil || rec == nil || inLen < 0 {
+		return -_wasiEFAULT
+	}
+	a, errno := sockAddrOfHostBytes(in)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	writeSockAddrRecord(rec, a)
+	return _wasiESUCCESS
+}
+
 // socketFamily returns the address family of a socket entry: the one it was
 // made with, or, for a connection or a listener the embedder handed in, the
 // family of its address.
@@ -11443,6 +11513,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"socketIPv4":                true,
 			"ipv4SockAddr":              true,
 			"scopeOfZone":               true,
+			"writeSockAddrRecord":       true,
 			"awaitDial":                 true,
 			"sendDatagram":              true,
 			"userRecord":                true,

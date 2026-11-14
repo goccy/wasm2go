@@ -3,7 +3,9 @@
 package codegen
 
 import (
+	"bytes"
 	"encoding/binary"
+	"net"
 	"sync"
 	"syscall"
 	"time"
@@ -404,4 +406,85 @@ func hostTerminalOfMaster(fd int) (path string, ok bool) {
 		}
 	}
 	return "", false
+}
+
+// The structures of the C library of darwin for the socket addresses: a
+// length byte, then the family as a byte; the port is in network byte
+// order; a Unix-domain socket has room for a name of 104 bytes.
+const (
+	darwinSockaddrInet4Size = 16
+	darwinSockaddrInet6Size = 28
+	darwinSockaddrUnixPath  = 2
+	darwinSockaddrUnixSize  = darwinSockaddrUnixPath + 104
+)
+
+// hostSockaddrBytes renders a as struct sockaddr_in, sockaddr_in6 or
+// sockaddr_un of the host's C library, with the length such an address
+// has (in its length byte as well): the whole structure for an IP address
+// and for a Unix-domain socket with a path, the head alone for a socket
+// without a name. nil for a record of no family the host has, and for a
+// name the host has no room for.
+func hostSockaddrBytes(a wasiSockAddr) []byte {
+	var raw []byte
+	switch a.family {
+	case wasiSockFamilyIPv4:
+		raw = make([]byte, darwinSockaddrInet4Size)
+		raw[1] = syscall.AF_INET
+		binary.BigEndian.PutUint16(raw[2:], uint16(a.port))
+		copy(raw[4:8], a.ip.To4())
+	case wasiSockFamilyIPv6:
+		raw = make([]byte, darwinSockaddrInet6Size)
+		raw[1] = syscall.AF_INET6
+		binary.BigEndian.PutUint16(raw[2:], uint16(a.port))
+		copy(raw[8:24], a.ip.To16())
+		binary.NativeEndian.PutUint32(raw[24:], a.scope)
+	case wasiSockFamilyUnix:
+		if len(a.name) > darwinSockaddrUnixSize-darwinSockaddrUnixPath {
+			return nil
+		}
+		raw = make([]byte, darwinSockaddrUnixSize)
+		raw[1] = syscall.AF_UNIX
+		copy(raw[darwinSockaddrUnixPath:], a.name)
+		if a.name == "" {
+			raw = raw[:darwinSockaddrUnixPath]
+		}
+	default:
+		return nil
+	}
+	raw[0] = byte(len(raw))
+	return raw
+}
+
+// sockAddrOfHostBytes reads a struct sockaddr of the host's C library, as
+// hostSockaddrBytes writes it (the length byte is not relied on: programs
+// pack addresses without one). It reports EAFNOSUPPORT for a family the
+// records have no form for, EINVAL for bytes too few for their family.
+func sockAddrOfHostBytes(raw []byte) (wasiSockAddr, int32) {
+	if len(raw) < 2 {
+		return wasiSockAddr{}, _wasiEINVAL
+	}
+	switch raw[1] {
+	case syscall.AF_INET:
+		if len(raw) < darwinSockaddrInet4Size {
+			return wasiSockAddr{}, _wasiEINVAL
+		}
+		return wasiSockAddr{family: wasiSockFamilyIPv4, port: int(binary.BigEndian.Uint16(raw[2:])),
+			ip: append(net.IP(nil), raw[4:8]...)}, _wasiESUCCESS
+	case syscall.AF_INET6:
+		if len(raw) < darwinSockaddrInet6Size {
+			return wasiSockAddr{}, _wasiEINVAL
+		}
+		return wasiSockAddr{family: wasiSockFamilyIPv6, port: int(binary.BigEndian.Uint16(raw[2:])),
+			ip: append(net.IP(nil), raw[8:24]...), scope: binary.NativeEndian.Uint32(raw[24:])}, _wasiESUCCESS
+	case syscall.AF_UNIX:
+		name := raw[darwinSockaddrUnixPath:]
+		if len(name) > darwinSockaddrUnixSize-darwinSockaddrUnixPath {
+			name = name[:darwinSockaddrUnixSize-darwinSockaddrUnixPath]
+		}
+		if end := bytes.IndexByte(name, 0); end >= 0 {
+			name = name[:end]
+		}
+		return wasiSockAddr{family: wasiSockFamilyUnix, name: string(name)}, _wasiESUCCESS
+	}
+	return wasiSockAddr{}, _wasiEAFNOSUPPORT
 }

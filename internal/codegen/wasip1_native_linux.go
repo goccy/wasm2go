@@ -3,7 +3,9 @@
 package codegen
 
 import (
+	"bytes"
 	"encoding/binary"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -400,4 +402,94 @@ func hostTerminalOfMaster(fd int) (path string, ok bool) {
 		return "", false
 	}
 	return "/dev/pts/" + strconv.Itoa(int(binary.NativeEndian.Uint32(n[:]))), true
+}
+
+// The structures of Linux's C library for the socket addresses: the family
+// is the first two bytes, in the host's byte order, the port is in network
+// byte order; a Unix-domain socket has room for a name of 108 bytes.
+const (
+	linuxSockaddrInet4Size = 16
+	linuxSockaddrInet6Size = 28
+	// The size of struct sockaddr_in6 before it had the scope id
+	// (SIN6_LEN_RFC2133), which the kernel still takes.
+	linuxSockaddrInet6OldSize = 24
+	linuxSockaddrUnixPath     = 2
+	linuxSockaddrUnixSize     = linuxSockaddrUnixPath + 108
+)
+
+// hostSockaddrBytes renders a as struct sockaddr_in, sockaddr_in6 or
+// sockaddr_un of the host's C library, with the length such an address
+// has: the whole structure for an IP address and for a Unix-domain socket
+// with a path; the family and the name for an abstract name (one that
+// starts with a NUL); the family alone for a socket without a name. nil
+// for a record of no family the host has.
+func hostSockaddrBytes(a wasiSockAddr) []byte {
+	switch a.family {
+	case wasiSockFamilyIPv4:
+		raw := make([]byte, linuxSockaddrInet4Size)
+		binary.NativeEndian.PutUint16(raw[0:], syscall.AF_INET)
+		binary.BigEndian.PutUint16(raw[2:], uint16(a.port))
+		copy(raw[4:8], a.ip.To4())
+		return raw
+	case wasiSockFamilyIPv6:
+		raw := make([]byte, linuxSockaddrInet6Size)
+		binary.NativeEndian.PutUint16(raw[0:], syscall.AF_INET6)
+		binary.BigEndian.PutUint16(raw[2:], uint16(a.port))
+		copy(raw[8:24], a.ip.To16())
+		binary.NativeEndian.PutUint32(raw[24:], a.scope)
+		return raw
+	case wasiSockFamilyUnix:
+		if len(a.name) > linuxSockaddrUnixSize-linuxSockaddrUnixPath {
+			return nil
+		}
+		raw := make([]byte, linuxSockaddrUnixSize)
+		binary.NativeEndian.PutUint16(raw[0:], syscall.AF_UNIX)
+		copy(raw[linuxSockaddrUnixPath:], a.name)
+		if a.name == "" || a.name[0] == 0 {
+			return raw[:linuxSockaddrUnixPath+len(a.name)]
+		}
+		return raw
+	}
+	return nil
+}
+
+// sockAddrOfHostBytes reads a struct sockaddr of the host's C library, as
+// hostSockaddrBytes writes it. It reports EAFNOSUPPORT for a family the
+// records have no form for, EINVAL for bytes too few for their family (as
+// the kernel takes them).
+func sockAddrOfHostBytes(raw []byte) (wasiSockAddr, int32) {
+	if len(raw) < 2 {
+		return wasiSockAddr{}, _wasiEINVAL
+	}
+	switch binary.NativeEndian.Uint16(raw[0:]) {
+	case syscall.AF_INET:
+		if len(raw) < linuxSockaddrInet4Size {
+			return wasiSockAddr{}, _wasiEINVAL
+		}
+		return wasiSockAddr{family: wasiSockFamilyIPv4, port: int(binary.BigEndian.Uint16(raw[2:])),
+			ip: append(net.IP(nil), raw[4:8]...)}, _wasiESUCCESS
+	case syscall.AF_INET6:
+		if len(raw) < linuxSockaddrInet6OldSize {
+			return wasiSockAddr{}, _wasiEINVAL
+		}
+		a := wasiSockAddr{family: wasiSockFamilyIPv6, port: int(binary.BigEndian.Uint16(raw[2:])),
+			ip: append(net.IP(nil), raw[8:24]...)}
+		if len(raw) >= linuxSockaddrInet6Size {
+			a.scope = binary.NativeEndian.Uint32(raw[24:])
+		}
+		return a, _wasiESUCCESS
+	case syscall.AF_UNIX:
+		name := raw[linuxSockaddrUnixPath:]
+		if len(name) > linuxSockaddrUnixSize-linuxSockaddrUnixPath {
+			name = name[:linuxSockaddrUnixSize-linuxSockaddrUnixPath]
+		}
+		if len(name) > 0 && name[0] != 0 {
+			// a path ends at its first NUL; an abstract name is every byte
+			if end := bytes.IndexByte(name, 0); end >= 0 {
+				name = name[:end]
+			}
+		}
+		return wasiSockAddr{family: wasiSockFamilyUnix, name: string(name)}, _wasiESUCCESS
+	}
+	return wasiSockAddr{}, _wasiEAFNOSUPPORT
 }

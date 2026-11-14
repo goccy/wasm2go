@@ -342,6 +342,13 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 }
 func (a wasiSockAddr) hostSockaddr(unixPath string) syscall.Sockaddr { return nil }
 
+// The structures of the host's C library for socket addresses are not
+// known here: no address has the host's form.
+func hostSockaddrBytes(a wasiSockAddr) []byte { return nil }
+func sockAddrOfHostBytes(raw []byte) (wasiSockAddr, int32) {
+	return wasiSockAddr{}, _wasiEAFNOSUPPORT
+}
+
 // Terminals: this platform has none the runtime can ask.
 const (
 	hostTakeTerminal  = 0
