@@ -459,6 +459,42 @@ func TestHostDescriptors_ANewDescriptorIsTheHostsWhileAnotherProcessHoldsALowerN
 	}
 }
 
+// A descriptor another process of the family closes is never taken in by
+// the guest as one that code outside it made, whenever the guest asks
+// about the number (a program that maps its open descriptors dups each
+// number in turn): until the host has closed the descriptor, the number is
+// the other process's; after, nothing is open under it.
+func TestHostDescriptors_ADescriptorAnotherProcessClosesIsNeverTakenIn(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newHostGuest(t, dir)
+	const out int32 = 5300
+	names := []string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt", "h.txt"}
+	for round := 0; round < 300; round++ {
+		child := w.Fork()
+		var made []int32
+		for _, name := range names {
+			made = append(made, createTestFile(t, child, name))
+		}
+		closed := make(chan struct{})
+		go func() {
+			_ = child.CloseAll()
+			close(closed)
+		}()
+		for open := true; open; {
+			select {
+			case <-closed:
+				open = false
+			default:
+			}
+			for _, fd := range made {
+				if rc := w.Fd_dup(m, fd, out); rc == _wasiESUCCESS {
+					t.Fatalf("round %d: descriptor %d of the forked process, which it was closing, became its parent's", round, fd)
+				}
+			}
+		}
+	}
+}
+
 // What a forked process does to a standard descriptor is its own: it closes
 // standard output and opens a file, which is its descriptor 1, and the
 // parent's standard output is untouched.

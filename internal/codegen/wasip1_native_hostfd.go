@@ -488,8 +488,17 @@ func (h *hostFile) Close() error {
 	if fd < 0 {
 		return nil
 	}
+	// The host closes the descriptor before the entry leaves the host's
+	// table. Until then the number is this entry's, and another instance
+	// that asks about it (a process of the family that maps its open
+	// descriptors) does not take the descriptor in as one that code outside
+	// the guest made (takeInOutsideLocked). The number the host frees can
+	// go to a new descriptor of another instance in between; that one's
+	// entry replaces this one in the table (hostEnter), and hostForget
+	// leaves it there.
+	err := syscall.Close(fd)
 	hostForget(fd, h)
-	if err := syscall.Close(fd); err != nil && err != syscall.EINTR {
+	if err != nil && err != syscall.EINTR {
 		return os.NewSyscallError("close", err)
 	}
 	return nil
