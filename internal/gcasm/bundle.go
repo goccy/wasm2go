@@ -363,10 +363,12 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 	}
 
 	// Rewrite the translated tree around the gcasm files: the
-	// own-backend asm (.s) and its decls/alias sources (tagged
+	// own-backend asm (<arch>.s) and its decls/alias sources (tagged
 	// `amd64 || arm64`) go away; gcasm now serves BOTH amd64 and arm64,
 	// so the pure guards stay `!amd64 && !arm64` (the pure fallback for
-	// other arches + the `-tags purego` escape).
+	// other arches + the `-tags purego` escape). Other assembly files
+	// are the runtime's own (the C library's trampolines of a platform
+	// file of the wasi host) and stay.
 	for name, data := range all {
 		if base := filepath.Base(name); strings.HasPrefix(base, "simd_") || strings.HasPrefix(base, "cpufeat_") {
 			// The SIMD helper set (scalar reference + its own per-arch
@@ -379,8 +381,9 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 			continue
 		}
 		switch {
-		case strings.HasSuffix(name, ".s"):
+		case ownBackendAsm(name):
 			out[name] = nil // delete
+		case strings.HasSuffix(name, ".s"):
 		case strings.HasPrefix(string(data), "//go:build "):
 			line := string(data)
 			if idx := strings.Index(line, "\n"); idx >= 0 {
@@ -396,6 +399,19 @@ func Build(mod *wasm.Module, mainSrc []byte, resFiles map[string][]byte, importP
 		}
 	}
 	return out, stats, nil
+}
+
+// ownBackendAsm reports whether a file of the translated tree is the
+// assembly of the own backend for an architecture gcasm serves (<arch>.s
+// of a package), which the gcasm files replace.
+func ownBackendAsm(name string) bool {
+	base := filepath.Base(name)
+	for _, spec := range archSpecs {
+		if base == spec.name+".s" {
+			return true
+		}
+	}
+	return false
 }
 
 func pkgOrRoot(rel string) string {

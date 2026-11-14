@@ -454,3 +454,71 @@ func TestTerminal_TheCommandAProcessBecomesTakesItsTerminal(t *testing.T) {
 		t.Fatalf("the command the process became ended with status %#x", status)
 	}
 }
+
+// A write in blocking mode to a terminal takes what there is room for and
+// waits in the host's call for room for the rest, and there is no asking
+// how much room there is beforehand. A signal posted to the guest meanwhile
+// ends that call as it ends the system call in a process: the guest's write
+// returns what was written.
+func TestTerminal_BlockingWriteIsEndedByASignal(t *testing.T) {
+	w, m := newHostGuest(t, "/")
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, 0)
+	master, path := openTestTerminal(t, w, m)
+	slave := openTerminal(t, w, path)
+	// The terminal keeps what it is sent until it is read, rather than
+	// dropping what does not fit in a line, and sends nothing back. (The
+	// record carries the host's flags: ICANON differs, ECHO does not.)
+	canonical, echo := uint32(0x2), uint32(0x8)
+	if runtime.GOOS == "darwin" {
+		canonical = 0x100
+	}
+	if rc := w.Tty_getattr(m, slave, ttyRecordOff); rc != _wasiESUCCESS {
+		t.Fatalf("Tty_getattr rc=%d", rc)
+	}
+	lflag := readU32(m.memory, int(ttyRecordOff)+guestTermiosLflag) &^ (canonical | echo)
+	binary.LittleEndian.PutUint32(m.memory[int(ttyRecordOff)+guestTermiosLflag:], lflag)
+	if rc := w.Tty_setattr(m, slave, 0 /* TCSANOW */, ttyRecordOff); rc != _wasiESUCCESS {
+		t.Fatalf("Tty_setattr rc=%d", rc)
+	}
+
+	const size = 1 << 20
+	big := &Module{memory: make([]byte, size+8192)}
+	makeIovec(big, 64, 4096, size)
+	postSoon(w, wasiSIGUSR1)
+	start := time.Now()
+	if rc := w.Fd_write(big, master, 64, 1, 128); rc != _wasiESUCCESS {
+		t.Fatalf("interrupted write rc=%d, want what it wrote", rc)
+	}
+	written := readU32(big.memory, 128)
+	if written == 0 || written >= size {
+		t.Fatalf("the interrupted write wrote %d of %d bytes", written, size)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the interrupted write returned after %v", d)
+	}
+	if got := takeSignals(t, w, m); got != signalMask(wasiSIGUSR1) {
+		t.Fatalf("taken = %#x, want SIGUSR1", got)
+	}
+
+	// With the terminal read, the rest is written in full.
+	host, _ := w.HostDescriptor(slave)
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			if _, err := syscall.Read(int(host), buf); err != nil && err != syscall.EINTR {
+				return
+			}
+		}
+	}()
+	rest := size - written
+	makeIovec(big, 64, 4096+int32(written), int32(rest))
+	if rc := w.Fd_write(big, master, 64, 1, 128); rc != _wasiESUCCESS {
+		t.Fatalf("write with a reader rc=%d", rc)
+	}
+	if n := readU32(big.memory, 128); n != rest {
+		t.Fatalf("the write with a reader wrote %d of %d bytes", n, rest)
+	}
+}

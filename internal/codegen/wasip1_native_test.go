@@ -1450,8 +1450,19 @@ func TestWasip1EmitPlatformCompanions(t *testing.T) {
 		"wasip1_hostnumbers_linux_noheaders.go": "linux && (mips || mipsle || mips64 || mips64le)",
 		"wasip1_hostnumbers_darwin.go":          "darwin",
 	}
-	if len(companions) != len(wantConstraints) {
-		t.Fatalf("companions = %d files, want %d", len(companions), len(wantConstraints))
+	// The assembly files of a platform file go out as they are: their
+	// file names are their constraints.
+	wantAsm := map[string][]byte{
+		"wasip1_native_darwin_arm64.s": wasip1NativeDarwinARM64Raw,
+		"wasip1_native_darwin_amd64.s": wasip1NativeDarwinAMD64Raw,
+	}
+	if len(companions) != len(wantConstraints)+len(wantAsm) {
+		t.Fatalf("companions = %d files, want %d", len(companions), len(wantConstraints)+len(wantAsm))
+	}
+	for name, raw := range wantAsm {
+		if got, ok := companions[name]; !ok || !bytes.Equal(got, raw) {
+			t.Errorf("%s is not emitted as it is (emitted: %v)", name, ok)
+		}
 	}
 	for name, constraint := range wantConstraints {
 		src, ok := companions[name]

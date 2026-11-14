@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -1654,6 +1655,55 @@ func (w *WasiStubs) awaitHost(fds []hostPoll, until time.Time) int32 {
 	return _wasiEAGAIN
 }
 
+// interruptibleHostCall makes call, a system call of the host's that can
+// wait in the kernel for as long as nothing else happens (a write to a
+// terminal nobody reads, which takes what there is room for and waits for
+// room for the rest), so that a signal posted to the guest meanwhile ends it
+// as a signal ends a system call in a process: it fails with EINTR, or
+// returns what it has done so far. Unlike the waits of awaitHost, such a call
+// cannot be woken from outside; the thread making it is sent
+// hostInterruptSignal, whose handler is installed without SA_RESTART.
+//
+// called is false, and call is not made, when a posted signal is waiting to
+// be noticed already: the guest's call ends with EINTR. interrupted reports
+// that a signal was posted while the call was in progress. Where the host
+// cannot interrupt a thread, call is made as it is.
+func (w *WasiStubs) interruptibleHostCall(call func()) (called, interrupted bool) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	thread, ok := hostThreadSelf()
+	if !ok {
+		call()
+		return true, false
+	}
+	// The signal is sent again until the call has returned: the first can
+	// reach the thread before the call has begun to wait in the kernel.
+	var sending sync.Mutex
+	over := false
+	wake := func() {
+		go func() {
+			for pause := 100 * time.Microsecond; ; pause = min(2*pause, 20*time.Millisecond) {
+				sending.Lock()
+				if over {
+					sending.Unlock()
+					return
+				}
+				interruptHostThread(thread)
+				sending.Unlock()
+				time.Sleep(pause)
+			}
+		}()
+	}
+	if !w.beginBlocking(wake) {
+		return false, true
+	}
+	call()
+	sending.Lock()
+	over = true
+	sending.Unlock()
+	return true, w.endBlocking()
+}
+
 // The MSG_ flags of the host for the flags of one send or receive.
 func hostMsgFlags(flags int32) int {
 	out := 0
@@ -1822,10 +1872,17 @@ func (w *WasiStubs) readHost(h *hostFile, bufs [][]byte) (uint64, int32) {
 // right now; otherwise n bytes were taken, or err says why not.
 // nonblocking tells whether the open file is in non-blocking mode; it is
 // asked only where the answer decides how the write is made.
-func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, nonblocking func() bool) (n int, again bool, err error) {
+//
+// A write in blocking mode to a terminal (or another character device) is
+// the exception: the host takes what there is room for and waits in its
+// call for room for the rest, and there is no asking it how much room there
+// is. That write is made through interruptible (interruptibleHostCall), and
+// interrupted reports that a signal posted to the guest ended it.
+func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, nonblocking func() bool,
+	interruptible func(call func()) (called, interrupted bool)) (n int, again, interrupted bool, err error) {
 	fd, err := h.hold()
 	if err != nil {
-		return 0, false, err
+		return 0, false, false, err
 	}
 	defer h.release()
 	for {
@@ -1844,18 +1901,26 @@ func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, nonblocking func() boo
 			hostCallTurn(fd).Lock()
 			if hostReadyNow(fd, hostPollOut) == 0 {
 				hostCallTurn(fd).Unlock()
-				return 0, true, nil
+				return 0, true, false, nil
 			}
-			piece := p
-			if h.kind == syscall.S_IFIFO && len(piece) > hostPipeBuf {
-				if room := hostPipeRoom(fd); len(piece) > room {
-					piece = piece[:room]
+			if h.kind == syscall.S_IFIFO {
+				piece := p
+				if len(piece) > hostPipeBuf {
+					if room := hostPipeRoom(fd); len(piece) > room {
+						piece = piece[:room]
+					}
+				}
+				n, err = syscall.Write(fd, piece)
+			} else {
+				var called bool
+				called, interrupted = interruptible(func() { n, err = syscall.Write(fd, p) })
+				if !called {
+					n, err = 0, syscall.EINTR
 				}
 			}
-			n, err = syscall.Write(fd, piece)
 			hostCallTurn(fd).Unlock()
 		}
-		if err != syscall.EINTR {
+		if err != syscall.EINTR || interrupted {
 			break
 		}
 	}
@@ -1863,9 +1928,13 @@ func (h *hostFile) sendNow(p []byte, to syscall.Sockaddr, nonblocking func() boo
 		n = 0
 	}
 	if err == syscall.EAGAIN {
-		return 0, true, nil
+		return 0, true, false, nil
 	}
-	return n, false, err
+	if interrupted && err == syscall.EINTR {
+		// Ended before it wrote anything: the caller tells the guest so.
+		err = nil
+	}
+	return n, false, interrupted, err
 }
 
 // sendHost is one write or send of the guest's on a descriptor of the host
@@ -1904,7 +1973,7 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 			i++
 			continue
 		}
-		n, again, err := h.sendNow(buf, to, mode)
+		n, again, interrupted, err := h.sendNow(buf, to, mode, w.interruptibleHostCall)
 		if err != nil {
 			if total > 0 {
 				return total, _wasiESUCCESS
@@ -1912,6 +1981,19 @@ func (w *WasiStubs) sendHost(op *wasiOpen, h *hostFile, bufs [][]byte, to syscal
 			return 0, w.writeFailure(err, flags)
 		}
 		total += uint64(n)
+		if interrupted {
+			if n < len(buf) {
+				// A signal ended the write: what it wrote is the count,
+				// and nothing written is EINTR.
+				if total > 0 {
+					return total, _wasiESUCCESS
+				}
+				return 0, _wasiEINTR
+			}
+			// It was all written before the signal could end it: the
+			// signal is still to be noticed.
+			w.keepInterrupt()
+		}
 		if !again {
 			if bufs[i] = buf[n:]; len(bufs[i]) == 0 || op.dgram {
 				i++

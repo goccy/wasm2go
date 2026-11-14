@@ -7,8 +7,10 @@ import (
 	"encoding/binary"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -492,4 +494,74 @@ func sockAddrOfHostBytes(raw []byte) (wasiSockAddr, int32) {
 		return wasiSockAddr{family: wasiSockFamilyUnix, name: string(name)}, _wasiESUCCESS
 	}
 	return wasiSockAddr{}, _wasiEAFNOSUPPORT
+}
+
+// hostInterruptSignal is the host signal that ends a system call which the
+// runtime makes for the guest and which waits in the kernel (see
+// interruptibleHostCall): the last real-time signal, which neither the Go
+// runtime nor the C library takes for itself, and which no signal of the
+// guest is relayed as.
+const hostInterruptSignal = 64
+
+// hostKernelSigaction is struct sigaction as the kernel's rt_sigaction takes
+// it on the architectures hostInterruptReady names. On those without
+// SA_RESTORER the mask comes third; it is only read and written back as it
+// was, so the same layout serves.
+type hostKernelSigaction struct {
+	handler  uintptr
+	flags    uintptr
+	restorer uintptr
+	mask     uint64
+}
+
+const hostSARestart = 0x10000000
+
+// hostInterruptReady reports whether hostInterruptSignal can end a system
+// call; the first call makes it so.
+//
+// The Go runtime has its handler installed for the signal, with SA_RESTART:
+// a system call it interrupts would be restarted, which is what the runtime
+// wants of the signals it handles itself. For this signal it handles nothing
+// (nobody asks for it, and the handler returns at once), so the flag is taken
+// off its installation: the handler stays, and a system call the signal
+// interrupts fails with EINTR, or returns what it has done so far. A signal
+// without the runtime's handler is not used: its default action ends the
+// process.
+var hostInterruptReady = sync.OnceValue(func() bool {
+	switch runtime.GOARCH {
+	case "amd64", "arm64", "riscv64", "loong64", "ppc64", "ppc64le", "s390x":
+	default:
+		return false
+	}
+	var act hostKernelSigaction
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, hostInterruptSignal,
+		0, uintptr(unsafe.Pointer(&act)), unsafe.Sizeof(act.mask), 0, 0); errno != 0 {
+		return false
+	}
+	const sigDFL, sigIGN = 0, 1
+	if act.handler == sigDFL || act.handler == sigIGN {
+		return false
+	}
+	if act.flags&hostSARestart == 0 {
+		return true
+	}
+	act.flags &^= hostSARestart
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, hostInterruptSignal,
+		uintptr(unsafe.Pointer(&act)), 0, unsafe.Sizeof(act.mask), 0, 0)
+	return errno == 0
+})
+
+// hostThreadSelf returns the thread the caller runs on (its OS thread
+// locked), for interruptHostThread; ok is false where a system call cannot
+// be interrupted.
+func hostThreadSelf() (thread uint64, ok bool) {
+	if !hostInterruptReady() {
+		return 0, false
+	}
+	return uint64(syscall.Gettid()), true
+}
+
+// interruptHostThread sends hostInterruptSignal to the thread.
+func interruptHostThread(thread uint64) {
+	_ = syscall.Tgkill(syscall.Getpid(), int(thread), syscall.Signal(hostInterruptSignal))
 }

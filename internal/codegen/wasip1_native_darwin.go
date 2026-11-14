@@ -488,3 +488,82 @@ func sockAddrOfHostBytes(raw []byte) (wasiSockAddr, int32) {
 	}
 	return wasiSockAddr{}, _wasiEAFNOSUPPORT
 }
+
+// hostInterruptSignal is the host signal that ends a system call which the
+// runtime makes for the guest and which waits in the kernel (see
+// interruptibleHostCall): SIGINFO, which the Go runtime does not take for
+// itself and which no signal of the guest is relayed as (the guest's signals
+// are Linux's, which has no SIGINFO).
+const hostInterruptSignal = 29
+
+// The C library's functions that send a signal to one thread and change a
+// signal's installation: the system has no system call for the first that
+// the Go runtime lets a program make, so they are called as the syscall
+// package calls the C library, through a trampoline of the assembly file
+// beside this one.
+//
+//go:cgo_import_dynamic libc_pthread_self pthread_self "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_pthread_kill pthread_kill "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_sigaction sigaction "/usr/lib/libSystem.B.dylib"
+
+// The addresses of the trampolines (defined in the assembly file).
+var hostLibcPthreadSelf, hostLibcPthreadKill, hostLibcSigaction uintptr
+
+// hostLibcCall calls the C library's function at fn with three arguments,
+// as the syscall package does.
+//
+//go:linkname hostLibcCall syscall.syscall
+func hostLibcCall(fn, a1, a2, a3 uintptr) (r1, r2 uintptr, err syscall.Errno)
+
+// hostSigaction is struct sigaction as the C library's sigaction takes it.
+type hostSigaction struct {
+	handler uintptr
+	mask    uint32
+	flags   int32
+}
+
+const hostSARestart = 0x0002
+
+// hostInterruptReady reports whether hostInterruptSignal can end a system
+// call; the first call makes it so.
+//
+// The Go runtime has its handler installed for the signal, with SA_RESTART:
+// a system call it interrupts would be restarted, which is what the runtime
+// wants of the signals it handles itself. For this signal it handles nothing
+// (nobody asks for it, and the handler returns at once), so the flag is taken
+// off its installation: the handler stays, and a system call the signal
+// interrupts fails with EINTR, or returns what it has done so far. A signal
+// without the runtime's handler is not used: its default action is not to
+// interrupt.
+var hostInterruptReady = sync.OnceValue(func() bool {
+	var act hostSigaction
+	if rc, _, _ := hostLibcCall(hostLibcSigaction, hostInterruptSignal, 0, uintptr(unsafe.Pointer(&act))); int32(rc) != 0 {
+		return false
+	}
+	const sigDFL, sigIGN = 0, 1
+	if act.handler == sigDFL || act.handler == sigIGN {
+		return false
+	}
+	if act.flags&hostSARestart == 0 {
+		return true
+	}
+	act.flags &^= hostSARestart
+	rc, _, _ := hostLibcCall(hostLibcSigaction, hostInterruptSignal, uintptr(unsafe.Pointer(&act)), 0)
+	return int32(rc) == 0
+})
+
+// hostThreadSelf returns the thread the caller runs on (its OS thread
+// locked), for interruptHostThread; ok is false where a system call cannot
+// be interrupted.
+func hostThreadSelf() (thread uint64, ok bool) {
+	if !hostInterruptReady() {
+		return 0, false
+	}
+	self, _, _ := hostLibcCall(hostLibcPthreadSelf, 0, 0, 0)
+	return uint64(self), true
+}
+
+// interruptHostThread sends hostInterruptSignal to the thread.
+func interruptHostThread(thread uint64) {
+	hostLibcCall(hostLibcPthreadKill, uintptr(thread), hostInterruptSignal, 0)
+}

@@ -11673,6 +11673,10 @@ var (
 	wasip1NativeLinuxRaw []byte
 	//go:embed wasip1_native_darwin.go
 	wasip1NativeDarwinRaw []byte
+	//go:embed wasip1_native_darwin_arm64.s
+	wasip1NativeDarwinARM64Raw []byte
+	//go:embed wasip1_native_darwin_amd64.s
+	wasip1NativeDarwinAMD64Raw []byte
 	//go:embed wasip1_native_other.go
 	wasip1NativeOtherRaw []byte
 	//go:embed wasip1_native_hostfd.go
@@ -11692,10 +11696,11 @@ var (
 )
 
 // emitWasip1Platform returns the per-platform companions of the native wasi
-// implementation — output filename → Go source for package pkg — or nil
-// when the module does not import wasi. They are written out as separate
-// files, next to the one that holds the emitWasip1Native declarations,
-// because their build constraints have to stay attached to them.
+// implementation — output filename → Go source for package pkg (or, for an
+// assembly file, the file as it is) — or nil when the module does not import
+// wasi. They are written out as separate files, next to the one that holds
+// the emitWasip1Native declarations, because their build constraints have to
+// stay attached to them.
 func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 	if !t.wasmImportsWasi() {
 		return nil
@@ -11705,6 +11710,9 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 		"wasip1_native_posix.go":    wasip1NativePosixRaw,
 		"wasip1_native_linux.go":    wasip1NativeLinuxRaw,
 		"wasip1_native_darwin.go":   wasip1NativeDarwinRaw,
+		// the C library's trampolines of the darwin file
+		"wasip1_native_darwin_arm64.s": wasip1NativeDarwinARM64Raw,
+		"wasip1_native_darwin_amd64.s": wasip1NativeDarwinAMD64Raw,
 		"wasip1_native_other.go":    wasip1NativeOtherRaw,
 		"wasip1_native_hostfd.go":   wasip1NativeHostFDRaw,
 		"wasip1_native_hostsock.go": wasip1NativeHostSockRaw,

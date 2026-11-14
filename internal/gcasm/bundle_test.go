@@ -285,3 +285,25 @@ func main() {
 	}
 	t.Logf("gate4: %d export cases match between gcasm and pure builds", exports)
 }
+
+// The gcasm files replace the own backend's assembly (<arch>.s of each
+// package) and nothing else: the runtime's own assembly files, the C
+// library's trampolines of a platform file of the wasi host, stay in the
+// tree, or the bundle would call through trampolines that are not there.
+func TestBuildReplacesOnlyTheOwnBackendsAssembly(t *testing.T) {
+	for name, want := range map[string]bool{
+		"amd64.s":                           true,
+		"arm64.s":                           true,
+		"p0/amd64.s":                        true,
+		"p12/arm64.s":                       true,
+		"base/wasip1_native_darwin_arm64.s": false,
+		"base/wasip1_native_darwin_amd64.s": false,
+		"wasip1_native_darwin_arm64.s":      false,
+		"simd_asm_arm64.s":                  false,
+		"cpufeat_amd64.s":                   false,
+	} {
+		if got := ownBackendAsm(name); got != want {
+			t.Errorf("ownBackendAsm(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
