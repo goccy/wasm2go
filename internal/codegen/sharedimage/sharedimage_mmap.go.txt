@@ -49,6 +49,17 @@ func mmapShared(f *os.File, length int) ([]byte, error) {
 	return mem, nil
 }
 
+// mmapAnonymous maps length bytes of zeros, private to the process: memory
+// of an instance's own that stays at one address.
+func mmapAnonymous(length int) ([]byte, error) {
+	mem, err := syscall.Mmap(-1, 0, length,
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		return nil, fmt.Errorf("wasm2go: mapping memory of the instance's own: %w", err)
+	}
+	return mem, nil
+}
+
 func unmapMemory(mem []byte) {
 	if len(mem) == 0 {
 		return

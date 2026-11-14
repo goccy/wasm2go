@@ -331,3 +331,94 @@ func keysOf(m map[string][]byte) []string {
 	}
 	return out
 }
+
+// An instance can start on memory of its own that AnonymousMemory maps for
+// it, holding the data segments of an instance constructed for the purpose:
+// it starts as one on its own allocation does, its memory grows in place,
+// and its forks get its state. Its first fork maps its memory onto the image
+// the fork writes where the platform can tell later what an instance
+// changes (Linux), and its next forks start from that image.
+func TestForkMemoryOfAnonymousMemory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no mmap: the generated package cannot map memory")
+	}
+	bin := testfixture.Wasm(t, "cg_sharedimage")
+	parsed, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res, err := codegen.Translate(&buf, parsed, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const main = `package main
+
+import (
+	"fmt"
+	"runtime"
+
+	"gentest/pkg"
+)
+
+const ceiling = 4 * 65536
+
+func fork(m *pkg.Module, img *pkg.SharedImage) (child *pkg.Module, parentImg *pkg.SharedImage, rebased bool) {
+	f, err := pkg.ForkMemory(m, img, ceiling)
+	if err != nil {
+		panic(err)
+	}
+	parentImg = img
+	if f.Rebased {
+		parentImg = f.Image
+	}
+	return pkg.NewFromSnapshot(f.Memory, f.Size, f.Globals), parentImg, f.Rebased
+}
+
+func main() {
+	from := pkg.New()
+	img, mem, err := pkg.AnonymousMemory(from, ceiling)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := img.Memory(ceiling); err == nil {
+		panic("the stand-in of an anonymous memory mapped something")
+	}
+	a := pkg.NewWithMemory(mem, pkg.InitialMemoryBytes)
+	fmt.Println("a starts: start ran", a.Peek(100) > 0, "marker", a.Marker())
+
+	a.Poke(1024, 'A')
+	b, aImg, rebased := fork(a, img)
+	fmt.Println("b inherits", b.Peek(1024), "marker", b.Marker())
+	fmt.Println("rebased where the platform tells changes:", rebased == (runtime.GOOS == "linux"))
+	b.Poke(1024, 'B')
+	a.Poke(1025, 'Z')
+	fmt.Println("after the fork a", a.Peek(1024), a.Peek(1025), "b", b.Peek(1024), b.Peek(1025))
+
+	at := &a.Memory()[:1][0]
+	fmt.Println("a grows from", a.Grow(1), "in place:", &a.Memory()[:1][0] == at)
+	a.Poke(2*65536+10, 'G')
+	c, _, _ := fork(a, aImg)
+	fmt.Println("c inherits", c.Peek(1024), c.Peek(1025), c.Peek(2*65536+10))
+	c.Poke(1024, 'C')
+	fmt.Println("after the fork a", a.Peek(1024), "c", c.Peek(1024))
+}
+`
+	out := runGoSnippetWithAux(t, buf.String(), main,
+		[]map[string][]byte{res.Sidecars, filesWithAux(res)}, res.AuxFiles)
+
+	for _, want := range []string{
+		"a starts: start ran true marker 42",
+		"b inherits 65 marker 42",
+		"rebased where the platform tells changes: true",
+		"after the fork a 65 90 b 66 101",
+		"a grows from 2 in place: true",
+		"c inherits 65 90 71",
+		"after the fork a 65 c 67",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output:\n%s", want, out)
+		}
+	}
+}

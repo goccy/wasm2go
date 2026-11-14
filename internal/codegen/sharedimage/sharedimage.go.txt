@@ -39,6 +39,7 @@ package {{.Pkg}}
 // every instance allocates and initializes its own memory, exactly as before.
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"runtime"
@@ -52,6 +53,11 @@ type SharedImage struct {
 	dataEnd uint32   // where the data segments stop and BSS begins
 	globals []uint64 // non-nil for a snapshot: the instance's wasm globals
 	err     error    // non-nil if the image could not be built
+	// anonymous marks the stand-in that AnonymousMemory returns for memory
+	// no file holds: ForkMemory may map that memory onto the image it
+	// writes, which it may not do to memory it knows nothing of (an
+	// allocation of the Go heap).
+	anonymous bool
 }
 
 // ImageBuilder brings up one throwaway instance. The caller supplies it because
@@ -243,6 +249,53 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	return &SharedImage{f: f, size: size, dataEnd: dataEnd, globals: globals}
 }
 
+// AnonymousMemory returns memory for one instance that initializes itself
+// on it: a private mapping, ceiling bytes long, that holds what from's
+// memory holds below its data end and zeros above. from is an instance
+// constructed and not run since: below its data end it holds the data
+// segments, and whatever its start section (which a constructor runs) wrote
+// there — the instance on the new memory runs its start section again, as
+// one on a NewSharedImage image does. Build the instance with
+// NewWithMemory (memory size InitialMemoryBytes) and initialize it as an
+// instance on memory of its own: nothing is imaged or written to a file
+// first, so the instance starts as fast as one that allocates its memory,
+// and its memory keeps one address for its whole life, growing up to
+// ceiling (native code that holds pointers into it needs that). Pages of
+// from's memory that are all zeros are not copied: they stay untouched,
+// costing nothing.
+//
+// The image returned stands for that memory in ForkMemory, as the image an
+// instance's memory is a mapping of: the first fork of the instance writes
+// its memory into an image and, where the platform can tell later what the
+// instance changes, maps the memory onto that image (Rebased), so that the
+// forks after it copy only what the instance changed. The image maps
+// nothing itself. Pass the memory to UnmapMemory when the instance is done.
+func AnonymousMemory(from *{{.Module}}, ceiling int) (*SharedImage, []byte, error) {
+	if !mmapSupported {
+		return nil, nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+	}
+	dataEnd := int(from.{{.DataEnd}})
+	if dataEnd > len(from.{{.Memory}}) || dataEnd > ceiling {
+		return nil, nil, fmt.Errorf("wasm2go: the data segments (%d bytes) do not fit in a memory of %d bytes", dataEnd, min(len(from.{{.Memory}}), ceiling))
+	}
+	mem, err := mmapAnonymous(ceiling)
+	if err != nil {
+		return nil, nil, err
+	}
+	src := from.{{.Memory}}[:dataEnd]
+	page := os.Getpagesize()
+	zeros := make([]byte, page)
+	for at := 0; at < len(src); at += page {
+		end := min(at+page, len(src))
+		if !bytes.Equal(src[at:end], zeros[:end-at]) {
+			copy(mem[at:end], src[at:end])
+		}
+	}
+	img := &SharedImage{dataEnd: uint32(dataEnd), anonymous: true,
+		err: fmt.Errorf("wasm2go: memory of an instance's own is no image to map")}
+	return img, mem, nil
+}
+
 // Err reports why the image is unavailable, or nil. A caller that gets an
 // error must build each instance's memory itself.
 func (s *SharedImage) Err() error { return s.err }
@@ -329,16 +382,17 @@ const forkRebaseShare = 8
 // that runs it (inside a host import, say).
 //
 // from is the image m's memory is a private mapping of (SharedImage.Memory,
-// or the Memory of an earlier MemoryFork), or nil when the memory is no such
-// mapping. Where the platform can tell which pages the instance has changed
+// or the Memory of an earlier MemoryFork), the image AnonymousMemory
+// returned with m's memory, or nil when the memory is none of these. Where the platform can tell which pages the instance has changed
 // since (Linux), the duplicate is a second private mapping of the same image
 // into which only those pages are copied, so a fork costs what the instance
 // changed, not what it holds. When that is a large part of the memory, or
 // cannot be told, the whole memory is written into a new image and the
 // duplicate maps it; the instance's own memory is then mapped onto the new
-// image too (Rebased), so that its next forks are cheap again. Without from
-// every fork writes the whole memory, and ceiling is the length of the
-// duplicate's mapping; with from the duplicate is as long as m's.
+// image too (Rebased), so that its next forks are cheap again; so is memory
+// from AnonymousMemory at its first fork. Without from every fork writes the
+// whole memory, and ceiling is the length of the duplicate's mapping; with
+// from the duplicate is as long as m's.
 //
 // The image is shared by the mappings made of it. Close an image when no
 // instance that may still be forked maps it.
@@ -355,10 +409,13 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 	mem := m.{{.Memory}}
 	fork := &MemoryFork{Size: size, Globals: {{.SaveGlobals}}(m)}
 	mapped := from != nil && from.f != nil
-	if mapped {
+	anonymous := from != nil && from.anonymous
+	if mapped || anonymous {
 		// A memory that grew is a shorter slice of its mapping.
 		mem = mem[:cap(mem)]
 		ceiling = len(mem)
+	}
+	if mapped {
 		if runs, changed, ok := privatePages(mem[:size]); ok && changed <= size/forkRebaseShare {
 			child, err := mmapImage(from.f, ceiling)
 			if err != nil {
@@ -398,7 +455,7 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 		return fork, nil
 	}
 	fork.Image = &SharedImage{f: f, size: size, dataEnd: m.{{.DataEnd}}}
-	if mapped && remapImage(f, mem) == nil {
+	if (mapped || anonymous) && remapImage(f, mem) == nil {
 		fork.Rebased = true
 	}
 	return fork, nil

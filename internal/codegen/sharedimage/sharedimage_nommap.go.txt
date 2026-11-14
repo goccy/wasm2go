@@ -22,3 +22,7 @@ func mmapShared(f *os.File, length int) ([]byte, error) {
 	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
 }
 
+
+func mmapAnonymous(length int) ([]byte, error) {
+	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+}
