@@ -80,8 +80,13 @@ func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 	if hostSuite {
 		// The guest's descriptors are the host process's — not the ones
 		// the test process has open for itself — and the ones a test
-		// leaves open go with the test.
+		// leaves open go with the test. As SetHostProcess does, SIGPIPE
+		// the runtime is not handling is ignored rather than forwarded to
+		// its default action, which would end the test process at the
+		// first write into a closed pipe after a guest stopped handling
+		// it.
 		KeepRuntimeDescriptorsHigh()
+		forwardSIGPIPEToIgnore()
 		w.hostProcess = true
 		t.Cleanup(func() { _ = w.CloseAll() })
 	}

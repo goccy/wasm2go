@@ -25,8 +25,9 @@ func newHostGuest(t *testing.T, dir string) (*WasiStubs, *Module) {
 	w, m := newTestStubs(t, dir)
 	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	// As SetHostProcess does: what the test process has open for itself is
-	// not the guest's.
+	// not the guest's, and SIGPIPE the runtime is not handling is ignored.
 	KeepRuntimeDescriptorsHigh()
+	forwardSIGPIPEToIgnore()
 	w.hostProcess = true
 	t.Cleanup(func() { _ = w.CloseAll() })
 	return w, m
