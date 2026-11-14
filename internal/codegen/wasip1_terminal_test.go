@@ -395,18 +395,27 @@ func TestTerminal_TheCommandAProcessBecomesTakesItsTerminal(t *testing.T) {
 		}
 		return int32(readU32(cm.memory, int(pidOff)))
 	}
-	// What arrives at the master within the time: it is read before the
-	// command is waited for, because a terminal that still holds output
-	// keeps the process that closes it waiting on some systems.
-	fromMaster := func(wait time.Duration) string {
+	// What arrives at the master until it has want, or the time is up: it
+	// is read before the command is waited for, because a terminal that
+	// still holds output keeps the process that closes it waiting on some
+	// systems. A line and its end can come in reads of their own.
+	fromMaster := func(want string, wait time.Duration) string {
 		t.Helper()
 		host, _ := w.HostDescriptor(master)
-		set := []hostPoll{{fd: int32(host), events: hostPollIn}}
-		hostPollUntil(set, time.Now().Add(wait))
-		if set[0].revents&hostPollIn == 0 {
-			return ""
+		until := time.Now().Add(wait)
+		got := ""
+		for !strings.Contains(got, want) {
+			set := []hostPoll{{fd: int32(host), events: hostPollIn}}
+			hostPollUntil(set, until)
+			if set[0].revents&hostPollIn == 0 {
+				break
+			}
+			more, rc := fdReadString(w, m, master, 64)
+			if rc != _wasiESUCCESS {
+				break
+			}
+			got += more
 		}
-		got, _ := fdReadString(w, m, master, 64)
 		return got
 	}
 	ended := func(pid int32) int32 {
@@ -418,7 +427,7 @@ func TestTerminal_TheCommandAProcessBecomesTakesItsTerminal(t *testing.T) {
 	}
 	// A child like any other is started as before: it writes to its output.
 	pid := start(false, "echo done")
-	if got := fromMaster(10 * time.Second); !strings.Contains(got, "done") {
+	if got := fromMaster("done", 10*time.Second); !strings.Contains(got, "done") {
 		t.Fatalf("a child command: the master has %q, want what it wrote to its output", got)
 	}
 	if status := ended(pid); status != 0 {
@@ -438,7 +447,7 @@ func TestTerminal_TheCommandAProcessBecomesTakesItsTerminal(t *testing.T) {
 		t.Fatal("the next command is still the one the process becomes after that was taken back")
 	}
 	pid = start(true, "echo became > /dev/tty")
-	if got := fromMaster(10 * time.Second); !strings.Contains(got, "became") {
+	if got := fromMaster("became", 10*time.Second); !strings.Contains(got, "became") {
 		t.Fatalf("the master has %q, want what the command wrote to /dev/tty", got)
 	}
 	if status := ended(pid); status != 0 {
