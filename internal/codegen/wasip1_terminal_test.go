@@ -505,12 +505,28 @@ func TestTerminal_BlockingWriteIsEndedByASignal(t *testing.T) {
 
 	// With the terminal read, the rest is written in full.
 	host, _ := w.HostDescriptor(slave)
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		buf := make([]byte, 64<<10)
 		for {
-			if _, err := syscall.Read(int(host), buf); err != nil && err != syscall.EINTR {
+			if n, err := syscall.Read(int(host), buf); (err != nil && err != syscall.EINTR) || (err == nil && n == 0) {
 				return
 			}
+		}
+	}()
+	// The reader ends before the terminal's descriptors are closed: on
+	// darwin a close of a terminal waits for a read of it in progress, and
+	// the descriptors are closed in no set order at the test's end. Closing
+	// the master first ends the read (the terminal is hung up).
+	defer func() {
+		if rc := w.Fd_close(m, master); rc != _wasiESUCCESS {
+			t.Errorf("close of the master rc=%d", rc)
+		}
+		select {
+		case <-readerDone:
+		case <-time.After(10 * time.Second):
+			t.Errorf("the reader of the terminal did not end when its master was closed")
 		}
 	}()
 	rest := size - written
