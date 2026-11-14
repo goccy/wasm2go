@@ -2312,7 +2312,7 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		}
 		cmd.SysProcAttr = commandTerminal(terminal, files)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startCommand(cmd); err != nil {
 		return -mapExecError(err)
 	}
 

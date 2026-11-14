@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"sync"
@@ -74,6 +75,16 @@ var hostTable struct {
 	// own that it can place (see hostFloor). From there up every number is
 	// the runtime's.
 	floor int
+	// making is held for reading while descriptors are made in the
+	// process that the runtime can record as its own only once they exist
+	// — what the Go runtime makes when a command starts (startCommand) —
+	// and for writing while a guest takes in a descriptor that code
+	// outside it made (takeInOutsideLocked). Until they are recorded they
+	// are open under low numbers and nobody's, which is what a descriptor
+	// made outside the guest looks like. It cannot be derived: the
+	// descriptors do not exist before, and the numbers the host gives
+	// them are not known.
+	making sync.RWMutex
 }
 
 // hostCallTurns are held, one per descriptor number, while a descriptor is
@@ -1154,7 +1165,12 @@ func (w *WasiStubs) hostOpenLocked(fd int32, op *wasiOpen) *wasiOpen {
 // the entry is checked against the host before every use. Caller holds
 // w.mu.
 func (w *WasiStubs) takeInOutsideLocked(fd int32) *wasiOpen {
-	if fd < 0 || !w.hostNumberFreeLocked(int(fd)) {
+	if fd < 0 {
+		return nil
+	}
+	hostTable.making.Lock()
+	defer hostTable.making.Unlock()
+	if !w.hostNumberFreeLocked(int(fd)) {
 		return nil
 	}
 	made, open := hostIdentityOf(int(fd))
@@ -2149,4 +2165,50 @@ func hostPipe() (r, wr *wasiOpen, err error) {
 	r = &wasiOpen{f: newHostFile(p[0], syscall.S_IFIFO, ""), noWrite: true}
 	wr = &wasiOpen{f: newHostFile(p[1], syscall.S_IFIFO, ""), noRead: true}
 	return r, wr, nil
+}
+
+// startCommand starts cmd. What the Go runtime makes in the process for the
+// command has low numbers that are nobody's while the command starts: the
+// pipe it learns of a failed exec through, the pipes it copies streams that
+// are not files through, the handle of the process (a pidfd, where the
+// kernel has them). Some it keeps until the command has been waited for.
+// The start excludes a guest taking a descriptor in (hostTable.making),
+// and what it left open that is nobody's is recorded as the runtime's
+// before it ends. A descriptor another process of the family makes in the
+// meantime is recorded along — its entry is in the host's table soon
+// after, and a recorded number keeps only guests from taking it in, which
+// none would anyway.
+func startCommand(cmd *exec.Cmd) error {
+	hostTable.making.RLock()
+	defer hostTable.making.RUnlock()
+	before := map[int]bool{}
+	for _, fd := range nobodysDescriptors() {
+		before[fd] = true
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	for _, fd := range nobodysDescriptors() {
+		if !before[fd] {
+			hostReserve(fd)
+		}
+	}
+	return nil
+}
+
+// nobodysDescriptors returns the descriptors of the process above the
+// standard ones and below floor that no guest has and that the runtime has
+// not recorded as its own.
+func nobodysDescriptors() []int {
+	var fds []int
+	floor := hostFloor()
+	for _, fd := range openDescriptors() {
+		if fd <= 2 || fd >= floor {
+			continue
+		}
+		if owner, reserved := hostOwner(fd); owner == nil && !reserved {
+			fds = append(fds, fd)
+		}
+	}
+	return fds
 }

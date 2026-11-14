@@ -495,6 +495,38 @@ func TestHostDescriptors_ADescriptorAnotherProcessClosesIsNeverTakenIn(t *testin
 	}
 }
 
+// What the Go runtime keeps in the process for a command the guest started
+// — the handle of the process (a pidfd, where the kernel has them) — has a
+// low number, and is the runtime's: a guest that maps its open descriptors
+// by dup'ing each number does not get it while the command runs.
+func TestHostDescriptors_WhatTheRuntimeKeepsForACommandIsNotTakenIn(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newHostGuest(t, dir)
+	const out int32 = 5300
+	// The numbers a dup of which works: what the guest has, and what is
+	// taken in as made outside it (the test process's own).
+	openNumbers := func() []int32 {
+		var got []int32
+		for fd := int32(3); fd < 64; fd++ {
+			if rc := w.Fd_dup(m, fd, out); rc == _wasiESUCCESS {
+				got = append(got, fd)
+				closeTestFd(t, w, m, int32(binary.LittleEndian.Uint32(m.memory[out:])))
+			}
+		}
+		return got
+	}
+	before := openNumbers()
+	pid := spawnTestProc(t, w, m, "/bin/sleep", "2")
+	during := openNumbers()
+	if len(during) != len(before) {
+		t.Errorf("while the command runs the guest has %v, before it had %v", during, before)
+	}
+	const statusOff int32 = 4100
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+}
+
 // What a forked process does to a standard descriptor is its own: it closes
 // standard output and opens a file, which is its descriptor 1, and the
 // parent's standard output is untouched.

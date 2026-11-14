@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -392,3 +393,6 @@ func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, result
 // forwardSIGPIPEToIgnore has nothing to do on a platform whose signals the
 // runtime does not follow.
 func forwardSIGPIPEToIgnore() {}
+
+// startCommand starts cmd; no guest takes descriptors in on this platform.
+func startCommand(cmd *exec.Cmd) error { return cmd.Start() }
