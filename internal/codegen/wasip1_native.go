@@ -2614,6 +2614,9 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 	}
 	w.mu.Lock()
 	proc := w.procs[pid]
+	if proc == nil && w.hostProcess {
+		proc = w.adoptHostChildLocked(pid)
+	}
 	w.mu.Unlock()
 	if proc == nil {
 		return -_wasiECHILD
@@ -2639,6 +2642,41 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 	}
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
+}
+
+// adoptHostChildLocked makes a child of the host process that the runtime
+// did not start a process of this instance, so that the guest that is the
+// host process waits for it as perl waits for any child of its process:
+// native code starts such children for it (a module's C that calls
+// posix_spawn, or vfork and exec — Proc::FastSpawn — and returns the pid).
+// It returns nil when pid is no such child: a process of the family (a
+// sibling's command, which this instance does not wait for, as one process
+// does not wait for another's children), or no child of the host process.
+// A child that has ended is reaped by the asking; one that has not is
+// waited for, and reaped, by a goroutine, and its status is collected as a
+// spawned command's is. Only the guest's wait for that pid finds it: wait()
+// (Proc_wait_any) does not look for children the runtime does not know.
+// Caller holds w.mu.
+func (w *WasiStubs) adoptHostChildLocked(pid int32) *wasiProc {
+	if pid <= 0 || w.pidsLocked().find(pid) != nil {
+		return nil
+	}
+	status, child, ended := hostChildState(int(pid))
+	if !child {
+		return nil
+	}
+	proc := &wasiProc{done: make(chan struct{})}
+	if w.procs == nil {
+		w.procs = map[int32]*wasiProc{}
+	}
+	w.procs[pid] = proc
+	if ended {
+		proc.status = status
+		close(proc.done)
+		return proc
+	}
+	go func() { w.finishProc(proc, hostAwaitChild(int(pid))) }()
+	return proc
 }
 
 // Proc_wait_any is a NON-STANDARD host import (name "proc_wait_any") backing
@@ -3005,22 +3043,28 @@ func encodeWaitStatus(st *os.ProcessState) int32 {
 		return 0
 	}
 	if ws, ok := st.Sys().(syscall.WaitStatus); ok {
-		if ws.Signaled() {
-			if sig := guestSignalOf(ws.Signal()); sig != 0 {
-				return sig
-			}
-			// A signal the guest has no number for: all that can be said is
-			// that a signal ended the process, and SIGKILL says the least
-			// about which.
-			return wasiSIGKILL
-		}
-		return int32(ws.ExitStatus()&0xff) << 8
+		return encodeHostWaitStatus(ws)
 	}
 	code := st.ExitCode()
 	if code < 0 {
 		code = 127
 	}
 	return int32(code&0xff) << 8
+}
+
+// encodeHostWaitStatus is encodeWaitStatus for the host's wait status of a
+// process.
+func encodeHostWaitStatus(ws syscall.WaitStatus) int32 {
+	if ws.Signaled() {
+		if sig := guestSignalOf(ws.Signal()); sig != 0 {
+			return sig
+		}
+		// A signal the guest has no number for: all that can be said is
+		// that a signal ended the process, and SIGKILL says the least
+		// about which.
+		return wasiSIGKILL
+	}
+	return int32(ws.ExitStatus()&0xff) << 8
 }
 
 // mapExecError maps an exec.Command Start() failure to a wasi errno. The
@@ -11607,6 +11651,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"wasiHostOnlyErrno":         true,
 			"mapExecError":              true,
 			"encodeWaitStatus":          true,
+			"encodeHostWaitStatus":      true,
 			"totalBytesPlusNul":         true,
 			"putStrVec64":               true,
 			"readVec":                   true,

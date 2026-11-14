@@ -247,6 +247,43 @@ func setHostGroups(gids []int) (err error) {
 // acceptRaw.
 const hostInputNow = true
 
+// hostChildState asks the host about pid as a child of this process: child
+// is false when it is none of its children; ended says that it has ended,
+// and then status is how (encodeHostWaitStatus) and the child is reaped.
+func hostChildState(pid int) (status int32, child, ended bool) {
+	var ws syscall.WaitStatus
+	for {
+		got, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+		switch {
+		case err == syscall.EINTR:
+			continue
+		case err != nil:
+			return 0, false, false
+		case got == 0:
+			return 0, true, false
+		}
+		return encodeHostWaitStatus(ws), true, true
+	}
+}
+
+// hostAwaitChild waits until the child pid of this process has ended, reaps
+// it, and returns how it ended. A child whose status the host did not keep
+// (the host process ignores SIGCHLD) is said to have been killed: all that
+// is known is that it is gone.
+func hostAwaitChild(pid int) int32 {
+	var ws syscall.WaitStatus
+	for {
+		_, err := syscall.Wait4(pid, &ws, 0, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return wasiSIGKILL
+		}
+		return encodeHostWaitStatus(ws)
+	}
+}
+
 // descriptorWaits reports whether a call on the descriptor waits when there
 // is nothing for it: it is not in non-blocking mode, which the descriptors
 // the runtime polls are. Such a descriptor cannot be asked what is there.
