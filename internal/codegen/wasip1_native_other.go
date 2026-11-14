@@ -271,6 +271,11 @@ func (s *hostPollSet) look()                                                {}
 func (s *hostPollSet) ready(mark func(sub int)) bool                        { return false }
 func (s *hostPollSet) await(w *WasiStubs, until time.Time) int32            { return _wasiENOSYS }
 func (s *hostPollSet) awaitStoppable(until time.Time, stop <-chan struct{}) {}
+func (s *hostPollSet) hungUp(sub int) bool                                  { return false }
+
+// hostHungUp would ask the host whether a descriptor of its own has been
+// hung up on, which the runtime cannot do on this platform.
+func hostHungUp(fd uintptr) (hup, known bool) { return false, false }
 
 // KeepRuntimeDescriptorsHigh keeps the Go runtime's own descriptors above
 // the numbers a program's descriptors get, where the guest's descriptors

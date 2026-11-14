@@ -5772,6 +5772,12 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 	ready := make([]bool, len(fdEvents))
 	errnos := make([]int32, len(fdEvents))
 	ops := make([]*wasiOpen, len(fdEvents))
+	// The stream behind a subscription for reading that can be hung up on,
+	// asked about when its event is reported (streamHungUp); a socket
+	// that is connecting finds its stream then. Descriptors of the host
+	// process are answered by the host's poll instead.
+	hangStreams := make([]any, len(fdEvents))
+	connecting := make([]bool, len(fdEvents))
 	// The descriptors of the host process among them are asked about
 	// together, in one poll(2).
 	var hostSet hostPollSet
@@ -5813,6 +5819,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			// A socket that is connecting becomes writable when the
 			// attempt has ended, either way, and readable when it has
 			// failed or when the connection it made has input.
+			connecting[i] = ev.isRead
 			key := probeKey{op: op, write: !ev.isRead}
 			if at, seen := probeOf[key]; seen {
 				probeIndex[i] = at
@@ -5905,6 +5912,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 			ready[i], anyReady = true, true
 			continue
 		}
+		hangStreams[i] = stream
 		if pending, _ := op.aheadReady(); pending {
 			ready[i], anyReady = true, true
 			continue
@@ -6012,12 +6020,24 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		if ev.etype == 0 && anyReady {
 			continue
 		}
-		writeEvent(events[written:written+32], ev.userdata, ev.etype, 0, 0)
+		writeEvent(events[written:written+32], ev.userdata, ev.etype, 0, 0, 0)
 		written += 32
 	}
 	for i, ev := range fdEvents {
 		if !ready[i] {
 			continue
+		}
+		var flags uint16
+		if errnos[i] == 0 {
+			if hostSet.hungUp(i) {
+				flags = wasiEventHangup
+			} else if stream := hangStreams[i]; stream != nil && streamHungUp(stream) {
+				flags = wasiEventHangup
+			} else if connecting[i] {
+				if stream := ops[i].netConn(); stream != nil && streamHungUp(stream) {
+					flags = wasiEventHangup
+				}
+			}
 		}
 		var nbytes uint64
 		if op := ops[i]; op != nil && ev.isRead && errnos[i] == 0 {
@@ -6035,12 +6055,27 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 				}
 			}
 		}
-		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(errnos[i]), nbytes)
+		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(errnos[i]), nbytes, flags)
 		written += 32
 	}
 
 	binary.LittleEndian.PutUint32(nev, uint32(written/32))
 	return _wasiESUCCESS
+}
+
+// wasiEventHangup is eventrwflags' fd_readwrite_hangup: the peer of the
+// descriptor has hung up. The guest's poll() reports it as POLLHUP.
+const wasiEventHangup uint16 = 1
+
+// streamHungUp reports whether a stream has been hung up on, as poll(2)
+// tells it with POLLHUP: the writers of a pipe have all closed it, a
+// connection is shut down both ways. Only the host can tell, for a stream
+// that is a descriptor of its own; of any other stream it is not known, and
+// the guest finds the end of its input by reading it.
+func streamHungUp(stream any) bool {
+	var hup bool
+	hostDescriptor(stream, func(fd uintptr) { hup, _ = hostHungUp(fd) })
+	return hup
 }
 
 // pollProbe is one descriptor poll_oneoff has to probe for readiness: a
@@ -6104,7 +6139,7 @@ func pollReady(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
 	<-done
 }
 
-func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64) {
+func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64, flags uint16) {
 	for i := range dst {
 		dst[i] = 0
 	}
@@ -6112,6 +6147,7 @@ func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes ui
 	binary.LittleEndian.PutUint16(dst[8:], errno)
 	binary.LittleEndian.PutUint16(dst[10:], uint16(etype))
 	binary.LittleEndian.PutUint64(dst[16:], nbytes)
+	binary.LittleEndian.PutUint16(dst[24:], flags)
 }
 
 func (w *WasiStubs) Proc_exit(m *Module, code int32) {
@@ -11510,6 +11546,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVec":                   true,
 			"readVecFailure":            true,
 			"hostDescriptor":            true,
+			"streamHungUp":              true,
 			"restoreHostSignal":         true,
 			"readNow":                   true,
 			"appendWasiString":          true,

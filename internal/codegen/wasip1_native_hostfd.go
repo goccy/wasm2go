@@ -936,6 +936,24 @@ func (s *hostPollSet) ready(mark func(sub int)) bool {
 	return any
 }
 
+// hungUp reports whether the last poll found the descriptor of subscription
+// sub hung up on (POLLHUP), which poll(2) reports whether it was asked for
+// or not.
+func (s *hostPollSet) hungUp(sub int) bool {
+	for i, p := range s.fds {
+		if s.subs[i] == sub {
+			return p.revents&hostPollHup != 0
+		}
+	}
+	return false
+}
+
+// hostHungUp asks the host whether a descriptor of its own has been hung up
+// on (POLLHUP): known is false when the host cannot say.
+func hostHungUp(fd uintptr) (hup, known bool) {
+	return hostReadyNow(int(fd), hostPollIn)&hostPollHup != 0, true
+}
+
 // await waits for one of the descriptors, as awaitHost does.
 func (s *hostPollSet) await(w *WasiStubs, until time.Time) int32 {
 	return w.awaitHost(s.fds, until)
