@@ -412,3 +412,10 @@ func forwardSIGPIPEToIgnore() {}
 
 // startCommand starts cmd; no guest takes descriptors in on this platform.
 func startCommand(cmd *exec.Cmd) error { return cmd.Start() }
+
+// hostHostByName would look a host up as the C library's gethostbyname
+// does, which the runtime cannot call on this platform: asked is false, and
+// Sock_host_by_name asks the runtime's resolver.
+func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) {
+	return "", nil, false
+}

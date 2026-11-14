@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -566,4 +568,68 @@ func hostThreadSelf() (thread uint64, ok bool) {
 // interruptHostThread sends hostInterruptSignal to the thread.
 func interruptHostThread(thread uint64) {
 	hostLibcCall(hostLibcPthreadKill, uintptr(thread), hostInterruptSignal, 0)
+}
+
+// The C library's gethostbyname2, called as the functions above are: what
+// perl's gethostbyname calls on this system. It answers in storage of its
+// own, which the next call reuses, hence the lock.
+//
+//go:cgo_import_dynamic libc_gethostbyname2 gethostbyname2 "/usr/lib/libSystem.B.dylib"
+
+var hostLibcGethostbyname2 uintptr
+
+var hostHostByNameMu sync.Mutex
+
+// hostHostent is struct hostent.
+type hostHostent struct {
+	name     *byte
+	aliases  **byte
+	addrtype int32
+	length   int32
+	addrList **byte
+}
+
+// hostHostByName looks the host name up as the C library's gethostbyname
+// does — gethostbyname2(name, AF_INET) — and returns its official name and
+// IPv4 addresses (none when it has none, or the name has no entry). asked
+// is true: the runtime can ask on this system. Unlike the C library's
+// getaddrinfo, which the runtime's resolver calls here, it leaves no socket
+// to the system open behind (getaddrinfo's sorting of the addresses opens
+// one, and keeps it).
+func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) {
+	cname := append([]byte(name), 0)
+	const afInet = 2
+	hostHostByNameMu.Lock()
+	defer hostHostByNameMu.Unlock()
+	r, _, _ := hostLibcCall(hostLibcGethostbyname2, uintptr(unsafe.Pointer(&cname[0])), afInet, 0)
+	runtime.KeepAlive(cname)
+	if r == 0 {
+		return "", nil, true
+	}
+	// The entry is the C library's memory, which the Go collector does not
+	// manage: it is read here, under the lock, and copied. (The address is
+	// taken as the pointer it is, not converted from a number.)
+	ent := *(**hostHostent)(unsafe.Pointer(&r))
+	if ent.addrtype != afInet || ent.length != 4 {
+		return "", nil, true
+	}
+	if ent.name != nil {
+		official = unsafe.String(ent.name, cStringLen(ent.name))
+		official = strings.Clone(official)
+	}
+	if ent.addrList != nil {
+		for p := ent.addrList; *p != nil; p = (**byte)(unsafe.Add(unsafe.Pointer(p), unsafe.Sizeof(p))) {
+			addrs = append(addrs, *(*[4]byte)(unsafe.Pointer(*p)))
+		}
+	}
+	return official, addrs, true
+}
+
+// cStringLen returns the length of the NUL-terminated string at p.
+func cStringLen(p *byte) int {
+	n := 0
+	for *(*byte)(unsafe.Add(unsafe.Pointer(p), n)) != 0 {
+		n++
+	}
+	return n
 }

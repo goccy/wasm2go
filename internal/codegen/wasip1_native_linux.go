@@ -565,3 +565,10 @@ func hostThreadSelf() (thread uint64, ok bool) {
 func interruptHostThread(thread uint64) {
 	_ = syscall.Tgkill(syscall.Getpid(), int(thread), syscall.Signal(hostInterruptSignal))
 }
+
+// hostHostByName would look a host up as the C library's gethostbyname
+// does, which the runtime has no C library to call for here: asked is
+// false, and Sock_host_by_name asks the runtime's resolver.
+func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) {
+	return "", nil, false
+}

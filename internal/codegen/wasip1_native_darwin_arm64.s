@@ -17,3 +17,8 @@ TEXT hostLibcSigactionTrampoline<>(SB),NOSPLIT,$0-0
 	JMP	libc_sigaction(SB)
 GLOBL	·hostLibcSigaction(SB), RODATA, $8
 DATA	·hostLibcSigaction(SB)/8, $hostLibcSigactionTrampoline<>(SB)
+
+TEXT hostLibcGethostbyname2Trampoline<>(SB),NOSPLIT,$0-0
+	JMP	libc_gethostbyname2(SB)
+GLOBL	·hostLibcGethostbyname2(SB), RODATA, $8
+DATA	·hostLibcGethostbyname2(SB)/8, $hostLibcGethostbyname2Trampoline<>(SB)

@@ -7208,6 +7208,72 @@ func (w *WasiStubs) reverseLookup(m *Module, ip string, bufPtr, bufLen, neededPt
 	return w.writeWasiRecord(m, []byte(name), bufPtr, bufLen, neededPtr)
 }
 
+// Sock_host_by_name is a NON-STANDARD host import (name
+// "sock_host_by_name") backing gethostbyname(): the IPv4 addresses of the
+// host named at (nodePtr, nodeLen), and its official name, as the host's
+// gethostbyname finds them where the runtime can call it (darwin: the C
+// library's gethostbyname2, which is what perl calls there), and as the
+// runtime's resolver finds them otherwise (the official name is then the
+// name asked about). It is an import of its own, and not Sock_resolve's
+// lookup of IPv4 addresses, because the two lookups differ on a host where
+// getaddrinfo does more than gethostbyname: darwin's sorts the addresses it
+// finds, for which it opens, and keeps, a socket to the system that
+// gethostbyname never opens; a program that only called gethostbyname
+// would leave it to every command it starts.
+//
+// The record (writeWasiRecord) is the number of addresses (u32), the
+// addresses (4 bytes each, as they sit in s_addr), then the official name.
+// An address written in numbers is converted, not looked up, and the lookup
+// policy (SetResolveHook) is not asked about it. Returns 0, or a negative
+// errno: ENOENT when the name has no IPv4 address, EACCES when the policy
+// refuses.
+func (w *WasiStubs) Sock_host_by_name(m *Module, nodePtr, nodeLen, bufPtr, bufLen, neededPtr int32) int32 {
+	node := w.memSlice(m, nodePtr, nodeLen)
+	if node == nil && nodeLen != 0 {
+		return -_wasiEFAULT
+	}
+	name := string(node)
+	official := name
+	var addrs [][4]byte
+	if ip := net.ParseIP(name); ip != nil {
+		v4 := ip.To4()
+		if v4 == nil {
+			return -_wasiENOENT
+		}
+		addrs = append(addrs, [4]byte(v4))
+	} else {
+		w.mu.Lock()
+		hook := w.resolveHook
+		w.mu.Unlock()
+		if hook != nil && !hook(name) {
+			return -_wasiEACCES
+		}
+		var asked bool
+		official, addrs, asked = hostHostByName(name)
+		if !asked {
+			official = name
+			found, err := net.DefaultResolver.LookupIPAddr(context.Background(), name)
+			if err != nil {
+				return -_wasiENOENT
+			}
+			for _, addr := range found {
+				if v4 := addr.IP.To4(); v4 != nil {
+					addrs = append(addrs, [4]byte(v4))
+				}
+			}
+		}
+	}
+	if len(addrs) == 0 {
+		return -_wasiENOENT
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(len(addrs)))
+	for _, a := range addrs {
+		rec = append(rec, a[:]...)
+	}
+	rec = append(rec, official...)
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
 // ----- process groups ---------------------------------------------------------
 //
 // The processes of a fork family are goroutines of one host process, so the
