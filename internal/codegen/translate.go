@@ -951,8 +951,9 @@ type translator struct {
 	auxFiles map[string][]byte
 
 	// elemInitChunks holds the helper FuncDecls that emitNewFunc factors out
-	// of the element-segment population loop. They get appended at top level
-	// alongside the rest of the function decls.
+	// of the element-segment population loop and of the data-segment copies,
+	// and InstallDataSegments, which runs the latter. They get appended at
+	// top level alongside the rest of the function decls.
 	elemInitChunks []ast.Decl
 
 	// Multi-package state. plan != nil iff opts.MultiPackage is true.
@@ -1894,8 +1895,9 @@ const (
 	newAlloc newMode = iota
 	// newFromMemory takes the memory from the caller (NewWithMemory) and skips
 	// copying the active data segments into it — the caller's memory already
-	// holds them. The start section still runs, because the caller's memory is
-	// an image of the data segments and nothing more.
+	// holds them: an image of them, or a fresh memory the caller installed
+	// them in with InstallDataSegments. The start section still runs, because
+	// the caller's memory is an image of the data segments and nothing more.
 	newFromMemory
 	// newFromSnapshot takes the memory AND the wasm globals from the caller
 	// (NewFromSnapshot): a snapshot of an instance that has already been fully
@@ -1925,9 +1927,12 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 // initialMemoryBytesConst emits the module's declared initial linear-memory
 // size as an exported constant. It is what NewWithMemory's memSize parameter
 // must be when the caller-provided memory is FRESH (all zeros, e.g. a
-// MAP_SHARED mapping handed to an in-place image builder): the constructor
-// then installs the data segments and runs initialization exactly as the
-// allocating constructor would.
+// MAP_SHARED mapping handed to an in-place image builder) and the caller has
+// installed the active data segments in it (InstallDataSegments): the
+// constructor then runs initialization exactly as the allocating constructor
+// would. NewWithMemory itself never writes the data segments: it cannot tell
+// a fresh memory from an image that holds them, and writing over an image
+// would fault in a private copy of every page and undo the sharing.
 func (t *translator) initialMemoryBytesConst() ast.Decl {
 	return &ast.GenDecl{
 		Tok: token.CONST,
@@ -1935,6 +1940,51 @@ func (t *translator) initialMemoryBytesConst() ast.Decl {
 			Names:  []*ast.Ident{newID("InitialMemoryBytes")},
 			Values: []ast.Expr{uintLit(t.mod.Memories[0].Limits.Min * 65536)},
 		}},
+	}
+}
+
+// installDataSegmentsFunc emits InstallDataSegments(memory []byte), which
+// copies the module's active data segments into memory as the allocating
+// constructors copy them into the memory they allocate (calls are their
+// copies, run on a Module that has only the memory). It is what a caller
+// that hands NewWithMemory a FRESH memory runs first — an in-place image
+// builder on its mapping — since NewWithMemory takes the memory as it is.
+// Passive segments are not copied: the start section installs them, in
+// every constructor that runs it.
+func (t *translator) installDataSegmentsFunc(calls []ast.Stmt) ast.Decl {
+	body := &ast.BlockStmt{List: []ast.Stmt{
+		&ast.AssignStmt{
+			Tok: token.DEFINE,
+			Lhs: []ast.Expr{newID("m")},
+			Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: &ast.CompositeLit{Type: t.moduleTypeName()}}},
+		},
+		&ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{t.fieldRef("memory")},
+			Rhs: []ast.Expr{newID("memory")},
+		},
+	}}
+	body.List = append(body.List, calls...)
+	if len(calls) == 0 {
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID("_")},
+			Rhs: []ast.Expr{newID("m")},
+		})
+	}
+	return &ast.FuncDecl{
+		Doc: &ast.CommentGroup{List: []*ast.Comment{
+			{Text: "// InstallDataSegments copies the module's active data segments into"},
+			{Text: "// memory, as New does into the memory it allocates. NewWithMemory takes"},
+			{Text: "// its memory as it is: a fresh memory (all zeros, InitialMemoryBytes"},
+			{Text: "// long or more) gets the segments from here first."},
+		}},
+		Name: newID("InstallDataSegments"),
+		Type: &ast.FuncType{Params: &ast.FieldList{List: []*ast.Field{{
+			Names: []*ast.Ident{newID("memory")},
+			Type:  &ast.ArrayType{Elt: newID("byte")},
+		}}}},
+		Body: body,
 	}
 }
 
@@ -2448,6 +2498,10 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// code slices it by offset/length per segment. This avoids producing
 	// thousands of tiny sidecar files for wasm modules that emit one
 	// segment per string literal.
+	//
+	// installCalls collects the calls of the copies for InstallDataSegments,
+	// emitted with the allocating constructors.
+	var installCalls []ast.Stmt
 	if len(t.mod.Datas) > 0 {
 		// A C++→wasm build commonly emits one data segment per symbol —
 		// modules can carry tens of thousands. Emitting one copy() per
@@ -2578,7 +2632,8 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			}
 			chunkName := fmt.Sprintf("initData_%d", c)
 			if memFromArg {
-				// See above: definitions once, calls per constructor.
+				// Defined once, and never called by a constructor that takes
+				// its memory: the memory holds the segments already.
 				continue
 			}
 			t.elemInitChunks = append(t.elemInitChunks, &ast.FuncDecl{
@@ -2595,7 +2650,14 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				Fun:  newID(chunkName),
 				Args: []ast.Expr{newID("m")},
 			}})
+			installCalls = append(installCalls, &ast.ExprStmt{X: &ast.CallExpr{
+				Fun:  newID(chunkName),
+				Args: []ast.Expr{newID("m")},
+			}})
 		}
+	}
+	if mode == newAlloc && len(t.mod.Memories) > 0 {
+		t.elemInitChunks = append(t.elemInitChunks, t.installDataSegmentsFunc(installCalls))
 	}
 
 	// Passive data segments: register blob views under their ORIGINAL
