@@ -618,8 +618,17 @@ func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) 
 		official = strings.Clone(official)
 	}
 	if ent.addrList != nil {
-		for p := ent.addrList; *p != nil; p = (**byte)(unsafe.Add(unsafe.Pointer(p), unsafe.Sizeof(p))) {
-			addrs = append(addrs, *(*[4]byte)(unsafe.Pointer(*p)))
+		// The C library packs the entry: its address list need not be
+		// aligned as a Go pointer must be (darwin's lies 2 bytes past a
+		// pointer boundary), so the list is read as numbers, each address
+		// then taken as the pointer it is.
+		list := unsafe.Pointer(ent.addrList)
+		for i := uintptr(0); ; i++ {
+			a := *(*uintptr)(unsafe.Add(list, i*unsafe.Sizeof(uintptr(0))))
+			if a == 0 {
+				break
+			}
+			addrs = append(addrs, *(*[4]byte)(*(*unsafe.Pointer)(unsafe.Pointer(&a))))
 		}
 	}
 	return official, addrs, true
