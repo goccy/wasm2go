@@ -14,17 +14,18 @@ import (
 // and at an address whose sum with the static offset wraps a u64 as
 // well — for plain loads and stores of every width, static offsets
 // below and above the memory's minimum, constant addresses, inline and
-// helper atomics and the bulk operations, before and after memory.grow
-// (also a grow inside the accessing function). A trapped store writes
-// nothing, and a store before a trapping load in the same function has
-// happened. Accesses whose check another one's stands for (a later
-// access off the same address that reaches further, one inside a
-// branch, one whose address is an i64.add that wraps) trap as they
-// would on their own. Both backends: the generated code as the host
-// builds it, and the pure Go form. Which form the first is follows the
-// build: the assembly on arm64 and on amd64 from GOAMD64=v2 up, the
-// pure fallback otherwise — run the test with GOARCH=arm64 or
-// GOAMD64=v2 to cover the assembly.
+// helper atomics, v128 accesses (alone, sharing one coalesced range
+// check, and fused into one region with other ops) and the bulk
+// operations, before and after memory.grow (also a grow inside the
+// accessing function). A trapped store writes nothing, and a store
+// before a trapping load in the same function has happened. Accesses
+// whose check another one's stands for (a later access off the same
+// address that reaches further, one inside a branch, one whose address
+// is an i64.add that wraps) trap as they would on their own. Both
+// backends: the generated code as the host builds it, and the pure Go
+// form. Which form the first is follows the build: the assembly on
+// arm64 and on amd64 from GOAMD64=v2 up, the pure fallback otherwise —
+// run the test with GOARCH=arm64 or GOAMD64=v2 to cover the assembly.
 func TestMem64OutOfBoundsTraps(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -135,6 +136,20 @@ const mem64BoundsMain = `	m := pkg.New()
 		run("atomicadd32 "+a.label, func() any { return m.Atomicadd32(int64(a.addr), 1) })
 	}
 	run("atomicstore32 2", func() any { m.Atomicstore32(2, 7); return "ok" })
+	for _, a := range edges(16) {
+		run("vload "+a.label, func() any { return m.Vload(int64(a.addr)) })
+		run("vstore "+a.label, func() any { m.Vstore(int64(a.addr), 8); return "ok" })
+	}
+	for _, a := range edges(32) {
+		run("vsum "+a.label, func() any { return m.Vsum(int64(a.addr)) })
+	}
+	run("vsum 2^64-16", func() any { return m.Vsum(-16) })
+	for _, a := range edges(16) {
+		run("vaddstore dst "+a.label, func() any { m.Vaddstore(int64(a.addr), 0); return "ok" })
+	}
+	for _, a := range edges(32) {
+		run("vaddstore src "+a.label, func() any { m.Vaddstore(0, int64(a.addr)); return "ok" })
+	}
 	run("fill end-16 16", func() any { m.Fill(int64(end-16), 16); return "ok" })
 	run("fill end-16 17", func() any { m.Fill(int64(end-16), 17); return "ok" })
 	run("fill 2^64-8 16", func() any { m.Fill(-8, 16); return "ok" })
@@ -169,6 +184,7 @@ const mem64BoundsMain = `	m := pkg.New()
 const oob = "trap wasm: memory access out of bounds"
 const aoob = "trap wasm: atomic access out of bounds"
 const unaligned = "trap wasm: unaligned atomic access"
+const voob = "trap wasm: v128 memory access out of bounds"
 
 // mem64BoundsWant is what mem64BoundsMain prints.
 var mem64BoundsWant = edgeLines("load8", "0", oob) +
@@ -194,6 +210,11 @@ var mem64BoundsWant = edgeLines("load8", "0", oob) +
 	"atomicload64 4: " + unaligned + "\n" +
 	interleave(edgeLines("atomicstore32", "ok", aoob), edgeLines("atomicadd32", "7", aoob)) +
 	"atomicstore32 2: " + unaligned + "\n" +
+	interleave(edgeLines("vload", "0", voob), edgeLines("vstore", "ok", voob)) +
+	edgeLines("vsum", "8", voob) +
+	"vsum 2^64-16: " + voob + "\n" +
+	edgeLines("vaddstore dst", "ok", voob) +
+	edgeLines("vaddstore src", "ok", voob) +
 	"fill end-16 16: ok\n" +
 	"fill end-16 17: trap wasm: memory.fill out of bounds\n" +
 	"fill 2^64-8 16: trap wasm: memory.fill out of bounds\n" +

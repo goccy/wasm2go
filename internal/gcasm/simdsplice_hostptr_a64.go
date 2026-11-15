@@ -40,11 +40,19 @@ type a64HostPtr struct {
 // a64LoopHostPtrs picks the loop's bump-carried address scalars that
 // profit from pointer carry: constant-delta bumps whose scalar
 // appears as the variable part of at least two memory addresses.
-// Address width is immaterial: the carried pointer is recomputed
-// from the live scalar each copy, and the folded range compare
-// performs the same reassociation the coalesced checks already do.
+// The carried pointer is recomputed from the live scalar each copy,
+// and the folded range compare performs the same reassociation the
+// coalesced checks already do.
+//
+// A memory64 loop carries none: its folded compare adds the addend and
+// offset to the scalar before comparing, which a scalar near 2^64 wraps
+// back into range — and the pointer would then address bytes below the
+// memory. Its loads keep the per-access checked forms.
 func a64LoopHostPtrs(loop *simdfuse.Loop, freeRegs []string) map[int]*a64HostPtr {
 	tree := loop.Tree
+	if tree.Addr64 {
+		return nil
+	}
 	bumped := map[int]bool{}
 	for _, bp := range loop.Bumps {
 		if bp.DeltaScalar < 0 && bp.Delta > 0 {

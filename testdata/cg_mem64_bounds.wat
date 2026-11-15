@@ -38,6 +38,17 @@
   (func (export "atomicstore32") (param i64 i32) (i32.atomic.store (local.get 0) (local.get 1)))
   (func (export "atomicadd32") (param i64 i32) (result i32) (i32.atomic.rmw.add (local.get 0) (local.get 1)))
 
+  (func (export "vload") (param i64) (result i64) (i64x2.extract_lane 0 (v128.load (local.get 0))))
+  (func (export "vstore") (param i64 i64) (v128.store (local.get 0) (i64x2.splat (local.get 1))))
+  ;; two loads off one address, which share one coalesced range check
+  (func (export "vsum") (param i64) (result i64)
+    (i64x2.extract_lane 0
+      (i64x2.add (v128.load (local.get 0)) (v128.load offset=16 (local.get 0)))))
+  ;; loads, an add and a store the generator fuses into one region
+  (func (export "vaddstore") (param i64 i64)
+    (v128.store (local.get 0)
+      (i64x2.add (v128.load (local.get 1)) (v128.load offset=16 (local.get 1)))))
+
   (func (export "fill") (param i64 i64) (memory.fill (local.get 0) (i32.const 0x5a) (local.get 1)))
   (func (export "copy") (param i64 i64 i64) (memory.copy (local.get 0) (local.get 1) (local.get 2)))
 

@@ -3333,11 +3333,13 @@ func simd_m64_v128_load(m *Module, addr int64, offset int64) [2]uint64 {
 //
 //go:noinline
 func simd_m64_v128_load_rng(m *Module, addr int64, offset int64, rlo int64, span int64) [2]uint64 {
-	// addr is a valid guest pointer (< the 2^48 hard cap, so
-	// non-negative as int64); rlo is a small signed window start and
-	// span a small positive length, so the signed sum cannot overflow.
+	// Every member of the group loads at this same address (the pass
+	// groups memory64 loads by address value). At or above the 2^48
+	// hard cap, past any memory.size, every member is out of bounds;
+	// below it, rlo (a small signed window start) and span (a small
+	// positive length) cannot make the sums wrap.
 	start := addr + rlo
-	if start < 0 || uint64(start)+uint64(span) > m.memSize.Load() {
+	if uint64(addr) >= mem64HardCap() || start < 0 || uint64(start)+uint64(span) > m.memSize.Load() {
 		wasm_trap_simd_oob()
 	}
 	ea := uint64(addr) + uint64(offset)
