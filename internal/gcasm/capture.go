@@ -200,6 +200,11 @@ func diagnostics(b []byte) string {
 			strings.HasPrefix(ln, "compile: "),
 			strings.HasPrefix(ln, "asm: "),
 			strings.HasPrefix(ln, "link: "),
+			// a tool that did not finish: killed (out of memory) or crashed
+			strings.Contains(ln, ": signal: "),
+			strings.HasPrefix(ln, "fatal error: "),
+			strings.HasPrefix(ln, "panic: "),
+			strings.Contains(ln, "internal compiler error"),
 			errLine.MatchString(ln):
 			diag = append(diag, ln)
 		}
