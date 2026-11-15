@@ -427,3 +427,10 @@ func hostAwaitChild(pid int) int32 { return wasiSIGKILL }
 func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) {
 	return "", nil, false
 }
+
+// hostAccess would ask the host about an access to a file, which the
+// runtime cannot do on this platform: asked is false, and Path_access
+// decides by the file's mode bits.
+func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+	return 0, false
+}

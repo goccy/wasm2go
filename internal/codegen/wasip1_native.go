@@ -4540,6 +4540,126 @@ func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Path_access is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "path_access") backing access() and faccessat(): whether the program
+// may read, write or run a file, or find it at all. WASI preview1 has no
+// call that says so: wasi-libc's faccessat looks at the rights of the
+// preopened directory alone, which every file under it shares, and never at
+// X_OK, so a file of mode 0600 was runnable and one of mode 0400 writable.
+// The path at (pathPtr,pathLen) is preopen-relative, like path_open's; amode
+// is access's (F_OK 0, or any of X_OK 1, W_OK 2, R_OK 4); flags bit 0
+// (wasiAccessEffective) asks with the effective ids instead of the real ones,
+// as AT_EACCESS does.
+//
+// A file of the host's filesystem is asked about with the host's own check
+// (faccessat(2)), which also knows access control lists and read-only
+// mounts; a file of another backend by its mode bits and owner, for the ids
+// the guest has (Proc_ids). Returns 0, or a negative errno: EACCES when the
+// access is refused, ENOENT and the like when the file cannot be found,
+// EINVAL for an amode or flags it does not know.
+func (w *WasiStubs) Path_access(m *Module, pathPtr, pathLen, amode, flags int32) int32 {
+	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	if amode&^(wasiAccessRead|wasiAccessWrite|wasiAccessExec) != 0 || flags&^wasiAccessEffective != 0 {
+		return -_wasiEINVAL
+	}
+	path := string(pathSlice)
+	if !w.checkFS(path, false) {
+		return -_wasiEACCES
+	}
+	effective := flags&wasiAccessEffective != 0
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	if located, can := fsys.(interface {
+		HostPath(name string) (string, error)
+	}); can {
+		if host, err := located.HostPath(path); err == nil {
+			if errno, asked := hostAccess(host, uint32(amode), effective); asked {
+				return -errno
+			}
+		} else if !errors.Is(err, errors.ErrUnsupported) {
+			return -mapOSError(err)
+		}
+	}
+	fi, err := fsys.Stat(path)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	if amode == 0 {
+		return _wasiESUCCESS
+	}
+	uid, gid := w.accessIDs(effective)
+	if !modeAllows(fi, fileStatOf(fi), uint32(amode), uid, gid, w.accessGroups()) {
+		return -_wasiEACCES
+	}
+	return _wasiESUCCESS
+}
+
+// The bits of Path_access's amode (access's R_OK, W_OK, X_OK) and flags.
+const (
+	wasiAccessExec      int32 = 1
+	wasiAccessWrite     int32 = 2
+	wasiAccessRead      int32 = 4
+	wasiAccessEffective int32 = 1
+)
+
+// accessIDs returns the user and group id the guest asks Path_access with:
+// its real ones, or its effective ones (Proc_ids reports both).
+func (w *WasiStubs) accessIDs(effective bool) (uid, gid uint32) {
+	if !w.hostIdentity() {
+		return 0, 0
+	}
+	if effective {
+		return uint32(os.Geteuid()), uint32(os.Getegid())
+	}
+	return uint32(os.Getuid()), uint32(os.Getgid())
+}
+
+// accessGroups returns the supplementary groups of the guest: the host
+// process's when the guest has its identity, none otherwise.
+func (w *WasiStubs) accessGroups() []uint32 {
+	if !w.hostIdentity() {
+		return nil
+	}
+	groups, err := os.Getgroups()
+	if err != nil {
+		return nil
+	}
+	out := make([]uint32, len(groups))
+	for i, g := range groups {
+		out[i] = uint32(g)
+	}
+	return out
+}
+
+// modeAllows reports whether a process of user uid and group gid (with the
+// supplementary groups) may make the accesses of amode to the file fi
+// describes, by its mode bits, as access(2) decides without access control
+// lists: the owner's bits for its owner, the group's for a member of its
+// group, the others' for the rest; uid 0 may read and write anything, and
+// run what has any x bit, or search any directory.
+func modeAllows(fi os.FileInfo, st fileStat, amode, uid, gid uint32, groups []uint32) bool {
+	perm := uint32(fi.Mode().Perm())
+	if uid == 0 {
+		return amode&uint32(wasiAccessExec) == 0 || fi.IsDir() || perm&0o111 != 0
+	}
+	shift := uint32(0)
+	member := st.gid == gid
+	for _, g := range groups {
+		member = member || g == st.gid
+	}
+	switch {
+	case st.uid == uid:
+		shift = 6
+	case member:
+		shift = 3
+	}
+	return (perm>>shift)&amode == amode
+}
+
 // Proc_umask is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "proc_umask") backing a bridge-provided umask(): it sets the
 // instance's file mode creation mask and returns the previous one. The
@@ -11665,6 +11785,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVecFailure":            true,
 			"hostDescriptor":            true,
 			"streamHungUp":              true,
+			"modeAllows":                true,
 			"restoreHostSignal":         true,
 			"readNow":                   true,
 			"appendWasiString":          true,

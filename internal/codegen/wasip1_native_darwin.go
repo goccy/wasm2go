@@ -634,6 +634,46 @@ func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) 
 	return official, addrs, true
 }
 
+// hostLibcCall6 calls the C library's function at fn with up to six
+// arguments, as the syscall package does.
+//
+//go:linkname hostLibcCall6 syscall.syscall6
+func hostLibcCall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)
+
+// The C library's faccessat, called as the functions above are: the
+// syscall package has no call for it on this system.
+//
+//go:cgo_import_dynamic libc_faccessat faccessat "/usr/lib/libSystem.B.dylib"
+
+var hostLibcFaccessat uintptr
+
+// faccessat's AT_FDCWD and AT_EACCESS on this system.
+const (
+	hostATFDCWD   = -2
+	hostATEAccess = 0x10
+)
+
+// hostAccess asks the host whether the process may make the accesses of
+// amode (access's bits) to the file at path, with its effective ids or its
+// real ones: faccessat(2). asked is true: the host can always say.
+func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+	cpath, err := syscall.BytePtrFromString(path)
+	if err != nil {
+		return _wasiEINVAL, true
+	}
+	flags := 0
+	if effective {
+		flags = hostATEAccess
+	}
+	atFDCWD := hostATFDCWD
+	r, _, e := hostLibcCall6(hostLibcFaccessat, uintptr(atFDCWD), uintptr(unsafe.Pointer(cpath)), uintptr(amode), uintptr(flags), 0, 0)
+	runtime.KeepAlive(cpath)
+	if int32(r) == -1 {
+		return mapOSError(e), true
+	}
+	return _wasiESUCCESS, true
+}
+
 // cStringLen returns the length of the NUL-terminated string at p.
 func cStringLen(p *byte) int {
 	n := 0

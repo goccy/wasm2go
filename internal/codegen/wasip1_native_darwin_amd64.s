@@ -22,3 +22,8 @@ TEXT hostLibcGethostbyname2Trampoline<>(SB),NOSPLIT,$0-0
 	JMP	libc_gethostbyname2(SB)
 GLOBL	·hostLibcGethostbyname2(SB), RODATA, $8
 DATA	·hostLibcGethostbyname2(SB)/8, $hostLibcGethostbyname2Trampoline<>(SB)
+
+TEXT hostLibcFaccessatTrampoline<>(SB),NOSPLIT,$0-0
+	JMP	libc_faccessat(SB)
+GLOBL	·hostLibcFaccessat(SB), RODATA, $8
+DATA	·hostLibcFaccessat(SB)/8, $hostLibcFaccessatTrampoline<>(SB)

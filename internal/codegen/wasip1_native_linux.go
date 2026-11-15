@@ -572,3 +572,23 @@ func interruptHostThread(thread uint64) {
 func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) {
 	return "", nil, false
 }
+
+// hostAccess asks the host whether the process may make the accesses of
+// amode (access's bits) to the file at path, with its effective ids or its
+// real ones: faccessat(2). asked is true: the host can always say.
+func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+	flags := 0
+	if effective {
+		flags = hostATEAccess
+	}
+	if err := syscall.Faccessat(hostATFDCWD, path, amode, flags); err != nil {
+		return mapOSError(err), true
+	}
+	return _wasiESUCCESS, true
+}
+
+// faccessat's AT_FDCWD and AT_EACCESS on this system.
+const (
+	hostATFDCWD   = -100
+	hostATEAccess = 0x200
+)
