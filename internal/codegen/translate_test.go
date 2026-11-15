@@ -90,12 +90,16 @@ func runGoSnippet(t *testing.T, generated string, mainSrc string, sidecars ...ma
 	return runGoSnippetWithAux(t, generated, mainSrc, sidecars, nil)
 }
 
-// pureGuardRe matches codegen's pure-Go fallback build constraint.
-var pureGuardRe = regexp.MustCompile(`(?m)^//go:build !amd64 && !arm64\n`)
+// pureGuardRe matches codegen's pure-Go fallback build constraint
+// (pureFallbackTag), as it is written now and as it was before the asm
+// bundle covered amd64 only from amd64.v2 on: with the older form alone,
+// the guard stayed in place on an arm64 test host and the snippets did not
+// compile (their function bodies were left out).
+var pureGuardRe = regexp.MustCompile(`(?m)^//go:build (!amd64 && !arm64|!arm64 && \(!amd64 \|\| !amd64\.v2\))\n`)
 
-// stripPureGuard removes the `//go:build !amd64 && !arm64` constraint from
-// a generated file so codegen's pure-Go function bodies compile and run on
-// the amd64/arm64 test host. In production the gcasm backend supplies the
+// stripPureGuard removes the pure fallback constraint from a generated
+// file so codegen's pure-Go function bodies compile and run on the
+// amd64/arm64 test host. In production the gcasm backend supplies the
 // per-arch asm for those GOARCHs (see transpile.Translate); codegen alone
 // now emits only the pure bodies, so these codegen tests — which exercise
 // that output directly and cannot import transpile (import cycle) — must
