@@ -461,7 +461,8 @@ func TestOpenOfAFIFOWithoutWaiting(t *testing.T) {
 }
 
 // awaitHostInput waits, for up to five seconds, until the host descriptor
-// behind stream has input.
+// behind stream (a stream, a datagram socket or a listener) has input: for
+// a listener, a connection waiting to be accepted.
 func awaitHostInput(t *testing.T, stream any) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -569,6 +570,11 @@ func TestProbeWithNoTimeLeftFindsWhatIsThere(t *testing.T) {
 		t.Fatal("a listener nobody connected to is ready")
 	}
 	conn := dialLoopback(t, w, m, port)
+	// The connect may return before the host has queued the connection
+	// at the listener (darwin completes it on the loopback interface's
+	// input thread): wait until the host has it, then probe with no time
+	// left.
+	awaitHostInput(t, bounded)
 	if !lop.probeAccept(bounded, past(), nil) {
 		t.Fatal("a listener with a connection waiting is not ready")
 	}
