@@ -12,7 +12,8 @@ const mmapSupported = true
 
 // mmapImage maps the image as one instance's linear memory: MAP_PRIVATE, so
 // reads share the image's physical pages with every other instance and a write
-// faults in a private copy of just that page.
+// faults in a private copy of just that page. Its pages are charged against
+// the commit limit as they are written, not all at once (mapNoReserve).
 //
 // The file is sparse-extended to the ceiling first, so the whole range is
 // mappable and everything past the image reads as zeros — which is what a
@@ -29,7 +30,7 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 		}
 	}
 	mem, err := syscall.Mmap(int(f.Fd()), 0, ceiling,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE)
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|mapNoReserve)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping the shared memory image: %w", err)
 	}
@@ -50,10 +51,11 @@ func mmapShared(f *os.File, length int) ([]byte, error) {
 }
 
 // mmapAnonymous maps length bytes of zeros, private to the process: memory
-// of an instance's own that stays at one address.
+// of an instance's own that stays at one address, charged as it is written
+// (mapNoReserve).
 func mmapAnonymous(length int) ([]byte, error) {
 	mem, err := syscall.Mmap(-1, 0, length,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON|mapNoReserve)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping memory of the instance's own: %w", err)
 	}
