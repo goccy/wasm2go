@@ -193,11 +193,15 @@ func memOpen(m *{{.Module}}, accessible, ceiling uint64) ([]byte, error) {
 
 // memOwn makes the instance the owner of the reservation mem: it is
 // unmapped once neither the instance nor any copy of it (a wasi-threads
-// agent runs on one) refers to it.
+// agent runs on one) refers to it. What the instance refers to is a value
+// of its own that describes the reservation, not the registry's entry:
+// the registry holds its entry for as long as the reservation is
+// registered, so a finalizer on the entry would never run.
 func memOwn(m *{{.Module}}, mem []byte) {
 	r, _ := memRegistered(mem)
-	m.{{.MemRes}} = r
-	runtime.SetFinalizer(r, func(r *memReservation) {
+	own := &memReservation{mem: r.mem, ceiling: r.ceiling}
+	m.{{.MemRes}} = own
+	runtime.SetFinalizer(own, func(r *memReservation) {
 		memUnregister(r.mem)
 		_ = syscall.Munmap(r.mem)
 	})
