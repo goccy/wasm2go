@@ -1922,6 +1922,11 @@ func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Fd_closefrom64 is Fd_closefrom for a memory64 guest.
+func (w *WasiStubs) Fd_closefrom64(m *Module, lowFd int32) int32 {
+	return w.Fd_closefrom(m, lowFd)
+}
+
 // wasiPreopenFD is the fd of the preopened root directory. It is not a
 // table entry and is never handed out for a new descriptor — except to a
 // guest whose descriptors are the host process's, for which 3 is a number
@@ -2150,16 +2155,15 @@ func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
 
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
 // ptr (0) yields "". ok is false on an out-of-bounds or unterminated read.
-func (w *WasiStubs) readCStr(m *Module, ptr int32) (s string, ok bool) {
+func (w *WasiStubs) readCStr(m *Module, ptr uint64) (s string, ok bool) {
 	if ptr == 0 {
 		return "", true
 	}
 	mem := m.memory
-	lo := uint64(uint32(ptr))
-	if lo > uint64(len(mem)) {
+	if ptr > uint64(len(mem)) {
 		return "", false
 	}
-	rest := mem[lo:]
+	rest := mem[ptr:]
 	for i := 0; i < len(rest); i++ {
 		if rest[i] == 0 {
 			return string(rest[:i]), true
@@ -2169,17 +2173,18 @@ func (w *WasiStubs) readCStr(m *Module, ptr int32) (s string, ok bool) {
 }
 
 // readCStrArray reads a NULL-terminated array of C-string pointers (a char**)
-// at ptr. A nil ptr (0) yields a nil slice. ok is false on a bad read.
-func (w *WasiStubs) readCStrArray(m *Module, ptr int32) (out []string, ok bool) {
+// at ptr, whose entries are the guest's pointers (abi). A nil ptr (0) yields
+// a nil slice. ok is false on a bad read.
+func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []string, ok bool) {
 	if ptr == 0 {
 		return nil, true
 	}
-	for off := ptr; ; off += 4 {
-		b := w.memSlice(m, off, 4)
+	for off := ptr; ; off += abi.wordSize() {
+		b := w.memBytes(m, off, abi.wordSize())
 		if b == nil {
 			return nil, false
 		}
-		p := int32(binary.LittleEndian.Uint32(b))
+		p := abi.word(b)
 		if p == 0 {
 			break
 		}
@@ -2204,15 +2209,25 @@ func (w *WasiStubs) readCStrArray(m *Module, ptr int32) (out []string, ok bool) 
 // own pid when the guest is the host process, a pid token otherwise.
 // Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
+	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
+}
+
+// Proc_spawn64 is Proc_spawn for a memory64 guest.
+func (w *WasiStubs) Proc_spawn64(m *Module, pathPtr, argvPtr, envpPtr int64, stdinFd, stdoutFd, stderrFd int32, cwdPtr, pidOutPtr int64) int32 {
+	return w.procSpawn(m, wasiABI64, uint64(pathPtr), uint64(argvPtr), uint64(envpPtr), stdinFd, stdoutFd, stderrFd, uint64(cwdPtr), uint64(pidOutPtr))
+}
+
+// procSpawn is the body of Proc_spawn and Proc_spawn64.
+func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr uint64, stdinFd, stdoutFd, stderrFd int32, cwdPtr, pidOutPtr uint64) int32 {
 	path, ok := w.readCStr(m, pathPtr)
 	if !ok || path == "" {
 		return -_wasiEINVAL
 	}
-	argv, ok := w.readCStrArray(m, argvPtr)
+	argv, ok := w.readCStrArray(m, abi, argvPtr)
 	if !ok {
 		return -_wasiEFAULT
 	}
-	env, ok := w.readCStrArray(m, envpPtr)
+	env, ok := w.readCStrArray(m, abi, envpPtr)
 	if !ok {
 		return -_wasiEFAULT
 	}
@@ -2223,7 +2238,7 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	if !ok {
 		return -_wasiEFAULT
 	}
-	out := w.memSlice(m, pidOutPtr, 4)
+	out := w.memBytes(m, pidOutPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -2473,7 +2488,17 @@ func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
 // descriptor number, not to the open file: a duplicate starts without it.
 // Returns 0 or a negative errno.
 func (w *WasiStubs) Fd_cloexec(m *Module, fd, set, value, oldPtr int32) int32 {
-	out := w.memSlice(m, oldPtr, 4)
+	return w.fdCloexec(m, fd, set, value, zext(oldPtr))
+}
+
+// Fd_cloexec64 is Fd_cloexec for a memory64 guest.
+func (w *WasiStubs) Fd_cloexec64(m *Module, fd, set, value int32, oldPtr int64) int32 {
+	return w.fdCloexec(m, fd, set, value, uint64(oldPtr))
+}
+
+// fdCloexec is the body of Fd_cloexec and Fd_cloexec64.
+func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) int32 {
+	out := w.memBytes(m, oldPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -2561,7 +2586,17 @@ func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
 // to a child as its stdout/stderr via Proc_spawn, so subprocess.run can
 // capture output. Returns 0 or a negative errno.
 func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
-	out := w.memSlice(m, fdsOutPtr, 8)
+	return w.pipe(m, zext(fdsOutPtr))
+}
+
+// Pipe64 is Pipe for a memory64 guest.
+func (w *WasiStubs) Pipe64(m *Module, fdsOutPtr int64) int32 {
+	return w.pipe(m, uint64(fdsOutPtr))
+}
+
+// pipe is the body of Pipe and Pipe64.
+func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
+	out := w.memBytes(m, fdsOutPtr, 8)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -2608,7 +2643,17 @@ func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 // once the process has finished — EINTR when a signal was posted to the
 // guest before the process finished.
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
-	out := w.memSlice(m, statusOutPtr, 4)
+	return w.procWait(m, pid, options, zext(statusOutPtr))
+}
+
+// Proc_wait64 is Proc_wait for a memory64 guest.
+func (w *WasiStubs) Proc_wait64(m *Module, pid, options int32, statusOutPtr int64) int32 {
+	return w.procWait(m, pid, options, uint64(statusOutPtr))
+}
+
+// procWait is the body of Proc_wait and Proc_wait64.
+func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64) int32 {
+	out := w.memBytes(m, statusOutPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -2690,8 +2735,18 @@ func (w *WasiStubs) adoptHostChildLocked(pid int32) *wasiProc {
 // all, EAGAIN when WNOHANG is set and none of them has finished yet, EINTR
 // when a signal was posted to the guest before one finished.
 func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr int32) int32 {
-	pidOut := w.memSlice(m, pidOutPtr, 4)
-	statusOut := w.memSlice(m, statusOutPtr, 4)
+	return w.procWaitAny(m, options, zext(pidOutPtr), zext(statusOutPtr))
+}
+
+// Proc_wait_any64 is Proc_wait_any for a memory64 guest.
+func (w *WasiStubs) Proc_wait_any64(m *Module, options int32, pidOutPtr, statusOutPtr int64) int32 {
+	return w.procWaitAny(m, options, uint64(pidOutPtr), uint64(statusOutPtr))
+}
+
+// procWaitAny is the body of Proc_wait_any and Proc_wait_any64.
+func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPtr uint64) int32 {
+	pidOut := w.memBytes(m, pidOutPtr, 4)
+	statusOut := w.memBytes(m, statusOutPtr, 4)
 	if pidOut == nil || statusOut == nil {
 		return -_wasiEFAULT
 	}
@@ -2759,7 +2814,17 @@ func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr in
 // when pid is not a process of this instance, EINVAL when it is not a host
 // process.
 func (w *WasiStubs) Proc_exec(m *Module, pid, statusOutPtr int32) int32 {
-	out := w.memSlice(m, statusOutPtr, 4)
+	return w.procExec(m, pid, zext(statusOutPtr))
+}
+
+// Proc_exec64 is Proc_exec for a memory64 guest.
+func (w *WasiStubs) Proc_exec64(m *Module, pid int32, statusOutPtr int64) int32 {
+	return w.procExec(m, pid, uint64(statusOutPtr))
+}
+
+// procExec is the body of Proc_exec and Proc_exec64.
+func (w *WasiStubs) procExec(m *Module, pid int32, statusOutPtr uint64) int32 {
+	out := w.memBytes(m, statusOutPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -2850,7 +2915,17 @@ func (w *WasiStubs) awaitInterruptibly(done <-chan struct{}) bool {
 // when the hook failed (the child's descriptors are released and the pid is
 // forgotten).
 func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
-	out := w.memSlice(m, pidOutPtr, 4)
+	return w.procFork(m, zext(pidOutPtr))
+}
+
+// Proc_fork64 is Proc_fork for a memory64 guest.
+func (w *WasiStubs) Proc_fork64(m *Module, pidOutPtr int64) int32 {
+	return w.procFork(m, uint64(pidOutPtr))
+}
+
+// procFork is the body of Proc_fork and Proc_fork64.
+func (w *WasiStubs) procFork(m *Module, pidOutPtr uint64) int32 {
+	out := w.memBytes(m, pidOutPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -2961,6 +3036,11 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 		return -_wasiEPERM
 	}
 	return _wasiESUCCESS
+}
+
+// Proc_kill64 is Proc_kill for a memory64 guest.
+func (w *WasiStubs) Proc_kill64(m *Module, pid, sig int32) int32 {
+	return w.Proc_kill(m, pid, sig)
 }
 
 // killOutside signals a process that is not one of the fork family's. Only
@@ -3225,18 +3305,65 @@ func (w *WasiStubs) checkNet(op string) bool {
 	return hook(op)
 }
 
-// memSlice returns m.memory[off : off+n]. Callers must hold any locks
-// they need on the wasm side; WasiStubs.mu is independent. Returns an
-// empty slice on out-of-range (the wasi function should then return
-// EFAULT / EINVAL).
-func (w *WasiStubs) memSlice(m *Module, off, n int32) []byte {
+// memBytes returns the n bytes of guest memory at off, m.memory[off :
+// off+n], or nil when any of them lies outside the memory (the wasi
+// function should then return EFAULT / EINVAL). off and n are the guest's
+// address and size at full width: a wasm32 guest's zero-extended (zext), a
+// memory64 guest's as they are. No sum of them wraps around, so a guest
+// address with bits above the memory's size set never aliases memory
+// below it. Callers must hold any locks they need on the wasm side;
+// WasiStubs.mu is independent.
+func (w *WasiStubs) memBytes(m *Module, off, n uint64) []byte {
 	mem := m.memory
-	lo := uint64(uint32(off))
-	hi := lo + uint64(uint32(n))
-	if hi > uint64(len(mem)) {
+	size := uint64(len(mem))
+	if off > size || n > size-off {
 		return nil
 	}
-	return mem[lo:hi]
+	return mem[off : off+n]
+}
+
+// memSlice is memBytes for the i32 address and size of a binding that
+// only a wasm32 guest has.
+func (w *WasiStubs) memSlice(m *Module, off, n int32) []byte {
+	return w.memBytes(m, zext(off), zext(n))
+}
+
+// zext widens a wasm32 guest's i32 that stands for an address or a size,
+// both unsigned there, to the full width the bindings shared with a
+// memory64 guest take.
+func zext(v int32) uint64 { return uint64(uint32(v)) }
+
+// wasiABI is the width in bytes of a pointer and of __wasi_size_t in the
+// guest's C library: 4 for a wasm32 module, 8 for a memory64 one (LP64).
+// The records whose layout depends on it — iovecs, the argv and environ
+// tables, prestat, the size a call writes back — are read and written
+// through it. A binding knows it by which of its two methods was called:
+// the wasm32 one passes wasiABI32, its *64 twin wasiABI64.
+type wasiABI uint64
+
+const (
+	wasiABI32 wasiABI = 4
+	wasiABI64 wasiABI = 8
+)
+
+// wordSize is the size of a pointer or __wasi_size_t.
+func (a wasiABI) wordSize() uint64 { return uint64(a) }
+
+// word reads the pointer or __wasi_size_t at the start of b.
+func (a wasiABI) word(b []byte) uint64 {
+	if a == wasiABI32 {
+		return uint64(binary.LittleEndian.Uint32(b))
+	}
+	return binary.LittleEndian.Uint64(b)
+}
+
+// putWord writes v as a pointer or __wasi_size_t at the start of b.
+func (a wasiABI) putWord(b []byte, v uint64) {
+	if a == wasiABI32 {
+		binary.LittleEndian.PutUint32(b, uint32(v))
+		return
+	}
+	binary.LittleEndian.PutUint64(b, v)
 }
 
 // errno values used below (subset; see wasi-libc errno.h).
@@ -3356,7 +3483,7 @@ func mapOSError(err error) int32 {
 
 // totalBytes sums len(s)+1 over s in a uint64 and reports whether the
 // total fits in an int32 (i.e. is representable as a wasm-side i32
-// length). Callers route the result through memSlice and an OOB on a
+// length). Callers route the result through memBytes and an OOB on a
 // pathologically long arg list surfaces as EFAULT to the guest rather
 // than a host-side panic via a wrapped-int32 length.
 func totalBytesPlusNul(ss []string) (int32, bool) {
@@ -3371,113 +3498,139 @@ func totalBytesPlusNul(ss []string) (int32, bool) {
 }
 
 func (w *WasiStubs) Args_get(m *Module, argv, argvBuf int32) int32 {
+	return w.argsGet(m, wasiABI32, zext(argv), zext(argvBuf))
+}
+
+// Args_get64 is Args_get for a memory64 guest.
+func (w *WasiStubs) Args_get64(m *Module, argv, argvBuf int64) int32 {
+	return w.argsGet(m, wasiABI64, uint64(argv), uint64(argvBuf))
+}
+
+// argsGet is the body of Args_get and Args_get64.
+func (w *WasiStubs) argsGet(m *Module, abi wasiABI, argv, argvBuf uint64) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	// Validate the argv pointer array first: len(args) * 4 bytes of
-	// uint32 entries at argv. Multiply in uint64 so a pathological arg
-	// count cannot wrap to a negative int32 length.
-	argvBytes64 := uint64(len(w.args)) * 4
-	if argvBytes64 > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	argvSlice := w.memSlice(m, argv, int32(argvBytes64))
-	if argvSlice == nil {
-		return _wasiEFAULT
-	}
-	total, ok := totalBytesPlusNul(w.args)
-	if !ok {
-		return _wasiEFAULT
-	}
-	argvBufSlice := w.memSlice(m, argvBuf, total)
-	if argvBufSlice == nil {
-		return _wasiEFAULT
-	}
-	bufOff := uint32(0)
-	for i, a := range w.args {
-		binary.LittleEndian.PutUint32(argvSlice[i*4:], uint32(argvBuf)+bufOff)
-		n := copy(argvBufSlice[bufOff:], a)
-		if n < len(a) {
-			return _wasiEFAULT
-		}
-		bufOff += uint32(n)
-		argvBufSlice[bufOff] = 0
-		bufOff++
-	}
-	return _wasiESUCCESS
+	return w.putStrVec(m, abi, argv, argvBuf, w.args)
 }
 
 func (w *WasiStubs) Args_sizes_get(m *Module, argcPtr, argvBufLenPtr int32) int32 {
+	return w.argsSizesGet(m, wasiABI32, zext(argcPtr), zext(argvBufLenPtr))
+}
+
+// Args_sizes_get64 is Args_sizes_get for a memory64 guest.
+func (w *WasiStubs) Args_sizes_get64(m *Module, argcPtr, argvBufLenPtr int64) int32 {
+	return w.argsSizesGet(m, wasiABI64, uint64(argcPtr), uint64(argvBufLenPtr))
+}
+
+// argsSizesGet is the body of Args_sizes_get and Args_sizes_get64.
+func (w *WasiStubs) argsSizesGet(m *Module, abi wasiABI, argcPtr, argvBufLenPtr uint64) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	argcSlice := w.memSlice(m, argcPtr, 4)
-	bufLenSlice := w.memSlice(m, argvBufLenPtr, 4)
-	if argcSlice == nil || bufLenSlice == nil {
-		return _wasiEFAULT
-	}
-	total, ok := totalBytesPlusNul(w.args)
-	if !ok {
-		return _wasiEFAULT
-	}
-	binary.LittleEndian.PutUint32(argcSlice, uint32(len(w.args)))
-	binary.LittleEndian.PutUint32(bufLenSlice, uint32(total))
-	return _wasiESUCCESS
+	return w.putStrVecSizes(m, abi, argcPtr, argvBufLenPtr, w.args)
 }
 
 func (w *WasiStubs) Environ_get(m *Module, envv, envBuf int32) int32 {
+	return w.environGet(m, wasiABI32, zext(envv), zext(envBuf))
+}
+
+// Environ_get64 is Environ_get for a memory64 guest.
+func (w *WasiStubs) Environ_get64(m *Module, envv, envBuf int64) int32 {
+	return w.environGet(m, wasiABI64, uint64(envv), uint64(envBuf))
+}
+
+// environGet is the body of Environ_get and Environ_get64.
+func (w *WasiStubs) environGet(m *Module, abi wasiABI, envv, envBuf uint64) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	envvBytes64 := uint64(len(w.env)) * 4
-	if envvBytes64 > 0x7fffffff {
+	return w.putStrVec(m, abi, envv, envBuf, w.env)
+}
+
+func (w *WasiStubs) Environ_sizes_get(m *Module, envcPtr, envBufLenPtr int32) int32 {
+	return w.environSizesGet(m, wasiABI32, zext(envcPtr), zext(envBufLenPtr))
+}
+
+// Environ_sizes_get64 is Environ_sizes_get for a memory64 guest.
+func (w *WasiStubs) Environ_sizes_get64(m *Module, envcPtr, envBufLenPtr int64) int32 {
+	return w.environSizesGet(m, wasiABI64, uint64(envcPtr), uint64(envBufLenPtr))
+}
+
+// environSizesGet is the body of Environ_sizes_get and Environ_sizes_get64.
+func (w *WasiStubs) environSizesGet(m *Module, abi wasiABI, envcPtr, envBufLenPtr uint64) int32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.putStrVecSizes(m, abi, envcPtr, envBufLenPtr, w.env)
+}
+
+// putStrVec writes ss the way args_get and environ_get hand a list of
+// strings to the guest: a char* table of len(ss) guest pointers at vec,
+// and the NUL-terminated strings they point to packed at buf. Every
+// window is validated before anything is written.
+func (w *WasiStubs) putStrVec(m *Module, abi wasiABI, vec, buf uint64, ss []string) int32 {
+	// The table is len(ss) words; multiply in uint64 so a pathological
+	// count cannot wrap.
+	vecBytes := uint64(len(ss)) * abi.wordSize()
+	if vecBytes > 0x7fffffff {
 		return _wasiEFAULT
 	}
-	envvSlice := w.memSlice(m, envv, int32(envvBytes64))
-	if envvSlice == nil {
+	vecSlice := w.memBytes(m, vec, vecBytes)
+	if vecSlice == nil {
 		return _wasiEFAULT
 	}
-	total, ok := totalBytesPlusNul(w.env)
+	total, ok := totalBytesPlusNul(ss)
 	if !ok {
 		return _wasiEFAULT
 	}
-	envBufSlice := w.memSlice(m, envBuf, total)
-	if envBufSlice == nil {
+	bufSlice := w.memBytes(m, buf, uint64(total))
+	if bufSlice == nil {
 		return _wasiEFAULT
 	}
-	bufOff := uint32(0)
-	for i, e := range w.env {
-		binary.LittleEndian.PutUint32(envvSlice[i*4:], uint32(envBuf)+bufOff)
-		n := copy(envBufSlice[bufOff:], e)
-		if n < len(e) {
+	bufOff := uint64(0)
+	for i, s := range ss {
+		abi.putWord(vecSlice[uint64(i)*abi.wordSize():], buf+bufOff)
+		n := copy(bufSlice[bufOff:], s)
+		if n < len(s) {
 			return _wasiEFAULT
 		}
-		bufOff += uint32(n)
-		envBufSlice[bufOff] = 0
+		bufOff += uint64(n)
+		bufSlice[bufOff] = 0
 		bufOff++
 	}
 	return _wasiESUCCESS
 }
 
-func (w *WasiStubs) Environ_sizes_get(m *Module, envcPtr, envBufLenPtr int32) int32 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	envcSlice := w.memSlice(m, envcPtr, 4)
-	bufLenSlice := w.memSlice(m, envBufLenPtr, 4)
-	if envcSlice == nil || bufLenSlice == nil {
+// putStrVecSizes writes what args_sizes_get and environ_sizes_get report
+// about ss: its length at countPtr and the bytes its strings take with
+// their NULs at bufLenPtr, both __wasi_size_t.
+func (w *WasiStubs) putStrVecSizes(m *Module, abi wasiABI, countPtr, bufLenPtr uint64, ss []string) int32 {
+	countSlice := w.memBytes(m, countPtr, abi.wordSize())
+	bufLenSlice := w.memBytes(m, bufLenPtr, abi.wordSize())
+	if countSlice == nil || bufLenSlice == nil {
 		return _wasiEFAULT
 	}
-	total, ok := totalBytesPlusNul(w.env)
+	total, ok := totalBytesPlusNul(ss)
 	if !ok {
 		return _wasiEFAULT
 	}
-	binary.LittleEndian.PutUint32(envcSlice, uint32(len(w.env)))
-	binary.LittleEndian.PutUint32(bufLenSlice, uint32(total))
+	abi.putWord(countSlice, uint64(len(ss)))
+	abi.putWord(bufLenSlice, uint64(total))
 	return _wasiESUCCESS
 }
 
-func (w *WasiStubs) Clock_res_get(m *Module, clockID int32, resPtr int32) int32 {
+func (w *WasiStubs) Clock_res_get(m *Module, clockID, resPtr int32) int32 {
+	return w.clockResGet(m, clockID, zext(resPtr))
+}
+
+// Clock_res_get64 is Clock_res_get for a memory64 guest.
+func (w *WasiStubs) Clock_res_get64(m *Module, clockID, resPtr int64) int32 {
+	return w.clockResGet(m, int32(clockID), uint64(resPtr))
+}
+
+// clockResGet is the body of Clock_res_get and Clock_res_get64.
+func (w *WasiStubs) clockResGet(m *Module, clockID int32, resPtr uint64) int32 {
 	// Report 1ns resolution for both realtime and monotonic — Go's
 	// time.Now() resolution is OS-dependent but always claims ns
 	// precision in its API.
-	out := w.memSlice(m, resPtr, 8)
+	out := w.memBytes(m, resPtr, 8)
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -3486,7 +3639,17 @@ func (w *WasiStubs) Clock_res_get(m *Module, clockID int32, resPtr int32) int32 
 }
 
 func (w *WasiStubs) Clock_time_get(m *Module, clockID int32, precision int64, timePtr int32) int32 {
-	out := w.memSlice(m, timePtr, 8)
+	return w.clockTimeGet(m, clockID, precision, zext(timePtr))
+}
+
+// Clock_time_get64 is Clock_time_get for a memory64 guest.
+func (w *WasiStubs) Clock_time_get64(m *Module, clockID, precision, timePtr int64) int32 {
+	return w.clockTimeGet(m, int32(clockID), precision, uint64(timePtr))
+}
+
+// clockTimeGet is the body of Clock_time_get and Clock_time_get64.
+func (w *WasiStubs) clockTimeGet(m *Module, clockID int32, precision int64, timePtr uint64) int32 {
+	out := w.memBytes(m, timePtr, 8)
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -3498,8 +3661,7 @@ func (w *WasiStubs) Clock_time_get(m *Module, clockID int32, precision int64, ti
 	return _wasiESUCCESS
 }
 
-// clockNanos is the layout-independent body of clock_time_get, shared
-// by the wasm32 and wasm64 bindings.
+// clockNanos reads the clock clock_time_get reports for clockID.
 func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 	switch clockID {
 	case 0: // CLOCK_REALTIME
@@ -3590,18 +3752,32 @@ func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Fd_close64 is Fd_close for a memory64 guest.
+func (w *WasiStubs) Fd_close64(m *Module, fd int64) int32 {
+	return w.Fd_close(m, int32(fd))
+}
+
 func (w *WasiStubs) Fd_fdstat_get(m *Module, fd, ptr int32) int32 {
+	return w.fdFdstatGet(m, fd, zext(ptr))
+}
+
+// Fd_fdstat_get64 is Fd_fdstat_get for a memory64 guest.
+func (w *WasiStubs) Fd_fdstat_get64(m *Module, fd, ptr int64) int32 {
+	return w.fdFdstatGet(m, int32(fd), uint64(ptr))
+}
+
+// fdFdstatGet is the body of Fd_fdstat_get and Fd_fdstat_get64.
+func (w *WasiStubs) fdFdstatGet(m *Module, fd int32, ptr uint64) int32 {
 	// fdstat is 24 bytes wide (filetype u8 + flags u16 + rights base/inherit u64+u64).
-	out := w.memSlice(m, ptr, 24)
+	out := w.memBytes(m, ptr, 24)
 	if out == nil {
 		return _wasiEFAULT
 	}
 	return w.fdstatFill(fd, out)
 }
 
-// fdstatFill writes the 24-byte fdstat for fd into out — the shared
-// body of the 32- and 64-bit Fd_fdstat_get bindings (the struct holds
-// no pointers, so the layout is width-independent).
+// fdstatFill writes the 24-byte fdstat for fd into out (the struct holds
+// no pointers, so its layout is the same for every guest).
 func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -3691,6 +3867,11 @@ func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Fd_fdstat_set_flags64 is Fd_fdstat_set_flags for a memory64 guest.
+func (w *WasiStubs) Fd_fdstat_set_flags64(m *Module, fd, flags int64) int32 {
+	return w.Fd_fdstat_set_flags(m, int32(fd), int32(flags))
+}
+
 // Fd_fdstat_set_rights stores the requested rights on the wasiOpen but
 // does not enforce them — the host process is the trust boundary. WASI
 // programs that succeed with maximal rights (per Fd_fdstat_get) get the
@@ -3705,8 +3886,18 @@ func (w *WasiStubs) Fd_fdstat_set_rights(m *Module, fd int32, rightsBase, rights
 }
 
 func (w *WasiStubs) Fd_filestat_get(m *Module, fd, ptr int32) int32 {
+	return w.fdFilestatGet(m, fd, zext(ptr))
+}
+
+// Fd_filestat_get64 is Fd_filestat_get for a memory64 guest.
+func (w *WasiStubs) Fd_filestat_get64(m *Module, fd, ptr int64) int32 {
+	return w.fdFilestatGet(m, int32(fd), uint64(ptr))
+}
+
+// fdFilestatGet is the body of Fd_filestat_get and Fd_filestat_get64.
+func (w *WasiStubs) fdFilestatGet(m *Module, fd int32, ptr uint64) int32 {
 	// filestat is 64 bytes wide.
-	out := w.memSlice(m, ptr, 64)
+	out := w.memBytes(m, ptr, 64)
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -3765,6 +3956,11 @@ func (w *WasiStubs) Fd_filestat_set_size(m *Module, fd int32, size int64) int32 
 	return _wasiESUCCESS
 }
 
+// Fd_filestat_set_size64 is Fd_filestat_set_size for a memory64 guest.
+func (w *WasiStubs) Fd_filestat_set_size64(m *Module, fd, size int64) int32 {
+	return w.Fd_filestat_set_size(m, int32(fd), size)
+}
+
 func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64, fstFlags int32) int32 {
 	// fstFlags: 0x1 ATIME, 0x2 ATIME_NOW, 0x4 MTIME, 0x8 MTIME_NOW.
 	// atim/mtim are wasi `timestamp` (u64 nanoseconds) — a single i64 each
@@ -3789,6 +3985,11 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
+}
+
+// Fd_filestat_set_times64 is Fd_filestat_set_times for a memory64 guest.
+func (w *WasiStubs) Fd_filestat_set_times64(m *Module, fd, atim, mtim, fstFlags int64) int32 {
+	return w.Fd_filestat_set_times(m, int32(fd), atim, mtim, int32(fstFlags))
 }
 
 // combine64 reconstructs an unsigned 64-bit time value from a pair of
@@ -3833,30 +4034,53 @@ func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, current os.FileInfo
 }
 
 func (w *WasiStubs) Fd_prestat_get(m *Module, fd, ptr int32) int32 {
+	return w.fdPrestatGet(m, wasiABI32, fd, zext(ptr))
+}
+
+// Fd_prestat_get64 is Fd_prestat_get for a memory64 guest.
+func (w *WasiStubs) Fd_prestat_get64(m *Module, fd, ptr int64) int32 {
+	return w.fdPrestatGet(m, wasiABI64, int32(fd), uint64(ptr))
+}
+
+// fdPrestatGet is the body of Fd_prestat_get and Fd_prestat_get64.
+func (w *WasiStubs) fdPrestatGet(m *Module, abi wasiABI, fd int32, ptr uint64) int32 {
 	// Only fd 3 is reserved as the preopen "/" directory. Returning EBADF
 	// for everything else is the wasi-libc convention used to terminate
 	// the directory-enumeration loop in __wasilibc_register_preopened_fd.
 	if fd != 3 {
 		return _wasiEBADF
 	}
-	// prestat is 8 bytes wide: tag u8 + reserved u8[3] + len u32.
-	out := w.memSlice(m, ptr, 8)
+	// prestat is a u8 tag, padding, then the name's length as a
+	// __wasi_size_t aligned to its size: 8 bytes for a wasm32 guest (the
+	// length a u32 at 4), 16 for a memory64 one (a u64 at 8).
+	out := w.memBytes(m, ptr, 2*abi.wordSize())
 	if out == nil {
 		return _wasiEFAULT
 	}
 	out[0] = 0 // preopen tag = directory
-	binary.LittleEndian.PutUint32(out[4:], 1)
+	abi.putWord(out[abi.wordSize():], 1)
 	return _wasiESUCCESS
 }
 
 func (w *WasiStubs) Fd_prestat_dir_name(m *Module, fd, buf, buflen int32) int32 {
+	return w.fdPrestatDirName(m, fd, zext(buf), int64(buflen))
+}
+
+// Fd_prestat_dir_name64 is Fd_prestat_dir_name for a memory64 guest.
+func (w *WasiStubs) Fd_prestat_dir_name64(m *Module, fd, buf, buflen int64) int32 {
+	return w.fdPrestatDirName(m, int32(fd), uint64(buf), buflen)
+}
+
+// fdPrestatDirName is the body of Fd_prestat_dir_name and
+// Fd_prestat_dir_name64.
+func (w *WasiStubs) fdPrestatDirName(m *Module, fd int32, buf uint64, buflen int64) int32 {
 	if fd != 3 {
 		return _wasiEBADF
 	}
 	if buflen < 1 {
 		return _wasiESUCCESS
 	}
-	out := w.memSlice(m, buf, buflen)
+	out := w.memBytes(m, buf, uint64(buflen))
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -3865,14 +4089,25 @@ func (w *WasiStubs) Fd_prestat_dir_name(m *Module, fd, buf, buflen int32) int32 
 }
 
 func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 {
+	return w.fdRead(m, wasiABI32, fd, zext(iovs), zext(iovsLen), zext(nreadPtr))
+}
+
+// Fd_read64 is Fd_read for a memory64 guest.
+func (w *WasiStubs) Fd_read64(m *Module, fd, iovs, iovsLen, nreadPtr int64) int32 {
+	return w.fdRead(m, wasiABI64, int32(fd), uint64(iovs), uint64(iovsLen), uint64(nreadPtr))
+}
+
+// fdRead is the body of Fd_read and Fd_read64.
+func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nreadPtr uint64) int32 {
 	w.mu.Lock()
 	src, op := w.fdSrcLocked(fd)
 	w.mu.Unlock()
 	if src == nil {
 		return _wasiEBADF
 	}
-	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
-	nreadSlice := w.memSlice(m, nreadPtr, 4)
+	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
+	// nread is a __wasi_size_t.
+	nreadSlice := w.memBytes(m, nreadPtr, abi.wordSize())
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
@@ -3903,30 +4138,30 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 			n = readVec(src, bufs)
 		}
 	}
-	binary.LittleEndian.PutUint32(nreadSlice, uint32(n))
+	abi.putWord(nreadSlice, n)
 	return _wasiESUCCESS
 }
 
-// iovecSlices resolves a wasm32 ciovec/iovec array ({u32 ptr, u32 len}
-// entries at iovs) into the backing memory windows. Every entry is
-// validated before any I/O happens, so a bad iovec faults the whole
-// call instead of after a partial transfer.
-func (w *WasiStubs) iovecSlices(m *Module, iovs, iovsLen int32) ([][]byte, bool) {
-	// Compute the array size in uint64 so a pathological iovsLen can't
-	// wrap to negative.
-	iovBytes := uint64(uint32(iovsLen)) * 8
-	if iovBytes > 0x7fffffff {
+// iovecSlices resolves a ciovec/iovec array (iovsLen entries at iovs of a
+// guest pointer and a __wasi_size_t each: {u32 ptr, u32 len} for a wasm32
+// guest, {u64 ptr, u64 len} for a memory64 one) into the backing memory
+// windows. Every entry is validated before any I/O happens, so a bad iovec
+// faults the whole call instead of after a partial transfer.
+func (w *WasiStubs) iovecSlices(m *Module, abi wasiABI, iovs, iovsLen uint64) ([][]byte, bool) {
+	// The array may take up to 2 GiB; bound the count before multiplying
+	// so that a pathological iovsLen cannot wrap.
+	stride := 2 * abi.wordSize()
+	if iovsLen > 0x7fffffff/stride {
 		return nil, false
 	}
-	iovecs := w.memSlice(m, iovs, int32(iovBytes))
+	iovecs := w.memBytes(m, iovs, iovsLen*stride)
 	if iovecs == nil {
 		return nil, false
 	}
 	bufs := make([][]byte, 0, iovsLen)
-	for i := int32(0); i < iovsLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
+	for i := uint64(0); i < iovsLen; i++ {
+		entry := iovecs[i*stride:]
+		buf := w.memBytes(m, abi.word(entry), abi.word(entry[abi.wordSize():]))
 		if buf == nil {
 			return nil, false
 		}
@@ -4378,36 +4613,46 @@ func (w *WasiStubs) Fd_pwrite(m *Module, fd, iovs, iovsLen int32, offset int64, 
 }
 
 func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr int32) int32 {
-	out := w.memSlice(m, newOffPtr, 8)
+	return w.fdSeek(m, fd, offset, whence, zext(newOffPtr))
+}
+
+// Fd_seek64 is Fd_seek for a memory64 guest.
+func (w *WasiStubs) Fd_seek64(m *Module, fd, offset, whence, newOffPtr int64) int32 {
+	return w.fdSeek(m, int32(fd), offset, int32(whence), uint64(newOffPtr))
+}
+
+// fdSeek is the body of Fd_seek and Fd_seek64.
+func (w *WasiStubs) fdSeek(m *Module, fd int32, offset int64, whence int32, newOffPtr uint64) int32 {
+	out := w.memBytes(m, newOffPtr, 8)
 	if out == nil {
 		return _wasiEFAULT
 	}
-	n, errno := w.fdSeek(fd, offset, int(whence))
-	if errno != _wasiESUCCESS {
-		return errno
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil || op.f == nil {
+		return _wasiEBADF
+	}
+	n, err := op.f.Seek(offset, int(whence))
+	if err != nil {
+		return _wasiEINVAL
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
 }
 
-// fdSeek is the layout-independent body of fd_seek, shared by the
-// wasm32 and wasm64 bindings.
-func (w *WasiStubs) fdSeek(fd int32, offset int64, whence int) (int64, int32) {
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	if op == nil || op.f == nil {
-		return 0, _wasiEBADF
-	}
-	n, err := op.f.Seek(offset, whence)
-	if err != nil {
-		return 0, _wasiEINVAL
-	}
-	return n, _wasiESUCCESS
+func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
+	return w.fdTell(m, fd, zext(offsetPtr))
 }
 
-func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
-	out := w.memSlice(m, offsetPtr, 8)
+// Fd_tell64 is Fd_tell for a memory64 guest.
+func (w *WasiStubs) Fd_tell64(m *Module, fd, offsetPtr int64) int32 {
+	return w.fdTell(m, int32(fd), uint64(offsetPtr))
+}
+
+// fdTell is the body of Fd_tell and Fd_tell64.
+func (w *WasiStubs) fdTell(m *Module, fd int32, offsetPtr uint64) int32 {
+	out := w.memBytes(m, offsetPtr, 8)
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -4426,16 +4671,27 @@ func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
 }
 
 func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) int32 {
+	return w.fdWrite(m, wasiABI32, fd, zext(iovs), zext(iovsLen), zext(nwrittenPtr))
+}
+
+// Fd_write64 is Fd_write for a memory64 guest.
+func (w *WasiStubs) Fd_write64(m *Module, fd, iovs, iovsLen, nwrittenPtr int64) int32 {
+	return w.fdWrite(m, wasiABI64, int32(fd), uint64(iovs), uint64(iovsLen), uint64(nwrittenPtr))
+}
+
+// fdWrite is the body of Fd_write and Fd_write64.
+func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwrittenPtr uint64) int32 {
 	w.mu.Lock()
 	dst, op := w.fdDstLocked(fd)
 	w.mu.Unlock()
-	bufs, ok := w.iovecSlices(m, iovs, iovsLen)
-	nwrittenSlice := w.memSlice(m, nwrittenPtr, 4)
+	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
+	// nwritten is a __wasi_size_t.
+	nwrittenSlice := w.memBytes(m, nwrittenPtr, abi.wordSize())
 	if !ok || nwrittenSlice == nil {
 		return _wasiEFAULT
 	}
 	if dst == nil {
-		binary.LittleEndian.PutUint32(nwrittenSlice, 0)
+		abi.putWord(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
 	var n uint64
@@ -4445,9 +4701,10 @@ func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) in
 	} else {
 		n, errno = w.writeFd(op, dst, bufs)
 	}
-	binary.LittleEndian.PutUint32(nwrittenSlice, uint32(n))
+	abi.putWord(nwrittenSlice, n)
 	return errno
 }
+
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -4459,6 +4716,11 @@ func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
+}
+
+// Fd_sync64 is Fd_sync for a memory64 guest.
+func (w *WasiStubs) Fd_sync64(m *Module, fd int64) int32 {
+	return w.Fd_sync(m, int32(fd))
 }
 
 func (w *WasiStubs) Fd_datasync(m *Module, fd int32) int32 {
@@ -4508,7 +4770,17 @@ func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32
 // no way to change file modes. The path at (pathPtr,pathLen) is
 // preopen-relative, like path_open's. Returns 0 or a negative errno.
 func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	return w.pathChmod(m, zext(pathPtr), pathLen, mode)
+}
+
+// Path_chmod64 is Path_chmod for a memory64 guest.
+func (w *WasiStubs) Path_chmod64(m *Module, pathPtr int64, pathLen, mode int32) int32 {
+	return w.pathChmod(m, uint64(pathPtr), pathLen, mode)
+}
+
+// pathChmod is the body of Path_chmod and Path_chmod64.
+func (w *WasiStubs) pathChmod(m *Module, pathPtr uint64, pathLen, mode int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
 	if pathSlice == nil {
 		return -_wasiEFAULT
 	}
@@ -4540,6 +4812,11 @@ func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Fd_chmod64 is Fd_chmod for a memory64 guest.
+func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
+	return w.Fd_chmod(m, fd, mode)
+}
+
 // Proc_umask is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "proc_umask") backing a bridge-provided umask(): it sets the
 // instance's file mode creation mask and returns the previous one. The
@@ -4565,6 +4842,11 @@ func (w *WasiStubs) Proc_umask(m *Module, mask int32) int32 {
 	return int32(prev)
 }
 
+// Proc_umask64 is Proc_umask for a memory64 guest.
+func (w *WasiStubs) Proc_umask64(m *Module, mask int32) int32 {
+	return w.Proc_umask(m, mask)
+}
+
 // createMode returns the mode a file or directory the guest creates with
 // the requested mode gets: the instance's umask taken out of it.
 func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
@@ -4583,8 +4865,18 @@ func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
 // for a preopen-relative path, plus that mode, and writes the new fd at
 // openedFdPtr. Returns 0 or a negative errno.
 func (w *WasiStubs) Path_open_mode(m *Module, dirflags, pathPtr, pathLen, oflags int32, fsRightsBase int64, fdflags, mode, openedFdPtr int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	outSlice := w.memSlice(m, openedFdPtr, 4)
+	return w.openGuestPathMode(m, dirflags, zext(pathPtr), pathLen, oflags, fsRightsBase, fdflags, mode, zext(openedFdPtr))
+}
+
+// Path_open_mode64 is Path_open_mode for a memory64 guest.
+func (w *WasiStubs) Path_open_mode64(m *Module, dirflags int32, pathPtr int64, pathLen, oflags int32, fsRightsBase int64, fdflags, mode int32, openedFdPtr int64) int32 {
+	return w.openGuestPathMode(m, dirflags, uint64(pathPtr), pathLen, oflags, fsRightsBase, fdflags, mode, uint64(openedFdPtr))
+}
+
+// openGuestPathMode is the body of Path_open_mode and Path_open_mode64.
+func (w *WasiStubs) openGuestPathMode(m *Module, dirflags int32, pathPtr uint64, pathLen, oflags int32, fsRightsBase int64, fdflags, mode int32, openedFdPtr uint64) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	outSlice := w.memBytes(m, openedFdPtr, 4)
 	if pathSlice == nil || outSlice == nil {
 		return -_wasiEFAULT
 	}
@@ -4602,7 +4894,18 @@ func (w *WasiStubs) Path_open_mode(m *Module, dirflags, pathPtr, pathLen, oflags
 // argument of mkdir(2). The path is preopen-relative. Returns 0 or a
 // negative errno.
 func (w *WasiStubs) Path_create_directory_mode(m *Module, pathPtr, pathLen, mode int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	return w.pathCreateDirectoryMode(m, zext(pathPtr), pathLen, mode)
+}
+
+// Path_create_directory_mode64 is Path_create_directory_mode for a memory64 guest.
+func (w *WasiStubs) Path_create_directory_mode64(m *Module, pathPtr int64, pathLen, mode int32) int32 {
+	return w.pathCreateDirectoryMode(m, uint64(pathPtr), pathLen, mode)
+}
+
+// pathCreateDirectoryMode is the body of Path_create_directory_mode and
+// Path_create_directory_mode64.
+func (w *WasiStubs) pathCreateDirectoryMode(m *Module, pathPtr uint64, pathLen, mode int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
 	if pathSlice == nil {
 		return -_wasiEFAULT
 	}
@@ -4711,6 +5014,11 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 	}
 }
 
+// Fd_flock64 is Fd_flock for a memory64 guest.
+func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
+	return w.Fd_flock(m, fd, lock, wait)
+}
+
 // The interval at which a waiting Fd_flock tries again: it starts at the
 // minimum and doubles up to the maximum.
 const (
@@ -4727,8 +5035,18 @@ const (
 // mode (the file type bits, unixType*, and the low twelve mode bits), the
 // uid, the gid — and returns 0 or a negative errno.
 func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPtr int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	out := w.memSlice(m, outPtr, wasiFilestatExtSize)
+	return w.pathFilestatExt(m, zext(pathPtr), pathLen, follow, zext(outPtr))
+}
+
+// Path_filestat_ext64 is Path_filestat_ext for a memory64 guest.
+func (w *WasiStubs) Path_filestat_ext64(m *Module, pathPtr int64, pathLen, follow int32, outPtr int64) int32 {
+	return w.pathFilestatExt(m, uint64(pathPtr), pathLen, follow, uint64(outPtr))
+}
+
+// pathFilestatExt is the body of Path_filestat_ext and Path_filestat_ext64.
+func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow int32, outPtr uint64) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	out := w.memBytes(m, outPtr, wasiFilestatExtSize)
 	if pathSlice == nil || out == nil {
 		return -_wasiEFAULT
 	}
@@ -4758,7 +5076,17 @@ func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPt
 // two have no file behind them; they belong to the guest's own user (see
 // SetHostProcess).
 func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, wasiFilestatExtSize)
+	return w.fdFilestatExt(m, fd, zext(outPtr))
+}
+
+// Fd_filestat_ext64 is Fd_filestat_ext for a memory64 guest.
+func (w *WasiStubs) Fd_filestat_ext64(m *Module, fd int32, outPtr int64) int32 {
+	return w.fdFilestatExt(m, fd, uint64(outPtr))
+}
+
+// fdFilestatExt is the body of Fd_filestat_ext and Fd_filestat_ext64.
+func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, wasiFilestatExtSize)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -4909,6 +5237,16 @@ func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
 // Returns 0, or a negative errno: EBADF, ENOTDIR for a descriptor that is
 // not a directory's, ERANGE when the buffer is too small.
 func (w *WasiStubs) Fd_path(m *Module, fd, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.fdPath(m, fd, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Fd_path64 is Fd_path for a memory64 guest.
+func (w *WasiStubs) Fd_path64(m *Module, fd int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.fdPath(m, fd, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// fdPath is the body of Fd_path and Fd_path64.
+func (w *WasiStubs) fdPath(m *Module, fd int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	root := op == nil && w.rootNumberLocked(fd)
@@ -4977,7 +5315,17 @@ func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, mode
 // open descriptor (offset included), and the underlying file closes only
 // when the last sharing fd does. Writes the new fd at outPtr.
 func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 4)
+	return w.fdDup(m, fd, zext(outPtr))
+}
+
+// Fd_dup64 is Fd_dup for a memory64 guest.
+func (w *WasiStubs) Fd_dup64(m *Module, fd int32, outPtr int64) int32 {
+	return w.fdDup(m, fd, uint64(outPtr))
+}
+
+// fdDup is the body of Fd_dup and Fd_dup64.
+func (w *WasiStubs) fdDup(m *Module, fd int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -5033,6 +5381,11 @@ func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Fd_dup264 is Fd_dup2 for a memory64 guest.
+func (w *WasiStubs) Fd_dup264(m *Module, from, to int32) int32 {
+	return w.Fd_dup2(m, from, to)
+}
+
 func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -5069,6 +5422,11 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 		return mapOSError(closeErr)
 	}
 	return _wasiESUCCESS
+}
+
+// Fd_renumber64 is Fd_renumber for a memory64 guest.
+func (w *WasiStubs) Fd_renumber64(m *Module, from, to int64) int32 {
+	return w.Fd_renumber(m, int32(from), int32(to))
 }
 
 // readDirCached lazily caches the directory listing on first
@@ -5132,24 +5490,34 @@ func (d *dotDirEntry) Info() (os.FileInfo, error) {
 }
 
 func (w *WasiStubs) Fd_readdir(m *Module, fd, buf, buflen int32, cookie int64, bufusedPtr int32) int32 {
-	bufSlice := w.memSlice(m, buf, buflen)
-	bufusedSlice := w.memSlice(m, bufusedPtr, 4)
+	return w.fdReaddir(m, wasiABI32, fd, zext(buf), zext(buflen), cookie, zext(bufusedPtr))
+}
+
+// Fd_readdir64 is Fd_readdir for a memory64 guest.
+func (w *WasiStubs) Fd_readdir64(m *Module, fd, buf, buflen, cookie, bufusedPtr int64) int32 {
+	return w.fdReaddir(m, wasiABI64, int32(fd), uint64(buf), uint64(buflen), cookie, uint64(bufusedPtr))
+}
+
+// fdReaddir is the body of Fd_readdir and Fd_readdir64.
+func (w *WasiStubs) fdReaddir(m *Module, abi wasiABI, fd int32, buf, buflen uint64, cookie int64, bufusedPtr uint64) int32 {
+	bufSlice := w.memBytes(m, buf, buflen)
+	// bufused is a __wasi_size_t; the dirents themselves are the same
+	// for every guest (u64s and a u32).
+	bufusedSlice := w.memBytes(m, bufusedPtr, abi.wordSize())
 	if bufSlice == nil || bufusedSlice == nil {
 		return _wasiEFAULT
 	}
-	written, errno := w.fdReaddir(fd, bufSlice, cookie)
+	written, errno := w.fillDirents(fd, bufSlice, cookie)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	binary.LittleEndian.PutUint32(bufusedSlice, uint32(written))
+	abi.putWord(bufusedSlice, uint64(written))
 	return _wasiESUCCESS
 }
 
-// fdReaddir is the layout-independent body of fd_readdir: it packs
-// dirents into bufSlice starting at the cookie'th entry and returns the
-// byte count used. The dirent wire format has no pointer-width fields,
-// so wasm32 and wasm64 share it; only the bufused out-pointer differs.
-func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int32) {
+// fillDirents packs the dirents of fd_readdir into bufSlice starting at
+// the cookie'th entry and returns the byte count used.
+func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, int32) {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
@@ -5227,11 +5595,21 @@ func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int
 // using os.OpenFile. Callers that need a sandbox should provide their
 // own Wasi_snapshot_preview1Imports implementation via NewWithWASI.
 func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags int32, fsRightsBase, fsRightsInherit int64, fdflags, openedFdPtr int32) int32 {
+	return w.openGuestPath(m, dirFd, dirflags, zext(pathPtr), zext(pathLen), oflags, fsRightsBase, fsRightsInherit, fdflags, zext(openedFdPtr))
+}
+
+// Path_open64 is Path_open for a memory64 guest.
+func (w *WasiStubs) Path_open64(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, fsRightsInherit, fdflags, openedFdPtr int64) int32 {
+	return w.openGuestPath(m, int32(dirFd), int32(dirflags), uint64(pathPtr), uint64(pathLen), int32(oflags), fsRightsBase, fsRightsInherit, int32(fdflags), uint64(openedFdPtr))
+}
+
+// openGuestPath is the body of Path_open and Path_open64.
+func (w *WasiStubs) openGuestPath(m *Module, dirFd, dirflags int32, pathPtr, pathLen uint64, oflags int32, fsRightsBase, fsRightsInherit int64, fdflags int32, openedFdPtr uint64) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	outSlice := w.memSlice(m, openedFdPtr, 4)
+	pathSlice := w.memBytes(m, pathPtr, pathLen)
+	outSlice := w.memBytes(m, openedFdPtr, 4)
 	if pathSlice == nil || outSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5518,10 +5896,20 @@ func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int
 }
 
 func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) int32 {
+	return w.pathUnlinkFile(m, dirFd, zext(pathPtr), zext(pathLen))
+}
+
+// Path_unlink_file64 is Path_unlink_file for a memory64 guest.
+func (w *WasiStubs) Path_unlink_file64(m *Module, dirFd, pathPtr, pathLen int64) int32 {
+	return w.pathUnlinkFile(m, int32(dirFd), uint64(pathPtr), uint64(pathLen))
+}
+
+// pathUnlinkFile is the body of Path_unlink_file and Path_unlink_file64.
+func (w *WasiStubs) pathUnlinkFile(m *Module, dirFd int32, pathPtr, pathLen uint64) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5546,10 +5934,21 @@ func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) i
 }
 
 func (w *WasiStubs) Path_remove_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
+	return w.pathRemoveDirectory(m, dirFd, zext(pathPtr), zext(pathLen))
+}
+
+// Path_remove_directory64 is Path_remove_directory for a memory64 guest.
+func (w *WasiStubs) Path_remove_directory64(m *Module, dirFd, pathPtr, pathLen int64) int32 {
+	return w.pathRemoveDirectory(m, int32(dirFd), uint64(pathPtr), uint64(pathLen))
+}
+
+// pathRemoveDirectory is the body of Path_remove_directory and
+// Path_remove_directory64.
+func (w *WasiStubs) pathRemoveDirectory(m *Module, dirFd int32, pathPtr, pathLen uint64) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5571,11 +5970,21 @@ func (w *WasiStubs) Path_remove_directory(m *Module, dirFd, pathPtr, pathLen int
 }
 
 func (w *WasiStubs) Path_rename(m *Module, oldFd, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int32) int32 {
+	return w.pathRename(m, oldFd, zext(oldPathPtr), zext(oldPathLen), newFd, zext(newPathPtr), zext(newPathLen))
+}
+
+// Path_rename64 is Path_rename for a memory64 guest.
+func (w *WasiStubs) Path_rename64(m *Module, oldFd, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int64) int32 {
+	return w.pathRename(m, int32(oldFd), uint64(oldPathPtr), uint64(oldPathLen), int32(newFd), uint64(newPathPtr), uint64(newPathLen))
+}
+
+// pathRename is the body of Path_rename and Path_rename64.
+func (w *WasiStubs) pathRename(m *Module, oldFd int32, oldPathPtr, oldPathLen uint64, newFd int32, newPathPtr, newPathLen uint64) int32 {
 	if !rootDirFD(oldFd) || !rootDirFD(newFd) {
 		return _wasiEBADF
 	}
-	oldSlice := w.memSlice(m, oldPathPtr, oldPathLen)
-	newSlice := w.memSlice(m, newPathPtr, newPathLen)
+	oldSlice := w.memBytes(m, oldPathPtr, oldPathLen)
+	newSlice := w.memBytes(m, newPathPtr, newPathLen)
 	if oldSlice == nil || newSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5589,11 +5998,21 @@ func (w *WasiStubs) Path_rename(m *Module, oldFd, oldPathPtr, oldPathLen, newFd,
 }
 
 func (w *WasiStubs) Path_filestat_get(m *Module, dirFd, flags, pathPtr, pathLen, outPtr int32) int32 {
+	return w.pathFilestatGet(m, dirFd, flags, zext(pathPtr), zext(pathLen), zext(outPtr))
+}
+
+// Path_filestat_get64 is Path_filestat_get for a memory64 guest.
+func (w *WasiStubs) Path_filestat_get64(m *Module, dirFd, flags, pathPtr, pathLen, outPtr int64) int32 {
+	return w.pathFilestatGet(m, int32(dirFd), int32(flags), uint64(pathPtr), uint64(pathLen), uint64(outPtr))
+}
+
+// pathFilestatGet is the body of Path_filestat_get and Path_filestat_get64.
+func (w *WasiStubs) pathFilestatGet(m *Module, dirFd, flags int32, pathPtr, pathLen, outPtr uint64) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	out := w.memSlice(m, outPtr, 64)
+	pathSlice := w.memBytes(m, pathPtr, pathLen)
+	out := w.memBytes(m, outPtr, 64)
 	if pathSlice == nil || out == nil {
 		return _wasiEFAULT
 	}
@@ -5616,10 +6035,21 @@ func (w *WasiStubs) Path_filestat_get(m *Module, dirFd, flags, pathPtr, pathLen,
 }
 
 func (w *WasiStubs) Path_filestat_set_times(m *Module, dirFd, flags, pathPtr, pathLen int32, atim, mtim int64, fstFlags int32) int32 {
+	return w.pathFilestatSetTimes(m, dirFd, flags, zext(pathPtr), zext(pathLen), atim, mtim, fstFlags)
+}
+
+// Path_filestat_set_times64 is Path_filestat_set_times for a memory64 guest.
+func (w *WasiStubs) Path_filestat_set_times64(m *Module, dirFd, flags, pathPtr, pathLen, atim, mtim, fstFlags int64) int32 {
+	return w.pathFilestatSetTimes(m, int32(dirFd), int32(flags), uint64(pathPtr), uint64(pathLen), atim, mtim, int32(fstFlags))
+}
+
+// pathFilestatSetTimes is the body of Path_filestat_set_times and
+// Path_filestat_set_times64.
+func (w *WasiStubs) pathFilestatSetTimes(m *Module, dirFd, flags int32, pathPtr, pathLen uint64, atim, mtim int64, fstFlags int32) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5650,11 +6080,21 @@ func (o osFS) Chtimes(name string, atime, mtime time.Time) error {
 }
 
 func (w *WasiStubs) Path_link(m *Module, oldFd, oldFlags, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int32) int32 {
+	return w.pathLink(m, oldFd, oldFlags, zext(oldPathPtr), zext(oldPathLen), newFd, zext(newPathPtr), zext(newPathLen))
+}
+
+// Path_link64 is Path_link for a memory64 guest.
+func (w *WasiStubs) Path_link64(m *Module, oldFd, oldFlags, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int64) int32 {
+	return w.pathLink(m, int32(oldFd), int32(oldFlags), uint64(oldPathPtr), uint64(oldPathLen), int32(newFd), uint64(newPathPtr), uint64(newPathLen))
+}
+
+// pathLink is the body of Path_link and Path_link64.
+func (w *WasiStubs) pathLink(m *Module, oldFd, oldFlags int32, oldPathPtr, oldPathLen uint64, newFd int32, newPathPtr, newPathLen uint64) int32 {
 	if !rootDirFD(oldFd) || !rootDirFD(newFd) {
 		return _wasiEBADF
 	}
-	oldSlice := w.memSlice(m, oldPathPtr, oldPathLen)
-	newSlice := w.memSlice(m, newPathPtr, newPathLen)
+	oldSlice := w.memBytes(m, oldPathPtr, oldPathLen)
+	newSlice := w.memBytes(m, newPathPtr, newPathLen)
 	if oldSlice == nil || newSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5668,11 +6108,21 @@ func (w *WasiStubs) Path_link(m *Module, oldFd, oldFlags, oldPathPtr, oldPathLen
 }
 
 func (w *WasiStubs) Path_symlink(m *Module, targetPtr, targetLen, dirFd, linkPathPtr, linkPathLen int32) int32 {
+	return w.pathSymlink(m, zext(targetPtr), zext(targetLen), dirFd, zext(linkPathPtr), zext(linkPathLen))
+}
+
+// Path_symlink64 is Path_symlink for a memory64 guest.
+func (w *WasiStubs) Path_symlink64(m *Module, targetPtr, targetLen, dirFd, linkPathPtr, linkPathLen int64) int32 {
+	return w.pathSymlink(m, uint64(targetPtr), uint64(targetLen), int32(dirFd), uint64(linkPathPtr), uint64(linkPathLen))
+}
+
+// pathSymlink is the body of Path_symlink and Path_symlink64.
+func (w *WasiStubs) pathSymlink(m *Module, targetPtr, targetLen uint64, dirFd int32, linkPathPtr, linkPathLen uint64) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	targetSlice := w.memSlice(m, targetPtr, targetLen)
-	linkSlice := w.memSlice(m, linkPathPtr, linkPathLen)
+	targetSlice := w.memBytes(m, targetPtr, targetLen)
+	linkSlice := w.memBytes(m, linkPathPtr, linkPathLen)
 	if targetSlice == nil || linkSlice == nil {
 		return _wasiEFAULT
 	}
@@ -5686,12 +6136,23 @@ func (w *WasiStubs) Path_symlink(m *Module, targetPtr, targetLen, dirFd, linkPat
 }
 
 func (w *WasiStubs) Path_readlink(m *Module, dirFd, pathPtr, pathLen, buf, buflen, bufusedPtr int32) int32 {
+	return w.pathReadlink(m, wasiABI32, dirFd, zext(pathPtr), zext(pathLen), zext(buf), zext(buflen), zext(bufusedPtr))
+}
+
+// Path_readlink64 is Path_readlink for a memory64 guest.
+func (w *WasiStubs) Path_readlink64(m *Module, dirFd, pathPtr, pathLen, buf, buflen, bufusedPtr int64) int32 {
+	return w.pathReadlink(m, wasiABI64, int32(dirFd), uint64(pathPtr), uint64(pathLen), uint64(buf), uint64(buflen), uint64(bufusedPtr))
+}
+
+// pathReadlink is the body of Path_readlink and Path_readlink64.
+func (w *WasiStubs) pathReadlink(m *Module, abi wasiABI, dirFd int32, pathPtr, pathLen, buf, buflen, bufusedPtr uint64) int32 {
 	if !rootDirFD(dirFd) {
 		return _wasiEBADF
 	}
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	bufSlice := w.memSlice(m, buf, buflen)
-	bufused := w.memSlice(m, bufusedPtr, 4)
+	pathSlice := w.memBytes(m, pathPtr, pathLen)
+	bufSlice := w.memBytes(m, buf, buflen)
+	// bufused is a __wasi_size_t.
+	bufused := w.memBytes(m, bufusedPtr, abi.wordSize())
 	if pathSlice == nil || bufSlice == nil || bufused == nil {
 		return _wasiEFAULT
 	}
@@ -5703,12 +6164,22 @@ func (w *WasiStubs) Path_readlink(m *Module, dirFd, pathPtr, pathLen, buf, bufle
 		return mapOSError(err)
 	}
 	n := copy(bufSlice, target)
-	binary.LittleEndian.PutUint32(bufused, uint32(n))
+	abi.putWord(bufused, uint64(n))
 	return _wasiESUCCESS
 }
 
 func (w *WasiStubs) Random_get(m *Module, buf, bufLen int32) int32 {
-	slice := w.memSlice(m, buf, bufLen)
+	return w.randomGet(m, zext(buf), zext(bufLen))
+}
+
+// Random_get64 is Random_get for a memory64 guest.
+func (w *WasiStubs) Random_get64(m *Module, buf, bufLen int64) int32 {
+	return w.randomGet(m, uint64(buf), uint64(bufLen))
+}
+
+// randomGet is the body of Random_get and Random_get64.
+func (w *WasiStubs) randomGet(m *Module, buf, bufLen uint64) int32 {
+	slice := w.memBytes(m, buf, bufLen)
 	if slice == nil {
 		return _wasiEFAULT
 	}
@@ -5722,6 +6193,11 @@ func (w *WasiStubs) Random_get(m *Module, buf, bufLen int32) int32 {
 func (w *WasiStubs) Sched_yield(m *Module) int32 {
 	runtime.Gosched()
 	return _wasiESUCCESS
+}
+
+// Sched_yield64 is Sched_yield for a memory64 guest.
+func (w *WasiStubs) Sched_yield64(m *Module) int32 {
+	return w.Sched_yield(m)
 }
 
 // Poll_oneoff decodes the WASI subscription_u records and reproduces the
@@ -5744,17 +6220,26 @@ func (w *WasiStubs) Sched_yield(m *Module) int32 {
 // eventtype, u64 fd_readwrite_nbytes (filled for fd events), u16
 // flags, then 6 bytes of padding.
 func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int32) int32 {
-	subsTotal := uint64(uint32(nsubs)) * 48
-	if subsTotal > 0x7fffffff {
+	return w.pollOneoff(m, wasiABI32, zext(inPtr), zext(outPtr), zext(nsubs), zext(neventsPtr))
+}
+
+// Poll_oneoff64 is Poll_oneoff for a memory64 guest.
+func (w *WasiStubs) Poll_oneoff64(m *Module, inPtr, outPtr, nsubs, neventsPtr int64) int32 {
+	return w.pollOneoff(m, wasiABI64, uint64(inPtr), uint64(outPtr), uint64(nsubs), uint64(neventsPtr))
+}
+
+// pollOneoff is the body of Poll_oneoff and Poll_oneoff64.
+func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, neventsPtr uint64) int32 {
+	// The subscriptions (48 bytes each) and the events (32 bytes each)
+	// are the same for every guest; only nevents is a __wasi_size_t. The
+	// arrays may take up to 2 GiB: bound the count before multiplying so
+	// that a pathological nsubs cannot wrap.
+	if nsubs > 0x7fffffff/48 {
 		return _wasiEFAULT
 	}
-	subs := w.memSlice(m, inPtr, int32(subsTotal))
-	evTotal := uint64(uint32(nsubs)) * 32
-	if evTotal > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	events := w.memSlice(m, outPtr, int32(evTotal))
-	nev := w.memSlice(m, neventsPtr, 4)
+	subs := w.memBytes(m, inPtr, nsubs*48)
+	events := w.memBytes(m, outPtr, nsubs*32)
+	nev := w.memBytes(m, neventsPtr, abi.wordSize())
 	if subs == nil || events == nil || nev == nil {
 		return _wasiEFAULT
 	}
@@ -5768,7 +6253,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 	var minClockNs int64 = -1
 	var clockEvents []pollItem
 	var fdEvents []pollItem
-	for i := int32(0); i < nsubs; i++ {
+	for i := uint64(0); i < nsubs; i++ {
 		base := i * 48
 		userdata := binary.LittleEndian.Uint64(subs[base:])
 		etype := subs[base+8]
@@ -6103,7 +6588,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		written += 32
 	}
 
-	binary.LittleEndian.PutUint32(nev, uint32(written/32))
+	abi.putWord(nev, uint64(written/32))
 	return _wasiESUCCESS
 }
 
@@ -6200,6 +6685,11 @@ func (w *WasiStubs) Proc_exit(m *Module, code int32) {
 	panic(&WasiExitError{Code: code})
 }
 
+// Proc_exit64 is Proc_exit for a memory64 guest.
+func (w *WasiStubs) Proc_exit64(m *Module, code int64) {
+	w.Proc_exit(m, int32(code))
+}
+
 func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
 	p, err := os.FindProcess(os.Getpid())
 	if err != nil {
@@ -6289,10 +6779,20 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 // called listen on, EINTR when a signal is posted to the guest while it
 // waits.
 func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
+	return w.sockAccept(m, fd, flags, zext(fdOutPtr))
+}
+
+// Sock_accept64 is Sock_accept for a memory64 guest.
+func (w *WasiStubs) Sock_accept64(m *Module, fd, flags, fdOutPtr int64) int32 {
+	return w.sockAccept(m, int32(fd), int32(flags), uint64(fdOutPtr))
+}
+
+// sockAccept is the body of Sock_accept and Sock_accept64.
+func (w *WasiStubs) sockAccept(m *Module, fd, flags int32, fdOutPtr uint64) int32 {
 	if !w.checkNet("accept") {
 		return _wasiEACCES
 	}
-	out := w.memSlice(m, fdOutPtr, 4)
+	out := w.memBytes(m, fdOutPtr, 4)
 	if out == nil {
 		return _wasiEFAULT
 	}
@@ -6477,7 +6977,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 		}
 		return _wasiENOTSOCK
 	}
-	bufs, ok := w.iovecSlices(m, siData, siDataLen)
+	bufs, ok := w.iovecSlices(m, wasiABI32, zext(siData), zext(siDataLen))
 	lenOut := w.memSlice(m, soDataLenPtr, 4)
 	if !ok || lenOut == nil {
 		return _wasiEFAULT
@@ -6538,6 +7038,11 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 		return mapNetError(shErr)
 	}
 	return _wasiESUCCESS
+}
+
+// Sock_shutdown64 is Sock_shutdown for a memory64 guest.
+func (w *WasiStubs) Sock_shutdown64(m *Module, fd, how int64) int32 {
+	return w.Sock_shutdown(m, int32(fd), int32(how))
 }
 
 // writeFilestat populates the 64-byte WASI filestat structure from a
@@ -6726,7 +7231,17 @@ const (
 // parent the process that forked it until that one is gone, then 1. Returns
 // 0 or a negative errno.
 func (w *WasiStubs) Proc_ids(m *Module, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 24)
+	return w.procIDs(m, zext(outPtr))
+}
+
+// Proc_ids64 is Proc_ids for a memory64 guest.
+func (w *WasiStubs) Proc_ids64(m *Module, outPtr int64) int32 {
+	return w.procIDs(m, uint64(outPtr))
+}
+
+// procIDs is the body of Proc_ids and Proc_ids64.
+func (w *WasiStubs) procIDs(m *Module, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 24)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -6783,7 +7298,17 @@ func (w *WasiStubs) processID() (pid int32, alive bool) {
 // process, whose times these are. Returns 0, or a negative errno: ENOSYS on
 // a host that does not account for them.
 func (w *WasiStubs) Proc_times(m *Module, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 32)
+	return w.procTimes(m, zext(outPtr))
+}
+
+// Proc_times64 is Proc_times for a memory64 guest.
+func (w *WasiStubs) Proc_times64(m *Module, outPtr int64) int32 {
+	return w.procTimes(m, uint64(outPtr))
+}
+
+// procTimes is the body of Proc_times and Proc_times64.
+func (w *WasiStubs) procTimes(m *Module, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 32)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -6806,7 +7331,17 @@ func (w *WasiStubs) Proc_times(m *Module, outPtr int32) int32 {
 // 0, or a negative errno: ENOSYS for a guest that is not the host process,
 // which has no priority to speak of.
 func (w *WasiStubs) Proc_priority(m *Module, which, who, set, value, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 4)
+	return w.procPriority(m, which, who, set, value, zext(outPtr))
+}
+
+// Proc_priority64 is Proc_priority for a memory64 guest.
+func (w *WasiStubs) Proc_priority64(m *Module, which, who, set, value int32, outPtr int64) int32 {
+	return w.procPriority(m, which, who, set, value, uint64(outPtr))
+}
+
+// procPriority is the body of Proc_priority and Proc_priority64.
+func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -6839,7 +7374,17 @@ func (w *WasiStubs) Proc_priority(m *Module, which, who, set, value, outPtr int3
 // permission bits, less the instance's umask. Returns 0, or a negative
 // errno: ENOSYS when the filesystem of the instance has no FIFOs.
 func (w *WasiStubs) Path_mkfifo(m *Module, pathPtr, pathLen, mode int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	return w.pathMkfifo(m, zext(pathPtr), pathLen, mode)
+}
+
+// Path_mkfifo64 is Path_mkfifo for a memory64 guest.
+func (w *WasiStubs) Path_mkfifo64(m *Module, pathPtr int64, pathLen, mode int32) int32 {
+	return w.pathMkfifo(m, uint64(pathPtr), pathLen, mode)
+}
+
+// pathMkfifo is the body of Path_mkfifo and Path_mkfifo64.
+func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
 	if pathSlice == nil {
 		return -_wasiEFAULT
 	}
@@ -6885,7 +7430,17 @@ func (o osFS) Chown(name string, uid, gid int, follow bool) error {
 // is left as it is. Returns 0, or a negative errno: ENOSYS when the
 // filesystem of the instance keeps no owners.
 func (w *WasiStubs) Path_chown(m *Module, pathPtr, pathLen, uid, gid, follow int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	return w.pathChown(m, zext(pathPtr), pathLen, uid, gid, follow)
+}
+
+// Path_chown64 is Path_chown for a memory64 guest.
+func (w *WasiStubs) Path_chown64(m *Module, pathPtr int64, pathLen, uid, gid, follow int32) int32 {
+	return w.pathChown(m, uint64(pathPtr), pathLen, uid, gid, follow)
+}
+
+// pathChown is the body of Path_chown and Path_chown64.
+func (w *WasiStubs) pathChown(m *Module, pathPtr uint64, pathLen, uid, gid, follow int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
 	if pathSlice == nil {
 		return -_wasiEFAULT
 	}
@@ -6929,6 +7484,11 @@ func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 		return -mapOSError(err)
 	}
 	return _wasiESUCCESS
+}
+
+// Fd_chown64 is Fd_chown for a memory64 guest.
+func (w *WasiStubs) Fd_chown64(m *Module, fd, uid, gid int32) int32 {
+	return w.Fd_chown(m, fd, uid, gid)
 }
 
 // The requests of Proc_setids.
@@ -7020,15 +7580,30 @@ func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Proc_setids64 is Proc_setids for a memory64 guest.
+func (w *WasiStubs) Proc_setids64(m *Module, request, a, b, c int32) int32 {
+	return w.Proc_setids(m, request, a, b, c)
+}
+
 // Proc_setgroups is a NON-STANDARD host import (name "proc_setgroups")
 // backing setgroups for a guest that is the host process: count u32 group
 // ids at listPtr become the supplementary groups. Returns 0, or a negative
 // errno: ENOSYS for a guest that is not the host process.
 func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
+	return w.procSetgroups(m, zext(listPtr), count)
+}
+
+// Proc_setgroups64 is Proc_setgroups for a memory64 guest.
+func (w *WasiStubs) Proc_setgroups64(m *Module, listPtr int64, count int32) int32 {
+	return w.procSetgroups(m, uint64(listPtr), count)
+}
+
+// procSetgroups is the body of Proc_setgroups and Proc_setgroups64.
+func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 {
 	if count < 0 || count > 65536 {
 		return -_wasiEINVAL
 	}
-	list := w.memSlice(m, listPtr, count*4)
+	list := w.memBytes(m, listPtr, zext(count*4))
 	if list == nil && count > 0 {
 		return -_wasiEFAULT
 	}
@@ -7064,6 +7639,16 @@ func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
 // a negative errno: ENOSYS for a guest that is not the host process — it is
 // a system of its own — and on a host that cannot say.
 func (w *WasiStubs) Proc_uname(m *Module, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUname(m, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_uname64 is Proc_uname for a memory64 guest.
+func (w *WasiStubs) Proc_uname64(m *Module, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUname(m, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUname is the body of Proc_uname and Proc_uname64.
+func (w *WasiStubs) procUname(m *Module, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if !w.hostIdentity() {
 		return -_wasiENOSYS
 	}
@@ -7090,7 +7675,17 @@ func (w *WasiStubs) Proc_uname(m *Module, bufPtr, bufLen, neededPtr int32) int32
 //
 // Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_chdir(m *Module, pathPtr, pathLen int32) int32 {
-	path := w.memSlice(m, pathPtr, pathLen)
+	return w.procChdir(m, zext(pathPtr), pathLen)
+}
+
+// Proc_chdir64 is Proc_chdir for a memory64 guest.
+func (w *WasiStubs) Proc_chdir64(m *Module, pathPtr int64, pathLen int32) int32 {
+	return w.procChdir(m, uint64(pathPtr), pathLen)
+}
+
+// procChdir is the body of Proc_chdir and Proc_chdir64.
+func (w *WasiStubs) procChdir(m *Module, pathPtr uint64, pathLen int32) int32 {
+	path := w.memBytes(m, pathPtr, zext(pathLen))
 	if path == nil {
 		return -_wasiEFAULT
 	}
@@ -7109,8 +7704,18 @@ func (w *WasiStubs) Proc_chdir(m *Module, pathPtr, pathLen int32) int32 {
 // process the host process's environment follows. A forked process's
 // change stays its own. Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_setenv(m *Module, namePtr, nameLen, valuePtr, valueLen, hasValue int32) int32 {
-	name := w.memSlice(m, namePtr, nameLen)
-	value := w.memSlice(m, valuePtr, valueLen)
+	return w.procSetenv(m, zext(namePtr), nameLen, zext(valuePtr), valueLen, hasValue)
+}
+
+// Proc_setenv64 is Proc_setenv for a memory64 guest.
+func (w *WasiStubs) Proc_setenv64(m *Module, namePtr int64, nameLen int32, valuePtr int64, valueLen, hasValue int32) int32 {
+	return w.procSetenv(m, uint64(namePtr), nameLen, uint64(valuePtr), valueLen, hasValue)
+}
+
+// procSetenv is the body of Proc_setenv and Proc_setenv64.
+func (w *WasiStubs) procSetenv(m *Module, namePtr uint64, nameLen int32, valuePtr uint64, valueLen, hasValue int32) int32 {
+	name := w.memBytes(m, namePtr, zext(nameLen))
+	value := w.memBytes(m, valuePtr, zext(valueLen))
 	if name == nil || (value == nil && hasValue != 0) {
 		return -_wasiEFAULT
 	}
@@ -7183,8 +7788,18 @@ func findHostService(match func(wasiService) bool) (found wasiService, ok bool) 
 // there is no such service — as for every guest that is not the host
 // process, which has no services database.
 func (w *WasiStubs) Sock_service(m *Module, namePtr, nameLen, port, byPort, protoPtr, protoLen, bufPtr, bufLen, neededPtr int32) int32 {
-	nameBytes := w.memSlice(m, namePtr, nameLen)
-	protoBytes := w.memSlice(m, protoPtr, protoLen)
+	return w.sockService(m, zext(namePtr), nameLen, port, byPort, zext(protoPtr), protoLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Sock_service64 is Sock_service for a memory64 guest.
+func (w *WasiStubs) Sock_service64(m *Module, namePtr int64, nameLen, port, byPort int32, protoPtr int64, protoLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.sockService(m, uint64(namePtr), nameLen, port, byPort, uint64(protoPtr), protoLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// sockService is the body of Sock_service and Sock_service64.
+func (w *WasiStubs) sockService(m *Module, namePtr uint64, nameLen, port, byPort int32, protoPtr uint64, protoLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	nameBytes := w.memBytes(m, namePtr, zext(nameLen))
+	protoBytes := w.memBytes(m, protoPtr, zext(protoLen))
 	if nameBytes == nil || protoBytes == nil {
 		return -_wasiEFAULT
 	}
@@ -7230,12 +7845,12 @@ func (w *WasiStubs) Sock_service(m *Module, namePtr, nameLen, port, byPort, prot
 // dotted form. Returns 0, or a negative errno: ENOENT when the address has
 // no name, EACCES when the hook refuses.
 func (w *WasiStubs) Sock_reverse(m *Module, ipBE, bufPtr, bufLen, neededPtr int32) int32 {
-	return w.reverseLookup(m, socketIPv4(ipBE), bufPtr, bufLen, neededPtr)
+	return w.reverseLookup(m, socketIPv4(ipBE), zext(bufPtr), bufLen, zext(neededPtr))
 }
 
 // reverseLookup is Sock_reverse for the IP address ip, of either family,
 // written in numbers.
-func (w *WasiStubs) reverseLookup(m *Module, ip string, bufPtr, bufLen, neededPtr int32) int32 {
+func (w *WasiStubs) reverseLookup(m *Module, ip string, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	w.mu.Lock()
 	hook := w.resolveHook
 	w.mu.Unlock()
@@ -7272,7 +7887,17 @@ func (w *WasiStubs) reverseLookup(m *Module, ip string, bufPtr, bufLen, neededPt
 // errno: ENOENT when the name has no IPv4 address, EACCES when the policy
 // refuses.
 func (w *WasiStubs) Sock_host_by_name(m *Module, nodePtr, nodeLen, bufPtr, bufLen, neededPtr int32) int32 {
-	node := w.memSlice(m, nodePtr, nodeLen)
+	return w.sockHostByName(m, zext(nodePtr), nodeLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Sock_host_by_name64 is Sock_host_by_name for a memory64 guest.
+func (w *WasiStubs) Sock_host_by_name64(m *Module, nodePtr int64, nodeLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.sockHostByName(m, uint64(nodePtr), nodeLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// sockHostByName is the body of Sock_host_by_name and Sock_host_by_name64.
+func (w *WasiStubs) sockHostByName(m *Module, nodePtr uint64, nodeLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	node := w.memBytes(m, nodePtr, zext(nodeLen))
 	if node == nil && nodeLen != 0 {
 		return -_wasiEFAULT
 	}
@@ -7362,6 +7987,11 @@ func (w *WasiStubs) Host_numbering(m *Module) int32 {
 	return 0
 }
 
+// Host_numbering64 is Host_numbering for a memory64 guest.
+func (w *WasiStubs) Host_numbering64(m *Module) int32 {
+	return w.Host_numbering(m)
+}
+
 // Host_number_at is a NON-STANDARD host import (name "host_number_at"): the
 // index-th number of a family of the host operating system's numbers. The
 // families are numbered as in the wasip1_hostnumbers_* tables (1 is the
@@ -7371,6 +8001,16 @@ func (w *WasiStubs) Host_numbering(m *Module) int32 {
 // past the last number of the family (at index 0: the host has no table of
 // it), ERANGE for a name longer than nameCap.
 func (w *WasiStubs) Host_number_at(m *Module, family, index, namePtr, nameCap, nameLenPtr, valuePtr int32) int32 {
+	return w.hostNumberAt(m, family, index, zext(namePtr), nameCap, zext(nameLenPtr), zext(valuePtr))
+}
+
+// Host_number_at64 is Host_number_at for a memory64 guest.
+func (w *WasiStubs) Host_number_at64(m *Module, family, index int32, namePtr int64, nameCap int32, nameLenPtr, valuePtr int64) int32 {
+	return w.hostNumberAt(m, family, index, uint64(namePtr), nameCap, uint64(nameLenPtr), uint64(valuePtr))
+}
+
+// hostNumberAt is the body of Host_number_at and Host_number_at64.
+func (w *WasiStubs) hostNumberAt(m *Module, family, index int32, namePtr uint64, nameCap int32, nameLenPtr, valuePtr uint64) int32 {
 	table := hostNumberTable(family)
 	if index < 0 || int(index) >= len(table) {
 		return -_wasiENOENT
@@ -7379,9 +8019,9 @@ func (w *WasiStubs) Host_number_at(m *Module, family, index, namePtr, nameCap, n
 	if int64(len(number.name)) > int64(nameCap) {
 		return -_wasiERANGE
 	}
-	name := w.memSlice(m, namePtr, int32(len(number.name)))
-	nameLen := w.memSlice(m, nameLenPtr, 4)
-	value := w.memSlice(m, valuePtr, 8)
+	name := w.memBytes(m, namePtr, uint64(len(number.name)))
+	nameLen := w.memBytes(m, nameLenPtr, 4)
+	value := w.memBytes(m, valuePtr, 8)
 	if name == nil || nameLen == nil || value == nil {
 		return -_wasiEFAULT
 	}
@@ -7429,7 +8069,17 @@ func (w *WasiStubs) groupExists(pgid int32) bool {
 // of the host. The group is written at outPtr (u32). Returns 0, or a
 // negative errno: ESRCH for a pid that names no such process.
 func (w *WasiStubs) Proc_getpgid(m *Module, pid, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 4)
+	return w.procGetpgid(m, pid, zext(outPtr))
+}
+
+// Proc_getpgid64 is Proc_getpgid for a memory64 guest.
+func (w *WasiStubs) Proc_getpgid64(m *Module, pid int32, outPtr int64) int32 {
+	return w.procGetpgid(m, pid, uint64(outPtr))
+}
+
+// procGetpgid is the body of Proc_getpgid and Proc_getpgid64.
+func (w *WasiStubs) procGetpgid(m *Module, pid int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -7521,13 +8171,28 @@ func (w *WasiStubs) Proc_setpgid(m *Module, pid, pgid int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Proc_setpgid64 is Proc_setpgid for a memory64 guest.
+func (w *WasiStubs) Proc_setpgid64(m *Module, pid, pgid int32) int32 {
+	return w.Proc_setpgid(m, pid, pgid)
+}
+
 // Proc_setsid is a NON-STANDARD host import (name "proc_setsid") backing
 // setsid: the caller starts a session, and in it a process group, of its
 // own; their id, the caller's pid, is written at outPtr (u32). A guest that
 // is the host process does this to the host process. Returns 0, or a
 // negative errno: EPERM when the caller already leads a process group.
 func (w *WasiStubs) Proc_setsid(m *Module, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 4)
+	return w.procSetsid(m, zext(outPtr))
+}
+
+// Proc_setsid64 is Proc_setsid for a memory64 guest.
+func (w *WasiStubs) Proc_setsid64(m *Module, outPtr int64) int32 {
+	return w.procSetsid(m, uint64(outPtr))
+}
+
+// procSetsid is the body of Proc_setsid and Proc_setsid64.
+func (w *WasiStubs) procSetsid(m *Module, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -7567,6 +8232,11 @@ func (w *WasiStubs) Proc_exec_next(m *Module, on int32) int32 {
 	w.execNext = on != 0
 	w.mu.Unlock()
 	return _wasiESUCCESS
+}
+
+// Proc_exec_next64 is Proc_exec_next for a memory64 guest.
+func (w *WasiStubs) Proc_exec_next64(m *Module, on int32) int32 {
+	return w.Proc_exec_next(m, on)
 }
 
 // killGroup signals every process of a group, for Proc_kill: pid 0 names
@@ -7680,7 +8350,17 @@ func (w *WasiStubs) signalCommands(sig syscall.Signal) {
 // them, the ids themselves. Returns 0, or a negative errno: ERANGE when
 // capacity is non-zero and too small (the count is still written).
 func (w *WasiStubs) Proc_groups(m *Module, bufPtr, capacity, countPtr int32) int32 {
-	countOut := w.memSlice(m, countPtr, 4)
+	return w.procGroups(m, zext(bufPtr), capacity, zext(countPtr))
+}
+
+// Proc_groups64 is Proc_groups for a memory64 guest.
+func (w *WasiStubs) Proc_groups64(m *Module, bufPtr int64, capacity int32, countPtr int64) int32 {
+	return w.procGroups(m, uint64(bufPtr), capacity, uint64(countPtr))
+}
+
+// procGroups is the body of Proc_groups and Proc_groups64.
+func (w *WasiStubs) procGroups(m *Module, bufPtr uint64, capacity int32, countPtr uint64) int32 {
+	countOut := w.memBytes(m, countPtr, 4)
 	if countOut == nil || capacity < 0 {
 		return -_wasiEFAULT
 	}
@@ -7698,7 +8378,7 @@ func (w *WasiStubs) Proc_groups(m *Module, bufPtr, capacity, countPtr int32) int
 	if int(capacity) < len(groups) {
 		return -_wasiERANGE
 	}
-	buf := w.memSlice(m, bufPtr, int32(len(groups))*4)
+	buf := w.memBytes(m, bufPtr, uint64(len(groups))*4)
 	if buf == nil {
 		return -_wasiEFAULT
 	}
@@ -7719,8 +8399,8 @@ func appendWasiString(rec []byte, s string) []byte {
 // written at neededPtr, and the record at bufPtr when bufLen bytes are
 // enough for it. Returns 0, or a negative errno: ERANGE when the buffer is
 // too small — the guest then calls again with one of the size it was told.
-func (w *WasiStubs) writeWasiRecord(m *Module, rec []byte, bufPtr, bufLen, neededPtr int32) int32 {
-	needed := w.memSlice(m, neededPtr, 4)
+func (w *WasiStubs) writeWasiRecord(m *Module, rec []byte, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	needed := w.memBytes(m, neededPtr, 4)
 	if needed == nil || bufLen < 0 {
 		return -_wasiEFAULT
 	}
@@ -7728,7 +8408,7 @@ func (w *WasiStubs) writeWasiRecord(m *Module, rec []byte, bufPtr, bufLen, neede
 	if int(bufLen) < len(rec) {
 		return -_wasiERANGE
 	}
-	buf := w.memSlice(m, bufPtr, int32(len(rec)))
+	buf := w.memBytes(m, bufPtr, uint64(len(rec)))
 	if buf == nil {
 		return -_wasiEFAULT
 	}
@@ -7762,7 +8442,7 @@ func userRecord(u *user.User) (rec []byte, ok bool) {
 // writeUser answers a user lookup: the record of u, or ENOENT when the
 // lookup found no such user (err != nil) or the instance has no user
 // database.
-func (w *WasiStubs) writeUser(m *Module, u *user.User, err error, bufPtr, bufLen, neededPtr int32) int32 {
+func (w *WasiStubs) writeUser(m *Module, u *user.User, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if err != nil {
 		return -_wasiENOENT
 	}
@@ -7780,6 +8460,16 @@ func (w *WasiStubs) writeUser(m *Module, u *user.User, err error, bufPtr, bufLen
 // instance that is not the host process — and ERANGE when the buffer is too
 // small.
 func (w *WasiStubs) Proc_user_by_id(m *Module, uid, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUserByID(m, uid, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_user_by_id64 is Proc_user_by_id for a memory64 guest.
+func (w *WasiStubs) Proc_user_by_id64(m *Module, uid int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUserByID(m, uid, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUserByID is the body of Proc_user_by_id and Proc_user_by_id64.
+func (w *WasiStubs) procUserByID(m *Module, uid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if !w.hostIdentity() {
 		return -_wasiENOENT
 	}
@@ -7791,7 +8481,17 @@ func (w *WasiStubs) Proc_user_by_id(m *Module, uid, bufPtr, bufLen, neededPtr in
 // backing getpwnam: Proc_user_by_id for the login name at (namePtr,
 // nameLen).
 func (w *WasiStubs) Proc_user_by_name(m *Module, namePtr, nameLen, bufPtr, bufLen, neededPtr int32) int32 {
-	name := w.memSlice(m, namePtr, nameLen)
+	return w.procUserByName(m, zext(namePtr), nameLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_user_by_name64 is Proc_user_by_name for a memory64 guest.
+func (w *WasiStubs) Proc_user_by_name64(m *Module, namePtr int64, nameLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUserByName(m, uint64(namePtr), nameLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUserByName is the body of Proc_user_by_name and Proc_user_by_name64.
+func (w *WasiStubs) procUserByName(m *Module, namePtr uint64, nameLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	name := w.memBytes(m, namePtr, zext(nameLen))
 	if name == nil {
 		return -_wasiEFAULT
 	}
@@ -7805,7 +8505,7 @@ func (w *WasiStubs) Proc_user_by_name(m *Module, namePtr, nameLen, bufPtr, bufLe
 // writeGroup answers a group lookup with the group's record: u32 gid, then
 // the group name as a string (appendWasiString). The host's group lookup
 // (os/user) does not report a group's members, so the record carries none.
-func (w *WasiStubs) writeGroup(m *Module, g *user.Group, err error, bufPtr, bufLen, neededPtr int32) int32 {
+func (w *WasiStubs) writeGroup(m *Module, g *user.Group, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if err != nil {
 		return -_wasiENOENT
 	}
@@ -7821,6 +8521,16 @@ func (w *WasiStubs) writeGroup(m *Module, g *user.Group, err error, bufPtr, bufL
 // Proc_group_by_id is a NON-STANDARD host import (name "proc_group_by_id")
 // backing getgrgid; see Proc_user_by_id and writeGroup.
 func (w *WasiStubs) Proc_group_by_id(m *Module, gid, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procGroupByID(m, gid, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_group_by_id64 is Proc_group_by_id for a memory64 guest.
+func (w *WasiStubs) Proc_group_by_id64(m *Module, gid int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procGroupByID(m, gid, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procGroupByID is the body of Proc_group_by_id and Proc_group_by_id64.
+func (w *WasiStubs) procGroupByID(m *Module, gid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if !w.hostIdentity() {
 		return -_wasiENOENT
 	}
@@ -7832,7 +8542,17 @@ func (w *WasiStubs) Proc_group_by_id(m *Module, gid, bufPtr, bufLen, neededPtr i
 // "proc_group_by_name") backing getgrnam; see Proc_user_by_name and
 // writeGroup.
 func (w *WasiStubs) Proc_group_by_name(m *Module, namePtr, nameLen, bufPtr, bufLen, neededPtr int32) int32 {
-	name := w.memSlice(m, namePtr, nameLen)
+	return w.procGroupByName(m, zext(namePtr), nameLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_group_by_name64 is Proc_group_by_name for a memory64 guest.
+func (w *WasiStubs) Proc_group_by_name64(m *Module, namePtr int64, nameLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procGroupByName(m, uint64(namePtr), nameLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procGroupByName is the body of Proc_group_by_name and Proc_group_by_name64.
+func (w *WasiStubs) procGroupByName(m *Module, namePtr uint64, nameLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	name := w.memBytes(m, namePtr, zext(nameLen))
 	if name == nil {
 		return -_wasiEFAULT
 	}
@@ -8198,10 +8918,20 @@ const wasiZoneNameSize = 16
 // each: the one in use, standard time's, and daylight saving time's (empty
 // when the zone has none). Returns 0 or a negative errno.
 func (w *WasiStubs) Clock_zone(m *Module, tzPtr, tzLen, hasTZ int32, t int64, local, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 16+3*wasiZoneNameSize)
+	return w.clockZone(m, zext(tzPtr), tzLen, hasTZ, t, local, zext(outPtr))
+}
+
+// Clock_zone64 is Clock_zone for a memory64 guest.
+func (w *WasiStubs) Clock_zone64(m *Module, tzPtr int64, tzLen, hasTZ int32, t int64, local int32, outPtr int64) int32 {
+	return w.clockZone(m, uint64(tzPtr), tzLen, hasTZ, t, local, uint64(outPtr))
+}
+
+// clockZone is the body of Clock_zone and Clock_zone64.
+func (w *WasiStubs) clockZone(m *Module, tzPtr uint64, tzLen, hasTZ int32, t int64, local int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 16+3*wasiZoneNameSize)
 	var tz []byte
 	if hasTZ != 0 {
-		tz = w.memSlice(m, tzPtr, tzLen)
+		tz = w.memBytes(m, tzPtr, zext(tzLen))
 		if tz == nil && tzLen != 0 {
 			return -_wasiEFAULT
 		}
@@ -8296,7 +9026,17 @@ func syslogResult(err error) int32 {
 // Syslogger accepts, or a negative errno: ENOSYS when the instance has no
 // system logger, otherwise what the logger reported.
 func (w *WasiStubs) Proc_syslog_open(m *Module, identPtr, identLen, options, facility int32) int32 {
-	ident := w.memSlice(m, identPtr, identLen)
+	return w.procSyslogOpen(m, zext(identPtr), identLen, options, facility)
+}
+
+// Proc_syslog_open64 is Proc_syslog_open for a memory64 guest.
+func (w *WasiStubs) Proc_syslog_open64(m *Module, identPtr int64, identLen, options, facility int32) int32 {
+	return w.procSyslogOpen(m, uint64(identPtr), identLen, options, facility)
+}
+
+// procSyslogOpen is the body of Proc_syslog_open and Proc_syslog_open64.
+func (w *WasiStubs) procSyslogOpen(m *Module, identPtr uint64, identLen, options, facility int32) int32 {
+	ident := w.memBytes(m, identPtr, zext(identLen))
 	if ident == nil && identLen != 0 {
 		return -_wasiEFAULT
 	}
@@ -8317,8 +9057,18 @@ func (w *WasiStubs) Proc_syslog_open(m *Module, identPtr, identLen, options, fac
 // instance has no system logger, EINVAL for a severity or facility out of
 // range, otherwise what the logger reported.
 func (w *WasiStubs) Proc_syslog(m *Module, severity, facility, options, identPtr, identLen, msgPtr, msgLen int32) int32 {
-	ident := w.memSlice(m, identPtr, identLen)
-	text := w.memSlice(m, msgPtr, msgLen)
+	return w.procSyslog(m, severity, facility, options, zext(identPtr), identLen, zext(msgPtr), msgLen)
+}
+
+// Proc_syslog64 is Proc_syslog for a memory64 guest.
+func (w *WasiStubs) Proc_syslog64(m *Module, severity, facility, options int32, identPtr int64, identLen int32, msgPtr int64, msgLen int32) int32 {
+	return w.procSyslog(m, severity, facility, options, uint64(identPtr), identLen, uint64(msgPtr), msgLen)
+}
+
+// procSyslog is the body of Proc_syslog and Proc_syslog64.
+func (w *WasiStubs) procSyslog(m *Module, severity, facility, options int32, identPtr uint64, identLen int32, msgPtr uint64, msgLen int32) int32 {
+	ident := w.memBytes(m, identPtr, zext(identLen))
+	text := w.memBytes(m, msgPtr, zext(msgLen))
 	if (ident == nil && identLen != 0) || (text == nil && msgLen != 0) {
 		return -_wasiEFAULT
 	}
@@ -8350,6 +9100,11 @@ func (w *WasiStubs) Proc_syslog_close(m *Module) int32 {
 		return -_wasiENOSYS
 	}
 	return syslogResult(l.Close())
+}
+
+// Proc_syslog_close64 is Proc_syslog_close for a memory64 guest.
+func (w *WasiStubs) Proc_syslog_close64(m *Module) int32 {
+	return w.Proc_syslog_close(m)
 }
 
 // ----- signals ----------------------------------------------------------------
@@ -8386,9 +9141,11 @@ func (e *WasiSignalError) Error() string {
 type wasiSignals struct {
 	// flagModule and flagAddr locate the guest's flag word, once the guest
 	// has registered it (Proc_signal_register). Until then there is no one
-	// to deliver a signal to, and PostSignal drops what it is given.
+	// to deliver a signal to, and PostSignal drops what it is given. The
+	// address is a guest address at full width, which a memory64 guest's
+	// may need; the flag word itself is a 32-bit int.
 	flagModule *Module
-	flagAddr   uint32
+	flagAddr   uint64
 	// handled, ignored and blocked are the dispositions the guest reported:
 	// the signals it has a handler for, the ones it ignores explicitly
 	// (SIG_IGN), and its signal mask. A signal in neither of the first two
@@ -8562,9 +9319,9 @@ func (w *WasiStubs) SetOutsideInterrupt(interrupt func()) (previous func()) {
 // another goroutine and may be growing its memory, hence accessMemory.
 // Caller holds w.mu.
 func (w *WasiStubs) raiseSignalFlagLocked() {
-	addr := uint64(w.sig.flagAddr)
+	addr := w.sig.flagAddr
 	accessMemory(w.sig.flagModule, func(mem []byte) {
-		if addr+4 <= uint64(len(mem)) {
+		if size := uint64(len(mem)); addr <= size && 4 <= size-addr {
 			binary.LittleEndian.PutUint32(mem[addr:], 1)
 		}
 	})
@@ -8633,16 +9390,27 @@ func (w *WasiStubs) interruptDue() bool {
 // address are already registered, and 0 when the registration is new — the
 // guest then reports its dispositions, which the host does not know either.
 func (w *WasiStubs) Proc_signal_register(m *Module, flagPtr int32) int32 {
-	if w.memSlice(m, flagPtr, 4) == nil {
+	return w.procSignalRegister(m, zext(flagPtr))
+}
+
+// Proc_signal_register64 is Proc_signal_register for a memory64 guest.
+func (w *WasiStubs) Proc_signal_register64(m *Module, flagPtr int64) int32 {
+	return w.procSignalRegister(m, uint64(flagPtr))
+}
+
+// procSignalRegister is the body of Proc_signal_register and
+// Proc_signal_register64.
+func (w *WasiStubs) procSignalRegister(m *Module, flagPtr uint64) int32 {
+	if w.memBytes(m, flagPtr, 4) == nil {
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s := &w.sig
-	if s.flagModule == m && s.flagAddr == uint32(flagPtr) {
+	if s.flagModule == m && s.flagAddr == flagPtr {
 		return 1
 	}
-	s.flagModule, s.flagAddr = m, uint32(flagPtr)
+	s.flagModule, s.flagAddr = m, flagPtr
 	return 0
 }
 
@@ -8671,12 +9439,27 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 	return _wasiESUCCESS
 }
 
+// Proc_signal_dispositions64 is Proc_signal_dispositions for a memory64 guest.
+func (w *WasiStubs) Proc_signal_dispositions64(m *Module, handled, ignored, blocked int64) int32 {
+	return w.Proc_signal_dispositions(m, handled, ignored, blocked)
+}
+
 // Proc_signal_take is a NON-STANDARD host import (name "proc_signal_take").
 // It writes the mask of posted signals (u64) at maskPtr and forgets them:
 // from here on they are the guest's to deliver, or to hold while blocked.
 // Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_signal_take(m *Module, maskPtr int32) int32 {
-	out := w.memSlice(m, maskPtr, 8)
+	return w.procSignalTake(m, zext(maskPtr))
+}
+
+// Proc_signal_take64 is Proc_signal_take for a memory64 guest.
+func (w *WasiStubs) Proc_signal_take64(m *Module, maskPtr int64) int32 {
+	return w.procSignalTake(m, uint64(maskPtr))
+}
+
+// procSignalTake is the body of Proc_signal_take and Proc_signal_take64.
+func (w *WasiStubs) procSignalTake(m *Module, maskPtr uint64) int32 {
+	out := w.memBytes(m, maskPtr, 8)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -8713,7 +9496,17 @@ const (
 //
 // Returns 0, or a negative errno: EINVAL for a negative time.
 func (w *WasiStubs) Proc_itimer(m *Module, set int32, value, interval int64, oldPtr int32) int32 {
-	out := w.memSlice(m, oldPtr, 16)
+	return w.procItimer(m, set, value, interval, zext(oldPtr))
+}
+
+// Proc_itimer64 is Proc_itimer for a memory64 guest.
+func (w *WasiStubs) Proc_itimer64(m *Module, set int32, value, interval, oldPtr int64) int32 {
+	return w.procItimer(m, set, value, interval, uint64(oldPtr))
+}
+
+// procItimer is the body of Proc_itimer and Proc_itimer64.
+func (w *WasiStubs) procItimer(m *Module, set int32, value, interval int64, oldPtr uint64) int32 {
+	out := w.memBytes(m, oldPtr, 16)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -8817,6 +9610,11 @@ func (w *WasiStubs) stopTimerLocked() {
 // guest with a panic, whose value is a *WasiSignalError.
 func (w *WasiStubs) Proc_terminate(m *Module, sig int32) {
 	panic(&WasiSignalError{Signal: sig})
+}
+
+// Proc_terminate64 is Proc_terminate for a memory64 guest.
+func (w *WasiStubs) Proc_terminate64(m *Module, sig int32) {
+	w.Proc_terminate(m, sig)
 }
 
 // detachSignalsLocked ends signal delivery to this instance: nothing may
@@ -9497,6 +10295,11 @@ func (w *WasiStubs) Sock_listen(m *Module, fd, backlog int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Sock_listen64 is Sock_listen for a memory64 guest.
+func (w *WasiStubs) Sock_listen64(m *Module, fd, backlog int32) int32 {
+	return w.Sock_listen(m, fd, backlog)
+}
+
 // The address families of a socket and of a socket name: the host's own
 // numbering (a libc's AF_* numbers differ from libc to libc).
 const (
@@ -9508,8 +10311,8 @@ const (
 // writeSockName writes a socket name at outPtr as three little-endian u32:
 // the family (wasiSockFamily*), the IPv4 address with its first octet in the
 // low byte, and the port. A name that is not an IPv4 one has only a family.
-func (w *WasiStubs) writeSockName(m *Module, addr net.Addr, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 12)
+func (w *WasiStubs) writeSockName(m *Module, addr net.Addr, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 12)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -9557,18 +10360,18 @@ func (w *WasiStubs) Sock_getsockname(m *Module, fd, outPtr int32) int32 {
 		if errno != _wasiESUCCESS {
 			return -errno
 		}
-		return w.writeSockName(m, addr, outPtr)
+		return w.writeSockName(m, addr, zext(outPtr))
 	}
 	if conn := op.netConn(); conn != nil {
-		return w.writeSockName(m, conn.LocalAddr(), outPtr)
+		return w.writeSockName(m, conn.LocalAddr(), zext(outPtr))
 	}
 	if l, _ := op.netListener(); l != nil {
-		return w.writeSockName(m, l.Addr(), outPtr)
+		return w.writeSockName(m, l.Addr(), zext(outPtr))
 	}
 	if !op.isSocket {
 		return -_wasiENOTSOCK
 	}
-	return w.writeSockName(m, nil, outPtr)
+	return w.writeSockName(m, nil, zext(outPtr))
 }
 
 // Sock_getpeername is a NON-STANDARD host import (name "sock_getpeername")
@@ -9587,7 +10390,7 @@ func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
 		if errno != _wasiESUCCESS {
 			return -errno
 		}
-		return w.writeSockName(m, addr, outPtr)
+		return w.writeSockName(m, addr, zext(outPtr))
 	}
 	conn := op.netConn()
 	if conn == nil {
@@ -9604,7 +10407,7 @@ func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
 	if errno := op.peerLost(conn); errno != _wasiESUCCESS {
 		return -errno
 	}
-	return w.writeSockName(m, peer, outPtr)
+	return w.writeSockName(m, peer, zext(outPtr))
 }
 
 // peerLost asks the host whether the stream connection conn of op still has
@@ -9664,7 +10467,17 @@ func (op *wasiOpen) timeouts() (receive, send time.Duration) {
 // with EAGAIN. Returns 0, or a negative errno: EINVAL for another which or a
 // negative time.
 func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, oldPtr int32) int32 {
-	out := w.memSlice(m, oldPtr, 8)
+	return w.sockTimeout(m, fd, which, set, nanos, zext(oldPtr))
+}
+
+// Sock_timeout64 is Sock_timeout for a memory64 guest.
+func (w *WasiStubs) Sock_timeout64(m *Module, fd, which, set int32, nanos, oldPtr int64) int32 {
+	return w.sockTimeout(m, fd, which, set, nanos, uint64(oldPtr))
+}
+
+// sockTimeout is the body of Sock_timeout and Sock_timeout64.
+func (w *WasiStubs) sockTimeout(m *Module, fd, which, set int32, nanos int64, oldPtr uint64) int32 {
+	out := w.memBytes(m, oldPtr, 8)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -9771,6 +10584,11 @@ func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 	return _wasiESUCCESS
 }
 
+// Sock_setopt64 is Sock_setopt for a memory64 guest.
+func (w *WasiStubs) Sock_setopt64(m *Module, fd, option, value int32) int32 {
+	return w.Sock_setopt(m, fd, option, value)
+}
+
 // Sock_getopt is a NON-STANDARD host import (name "sock_getopt") backing
 // getsockopt(): it writes the option's value (i32) at valuePtr — what the
 // guest set, or the option's initial value: 0, and -1 (off) for linger.
@@ -9780,7 +10598,17 @@ func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 // SO_ACCEPTCONN is 1 for a socket that listens. Returns
 // 0, or a negative errno: ENOPROTOOPT for an unknown option.
 func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
-	out := w.memSlice(m, valuePtr, 4)
+	return w.sockGetopt(m, fd, option, zext(valuePtr))
+}
+
+// Sock_getopt64 is Sock_getopt for a memory64 guest.
+func (w *WasiStubs) Sock_getopt64(m *Module, fd, option int32, valuePtr int64) int32 {
+	return w.sockGetopt(m, fd, option, uint64(valuePtr))
+}
+
+// sockGetopt is the body of Sock_getopt and Sock_getopt64.
+func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int32 {
+	out := w.memBytes(m, valuePtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -10317,7 +11145,7 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 		}
 		binary.LittleEndian.PutUint32(out, uint32(n))
 		if from != nil {
-			if rc := w.writeSockName(m, from, namePtr); rc != -_wasiENOTSUP {
+			if rc := w.writeSockName(m, from, zext(namePtr)); rc != -_wasiENOTSUP {
 				return rc
 			}
 		}
@@ -10334,7 +11162,7 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 		}
 		binary.LittleEndian.PutUint32(out, uint32(n))
 		if from != nil {
-			return w.writeSockName(m, from, namePtr)
+			return w.writeSockName(m, from, zext(namePtr))
 		}
 		return _wasiESUCCESS
 	}
@@ -10348,7 +11176,7 @@ func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr,
 	}
 	binary.LittleEndian.PutUint32(out, uint32(n))
 	if peer := conn.RemoteAddr(); peer != nil {
-		if rc := w.writeSockName(m, peer, namePtr); rc != -_wasiENOTSUP {
+		if rc := w.writeSockName(m, peer, zext(namePtr)); rc != -_wasiENOTSUP {
 			return rc
 		}
 	}
@@ -10461,8 +11289,8 @@ type wasiSockAddr struct {
 // readSockAddr reads the address record at ptr. It reports an errno:
 // EFAULT, EAFNOSUPPORT for a family the host has no sockets of, EINVAL for
 // a record that is not well formed.
-func (w *WasiStubs) readSockAddr(m *Module, ptr int32) (wasiSockAddr, int32) {
-	rec := w.memSlice(m, ptr, wasiSockAddrSize)
+func (w *WasiStubs) readSockAddr(m *Module, ptr uint64) (wasiSockAddr, int32) {
+	rec := w.memBytes(m, ptr, wasiSockAddrSize)
 	if rec == nil {
 		return wasiSockAddr{}, _wasiEFAULT
 	}
@@ -10534,8 +11362,8 @@ func (a wasiSockAddr) hostPort() string {
 // peer by its IPv4-mapped address, and a socket without an address has the
 // unspecified one of its family. unixName is the name of a Unix-domain
 // address as the guest knows it. Returns 0 or a negative errno.
-func (w *WasiStubs) writeSockAddr(m *Module, ptr int32, family int32, addr net.Addr, unixName string) int32 {
-	rec := w.memSlice(m, ptr, wasiSockAddrSize)
+func (w *WasiStubs) writeSockAddr(m *Module, ptr uint64, family int32, addr net.Addr, unixName string) int32 {
+	rec := w.memBytes(m, ptr, wasiSockAddrSize)
 	if rec == nil {
 		return -_wasiEFAULT
 	}
@@ -10618,6 +11446,16 @@ func writeSockAddrRecord(rec []byte, a wasiSockAddr) {
 // or a negative errno: EAFNOSUPPORT for a record of no family the host has,
 // ERANGE where the room is too small.
 func (w *WasiStubs) Sock_addr_to_host(m *Module, recordPtr, outPtr, outCap, outLenPtr int32) int32 {
+	return w.sockAddrToHost(m, zext(recordPtr), zext(outPtr), outCap, zext(outLenPtr))
+}
+
+// Sock_addr_to_host64 is Sock_addr_to_host for a memory64 guest.
+func (w *WasiStubs) Sock_addr_to_host64(m *Module, recordPtr, outPtr int64, outCap int32, outLenPtr int64) int32 {
+	return w.sockAddrToHost(m, uint64(recordPtr), uint64(outPtr), outCap, uint64(outLenPtr))
+}
+
+// sockAddrToHost is the body of Sock_addr_to_host and Sock_addr_to_host64.
+func (w *WasiStubs) sockAddrToHost(m *Module, recordPtr, outPtr uint64, outCap int32, outLenPtr uint64) int32 {
 	a, errno := w.readSockAddr(m, recordPtr)
 	if errno != _wasiESUCCESS {
 		return -errno
@@ -10629,8 +11467,8 @@ func (w *WasiStubs) Sock_addr_to_host(m *Module, recordPtr, outPtr, outCap, outL
 	if outCap < 0 || len(raw) > int(outCap) {
 		return -_wasiERANGE
 	}
-	out := w.memSlice(m, outPtr, int32(len(raw)))
-	lenOut := w.memSlice(m, outLenPtr, 4)
+	out := w.memBytes(m, outPtr, uint64(len(raw)))
+	lenOut := w.memBytes(m, outLenPtr, 4)
 	if out == nil || lenOut == nil {
 		return -_wasiEFAULT
 	}
@@ -10646,8 +11484,19 @@ func (w *WasiStubs) Sock_addr_to_host(m *Module, recordPtr, outPtr, outCap, outL
 // for a family the records have no form for (the bytes are no address of
 // the guest's then), EINVAL for bytes too few for their family.
 func (w *WasiStubs) Sock_addr_from_host(m *Module, inPtr, inLen, recordPtr int32) int32 {
-	in := w.memSlice(m, inPtr, inLen)
-	rec := w.memSlice(m, recordPtr, wasiSockAddrSize)
+	return w.sockAddrFromHost(m, zext(inPtr), inLen, zext(recordPtr))
+}
+
+// Sock_addr_from_host64 is Sock_addr_from_host for a memory64 guest.
+func (w *WasiStubs) Sock_addr_from_host64(m *Module, inPtr int64, inLen int32, recordPtr int64) int32 {
+	return w.sockAddrFromHost(m, uint64(inPtr), inLen, uint64(recordPtr))
+}
+
+// sockAddrFromHost is the body of Sock_addr_from_host and
+// Sock_addr_from_host64.
+func (w *WasiStubs) sockAddrFromHost(m *Module, inPtr uint64, inLen int32, recordPtr uint64) int32 {
+	in := w.memBytes(m, inPtr, zext(inLen))
+	rec := w.memBytes(m, recordPtr, wasiSockAddrSize)
 	if in == nil || rec == nil || inLen < 0 {
 		return -_wasiEFAULT
 	}
@@ -10799,11 +11648,11 @@ func (o osFS) HostName(path string) (string, bool) {
 
 // readSockPath reads the path that accompanies an address record (see the
 // head of this section); ok is false when it is not readable.
-func (w *WasiStubs) readSockPath(m *Module, ptr, n int32) (path string, ok bool) {
+func (w *WasiStubs) readSockPath(m *Module, ptr uint64, n int32) (path string, ok bool) {
 	if n == 0 {
 		return "", true
 	}
-	b := w.memSlice(m, ptr, n)
+	b := w.memBytes(m, ptr, zext(n))
 	if b == nil {
 		return "", false
 	}
@@ -10841,6 +11690,11 @@ func (w *WasiStubs) Sock_open(m *Module, family, typ int32) int32 {
 		return -_wasiEPROTONOSUPPORT
 	}
 	return w.openSocket(family, typ)
+}
+
+// Sock_open64 is Sock_open for a memory64 guest.
+func (w *WasiStubs) Sock_open64(m *Module, family, typ int32) int32 {
+	return w.Sock_open(m, family, typ)
 }
 
 // listenIP opens the listening socket behind a bound guest socket of an IP
@@ -10949,6 +11803,16 @@ func (w *WasiStubs) bindSocket(op *wasiOpen, a wasiSockAddr, path string) int32 
 // EADDRNOTAVAIL, EACCES, EAFNOSUPPORT for an address of another family than
 // the socket's, EINVAL for a socket that is already bound or connected.
 func (w *WasiStubs) Sock_bind_addr(m *Module, fd, addrPtr, pathPtr, pathLen int32) int32 {
+	return w.sockBindAddr(m, fd, zext(addrPtr), zext(pathPtr), pathLen)
+}
+
+// Sock_bind_addr64 is Sock_bind_addr for a memory64 guest.
+func (w *WasiStubs) Sock_bind_addr64(m *Module, fd int32, addrPtr, pathPtr int64, pathLen int32) int32 {
+	return w.sockBindAddr(m, fd, uint64(addrPtr), uint64(pathPtr), pathLen)
+}
+
+// sockBindAddr is the body of Sock_bind_addr and Sock_bind_addr64.
+func (w *WasiStubs) sockBindAddr(m *Module, fd int32, addrPtr, pathPtr uint64, pathLen int32) int32 {
 	a, errno := w.readSockAddr(m, addrPtr)
 	if errno != _wasiESUCCESS {
 		return -errno
@@ -11209,6 +12073,16 @@ func (w *WasiStubs) connectSocket(op *wasiOpen, a wasiSockAddr, path string) int
 // and connectStream for the policy and for what a blocking and a
 // non-blocking socket do. Returns 0 or a negative errno.
 func (w *WasiStubs) Sock_connect_addr(m *Module, fd, addrPtr, pathPtr, pathLen int32) int32 {
+	return w.sockConnectAddr(m, fd, zext(addrPtr), zext(pathPtr), pathLen)
+}
+
+// Sock_connect_addr64 is Sock_connect_addr for a memory64 guest.
+func (w *WasiStubs) Sock_connect_addr64(m *Module, fd int32, addrPtr, pathPtr int64, pathLen int32) int32 {
+	return w.sockConnectAddr(m, fd, uint64(addrPtr), uint64(pathPtr), pathLen)
+}
+
+// sockConnectAddr is the body of Sock_connect_addr and Sock_connect_addr64.
+func (w *WasiStubs) sockConnectAddr(m *Module, fd int32, addrPtr, pathPtr uint64, pathLen int32) int32 {
 	a, errno := w.readSockAddr(m, addrPtr)
 	if errno != _wasiESUCCESS {
 		return -errno
@@ -11234,6 +12108,16 @@ func (w *WasiStubs) Sock_connect_addr(m *Module, fd, addrPtr, pathPtr, pathLen i
 // its family, or a Unix-domain address without a name. Returns 0, or a
 // negative errno: ENOTCONN for the peer of a socket without a connection.
 func (w *WasiStubs) Sock_name(m *Module, fd, peer, addrPtr int32) int32 {
+	return w.sockName(m, fd, peer, zext(addrPtr))
+}
+
+// Sock_name64 is Sock_name for a memory64 guest.
+func (w *WasiStubs) Sock_name64(m *Module, fd, peer int32, addrPtr int64) int32 {
+	return w.sockName(m, fd, peer, uint64(addrPtr))
+}
+
+// sockName is the body of Sock_name and Sock_name64.
+func (w *WasiStubs) sockName(m *Module, fd, peer int32, addrPtr uint64) int32 {
 	op, errno := w.socketEntry(fd)
 	if errno != _wasiESUCCESS {
 		return -errno
@@ -11293,11 +12177,21 @@ func (w *WasiStubs) Sock_name(m *Module, fd, peer, addrPtr int32) int32 {
 // subject to the dial policy, as connecting to it is. Returns 0 or a
 // negative errno.
 func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, pathPtr, pathLen, sentPtr int32) int32 {
+	return w.sockSendtoAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(pathPtr), pathLen, zext(sentPtr))
+}
+
+// Sock_sendto_addr64 is Sock_sendto_addr for a memory64 guest.
+func (w *WasiStubs) Sock_sendto_addr64(m *Module, fd int32, bufPtr int64, bufLen, flags int32, addrPtr, pathPtr int64, pathLen int32, sentPtr int64) int32 {
+	return w.sockSendtoAddr(m, fd, uint64(bufPtr), bufLen, flags, uint64(addrPtr), uint64(pathPtr), pathLen, uint64(sentPtr))
+}
+
+// sockSendtoAddr is the body of Sock_sendto_addr and Sock_sendto_addr64.
+func (w *WasiStubs) sockSendtoAddr(m *Module, fd int32, bufPtr uint64, bufLen, flags int32, addrPtr, pathPtr uint64, pathLen int32, sentPtr uint64) int32 {
 	if !w.checkNet("send") {
 		return -_wasiEACCES
 	}
-	buf := w.memSlice(m, bufPtr, bufLen)
-	out := w.memSlice(m, sentPtr, 4)
+	buf := w.memBytes(m, bufPtr, zext(bufLen))
+	out := w.memBytes(m, sentPtr, 4)
 	if (buf == nil && bufLen != 0) || out == nil {
 		return -_wasiEFAULT
 	}
@@ -11395,12 +12289,22 @@ func sendDatagram(op *wasiOpen, conn datagramSocket, buf []byte, to net.Addr) (i
 // addrPtr — of family 0 when there is none to give, as for a datagram from
 // a Unix-domain socket that has no name. Returns 0 or a negative errno.
 func (w *WasiStubs) Sock_recvfrom_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, receivedPtr int32) int32 {
+	return w.sockRecvfromAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(receivedPtr))
+}
+
+// Sock_recvfrom_addr64 is Sock_recvfrom_addr for a memory64 guest.
+func (w *WasiStubs) Sock_recvfrom_addr64(m *Module, fd int32, bufPtr int64, bufLen, flags int32, addrPtr, receivedPtr int64) int32 {
+	return w.sockRecvfromAddr(m, fd, uint64(bufPtr), bufLen, flags, uint64(addrPtr), uint64(receivedPtr))
+}
+
+// sockRecvfromAddr is the body of Sock_recvfrom_addr and Sock_recvfrom_addr64.
+func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen, flags int32, addrPtr, receivedPtr uint64) int32 {
 	if !w.checkNet("recv") {
 		return -_wasiEACCES
 	}
-	buf := w.memSlice(m, bufPtr, bufLen)
-	out := w.memSlice(m, receivedPtr, 4)
-	name := w.memSlice(m, addrPtr, wasiSockAddrSize)
+	buf := w.memBytes(m, bufPtr, zext(bufLen))
+	out := w.memBytes(m, receivedPtr, 4)
+	name := w.memBytes(m, addrPtr, wasiSockAddrSize)
 	if (buf == nil && bufLen != 0) || out == nil || name == nil {
 		return -_wasiEFAULT
 	}
@@ -11462,7 +12366,17 @@ func (w *WasiStubs) Sock_recvfrom_addr(m *Module, fd, bufPtr, bufLen, flags, add
 // errno: ENOTSUP (EOPNOTSUPP) for another family, as socketpair(2) has it,
 // and on a host without socket pairs; EPROTONOSUPPORT for another type.
 func (w *WasiStubs) Sock_socketpair(m *Module, family, typ, fdsOutPtr int32) int32 {
-	out := w.memSlice(m, fdsOutPtr, 8)
+	return w.sockSocketpair(m, family, typ, zext(fdsOutPtr))
+}
+
+// Sock_socketpair64 is Sock_socketpair for a memory64 guest.
+func (w *WasiStubs) Sock_socketpair64(m *Module, family, typ int32, fdsOutPtr int64) int32 {
+	return w.sockSocketpair(m, family, typ, uint64(fdsOutPtr))
+}
+
+// sockSocketpair is the body of Sock_socketpair and Sock_socketpair64.
+func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint64) int32 {
+	out := w.memBytes(m, fdsOutPtr, 8)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -11495,8 +12409,18 @@ func (w *WasiStubs) Sock_socketpair(m *Module, family, typ, fdsOutPtr int32) int
 // ENOENT when the name has no address of the family, EACCES when the
 // policy refuses.
 func (w *WasiStubs) Sock_resolve(m *Module, nodePtr, nodeLen, family, outPtr, max, countPtr int32) int32 {
-	node := w.memSlice(m, nodePtr, nodeLen)
-	count := w.memSlice(m, countPtr, 4)
+	return w.sockResolve(m, zext(nodePtr), nodeLen, family, zext(outPtr), max, zext(countPtr))
+}
+
+// Sock_resolve64 is Sock_resolve for a memory64 guest.
+func (w *WasiStubs) Sock_resolve64(m *Module, nodePtr int64, nodeLen, family int32, outPtr int64, max int32, countPtr int64) int32 {
+	return w.sockResolve(m, uint64(nodePtr), nodeLen, family, uint64(outPtr), max, uint64(countPtr))
+}
+
+// sockResolve is the body of Sock_resolve and Sock_resolve64.
+func (w *WasiStubs) sockResolve(m *Module, nodePtr uint64, nodeLen, family int32, outPtr uint64, max int32, countPtr uint64) int32 {
+	node := w.memBytes(m, nodePtr, zext(nodeLen))
+	count := w.memBytes(m, countPtr, 4)
 	if (node == nil && nodeLen != 0) || count == nil || max < 0 {
 		return -_wasiEFAULT
 	}
@@ -11531,7 +12455,7 @@ func (w *WasiStubs) Sock_resolve(m *Module, nodePtr, nodeLen, family, outPtr, ma
 			if (addr.IP.To4() != nil) != (want == wasiSockFamilyIPv4) || n >= max {
 				continue
 			}
-			rc := w.writeSockAddr(m, outPtr+n*wasiSockAddrSize, want, &net.TCPAddr{IP: addr.IP, Zone: addr.Zone}, "")
+			rc := w.writeSockAddr(m, outPtr+uint64(n)*wasiSockAddrSize, want, &net.TCPAddr{IP: addr.IP, Zone: addr.Zone}, "")
 			if rc != _wasiESUCCESS {
 				return rc
 			}
@@ -11556,6 +12480,16 @@ func (w *WasiStubs) Sock_resolve(m *Module, nodePtr, nodeLen, family, outPtr, ma
 // "sock_reverse_addr") backing gethostbyaddr and getnameinfo: Sock_reverse
 // for the IP address in the address record at addrPtr, of either family.
 func (w *WasiStubs) Sock_reverse_addr(m *Module, addrPtr, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.sockReverseAddr(m, zext(addrPtr), zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Sock_reverse_addr64 is Sock_reverse_addr for a memory64 guest.
+func (w *WasiStubs) Sock_reverse_addr64(m *Module, addrPtr, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.sockReverseAddr(m, uint64(addrPtr), uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// sockReverseAddr is the body of Sock_reverse_addr and Sock_reverse_addr64.
+func (w *WasiStubs) sockReverseAddr(m *Module, addrPtr, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	a, errno := w.readSockAddr(m, addrPtr)
 	if errno != _wasiESUCCESS {
 		return -errno
@@ -11620,6 +12554,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"streamWriter":     true,
 			"pollProbe":        true,
 			"WasiStubs":        true,
+			"wasiABI":          true,
 			"dotDirEntry":      true,
 			"FS":               true,
 			"File":             true,
@@ -11653,7 +12588,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"encodeWaitStatus":          true,
 			"encodeHostWaitStatus":      true,
 			"totalBytesPlusNul":         true,
-			"putStrVec64":               true,
+			"zext":                      true,
 			"readVec":                   true,
 			"readVecFailure":            true,
 			"hostDescriptor":            true,
@@ -11855,16 +12790,16 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 	}
 	out := map[string][]byte{}
 	for name, raw := range map[string][]byte{
-		"wasip1_native_posix.go":    wasip1NativePosixRaw,
-		"wasip1_native_linux.go":    wasip1NativeLinuxRaw,
-		"wasip1_native_darwin.go":   wasip1NativeDarwinRaw,
+		"wasip1_native_posix.go":  wasip1NativePosixRaw,
+		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
+		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
 		// the C library's trampolines of the darwin file
 		"wasip1_native_darwin_arm64.s": wasip1NativeDarwinARM64Raw,
 		"wasip1_native_darwin_amd64.s": wasip1NativeDarwinAMD64Raw,
-		"wasip1_native_other.go":    wasip1NativeOtherRaw,
-		"wasip1_native_hostfd.go":   wasip1NativeHostFDRaw,
-		"wasip1_native_hostsock.go": wasip1NativeHostSockRaw,
-		"wasip1_native_terminal.go": wasip1NativeTerminalRaw,
+		"wasip1_native_other.go":       wasip1NativeOtherRaw,
+		"wasip1_native_hostfd.go":      wasip1NativeHostFDRaw,
+		"wasip1_native_hostsock.go":    wasip1NativeHostSockRaw,
+		"wasip1_native_terminal.go":    wasip1NativeTerminalRaw,
 
 		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,
@@ -12030,332 +12965,117 @@ func (t *translator) wasmImportsWasi() bool {
 
 // ----- wasm64-wasip1 (widened ABI) ------------------------------------------
 //
-// A memory64 module's wasi imports arrive with every argument widened
-// to pointer-width i64 (see the wasm2go wasi-libc port's
-// __wasi_abi_t), and pointer-bearing WASI structs (iovecs, sizes)
-// use the LP64 layout. The *64 methods below are the widened
-// bindings; codegen routes a memory64 module's imports here and
-// every wasm32 module keeps the standard methods above.
+// A memory64 module's wasi imports arrive widened (see the wasm2go
+// wasi-libc port's __wasi_abi_t): every argument of a standard import is a
+// pointer-width i64, every pointer of a non-standard one an i64, and the
+// WASI structs that hold pointers or sizes (iovecs, the argv and environ
+// tables, prestat, the sizes a call writes back) use the LP64 layout.
+// Codegen binds such a module's imports to the methods named <Name>64
+// (importMethodName); a wasm32 module binds the ones without the suffix.
+//
+// The two methods of an import are thin wrappers over one body, which
+// takes the guest's addresses as uint64 — a wasm32 guest's zero-extended
+// (zext), a memory64 guest's as they are, never truncated — and, where a
+// record's layout depends on the guest's pointer width, a wasiABI. A *64
+// method therefore does exactly what its wasm32 twin does but for the
+// widths. Most of them sit next to that twin; those of the terminal
+// imports, whose bodies are per platform (wasip1_native_terminal.go,
+// wasip1_native_other.go), follow.
 
-// memSlice64 is memSlice for full-range 64-bit guest pointers.
-func (w *WasiStubs) memSlice64(m *Module, off int64, n int64) []byte {
-	mem := m.memory
-	lo := uint64(off)
-	hi := lo + uint64(n)
-	if n < 0 || hi < lo || hi > uint64(len(mem)) {
-		return nil
-	}
-	return mem[lo:hi]
+// Tty_getattr is a NON-STANDARD host import (name "tty_getattr") backing
+// tcgetattr: the settings of the terminal fd are written at recordPtr, as
+// struct termios of the guest's C library, in the host's numbers. Returns 0
+// or a negative errno: ENOTTY for a descriptor that is no terminal.
+func (w *WasiStubs) Tty_getattr(m *Module, fd, recordPtr int32) int32 {
+	return w.ttyGetattr(m, fd, zext(recordPtr))
 }
 
-func (w *WasiStubs) Clock_time_get64(m *Module, clockID int64, precision int64, timePtr int64) int32 {
-	out := w.memSlice64(m, timePtr, 8)
-	if out == nil {
-		return _wasiEFAULT
-	}
-	nanos, errno := w.clockNanos(int32(clockID))
-	if errno != _wasiESUCCESS {
-		return errno
-	}
-	binary.LittleEndian.PutUint64(out, nanos)
-	return _wasiESUCCESS
+// Tty_getattr64 is Tty_getattr for a memory64 guest.
+func (w *WasiStubs) Tty_getattr64(m *Module, fd int32, recordPtr int64) int32 {
+	return w.ttyGetattr(m, fd, uint64(recordPtr))
 }
 
-func (w *WasiStubs) Fd_close64(m *Module, fd int64) int32 {
-	return w.Fd_close(m, int32(fd))
+// Tty_name is a NON-STANDARD host import (name "tty_name") backing ttyname:
+// the path of the terminal fd is written at bufPtr, which holds bufLen
+// bytes, and its length at lenPtr (u32) — also when it does not fit, which
+// is -ERANGE. Returns 0 or a negative errno: ENOTTY for a descriptor that is
+// no terminal, ENODEV for a terminal the host has no name for.
+func (w *WasiStubs) Tty_name(m *Module, fd, bufPtr, bufLen, lenPtr int32) int32 {
+	return w.ttyName(m, fd, zext(bufPtr), bufLen, zext(lenPtr))
 }
 
-func (w *WasiStubs) Sched_yield64(m *Module) int32 {
-	// No arguments to widen; the LP64 twin exists only because a wasm64
-	// module binds every wasi import through the widened interface.
-	return w.Sched_yield(m)
+// Tty_name64 is Tty_name for a memory64 guest.
+func (w *WasiStubs) Tty_name64(m *Module, fd int32, bufPtr int64, bufLen int32, lenPtr int64) int32 {
+	return w.ttyName(m, fd, uint64(bufPtr), bufLen, uint64(lenPtr))
 }
 
-func (w *WasiStubs) Fd_fdstat_get64(m *Module, fd int64, ptr int64) int32 {
-	// The fdstat struct holds no pointers, so its 24-byte layout is
-	// identical under LP64; only the out-pointer needs the 64-bit
-	// window. Stage through a scratch struct via the 32-bit logic.
-	out := w.memSlice64(m, ptr, 24)
-	if out == nil {
-		return _wasiEFAULT
-	}
-	return w.fdstatFill(int32(fd), out)
+// Tty_setattr is a NON-STANDARD host import (name "tty_setattr") backing
+// tcsetattr: the terminal fd gets the settings at recordPtr, at the time
+// actions says (the host's TCSANOW, TCSADRAIN or TCSAFLUSH). Returns 0 or a
+// negative errno.
+func (w *WasiStubs) Tty_setattr(m *Module, fd, actions, recordPtr int32) int32 {
+	return w.ttySetattr(m, fd, actions, zext(recordPtr))
 }
 
-func (w *WasiStubs) Fd_seek64(m *Module, fd int64, offset int64, whence int64, newOffPtr int64) int32 {
-	out := w.memSlice64(m, newOffPtr, 8)
-	if out == nil {
-		return _wasiEFAULT
-	}
-	n, errno := w.fdSeek(int32(fd), offset, int(whence))
-	if errno != _wasiESUCCESS {
-		return errno
-	}
-	binary.LittleEndian.PutUint64(out, uint64(n))
-	return _wasiESUCCESS
+// Tty_setattr64 is Tty_setattr for a memory64 guest.
+func (w *WasiStubs) Tty_setattr64(m *Module, fd, actions int32, recordPtr int64) int32 {
+	return w.ttySetattr(m, fd, actions, uint64(recordPtr))
 }
 
-// iovecSlices64 is iovecSlices for the LP64 iovec layout: {u64 buf,
-// u64 len}, 16 bytes per entry.
-func (w *WasiStubs) iovecSlices64(m *Module, iovs, iovsLen int64) ([][]byte, bool) {
-	if iovsLen < 0 || iovsLen > 1<<20 {
-		return nil, false
-	}
-	iovecs := w.memSlice64(m, iovs, iovsLen*16)
-	if iovecs == nil {
-		return nil, false
-	}
-	bufs := make([][]byte, 0, iovsLen)
-	for i := int64(0); i < iovsLen; i++ {
-		bufPtr := binary.LittleEndian.Uint64(iovecs[i*16:])
-		bufLen := binary.LittleEndian.Uint64(iovecs[i*16+8:])
-		buf := w.memSlice64(m, int64(bufPtr), int64(bufLen))
-		if buf == nil {
-			return nil, false
-		}
-		bufs = append(bufs, buf)
-	}
-	return bufs, true
+// Tty_speed is a NON-STANDARD host import (name "tty_speed") backing
+// cfgetispeed, cfgetospeed, cfsetispeed and cfsetospeed: where the speed of
+// a terminal is kept in its settings is the host's own. The input speed
+// (output 0) or the output speed of the settings at recordPtr is written at
+// outPtr (u32) as it was; with set non-zero it then becomes speed. Returns
+// 0 or a negative errno: EINVAL for a speed the host has no such number
+// for.
+func (w *WasiStubs) Tty_speed(m *Module, recordPtr, output, set, speed, outPtr int32) int32 {
+	return w.ttySpeed(m, zext(recordPtr), output, set, speed, zext(outPtr))
 }
 
-func (w *WasiStubs) Fd_write64(m *Module, fd int64, iovs int64, iovsLen int64, nwrittenPtr int64) int32 {
-	w.mu.Lock()
-	dst, op := w.fdDstLocked(int32(fd))
-	w.mu.Unlock()
-	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
-	// nwritten is a 64-bit __wasi_size_t.
-	nwrittenSlice := w.memSlice64(m, nwrittenPtr, 8)
-	if !ok || nwrittenSlice == nil {
-		return _wasiEFAULT
-	}
-	if dst == nil {
-		binary.LittleEndian.PutUint64(nwrittenSlice, 0)
-		return _wasiEBADF
-	}
-	n, errno := w.writeFd(op, dst, bufs)
-	binary.LittleEndian.PutUint64(nwrittenSlice, n)
-	return errno
+// Tty_speed64 is Tty_speed for a memory64 guest.
+func (w *WasiStubs) Tty_speed64(m *Module, recordPtr int64, output, set, speed int32, outPtr int64) int32 {
+	return w.ttySpeed(m, uint64(recordPtr), output, set, speed, uint64(outPtr))
 }
 
-func (w *WasiStubs) Proc_exit64(m *Module, code int64) {
-	panic(&WasiExitError{Code: int32(code)})
+// Tty_control64 is Tty_control for a memory64 guest.
+func (w *WasiStubs) Tty_control64(m *Module, fd, what, arg int32) int32 {
+	return w.Tty_control(m, fd, what, arg)
 }
 
-// putStrVec64 packs ss as an LP64 char** table (8-byte guest pointers
-// at vec) plus NUL-terminated bodies (at buf, guest address bufBase).
-// Both slices must already be sized: len(ss)*8 and totalBytesPlusNul.
-func putStrVec64(vec, buf []byte, bufBase uint64, ss []string) int32 {
-	bufOff := uint64(0)
-	for i, s := range ss {
-		binary.LittleEndian.PutUint64(vec[i*8:], bufBase+bufOff)
-		n := copy(buf[bufOff:], s)
-		if n < len(s) {
-			return _wasiEFAULT
-		}
-		bufOff += uint64(n)
-		buf[bufOff] = 0
-		bufOff++
-	}
-	return _wasiESUCCESS
+// Tty_pgrp is a NON-STANDARD host import (name "tty_pgrp") backing
+// tcgetpgrp and tcsetpgrp: the process group in the foreground of the
+// terminal fd is written at outPtr (u32); with set non-zero it then becomes
+// pgrp. Returns 0 or a negative errno. A process forked within the runtime
+// is refused (ENOSYS): the groups of such processes are the runtime's, and
+// a terminal's foreground group is a group of the host.
+func (w *WasiStubs) Tty_pgrp(m *Module, fd, set, pgrp, outPtr int32) int32 {
+	return w.ttyPgrp(m, fd, set, pgrp, zext(outPtr))
 }
 
-func (w *WasiStubs) Args_get64(m *Module, argv, argvBuf int64) int32 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	argvSlice := w.memSlice64(m, argv, int64(len(w.args))*8)
-	if argvSlice == nil {
-		return _wasiEFAULT
-	}
-	total, ok := totalBytesPlusNul(w.args)
-	if !ok {
-		return _wasiEFAULT
-	}
-	argvBufSlice := w.memSlice64(m, argvBuf, int64(total))
-	if argvBufSlice == nil {
-		return _wasiEFAULT
-	}
-	return putStrVec64(argvSlice, argvBufSlice, uint64(argvBuf), w.args)
+// Tty_pgrp64 is Tty_pgrp for a memory64 guest.
+func (w *WasiStubs) Tty_pgrp64(m *Module, fd, set, pgrp int32, outPtr int64) int32 {
+	return w.ttyPgrp(m, fd, set, pgrp, uint64(outPtr))
 }
 
-func (w *WasiStubs) Args_sizes_get64(m *Module, argcPtr, argvBufLenPtr int64) int32 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	argcSlice := w.memSlice64(m, argcPtr, 8)
-	bufLenSlice := w.memSlice64(m, argvBufLenPtr, 8)
-	if argcSlice == nil || bufLenSlice == nil {
-		return _wasiEFAULT
-	}
-	total, ok := totalBytesPlusNul(w.args)
-	if !ok {
-		return _wasiEFAULT
-	}
-	binary.LittleEndian.PutUint64(argcSlice, uint64(len(w.args)))
-	binary.LittleEndian.PutUint64(bufLenSlice, uint64(total))
-	return _wasiESUCCESS
+// Fd_ioctl is a NON-STANDARD host import (name "fd_ioctl") backing ioctl
+// for the requests of a terminal (window size, controlling terminal, modem
+// lines, ...), which the guest's C library does not answer. request is the
+// host's number. The argument is a number (buffer 0: arg is it) or memory
+// the request reads and writes (buffer non-zero: argLen bytes at arg, at
+// least what the request takes); what a request reads and writes there is
+// in the host's layout. What the call returned is written at resultPtr
+// (i32). Returns 0 or a negative errno: EINVAL for a request that is not
+// one of a terminal's, ENOTTY for a descriptor that is not the host's.
+//
+// The memory is the guest's, so a request whose argument holds pointers
+// cannot be passed on; no request of a terminal's does.
+func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, resultPtr int32) int32 {
+	return w.fdIoctl(m, fd, request, buffer, zext(arg), uintptr(int(arg)), argLen, zext(resultPtr))
 }
 
-func (w *WasiStubs) Environ_get64(m *Module, envv, envBuf int64) int32 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	envvSlice := w.memSlice64(m, envv, int64(len(w.env))*8)
-	if envvSlice == nil {
-		return _wasiEFAULT
-	}
-	total, ok := totalBytesPlusNul(w.env)
-	if !ok {
-		return _wasiEFAULT
-	}
-	envBufSlice := w.memSlice64(m, envBuf, int64(total))
-	if envBufSlice == nil {
-		return _wasiEFAULT
-	}
-	return putStrVec64(envvSlice, envBufSlice, uint64(envBuf), w.env)
-}
-
-func (w *WasiStubs) Environ_sizes_get64(m *Module, envcPtr, envBufLenPtr int64) int32 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	envcSlice := w.memSlice64(m, envcPtr, 8)
-	bufLenSlice := w.memSlice64(m, envBufLenPtr, 8)
-	if envcSlice == nil || bufLenSlice == nil {
-		return _wasiEFAULT
-	}
-	total, ok := totalBytesPlusNul(w.env)
-	if !ok {
-		return _wasiEFAULT
-	}
-	binary.LittleEndian.PutUint64(envcSlice, uint64(len(w.env)))
-	binary.LittleEndian.PutUint64(bufLenSlice, uint64(total))
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Fd_fdstat_set_flags64(m *Module, fd, flags int64) int32 {
-	return w.Fd_fdstat_set_flags(m, int32(fd), int32(flags))
-}
-
-func (w *WasiStubs) Fd_prestat_get64(m *Module, fd, ptr int64) int32 {
-	if int32(fd) != 3 {
-		return _wasiEBADF
-	}
-	// LP64 prestat: tag u8 + pad[7] + pr_name_len (__wasi_size_t, u64)
-	// = 16 bytes.
-	out := w.memSlice64(m, ptr, 16)
-	if out == nil {
-		return _wasiEFAULT
-	}
-	out[0] = 0 // preopen tag = directory
-	binary.LittleEndian.PutUint64(out[8:], 1)
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Fd_prestat_dir_name64(m *Module, fd, buf, buflen int64) int32 {
-	if int32(fd) != 3 {
-		return _wasiEBADF
-	}
-	if buflen < 1 {
-		return _wasiESUCCESS
-	}
-	out := w.memSlice64(m, buf, buflen)
-	if out == nil {
-		return _wasiEFAULT
-	}
-	out[0] = '/'
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Fd_read64(m *Module, fd, iovs, iovsLen, nreadPtr int64) int32 {
-	w.mu.Lock()
-	src, op := w.fdSrcLocked(int32(fd))
-	w.mu.Unlock()
-	if src == nil {
-		return _wasiEBADF
-	}
-	bufs, ok := w.iovecSlices64(m, iovs, iovsLen)
-	// nread is a 64-bit __wasi_size_t.
-	nreadSlice := w.memSlice64(m, nreadPtr, 8)
-	if !ok || nreadSlice == nil {
-		return _wasiEFAULT
-	}
-	// Input a readiness probe took out of the stream comes first, as in
-	// Fd_read.
-	n, served := op.takeAhead(bufs)
-	if !served {
-		n = readVec(src, bufs)
-	}
-	binary.LittleEndian.PutUint64(nreadSlice, n)
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Fd_readdir64(m *Module, fd, buf, buflen, cookie, bufusedPtr int64) int32 {
-	// The dirent wire format is pointer-free (u64s and a u32), so only
-	// the buffer window and the 64-bit bufused differ from wasm32.
-	bufSlice := w.memSlice64(m, buf, buflen)
-	bufusedSlice := w.memSlice64(m, bufusedPtr, 8)
-	if bufSlice == nil || bufusedSlice == nil {
-		return _wasiEFAULT
-	}
-	written, errno := w.fdReaddir(int32(fd), bufSlice, cookie)
-	if errno != _wasiESUCCESS {
-		return errno
-	}
-	binary.LittleEndian.PutUint64(bufusedSlice, uint64(written))
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Path_open64(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags, fsRightsBase, fsRightsInherit, fdflags, openedFdPtr int64) int32 {
-	if !rootDirFD(int32(dirFd)) {
-		return _wasiEBADF
-	}
-	pathSlice := w.memSlice64(m, pathPtr, pathLen)
-	// The opened fd is a __wasi_fd_t (u32) under LP64 too.
-	outSlice := w.memSlice64(m, openedFdPtr, 4)
-	if pathSlice == nil || outSlice == nil {
-		return _wasiEFAULT
-	}
-	fd, errno := w.pathOpen(string(pathSlice), int32(dirflags), int32(oflags), fsRightsBase, int32(fdflags))
-	if errno != _wasiESUCCESS {
-		return errno
-	}
-	binary.LittleEndian.PutUint32(outSlice, uint32(fd))
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Path_filestat_get64(m *Module, dirFd, flags, pathPtr, pathLen, outPtr int64) int32 {
-	if !rootDirFD(int32(dirFd)) {
-		return _wasiEBADF
-	}
-	pathSlice := w.memSlice64(m, pathPtr, pathLen)
-	// filestat is all fixed-width u64/u32 fields — 64 bytes under both
-	// ABIs.
-	out := w.memSlice64(m, outPtr, 64)
-	if pathSlice == nil || out == nil {
-		return _wasiEFAULT
-	}
-	w.mu.Lock()
-	fsys := w.fsys
-	w.mu.Unlock()
-	rel := string(pathSlice)
-	var st os.FileInfo
-	var err error
-	if flags&0x1 != 0 {
-		st, err = fsys.Stat(rel)
-	} else {
-		st, err = fsys.Lstat(rel)
-	}
-	if err != nil {
-		return mapOSError(err)
-	}
-	writeFilestat(out, st)
-	return _wasiESUCCESS
-}
-
-func (w *WasiStubs) Random_get64(m *Module, buf, bufLen int64) int32 {
-	slice := w.memSlice64(m, buf, bufLen)
-	if slice == nil {
-		return _wasiEFAULT
-	}
-	if _, err := rand.Read(slice); err != nil {
-		return _wasiEIO
-	}
-	return _wasiESUCCESS
+// Fd_ioctl64 is Fd_ioctl for a memory64 guest, whose argument keeps all
+// of its 64 bits as an address and as a number.
+func (w *WasiStubs) Fd_ioctl64(m *Module, fd, request, buffer int32, arg int64, argLen int32, resultPtr int64) int32 {
+	return w.fdIoctl(m, fd, request, buffer, uint64(arg), uintptr(arg), argLen, uint64(resultPtr))
 }
