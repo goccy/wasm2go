@@ -1,15 +1,13 @@
-;; Regression fixture for the FoldMemAddend pass: memory accesses whose
-;; base is `runtime index + LARGE constant addend`. Without the fold the
-;; addend reaches the emitter inside the base expression, bypasses the
-;; _consts-table guard, and gc's ARM64 backend folds it into a load/store
-;; addressing immediate — which fails to assemble inside very large
-;; functions ("LDPSW 27325896(R2): constant is not in pool"). The fold
-;; moves the addend into the access's static offset, where the guard
-;; routes it through _consts.
+;; Memory accesses whose base is `runtime index + LARGE constant addend`.
+;; gc's ARM64 backend once folded such an addend into a load/store
+;; addressing immediate, which fails to assemble inside very large
+;; functions ("LDPSW 27325896(R2): constant is not in pool"). The emitter
+;; zero-extends the i32 address before it adds the static offset, so the
+;; addend stays in the 32-bit address arithmetic and never reaches an
+;; addressing immediate.
 ;;
-;; read_neg exercises a large-magnitude NEGATIVE addend (sign-extends
-;; into the same out-of-range immediate); its folded offset holds the
-;; uint32 bit pattern and relies on the emitter's mod-2^32 wrap.
+;; read_neg exercises a large-magnitude NEGATIVE addend, whose i32 add
+;; wraps mod 2^32 as wasm's does.
 (module
   (memory (export "memory") 2)
   (func (export "write_far") (param i32 i32)

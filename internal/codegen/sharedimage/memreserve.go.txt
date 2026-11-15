@@ -1,0 +1,21 @@
+package {{.Pkg}}
+
+// The shape of a linear memory's reservation (see memreserve_on.go). A
+// reservation holds a memory of up to its limit and runs memReserveGuard
+// bytes past it: as far as the largest static offset plus access width the
+// generated code leaves unchecked can reach. The generated code reads the
+// limit back as the memory slice's capacity less memReserveGuard, and
+// embeds the same guard.
+const (
+	memReserveGuard = {{.ReserveGuard}}
+	// memReserveMax is the largest limit a reservation may have.
+	memReserveMax = {{.ReserveMax}}
+	// memReserveDefault is the limit of a reservation no ceiling was
+	// asked for (an instance the allocating constructors build).
+	memReserveDefault = {{.ReserveDefault}}
+	// memReserveFixed: every reservation has the limit memReserveMax,
+	// whatever ceiling its memory has (wasm32, whose addresses reach it
+	// whatever the memory's size, and whose accesses need no check
+	// because of it).
+	memReserveFixed = {{.ReserveFixed}}
+)

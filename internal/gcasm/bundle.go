@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/asmgen"
+	"github.com/goccy/wasm2go/internal/codegen/sharedimage"
 	"github.com/goccy/wasm2go/internal/simdfuse"
 	"github.com/goccy/wasm2go/internal/wasm"
 )
@@ -616,14 +617,18 @@ type archSpec struct {
 	dispatchStub func(sym, featSym, portSym, mirrorVar, argBytes string) string
 }
 
+// The bundle's assembly is captured from the pure bodies compiled where
+// linear memory is a reservation (see captureArch): the bounds checks it
+// carries are that form's, so it applies only where memory is one, and
+// the pure bodies run everywhere else (codegen.PureConstraint).
 var archSpecs = []archSpec{
 	// amd64 requires x86-64-v2: the SIMD splices use SSE4.1
 	// (PINSRQ/PEXTRQ/PMOVSX...), same baseline as the helper asm.
 	// GOAMD64=v1 builds compile the pure tree instead.
-	{name: "amd64", buildTag: "amd64 && amd64.v2", transform: Transform, jtMarker: "_jt",
+	{name: "amd64", buildTag: sharedimage.ReservedConstraint + " && amd64 && amd64.v2", transform: Transform, jtMarker: "_jt",
 		gatedMarker: "// avx2 dot", gatedSuffix: "avx2", portableSuffix: "sse",
 		featureVar: "HasAVX2", dispatchStub: x64DispatchStub},
-	{name: "arm64", buildTag: "arm64", transform: TransformARM64, jtMarker: "_jt",
+	{name: "arm64", buildTag: sharedimage.ReservedConstraint + " && arm64", transform: TransformARM64, jtMarker: "_jt",
 		gatedMarker: "// sdot v", gatedSuffix: "dotprod", portableSuffix: "generic",
 		featureVar: "CPUDotProd", dispatchStub: a64DispatchStub},
 }
@@ -732,9 +737,7 @@ func buildPkg(
 	// arch filenames (amd64.s/arm64.s), which — having no prefix
 	// before the arch — get NO implicit GOARCH constraint from the
 	// name (Go 1.4+ only auto-tags files with a non-empty prefix).
-	// This is exactly the header the own-asm backend emitted, and
-	// matches the plain `//go:build <arch>` tag on the decls and
-	// keepalive files below.
+	// The same constraint heads the decls and keepalive files below.
 	asmB.WriteString("//go:build " + arch.buildTag + "\n\n#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
 	var declFns strings.Builder
 	mirrorVars := map[string]bool{} // feature mirrors already declared in this package

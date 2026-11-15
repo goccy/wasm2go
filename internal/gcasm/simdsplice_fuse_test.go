@@ -258,22 +258,22 @@ func fuseScalarChainTree() *simdfuse.Tree {
 		NumScalars: 3, // block base, second base, table base
 		NeedsMem:   true,
 		Nodes: []simdfuse.Node{
-			{Op: "scalar_i32_load16_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgSum, Index: 0, Const: 34}}},
+			{Op: "scalar_i32_load16_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgSum, Index: 0, Const: 34}, {Kind: simdfuse.ArgConst}}},
 			{Op: "scalar_i32_shl", Args: []simdfuse.Arg{
 				{Kind: simdfuse.ArgNode, Index: 0}, {Kind: simdfuse.ArgConst, Const: 2},
 			}},
 			{Op: "scalar_i32_add", Args: []simdfuse.Arg{
 				{Kind: simdfuse.ArgNode, Index: 1}, {Kind: simdfuse.ArgScalar, Index: 2},
 			}},
-			{Op: "scalar_f32_load", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: 2}}},
-			{Op: "scalar_i32_load16_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgScalar, Index: 1}}},
+			{Op: "scalar_f32_load", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: 2}, {Kind: simdfuse.ArgConst}}},
+			{Op: "scalar_i32_load16_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgScalar, Index: 1}, {Kind: simdfuse.ArgConst}}},
 			{Op: "scalar_i32_shl", Args: []simdfuse.Arg{
 				{Kind: simdfuse.ArgNode, Index: 4}, {Kind: simdfuse.ArgConst, Const: 2},
 			}},
 			{Op: "scalar_i32_add", Args: []simdfuse.Arg{
 				{Kind: simdfuse.ArgNode, Index: 5}, {Kind: simdfuse.ArgScalar, Index: 2},
 			}},
-			{Op: "scalar_f32_load", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: 6}}},
+			{Op: "scalar_f32_load", Args: []simdfuse.Arg{{Kind: simdfuse.ArgNode, Index: 6}, {Kind: simdfuse.ArgConst}}},
 			{Op: "scalar_f32_mul", Args: []simdfuse.Arg{
 				{Kind: simdfuse.ArgNode, Index: 3}, {Kind: simdfuse.ArgNode, Index: 7},
 			}},

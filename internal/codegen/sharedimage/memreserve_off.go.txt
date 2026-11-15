@@ -1,0 +1,76 @@
+//go:build !({{.Reserved}})
+
+package {{.Pkg}}
+
+import "fmt"
+
+// Without mmap, on a 32-bit host, or with the wasm2go_boundschecks tag, a
+// linear memory is a Go allocation that grows by reslicing into spare
+// capacity or moving, and the generated code compares every access with
+// memory.size: memReserved is false, which the generated code tests as a
+// constant. See memreserve_on.go for the scheme the other builds use.
+const memReserved = false
+
+// memReservation is the reservation type of memreserve_on.go; no memory
+// of this build is one.
+type memReservation struct{ ceiling uint64 }
+
+func memRegister(mem []byte, ceiling uint64) {}
+
+func memRegistered(mem []byte) (*memReservation, bool) { return nil, false }
+
+func memUnregister(mem []byte) {}
+
+func memProtect(mem []byte, from, to uint64, rw bool) error { return nil }
+
+// memMappingLength reports that a mapping is as long as its ceiling here.
+func memMappingLength(ceiling uint64) (int, bool, error) { return 0, false, nil }
+
+// memAlloc allocates an instance's memory on the Go heap: length bytes,
+// with room to grow to capacity in place. The instance keeps the memory's
+// ceiling; the allocation does not.
+func memAlloc(m *{{.Module}}, length, accessible, capacity, ceiling uint64) []byte {
+	return make([]byte, length, max(length, capacity))
+}
+
+// memOpen has no reservation to map here; memory.grow never asks for one
+// (memReserved is false).
+func memOpen(m *{{.Module}}, accessible, ceiling uint64) ([]byte, error) {
+	return nil, fmt.Errorf("wasm2go: linear memory is no reservation in this build")
+}
+
+// memAdopt takes the memory handed to a constructor as it is: the guest's
+// memory is its first memSize bytes (a shared memory's slice spans all of
+// it), and it may grow to the end of the allocation.
+func memAdopt(m *{{.Module}}, memory []byte, memSize uint64, shared bool) ([]byte, uint64) {
+	if memSize > uint64(len(memory)) {
+		panic(fmt.Sprintf("wasm2go: memory size %d exceeds the memory handed in (%d bytes)", memSize, len(memory)))
+	}
+	if shared {
+		return memory, uint64(len(memory))
+	}
+	return memory[:memSize], uint64(len(memory))
+}
+
+func memEnter() bool { return false }
+
+func memLeave(m *{{.Module}}, prev bool) {}
+
+func memFaultTrap(m *{{.Module}}, r any) any { return r }
+{{if .Exported}}
+const MemReserved = memReserved
+
+func MemEnter() bool { return memEnter() }
+
+func MemLeave(m *{{.Module}}, prev bool) {}
+
+func MemFaultTrap(m *{{.Module}}, r any) any { return r }
+
+func MemAlloc(m *{{.Module}}, length, accessible, capacity, ceiling uint64) []byte {
+	return memAlloc(m, length, accessible, capacity, ceiling)
+}
+
+func MemAdopt(m *{{.Module}}, memory []byte, memSize uint64, shared bool) ([]byte, uint64) {
+	return memAdopt(m, memory, memSize, shared)
+}
+{{end}}

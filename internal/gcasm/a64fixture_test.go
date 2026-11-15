@@ -36,6 +36,9 @@ func a64FixtureGate(t *testing.T, fixture string) {
 	for name, data := range res.Sidecars {
 		pureFiles[name] = data
 	}
+	for name, data := range res.AuxFiles {
+		pureFiles[name] = data
+	}
 	for name, data := range res.Files {
 		pureFiles[name] = data
 	}

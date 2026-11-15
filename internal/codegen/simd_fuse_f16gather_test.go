@@ -80,7 +80,7 @@ func TestArgOffsetByAddPeel(t *testing.T) {
 	// Node 0: an opaque load; node 1: node0 + 4; node 2: node0 + 6.
 	fb := &fusedTreeBuilder{}
 	fb.nodes = []simdfuse.Node{
-		{Op: "scalar_i32_load16_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgScalar, Index: 0}}},
+		{Op: "scalar_i32_load16_u", Args: []simdfuse.Arg{{Kind: simdfuse.ArgScalar, Index: 0}, {Kind: simdfuse.ArgConst}}},
 		{Op: "scalar_i32_add", Args: []simdfuse.Arg{
 			{Kind: simdfuse.ArgNode, Index: 0}, {Kind: simdfuse.ArgConst, Const: 4}}},
 		{Op: "scalar_i32_add", Args: []simdfuse.Arg{

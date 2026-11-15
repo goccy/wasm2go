@@ -20,8 +20,8 @@ func TestM64HelperSmoke(t *testing.T) {
 	m := memTestModule(t, 4096)
 	v := [2]uint64{0x1122334455667788, 0x99aabbccddeeff00}
 	_ = v
-	_ = call(func() any { return anyOf(simd_m64_scalar_i32_load16_u(m, 40)) })
-	_ = call(func() any { return anyOf(simd_m64_scalar_f32_load(m, 40)) })
+	_ = call(func() any { return anyOf(simd_m64_scalar_i32_load16_u(m, 40, 0)) })
+	_ = call(func() any { return anyOf(simd_m64_scalar_f32_load(m, 40, 0)) })
 	_ = call(func() any { return anyOf(simd_m64_scalar_i32_shl(8, 8)) })
 	_ = call(func() any { return anyOf(simd_m64_scalar_i32_add(8, 8)) })
 	_ = call(func() any { return anyOf(simd_m64_v128_load(m, 40, 8)) })

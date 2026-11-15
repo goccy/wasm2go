@@ -2107,6 +2107,11 @@ func (sc *simdScalarizer) fuseSafeIntervener(st ast.Stmt) bool {
 			if id, isConv := x.Fun.(*ast.Ident); isConv && len(x.Args) == 1 && conversionName(id.Name) {
 				return true
 			}
+			if sc.em.memEACalls[x] {
+				// A wasm32 access's effective address (memOffsetExpr):
+				// pure, and trapping like the read it feeds.
+				return true
+			}
 			if paren, isParen := x.Fun.(*ast.ParenExpr); isParen {
 				if _, isStar := paren.X.(*ast.StarExpr); isStar {
 					// A pointer-type conversion `(*T)(...)` — the shape

@@ -1,0 +1,307 @@
+//go:build {{.Reserved}}
+
+package {{.Pkg}}
+
+import (
+	"fmt"
+	"math"
+	"runtime"
+	"runtime/debug"
+	"sync"
+	"syscall"
+	"unsafe"
+)
+
+// Linear memory as a reservation.
+//
+// Every linear memory of the package lives at the head of a reservation of
+// its own: address space mapped at once, of which the first memory.size
+// bytes are readable and writable and every byte after them is inaccessible
+// (PROT_NONE). The reservation holds a memory of up to its limit — the
+// ceiling its memory was given in whole wasm pages, or memReserveDefault —
+// and runs memReserveGuard bytes past it. memory.grow opens the pages it
+// adds; a memory of the instance's own that outgrows the limit moves to a
+// larger reservation (memGrowReserved), and no memory ever shrinks.
+//
+// The generated code relies on that shape instead of comparing every access
+// with memory.size. A memory64 access first tests that its address is below
+// the limit (one comparison with a value the function reads once: the
+// memory slice's capacity less memReserveGuard), and every wasm32 address
+// is below its fixed 4 GiB limit by construction. The address plus the
+// access's static offset and width then lies inside the reservation, whose
+// tail past the limit is as long as the largest offset that test leaves to
+// it. So an access below memory.size reads and writes the memory, and any
+// other one touches an inaccessible page: the fault it takes is turned into
+// the trap ("wasm: memory access out of bounds") by memLeave and
+// memFaultTrap, on the goroutine that runs guest code with panic-on-fault
+// set (memEnter).
+//
+// A build without mmap or for a 32-bit host (386, arm, mips, mipsle: their
+// address space has no room for reservations), or one with the
+// wasm2go_boundschecks tag, compiles memreserve_off.go instead, where
+// memReserved is false and the generated code compares every access with
+// memory.size. The constraints name the 32-bit hosts rather than the
+// 64-bit ones: gcasm's capture keeps a file whose constraint names neither
+// amd64 nor arm64 as it is (see PureFilter).
+const memReserved = true
+
+// memReservation is a reservation wasm2go mapped: one handed out by the
+// shared-image functions, or one a constructor made for an instance it
+// gives memory of its own (the instance then owns it: see memOwn).
+type memReservation struct {
+	mem []byte
+	// ceiling is how far a memory in it may grow: the ceiling it was
+	// asked for (memReserveDefault when none was), at most its limit.
+	ceiling uint64
+}
+
+// memReservations are the reservations mapped and not yet unmapped, by the
+// address of their first byte. A constructor handed a memory consults it:
+// only a reservation may have its pages protected and serve as an
+// instance's memory in place.
+var memReservations sync.Map
+
+// memReservationLength is the length of the reservation for a memory of
+// the given ceiling (memReserveDefault for 0), and the ceiling as the
+// reservation keeps it. A ceiling past memReserveMax is refused, never
+// lowered — except a wasm32 memory's (memReserveFixed), which cannot pass
+// 4 GiB whatever it was given.
+func memReservationLength(ceiling uint64) (int, uint64, error) {
+	if ceiling == 0 {
+		ceiling = memReserveDefault
+	}
+	limit := uint64(memReserveMax)
+	if memReserveFixed {
+		ceiling = min(ceiling, limit)
+	} else {
+		if ceiling > memReserveMax {
+			return 0, 0, fmt.Errorf("wasm2go: a linear memory of up to %d bytes exceeds the %d bytes of address space one may reserve", ceiling, uint64(memReserveMax))
+		}
+		limit = (ceiling + 0xffff) &^ 0xffff // whole wasm pages
+	}
+	length := limit + memReserveGuard
+	if length > math.MaxInt {
+		return 0, 0, fmt.Errorf("wasm2go: a reservation of %d bytes does not fit in this process's address space", length)
+	}
+	return int(length), ceiling, nil
+}
+
+// memReserve maps a reservation for a memory of the given ceiling (see
+// memReservationLength), all of it inaccessible and charged against
+// nothing until pages are opened and written (mapNoReserve), and
+// registers it.
+func memReserve(ceiling uint64) ([]byte, error) {
+	length, ceiling, err := memReservationLength(ceiling)
+	if err != nil {
+		return nil, err
+	}
+	mem, err := syscall.Mmap(-1, 0, length, syscall.PROT_NONE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANON|mapNoReserve)
+	if err != nil {
+		return nil, fmt.Errorf("wasm2go: reserving %d bytes of address space for a linear memory: %w", length, err)
+	}
+	memRegister(mem, ceiling)
+	return mem, nil
+}
+
+// memRegister records mem, a mapping as long as memReservationLength gives
+// for ceiling, as a reservation whose memory may grow to ceiling.
+func memRegister(mem []byte, ceiling uint64) {
+	memReservations.Store(uintptr(unsafe.Pointer(unsafe.SliceData(mem))),
+		&memReservation{mem: mem, ceiling: min(ceiling, uint64(len(mem))-memReserveGuard)})
+}
+
+// memRegistered returns the reservation mem is, if it is one.
+func memRegistered(mem []byte) (*memReservation, bool) {
+	if len(mem) == 0 {
+		return nil, false
+	}
+	r, ok := memReservations.Load(uintptr(unsafe.Pointer(unsafe.SliceData(mem))))
+	if !ok || len(r.(*memReservation).mem) != len(mem) {
+		return nil, false
+	}
+	return r.(*memReservation), true
+}
+
+// memUnregister forgets the reservation that starts where mem does.
+func memUnregister(mem []byte) {
+	if len(mem) == 0 {
+		return
+	}
+	memReservations.Delete(uintptr(unsafe.Pointer(unsafe.SliceData(mem))))
+}
+
+// memMappingLength is the length of every mapping of a linear memory of
+// the given ceiling: its reservation's.
+func memMappingLength(ceiling uint64) (int, bool, error) {
+	length, _, err := memReservationLength(ceiling)
+	return length, true, err
+}
+
+// memProtect makes bytes from..to of the reservation mem accessible (rw)
+// or not. Both ends are multiples of the wasm page, and so of every host
+// page size.
+func memProtect(mem []byte, from, to uint64, rw bool) error {
+	if from >= to {
+		return nil
+	}
+	prot := syscall.PROT_NONE
+	if rw {
+		prot = syscall.PROT_READ | syscall.PROT_WRITE
+	}
+	if err := syscall.Mprotect(mem[from:to:to], prot); err != nil {
+		return fmt.Errorf("wasm2go: protecting linear memory: %w", err)
+	}
+	return nil
+}
+
+// memAlloc gives an instance memory of its own (memOpen), sliced length
+// bytes long: memory.size, or a shared memory's whole ceiling. The
+// reservation holds the memory up to the largest of ceiling (how far it is
+// expected to grow), capacity (the room the caller asked to keep for
+// growth) and memReserveDefault, or memReserveDefault when they ask for
+// more than may be reserved: a memory that is not shared moves to a larger
+// reservation when it outgrows its own (memGrowReserved). A shared memory
+// never moves: its reservation holds length, or the constructor fails.
+func memAlloc(m *{{.Module}}, length, accessible, capacity, ceiling uint64) []byte {
+	ceiling = max(ceiling, capacity, memReserveDefault)
+	if ceiling > memReserveMax {
+		ceiling = memReserveDefault
+	}
+	mem, err := memOpen(m, accessible, max(ceiling, length))
+	if err != nil {
+		panic(err)
+	}
+	return mem[:length:len(mem)]
+}
+
+// memOpen maps a reservation of the instance's own for a memory of the
+// given ceiling, with its first accessible bytes open.
+func memOpen(m *{{.Module}}, accessible, ceiling uint64) ([]byte, error) {
+	mem, err := memReserve(ceiling)
+	if err != nil {
+		return nil, err
+	}
+	if err := memProtect(mem, 0, accessible, true); err != nil {
+		memUnregister(mem)
+		_ = syscall.Munmap(mem)
+		return nil, err
+	}
+	memOwn(m, mem)
+	return mem, nil
+}
+
+// memOwn makes the instance the owner of the reservation mem: it is
+// unmapped once neither the instance nor any copy of it (a wasi-threads
+// agent runs on one) refers to it.
+func memOwn(m *{{.Module}}, mem []byte) {
+	r, _ := memRegistered(mem)
+	m.{{.MemRes}} = r
+	runtime.SetFinalizer(r, func(r *memReservation) {
+		memUnregister(r.mem)
+		_ = syscall.Munmap(r.mem)
+	})
+}
+
+// memAdopt makes memory, handed to a constructor with memSize bytes of the
+// guest's memory in it, the instance's memory, and returns it sliced as the
+// instance sees it (memory.size long, or a shared memory's whole ceiling)
+// together with how far it may grow. A reservation serves in place: its
+// pages past memory.size become inaccessible. Any other memory goes
+// through memAdoptForeign.
+func memAdopt(m *{{.Module}}, memory []byte, memSize uint64, shared bool) ([]byte, uint64) {
+	r, ok := memRegistered(memory)
+	if !ok {
+		memory = memAdoptForeign(m, memory, memSize)
+		r, _ = memRegistered(memory)
+	}
+	if memSize > r.ceiling {
+		panic(fmt.Sprintf("wasm2go: memory size %d exceeds the memory's ceiling (%d bytes)", memSize, r.ceiling))
+	}
+	if err := memProtect(memory, 0, memSize, true); err != nil {
+		panic(err)
+	}
+	if err := memProtect(memory, memSize, uint64(len(memory)), false); err != nil {
+		panic(err)
+	}
+	length := memSize
+	if shared {
+		length = r.ceiling
+	}
+	return memory[:length:len(memory)], r.ceiling
+}
+
+// memAdoptForeign is what becomes of a memory wasm2go did not map (a Go
+// allocation, a mapping of the caller's) handed to a constructor: it cannot
+// be protected, so what it holds (memSize bytes) is copied into a
+// reservation of the instance's own whose ceiling is the memory's length,
+// and the memory handed in is no longer the guest's. It returns the
+// reservation.
+func memAdoptForeign(m *{{.Module}}, memory []byte, memSize uint64) []byte {
+	if memSize > uint64(len(memory)) {
+		panic(fmt.Sprintf("wasm2go: memory size %d exceeds the memory's ceiling (%d bytes)", memSize, len(memory)))
+	}
+	mem, err := memOpen(m, memSize, uint64(len(memory)))
+	if err != nil {
+		panic(err)
+	}
+	copy(mem, memory[:memSize])
+	return mem
+}
+
+// memEnter readies the calling goroutine to run guest code: a fault there
+// panics instead of ending the process. It returns the setting to restore.
+func memEnter() bool { return debug.SetPanicOnFault(true) }
+
+// memLeave is deferred by every entry into guest code that does not
+// recover panics itself: it restores the goroutine's fault setting and
+// passes a panic on — a fault in the instance's reservation as the trap it
+// stands for (memFaultTrap).
+func memLeave(m *{{.Module}}, prev bool) {
+	debug.SetPanicOnFault(prev)
+	if r := recover(); r != nil {
+		panic(memFaultTrap(m, r))
+	}
+}
+
+// memFaultTrap is what a recovered panic stands for: a fault (from
+// panic-on-fault, see memEnter) at an address in the instance's
+// reservation is an access past memory.size, the trap
+// "wasm: memory access out of bounds"; any other panic is itself.
+func memFaultTrap(m *{{.Module}}, r any) any {
+	f, ok := r.(interface{ Addr() uintptr })
+	if !ok {
+		return r
+	}
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(m.{{.Memory}})))
+	if addr := f.Addr(); addr >= base && addr-base < uintptr(cap(m.{{.Memory}})) {
+		return "wasm: memory access out of bounds"
+	}
+	return r
+}
+{{if .Exported}}
+// The same for the packages of the module's functions and entry points.
+// MemLeave repeats memLeave's body: recover works only in the function a
+// defer names.
+
+const MemReserved = memReserved
+
+func MemEnter() bool { return memEnter() }
+
+func MemLeave(m *{{.Module}}, prev bool) {
+	debug.SetPanicOnFault(prev)
+	if r := recover(); r != nil {
+		panic(memFaultTrap(m, r))
+	}
+}
+
+func MemFaultTrap(m *{{.Module}}, r any) any { return memFaultTrap(m, r) }
+
+func MemAlloc(m *{{.Module}}, length, accessible, capacity, ceiling uint64) []byte {
+	return memAlloc(m, length, accessible, capacity, ceiling)
+}
+
+func MemAdopt(m *{{.Module}}, memory []byte, memSize uint64, shared bool) ([]byte, uint64) {
+	return memAdopt(m, memory, memSize, shared)
+}
+{{end}}
