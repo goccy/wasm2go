@@ -584,6 +584,11 @@ func (se *structEmitter) blockValues(blk *ssa.Block) ([]ast.Stmt, error) {
 		} else if len(pre) > 0 {
 			out = append(out, pre...)
 		}
+		if guard, err := se.em.memAccessGuard(v, se.emitExpr); err != nil {
+			return nil, err
+		} else if len(guard) > 0 {
+			out = append(out, guard...)
+		}
 		if se.hoist[v.ID] {
 			rhs, err := se.em.emitOp(v, se.emitExpr)
 			if err != nil {

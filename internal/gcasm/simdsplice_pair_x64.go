@@ -16,14 +16,22 @@ import (
 // x64SimdMemTrapLabel is the per-function out-of-bounds stub label.
 const x64SimdMemTrapLabel = "gcasmsimdoob"
 
+// x64Addr64Guard is the amd64 twin of a64Addr64Guard: it jumps to the
+// trap stub when reg (a memory64 address, offset, or the OR of both)
+// has a bit set at 48 or above, clobbering reg and the flags.
+func x64Addr64Guard(b *strings.Builder, reg string) {
+	fmt.Fprintf(b, "\tSHRQ $48, %s\n", reg)
+	fmt.Fprintf(b, "\tJNE %s\n", x64SimdMemTrapLabel)
+}
+
 // x64MemPreamble emits the effective-address computation and bounds
 // check, leaving the checked HOST address in R11. m/addr/offset arrive
 // in AX/BX/CX (ABIInternal). Clobbers R10–R12 and the flags — all dead
 // at a call site — and preserves DI/SI/R8 (value and lane arguments).
-// The ONLY width difference is the address/offset move: MOVL
-// (zero-extend i32) on wasm32, MOVQ (full i64) on memory64. The
-// arithmetic and bounds check are identical, and neither needs a wrap
-// guard — see a64MemPreambleRegs (the arm64 twin).
+// The address/offset move is MOVL (zero-extend i32) on wasm32 and MOVQ
+// (full i64) on memory64, where an address or offset at or above 2^48
+// traps before the sum (x64Addr64Guard) — see a64MemPreambleRegs (the
+// arm64 twin).
 func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bool) {
 	movAddr := "MOVL"
 	if addr64 {
@@ -31,6 +39,11 @@ func x64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bo
 	}
 	fmt.Fprintf(b, "\t%s BX, R10\n", movAddr)
 	fmt.Fprintf(b, "\t%s CX, R11\n", movAddr)
+	if addr64 {
+		b.WriteString("\tMOVQ R10, R12\n")
+		b.WriteString("\tORQ R11, R12\n")
+		x64Addr64Guard(b, "R12")
+	}
 	b.WriteString("\tADDQ R11, R10\n")
 	// if ea+size > m.memSize.Load() → trap. A plain aligned 64-bit
 	// load is single-copy atomic on amd64; reading a pre-grow value
@@ -63,7 +76,10 @@ func x64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, 
 		// in (AX, BX). rlo is signed; ADDQ's sign flag catches a
 		// negative start (a wrapped group member), matching the helper.
 		if addr64 {
+			// One address for the whole group (see the arm64 twin).
 			b.WriteString("\tMOVQ BX, R10\n")
+			b.WriteString("\tMOVQ BX, R11\n")
+			x64Addr64Guard(b, "R11")
 			b.WriteString("\tMOVQ DI, R11\n")
 			b.WriteString("\tADDQ R10, R11\n")
 			fmt.Fprintf(b, "\tJS %s\n", x64SimdMemTrapLabel)

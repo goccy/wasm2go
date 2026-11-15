@@ -930,9 +930,8 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		case simdfuse.ArgScalar:
 			fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(a))
 		case simdfuse.ArgSum:
-			// base+const at full width: the descriptor constant is a
-			// small reassociated memarg delta added as i64 — no wrap
-			// semantics needed under the 2^48 memory cap.
+			// base+const at full width: an i64 add, wrapping as the
+			// guest's own does; the guard below checks the sum.
 			fmt.Fprintf(b, "\tMOVQ %s, R12\n", scalarReg(a))
 			if a.Const != 0 {
 				fmt.Fprintf(b, "\tADDQ $%d, R12\n", int64(a.Const))
@@ -955,22 +954,20 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 			fmt.Fprintf(b, "\tMOVL %s, R12\n", scalarReg(a))
 		}
 	}
+	// guardAddr traps a memory64 address at or above 2^48 before any
+	// sum (see x64FusedEA64), in the forms that check their bounds; the
+	// unchecked _nc forms load at an address a range check before them
+	// (the group's _rng load, or the loop head's) already guarded.
+	guardAddr := func() {
+		if addr64 {
+			b.WriteString("\tMOVQ R12, AX\n")
+			x64Addr64Guard(b, "AX")
+		}
+	}
 	addOff := func(i int) {
 		if addr64 {
-			// Add the memarg offset (small const, or a scalar) into the
-			// effective address; same arithmetic as wasm32, no wrap
-			// guard (see x64FusedMemCheck).
-			a := n.Args[i]
-			switch a.Kind {
-			case simdfuse.ArgConst:
-				if a.Const != 0 {
-					fmt.Fprintf(b, "\tADDQ $%d, R12\n", int64(a.Const))
-				}
-			case simdfuse.ArgScalar:
-				fmt.Fprintf(b, "\tMOVQ %s, AX\n", scalarReg(a))
-				b.WriteString("\tADDQ AX, R12\n")
-			default:
-				addOffErr = fmt.Errorf("fused addr64 load %s: bad offset form", n.Op)
+			if err := x64Addr64AddOff(b, n.Args[i], scalarReg); err != nil {
+				addOffErr = fmt.Errorf("fused addr64 load %s: %w", n.Op, err)
 			}
 			return
 		}
@@ -991,25 +988,30 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 	}
 	switch n.Op {
 	case "v128_load":
+		guardAddr()
 		addOff(1)
 		checked(16)
 	case "v128_load32_zero":
+		guardAddr()
 		addOff(1)
 		checked(4)
 		fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
 		return addOffErr
 	case "v128_load64_zero":
+		guardAddr()
 		addOff(1)
 		checked(8)
 		fmt.Fprintf(b, "\tVMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
 		return addOffErr
 	case "v128_load32_splat":
+		guardAddr()
 		addOff(1)
 		checked(4)
 		fmt.Fprintf(b, "\tVMOVSS (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
 		fmt.Fprintf(b, "\tVPSHUFD $0x00, X%d, X%d\n", dst, dst)
 		return addOffErr
 	case "v128_load16x4_u":
+		guardAddr()
 		addOff(1)
 		checked(8)
 		fmt.Fprintf(b, "\tVMOVQ (%s)(R12*1), X%d\n", x64MemBase(b, offs), dst)
@@ -1043,6 +1045,7 @@ func x64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		}
 		return addOffErr
 	case "v128_load_rng":
+		guardAddr()
 		// start/end accumulate in R12 and are undone afterwards, so
 		// the address survives without a third register. The window is
 		// constant by the walker's contract (checked before emitting
@@ -1100,10 +1103,11 @@ func x64DeferOff(a simdfuse.Arg) (string, bool) {
 // AX = the memory base, ready for an indexed lane insert.
 // x64FusedEA64 materializes a memory64 member's checked effective
 // address into R12 (base pointer + memarg offset, then the ea+size
-// range check against memSize) and leaves the M base in AX. The
-// arithmetic and range check are identical to the wasm32 fused-store
-// path; the only difference is the full-width base load. No wrap guard
-// is needed — see a64FusedMemCheck's note (the arm64 twin).
+// range check against memSize) and leaves the M base in AX. The range
+// check is the wasm32 fused-store path's; the base loads at full width,
+// and the address and the offset each trap at or above 2^48 first
+// (x64Addr64Guard, x64Addr64AddOff), which keeps the sum from wrapping —
+// see a64FusedMemCheck (the arm64 twin).
 func x64FusedEA64(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, offs *ModuleOffsets, size int, addrReg string) (string, error) {
 	if addrReg != "" {
 		fmt.Fprintf(b, "\tMOVQ %s, R12\n", addrReg)
@@ -1121,21 +1125,41 @@ func x64FusedEA64(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 			return "", fmt.Errorf("fused addr64 %s: folded base form", n.Op)
 		}
 	}
-	switch off := n.Args[1]; off.Kind {
-	case simdfuse.ArgConst:
-		if off.Const != 0 {
-			fmt.Fprintf(b, "\tADDQ $%d, R12\n", int64(off.Const))
-		}
-	case simdfuse.ArgScalar:
-		fmt.Fprintf(b, "\tMOVQ %s, AX\n", scalarReg(off))
-		b.WriteString("\tADDQ AX, R12\n")
-	default:
-		return "", fmt.Errorf("fused addr64 %s: bad offset form", n.Op)
+	b.WriteString("\tMOVQ R12, AX\n")
+	x64Addr64Guard(b, "AX")
+	if err := x64Addr64AddOff(b, n.Args[1], scalarReg); err != nil {
+		return "", fmt.Errorf("fused addr64 %s: %w", n.Op, err)
 	}
 	fmt.Fprintf(b, "\tADDQ $%d, R12\n", size)
 	x64MemSizeCheck(b, offs)
 	fmt.Fprintf(b, "\tSUBQ $%d, R12\n", size)
 	return x64MemBase(b, offs), nil
+}
+
+// x64Addr64AddOff adds a fused memory64 member's memarg offset into R12
+// (which holds the guarded address), guarding it like the address: a
+// scalar offset at or above 2^48 traps, and a negative descriptor
+// constant (a u64 offset at or above 2^63) traps unconditionally — the
+// amd64 twin of a64Addr64AddOff. Scratch: AX.
+func x64Addr64AddOff(b *strings.Builder, off simdfuse.Arg, scalarReg func(simdfuse.Arg) string) error {
+	switch off.Kind {
+	case simdfuse.ArgConst:
+		switch {
+		case off.Const == 0:
+		case off.Const < 0:
+			fmt.Fprintf(b, "\tJMP %s\n", x64SimdMemTrapLabel)
+		default:
+			fmt.Fprintf(b, "\tADDQ $%d, R12\n", int64(off.Const))
+		}
+	case simdfuse.ArgScalar:
+		fmt.Fprintf(b, "\tMOVQ %s, AX\n", scalarReg(off))
+		x64Addr64Guard(b, "AX")
+		fmt.Fprintf(b, "\tMOVQ %s, AX\n", scalarReg(off))
+		b.WriteString("\tADDQ AX, R12\n")
+	default:
+		return fmt.Errorf("bad offset form")
+	}
+	return nil
 }
 
 func x64FusedLaneAddr(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, offs *ModuleOffsets, addr64 bool, addrReg string) (string, error) {
@@ -1324,8 +1348,11 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	//   maxAddress = base + end + (iters-1)*delta
 	// against memSize covers every iteration's accesses and the loads
 	// inside the loop drop to single indexed instructions. Trapping at
-	// the loop head instead of the precise access is the same
-	// relaxation the windowed range check already makes. memory64
+	// the loop head instead of the precise access is exact for a loop
+	// that only loads, as the windowed range check is: an access that
+	// would trap in some iteration traps before anything observable
+	// happened. A loop with a store keeps its per-access checks — the
+	// iterations before the trapping one must still write. memory64
 	// trees only (all address terms add at full width there). Two loop
 	// forms qualify: the pretest power-of-two-step loop (iters =
 	// counter>>log2(Dec)) and the do-while floor loop with a unit step
@@ -1333,10 +1360,22 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 	// once). Addresses may be a scalar argument, a scalar+const sum,
 	// or a scalar-chain ADD tree over those — the interleaved kernels
 	// derive every load address as bumpedBase + columnBase + const.
+	//
+	// The guest's first-iteration address (the terms' wrapping sum) is
+	// guarded below 2^48 and the strided extent (iters-1)*delta must not
+	// overflow; past either, some iteration is out of bounds (memory.size
+	// never exceeds 2^48), and below both the maximum address is the
+	// unwrapped sum the compare sees.
 	hoistedTrap := false
 	hoistForm := 0 // 1 = pretest pow2, 2 = do-while ExitGT unit-step
 	sh := 0
-	if tree.Addr64 && loop.Dec > 0 {
+	storeFree := true
+	for _, n := range tree.Nodes {
+		if simdfuse.IsStore(n.Op) {
+			storeFree = false
+		}
+	}
+	if tree.Addr64 && loop.Dec > 0 && storeFree {
 		switch {
 		case loop.PreTest && loop.Dec&(loop.Dec-1) == 0:
 			hoistForm = 1
@@ -1469,14 +1508,35 @@ func x64SpliceLoop(b *strings.Builder, loop *simdfuse.Loop, pool *ConstPool, off
 			key := fmt.Sprintf("%v/%d/%d", terms, end, d)
 			if !checkedSpans[key] {
 				checkedSpans[key] = true
-				post := emitIters(fmt.Sprintf("gcasmfxh%s_%d", site, i))
-				if d != 0 {
-					fmt.Fprintf(b, "\tIMUL3Q $%d, R12, R12\n", d)
-				}
+				// The first iteration's address: the terms and the
+				// sum's constant, wrapping as the guest's adds do,
+				// guarded below 2^48 (through AX), then kept in AX.
+				// end carries the constant, so take it back out.
+				b.WriteString("\tXORL R12, R12\n")
 				for _, tm := range terms {
 					fmt.Fprintf(b, "\tADDQ %s, R12\n", x64FusedArgRegs[1+tm])
 				}
-				fmt.Fprintf(b, "\tADDQ $%d, R12\n", end)
+				if base != 0 {
+					fmt.Fprintf(b, "\tADDQ $%d, R12\n", base)
+				}
+				b.WriteString("\tMOVQ R12, AX\n")
+				x64Addr64Guard(b, "AX")
+				b.WriteString("\tMOVQ R12, AX\n")
+				post := emitIters(fmt.Sprintf("gcasmfxh%s_%d", site, i))
+				if d != 0 {
+					// (iters-1)*delta: a count at or above 2^63, or
+					// a product that overflows, reaches past 2^48.
+					b.WriteString("\tTESTQ R12, R12\n")
+					fmt.Fprintf(b, "\tJS %s\n", x64SimdMemTrapLabel)
+					fmt.Fprintf(b, "\tIMUL3Q $%d, R12, R12\n", d)
+					fmt.Fprintf(b, "\tJOS %s\n", x64SimdMemTrapLabel)
+				} else {
+					b.WriteString("\tXORL R12, R12\n")
+				}
+				b.WriteString("\tADDQ AX, R12\n")
+				if rest := end - base; rest != 0 {
+					fmt.Fprintf(b, "\tADDQ $%d, R12\n", rest)
+				}
 				x64MemSizeCheck(b, offs)
 				if post != "" {
 					fmt.Fprintf(b, "%s:\n", post)

@@ -47,6 +47,13 @@ type DirectAsmFn struct {
 // emits but fails to link would break the build instead of falling
 // back.
 func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName string, cfg Config, modOffs *ModuleOffsets, pool *ConstPool, importPath, rel string, calleeSig calleeResolver, fnOwner map[string]string, stats *BuildStats) (string, bool) {
+	if mod.Memory64() {
+		// The direct emitters address a memory64 memory without the
+		// bounds check every memory64 access needs (see "Memory64
+		// bounds checks" in codegen); the listing transform keeps it.
+		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: memory64 accesses need bounds checks\n", archName, name)
+		return "", false
+	}
 	if len(mod.Memories) > 0 && (modOffs == nil || modOffs.M != asmgen.ModuleMOffset) {
 		fmt.Fprintf(os.Stderr, "wasm2go: direct-asm (%s): %s falls back: Module layout unverified (probe %v)\n",
 			archName, name, modOffs)

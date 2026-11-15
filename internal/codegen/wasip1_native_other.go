@@ -387,22 +387,22 @@ func commandTerminal(path string, files []any) *syscall.SysProcAttr { return nil
 
 const hostOpenNoTerminal = 0
 
-func (w *WasiStubs) takeOpenedTerminalLocked(op *wasiOpen)            {}
-func (w *WasiStubs) Tty_getattr(m *Module, fd, recordPtr int32) int32 { return -_wasiENOSYS }
-func (w *WasiStubs) Tty_name(m *Module, fd, bufPtr, bufLen, lenPtr int32) int32 {
+func (w *WasiStubs) takeOpenedTerminalLocked(op *wasiOpen)                  {}
+func (w *WasiStubs) ttyGetattr(m *Module, fd int32, recordPtr uint64) int32 { return -_wasiENOSYS }
+func (w *WasiStubs) ttyName(m *Module, fd int32, bufPtr uint64, bufLen int32, lenPtr uint64) int32 {
 	return -_wasiENOSYS
 }
-func (w *WasiStubs) Tty_setattr(m *Module, fd, actions, recordPtr int32) int32 {
+func (w *WasiStubs) ttySetattr(m *Module, fd, actions int32, recordPtr uint64) int32 {
 	return -_wasiENOSYS
 }
-func (w *WasiStubs) Tty_speed(m *Module, recordPtr, output, set, speed, outPtr int32) int32 {
+func (w *WasiStubs) ttySpeed(m *Module, recordPtr uint64, output, set, speed int32, outPtr uint64) int32 {
 	return -_wasiENOSYS
 }
 func (w *WasiStubs) Tty_control(m *Module, fd, what, arg int32) int32 { return -_wasiENOSYS }
-func (w *WasiStubs) Tty_pgrp(m *Module, fd, set, pgrp, outPtr int32) int32 {
+func (w *WasiStubs) ttyPgrp(m *Module, fd, set, pgrp int32, outPtr uint64) int32 {
 	return -_wasiENOSYS
 }
-func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, resultPtr int32) int32 {
+func (w *WasiStubs) fdIoctl(m *Module, fd, request, buffer int32, argAddr uint64, argValue uintptr, argLen int32, resultPtr uint64) int32 {
 	return -_wasiENOSYS
 }
 

@@ -985,18 +985,13 @@ func dst0Src(loc []fusedLoc, n simdfuse.Node) int {
 // a64FusedMemCheck materializes a member's checked effective address
 // into R25: the base plus the memarg offset (a small bounded constant,
 // or rarely a scalar), then the ea+size ≤ memSize range check. The
-// wasm32 and memory64 paths share the SAME arithmetic and bounds
-// check; the ONLY difference is how the base is loaded — a
-// zero-extended i32 (MOVWU, in the caller) versus a full i64 (MOVD).
-//
-// No wrap guard is needed on either width: a memory64's linear memory
-// is capped at 2^48 bytes (mem64HardCap), so every valid address is
-// well below 2^63, the offset/size are small, and the ea+size ≤
-// memSize comparison catches every out-of-range access. The only
-// address that could wrap a u64 is one the guest deliberately computes
-// near 2^64, which real (wasi-sdk-compiled) code never produces and
-// which — even then — resolves within the module's own memory slice,
-// never outside it. This matches wasm2go's existing bounds model.
+// wasm32 and memory64 paths share the bounds check; they differ in how
+// the base is loaded — a zero-extended i32 (MOVWU, in the caller)
+// versus a full i64 (MOVD) — and in the memory64 guards: a memory64
+// address is the guest's own 64-bit value, and one near 2^64 would wrap
+// the sum back into bounds (or below the memory's base), so the address
+// and the offset each trap at or above 2^48 first (a64Addr64Guard,
+// a64Addr64AddOff), which leaves the comparison exact.
 func a64FusedMemCheck(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.Arg) string, span int, addr64 bool, addrReg string) error {
 	if addrReg != "" {
 		// Chain-computed address (see a64FusedLoad).
@@ -1025,25 +1020,28 @@ func a64FusedMemCheck(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfu
 	} else {
 		fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(n.Args[0]))
 	}
-	switch off := n.Args[1]; off.Kind {
-	case simdfuse.ArgConst:
-		if off.Const != 0 {
-			if off.Const > 0 && off.Const < 4096 {
-				fmt.Fprintf(b, "\tADD $%d, R25, R25\n", off.Const)
-			} else {
-				fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(off.Const))
-				b.WriteString("\tADD R26, R25, R25\n")
+	if addr64 {
+		a64Addr64GuardFrom(b, "R25", "R27")
+		if err := a64Addr64AddOff(b, n.Args[1], scalarReg); err != nil {
+			return fmt.Errorf("fused %s: %w", n.Op, err)
+		}
+	} else {
+		switch off := n.Args[1]; off.Kind {
+		case simdfuse.ArgConst:
+			if off.Const != 0 {
+				if off.Const > 0 && off.Const < 4096 {
+					fmt.Fprintf(b, "\tADD $%d, R25, R25\n", off.Const)
+				} else {
+					fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(off.Const))
+					b.WriteString("\tADD R26, R25, R25\n")
+				}
 			}
-		}
-	case simdfuse.ArgScalar:
-		if addr64 {
-			fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(off))
-		} else {
+		case simdfuse.ArgScalar:
 			fmt.Fprintf(b, "\tMOVWU %s, R26\n", scalarReg(off))
+			b.WriteString("\tADD R26, R25, R25\n")
+		default:
+			return fmt.Errorf("fused %s: bad offset form", n.Op)
 		}
-		b.WriteString("\tADD R26, R25, R25\n")
-	default:
-		return fmt.Errorf("fused %s: bad offset form", n.Op)
 	}
 	fmt.Fprintf(b, "\tADD $%d, R25, R27\n", span)
 	b.WriteString("\tCMP R27, R21\n")
@@ -1219,10 +1217,8 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		case simdfuse.ArgScalar:
 			fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(a))
 		case simdfuse.ArgSum:
-			// base+const at full width: the descriptor constant is a
-			// small reassociated memarg delta added as i64 — no wrap
-			// semantics needed, the sum stays far below 2^63 under
-			// the 2^48 memory cap.
+			// base+const at full width: an i64 add, wrapping as the
+			// guest's own does; the guard below checks the sum.
 			if a.Const == 0 {
 				fmt.Fprintf(b, "\tMOVD %s, R25\n", scalarReg(a))
 			} else if a.Const > 0 && a.Const < 4096 {
@@ -1251,32 +1247,22 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 			fmt.Fprintf(b, "\tMOVWU %s, R25\n", scalarReg(a))
 		}
 	}
+	// A memory64 address is the guest's own 64-bit value: trap one at or
+	// above 2^48 before any sum, as a64FusedMemCheck does — except in the
+	// unchecked _nc form, whose address the group's _rng load guarded.
+	if addr64 && n.Op != "v128_load_nc" {
+		a64Addr64GuardFrom(b, "R25", "R27")
+	}
 	// Add the memarg offset into the effective address in R25. Both
 	// widths share this: a small bounded constant is a plain ADD; a
 	// scalar offset is materialized then added. A memory64 base rides
-	// in a full-width register (MOVD, above); the arithmetic is the
-	// same as wasm32's. See a64FusedMemCheck for why no wrap guard is
-	// needed.
+	// in a full-width register (MOVD, above), and its offset is guarded
+	// like the address (a64Addr64AddOff).
 	addOffErr := error(nil)
 	addOff := func(i int) {
 		if addr64 {
-			a := n.Args[i]
-			switch a.Kind {
-			case simdfuse.ArgConst:
-				if a.Const == 0 {
-					return
-				}
-				if a.Const > 0 && a.Const < 4096 {
-					fmt.Fprintf(b, "\tADD $%d, R25, R25\n", a.Const)
-				} else {
-					fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(a.Const))
-					b.WriteString("\tADD R26, R25, R25\n")
-				}
-			case simdfuse.ArgScalar:
-				fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(a))
-				b.WriteString("\tADD R26, R25, R25\n")
-			default:
-				addOffErr = fmt.Errorf("fused addr64 load %s: bad offset form", n.Op)
+			if err := a64Addr64AddOff(b, n.Args[i], scalarReg); err != nil {
+				addOffErr = fmt.Errorf("fused addr64 load %s: %w", n.Op, err)
 			}
 			return
 		}
@@ -1297,8 +1283,7 @@ func a64FusedLoad(b *strings.Builder, n simdfuse.Node, scalarReg func(simdfuse.A
 		b.WriteString("\tADD R26, R25, R25\n")
 	}
 	// The single bounds check, identical for both widths: trap unless
-	// ea+size ≤ memSize. See a64FusedMemCheck's note on why memory64
-	// needs no additional wrap guard here.
+	// ea+size ≤ memSize (exact on memory64 after the guards above).
 	checked := func(size int) {
 		fmt.Fprintf(b, "\tADD $%d, R25, R27\n", size)
 		b.WriteString("\tCMP R27, R21\n")

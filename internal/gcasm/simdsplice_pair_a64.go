@@ -52,7 +52,11 @@ func a64SplicePair(b *strings.Builder, op string, addr64 bool, pool *ConstPool, 
 		// (R0, R1). rlo is signed; a negative start means a group
 		// member wrapped and must trap, matching the helper.
 		if addr64 {
+			// One address for the whole group: see the array-form
+			// twin in a64SpliceSimdMem.
 			b.WriteString("\tMOVD R1, R25\n")
+			b.WriteString("\tMOVD R1, R26\n")
+			a64Addr64Guard(b, "R26")
 			b.WriteString("\tADD R3, R25, R26\n")
 			fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
 			b.WriteString("\tADD R4, R26, R27\n")

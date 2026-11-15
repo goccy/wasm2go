@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/goccy/wasm2go/internal/asmgen"
+	"github.com/goccy/wasm2go/internal/simdfuse"
 )
 
 // Config is the build configuration the splice emitters consult.
@@ -137,6 +138,53 @@ func FindModuleOffsets(fns []*Fn, arch string) *ModuleOffsets {
 // memory splices branch to.
 const a64SimdMemTrapLabel = "gcasmsimdoob"
 
+// a64Addr64Guard branches to the trap stub when reg, a memory64 address
+// or offset (or the OR of both), has a bit set at 48 or above. A
+// memory64's memory.size never exceeds 2^48 (mem64HardCap, enforced by
+// memoryGrow64 and the constructors), so such an access is out of bounds
+// whatever else holds; and once both operands are below 2^48, their sum
+// plus an access width cannot wrap a u64, which is what makes the
+// ea+size ≤ memSize comparison after it exact. reg is clobbered.
+func a64Addr64Guard(b *strings.Builder, reg string) {
+	a64Addr64GuardFrom(b, reg, reg)
+}
+
+// a64Addr64GuardFrom is a64Addr64Guard on src through scratch, leaving
+// src intact.
+func a64Addr64GuardFrom(b *strings.Builder, src, scratch string) {
+	fmt.Fprintf(b, "\tLSR $48, %s, %s\n", src, scratch)
+	fmt.Fprintf(b, "\tCBNZ %s, %s\n", scratch, a64SimdMemTrapLabel)
+}
+
+// a64Addr64AddOff adds a fused memory64 member's memarg offset into R25
+// (which holds the guarded address) after guarding it the same way: a
+// scalar offset at or above 2^48 traps, and a constant one that does
+// not fit below 2^31 — negative as the descriptor's int32, so a u64
+// offset at or above 2^63 — names no byte of any memory, so the access
+// traps unconditionally. Scratch: R26, R27.
+func a64Addr64AddOff(b *strings.Builder, off simdfuse.Arg, scalarReg func(simdfuse.Arg) string) error {
+	switch off.Kind {
+	case simdfuse.ArgConst:
+		switch {
+		case off.Const == 0:
+		case off.Const < 0:
+			fmt.Fprintf(b, "\tJMP %s\n", a64SimdMemTrapLabel)
+		case off.Const < 4096:
+			fmt.Fprintf(b, "\tADD $%d, R25, R25\n", off.Const)
+		default:
+			fmt.Fprintf(b, "\tMOVD $%d, R26\n", int64(off.Const))
+			b.WriteString("\tADD R26, R25, R25\n")
+		}
+	case simdfuse.ArgScalar:
+		fmt.Fprintf(b, "\tMOVD %s, R26\n", scalarReg(off))
+		a64Addr64GuardFrom(b, "R26", "R27")
+		b.WriteString("\tADD R26, R25, R25\n")
+	default:
+		return fmt.Errorf("fused addr64: bad offset form")
+	}
+	return nil
+}
+
 // a64MemPreamble emits the effective-address computation and bounds
 // check, leaving the checked HOST address in R27. m/addr/offset arrive
 // in R0/R1/R2 (ABIInternal; the v128 store/lane params never displace
@@ -151,22 +199,22 @@ func a64MemPreamble(b *strings.Builder, size int, offs *ModuleOffsets, addr64 bo
 // (m, addr, offset) as parameters, for callers whose arguments do not
 // sit at the front of the ABI sequence (fused splices).
 func a64MemPreambleRegs(b *strings.Builder, size int, offs *ModuleOffsets, mReg, addrReg, offReg string, addr64 bool) {
-	// The ONLY width difference: the address/offset operands are
-	// zero-extended from i32 (MOVWU) on wasm32 and full i64 (MOVD) on
-	// memory64. The effective-address arithmetic and the ea+size ≤
-	// memSize bounds check are identical, and neither width needs a
-	// wrap guard — a memory64's memory is capped at 2^48 (mem64HardCap)
-	// so every valid ea is well below 2^63, and the comparison catches
-	// every out-of-range access. (The one address that could wrap a
-	// u64 is one the guest builds near 2^64, which real code never
-	// produces and which resolves within the module's own memory
-	// slice anyway.)
+	// The address/offset operands are zero-extended from i32 (MOVWU)
+	// on wasm32 and full i64 (MOVD) on memory64. A wasm32 sum of two
+	// u32s cannot wrap a u64. A memory64 one can, so the memory64 form
+	// first traps an address or offset at or above 2^48 (see
+	// a64Addr64Guard); the ea+size ≤ memSize check that follows is then
+	// exact on both widths.
 	movAddr := "MOVWU"
 	if addr64 {
 		movAddr = "MOVD"
 	}
 	fmt.Fprintf(b, "\t%s %s, R25\n", movAddr, addrReg)
 	fmt.Fprintf(b, "\t%s %s, R26\n", movAddr, offReg)
+	if addr64 {
+		b.WriteString("\tORR R26, R25, R27\n")
+		a64Addr64Guard(b, "R27")
+	}
 	b.WriteString("\tADD R26, R25, R25\n")
 	// A plain load of the atomic memSize is sound here: aligned 64-bit
 	// loads are single-copy atomic on arm64, and reading a pre-grow
@@ -253,7 +301,12 @@ func a64SpliceSimdMem(b *strings.Builder, op string, addr64 bool, cargs []RegAss
 			return false, false
 		}
 		if addr64 {
+			// The group shares one address (the pass groups memory64
+			// loads by address value only), so an address at or above
+			// 2^48 puts every member out of bounds.
 			b.WriteString("\tMOVD R1, R25\n")
+			b.WriteString("\tMOVD R1, R26\n")
+			a64Addr64Guard(b, "R26")
 			b.WriteString("\tADD R3, R25, R26\n")
 			fmt.Fprintf(b, "\tTBNZ $63, R26, %s\n", a64SimdMemTrapLabel)
 			b.WriteString("\tADD R4, R26, R27\n")

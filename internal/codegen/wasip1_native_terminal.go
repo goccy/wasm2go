@@ -156,12 +156,10 @@ func (w *WasiStubs) heldHostDescriptor(fd int32) (h *hostFile, number int, errno
 	return h, number, _wasiESUCCESS
 }
 
-// Tty_getattr is a NON-STANDARD host import (name "tty_getattr") backing
-// tcgetattr: the settings of the terminal fd are written at recordPtr, as
-// struct termios of the guest's C library, in the host's numbers. Returns 0
-// or a negative errno: ENOTTY for a descriptor that is no terminal.
-func (w *WasiStubs) Tty_getattr(m *Module, fd, recordPtr int32) int32 {
-	record := w.memSlice(m, recordPtr, guestTermiosSize)
+// ttyGetattr is the body of Tty_getattr and Tty_getattr64 on a system with
+// terminals.
+func (w *WasiStubs) ttyGetattr(m *Module, fd int32, recordPtr uint64) int32 {
+	record := w.memBytes(m, recordPtr, guestTermiosSize)
 	if record == nil {
 		return -_wasiEFAULT
 	}
@@ -176,14 +174,11 @@ func (w *WasiStubs) Tty_getattr(m *Module, fd, recordPtr int32) int32 {
 	return _wasiESUCCESS
 }
 
-// Tty_name is a NON-STANDARD host import (name "tty_name") backing ttyname:
-// the path of the terminal fd is written at bufPtr, which holds bufLen
-// bytes, and its length at lenPtr (u32) — also when it does not fit, which
-// is -ERANGE. Returns 0 or a negative errno: ENOTTY for a descriptor that is
-// no terminal, ENODEV for a terminal the host has no name for.
-func (w *WasiStubs) Tty_name(m *Module, fd, bufPtr, bufLen, lenPtr int32) int32 {
-	buf := w.memSlice(m, bufPtr, bufLen)
-	length := w.memSlice(m, lenPtr, 4)
+// ttyName is the body of Tty_name and Tty_name64 on a system with
+// terminals.
+func (w *WasiStubs) ttyName(m *Module, fd int32, bufPtr uint64, bufLen int32, lenPtr uint64) int32 {
+	buf := w.memBytes(m, bufPtr, zext(bufLen))
+	length := w.memBytes(m, lenPtr, 4)
 	if buf == nil || length == nil {
 		return -_wasiEFAULT
 	}
@@ -207,12 +202,10 @@ func (w *WasiStubs) Tty_name(m *Module, fd, bufPtr, bufLen, lenPtr int32) int32 
 	return _wasiESUCCESS
 }
 
-// Tty_setattr is a NON-STANDARD host import (name "tty_setattr") backing
-// tcsetattr: the terminal fd gets the settings at recordPtr, at the time
-// actions says (the host's TCSANOW, TCSADRAIN or TCSAFLUSH). Returns 0 or a
-// negative errno.
-func (w *WasiStubs) Tty_setattr(m *Module, fd, actions, recordPtr int32) int32 {
-	record := w.memSlice(m, recordPtr, guestTermiosSize)
+// ttySetattr is the body of Tty_setattr and Tty_setattr64 on a system with
+// terminals.
+func (w *WasiStubs) ttySetattr(m *Module, fd, actions int32, recordPtr uint64) int32 {
+	record := w.memBytes(m, recordPtr, guestTermiosSize)
 	if record == nil {
 		return -_wasiEFAULT
 	}
@@ -227,16 +220,11 @@ func (w *WasiStubs) Tty_setattr(m *Module, fd, actions, recordPtr int32) int32 {
 	return _wasiESUCCESS
 }
 
-// Tty_speed is a NON-STANDARD host import (name "tty_speed") backing
-// cfgetispeed, cfgetospeed, cfsetispeed and cfsetospeed: where the speed of
-// a terminal is kept in its settings is the host's own. The input speed
-// (output 0) or the output speed of the settings at recordPtr is written at
-// outPtr (u32) as it was; with set non-zero it then becomes speed. Returns
-// 0 or a negative errno: EINVAL for a speed the host has no such number
-// for.
-func (w *WasiStubs) Tty_speed(m *Module, recordPtr, output, set, speed, outPtr int32) int32 {
-	record := w.memSlice(m, recordPtr, guestTermiosSize)
-	out := w.memSlice(m, outPtr, 4)
+// ttySpeed is the body of Tty_speed and Tty_speed64 on a system with
+// terminals.
+func (w *WasiStubs) ttySpeed(m *Module, recordPtr uint64, output, set, speed int32, outPtr uint64) int32 {
+	record := w.memBytes(m, recordPtr, guestTermiosSize)
+	out := w.memBytes(m, outPtr, 4)
 	if record == nil || out == nil {
 		return -_wasiEFAULT
 	}
@@ -265,14 +253,10 @@ func (w *WasiStubs) Tty_control(m *Module, fd, what, arg int32) int32 {
 	return _wasiESUCCESS
 }
 
-// Tty_pgrp is a NON-STANDARD host import (name "tty_pgrp") backing
-// tcgetpgrp and tcsetpgrp: the process group in the foreground of the
-// terminal fd is written at outPtr (u32); with set non-zero it then becomes
-// pgrp. Returns 0 or a negative errno. A process forked within the runtime
-// is refused (ENOSYS): the groups of such processes are the runtime's, and
-// a terminal's foreground group is a group of the host.
-func (w *WasiStubs) Tty_pgrp(m *Module, fd, set, pgrp, outPtr int32) int32 {
-	out := w.memSlice(m, outPtr, 4)
+// ttyPgrp is the body of Tty_pgrp and Tty_pgrp64 on a system with
+// terminals.
+func (w *WasiStubs) ttyPgrp(m *Module, fd, set, pgrp int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -297,20 +281,11 @@ func (w *WasiStubs) Tty_pgrp(m *Module, fd, set, pgrp, outPtr int32) int32 {
 	return _wasiESUCCESS
 }
 
-// Fd_ioctl is a NON-STANDARD host import (name "fd_ioctl") backing ioctl
-// for the requests of a terminal (window size, controlling terminal, modem
-// lines, ...), which the guest's C library does not answer. request is the
-// host's number. The argument is a number (buffer 0: arg is it) or memory
-// the request reads and writes (buffer non-zero: argLen bytes at arg, at
-// least what the request takes); what a request reads and writes there is
-// in the host's layout. What the call returned is written at resultPtr
-// (i32). Returns 0 or a negative errno: EINVAL for a request that is not
-// one of a terminal's, ENOTTY for a descriptor that is not the host's.
-//
-// The memory is the guest's, so a request whose argument holds pointers
-// cannot be passed on; no request of a terminal's does.
-func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, resultPtr int32) int32 {
-	result := w.memSlice(m, resultPtr, 4)
+// fdIoctl is the body of Fd_ioctl and Fd_ioctl64 on a system with
+// terminals. The argument comes both ways: argAddr is it as a guest
+// address, argValue as the number the request takes.
+func (w *WasiStubs) fdIoctl(m *Module, fd, request, buffer int32, argAddr uint64, argValue uintptr, argLen int32, resultPtr uint64) int32 {
+	result := w.memBytes(m, resultPtr, 4)
 	if result == nil {
 		return -_wasiEFAULT
 	}
@@ -333,7 +308,7 @@ func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, result
 	var returned int
 	var err error
 	if buffer != 0 {
-		buf := w.memSlice(m, arg, argLen)
+		buf := w.memBytes(m, argAddr, zext(argLen))
 		if buf == nil {
 			return -_wasiEFAULT
 		}
@@ -342,7 +317,7 @@ func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, buffer, arg, argLen, result
 		}
 		returned, err = hostIoctlBuffer(number, req, buf)
 	} else {
-		returned, err = hostIoctlValue(number, req, uintptr(int(arg)))
+		returned, err = hostIoctlValue(number, req, argValue)
 	}
 	if err != nil {
 		return -mapOSError(err)

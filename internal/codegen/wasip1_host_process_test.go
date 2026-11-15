@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -188,6 +189,91 @@ func TestProcTimes(t *testing.T) {
 	if user == 0 || system == 0 {
 		t.Fatalf("user = %dns, system = %dns: both are spent by now", user, system)
 	}
+}
+
+// A guest that is the host process and has waited for a command it
+// started finds the command off the host's process table, and its CPU
+// time in the times of the children (as times after system shows them):
+// the host adds a child's time to its parent's when it takes the child off
+// the table, and the guest's wait does that before it returns. The
+// command's streams are the host's, so that the runtime learns of its end
+// from the host without waiting for it there and then (Linux).
+func TestProcTimesCountTheChildrenWaitedFor(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	KeepRuntimeDescriptorsHigh()
+	forwardSIGPIPEToIgnore()
+	w.hostProcess = true
+	t.Cleanup(func() { _ = w.CloseAll() })
+	children := func() uint64 {
+		t.Helper()
+		if rc := w.Proc_times(m, 64); rc != _wasiESUCCESS {
+			t.Fatalf("Proc_times rc=%d", rc)
+		}
+		return binary.LittleEndian.Uint64(m.memory[80:]) + binary.LittleEndian.Uint64(m.memory[88:])
+	}
+	before := children()
+	pid := spawnTestProc(t, w, m, "/bin/sh", "-c", "i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done")
+	const statusOff int32 = 5000
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if status := readU32(m.memory, int(statusOff)); status != 0 {
+		t.Fatalf("status = %#x, want a clean exit", status)
+	}
+	if err := syscall.Kill(int(pid), 0); err != syscall.ESRCH {
+		t.Errorf("the command is still on the host's process table after the wait: kill(pid, 0) = %v", err)
+	}
+	if after := children(); after <= before {
+		t.Errorf("the times of the children are %dns after the wait, %dns before it: the command's are not in them", after, before)
+	}
+}
+
+// failingIDs is a HostIDs whose every call fails with err.
+type failingIDs struct{ err error }
+
+func (f failingIDs) Setuid(int) error              { return f.err }
+func (f failingIDs) Seteuid(int) error             { return f.err }
+func (f failingIDs) Setreuid(int, int) error       { return f.err }
+func (f failingIDs) Setresuid(int, int, int) error { return f.err }
+func (f failingIDs) Setgid(int) error              { return f.err }
+func (f failingIDs) Setegid(int) error             { return f.err }
+func (f failingIDs) Setregid(int, int) error       { return f.err }
+func (f failingIDs) Setresgid(int, int, int) error { return f.err }
+func (f failingIDs) Setgroups([]int) error         { return f.err }
+
+// The error of the host's call that changes an id reaches the guest as the
+// wasi errno of the same meaning, from the runtime's own call (EPERM for
+// another user's id, to a user who is not the superuser) and from an
+// embedder's (SetHostIDs).
+func TestProcSetidsReportsTheErrorOfTheHostCall(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	w.SetHostProcess(true)
+	defer w.SetHostProcess(false)
+	if os.Getuid() != 0 {
+		if rc := w.Proc_setids(m, wasiSetUID, int32(os.Getuid()+1), -1, -1); rc != -_wasiEPERM {
+			t.Errorf("setuid to another user rc=%d, want -EPERM", rc)
+		}
+		if rc := w.Proc_setids(m, wasiSetREUID, -1, int32(os.Getuid()+1), -1); rc != -_wasiEPERM {
+			t.Errorf("setreuid to another user rc=%d, want -EPERM", rc)
+		}
+	}
+	for _, c := range []struct {
+		err  error
+		want int32
+	}{
+		{syscall.EPERM, _wasiEPERM},
+		{syscall.EINVAL, _wasiEINVAL},
+		{syscall.EAGAIN, _wasiEAGAIN},
+		{errors.ErrUnsupported, _wasiENOSYS},
+	} {
+		w.SetHostIDs(failingIDs{c.err})
+		for request := wasiSetUID; request <= wasiSetRESGID; request++ {
+			if rc := w.Proc_setids(m, request, 1, 2, 3); rc != -c.want {
+				t.Errorf("request %d failing with %v: rc=%d, want %d", request, c.err, rc, -c.want)
+			}
+		}
+	}
+	w.SetHostIDs(nil)
 }
 
 func TestMkfifoAndOwner(t *testing.T) {

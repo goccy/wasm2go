@@ -90,7 +90,7 @@ func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 		w.hostProcess = true
 		t.Cleanup(func() { _ = w.CloseAll() })
 	}
-	m := &Module{memory: make([]byte, 1<<16)}
+	m := newGuestModule(1 << 16)
 	return w, m
 }
 
@@ -1342,7 +1342,7 @@ func TestWasi_Itoa32(t *testing.T) {
 
 func TestWasi_MemSliceOOB(t *testing.T) {
 	w := &WasiStubs{}
-	m := &Module{memory: make([]byte, 16)}
+	m := newGuestModule(16)
 	if s := w.memSlice(m, 8, 16); s != nil {
 		t.Fatalf("expected nil for OOB, got %v", s)
 	}
@@ -1760,7 +1760,7 @@ func TestWasi_FdReadStdin(t *testing.T) {
 		stdin:     r,
 		monoStart: time.Now(),
 	}
-	m := &Module{memory: make([]byte, 1<<14)}
+	m := newGuestModule(1 << 14)
 	makeIovec(m, 200, 300, 16)
 	if rc := w.Fd_read(m, 0, 200, 1, 400); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_read(stdin) rc=%d", rc)
@@ -1789,7 +1789,7 @@ func TestWasi_FdWriteToStdoutErr(t *testing.T) {
 		stderr:    wp,
 		monoStart: time.Now(),
 	}
-	m := &Module{memory: make([]byte, 1<<14)}
+	m := newGuestModule(1 << 14)
 	copy(m.memory[100:], "stderrmsg")
 	makeIovec(m, 200, 100, 9)
 	if rc := w.Fd_write(m, 2, 200, 1, 400); rc != _wasiESUCCESS {

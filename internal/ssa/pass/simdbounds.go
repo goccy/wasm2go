@@ -173,15 +173,18 @@ func splitSimdAddr(v *ssa.Value) (*ssa.Value, int64, bool) {
 		}
 		return addr, off, true
 	case ssa.OpConst64:
+		// A memory64 group keys on the address value itself; no addend
+		// is peeled. An i64 address is the guest's wrapping sum, and a
+		// member whose base+addend wrapped past 2^64 lands at a small
+		// address while its siblings do not: one window over the base
+		// would then pass a member that must trap, or trap a group whose
+		// members are all in bounds. With one shared address, the
+		// window [addr+lo, addr+lo+span) is exactly the union of the
+		// members' ranges once addr < 2^48 (which the _rng forms check
+		// first; memory.size never exceeds it).
 		off := offV.AuxInt
 		if off < 0 || off >= simdBoundsWindow {
 			return nil, 0, false
-		}
-		if addr.Op == ssa.OpAdd64 && len(addr.Args) == 2 && addr.Args[1].Op == ssa.OpConst64 {
-			c := addr.Args[1].AuxInt
-			if c >= 0 && c < simdBoundsWindow {
-				return addr.Args[0], off + c, true
-			}
 		}
 		return addr, off, true
 	}

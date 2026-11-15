@@ -57,7 +57,7 @@ func TestWasi_HostDescriptor(t *testing.T) {
 	}
 
 	// A connected socket has one; a socket that is only created has none.
-	sock := w.Sock_socket(&Module{memory: make([]byte, 1<<16)}, 2, 1)
+	sock := w.Sock_socket(newGuestModule(1<<16), 2, 1)
 	if sock < 0 {
 		t.Fatalf("socket: %d", sock)
 	}

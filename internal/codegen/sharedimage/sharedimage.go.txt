@@ -41,6 +41,7 @@ package {{.Pkg}}
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sync"
@@ -50,7 +51,7 @@ import (
 type SharedImage struct {
 	f       *os.File // unlinked; holds the image
 	size    uint64   // the guest's memory.size for the image
-	dataEnd uint32   // where the data segments stop and BSS begins
+	dataEnd uint64   // where the data segments stop and BSS begins
 	globals []uint64 // non-nil for a snapshot: the instance's wasm globals
 	err     error    // non-nil if the image could not be built
 	// anonymous marks the stand-in that AnonymousMemory returns for memory
@@ -124,8 +125,9 @@ type InPlaceImageBuilder func(mem []byte) (m *{{.Module}}, err error)
 // touches is written once, straight into the file's page cache — there is no
 // intermediate buffer, no copy, and the dirty footprint of building the image
 // is exactly the pages the build touches. Cached once per process, like
-// NewSharedImage.
-func NewSharedImageInPlace(ceiling int, build InPlaceImageBuilder) *SharedImage {
+// NewSharedImage. ceiling is the length of the mapping the builder runs on,
+// in bytes (see Memory).
+func NewSharedImageInPlace(ceiling uint64, build InPlaceImageBuilder) *SharedImage {
 	sharedInPlaceOnce.Do(func() { sharedInPlaceImg = buildSharedImageInPlace(ceiling, build, false) })
 	return sharedInPlaceImg
 }
@@ -133,23 +135,27 @@ func NewSharedImageInPlace(ceiling int, build InPlaceImageBuilder) *SharedImage 
 // NewSharedSnapshotInPlace is NewSharedSnapshot with the copy elided — see
 // NewSharedImageInPlace for the mechanics and NewSharedSnapshot for the
 // snapshot contract (build it clean and take it at rest; not cached).
-func NewSharedSnapshotInPlace(ceiling int, build InPlaceImageBuilder) *SharedImage {
+func NewSharedSnapshotInPlace(ceiling uint64, build InPlaceImageBuilder) *SharedImage {
 	return buildSharedImageInPlace(ceiling, build, true)
 }
 
-func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bool) *SharedImage {
+func buildSharedImageInPlace(ceiling uint64, build InPlaceImageBuilder, snapshot bool) *SharedImage {
 	if !mmapSupported {
 		return &SharedImage{err: fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")}
+	}
+	length, err := mappingLength(ceiling)
+	if err != nil {
+		return &SharedImage{err: err}
 	}
 	f, err := newTempImageFile()
 	if err != nil {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
-	if err := f.Truncate(int64(ceiling)); err != nil {
+	if err := f.Truncate(int64(length)); err != nil {
 		f.Close()
 		return &SharedImage{err: fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)}
 	}
-	mem, err := mmapShared(f, ceiling)
+	mem, err := mmapShared(f, length)
 	if err != nil {
 		f.Close()
 		return &SharedImage{err: err}
@@ -165,7 +171,7 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 	}
 	size := m.{{.MemSize}}.Load()
 	dataEnd := m.{{.DataEnd}}
-	if dataEnd == 0 || uint64(dataEnd) > size {
+	if dataEnd == 0 || dataEnd > size {
 		return fail(fmt.Errorf(
 			"wasm2go: shared memory image: no data segments were installed (dataEnd=%d, size=%d)",
 			dataEnd, size))
@@ -184,7 +190,7 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 		if err := f.Truncate(int64(dataEnd)); err != nil {
 			return fail(fmt.Errorf("wasm2go: trimming the shared memory image: %w", err))
 		}
-		if err := f.Truncate(int64(ceiling)); err != nil {
+		if err := f.Truncate(int64(length)); err != nil {
 			return fail(fmt.Errorf("wasm2go: re-extending the shared memory image: %w", err))
 		}
 	}
@@ -205,7 +211,7 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	}
 	size := m.{{.MemSize}}.Load()
 	dataEnd := m.{{.DataEnd}}
-	if dataEnd == 0 || uint64(dataEnd) > size {
+	if dataEnd == 0 || dataEnd > size {
 		return &SharedImage{err: fmt.Errorf(
 			"wasm2go: shared memory image: no data segments were installed (dataEnd=%d, size=%d)",
 			dataEnd, size)}
@@ -221,14 +227,14 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	// holds the start section's "already ran" flag and the C++ static state.
 	// Inheriting the flag makes the start section trap on its second run;
 	// inheriting statics that point into a heap this image does not carry
-	// breaks the first thing that follows one of those pointers. A fresh
-	// make() zeroes it for us.
-	keep := uint64(dataEnd)
+	// breaks the first thing that follows one of those pointers. The file
+	// holds what is kept and nothing more: a mapping extends it to its
+	// length (mmapImage), and everything past the end of the file reads as
+	// zeros.
+	keep := dataEnd
 	if snapshot {
 		keep = size
 	}
-	img := make([]byte, size)
-	copy(img, m.{{.Memory}}[:keep])
 
 	var globals []uint64
 	if snapshot {
@@ -243,7 +249,7 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	if err != nil {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
-	if _, err := f.Write(img); err != nil {
+	if _, err := f.Write(m.{{.Memory}}[:keep]); err != nil {
 		f.Close()
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
@@ -271,15 +277,19 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 // instance changes, maps the memory onto that image (Rebased), so that the
 // forks after it copy only what the instance changed. The image maps
 // nothing itself. Pass the memory to UnmapMemory when the instance is done.
-func AnonymousMemory(from *{{.Module}}, ceiling int) (*SharedImage, []byte, error) {
+func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, error) {
 	if !mmapSupported {
 		return nil, nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
 	}
-	dataEnd := int(from.{{.DataEnd}})
-	if dataEnd > len(from.{{.Memory}}) || dataEnd > ceiling {
-		return nil, nil, fmt.Errorf("wasm2go: the data segments (%d bytes) do not fit in a memory of %d bytes", dataEnd, min(len(from.{{.Memory}}), ceiling))
+	dataEnd := from.{{.DataEnd}}
+	if dataEnd > uint64(len(from.{{.Memory}})) || dataEnd > ceiling {
+		return nil, nil, fmt.Errorf("wasm2go: the data segments (%d bytes) do not fit in a memory of %d bytes", dataEnd, min(uint64(len(from.{{.Memory}})), ceiling))
 	}
-	mem, err := mmapAnonymous(ceiling)
+	length, err := mappingLength(ceiling)
+	if err != nil {
+		return nil, nil, err
+	}
+	mem, err := mmapAnonymous(length)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -292,7 +302,7 @@ func AnonymousMemory(from *{{.Module}}, ceiling int) (*SharedImage, []byte, erro
 			copy(mem[at:end], src[at:end])
 		}
 	}
-	img := &SharedImage{dataEnd: uint32(dataEnd), anonymous: true,
+	img := &SharedImage{dataEnd: dataEnd, anonymous: true,
 		err: fmt.Errorf("wasm2go: memory of an instance's own is no image to map")}
 	return img, mem, nil
 }
@@ -308,7 +318,7 @@ func (s *SharedImage) Size() uint64 { return s.size }
 // DataEnd is where the image's data segments stop and its BSS begins. For an
 // image from NewSharedImage that is also where the image stops carrying data;
 // a snapshot carries everything.
-func (s *SharedImage) DataEnd() uint32 { return s.dataEnd }
+func (s *SharedImage) DataEnd() uint64 { return s.dataEnd }
 
 // Globals are the snapshotted instance's wasm globals, to be handed to
 // NewFromSnapshot along with the memory. Nil for a NewSharedImage image, which
@@ -320,16 +330,26 @@ func (s *SharedImage) Globals() []uint64 { return s.globals }
 // module's initializers: memory.init will find the segments already in place
 // and write nothing, while the initializers build this instance's own BSS.
 //
+// The ceiling is what the instance's memory can grow to, and costs address
+// space only: no page of the mapping is charged to the process before it is
+// written (see mapNoReserve). It is a uint64 because a memory64's memory
+// may be longer than 4 GiB; a ceiling the process's address space cannot
+// hold (above math.MaxInt) is refused with an error.
+//
 // The mapping is NOT Go heap — the GC will not reclaim it. Pass it to
 // UnmapMemory when the instance is done.
-func (s *SharedImage) Memory(ceiling int) ([]byte, error) {
+func (s *SharedImage) Memory(ceiling uint64) ([]byte, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	if uint64(ceiling) < s.size {
+	if ceiling < s.size {
 		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the image (%d bytes)", ceiling, s.size)
 	}
-	return mmapImage(s.f, ceiling)
+	length, err := mappingLength(ceiling)
+	if err != nil {
+		return nil, err
+	}
+	return mmapImage(s.f, length)
 }
 
 // Close releases the image itself. Mappings already handed out by Memory stay
@@ -397,7 +417,7 @@ const forkRebaseShare = 8
 //
 // The image is shared by the mappings made of it. Close an image when no
 // instance that may still be forked maps it.
-func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, error) {
+func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork, error) {
 	if !mmapSupported {
 		return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
 	}
@@ -412,13 +432,21 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 	mapped := from != nil && from.f != nil
 	anonymous := from != nil && from.anonymous
 	if mapped || anonymous {
-		// A memory that grew is a shorter slice of its mapping.
+		// The memory is the first memory.size bytes of its mapping (all
+		// of it, for a shared memory); the mapping is its capacity.
 		mem = mem[:cap(mem)]
-		ceiling = len(mem)
+		ceiling = uint64(len(mem))
+	}
+	if ceiling < size {
+		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the instance's memory (%d bytes)", ceiling, size)
+	}
+	length, err := mappingLength(ceiling)
+	if err != nil {
+		return nil, err
 	}
 	if mapped {
 		if runs, changed, ok := privatePages(mem[:size]); ok && changed <= size/forkRebaseShare {
-			child, err := mmapImage(from.f, ceiling)
+			child, err := mmapImage(from.f, length)
 			if err != nil {
 				return nil, err
 			}
@@ -429,9 +457,6 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 			return fork, nil
 		}
 	}
-	if uint64(ceiling) < size {
-		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the instance's memory (%d bytes)", ceiling, size)
-	}
 	f, err := newImageFile()
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: memory image: %w", err)
@@ -440,7 +465,7 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 		f.Close()
 		return nil, fmt.Errorf("wasm2go: memory image: %w", err)
 	}
-	child, err := mmapImage(f, ceiling)
+	child, err := mmapImage(f, length)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -464,6 +489,18 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling int) (*MemoryFork, er
 
 // pageRun is a run of pages, as byte offsets into a mapping.
 type pageRun struct{ from, to uint64 }
+
+// mappingLength is a memory ceiling as the length of a mapping. A ceiling
+// is a uint64, as a memory's size is, so that a memory64's ceiling above 4
+// GiB can be named on any host; a host whose address space cannot hold it
+// (a 32-bit one, for a ceiling above math.MaxInt) refuses it here, and the
+// embedder falls back as it does for any mapping that fails.
+func mappingLength(ceiling uint64) (int, error) {
+	if ceiling > math.MaxInt {
+		return 0, fmt.Errorf("wasm2go: a memory ceiling of %d bytes does not fit in this process's address space", ceiling)
+	}
+	return int(ceiling), nil
+}
 
 // newTempImageFile returns an empty temporary file that has no name any
 // more — the image must never be reachable by name: the pages live as long

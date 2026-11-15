@@ -88,6 +88,9 @@ type simdScalarizer struct {
 	// regions belong to shapes the ForStmt path already owns.
 	stmtDepth int
 	hoistArrs []string // array temps (__saN)
+	// hoistScalars are integer temps (a fused loop's bump fixes),
+	// declared at function top for the same reason as the others.
+	hoistScalars []*ast.ValueSpec
 }
 
 // scalarizeSimd rewrites body in place. Functions with v128 PARAMETERS
@@ -126,6 +129,15 @@ func (em *ssaEmitter) scalarizeSimd(body *ast.BlockStmt, paramsV128 map[string]b
 			Tok:   token.VAR,
 			Specs: []ast.Spec{&ast.ValueSpec{Names: idents, Type: newID("uint64")}},
 		}}, &ast.AssignStmt{Tok: token.ASSIGN, Lhs: blanks, Rhs: refs})
+	}
+	for _, spec := range sc.hoistScalars {
+		var blanks, refs []ast.Expr
+		for _, n := range spec.Names {
+			blanks = append(blanks, newID("_"))
+			refs = append(refs, newID(n.Name))
+		}
+		decls = append(decls, &ast.DeclStmt{Decl: &ast.GenDecl{Tok: token.VAR, Specs: []ast.Spec{spec}}},
+			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: blanks, Rhs: refs})
 	}
 	for _, n := range sc.hoistArrs {
 		decls = append(decls, &ast.DeclStmt{Decl: &ast.GenDecl{

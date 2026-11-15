@@ -364,6 +364,13 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// emitHelpers runs (the pure fallback render), so lazy helperRef
 	// registration is too late — pre-register like the others.
 	t.helpers["wasm_trap_unreachable"] = true
+	// The bounds checks in front of memory64 accesses trap through these
+	// (see memAccessGuard), for the same reason registered up front.
+	if m.Memory64() && len(m.Memories) > 0 {
+		t.helpers["wasm_trap_mem_oob"] = true
+		t.helpers["wasm_trap_atomic_oob"] = true
+		t.helpers["wasm_trap_atomic_unaligned"] = true
+	}
 
 	// accessMemory is the host-facing synchronised window into linear
 	// memory (out-of-band writers like go-python's interrupter use it;
@@ -1823,10 +1830,12 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		// here, at compile time) and memoryInit raises it for the PASSIVE ones,
 		// whose destinations are wasm constants the host cannot see until the
 		// start section runs them. SharedImage is the consumer: it may share
-		// everything below this line and must zero everything above it.
+		// everything below this line and must zero everything above it. A
+		// uint64 on every module, so that a memory64's segments above 4 GiB
+		// are described as they are.
 		fields = append(fields, &ast.Field{
 			Names: []*ast.Ident{newID(t.fieldName("dataEnd"))},
-			Type:  newID("uint32"),
+			Type:  newID("uint64"),
 		})
 		// memShared records whether the memory was declared shared, which
 		// is what makes the reslice-free grow above legal.
@@ -1990,7 +1999,9 @@ func (t *translator) installDataSegmentsFunc(calls []ast.Stmt) ast.Decl {
 
 // memLenExpr is uint64(len(memory)): with a caller-supplied memory the
 // allocation itself is the ceiling, so the wasm's declared maximum does not
-// enter into it.
+// enter into it. It names the constructor's parameter, the whole
+// allocation, not the Module's memory field, which (unless the memory is
+// shared) is only memory.size long.
 func memLenExpr() ast.Expr {
 	return &ast.CallExpr{
 		Fun:  newID("uint64"),
@@ -2188,7 +2199,75 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		}
 		var memRhs ast.Expr
 		if memFromArg {
-			memRhs = newID("memory")
+			// The image the caller handed us is already initialized; its
+			// grown size travels with it. It must respect the same
+			// implementation limit memoryGrow enforces — the coalesced
+			// SIMD bounds check is only exact below it. A memory64 uses
+			// the mem64 hard cap instead. It must lie inside the
+			// allocation: the guest's memory is a part of it. And it
+			// cannot be below the module's declared minimum, which no
+			// memory of the module ever is — the memory64 bounds checks
+			// rely on that (see "Memory64 bounds checks" in
+			// emit_memops.go).
+			capBytes := uint64(wasmMemHardCapBytes)
+			if mem.Is64 {
+				capBytes = 1 << 48 // mem64HardCap
+			}
+			if minBytesU > 0 {
+				body.List = append(body.List, &ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("memSize"),
+						Op: token.LSS,
+						Y:  uintLit(minBytesU),
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{
+						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+							stringLit(fmt.Sprintf("wasm2go: memory size is below the module's minimum (%d bytes)", minBytesU)),
+						}}},
+					}},
+				})
+			}
+			body.List = append(body.List,
+				&ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("memSize"),
+						Op: token.GTR,
+						Y:  uintLit(capBytes),
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{
+						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+							stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
+						}}},
+					}},
+				},
+				&ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("memSize"),
+						Op: token.GTR,
+						Y:  memLenExpr(),
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{
+						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+							stringLit("wasm2go: memory size exceeds the memory handed in"),
+						}}},
+					}},
+				},
+			)
+			if mem.Limits.Shared {
+				// A shared memory's slice spans the whole allocation from
+				// the start, as the allocating constructor's spans its
+				// ceiling: growth only moves memSize, bounded by the
+				// slice's length.
+				memRhs = newID("memory")
+			} else {
+				// The guest's memory is the first memSize bytes of the
+				// allocation; the rest is its capacity. Everything that
+				// bounds an access by the slice's length then refuses
+				// what lies past memory.size, and memory.grow reslices
+				// into the capacity in place — the allocation is the
+				// ceiling (maxMem below), so the memory never moves.
+				memRhs = &ast.SliceExpr{X: newID("memory"), High: newID("memSize")}
+			}
 		} else {
 			memRhs = &ast.CallExpr{
 				Fun: newID("make"),
@@ -2231,28 +2310,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		})
 		sizeArg := ast.Expr(uintLit(minBytesU))
 		if memFromArg {
-			// The image the caller handed us is already initialized; its
-			// grown size travels with it. It must respect the same
-			// implementation limit memoryGrow enforces — the coalesced
-			// SIMD bounds check is only exact below it. A memory64 uses
-			// the mem64 hard cap instead.
-			capBytes := uint64(wasmMemHardCapBytes)
-			if mem.Is64 {
-				capBytes = 1 << 48 // mem64HardCap
-			}
 			sizeArg = newID("memSize")
-			body.List = append(body.List, &ast.IfStmt{
-				Cond: &ast.BinaryExpr{
-					X:  newID("memSize"),
-					Op: token.GTR,
-					Y:  uintLit(capBytes),
-				},
-				Body: &ast.BlockStmt{List: []ast.Stmt{
-					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
-					}}},
-				}},
-			})
 		}
 		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
 			Fun: &ast.SelectorExpr{
@@ -3558,6 +3616,12 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 			}}}
 		}
 		out = append(out, &ast.FuncDecl{
+			Doc: &ast.CommentGroup{List: []*ast.Comment{
+				{Text: "// Memory returns the module's linear memory slice. The guest's memory is"},
+				{Text: "// its first memory.size bytes. For a shared memory the slice spans the"},
+				{Text: "// memory's whole ceiling, since another agent's memory.grow may raise"},
+				{Text: "// memory.size at any moment; for any other memory it is memory.size long."},
+			}},
 			Recv: recv,
 			Name: newID("Memory"),
 			Type: &ast.FuncType{

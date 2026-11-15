@@ -54,8 +54,9 @@ type Module struct {
 	// (see memoryInit) because the offsets are wasm constants the host never
 	// sees otherwise. An embedding that shares an initialized memory image
 	// needs it: the image may carry everything BELOW this line and must carry
-	// zeros above it. Zero until the start section has run.
-	dataEnd uint32
+	// zeros above it. Zero until the start section has run. A uint64: a
+	// memory64's segments may lie anywhere in its 64-bit address space.
+	dataEnd uint64
 	// threadStart runs the guest's wasi_thread_start export. New() assigns it
 	// when the wasm exports one. A field (not an interface assertion on the
 	// Module) because multi-package output emits exports as FREE FUNCTIONS in
@@ -146,6 +147,13 @@ func wasm_trap_memcopy_oob() { panic("wasm: memory.copy out of bounds") }
 
 //go:noinline
 func wasm_trap_meminit_oob() { panic("wasm: memory.init out of bounds") }
+
+// wasm_trap_mem_oob is the trap of a plain load or store whose effective
+// address and size reach past memory.size: the bounds checks in front of
+// memory64 accesses branch to a block that calls it.
+//
+//go:noinline
+func wasm_trap_mem_oob() { panic("wasm: memory access out of bounds") }
 
 // ----- Exception handling (EH proposal / setjmp-longjmp) --------------------
 //
@@ -902,7 +910,17 @@ func memoryGrow(m *Module, n int32) int32 {
 // neither be resliced nor relocated, so f's writes land in the array
 // the guest observes; a grow that raced in just before blocks until f
 // returns and then copies f's writes forward with the rest of the
-// contents. Determinism notes for callers:
+// contents.
+//
+// mem is the memory's whole slice. The guest's memory is its first
+// memory.size bytes (memSize), and an address at or past that is not the
+// guest's. For any memory but a shared one the two are the same length.
+// A shared memory's slice spans its whole ceiling from the start and
+// stays that way, since another agent's memory.grow may raise memSize
+// at any moment outside f; f gets the whole array and bounds what it
+// touches by memSize itself.
+//
+// Determinism notes for callers:
 //
 //   - f MUST NOT call back into the module or into memoryGrow — that
 //     would self-deadlock.
@@ -1161,7 +1179,7 @@ func memoryInit(m *Module, seg int, dst int32, src int32, n int32) {
 	// NOT carry BSS (the start section's "already ran" flag and the C++ static
 	// state — inheriting either is fatal). The offsets are only known here, at
 	// the memory.init that installs them.
-	if end := uint32(dst) + uint32(n); end > m.dataEnd {
+	if end := uint64(uint32(dst)) + uint64(uint32(n)); end > m.dataEnd {
 		m.dataEnd = end
 	}
 	d := m.memory[uint32(dst) : uint32(dst)+uint32(n)]
@@ -3267,17 +3285,11 @@ func memoryInit64(m *Module, seg int, dst int64, src int32, n int32) {
 		dstEnd < uint64(dst) || dstEnd > m.memSize.Load() {
 		wasm_trap_meminit_oob()
 	}
-	if dstEnd > uint64(m.dataEnd) {
-		// Same bookkeeping as the 32-bit memoryInit: the end of the
-		// data-segment region is where BSS begins, and image-sharing
-		// embeddings must know it. dataEnd is a uint32; a segment
-		// landing beyond 4GiB saturates it, which makes the sharing
-		// layer refuse the image instead of truncating the extent.
-		if dstEnd >= uint64(^uint32(0)) {
-			m.dataEnd = ^uint32(0)
-		} else {
-			m.dataEnd = uint32(dstEnd)
-		}
+	// Same bookkeeping as the 32-bit memoryInit: the end of the
+	// data-segment region is where BSS begins, and image-sharing
+	// embeddings must know it, above 4 GiB as below.
+	if dstEnd > m.dataEnd {
+		m.dataEnd = dstEnd
 	}
 	d := m.memory[uint64(dst):dstEnd]
 	s := data[uint32(src) : uint32(src)+uint32(n)]
@@ -3321,11 +3333,13 @@ func simd_m64_v128_load(m *Module, addr int64, offset int64) [2]uint64 {
 //
 //go:noinline
 func simd_m64_v128_load_rng(m *Module, addr int64, offset int64, rlo int64, span int64) [2]uint64 {
-	// addr is a valid guest pointer (< the 2^48 hard cap, so
-	// non-negative as int64); rlo is a small signed window start and
-	// span a small positive length, so the signed sum cannot overflow.
+	// Every member of the group loads at this same address (the pass
+	// groups memory64 loads by address value). At or above the 2^48
+	// hard cap, past any memory.size, every member is out of bounds;
+	// below it, rlo (a small signed window start) and span (a small
+	// positive length) cannot make the sums wrap.
 	start := addr + rlo
-	if start < 0 || uint64(start)+uint64(span) > m.memSize.Load() {
+	if uint64(addr) >= mem64HardCap() || start < 0 || uint64(start)+uint64(span) > m.memSize.Load() {
 		wasm_trap_simd_oob()
 	}
 	ea := uint64(addr) + uint64(offset)

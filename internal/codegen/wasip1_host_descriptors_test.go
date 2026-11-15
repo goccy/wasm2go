@@ -257,7 +257,7 @@ func TestHostDescriptors_BlockingReadWaitsAndASignalEndsIt(t *testing.T) {
 
 func TestHostDescriptors_BlockingWriteOfMoreThanThePipeHolds(t *testing.T) {
 	w, m := newHostGuest(t, t.TempDir())
-	big := &Module{memory: make([]byte, 1<<21)}
+	big := newGuestModule(1 << 21)
 	readFd, writeFd := newTestPipe(t, w, m)
 	const size = 1 << 20
 	for i := 0; i < size; i++ {
