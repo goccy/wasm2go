@@ -1497,15 +1497,20 @@ type wasiProc struct {
 }
 
 // release lets the host forget a host process that has ended: see
-// wasiProc.reap. The wait returns at once when the process has ended, and
-// when it ends otherwise.
+// wasiProc.reap. Every caller has seen the process end (done is closed),
+// so the wait returns at once — a command whose streams the runtime copies
+// was waited for when it ended, and one whose streams are the host's has
+// nothing more to wait for — and it is made before release returns. A
+// guest's wait for a child thus returns with the child off the host's
+// process table, as the host's own wait does; that is also when the host
+// adds the child's CPU time to the times of the children of the process
+// (getrusage RUSAGE_CHILDREN), which a guest reads next (times, after
+// system).
 func (proc *wasiProc) release() {
 	if proc.cmd == nil {
 		return
 	}
-	proc.reap.Do(func() {
-		go func() { _ = proc.cmd.Wait() }()
-	})
+	proc.reap.Do(func() { _ = proc.cmd.Wait() })
 }
 
 // wasiPIDs hands out pid tokens and knows the processes of a fork family by
@@ -7586,6 +7591,13 @@ const (
 // other means than the Go runtime's — a process linked with a C library
 // has to go through that library, which keeps the threads of the process
 // in step.
+//
+// The error of a call that failed is the error number it failed with
+// (the C library's errno, read on the thread that made the call), which
+// the guest is given as the wasi errno of the same meaning. An error that
+// carries no number — a syscall.Errno of 0, as a foreign-function call
+// that does not collect errno reports — tells the guest nothing but that
+// the call failed: it gets EIO.
 type HostIDs interface {
 	Setuid(uid int) error
 	Seteuid(euid int) error
