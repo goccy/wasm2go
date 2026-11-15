@@ -17,13 +17,21 @@ import (
 // module around the given main body.
 func buildMem64(t *testing.T, fixture, mainBody string) string {
 	t.Helper()
+	return buildMem64With(t, fixture, mainBody, transpile.Options{})
+}
+
+// buildMem64With is buildMem64 with transpile options (Package and
+// OutputImportPath are set here).
+func buildMem64With(t *testing.T, fixture, mainBody string, opts transpile.Options) string {
+	t.Helper()
 	bin := testfixture.Wasm(t, fixture)
 	m, err := transpile.Parse(bytes.NewReader(bin))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "m64test/pkg"})
+	opts.Package, opts.OutputImportPath = "pkg", "m64test/pkg"
+	res, err := transpile.Translate(&buf, m, opts)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}

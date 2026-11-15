@@ -148,6 +148,13 @@ func wasm_trap_memcopy_oob() { panic("wasm: memory.copy out of bounds") }
 //go:noinline
 func wasm_trap_meminit_oob() { panic("wasm: memory.init out of bounds") }
 
+// wasm_trap_mem_oob is the trap of a plain load or store whose effective
+// address and size reach past memory.size: the bounds checks in front of
+// memory64 accesses branch to a block that calls it.
+//
+//go:noinline
+func wasm_trap_mem_oob() { panic("wasm: memory access out of bounds") }
+
 // ----- Exception handling (EH proposal / setjmp-longjmp) --------------------
 //
 // A wasm `throw` becomes a Go panic carrying a wasmExc; a try/catch landing pad

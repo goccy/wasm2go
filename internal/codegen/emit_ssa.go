@@ -31,6 +31,19 @@ type ssaEmitter struct {
 	// emitters insert `mBase = m.M` refreshes after every value whose
 	// evaluation could run memory.grow. See emitFuncBody.
 	memBaseHoisted bool
+	// memGuardPlan (per function) is memGuardCoverage's plan of the
+	// memory64 bounds checks: the accesses whose check an earlier one
+	// implies, and the checks widened over the accesses after them. It
+	// is computed once over the function's dominator tree because the
+	// emitters visit blocks in their own order (and duplicate some), so
+	// "did a covering check run on every path here" cannot be answered
+	// at the emission point.
+	memGuardPlan map[ssa.ValueID]uint64
+	// memTrapsUsed (per function) records the trap helpers the
+	// function's bounds checks branch to, so that memTrapTail emits the
+	// blocks that are jumped to and no other (an unused label does not
+	// compile).
+	memTrapsUsed map[string]bool
 
 	// spinHeaders maps the loop headers (per function) that need a
 	// spinRelax preemption guard to their guard mask (interval-1, see
@@ -135,6 +148,8 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// (no raw base pointer at the access site), so hoisting mBase would
 	// only leave an unused local behind.
 	em.memBaseHoisted = funcTouchesMemory(f)
+	em.memGuardPlan = em.memGuardCoverage(f)
+	em.memTrapsUsed = nil
 
 	// EH in multi-package output: the wasmExc type + wasm_catch helper live in
 	// the base package (exported as WasmExc / Wasm_catch); the generated body
@@ -156,6 +171,10 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 		if em.t != nil && em.t.memMetrics != nil {
 			em.t.memMetrics.GotoFuncs++
 		}
+		// The abandoned structured attempt's bounds checks are gone
+		// with it; the trap blocks follow the checks this emission
+		// makes.
+		em.memTrapsUsed = nil
 		return em.emitMultiBlock(f)
 	}()
 	if err != nil {
@@ -175,7 +194,23 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 			Lhs: []ast.Expr{newID("_")},
 			Rhs: []ast.Expr{newID(memBaseLocal)},
 		}
-		body.List = append([]ast.Stmt{decl, keep}, body.List...)
+		prologue := []ast.Stmt{decl, keep}
+		if em.memLimHoisted() {
+			// The bounds checks' copy of memory.size, read where mBase
+			// is (see "Memory64 bounds checks" in emit_memops.go).
+			prologue = append(prologue,
+				&ast.AssignStmt{
+					Tok: token.DEFINE,
+					Lhs: []ast.Expr{newID(memLimLocal)},
+					Rhs: []ast.Expr{em.memSizeRead()},
+				},
+				&ast.AssignStmt{
+					Tok: token.ASSIGN,
+					Lhs: []ast.Expr{newID("_")},
+					Rhs: []ast.Expr{newID(memLimLocal)},
+				})
+		}
+		body.List = append(prologue, body.List...)
 	}
 	if em.spinGuardEmitted {
 		// The guard statements always increment the counter, so no
@@ -228,6 +263,8 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 		em.packedPrologue = nil
 	}
 	em.scalarizeSimd(body, paramsV128)
+	// The bounds checks' trap blocks close the body (see memTrapTail).
+	body.List = append(body.List, em.memTrapTail()...)
 	return body, nil
 }
 
@@ -318,16 +355,26 @@ func opCanGrowMemory(op ssa.Op) bool {
 
 // maybeMemBaseRefresh appends `mBase = m.M` to stmts when the just-
 // emitted value can have grown (and therefore relocated) the linear
-// memory. No-op when the function has no hoisted base.
+// memory. No-op when the function has no hoisted base. The bounds
+// checks' mLim, where the function keeps one, is refreshed with it:
+// memory.grow moves memory.size too.
 func (em *ssaEmitter) maybeMemBaseRefresh(stmts []ast.Stmt, v *ssa.Value) []ast.Stmt {
 	if !em.memBaseHoisted || !opCanGrowMemory(v.Op) {
 		return stmts
 	}
-	return append(stmts, &ast.AssignStmt{
+	stmts = append(stmts, &ast.AssignStmt{
 		Tok: token.ASSIGN,
 		Lhs: []ast.Expr{newID(memBaseLocal)},
 		Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID("M")}},
 	})
+	if em.memLimHoisted() {
+		stmts = append(stmts, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID(memLimLocal)},
+			Rhs: []ast.Expr{em.memSizeRead()},
+		})
+	}
+	return stmts
 }
 
 // emitMultiBlock handles multi-block CFGs using a goto/label form.
@@ -574,6 +621,11 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 			return err
 		} else if len(pre) > 0 {
 			*out = append(*out, pre...)
+		}
+		if guard, err := em.memAccessGuard(v, ec.emitExpr); err != nil {
+			return err
+		} else if len(guard) > 0 {
+			*out = append(*out, guard...)
 		}
 		if ec.hoist[v.ID] {
 			rhs, err := em.emitOp(v, ec.emitExpr)

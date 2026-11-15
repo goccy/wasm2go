@@ -8,8 +8,15 @@ import "github.com/goccy/wasm2go/internal/ssa"
 // Liveness is computed by marking from the roots and following Args:
 //
 //   - roots: side-effecting values (stores, calls, global.set, traps),
-//     each block's Control value, and the Ret-tail return markers.
+//     linear-memory loads, each block's Control value, and the Ret-tail
+//     return markers.
 //   - a value is live iff it is a root or an argument of a live value.
+//
+// A load is a root although it writes nothing: wasm traps a load whose
+// bytes lie past memory.size, whether or not its value is used, and the
+// emitter checks the bounds of a memory64 access in front of it. The
+// passes that make a load redundant by proving it reads what another
+// access did (MemOpt) remove it themselves.
 //
 // Returns true if anything was newly marked dead.
 func DCE(f *ssa.Func) bool {
@@ -37,7 +44,7 @@ func DCE(f *ssa.Func) bool {
 			if v.Op == ssa.OpInvalid {
 				continue
 			}
-			if v.HasSideEffect() {
+			if v.HasSideEffect() || isLinearLoad(v.Op) {
 				mark(v)
 			}
 			if i >= retStart { // Ret-tail return marker

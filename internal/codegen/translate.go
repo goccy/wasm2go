@@ -364,6 +364,13 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// emitHelpers runs (the pure fallback render), so lazy helperRef
 	// registration is too late — pre-register like the others.
 	t.helpers["wasm_trap_unreachable"] = true
+	// The bounds checks in front of memory64 accesses trap through these
+	// (see memAccessGuard), for the same reason registered up front.
+	if m.Memory64() && len(m.Memories) > 0 {
+		t.helpers["wasm_trap_mem_oob"] = true
+		t.helpers["wasm_trap_atomic_oob"] = true
+		t.helpers["wasm_trap_atomic_unaligned"] = true
+	}
 
 	// accessMemory is the host-facing synchronised window into linear
 	// memory (out-of-band writers like go-python's interrupter use it;
@@ -2196,11 +2203,29 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			// grown size travels with it. It must respect the same
 			// implementation limit memoryGrow enforces — the coalesced
 			// SIMD bounds check is only exact below it. A memory64 uses
-			// the mem64 hard cap instead. And it must lie inside the
-			// allocation: the guest's memory is a part of it.
+			// the mem64 hard cap instead. It must lie inside the
+			// allocation: the guest's memory is a part of it. And it
+			// cannot be below the module's declared minimum, which no
+			// memory of the module ever is — the memory64 bounds checks
+			// rely on that (see "Memory64 bounds checks" in
+			// emit_memops.go).
 			capBytes := uint64(wasmMemHardCapBytes)
 			if mem.Is64 {
 				capBytes = 1 << 48 // mem64HardCap
+			}
+			if minBytesU > 0 {
+				body.List = append(body.List, &ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("memSize"),
+						Op: token.LSS,
+						Y:  uintLit(minBytesU),
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{
+						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+							stringLit(fmt.Sprintf("wasm2go: memory size is below the module's minimum (%d bytes)", minBytesU)),
+						}}},
+					}},
+				})
 			}
 			body.List = append(body.List,
 				&ast.IfStmt{

@@ -1174,19 +1174,19 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		})
 	}
 	if len(bumpFixes) > 0 {
-		// The temps need declarations: hoist them as int32 zeros.
-		var names []ast.Expr
-		var zeros []ast.Expr
-		zeroType := "int32"
+		// The temps need declarations, at function top like the
+		// scalarizer's other temps (the fused call assigns them): one
+		// declared here would be jumped over by a goto to a label
+		// after it — the goto emitter's, or a bounds check's trap.
+		typ := "int32"
 		if tree.Addr64 {
-			zeroType = "int64"
+			typ = "int64"
 		}
+		spec := &ast.ValueSpec{Type: newID(typ)}
 		for _, bf := range bumpFixes {
-			names = append(names, newID(bf.temp))
-			zeros = append(zeros, &ast.CallExpr{Fun: newID(zeroType), Args: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}}})
+			spec.Names = append(spec.Names, newID(bf.temp))
 		}
-		*prelude = append(*prelude, &ast.AssignStmt{Tok: token.DEFINE, Lhs: names, Rhs: zeros},
-			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: append([]ast.Expr{}, blankFor(len(names))...), Rhs: names})
+		sc.hoistScalars = append(sc.hoistScalars, spec)
 	}
 	if len(exitCopies) == 0 && len(post) == 0 {
 		return callStmt, true
