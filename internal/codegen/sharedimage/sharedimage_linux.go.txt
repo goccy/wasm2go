@@ -17,6 +17,15 @@ import (
 // whose system call numbers imageSyscalls knows.
 const privatePagesKnown = runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
 
+// mapNoReserve keeps a private mapping of a linear memory from being
+// charged in full against the system's commit limit when it is made: the
+// mapping is as long as the memory may ever grow (wasm32's limit is 4 GiB),
+// most of it is never touched, and under the kernel's default overcommit
+// policy a private writable mapping longer than the machine's memory is
+// refused outright. Pages are charged as they are written, as the Go heap's
+// are.
+const mapNoReserve = syscall.MAP_NORESERVE
+
 // imageSyscalls returns the numbers of mmap and memfd_create: package
 // syscall has no call that maps at a given address, and no number for
 // memfd_create.
@@ -97,7 +106,7 @@ func remapImage(f *os.File, mem []byte) error {
 	addr := uintptr(unsafe.Pointer(unsafe.SliceData(mem)))
 	mmap, _ := imageSyscalls()
 	_, _, errno := syscall.Syscall6(mmap, addr, uintptr(len(mem)),
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_FIXED, f.Fd(), 0)
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_FIXED|mapNoReserve, f.Fd(), 0)
 	if errno != 0 {
 		return fmt.Errorf("wasm2go: mapping the memory image in place: %w", errno)
 	}
