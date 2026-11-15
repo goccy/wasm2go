@@ -1,9 +1,13 @@
 ;; wasip1_mem64_imports.wat — a memory64 module that imports every
-;; wasi_snapshot_preview1 name the Perl interpreter (perl.wasm) uses, each
-;; with its wasm64 signature: every argument of a standard import widened
-;; to i64, an i64 for every pointer of a non-standard one. Its translation
-;; must compile against the *64 bindings of WasiStubs. touch calls every
-;; import once so none of them can be dropped as unused; nothing runs it.
+;; wasi_snapshot_preview1 name WasiStubs binds (all the Perl interpreter
+;; uses, and the rest: fd_pread, the legacy sock_* imports, ...), each with
+;; its wasm64 signature: every argument of a standard import widened to i64
+;; (as the wasm2go port of wasi-libc declares them; proc_raise, which that
+;; C library no longer declares, the same way), and for a non-standard one
+;; an i64 for every pointer, long and size_t and an i32 for every int and
+;; unsigned of its C declaration. Its translation must compile against the
+;; *64 bindings of WasiStubs. touch calls every import once so none of them
+;; can be dropped as unused; nothing runs it.
 (module
   (import "wasi_snapshot_preview1" "args_get"
     (func $args_get (param i64 i64) (result i32)))
@@ -227,6 +231,48 @@
     (func $proc_exec_next (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "proc_times"
     (func $proc_times (param i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_advise"
+    (func $fd_advise (param i64 i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_allocate"
+    (func $fd_allocate (param i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_datasync"
+    (func $fd_datasync (param i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_fdstat_set_rights"
+    (func $fd_fdstat_set_rights (param i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_pread"
+    (func $fd_pread (param i64 i64 i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_pwrite"
+    (func $fd_pwrite (param i64 i64 i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "path_create_directory"
+    (func $path_create_directory (param i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_raise"
+    (func $proc_raise (param i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_recv"
+    (func $sock_recv (param i64 i64 i64 i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_send"
+    (func $sock_send (param i64 i64 i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "path_filestat_mode"
+    (func $path_filestat_mode (param i64 i32 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_socket"
+    (func $sock_socket (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_connect"
+    (func $sock_connect (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_bind"
+    (func $sock_bind (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_recvfrom"
+    (func $sock_recvfrom (param i32 i64 i32 i32 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_sendto"
+    (func $sock_sendto (param i32 i64 i32 i32 i32 i32 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_getsockname"
+    (func $sock_getsockname (param i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_getpeername"
+    (func $sock_getpeername (param i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_pair"
+    (func $sock_pair (param i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_getaddrinfo"
+    (func $sock_getaddrinfo (param i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_reverse"
+    (func $sock_reverse (param i32 i64 i32 i64) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -342,5 +388,26 @@
     (drop (call $proc_exec (i32.const 0) (i64.const 0)))
     (drop (call $proc_exec_next (i32.const 0)))
     (drop (call $proc_times (i64.const 0)))
+    (drop (call $fd_advise (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $fd_allocate (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $fd_datasync (i64.const 0)))
+    (drop (call $fd_fdstat_set_rights (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $fd_pread (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $fd_pwrite (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $path_create_directory (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $proc_raise (i64.const 0)))
+    (drop (call $sock_recv (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_send (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $path_filestat_mode (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_socket (i32.const 0) (i32.const 0)))
+    (drop (call $sock_connect (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $sock_bind (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $sock_recvfrom (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_sendto (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_getsockname (i32.const 0) (i64.const 0)))
+    (drop (call $sock_getpeername (i32.const 0) (i64.const 0)))
+    (drop (call $sock_pair (i64.const 0)))
+    (drop (call $sock_getaddrinfo (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_reverse (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
   )
 )

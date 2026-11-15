@@ -377,6 +377,121 @@ func TestWasi64_IovecsAndCountsAreLP64(t *testing.T) {
 	}
 }
 
+// fd_pread and fd_pwrite take LP64 iovecs and write a 64-bit nread and
+// nwritten for a memory64 guest; the wasm32 twins keep 8-byte iovecs and a
+// 4-byte count, and leave the bytes after it alone.
+func TestWasi64_PreadPwriteAreLP64(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	pathOff, pathLen := putPath(m, 1024, "p.txt")
+	if rc := w.Path_open64(m, 3, 0, int64(pathOff), int64(pathLen), 0x1, 1<<1|1<<6, 0, 0, 2048); rc != _wasiESUCCESS {
+		t.Fatalf("path_open64 rc=%d", rc)
+	}
+	fd := int64(readU32(m.memory, 2048))
+
+	copy(m.memory[4096:], "scatter")
+	copy(m.memory[4200:], "-gather")
+	putIovecs64(m, 3000, [2]uint64{4096, 7}, [2]uint64{4200, 7})
+	fillSentinel(m, 3100, 8)
+	if rc := w.Fd_pwrite64(m, fd, 3000, 2, 2, 3100); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pwrite64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3100); got != 14 {
+		t.Fatalf("nwritten=%#x, want 14 in all 8 bytes", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "p.txt")); string(got) != "\x00\x00scatter-gather" {
+		t.Fatalf("file holds %q", got)
+	}
+
+	putIovecs64(m, 3300, [2]uint64{5000, 4}, [2]uint64{5100, 32})
+	fillSentinel(m, 3400, 8)
+	if rc := w.Fd_pread64(m, fd, 3300, 2, 2, 3400); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pread64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3400); got != 14 {
+		t.Fatalf("nread=%#x, want 14 in all 8 bytes", got)
+	}
+	if got := string(m.memory[5000:5004]) + string(m.memory[5100:5110]); got != "scatter-gather" {
+		t.Fatalf("read back %q", got)
+	}
+
+	// The wasm32 twin: {u32 buf, u32 len} iovecs, a u32 count.
+	binary.LittleEndian.PutUint32(m.memory[3500:], 6000)
+	binary.LittleEndian.PutUint32(m.memory[3504:], 7)
+	fillSentinel(m, 3600, 8)
+	if rc := w.Fd_pread(m, int32(fd), 3500, 1, 9, 3600); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pread rc=%d", rc)
+	}
+	if got := readU32(m.memory, 3600); got != 7 || readU32(m.memory, 3604) != 0xffffffff {
+		t.Fatalf("wasm32 nread % x, want 7 in 4 bytes and the next 4 untouched", m.memory[3600:3608])
+	}
+	if got := string(m.memory[6000:6007]); got != "-gather" {
+		t.Fatalf("wasm32 read back %q", got)
+	}
+	fillSentinel(m, 3700, 8)
+	if rc := w.Fd_pwrite(m, int32(fd), 3500, 1, 16, 3700); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pwrite rc=%d", rc)
+	}
+	if got := readU32(m.memory, 3700); got != 7 || readU32(m.memory, 3704) != 0xffffffff {
+		t.Fatalf("wasm32 nwritten % x, want 7 in 4 bytes and the next 4 untouched", m.memory[3700:3708])
+	}
+}
+
+// sock_send and sock_recv take LP64 iovecs and write a 64-bit so_datalen
+// and ro_datalen for a memory64 guest (ro_flags stays 16 bits); the legacy
+// sock_sendto and sock_recvfrom write an int count, 4 bytes at every width.
+func TestWasi64_SocketTransfersAreLP64(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	if rc := w.Sock_pair64(m, 1024); rc != _wasiESUCCESS {
+		t.Skipf("sock_pair64: %d", rc)
+	}
+	a, b := int64(readU32(m.memory, 1024)), int64(readU32(m.memory, 1028))
+
+	copy(m.memory[4096:], "hello")
+	putIovecs64(m, 3000, [2]uint64{4096, 5})
+	fillSentinel(m, 3100, 8)
+	if rc := w.Sock_send64(m, a, 3000, 1, 0, 3100); rc != _wasiESUCCESS {
+		t.Fatalf("sock_send64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3100); got != 5 {
+		t.Fatalf("so_datalen=%#x, want 5 in all 8 bytes", got)
+	}
+	putIovecs64(m, 3200, [2]uint64{5000, 2}, [2]uint64{5100, 16})
+	fillSentinel(m, 3300, 8)
+	fillSentinel(m, 3400, 4)
+	if rc := w.Sock_recv64(m, b, 3200, 2, 0, 3300, 3400); rc != _wasiESUCCESS {
+		t.Fatalf("sock_recv64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3300); got != 5 {
+		t.Fatalf("ro_datalen=%#x, want 5 in all 8 bytes", got)
+	}
+	if m.memory[3400] != 0 || m.memory[3401] != 0 || m.memory[3402] != 0xff {
+		t.Fatalf("ro_flags % x, want 0 in 2 bytes and the next untouched", m.memory[3400:3404])
+	}
+	if got := string(m.memory[5000:5002]) + string(m.memory[5100:5103]); got != "hello" {
+		t.Fatalf("received %q", got)
+	}
+
+	copy(m.memory[4200:], "world")
+	fillSentinel(m, 3500, 8)
+	if rc := w.Sock_sendto64(m, int32(a), 4200, 5, 0, 0, 0, 0, 3500); rc != _wasiESUCCESS {
+		t.Fatalf("sock_sendto64 rc=%d", rc)
+	}
+	if got := readU32(m.memory, 3500); got != 5 || readU32(m.memory, 3504) != 0xffffffff {
+		t.Fatalf("sent % x, want 5 in 4 bytes and the next 4 untouched", m.memory[3500:3508])
+	}
+	fillSentinel(m, 3600, 8)
+	if rc := w.Sock_recvfrom64(m, int32(b), 5200, 64, 0, 3700, 3600); rc != _wasiESUCCESS {
+		t.Fatalf("sock_recvfrom64 rc=%d", rc)
+	}
+	if got := readU32(m.memory, 3600); got != 5 || readU32(m.memory, 3604) != 0xffffffff {
+		t.Fatalf("received % x, want 5 in 4 bytes and the next 4 untouched", m.memory[3600:3608])
+	}
+	if got := string(m.memory[5200:5205]); got != "world" {
+		t.Fatalf("received %q", got)
+	}
+}
+
 func TestWasi64_ReadlinkBufusedIsLP64(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Symlink("target-of-link", filepath.Join(dir, "ln")); err != nil {
@@ -801,6 +916,40 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"proc_umask",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_umask(m, 0o22) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_umask64(m, 0o22) }},
+		{"fd_advise, fd_allocate, fd_datasync and fd_fdstat_set_rights",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_advise(m, fd, 0, 8, 0) | w.Fd_allocate(m, fd, 0, 8) | w.Fd_datasync(m, fd) |
+					w.Fd_fdstat_set_rights(m, fd, 1<<1, 0)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_advise64(m, int64(fd), 0, 8, 0) | w.Fd_allocate64(m, int64(fd), 0, 8) |
+					w.Fd_datasync64(m, int64(fd)) | w.Fd_fdstat_set_rights64(m, int64(fd), 1<<1, 0)
+			}},
+		{"path_create_directory of a name that is taken",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory(m, 3, 512, 5) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory64(m, 3, 512, 5) }},
+		{"path_filestat_mode",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_mode(m, 512, 5, 1, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_mode64(m, 512, 5, 1, 1024) }},
+		{"sock_getaddrinfo",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Sock_getaddrinfo(m, 528, 9, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Sock_getaddrinfo64(m, 528, 9, 1024) }},
+		{"sock_socket and sock_getsockname",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				s := w.Sock_socket(m, 0, wasiSockTypeStream)
+				return s | w.Sock_getsockname(m, s, 2048)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				s := w.Sock_socket64(m, 0, wasiSockTypeStream)
+				return s | w.Sock_getsockname64(m, s, 2048)
+			}},
+		{"sock_pair and sock_getpeername",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Sock_pair(m, 1024) | w.Sock_getpeername(m, int32(readU32(m.memory, 1024)), 2048)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Sock_pair64(m, 1024) | w.Sock_getpeername64(m, int32(readU32(m.memory, 1024)), 2048)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w32, m32 := newTestStubs(t, dir)
