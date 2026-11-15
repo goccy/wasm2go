@@ -10,29 +10,51 @@ import (
 
 const mmapSupported = true
 
-// mmapImage maps the image as one instance's linear memory: MAP_PRIVATE, so
-// reads share the image's physical pages with every other instance and a write
-// faults in a private copy of just that page. Its pages are charged against
-// the commit limit as they are written, not all at once (mapNoReserve).
+// mapProt is the protection a private mapping of a linear memory is made
+// with. Where linear memory is a reservation (memreserve_on.go) that is
+// none: the maker opens (memProtect) as much as the memory holds, and
+// memory.grow opens the rest as it reaches it. A page made writable is
+// what a strict commit policy charges (Linux's vm.overcommit_memory=2,
+// which ignores mapNoReserve), at mmap or at mprotect, and closing it
+// again does not give the charge back: so the address space reserved past
+// memory.size — up to the memory's ceiling and the guard after it — is
+// charged for nothing. Elsewhere a memory is mapped accessible throughout,
+// as memory.grow opens nothing there.
+func mapProt() int {
+	if memReserved {
+		return syscall.PROT_NONE
+	}
+	return syscall.PROT_READ | syscall.PROT_WRITE
+}
+
+// mmapImage maps the image as one instance's linear memory, length bytes
+// long with its first open bytes accessible (see mapProt): MAP_PRIVATE, so
+// reads share the image's physical pages with every other instance and a
+// write faults in a private copy of just that page. Its pages are charged
+// against the commit limit as they are written, not all at once
+// (mapNoReserve), or under a strict policy as they are opened.
 //
-// The file is sparse-extended to the ceiling first, so the whole range is
-// mappable and everything past the image reads as zeros — which is what a
-// freshly grown wasm page must contain. Mapping past the end of the file
-// instead would fault with SIGBUS on first access.
-func mmapImage(f *os.File, ceiling int) ([]byte, error) {
+// The file is sparse-extended to the mapping's length first, so the whole
+// range is mappable and everything past the image reads as zeros — which
+// is what a freshly grown wasm page must contain. Mapping past the end of
+// the file instead would fault with SIGBUS on first access.
+func mmapImage(f *os.File, length, open int) ([]byte, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if fi.Size() < int64(ceiling) {
-		if err := f.Truncate(int64(ceiling)); err != nil {
+	if fi.Size() < int64(length) {
+		if err := f.Truncate(int64(length)); err != nil {
 			return nil, fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)
 		}
 	}
-	mem, err := syscall.Mmap(int(f.Fd()), 0, ceiling,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|mapNoReserve)
+	mem, err := syscall.Mmap(int(f.Fd()), 0, length, mapProt(), syscall.MAP_PRIVATE|mapNoReserve)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping the shared memory image: %w", err)
+	}
+	if err := memProtect(mem, 0, uint64(open), true); err != nil {
+		_ = syscall.Munmap(mem)
+		return nil, err
 	}
 	return mem, nil
 }
@@ -50,14 +72,18 @@ func mmapShared(f *os.File, length int) ([]byte, error) {
 	return mem, nil
 }
 
-// mmapAnonymous maps length bytes of zeros, private to the process: memory
-// of an instance's own that stays at one address, charged as it is written
-// (mapNoReserve).
-func mmapAnonymous(length int) ([]byte, error) {
-	mem, err := syscall.Mmap(-1, 0, length,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON|mapNoReserve)
+// mmapAnonymous maps length bytes of zeros, private to the process, with
+// the first open bytes accessible (see mapProt): memory of an instance's
+// own that stays at one address, charged as it is written (mapNoReserve),
+// or under a strict policy as it is opened.
+func mmapAnonymous(length, open int) ([]byte, error) {
+	mem, err := syscall.Mmap(-1, 0, length, mapProt(), syscall.MAP_PRIVATE|syscall.MAP_ANON|mapNoReserve)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping memory of the instance's own: %w", err)
+	}
+	if err := memProtect(mem, 0, uint64(open), true); err != nil {
+		_ = syscall.Munmap(mem)
+		return nil, err
 	}
 	return mem, nil
 }

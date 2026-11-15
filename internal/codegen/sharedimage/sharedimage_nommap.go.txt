@@ -12,7 +12,7 @@ import (
 // larger — see sharedimage.go for what the sharing buys.
 const mmapSupported = false
 
-func mmapImage(f *os.File, ceiling int) ([]byte, error) {
+func mmapImage(f *os.File, length, open int) ([]byte, error) {
 	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
 }
 
@@ -23,6 +23,6 @@ func mmapShared(f *os.File, length int) ([]byte, error) {
 }
 
 
-func mmapAnonymous(length int) ([]byte, error) {
+func mmapAnonymous(length, open int) ([]byte, error) {
 	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
 }

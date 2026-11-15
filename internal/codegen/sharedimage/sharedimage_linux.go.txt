@@ -23,7 +23,10 @@ const privatePagesKnown = runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"
 // most of it is never touched, and under the kernel's default overcommit
 // policy a private writable mapping longer than the machine's memory is
 // refused outright. Pages are charged as they are written, as the Go heap's
-// are.
+// are. The strict policy (vm.overcommit_memory=2) ignores the flag and
+// charges every page of a private mapping when it becomes writable, which
+// is why a memory's mapping is writable only as far as the memory reaches
+// where memory is a reservation (mapProt).
 const mapNoReserve = syscall.MAP_NORESERVE
 
 // imageSyscalls returns the numbers of mmap and memfd_create: package
@@ -88,8 +91,9 @@ func privatePages(mem []byte) (runs []pageRun, total uint64, ok bool) {
 }
 
 // remapImage replaces mem, a mapping that holds exactly what the head of f
-// holds, by a private mapping of f at the same address: nothing the process
-// reads there changes, and every page becomes the image's again.
+// holds, by a private mapping of f at the same address, made with mapProt:
+// once the caller opens as much of it as the memory holds, nothing the
+// process reads there changes, and every page is the image's again.
 func remapImage(f *os.File, mem []byte) error {
 	if !privatePagesKnown {
 		return fmt.Errorf("wasm2go: a memory image cannot be mapped in place on this platform")
@@ -106,7 +110,7 @@ func remapImage(f *os.File, mem []byte) error {
 	addr := uintptr(unsafe.Pointer(unsafe.SliceData(mem)))
 	mmap, _ := imageSyscalls()
 	_, _, errno := syscall.Syscall6(mmap, addr, uintptr(len(mem)),
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_FIXED|mapNoReserve, f.Fd(), 0)
+		uintptr(mapProt()), syscall.MAP_PRIVATE|syscall.MAP_FIXED|mapNoReserve, f.Fd(), 0)
 	if errno != 0 {
 		return fmt.Errorf("wasm2go: mapping the memory image in place: %w", errno)
 	}

@@ -261,7 +261,9 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 
 // AnonymousMemory returns memory for one instance that initializes itself
 // on it: a private mapping, ceiling bytes long, that holds what from's
-// memory holds below its data end and zeros above. from is an instance
+// memory holds below its data end and zeros above (where memory is a
+// reservation, the mapping is accessible as far as from's memory reaches,
+// its memory.size, until an instance is built on it). from is an instance
 // constructed and not run since: below its data end it holds the data
 // segments, and whatever its start section (which a constructor runs) wrote
 // there — the instance on the new memory runs its start section again, as
@@ -292,7 +294,7 @@ func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, e
 	if err != nil {
 		return nil, nil, err
 	}
-	mem, err := mmapAnonymous(length)
+	mem, err := mmapAnonymous(length, min(len(from.{{.Memory}}), length))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -336,9 +338,12 @@ func (s *SharedImage) Globals() []uint64 { return s.globals }
 //
 // The ceiling is what the instance's memory can grow to, and costs address
 // space only: no page of the mapping is charged to the process before it is
-// written (see mapNoReserve). It is a uint64 because a memory64's memory
-// may be longer than 4 GiB; a ceiling the process's address space cannot
-// hold (above math.MaxInt) is refused with an error.
+// written (see mapNoReserve), or under a strict commit policy before
+// memory.grow opens it: where memory is a reservation, the mapping is
+// accessible as far as the image's memory.size (see mapProt). It is a
+// uint64 because a memory64's memory may be longer than 4 GiB; a ceiling
+// the process's address space cannot hold (above math.MaxInt) is refused
+// with an error.
 //
 // The mapping is NOT Go heap — the GC will not reclaim it. Pass it to
 // UnmapMemory when the instance is done.
@@ -353,7 +358,7 @@ func (s *SharedImage) Memory(ceiling uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	mem, err := mmapImage(s.f, length)
+	mem, err := mmapImage(s.f, length, int(s.size))
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +465,7 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 	}
 	if mapped {
 		if runs, changed, ok := privatePages(mem[:size]); ok && changed <= size/forkRebaseShare {
-			child, err := mmapImage(from.f, length)
+			child, err := mmapImage(from.f, length, int(size))
 			if err != nil {
 				return nil, err
 			}
@@ -480,7 +485,7 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 		f.Close()
 		return nil, fmt.Errorf("wasm2go: memory image: %w", err)
 	}
-	child, err := mmapImage(f, length)
+	child, err := mmapImage(f, length, int(size))
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -498,9 +503,10 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 	}
 	fork.Image = &SharedImage{f: f, size: size, dataEnd: m.{{.DataEnd}}}
 	if (mapped || anonymous) && remapImage(f, mem) == nil {
-		// The new mapping is accessible throughout; a reservation's pages
-		// past memory.size close again before the instance runs on.
-		if err := memProtect(mem, size, uint64(len(mem)), false); err != nil {
+		// The new mapping is made as every mapping of a memory is
+		// (mapProt): the memory's pages open again before the instance
+		// runs on.
+		if err := memProtect(mem, 0, size, true); err != nil {
 			return nil, err
 		}
 		fork.Rebased = true
