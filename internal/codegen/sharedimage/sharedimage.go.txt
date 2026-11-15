@@ -40,12 +40,17 @@ package {{.Pkg}}
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"runtime"
 	"sync"
 )
+
+// errImageLimit is the failure to make or extend an image of linear memory
+// past the process's limit on the size of a file (see imageFits).
+var errImageLimit = errors.New("wasm2go: a memory image would be longer than the process may make a file (RLIMIT_FSIZE)")
 
 // SharedImage is a process-wide initialized linear-memory template.
 type SharedImage struct {
@@ -146,6 +151,9 @@ func buildSharedImageInPlace(ceiling uint64, build InPlaceImageBuilder, snapshot
 	length, err := mappingLength(ceiling)
 	if err != nil {
 		return &SharedImage{err: err}
+	}
+	if !imageFits(uint64(length)) {
+		return &SharedImage{err: errImageLimit}
 	}
 	f, err := newTempImageFile()
 	if err != nil {
@@ -427,7 +435,11 @@ const forkRebaseShare = 8
 // image too (Rebased), so that its next forks are cheap again; so is memory
 // from AnonymousMemory at its first fork. Without from every fork writes the
 // whole memory, and ceiling is the length of the duplicate's mapping; with
-// from the duplicate is as long as m's.
+// from the duplicate is as long as m's. Where the process may not make a
+// file as long as the duplicate's mapping (its file size limit, which a
+// program may lower, see imageFits), no image is made or extended: the
+// duplicate is memory of its own that holds a copy of m's, and m's memory
+// stays as it is.
 //
 // The image is shared by the mappings made of it. Close an image when no
 // instance that may still be forked maps it.
@@ -466,16 +478,32 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 	if mapped {
 		if runs, changed, ok := privatePages(mem[:size]); ok && changed <= size/forkRebaseShare {
 			child, err := mmapImage(from.f, length, int(size))
-			if err != nil {
+			if err == nil {
+				memRegister(child, ceiling)
+				for _, r := range runs {
+					copy(child[r.from:r.to], mem[r.from:r.to])
+				}
+				fork.Memory, fork.Image = child, from
+				return fork, nil
+			}
+			if !errors.Is(err, errImageLimit) {
 				return nil, err
 			}
-			memRegister(child, ceiling)
-			for _, r := range runs {
-				copy(child[r.from:r.to], mem[r.from:r.to])
-			}
-			fork.Memory, fork.Image = child, from
-			return fork, nil
 		}
+	}
+	if !imageFits(uint64(length)) {
+		// No image of the memory may be made (the process's file size
+		// limit is below the mapping's length): the duplicate is memory
+		// of its own that holds a copy of the memory, and m's memory
+		// stays as it is.
+		child, err := mmapAnonymous(length, int(size))
+		if err != nil {
+			return nil, err
+		}
+		memRegister(child, ceiling)
+		copy(child, mem[:size])
+		fork.Memory = child
+		return fork, nil
 	}
 	f, err := newImageFile()
 	if err != nil {

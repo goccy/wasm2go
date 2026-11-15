@@ -422,3 +422,137 @@ func main() {
 		}
 	}
 }
+
+// A program may lower the process's limit on the size of the files it makes
+// (RLIMIT_FSIZE) below the length of a memory's mapping, which an image of
+// the memory is as long as: its forks still get its state, from a copy in
+// memory of the duplicate's own where no image may be made, and the process
+// is not sent SIGXFSZ, which the program would take for its own. A fork that
+// needs no longer image than there is (a small change to memory on a
+// snapshot's image, where the platform tells changes) maps the image as
+// before.
+func TestForkMemoryUnderAFileSizeLimit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no mmap: the generated package cannot duplicate a memory")
+	}
+	bin := testfixture.Wasm(t, "cg_sharedimage")
+	parsed, err := wasm.Parse(bytes.NewReader(bin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res, err := codegen.Translate(&buf, parsed, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const main = `package main
+
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+	"time"
+
+	"gentest/pkg"
+)
+
+const ceiling = 4 * 65536
+
+func fork(m *pkg.Module, img *pkg.SharedImage, what string) (*pkg.Module, *pkg.MemoryFork) {
+	f, err := pkg.ForkMemory(m, img, ceiling)
+	if err != nil {
+		fmt.Println(what, "fork failed:", err)
+		return nil, nil
+	}
+	return pkg.NewFromSnapshot(f.Memory, f.Size, f.Globals), f
+}
+
+func main() {
+	snap := pkg.NewSharedSnapshot(func() (*pkg.Module, error) { return pkg.New(), nil })
+	if err := snap.Err(); err != nil {
+		fmt.Println("snapshot:", err)
+		return
+	}
+	mem, err := snap.Memory(ceiling)
+	if err != nil {
+		panic(err)
+	}
+	a := pkg.NewFromSnapshot(mem, snap.Size(), snap.Globals())
+	from := pkg.New()
+	oimg, omem, err := pkg.AnonymousMemory(from, ceiling)
+	if err != nil {
+		panic(err)
+	}
+	o := pkg.NewWithMemory(omem, pkg.InitialMemoryBytes)
+
+	xfsz := make(chan os.Signal, 1)
+	signal.Notify(xfsz, syscall.SIGXFSZ)
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &lim); err != nil {
+		panic(err)
+	}
+	lim.Cur = 1 << 20
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &lim); err != nil {
+		panic(err)
+	}
+
+	// A small change on the snapshot's image.
+	a.Poke(1024, 'X')
+	if b, f := fork(a, snap, "small change:"); b != nil {
+		fmt.Println("small change: b inherits", b.Peek(1024), "maps the snapshot where changes are told:", (f.Image == snap) == (runtime.GOOS == "linux"))
+	}
+
+	// A change to most of the memory.
+	for addr := int32(8192); addr < 2*65536; addr += 1024 {
+		a.Poke(addr, int32(addr/1024))
+	}
+	if c, f := fork(a, snap, "large change:"); c != nil {
+		ok := c.Peek(1024) == 'X'
+		for addr := int32(8192); addr < 2*65536; addr += 1024 {
+			ok = ok && c.Peek(addr) == int32(addr/1024)&0xff
+		}
+		fmt.Println("large change: c inherits everything:", ok, "rebased:", f.Rebased)
+		c.Poke(1024, 'C')
+		a.Poke(1025, 'Z')
+		fmt.Println("large change: after the fork a", a.Peek(1024), a.Peek(1025), "c", c.Peek(1024), c.Peek(1025))
+		if d, _ := fork(c, f.Image, "the duplicate's"); d != nil {
+			fmt.Println("the duplicate's fork inherits", d.Peek(1024), d.Peek(8192))
+		}
+	}
+
+	// Memory of the instance's own.
+	o.Poke(1024, 'O')
+	if p, f := fork(o, oimg, "own memory:"); p != nil {
+		fmt.Println("own memory: p inherits", p.Peek(1024), "marker", p.Marker(), "rebased:", f.Rebased)
+		p.Poke(1024, 'P')
+		fmt.Println("own memory: after the fork o", o.Peek(1024), "p", p.Peek(1024))
+	}
+
+	select {
+	case <-xfsz:
+		fmt.Println("the process was sent SIGXFSZ")
+	case <-time.After(200 * time.Millisecond):
+		fmt.Println("no SIGXFSZ")
+	}
+}
+`
+	out := runGoSnippetWithAux(t, buf.String(), main,
+		[]map[string][]byte{res.Sidecars, filesWithAux(res)}, res.AuxFiles)
+
+	for _, want := range []string{
+		"small change: b inherits 88 maps the snapshot where changes are told: true",
+		"large change: c inherits everything: true rebased: false",
+		"large change: after the fork a 88 90 c 67 101",
+		"the duplicate's fork inherits 67 8",
+		"own memory: p inherits 79 marker 42 rebased: false",
+		"own memory: after the fork o 79 p 80",
+		"no SIGXFSZ",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in output:\n%s", want, out)
+		}
+	}
+}

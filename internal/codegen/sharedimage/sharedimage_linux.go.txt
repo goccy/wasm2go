@@ -103,6 +103,9 @@ func remapImage(f *os.File, mem []byte) error {
 		return err
 	}
 	if fi.Size() < int64(len(mem)) {
+		if !imageFits(uint64(len(mem))) {
+			return errImageLimit
+		}
 		if err := f.Truncate(int64(len(mem))); err != nil {
 			return fmt.Errorf("wasm2go: sizing the memory image: %w", err)
 		}

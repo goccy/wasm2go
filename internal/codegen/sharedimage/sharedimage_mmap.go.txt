@@ -44,6 +44,9 @@ func mmapImage(f *os.File, length, open int) ([]byte, error) {
 		return nil, err
 	}
 	if fi.Size() < int64(length) {
+		if !imageFits(uint64(length)) {
+			return nil, errImageLimit
+		}
 		if err := f.Truncate(int64(length)); err != nil {
 			return nil, fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)
 		}
@@ -57,6 +60,22 @@ func mmapImage(f *os.File, length, open int) ([]byte, error) {
 		return nil, err
 	}
 	return mem, nil
+}
+
+// imageFits reports whether the process may make a file n bytes long. An
+// image of linear memory is a file (a memfd, or an unlinked temporary
+// file), and the process's limit on the size of the files it makes
+// (RLIMIT_FSIZE) applies to it as to any other: a program the module runs
+// may lower the limit (setrlimit; a shell's ulimit -f before the process
+// starts), and making a longer file fails with EFBIG and sends the process
+// SIGXFSZ, which the program takes for a signal about a file of its own.
+// So no image is made, or extended, past the limit.
+func imageFits(n uint64) bool {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &rl); err != nil {
+		return true
+	}
+	return uint64(rl.Cur) >= n
 }
 
 // mmapShared maps the image file MAP_SHARED, for an in-place builder:
