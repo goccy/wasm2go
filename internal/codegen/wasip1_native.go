@@ -6071,8 +6071,14 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		if !ready[i] {
 			continue
 		}
+		// The hang-up goes with events for reading only. The guest's C
+		// library takes it on an event for writing as the end of
+		// writability (POLLHUP contradicts POLLWRNORM), and its select()
+		// then puts the descriptor in no set, while the host's select(2)
+		// reports a socket whose peer is gone writable, a connect that
+		// failed among them: the write, or SO_ERROR, tells what happened.
 		var flags uint16
-		if errnos[i] == 0 {
+		if errnos[i] == 0 && ev.isRead {
 			if hostSet.hungUp(i) {
 				flags = wasiEventHangup
 			} else if stream := hangStreams[i]; stream != nil && streamHungUp(stream) {
@@ -6108,7 +6114,8 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 }
 
 // wasiEventHangup is eventrwflags' fd_readwrite_hangup: the peer of the
-// descriptor has hung up. The guest's poll() reports it as POLLHUP.
+// descriptor has hung up. The guest's poll() reports it as POLLHUP. It is
+// set on events for reading only (see Poll_oneoff).
 const wasiEventHangup uint16 = 1
 
 // streamHungUp reports whether a stream has been hung up on, as poll(2)
