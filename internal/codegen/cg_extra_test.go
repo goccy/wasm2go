@@ -63,8 +63,9 @@ func TestNativeWASIDefault(t *testing.T) {
 
 // TestNativeWASIReserve verifies the initial-linear-memory reservation API:
 // the full-body constructor is NewWithWASIReserve(..., reserveBytes int), the
-// memory make() takes a capacity argument so start-up grows are zero-copy
-// reslices, and the plain NewWithWASI delegates with a default headroom.
+// memory allocation (memAlloc) takes the reserve as its capacity argument so
+// start-up grows of a Go-heap memory are zero-copy reslices, and the plain
+// NewWithWASI delegates with a default headroom.
 func TestNativeWASIReserve(t *testing.T) {
 	mod := readFixture(t, "cg_wasi.wasm")
 	var buf bytes.Buffer
@@ -81,9 +82,10 @@ func TestNativeWASIReserve(t *testing.T) {
 	if !strings.Contains(src, "reserveBytes int") {
 		t.Errorf("NewWithWASIReserve missing reserveBytes param: %s", src)
 	}
-	// 3-arg make: make([]byte, <min>, <cap>) — two commas before the close.
-	if !regexp.MustCompile(`make\(\[\]byte,[^,)]+,[^,)]+\)`).MatchString(src) {
-		t.Errorf("memory make() is not 3-arg (no capacity reservation): %s", src)
+	// memAlloc(m, <len>, <accessible>, <cap>, <ceiling>): the clamped
+	// reserve is the capacity.
+	if !regexp.MustCompile(`memAlloc\(m, [^\n]*uint64\(__memcap\)`).MatchString(src) {
+		t.Errorf("memory allocation takes no capacity reservation: %s", src)
 	}
 	// Clamp so cap is never below len (make would panic otherwise).
 	if !strings.Contains(src, "__memcap") {

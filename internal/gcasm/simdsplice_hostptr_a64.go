@@ -73,7 +73,7 @@ func a64LoopHostPtrs(loop *simdfuse.Loop, freeRegs []string) map[int]*a64HostPtr
 		if _, isMem := fusedMemOpsA64[n.Op]; isMem && len(n.Args) > 0 {
 			count(n.Args[0])
 		}
-		if n.Op == "scalar_i32_load16_u" && len(n.Args) == 1 {
+		if n.Op == "scalar_i32_load16_u" && len(n.Args) == 2 {
 			count(n.Args[0])
 		}
 	}

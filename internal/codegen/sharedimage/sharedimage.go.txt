@@ -160,6 +160,9 @@ func buildSharedImageInPlace(ceiling uint64, build InPlaceImageBuilder, snapshot
 		f.Close()
 		return &SharedImage{err: err}
 	}
+	// The builder's instance takes the mapping as its memory in place
+	// (NewWithMemory), which it may only do to a mapping it knows.
+	memRegister(mem, ceiling)
 	fail := func(err error) *SharedImage {
 		unmapMemory(mem)
 		f.Close()
@@ -293,6 +296,7 @@ func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, e
 	if err != nil {
 		return nil, nil, err
 	}
+	memRegister(mem, ceiling)
 	src := from.{{.Memory}}[:dataEnd]
 	page := os.Getpagesize()
 	zeros := make([]byte, page)
@@ -349,7 +353,12 @@ func (s *SharedImage) Memory(ceiling uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return mmapImage(s.f, length)
+	mem, err := mmapImage(s.f, length)
+	if err != nil {
+		return nil, err
+	}
+	memRegister(mem, ceiling)
+	return mem, nil
 }
 
 // Close releases the image itself. Mappings already handed out by Memory stay
@@ -433,9 +442,14 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 	anonymous := from != nil && from.anonymous
 	if mapped || anonymous {
 		// The memory is the first memory.size bytes of its mapping (all
-		// of it, for a shared memory); the mapping is its capacity.
+		// of it, for a shared memory); the mapping is its capacity, and
+		// its ceiling is the duplicate's (a reservation's is what its
+		// mapping was asked for).
 		mem = mem[:cap(mem)]
 		ceiling = uint64(len(mem))
+		if r, ok := memRegistered(mem); ok {
+			ceiling = r.ceiling
+		}
 	}
 	if ceiling < size {
 		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the instance's memory (%d bytes)", ceiling, size)
@@ -450,6 +464,7 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 			if err != nil {
 				return nil, err
 			}
+			memRegister(child, ceiling)
 			for _, r := range runs {
 				copy(child[r.from:r.to], mem[r.from:r.to])
 			}
@@ -470,6 +485,7 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 		f.Close()
 		return nil, err
 	}
+	memRegister(child, ceiling)
 	fork.Memory = child
 	if !privatePagesKnown {
 		// Nothing can tell later what an instance changed since: the image
@@ -482,6 +498,11 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 	}
 	fork.Image = &SharedImage{f: f, size: size, dataEnd: m.{{.DataEnd}}}
 	if (mapped || anonymous) && remapImage(f, mem) == nil {
+		// The new mapping is accessible throughout; a reservation's pages
+		// past memory.size close again before the instance runs on.
+		if err := memProtect(mem, size, uint64(len(mem)), false); err != nil {
+			return nil, err
+		}
 		fork.Rebased = true
 	}
 	return fork, nil
@@ -495,7 +516,14 @@ type pageRun struct{ from, to uint64 }
 // GiB can be named on any host; a host whose address space cannot hold it
 // (a 32-bit one, for a ceiling above math.MaxInt) refuses it here, and the
 // embedder falls back as it does for any mapping that fails.
+//
+// Where linear memory is a reservation (memreserve_on.go), a mapping is the
+// length of the reservation for a memory of the ceiling, and a ceiling no
+// reservation may hold is refused.
 func mappingLength(ceiling uint64) (int, error) {
+	if l, ok, err := memMappingLength(ceiling); ok {
+		return l, err
+	}
 	if ceiling > math.MaxInt {
 		return 0, fmt.Errorf("wasm2go: a memory ceiling of %d bytes does not fit in this process's address space", ceiling)
 	}

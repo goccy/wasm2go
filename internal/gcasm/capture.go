@@ -60,10 +60,17 @@ func Capture(pkgDir, pkgPath string) ([]*Fn, []*DataSym, error) {
 // Bundle generation must produce identical output on any host, so the
 // arch is pinned explicitly rather than inherited from the environment
 // (the primary dev machine is darwin/arm64 under Rosetta).
+//
+// GOOS is pinned to linux and the build tags cleared for the same reason
+// and one more: the bodies compile in the form where linear memory is a
+// reservation (sharedimage.ReservedConstraint), whose bounds checks the
+// captured assembly then carries — the form the bundle's build constraint
+// limits it to. A wasm2go_boundschecks tag in GOFLAGS, or a host that is
+// no unix, would otherwise capture the other form.
 func captureArch(pkgDir, pkgPath, arch string) ([]*Fn, []*DataSym, error) {
-	cmd := exec.Command("go", "build", "-gcflags", pkgPath+"=-S", "./...")
+	cmd := exec.Command("go", "build", "-tags=", "-gcflags", pkgPath+"=-S", "./...")
 	cmd.Dir = pkgDir
-	cmd.Env = append(os.Environ(), "GOARCH="+arch)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+arch)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, nil, fmt.Errorf("gcasm capture: go build: %w\n%s", err, diagnostics(out))

@@ -110,28 +110,29 @@ func (fb *fusedTreeBuilder) f16GatherChain(tailIdx int, uses []int) ([4]int, boo
 }
 
 // f16LaneIndex chases one lane's address argument down to a
-// scalar_i32_load16_u node, returning the load's address argument and
-// the total table addend accumulated along the way.
-func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, addend int64, ok bool) {
+// scalar_i32_load16_u node, returning the load's address argument, its
+// constant static offset, and the total table addend accumulated along
+// the way.
+func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, off int32, addend int64, ok bool) {
 	switch a.Kind {
 	case simdfuse.ArgScalar:
 		narg, cok := fb.chaseI32(fb.scalars[a.Index])
 		if !cok {
-			return base, 0, false
+			return base, 0, 0, false
 		}
 		a = narg
 	case simdfuse.ArgSum:
 		narg, cok := fb.chaseI32(fb.scalars[a.Index])
 		if !cok {
-			return base, 0, false
+			return base, 0, 0, false
 		}
 		addend += int64(a.Const)
 		a = narg
 	case simdfuse.ArgConst:
-		return base, 0, false
+		return base, 0, 0, false
 	}
 	if a.Kind != simdfuse.ArgNode {
-		return base, 0, false
+		return base, 0, 0, false
 	}
 	n := &fb.nodes[a.Index]
 	if n.Op == "scalar_i32_add" && len(n.Args) == 2 {
@@ -140,7 +141,7 @@ func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, add
 			x, c = c, x
 		}
 		if c.Kind != simdfuse.ArgConst || x.Kind != simdfuse.ArgNode {
-			return base, 0, false
+			return base, 0, 0, false
 		}
 		addend += int64(c.Const)
 		n = &fb.nodes[x.Index]
@@ -148,25 +149,25 @@ func (fb *fusedTreeBuilder) f16LaneIndex(a simdfuse.Arg) (base simdfuse.Arg, add
 	if n.Op != "scalar_i32_shl" || len(n.Args) != 2 ||
 		n.Args[1].Kind != simdfuse.ArgConst || n.Args[1].Const != 2 ||
 		n.Args[0].Kind != simdfuse.ArgNode {
-		return base, 0, false
+		return base, 0, 0, false
 	}
 	ld := &fb.nodes[n.Args[0].Index]
-	if ld.Op != "scalar_i32_load16_u" || len(ld.Args) != 1 {
-		return base, 0, false
+	if ld.Op != "scalar_i32_load16_u" || len(ld.Args) != 2 || ld.Args[1].Kind != simdfuse.ArgConst {
+		return base, 0, 0, false
 	}
 	// Any address form is acceptable here — the group verifier proves
 	// lane adjacency structurally (argOffsetBy), and the fused mem
 	// emitters take chain-computed ArgNode addresses.
-	return ld.Args[0], addend, true
+	return ld.Args[0], ld.Args[1].Const, addend, true
 }
 
 // rewriteF16GatherGroup verifies one chain group end to end and
 // rewrites it in place. False leaves the tree unchanged (the caller
 // restores the chase snapshot).
 func (fb *fusedTreeBuilder) rewriteF16GatherGroup(tailIdx int, chain [4]int, tableOK func(uint32) bool) bool {
-	ldBase, total, ok := fb.f16LaneGather(chain)
+	ldBase, ldOff, total, ok := fb.f16LaneGather(chain)
 	if !ok {
-		ldBase, total, ok = fb.f16WordGather(chain)
+		ldBase, ldOff, total, ok = fb.f16WordGather(chain)
 	}
 	if !ok {
 		return false
@@ -187,7 +188,7 @@ func (fb *fusedTreeBuilder) rewriteF16GatherGroup(tailIdx int, chain [4]int, tab
 	} else {
 		fb.sc.em.useHelper("simd_v128_load16x4_u")
 	}
-	ldArgs := []simdfuse.Arg{ldBase, {Kind: simdfuse.ArgConst, Const: 0}}
+	ldArgs := []simdfuse.Arg{ldBase, {Kind: simdfuse.ArgConst, Const: ldOff}}
 	fb.nodes = append(fb.nodes, simdfuse.Node{Op: "v128_load16x4_u", Args: ldArgs})
 	fb.nodeVals = append(fb.nodeVals, nil)
 	nl := len(fb.nodes) - 1
@@ -200,31 +201,34 @@ func (fb *fusedTreeBuilder) rewriteF16GatherGroup(tailIdx int, chain [4]int, tab
 // base +0,+2,+4,+6 in lane order, and every lane accumulates the same
 // table addend. Returns the base address argument for the collapsed
 // 8-byte load and the shared table addend.
-func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bool) {
+func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int32, int64, bool) {
 	var bases [4]simdfuse.Arg
+	var offs [4]int32
 	var totals [4]int64
 	for k := 0; k < 4; k++ {
 		n := &fb.nodes[chain[k]]
 		if n.Args[1].Kind != simdfuse.ArgConst {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
-		b, addend, ok := fb.f16LaneIndex(n.Args[0])
+		b, off, addend, ok := fb.f16LaneIndex(n.Args[0])
 		if !ok {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
-		bases[k] = b
+		bases[k], offs[k] = b, off
 		totals[k] = addend + int64(n.Args[1].Const)
 	}
 	for k := 1; k < 4; k++ {
 		if totals[k] != totals[0] {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 	}
 	// The four f16 sources must be one base value at +0,+2,+4,+6 in
 	// lane order: proven structurally, with the lane delta carried by
 	// exactly one constant along otherwise-identical chase trees.
 	for k := 1; k < 4; k++ {
-		if !fb.argOffsetBy(bases[0], bases[k], int32(2*k)) {
+		// Each static offset is below 2^31 (an ArgConst of the chase's)
+		// and the address part carries the rest of the lane delta.
+		if offs[k] < 0 || offs[0] < 0 || !fb.argOffsetBy(bases[0], bases[k], int32(2*k)-(offs[k]-offs[0])) {
 			// Diagnosis: report which deltas DO hold to reveal the
 			// lane-order variant.
 			pat := ""
@@ -236,10 +240,10 @@ func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bo
 					}
 				}
 			}
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 	}
-	return bases[0], totals[0], true
+	return bases[0], offs[0], totals[0], true
 }
 
 // f16WordGather proves the word-unpack gather form the guest emits
@@ -254,13 +258,13 @@ func (fb *fusedTreeBuilder) f16LaneGather(chain [4]int) (simdfuse.Arg, int64, bo
 // per-load form; signedness of the shift is irrelevant because the
 // mask discards every bit above 17. The collapsed v128_load16x4_u
 // reads the same eight bytes the word load does.
-func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int64, bool) {
+func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int32, int64, bool) {
 	wName := ""
 	var totals [4]int64
 	for k := 0; k < 4; k++ {
 		n := &fb.nodes[chain[k]]
 		if n.Args[1].Kind != simdfuse.ArgConst {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 		a := n.Args[0]
 		add := int64(n.Args[1].Const)
@@ -272,49 +276,50 @@ func (fb *fusedTreeBuilder) f16WordGather(chain [4]int) (simdfuse.Arg, int64, bo
 			e = fb.scalars[a.Index]
 			add += int64(a.Const)
 		default:
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 		name, tadd, ok := fb.f16WordLane(e, k)
 		if !ok {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 		if k == 0 {
 			wName = name
 		} else if name != wName {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 		totals[k] = add + tadd
 	}
 	for k := 1; k < 4; k++ {
 		if totals[k] != totals[0] {
-			return simdfuse.Arg{}, 0, false
+			return simdfuse.Arg{}, 0, 0, false
 		}
 	}
 	// Resolve the shared word ident to its 64-bit linear-memory load
 	// and chase that load's address as the gather base.
 	if fb.sc == nil || fb.sc.defBind == nil {
-		return simdfuse.Arg{}, 0, false
+		return simdfuse.Arg{}, 0, 0, false
 	}
 	def, isDef := fb.sc.defBind[wName]
 	if !isDef || len(def.Rhs) != 1 {
-		return simdfuse.Arg{}, 0, false
+		return simdfuse.Arg{}, 0, 0, false
 	}
 	star, ok := def.Rhs[0].(*ast.StarExpr)
 	if !ok {
-		return simdfuse.Arg{}, 0, false
+		return simdfuse.Arg{}, 0, 0, false
 	}
-	// The uint64 address wrapper on the 64-bit load carries no
-	// memory64 information (every 8-byte deref widens its offset), so
-	// addr64 is deliberately not derived from it here.
-	addr, _, mok := matchMemDeref(star, "int64")
+	addr, off, mok := fb.matchMemDeref(star, "int64")
 	if !mok {
-		return simdfuse.Arg{}, 0, false
+		return simdfuse.Arg{}, 0, 0, false
 	}
 	aarg, aok := fb.chaseAddr(addr)
 	if !aok {
-		return simdfuse.Arg{}, 0, false
+		return simdfuse.Arg{}, 0, 0, false
 	}
-	return aarg, totals[0], true
+	oarg, ook := fb.chaseOffset(off)
+	if !ook || oarg.Kind != simdfuse.ArgConst || oarg.Const < 0 {
+		return simdfuse.Arg{}, 0, 0, false
+	}
+	return aarg, oarg.Const, totals[0], true
 }
 
 // f16WordLane matches one lane of the word-unpack form, returning the

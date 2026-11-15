@@ -49,14 +49,17 @@ const (
 )
 
 // scalarOpClass is the scalar vocabulary. Scalar loads mirror the
-// emitter's own unchecked scalar accesses (the memoryGrow hard cap
-// keeps every u32 offset inside the reserved region); the arithmetic
-// ops wrap mod 2^32 exactly like their wasm counterparts.
+// emitter's own scalar accesses: the effective address is the address
+// plus the static offset (an ArgConst or a scalar), added at 64 bits so
+// that a wasm32 address and offset make the 33-bit sum wasm defines, and
+// an access past memory.size traps (by a fault where linear memory is a
+// reservation, by the helpers' comparison elsewhere). The arithmetic ops
+// wrap mod 2^32 exactly like their wasm counterparts.
 //
-//	scalar_i32_load16_u  (addr)            -> i32   zero-extended
+//	scalar_i32_load16_u  (addr, offset)    -> i32   zero-extended
 //	scalar_i32_shl       (v, const)        -> i32
 //	scalar_i32_add       (a, b)            -> i32
-//	scalar_f32_load      (addr)            -> f32
+//	scalar_f32_load      (addr, offset)    -> f32
 //	scalar_f32_mul       (a, b)            -> f32
 var scalarOpClass = map[string]NodeClass{
 	"scalar_i32_load16_u": ClassI32,

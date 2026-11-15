@@ -435,7 +435,7 @@ func (t *translator) emitChunkAliasFiles(pkgName string, callerChunk int, dir st
 	bareWasm := t.emitWasmFnForwards(callerChunk, linknameForwardBare)
 	pureDecls := append([]ast.Decl{}, bareWasm...)
 	pureDecls = append(pureDecls, named...)
-	pureFile, err := t.formatAliasFile(pkgName, "!arm64 && (!amd64 || !amd64.v2)", pureDecls)
+	pureFile, err := t.formatAliasFile(pkgName, PureConstraint, pureDecls)
 	if err != nil {
 		return nil, err
 	}

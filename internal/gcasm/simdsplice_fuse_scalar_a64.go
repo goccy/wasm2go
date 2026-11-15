@@ -31,9 +31,10 @@ type a64ScalarPre struct {
 	fprOf     map[int]int    // ClassF32 node -> scratch V (value in lane 0)
 	// lutBase maps a table-base scalar index to a register holding the
 	// HOST address (memory base + table offset), hoisted by the loop
-	// splicer. When the classic lookup shape
-	// f32_load(add(shl(load16, 2), table)) hits a hoisted table, the
-	// shift and add elide into one scaled-register load.
+	// splicer. When the classic lookup shape — f32_load(add(shl(load16,
+	// 2), table)), or f32_load(shl(load16, 2)) with the table as the
+	// load's static offset — hits a hoisted table, the shift and add
+	// elide into one scaled-register load.
 	lutBase map[int]string
 	// elided marks nodes swallowed by that peephole; lutOf lists the
 	// f32 loads the peephole rewrites.
@@ -70,9 +71,11 @@ func newA64ScalarChain(b *strings.Builder, tree *simdfuse.Tree,
 			if p.elided == nil {
 				p.elided = map[int]bool{}
 			}
+			// The load16 and every node between it and the f32 load.
 			p.elided[ldIdx] = true
-			p.elided[tree.Nodes[n.Args[0].Index].Args[0].Index] = true
-			p.elided[n.Args[0].Index] = true
+			for j := n.Args[0].Index; j != ldIdx; j = tree.Nodes[j].Args[0].Index {
+				p.elided[j] = true
+			}
 			p.lutOf = append(p.lutOf, i)
 		}
 	}
@@ -238,22 +241,31 @@ func (p *a64ScalarPre) takeFpr(a simdfuse.Arg) (int, error) {
 	return f, nil
 }
 
-// lutPattern matches f32_load(add(shl(load16(...), 2), tableScalar))
+// lutPattern matches f32_load(add(shl(load16(...), 2), tableScalar)),
+// or f32_load(shl(load16(...), 2)) whose static offset is tableScalar,
 // against a hoisted table base, returning the load16 node and the
 // hoisted register.
 func (p *a64ScalarPre) lutPattern(n *simdfuse.Node) (int, string, bool) {
-	if p.lutBase == nil || n.Op != "scalar_f32_load" || n.Args[0].Kind != simdfuse.ArgNode {
+	if p.lutBase == nil || n.Op != "scalar_f32_load" || len(n.Args) != 2 || n.Args[0].Kind != simdfuse.ArgNode {
 		return 0, "", false
 	}
-	add := &p.tree.Nodes[n.Args[0].Index]
-	if add.Op != "scalar_i32_add" || add.Args[0].Kind != simdfuse.ArgNode || add.Args[1].Kind != simdfuse.ArgScalar {
+	shlIdx := n.Args[0].Index
+	table := n.Args[1]
+	if table.Kind == simdfuse.ArgConst && table.Const == 0 {
+		add := &p.tree.Nodes[shlIdx]
+		if add.Op != "scalar_i32_add" || add.Args[0].Kind != simdfuse.ArgNode || p.uses[shlIdx] != 1 {
+			return 0, "", false
+		}
+		shlIdx, table = add.Args[0].Index, add.Args[1]
+	}
+	if table.Kind != simdfuse.ArgScalar {
 		return 0, "", false
 	}
-	host, ok := p.lutBase[add.Args[1].Index]
+	host, ok := p.lutBase[table.Index]
 	if !ok {
 		return 0, "", false
 	}
-	shl := &p.tree.Nodes[add.Args[0].Index]
+	shl := &p.tree.Nodes[shlIdx]
 	if shl.Op != "scalar_i32_shl" || shl.Args[0].Kind != simdfuse.ArgNode || shl.Args[1].Const != 2 {
 		return 0, "", false
 	}
@@ -262,10 +274,42 @@ func (p *a64ScalarPre) lutPattern(n *simdfuse.Node) (int, string, bool) {
 		return 0, "", false
 	}
 	// The intermediate nodes must have no other consumers.
-	if p.uses[n.Args[0].Index] != 1 || p.uses[add.Args[0].Index] != 1 || p.uses[shl.Args[0].Index] != 1 {
+	if p.uses[n.Args[0].Index] != 1 || p.uses[shlIdx] != 1 || p.uses[shl.Args[0].Index] != 1 {
 		return 0, "", false
 	}
 	return shl.Args[0].Index, host, true
+}
+
+// addOffset adds a scalar load's static offset (its second operand) to
+// the address in g at 64 bits: on a wasm32 tree g holds the zero-extended
+// u32 address, and the 33-bit sum does not wrap. A memory64 tree's
+// offset is 0.
+func (p *a64ScalarPre) addOffset(g string, off simdfuse.Arg) error {
+	switch off.Kind {
+	case simdfuse.ArgConst:
+		u := uint64(uint32(off.Const))
+		if p.tree.Addr64 {
+			u = uint64(int64(off.Const))
+		}
+		switch {
+		case u == 0:
+		case u < 4096:
+			fmt.Fprintf(p.b, "\tADD $%d, %s, %s\n", u, g, g)
+		default:
+			fmt.Fprintf(p.b, "\tMOVD $%d, R22\n", int64(u))
+			fmt.Fprintf(p.b, "\tADD R22, %s, %s\n", g, g)
+		}
+	case simdfuse.ArgScalar:
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tADD %s, %s, %s\n", p.scalarReg(off), g, g)
+		} else {
+			fmt.Fprintf(p.b, "\tMOVWU %s, R22\n", p.scalarReg(off))
+			fmt.Fprintf(p.b, "\tADD R22, %s, %s\n", g, g)
+		}
+	default:
+		return fmt.Errorf("fused splice %s: bad scalar load offset", p.tree.Name)
+	}
+	return nil
 }
 
 func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
@@ -281,7 +325,18 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		// dot kernel by direct measurement before being wired here.
 		_ = host
 		ld := &p.tree.Nodes[ldIdx]
-		if hp, c, hok := a64HostPtrArg(p.hostPtrs, ld.Args[0]); hok {
+		ldAddr := ld.Args[0]
+		if off := ld.Args[1]; off.Kind == simdfuse.ArgConst && off.Const != 0 {
+			// A carried host pointer reads the 33-bit address directly:
+			// fold the static offset into the bumped scalar's addend.
+			switch ldAddr.Kind {
+			case simdfuse.ArgScalar:
+				ldAddr = simdfuse.Arg{Kind: simdfuse.ArgSum, Index: ldAddr.Index, Const: off.Const}
+			default:
+				ldAddr = simdfuse.Arg{Kind: simdfuse.ArgNode, Index: -1}
+			}
+		}
+		if hp, c, hok := a64HostPtrArg(p.hostPtrs, ldAddr); hok && ld.Args[1].Kind == simdfuse.ArgConst && uint32(ld.Args[1].Const) < 1<<31 {
 			if imm, sok := hp.imm(p.b, c, 2); sok {
 				f, err := p.allocFpr()
 				if err != nil {
@@ -298,6 +353,9 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 		}
 		g, err := p.takeGpr(ld.Args[0])
 		if err != nil {
+			return err
+		}
+		if err := p.addOffset(g, ld.Args[1]); err != nil {
 			return err
 		}
 		f, err := p.allocFpr()
@@ -320,6 +378,9 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 	case "scalar_i32_load16_u":
 		g, err := p.takeGpr(n.Args[0])
 		if err != nil {
+			return err
+		}
+		if err := p.addOffset(g, n.Args[1]); err != nil {
 			return err
 		}
 		fmt.Fprintf(p.b, "\tMOVHU (R20)(%s), %s\n", g, g)
@@ -365,6 +426,9 @@ func (p *a64ScalarPre) emit(i int, n *simdfuse.Node) error {
 	case "scalar_f32_load":
 		g, err := p.takeGpr(n.Args[0])
 		if err != nil {
+			return err
+		}
+		if err := p.addOffset(g, n.Args[1]); err != nil {
 			return err
 		}
 		f, err := p.allocFpr()

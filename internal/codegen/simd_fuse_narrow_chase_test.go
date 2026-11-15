@@ -32,12 +32,12 @@ func parseStmts(t *testing.T, body string) []ast.Stmt {
 }
 
 // narrowFB builds a builder with one intervener definition: a 64-bit
-// linear-memory load of the pointer local p.
+// linear-memory load of the pointer local p, in a memory64 module.
 func narrowFB(t *testing.T) *fusedTreeBuilder {
 	t.Helper()
 	def := parseStmts(t, "v = *(*int64)(unsafe.Add(mBase, uint64(p)))")[0].(*ast.AssignStmt)
 	return &fusedTreeBuilder{
-		sc:        &simdScalarizer{},
+		sc:        &simdScalarizer{em: &ssaEmitter{mem64: true}},
 		wideChase: true,
 		interDef:  map[string]*ast.AssignStmt{"v": def},
 	}
@@ -65,6 +65,9 @@ func TestChaseNarrowExtract16LowHalfword(t *testing.T) {
 	if a := n.Args[0]; a.Kind != simdfuse.ArgScalar || a.Const != 0 {
 		t.Fatalf("addr arg: %+v", a)
 	}
+	if o := n.Args[1]; o.Kind != simdfuse.ArgConst || o.Const != 0 {
+		t.Fatalf("offset arg: %+v", o)
+	}
 	if fb.chaseUses["v"] != 1 {
 		t.Fatalf("intervener consumption not recorded: %v", fb.chaseUses)
 	}
@@ -88,9 +91,13 @@ func TestChaseNarrowExtract16ShiftedLanes(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: not narrowed", tc.src)
 		}
+		// The halfword's position rides the load's static offset.
 		n := loadNodeOf(t, fb, arg)
-		if a := n.Args[0]; a.Kind != simdfuse.ArgSum || a.Const != tc.off {
-			t.Fatalf("%s: addr arg %+v, want sum +%d", tc.src, a, tc.off)
+		if a := n.Args[0]; a.Kind != simdfuse.ArgScalar {
+			t.Fatalf("%s: addr arg %+v, want the pointer scalar", tc.src, a)
+		}
+		if o := n.Args[1]; o.Kind != simdfuse.ArgConst || o.Const != tc.off {
+			t.Fatalf("%s: offset arg %+v, want %d", tc.src, o, tc.off)
 		}
 	}
 }

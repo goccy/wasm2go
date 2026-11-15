@@ -10,6 +10,7 @@ import (
 
 	"github.com/goccy/wasm2go/internal/emit"
 	"github.com/goccy/wasm2go/internal/ssa"
+	"github.com/goccy/wasm2go/internal/wasm"
 )
 
 // formatExpr / formatStmt render an AST node through go/format so the
@@ -328,9 +329,9 @@ func constArgExpr(v *ssa.Value) ast.Expr {
 // inline. (The constant-base path was already covered; this pins the
 // runtime-base path that regressed arm64 for wasmify's simplelib bundle.)
 func TestMemOffsetExpr_RuntimeBaseLargeOffset(t *testing.T) {
-	em := newSSAEmitter(&translator{})
+	em := newSSAEmitter(&translator{mod: &wasm.Module{}, helpers: map[string]bool{}})
 
-	large := formatExpr(t, em.memOffsetExpr(newID("v160"), 33571920, nil))
+	large := formatExpr(t, em.memOffsetExpr(newID("v160"), 33571920, nil, 8))
 	if !strings.Contains(large, "_consts[") {
 		t.Errorf("large runtime-base offset must route through _consts, got: %s", large)
 	}
@@ -338,7 +339,7 @@ func TestMemOffsetExpr_RuntimeBaseLargeOffset(t *testing.T) {
 		t.Errorf("large offset must not appear as a bare immediate, got: %s", large)
 	}
 
-	small := formatExpr(t, em.memOffsetExpr(newID("v160"), 8, nil))
+	small := formatExpr(t, em.memOffsetExpr(newID("v160"), 8, nil, 8))
 	if strings.Contains(small, "_consts") {
 		t.Errorf("small runtime-base offset must stay inline, got: %s", small)
 	}

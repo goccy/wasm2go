@@ -136,18 +136,19 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 		}
 		return 0, false
 	case *ast.StarExpr:
-		addr, is64, ok := matchMemDeref(x, "float32")
+		addr, off, ok := fb.matchMemDeref(x, "float32")
 		if !ok {
 			return 0, false
-		}
-		if is64 {
-			fb.addr64 = true
 		}
 		aarg, ok := fb.chaseAddr(addr)
 		if !ok {
 			return 0, false
 		}
-		return fb.addScalarNode("scalar_f32_load", []simdfuse.Arg{aarg})
+		oarg, ok := fb.chaseOffset(off)
+		if !ok {
+			return 0, false
+		}
+		return fb.addScalarNode("scalar_f32_load", []simdfuse.Arg{aarg, oarg})
 	case *ast.Ident:
 		// f32 chains are NOT cached across uses: their terminals live in
 		// low scratch registers only until the immediately-following
@@ -176,18 +177,19 @@ func (fb *fusedTreeBuilder) chaseF32(e ast.Expr) (int, bool) {
 // chaseLoad16Deref matches a `*(*uint16)(...)` linear-memory read and
 // registers it as a scalar_i32_load16_u node over the chased address.
 func (fb *fusedTreeBuilder) chaseLoad16Deref(inner *ast.StarExpr) (simdfuse.Arg, bool) {
-	addr, is64, mok := matchMemDeref(inner, "uint16")
+	addr, off, mok := fb.matchMemDeref(inner, "uint16")
 	if !mok {
 		return simdfuse.Arg{}, false
-	}
-	if is64 {
-		fb.addr64 = true
 	}
 	aarg, aok := fb.chaseAddr(addr)
 	if !aok {
 		return simdfuse.Arg{}, false
 	}
-	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
+	oarg, ook := fb.chaseOffset(off)
+	if !ook {
+		return simdfuse.Arg{}, false
+	}
+	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg, oarg})
 	if !nok {
 		return simdfuse.Arg{}, false
 	}
@@ -298,16 +300,15 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 		return simdfuse.Arg{}, false
 	}
 	var (
-		addr ast.Expr
-		is64 bool
-		bits int32
+		addr, off ast.Expr
+		bits      int32
 	)
 	for _, w := range []struct {
 		typ  string
 		bits int32
 	}{{"uint64", 64}, {"int64", 64}, {"uint32", 32}, {"int32", 32}} {
-		if a, i64, mok := matchMemDeref(star, w.typ); mok {
-			addr, is64, bits = a, i64, w.bits
+		if a, o, mok := fb.matchMemDeref(star, w.typ); mok {
+			addr, off, bits = a, o, w.bits
 			break
 		}
 	}
@@ -318,24 +319,20 @@ func (fb *fusedTreeBuilder) chaseNarrowExtract16(x *ast.BinaryExpr) (simdfuse.Ar
 	if !aok {
 		return simdfuse.Arg{}, false
 	}
-	if off := shift / 8; off != 0 {
-		switch aarg.Kind {
-		case simdfuse.ArgConst, simdfuse.ArgSum:
-			aarg.Const += off
-		case simdfuse.ArgScalar:
-			aarg = simdfuse.Arg{Kind: simdfuse.ArgSum, Index: aarg.Index, Const: off}
-		default:
-			idx, ok := fb.addScalarNode("scalar_i32_add", []simdfuse.Arg{aarg, {Kind: simdfuse.ArgConst, Const: off}})
-			if !ok {
-				return simdfuse.Arg{}, false
-			}
-			aarg = simdfuse.Arg{Kind: simdfuse.ArgNode, Index: idx}
+	oarg, ook := fb.chaseOffset(off)
+	if !ook {
+		return simdfuse.Arg{}, false
+	}
+	// The field lies shift/8 bytes into the wide load: past its static
+	// offset, which the load adds at 64 bits (a constant one only; the
+	// sum stays below 2^31 so the operand keeps its unsigned value).
+	if d := shift / 8; d != 0 {
+		if oarg.Kind != simdfuse.ArgConst || uint64(uint32(oarg.Const))+uint64(d) >= 1<<31 {
+			return simdfuse.Arg{}, false
 		}
+		oarg.Const += d
 	}
-	if is64 {
-		fb.addr64 = true
-	}
-	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg})
+	idx, nok := fb.addScalarNode("scalar_i32_load16_u", []simdfuse.Arg{aarg, oarg})
 	if !nok {
 		return simdfuse.Arg{}, false
 	}
@@ -722,52 +719,75 @@ func helperName(fun ast.Expr) string {
 	return ""
 }
 
-// matchMemDeref matches the emitter's unchecked scalar memory access
-// `*(*T)(unsafe.Add(mBase, ADDR))` and returns ADDR. mBase is the
-// emitter's function-local cache of m.M; no call can intervene inside
-// a window, so the cached pointer cannot go stale relative to the
-// fused call's own memory base.
-func matchMemDeref(star *ast.StarExpr, typ string) (addr ast.Expr, is64 bool, ok bool) {
+// matchMemDeref matches the emitter's scalar memory access
+// `*(*T)(unsafe.Add(mBase, ADDR))` and returns its address and static
+// offset as the chase builds the access from them. A wasm32 ADDR is
+// `memEA32(lim, ADDRESS, OFFSET, size)` (a call the emitter marks, see
+// memOffsetExpr): the address is the `uint32(X)` operand and the offset
+// the u32 one, which the scalar loads add at 64 bits — the 33-bit
+// effective address does not wrap. A memory64 ADDR is `uint64(X)`, whose
+// X carries the offset (off is nil), and a constant ADDR is the address
+// itself. It also marks the tree a memory64 one for a memory64 module.
+// mBase is the emitter's function-local cache of m.M; no call can
+// intervene inside a window, so the cached pointer cannot go stale
+// relative to the fused call's own memory base.
+func (fb *fusedTreeBuilder) matchMemDeref(star *ast.StarExpr, typ string) (addr, off ast.Expr, ok bool) {
 	conv, ok := star.X.(*ast.CallExpr)
 	if !ok || len(conv.Args) != 1 {
-		return nil, false, false
+		return nil, nil, false
 	}
 	paren, ok := conv.Fun.(*ast.ParenExpr)
 	if !ok {
-		return nil, false, false
+		return nil, nil, false
 	}
 	ptr, ok := paren.X.(*ast.StarExpr)
 	if !ok {
-		return nil, false, false
+		return nil, nil, false
 	}
 	if id, ok := ptr.X.(*ast.Ident); !ok || id.Name != typ {
-		return nil, false, false
+		return nil, nil, false
 	}
 	add, ok := conv.Args[0].(*ast.CallExpr)
 	if !ok || len(add.Args) != 2 {
-		return nil, false, false
+		return nil, nil, false
 	}
 	sel, ok := add.Fun.(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Add" {
-		return nil, false, false
+		return nil, nil, false
 	}
 	if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "unsafe" {
-		return nil, false, false
+		return nil, nil, false
 	}
 	if base, ok := add.Args[0].(*ast.Ident); !ok || base.Name != "mBase" {
-		return nil, false, false
+		return nil, nil, false
 	}
-	// memory64 wraps the address in uint64(...) before unsafe.Add;
-	// unwrap it so the address chase sees the raw arithmetic (wasm32
-	// keeps whatever the emitter produced — usually a bare sum). The
-	// returned is64 marks the whole tree Addr64 at the call site.
 	addr = add.Args[1]
-	if conv, ok := addr.(*ast.CallExpr); ok && len(conv.Args) == 1 {
-		if id, ok := conv.Fun.(*ast.Ident); ok && id.Name == "uint64" {
-			addr, is64 = conv.Args[0], true
+	if fb.sc.em.mem64 {
+		fb.addr64 = true
+		if conv, ok := addr.(*ast.CallExpr); ok && len(conv.Args) == 1 {
+			if id, ok := conv.Fun.(*ast.Ident); ok && id.Name == "uint64" {
+				addr = conv.Args[0]
+			}
 		}
+		return addr, nil, true
 	}
-	return addr, is64, true
+	if ea, ok := addr.(*ast.CallExpr); ok && fb.sc.em.memEACalls[ea] {
+		return ea.Args[1], ea.Args[2], true
+	}
+	return addr, nil, true
+}
+
+// chaseOffset resolves a static offset matchMemDeref returned: nil is 0,
+// a constant is an ArgConst holding its u32 bit pattern, and a constant
+// table read (a large offset) a scalar parameter.
+func (fb *fusedTreeBuilder) chaseOffset(off ast.Expr) (simdfuse.Arg, bool) {
+	if off == nil {
+		return simdfuse.Arg{Kind: simdfuse.ArgConst}, true
+	}
+	if c, ok := fb.constValueOf(stripIntConv(off)); ok {
+		return simdfuse.Arg{Kind: simdfuse.ArgConst, Const: c}, true
+	}
+	return fb.chaseI32(off)
 }
 
 // matchShiftConst matches the emitter's masked shift count

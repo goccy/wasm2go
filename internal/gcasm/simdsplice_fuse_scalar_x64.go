@@ -163,6 +163,39 @@ func (p *x64ScalarPre) takeGpr(a simdfuse.Arg) (string, error) {
 	return "", fmt.Errorf("fused splice %s: bad scalar operand kind", p.tree.Name)
 }
 
+// addOffset adds a scalar load's static offset (its second operand) to
+// the address in g at 64 bits: on a wasm32 tree g holds the zero-extended
+// u32 address (the 32-bit forms clear the upper half), and the 33-bit sum
+// does not wrap. AX, which the load then fills with the memory base, is
+// the scratch. A memory64 tree's offset is 0.
+func (p *x64ScalarPre) addOffset(g string, off simdfuse.Arg) error {
+	switch off.Kind {
+	case simdfuse.ArgConst:
+		u := uint64(uint32(off.Const))
+		if p.tree.Addr64 {
+			u = uint64(int64(off.Const))
+		}
+		switch {
+		case u == 0:
+		case u < 1<<31:
+			fmt.Fprintf(p.b, "\tADDQ $%d, %s\n", u, g)
+		default:
+			fmt.Fprintf(p.b, "\tMOVQ $%d, AX\n", int64(u))
+			fmt.Fprintf(p.b, "\tADDQ AX, %s\n", g)
+		}
+	case simdfuse.ArgScalar:
+		if p.tree.Addr64 {
+			fmt.Fprintf(p.b, "\tMOVQ %s, AX\n", p.scalarReg(off))
+		} else {
+			fmt.Fprintf(p.b, "\tMOVL %s, AX\n", p.scalarReg(off))
+		}
+		fmt.Fprintf(p.b, "\tADDQ AX, %s\n", g)
+	default:
+		return fmt.Errorf("fused splice %s: bad scalar load offset", p.tree.Name)
+	}
+	return nil
+}
+
 func (p *x64ScalarPre) takeFpr(a simdfuse.Arg) (int, error) {
 	if a.Kind != simdfuse.ArgNode {
 		return 0, fmt.Errorf("fused splice %s: f32 operand must be a node", p.tree.Name)
@@ -189,6 +222,9 @@ func (p *x64ScalarPre) emit(i int, n *simdfuse.Node) error {
 	case "scalar_i32_load16_u":
 		g, err := p.takeGpr(n.Args[0])
 		if err != nil {
+			return err
+		}
+		if err := p.addOffset(g, n.Args[1]); err != nil {
 			return err
 		}
 		fmt.Fprintf(p.b, "\tMOVWLZX (%s)(%s*1), %s\n", x64MemBase(p.b, p.offs), g, g)
@@ -234,6 +270,9 @@ func (p *x64ScalarPre) emit(i int, n *simdfuse.Node) error {
 	case "scalar_f32_load":
 		g, err := p.takeGpr(n.Args[0])
 		if err != nil {
+			return err
+		}
+		if err := p.addOffset(g, n.Args[1]); err != nil {
 			return err
 		}
 		f, err := p.allocFpr()

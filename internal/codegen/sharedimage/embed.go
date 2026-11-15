@@ -38,6 +38,15 @@ var highTmpl string
 //go:embed sharedimage_nohigh.go.txt
 var nohighTmpl string
 
+//go:embed memreserve.go.txt
+var reserveTmpl string
+
+//go:embed memreserve_on.go.txt
+var reserveOnTmpl string
+
+//go:embed memreserve_off.go.txt
+var reserveOffTmpl string
+
 // Names are the identifiers the emitting package supplies.
 type Names struct {
 	Pkg     string // package clause of the generated files
@@ -46,16 +55,45 @@ type Names struct {
 	MemMu   string // Module's memory lock field
 	MemSize string // Module's *atomic.Uint64 current-size field
 	DataEnd string // Module's data-segment-extent field
+	MemRes  string // Module's owned-reservation field
 
 	// SaveGlobals is the generated globals-snapshot function (see
 	// emitGlobalsSnapshot); multi-package output exports it.
 	SaveGlobals string
+
+	// Exported adds the exported forms of the reservation runtime that
+	// the module's other packages call (multi-package output).
+	Exported bool
+	// The shape of a linear memory's reservation (see memreserve.go.txt):
+	// it runs ReserveGuard bytes past its limit; the limit is at most
+	// ReserveMax, ReserveDefault for a memory given no ceiling, and always
+	// ReserveMax when ReserveFixed.
+	ReserveGuard   uint64
+	ReserveMax     uint64
+	ReserveDefault uint64
+	ReserveFixed   bool
 }
+
+// ReservedConstraint is the build constraint under which a linear memory
+// is a reservation (memreserve_on.go): a unix host with a 64-bit address
+// space, without the wasm2go_boundschecks tag. It names the 32-bit hosts
+// rather than the 64-bit ones, so that gcasm's capture, which drops the
+// files whose constraint names amd64 or arm64, keeps these as they are.
+//
+// The assembly gcasm captures is compiled from the generated code in this
+// form (the bounds checks it carries are the reservation's), so it applies
+// under exactly this constraint, and the pure Go form everywhere else:
+// see codegen's pureFallbackTag and gcasm's archSpecs.
+const ReservedConstraint = "unix && !wasm2go_boundschecks && !(386 || arm || mips || mipsle)"
+
+// Reserved is ReservedConstraint, for the templates' build lines.
+func (Names) Reserved() string { return ReservedConstraint }
 
 // Files renders the runtime: output filename → formatted Go source. The
 // files split by platform (mmap / no mmap, whether the pages a process
-// changed can be told, and whether an image file's descriptor is kept out
-// of the low numbers) and must be emitted together.
+// changed can be told, whether an image file's descriptor is kept out of
+// the low numbers, whether memory is a reservation) and must be emitted
+// together.
 func Files(n Names) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	for name, src := range map[string]string{
@@ -66,6 +104,9 @@ func Files(n Names) (map[string][]byte, error) {
 		"sharedimage_other.go":  nolinuxTmpl,
 		"sharedimage_high.go":   highTmpl,
 		"sharedimage_nohigh.go": nohighTmpl,
+		"memreserve.go":         reserveTmpl,
+		"memreserve_on.go":      reserveOnTmpl,
+		"memreserve_off.go":     reserveOffTmpl,
 	} {
 		t, err := template.New(name).Parse(src)
 		if err != nil {

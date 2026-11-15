@@ -195,6 +195,9 @@ func TestAsmOverrideEndToEnd(t *testing.T) {
 		for n, data := range res.Sidecars {
 			w("pkg/"+n, data)
 		}
+		for n, data := range res.AuxFiles {
+			w("pkg/"+n, data)
+		}
 		w("main.go", []byte(asmOverrideDriver))
 		cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
 		cmd.Dir = mod

@@ -82,6 +82,9 @@ func gate4At(t *testing.T, fixture string, modPath string) {
 	for name, data := range res.Sidecars {
 		treeIn[name] = data
 	}
+	for name, data := range res.AuxFiles {
+		treeIn[name] = data
+	}
 	for name, data := range res.Files {
 		treeIn[name] = data
 	}
@@ -120,6 +123,9 @@ func gate4At(t *testing.T, fixture string, modPath string) {
 		for name, data := range res.Sidecars {
 			tree["pkg/"+name] = data
 		}
+		for name, data := range res.AuxFiles {
+			tree["pkg/"+name] = data
+		}
 		for name, data := range res.Files {
 			tree["pkg/"+name] = data
 		}
@@ -138,6 +144,9 @@ func gate4At(t *testing.T, fixture string, modPath string) {
 				pf["gen.go"] = buf.Bytes()
 			}
 			for name, data := range res.Sidecars {
+				pf[name] = data
+			}
+			for name, data := range res.AuxFiles {
 				pf[name] = data
 			}
 			for name, data := range res.Files {

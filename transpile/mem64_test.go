@@ -24,6 +24,12 @@ func buildMem64(t *testing.T, fixture, mainBody string) string {
 // OutputImportPath are set here).
 func buildMem64With(t *testing.T, fixture, mainBody string, opts transpile.Options) string {
 	t.Helper()
+	return buildMem64Main(t, fixture, "package main\n\nimport (\n\t\"fmt\"\n\n\t\"m64test/pkg\"\n)\n\nfunc main() {\n"+mainBody+"}\n", opts)
+}
+
+// buildMem64Main is buildMem64With with the whole main.go source.
+func buildMem64Main(t *testing.T, fixture, mainSrc string, opts transpile.Options) string {
+	t.Helper()
 	bin := testfixture.Wasm(t, fixture)
 	m, err := transpile.Parse(bytes.NewReader(bin))
 	if err != nil {
@@ -57,7 +63,7 @@ func buildMem64With(t *testing.T, fixture, mainBody string, opts transpile.Optio
 			w("pkg/"+name, data)
 		}
 	}
-	w("main.go", []byte("package main\n\nimport (\n\t\"fmt\"\n\n\t\"m64test/pkg\"\n)\n\nfunc main() {\n"+mainBody+"}\n"))
+	w("main.go", []byte(mainSrc))
 	return dir
 }
 

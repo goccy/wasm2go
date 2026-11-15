@@ -95,7 +95,7 @@ func runGoSnippet(t *testing.T, generated string, mainSrc string, sidecars ...ma
 // bundle covered amd64 only from amd64.v2 on: with the older form alone,
 // the guard stayed in place on an arm64 test host and the snippets did not
 // compile (their function bodies were left out).
-var pureGuardRe = regexp.MustCompile(`(?m)^//go:build (!amd64 && !arm64|!arm64 && \(!amd64 \|\| !amd64\.v2\))\n`)
+var pureGuardRe = regexp.MustCompile(`(?m)^//go:build (!amd64 && !arm64|` + regexp.QuoteMeta(codegen.PureConstraint) + `)\n`)
 
 // stripPureGuard removes the pure fallback constraint from a generated
 // file so codegen's pure-Go function bodies compile and run on the

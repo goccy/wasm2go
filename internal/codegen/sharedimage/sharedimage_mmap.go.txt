@@ -66,6 +66,7 @@ func unmapMemory(mem []byte) {
 	if len(mem) == 0 {
 		return
 	}
+	memUnregister(mem)
 	_ = syscall.Munmap(mem)
 }
 

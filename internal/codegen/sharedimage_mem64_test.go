@@ -15,9 +15,10 @@ import (
 // past 4 GiB in place: in memory of an instance's own (AnonymousMemory), in
 // the memory of a fork of such an instance (ForkMemory), and on an image
 // built in place on a memory already past 4 GiB, whose data segments end
-// above 2^32 (DataEnd). Every mapping is 8 GiB long and only a few of its
-// pages are ever touched, so the process stays small; a host that cannot
-// map 8 GiB skips the test.
+// above 2^32 (DataEnd). Every mapping holds a memory of up to 8 GiB (where
+// linear memory is a reservation it runs a guard region past that) and
+// only a few of its pages are ever touched, so the process stays small; a
+// host that cannot map 8 GiB skips the test.
 func TestSharedImageMem64MappingsAboveFourGiB(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("no mmap: the generated package cannot map memory")
@@ -43,8 +44,8 @@ import (
 	"gentest/pkg"
 )
 
-// ceiling is the length of every mapping: twice what a wasm32 memory can
-// address.
+// ceiling is how far every mapping's memory may grow: twice what a wasm32
+// memory can address.
 const ceiling = 8 << 30
 
 // fourGiB is 4 GiB in wasm pages.
@@ -72,7 +73,7 @@ func main() {
 		fmt.Println("unmappable:", err)
 		return
 	}
-	fmt.Println("own memory mapped:", uint64(len(mem)) == ceiling)
+	fmt.Println("own memory mapped:", uint64(len(mem)) >= ceiling)
 	a := pkg.NewWithMemory(mem, pkg.InitialMemoryBytes)
 	at := &a.Memory()[:1][0]
 	fmt.Println("a holds", read(a, 1024, 14))
@@ -94,7 +95,7 @@ func main() {
 		panic(err)
 	}
 	c := pkg.NewFromSnapshot(f.Memory, f.Size, f.Globals)
-	fmt.Println("fork mapped:", uint64(len(f.Memory)) == ceiling, "c inherits", c.Peek(2048))
+	fmt.Println("fork mapped:", uint64(len(f.Memory)) >= ceiling, "c inherits", c.Peek(2048))
 	fmt.Println("c grows from", c.Grow(fourGiB))
 	c.Poke(high, 'C')
 	fmt.Println("c reads", c.Peek(high))

@@ -32,13 +32,13 @@ type ssaEmitter struct {
 	// evaluation could run memory.grow. See emitFuncBody.
 	memBaseHoisted bool
 	// memGuardPlan (per function) is memGuardCoverage's plan of the
-	// memory64 bounds checks: the accesses whose check an earlier one
-	// implies, and the checks widened over the accesses after them. It
-	// is computed once over the function's dominator tree because the
-	// emitters visit blocks in their own order (and duplicate some), so
-	// "did a covering check run on every path here" cannot be answered
-	// at the emission point.
-	memGuardPlan map[ssa.ValueID]uint64
+	// bounds checks: the accesses whose check an earlier one implies, and
+	// the checks widened over the accesses after them. It is computed
+	// once over the function's dominator tree because the emitters visit
+	// blocks in their own order (and duplicate some), so "did a covering
+	// check run on every path here" cannot be answered at the emission
+	// point.
+	memGuardPlan map[ssa.ValueID]memPlan
 	// memTrapsUsed (per function) records the trap helpers the
 	// function's bounds checks branch to, so that memTrapTail emits the
 	// blocks that are jumped to and no other (an unused label does not
@@ -73,6 +73,10 @@ type ssaEmitter struct {
 	// Reset per function.
 	simdCalls  map[*ast.CallExpr]simdCallMark
 	simdConsts map[*ast.CompositeLit]bool
+	// memEACalls marks the memEA32 calls that compute the effective
+	// addresses of the function's wasm32 accesses (memEA32Call), which
+	// the fused-region chase sees through. Reset per function.
+	memEACalls map[*ast.CallExpr]bool
 	// curFn is the function whose body is being emitted; the fusion
 	// pass keys direct-asm window retention off its name.
 	curFn *ssa.Func
@@ -131,6 +135,7 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 	// The SIMD marks are per-function state for the scalarization pass.
 	em.simdCalls = nil
 	em.simdConsts = nil
+	em.memEACalls = nil
 	em.curFn = f
 	em.spinHeaders = spinGuardHeaders(f)
 	em.spinGuardEmitted = false
@@ -208,6 +213,22 @@ func (em *ssaEmitter) emitFuncBody(f *ssa.Func) (*ast.BlockStmt, error) {
 					Tok: token.ASSIGN,
 					Lhs: []ast.Expr{newID("_")},
 					Rhs: []ast.Expr{newID(memLimLocal)},
+				})
+		}
+		if em.memResHoisted() {
+			// The reservation checks' copy of the reservation's limit,
+			// read where mBase is (see "Bounds checks" in
+			// emit_memguard.go).
+			prologue = append(prologue,
+				&ast.AssignStmt{
+					Tok: token.DEFINE,
+					Lhs: []ast.Expr{newID(memResLocal)},
+					Rhs: []ast.Expr{em.memResRead()},
+				},
+				&ast.AssignStmt{
+					Tok: token.ASSIGN,
+					Lhs: []ast.Expr{newID("_")},
+					Rhs: []ast.Expr{newID(memResLocal)},
 				})
 		}
 		body.List = append(prologue, body.List...)
@@ -356,8 +377,9 @@ func opCanGrowMemory(op ssa.Op) bool {
 // maybeMemBaseRefresh appends `mBase = m.M` to stmts when the just-
 // emitted value can have grown (and therefore relocated) the linear
 // memory. No-op when the function has no hoisted base. The bounds
-// checks' mLim, where the function keeps one, is refreshed with it:
-// memory.grow moves memory.size too.
+// checks' mLim and mRes, where the function keeps them, are refreshed with
+// it: memory.grow moves memory.size, and may move the memory to a larger
+// reservation.
 func (em *ssaEmitter) maybeMemBaseRefresh(stmts []ast.Stmt, v *ssa.Value) []ast.Stmt {
 	if !em.memBaseHoisted || !opCanGrowMemory(v.Op) {
 		return stmts
@@ -372,6 +394,13 @@ func (em *ssaEmitter) maybeMemBaseRefresh(stmts []ast.Stmt, v *ssa.Value) []ast.
 			Tok: token.ASSIGN,
 			Lhs: []ast.Expr{newID(memLimLocal)},
 			Rhs: []ast.Expr{em.memSizeRead()},
+		})
+	}
+	if em.memResHoisted() {
+		stmts = append(stmts, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID(memResLocal)},
+			Rhs: []ast.Expr{em.memResRead()},
 		})
 	}
 	return stmts

@@ -148,7 +148,7 @@ func (em *ssaEmitter) unsafeDerefExpr(spec memOpSpec, baseExpr ast.Expr, offset 
 	em.useImport("unsafe")
 	added := &ast.CallExpr{
 		Fun:  &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Add")},
-		Args: []ast.Expr{em.memBasePtrExpr(), em.memOffsetExpr(baseExpr, offset, baseVal)},
+		Args: []ast.Expr{em.memBasePtrExpr(), em.memOffsetExpr(baseExpr, offset, baseVal, memElemSize(spec.elemType))},
 	}
 	castFn := &ast.ParenExpr{X: &ast.StarExpr{X: newID(spec.elemType)}}
 	cast := &ast.CallExpr{Fun: castFn, Args: []ast.Expr{added}}
@@ -172,9 +172,10 @@ func (em *ssaEmitter) memBasePtrExpr() ast.Expr {
 	return &ast.SelectorExpr{X: newID("m"), Sel: newID("M")}
 }
 
-// memOffsetExpr returns the integer offset passed to unsafe.Add. It
-// elides redundant casts and routes large constant offsets through
-// the package-level _consts table:
+// memOffsetExpr returns the integer offset passed to unsafe.Add for an
+// access of size bytes (0: an inline atomic, whose own check stands in
+// front of it). It elides redundant casts and routes large constant
+// offsets through the package-level _consts table:
 //
 //   - A constant baseExpr emitted as int32(N) by emitConst is unwrapped:
 //     small totals (< largeConstThreshold) become a bare untyped literal
@@ -183,16 +184,21 @@ func (em *ssaEmitter) memBasePtrExpr() ast.Expr {
 //     runtime memory load, which the Go ARM64 backend resolves with
 //     register-offset LDR — sidestepping the literal-pool reachability
 //     failure that otherwise blows up very large transpiled functions.
-//   - Values whose int32 representation has the high bit set keep the
-//     uint32 wrap so the bit pattern survives Go's sign-extension to
-//     uintptr (only applies on the inline literal path; table entries
-//     already hold the full uintptr bit pattern).
-//   - Runtime int32 baseExprs are wrapped in uint32(...) for the same
-//     zero-extension guarantee.
-func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *ssa.Value) ast.Expr {
+//   - Runtime int32 baseExprs are wrapped in uint32(...) so that Go does
+//     not sign-extend them.
+//
+// The effective address of a wasm32 access is the unsigned i32 address
+// plus the u32 offset, a 33-bit sum that does not wrap: an address and
+// offset that reach past 4 GiB name bytes past every memory instead of
+// wrapping around to its start. A plain access computes it through
+// memEA32 (see "Bounds checks" in emit_memguard.go), which also bounds
+// it where linear memory is no reservation; a constant one whose bytes
+// lie within the declared minimum needs neither.
+func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *ssa.Value, size uint64) ast.Expr {
 	if em.mem64 {
 		return em.memOffsetExpr64(baseExpr, offset, baseVal)
 	}
+	checked := size != 0 && em.memGuarded()
 	n, ok := constInt32(baseExpr)
 	if !ok {
 		// The AST shape check misses a constant base that was HOISTED
@@ -210,13 +216,10 @@ func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *s
 		}
 	}
 	if !ok {
-		// baseExpr is not a compile-time int32 constant — fall back to
-		// the runtime cast path with an explicit uint32 wrap so wasm's
-		// unsigned-i32 address semantics survive Go's sign-extension
-		// to uintptr.
 		addr := ast.Expr(&ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{baseExpr}})
+		var off ast.Expr
 		if offset != 0 {
-			var off ast.Expr = uintLit(offset)
+			off = uintLit(offset)
 			// A large static offset added to a runtime index must NOT be
 			// emitted as a bare immediate: the gc ARM64 backend fuses
 			// adjacent f64 loads at a common base into an FLDPD (load-pair)
@@ -225,28 +228,66 @@ func (em *ssaEmitter) memOffsetExpr(baseExpr ast.Expr, offset uint64, baseVal *s
 			// ("constant is not in pool"). Routing the offset through the
 			// _consts table forces a runtime memory load, so the backend
 			// keeps the offset in a register (register-offset LDR) and no
-			// out-of-range immediate is ever formed. uint32(...) preserves
-			// the wasm unsigned-i32 wrap of the index+offset addition.
+			// out-of-range immediate is ever formed.
 			if offset >= largeConstThreshold && em.t != nil {
-				off = &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{em.constsIndexExpr(offset)}}
+				off = &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{em.constsIndexExpr(offset)}}
 			}
-			addr = &ast.BinaryExpr{X: addr, Op: token.ADD, Y: off}
 		}
-		return addr
+		if checked {
+			if off == nil {
+				off = uintLit(0)
+			}
+			return em.memEA32Call(addr, off, size)
+		}
+		sum := ast.Expr(&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{addr}})
+		if off != nil {
+			sum = &ast.BinaryExpr{X: sum, Op: token.ADD, Y: off}
+		}
+		return sum
 	}
 	total := uint64(uint32(n)) + offset
-	// Large positive offsets land in the table. Negative-int32
-	// constants (high-bit-set unsigned addresses) ALWAYS go to the
-	// table — they're always above the threshold once interpreted
-	// as uint64, and the table entry stores the full pattern so we
-	// don't need the uint32 wrap on the access site.
+	// Large totals land in the table. Negative-int32 constants
+	// (high-bit-set unsigned addresses) ALWAYS go to the table —
+	// they're always above the threshold once interpreted as uint64,
+	// and the table entry stores the full pattern.
+	var lit ast.Expr = uintLit(total)
 	if total >= largeConstThreshold && em.t != nil {
-		return em.constsIndexExpr(total)
+		lit = em.constsIndexExpr(total)
+	} else if n < 0 {
+		lit = &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{lit}}
 	}
-	if n >= 0 {
-		return uintLit(total)
+	if checked && total+size > em.memMinBytes() {
+		off := lit
+		if total >= largeConstThreshold {
+			off = &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{lit}}
+		}
+		return em.memEA32Call(uintLit(0), off, size)
 	}
-	return &ast.CallExpr{Fun: newID("uint32"), Args: []ast.Expr{uintLit(total)}}
+	return lit
+}
+
+// memEA32Call renders `memEA32(mLim, addr, off, size)` — or, for a
+// shared memory, `memEA32S(m, addr, off, size)` — and marks the call
+// for the fused-region chase (memEACalls).
+func (em *ssaEmitter) memEA32Call(addr, off ast.Expr, size uint64) ast.Expr {
+	call := &ast.CallExpr{Args: []ast.Expr{nil, addr, off, uintLit(size)}}
+	helper := "memEA32"
+	switch {
+	case em.memLimHoisted():
+		call.Args[0] = newID(memLimLocal)
+	case em.memShared():
+		helper = "memEA32S"
+		call.Args[0] = newID("m")
+	default:
+		call.Args[0] = em.memSizeRead()
+	}
+	em.useHelper(helper)
+	call.Fun = em.helperRef(helper)
+	if em.memEACalls == nil {
+		em.memEACalls = map[*ast.CallExpr]bool{}
+	}
+	em.memEACalls[call] = true
+	return call
 }
 
 // memOffsetExpr64 is memOffsetExpr for a memory64 module: the address
@@ -544,7 +585,7 @@ func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, name string, emitExpr func(
 		Fun: &ast.SelectorExpr{X: newID("unsafe"), Sel: newID("Add")},
 		Args: []ast.Expr{
 			em.memBasePtrExpr(),
-			em.memOffsetExpr(baseExpr, offU, v.Args[0]),
+			em.memOffsetExpr(baseExpr, offU, v.Args[0], 0),
 		},
 	}
 	ptr := &ast.CallExpr{
@@ -564,475 +605,4 @@ func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, name string, emitExpr func(
 	}
 	loaded := &ast.CallExpr{Fun: atomicFn, Args: []ast.Expr{ptr}}
 	return &ast.CallExpr{Fun: newID(spec.loadCast), Args: []ast.Expr{loaded}}, true, nil
-}
-
-// Memory64 bounds checks
-//
-// Every plain load and store of a memory64 memory, and every atomic
-// access emitted inline, is preceded by a check of its whole byte range
-// against memory.size (L below):
-//
-//	if uint64(base) > mLim-K {
-//		goto trapMem
-//	}
-//	v7 = *(*int64)(unsafe.Add(mBase, uint64(base)+16))
-//	...
-//	trapMem:
-//		wasm_trap_mem_oob()
-//		for {
-//		}
-//
-// K is the access's static offset plus its size, a compile-time
-// constant, and the access is in bounds exactly when base + K <= L in
-// unbounded arithmetic. Written as base > L-K, the comparison cannot
-// wrap: L never drops below the memory's declared minimum (memory only
-// grows, and the constructors refuse a smaller size), so for every K up
-// to that minimum L-K is exact, and base takes its full u64 range — an
-// address near 2^64, whose sum with the offset would wrap, fails it like
-// any other. A K above the minimum adds the test L < K. A constant
-// address needs no check when its range ends within the minimum, and
-// compares L with its end otherwise; so does an address that is a phi of
-// constants, through the largest of them. A K that overflows u64 names
-// bytes no memory has: such an access traps unconditionally.
-//
-// A check is left out where one that always runs before it implies it,
-// and a load's check covers the accesses right after it on the same
-// address (memGuardCoverage): memory never shrinks, so an address proven
-// in bounds stays in bounds for the rest of the function, calls and
-// memory.grow included.
-//
-// L lives in mLim, a function-level local beside mBase: read from
-// len(m.memory) (memory.size, for a memory that is not shared) where
-// mBase is read, and refreshed where mBase is, after every value that
-// can run memory.grow. A shared memory grows under other agents at any
-// moment, so its checks read memSize afresh instead.
-//
-// The checks of a function share one trap block per trap kind, at the
-// end of its body (trapStmt, memTrapTail). The trap helper never
-// returns; the empty loop after it tells gc so, which keeps the cold
-// path from saving and restoring what the accesses need (the shape the
-// unreachable trap has too).
-
-// memLimLocal is the name of the per-function copy of memory.size the
-// bounds checks compare with. Like mBase, it cannot collide with
-// generated value names.
-const memLimLocal = "mLim"
-
-// memGuarded reports whether the module's accesses are bounds-checked.
-func (em *ssaEmitter) memGuarded() bool { return em.mem64 }
-
-// memShared reports whether the module's memory is shared (threads).
-func (em *ssaEmitter) memShared() bool { return em.t != nil && em.t.memoryIsShared() }
-
-// memLimHoisted reports whether the function keeps memory.size in mLim.
-func (em *ssaEmitter) memLimHoisted() bool {
-	return em.memBaseHoisted && em.memGuarded() && !em.memShared()
-}
-
-// memSizeRead is `uint64(len(m.memory))`: memory.size of a memory that
-// is not shared, which every constructor and memoryGrow keep equal to
-// the slice's length.
-func (em *ssaEmitter) memSizeRead() ast.Expr {
-	return &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{
-		&ast.CallExpr{Fun: newID("len"), Args: []ast.Expr{em.fieldRef("memory")}},
-	}}
-}
-
-// memLimitExpr is memory.size in bytes at a bounds check.
-func (em *ssaEmitter) memLimitExpr() ast.Expr {
-	if em.memLimHoisted() {
-		return newID(memLimLocal)
-	}
-	if em.memShared() {
-		return &ast.CallExpr{Fun: &ast.SelectorExpr{X: em.fieldRef("memSize"), Sel: newID("Load")}}
-	}
-	return em.memSizeRead()
-}
-
-// memMinBytes is the memory's declared minimum in bytes: memory.size is
-// never below it.
-func (em *ssaEmitter) memMinBytes() uint64 {
-	if em.t == nil || len(em.t.mod.Memories) == 0 {
-		return 0
-	}
-	return em.t.mod.Memories[0].Limits.Min * 65536
-}
-
-// memElemSize is the byte width of a load/store element type.
-func memElemSize(elemType string) uint64 {
-	switch elemType {
-	case "uint8", "int8":
-		return 1
-	case "uint16", "int16":
-		return 2
-	case "uint32", "int32", "float32":
-		return 4
-	}
-	return 8
-}
-
-// memConstExpr is a u64 constant operand of a bounds check: small ones
-// inline, large ones through the _consts table for the addressing-
-// immediate reasons memOffsetExpr routes them there.
-func (em *ssaEmitter) memConstExpr(c uint64) ast.Expr {
-	if c >= largeConstThreshold && em.t != nil {
-		return &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{em.constsIndexExpr(c)}}
-	}
-	return uintLit(c)
-}
-
-// memAccessShape classifies v as an access the emitter renders inline —
-// a plain load or store, or an atomic emitted inline (any other atomic
-// goes through a helper that checks it) — with its width and static
-// offset.
-func (em *ssaEmitter) memAccessShape(v *ssa.Value) (size, off uint64, atomic, ok bool) {
-	if len(v.Args) == 0 {
-		return 0, 0, false, false
-	}
-	if spec, sok := loadSpec(v); sok {
-		return memElemSize(spec.elemType), uint64(v.AuxInt), false, true
-	}
-	if spec, sok := storeSpec(v); sok {
-		return memElemSize(spec.elemType), uint64(v.AuxInt), false, true
-	}
-	if v.Op == ssa.OpAtomicCall {
-		name, _ := v.Aux.(string)
-		if spec, o, aok := em.atomicInlineAccess(v, name); aok {
-			return memElemSize(spec.elemType), o, true, true
-		}
-	}
-	return 0, 0, false, false
-}
-
-// memAccessGuard returns the statements that check v's byte range
-// before v runs, or nil when v is no checked access or provably in
-// bounds. See "Memory64 bounds checks" above.
-func (em *ssaEmitter) memAccessGuard(v *ssa.Value, emitExpr func(*ssa.Value) (ast.Expr, error)) ([]ast.Stmt, error) {
-	if !em.memGuarded() {
-		return nil, nil
-	}
-	size, off, atomic, ok := em.memAccessShape(v)
-	if !ok {
-		return nil, nil
-	}
-	trap := "wasm_trap_mem_oob"
-	if atomic {
-		trap = "wasm_trap_atomic_oob"
-	}
-	// k is the checked span past the address: offset plus size, or
-	// what memGuardCoverage widened it to.
-	k := off + size
-	if plan, ok := em.memGuardPlan[v.ID]; ok {
-		if plan == 0 {
-			return nil, nil // implied by an earlier check
-		}
-		k = plan
-	}
-	minBytes := em.memMinBytes()
-	if !atomic && k >= off {
-		if hi, ok := memConstMax(v.Args[0], nil); ok {
-			if end := hi + k; end >= hi && end <= minBytes {
-				return nil, nil
-			}
-		}
-	}
-	var oob, misaligned ast.Expr
-	if c := ssaConstBase64(v.Args[0]); c != nil {
-		ea := uint64(c.AuxInt) + off
-		end := ea + size
-		switch {
-		case ea < off || end < ea:
-			oob = newID("true")
-		case end > minBytes:
-			oob = &ast.BinaryExpr{X: em.memLimitExpr(), Op: token.LSS, Y: em.memConstExpr(end)}
-		}
-		if atomic && ea&(size-1) != 0 {
-			misaligned = newID("true")
-		}
-	} else {
-		baseExpr, err := emitExpr(v.Args[0])
-		if err != nil {
-			return nil, err
-		}
-		a := &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{baseExpr}}
-		if k < off { // off+size overflowed
-			oob = newID("true")
-		} else {
-			oob = &ast.BinaryExpr{
-				X:  a,
-				Op: token.GTR,
-				Y:  &ast.BinaryExpr{X: em.memLimitExpr(), Op: token.SUB, Y: em.memConstExpr(k)},
-			}
-			if k > minBytes {
-				oob = &ast.BinaryExpr{
-					X:  &ast.BinaryExpr{X: em.memLimitExpr(), Op: token.LSS, Y: em.memConstExpr(k)},
-					Op: token.LOR,
-					Y:  oob,
-				}
-			}
-		}
-		if atomic {
-			// A second rendering of the base: AST nodes are not shared.
-			baseExpr, err := emitExpr(v.Args[0])
-			if err != nil {
-				return nil, err
-			}
-			ea := ast.Expr(&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{baseExpr}})
-			if off != 0 {
-				ea = &ast.BinaryExpr{X: ea, Op: token.ADD, Y: em.memConstExpr(off)}
-			}
-			misaligned = &ast.BinaryExpr{
-				X:  &ast.ParenExpr{X: &ast.BinaryExpr{X: ea, Op: token.AND, Y: uintLit(size - 1)}},
-				Op: token.NEQ,
-				Y:  uintLit(0),
-			}
-		}
-	}
-	var stmts []ast.Stmt
-	if oob != nil {
-		stmts = append(stmts, em.trapStmt(trap, oob))
-	}
-	if misaligned != nil {
-		stmts = append(stmts, em.trapStmt("wasm_trap_atomic_unaligned", misaligned))
-	}
-	return stmts, nil
-}
-
-// memConstMax reports whether the i64 address v is a constant, or a phi
-// (through copies and nested phis) all of whose incoming values are
-// constants, and returns the largest of them as a u64. seen guards the
-// phi cycles of loops; nil starts a fresh walk.
-func memConstMax(v *ssa.Value, seen map[ssa.ValueID]bool) (uint64, bool) {
-	for v != nil && v.Op == ssa.OpCopy && len(v.Args) == 1 {
-		v = v.Args[0]
-	}
-	if v == nil {
-		return 0, false
-	}
-	switch v.Op {
-	case ssa.OpConst64:
-		return uint64(v.AuxInt), true
-	case ssa.OpPhi:
-		if seen == nil {
-			seen = map[ssa.ValueID]bool{}
-		}
-		if seen[v.ID] {
-			// A cycle adds no value the other incoming edges lack.
-			return 0, true
-		}
-		seen[v.ID] = true
-		var hi uint64
-		for _, a := range v.Args {
-			c, ok := memConstMax(a, seen)
-			if !ok {
-				return 0, false
-			}
-			hi = max(hi, c)
-		}
-		return hi, true
-	}
-	return 0, false
-}
-
-// memGuardSpan describes the bytes a checked access with a run-time
-// address touches as root+lo .. root+hi: root is the address value with
-// a constant addend peeled off (lo, which the guest's i64.add put there),
-// hi is lo plus the static offset and the access size. ok is false for
-// anything that is no such access, or whose span does not fit.
-func (em *ssaEmitter) memGuardSpan(v *ssa.Value) (root ssa.ValueID, lo, hi uint64, atomic, ok bool) {
-	size, off, atomic, ok := em.memAccessShape(v)
-	if !ok || off >= 1<<32 {
-		return 0, 0, 0, false, false
-	}
-	base := v.Args[0]
-	for base != nil && base.Op == ssa.OpCopy && len(base.Args) == 1 {
-		base = base.Args[0]
-	}
-	if base == nil || ssaConstBase64(base) != nil {
-		return 0, 0, 0, false, false
-	}
-	if base.Op == ssa.OpAdd64 && len(base.Args) == 2 {
-		for i, a := range base.Args {
-			if c := ssaConstBase64(a); c != nil && c.AuxInt >= 0 && c.AuxInt < 1<<32 {
-				if x := base.Args[1-i]; ssaConstBase64(x) == nil {
-					return x.ID, uint64(c.AuxInt), uint64(c.AuxInt) + off + size, atomic, true
-				}
-			}
-		}
-	}
-	return base.ID, 0, off + size, atomic, true
-}
-
-// memGuardLookahead bounds how many values after a load memGuardCoverage
-// looks at to widen the load's check.
-const memGuardLookahead = 256
-
-// memGuardCoverage plans the checks of f's memory64 accesses with a
-// run-time address. It returns, per access, 0 when the access needs no
-// check of its own, or the span its check covers past its address when
-// that is wider than its own offset plus size; an access it does not
-// list is checked as usual.
-//
-// An access needs no check when a check that runs before it on every
-// path implies its own: one of an access in a dominating position (an
-// earlier value of the same block, or any value of a dominating block)
-// on the same root address. The covering check proved
-// root+lo_u .. root+hi_u in bounds, in the notation of memGuardSpan;
-// memory only grows, so that still holds at the covered access, calls
-// and memory.grow included. A span lo_v..hi_v is then in bounds when
-// lo_v ≥ lo_u and hi_v ≤ hi_u: either root+lo_u did not wrap and
-// root+lo_v is root+lo_u moved up by lo_v-lo_u within the proven range,
-// or it wrapped and root+lo_v wrapped the same way (lo_v ≥ lo_u) and lies
-// within the same proven range. An access whose addend is below the
-// covering one's is not covered: its address may not have wrapped where
-// the covering one's did.
-//
-// A load's check is widened over the accesses that follow it in its
-// block on the same root, with an addend at or above its own, up to the
-// next value with a side effect (included when it is such an access, a
-// store): their checks are then implied. Trapping at the load for a
-// later access is not observable — nothing between them writes or
-// calls, and every plain access traps with the same message — and when
-// the widened check fails, the original program traps by the last of
-// them: the access that reaches furthest is out of bounds, or (its
-// address having wrapped where this one's did not) this one is.
-//
-// Atomic accesses cover others (their check traps every access that is
-// out of bounds) but keep their own exact checks, which include
-// alignment and trap with their own message. Functions with try regions
-// keep every check.
-func (em *ssaEmitter) memGuardCoverage(f *ssa.Func) map[ssa.ValueID]uint64 {
-	if !em.memGuarded() || f.Entry == nil || len(f.TryRegions) > 0 {
-		return nil
-	}
-	idom := ssa.Dominators(f)
-	children := map[ssa.BlockID][]*ssa.Block{}
-	for _, b := range f.Blocks {
-		if d := idom[b.ID]; d != nil && b != f.Entry {
-			children[d.ID] = append(children[d.ID], b)
-		}
-	}
-	type span struct{ lo, hi uint64 }
-	avail := map[ssa.ValueID][]span{}
-	var plan map[ssa.ValueID]uint64
-	set := func(id ssa.ValueID, k uint64) {
-		if plan == nil {
-			plan = map[ssa.ValueID]uint64{}
-		}
-		plan[id] = k
-	}
-	var walk func(b *ssa.Block)
-	walk = func(b *ssa.Block) {
-		var pushed []ssa.ValueID
-		for i, v := range b.Values {
-			root, lo, hi, atomic, ok := em.memGuardSpan(v)
-			if !ok {
-				continue
-			}
-			if !atomic {
-				implied := false
-				for _, s := range avail[root] {
-					if lo >= s.lo && hi <= s.hi {
-						implied = true
-						break
-					}
-				}
-				if implied {
-					set(v.ID, 0)
-					continue
-				}
-				own := hi
-				// A store is a side effect itself: a trap moved in front
-				// of it would undo its write. Only a load's check widens.
-				// The look-ahead is bounded so that a long block of loads
-				// costs linear time.
-				rest := b.Values[i+1:]
-				if len(rest) > memGuardLookahead {
-					rest = rest[:memGuardLookahead]
-				}
-				for _, w := range rest {
-					if v.HasSideEffect() {
-						break
-					}
-					if wr, wlo, whi, watomic, wok := em.memGuardSpan(w); wok && !watomic && wr == root && wlo >= lo {
-						hi = max(hi, whi)
-					}
-					if w.HasSideEffect() {
-						break
-					}
-				}
-				if hi != own {
-					set(v.ID, hi-lo)
-				}
-			}
-			avail[root] = append(avail[root], span{lo, hi})
-			pushed = append(pushed, root)
-		}
-		for _, c := range children[b.ID] {
-			walk(c)
-		}
-		for i := len(pushed) - 1; i >= 0; i-- {
-			r := pushed[i]
-			avail[r] = avail[r][:len(avail[r])-1]
-		}
-	}
-	walk(f.Entry)
-	return plan
-}
-
-// memTrapKinds are the traps of the bounds checks, each with the label
-// of the function's one block that raises it, in the order those blocks
-// close the function (memTrapTail).
-var memTrapKinds = []struct{ helper, label string }{
-	{"wasm_trap_mem_oob", "trapMem"},
-	{"wasm_trap_atomic_oob", "trapAtomic"},
-	{"wasm_trap_atomic_unaligned", "trapUnaligned"},
-}
-
-// trapStmt renders `if cond { goto <the trap's label> }`. Every check
-// of a function shares one trap block per kind (memTrapTail) instead of
-// carrying a call of its own: the cold path costs one branch per check,
-// and gc lays the check out to fall through to the access (with a block
-// per check, gc's branch heuristics take the call that never returns for
-// the likely path and fall through into it).
-func (em *ssaEmitter) trapStmt(trap string, cond ast.Expr) ast.Stmt {
-	label := ""
-	for _, k := range memTrapKinds {
-		if k.helper == trap {
-			label = k.label
-		}
-	}
-	if em.memTrapsUsed == nil {
-		em.memTrapsUsed = map[string]bool{}
-	}
-	em.memTrapsUsed[trap] = true
-	return &ast.IfStmt{
-		Cond: cond,
-		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.BranchStmt{Tok: token.GOTO, Label: newID(label)}}},
-	}
-}
-
-// memTrapTail renders the trap blocks the function's checks branch to,
-// appended at the end of its body:
-//
-//	trapMem:
-//		wasm_trap_mem_oob()
-//		for {
-//		}
-//
-// At the top level of the body, each label is in scope of every check,
-// however deeply nested; no variable is declared at the top level after
-// the first check (the emitters declare their values at the head of the
-// body), so no goto jumps into a declaration's scope.
-func (em *ssaEmitter) memTrapTail() []ast.Stmt {
-	var out []ast.Stmt
-	for _, k := range memTrapKinds {
-		if !em.memTrapsUsed[k.helper] {
-			continue
-		}
-		out = append(out,
-			&ast.LabeledStmt{Label: newID(k.label), Stmt: &ast.ExprStmt{X: &ast.CallExpr{Fun: em.helperRef(k.helper)}}},
-			&ast.ForStmt{Body: &ast.BlockStmt{}})
-	}
-	return out
 }

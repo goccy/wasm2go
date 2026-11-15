@@ -77,6 +77,9 @@ func TestInlineLeafEndToEnd(t *testing.T) {
 	for name, data := range res.Sidecars {
 		writeFile("pkg/"+name, data)
 	}
+	for name, data := range res.AuxFiles {
+		writeFile("pkg/"+name, data)
+	}
 	writeFile("main.go", []byte(`package main
 
 import (

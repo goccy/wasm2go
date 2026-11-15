@@ -57,6 +57,9 @@ type Module struct {
 	// zeros above it. Zero until the start section has run. A uint64: a
 	// memory64's segments may lie anywhere in its 64-bit address space.
 	dataEnd uint64
+	// memRes is the reservation the instance owns, when its memory is one
+	// a constructor or memory.grow mapped for it (memreserve_on.go).
+	memRes *memReservation
 	// threadStart runs the guest's wasi_thread_start export. New() assigns it
 	// when the wasm exports one. A field (not an interface assertion on the
 	// Module) because multi-package output emits exports as FREE FUNCTIONS in
@@ -827,6 +830,39 @@ func memorySize(m *Module) int32 {
 // with codegen's wasmMemHardCapBytes).
 func wasmMemHardCap() uint64 { return (1 << 32) - (1 << 17) }
 
+// memEA32 is the effective address of a wasm32 load or store of size
+// bytes: the unsigned i32 address plus the u32 static offset, a 33-bit
+// sum that does not wrap. Where linear memory is a reservation
+// (memReserved) that is all it is: every limit is 4 GiB and the
+// reservation runs memReserveGuard past it, so the access lies inside
+// the reservation and faults when it reaches memory.size (see "Bounds
+// checks" in emit_memguard.go). Elsewhere it compares the access's end
+// with lim, memory.size, and traps past it.
+//
+// The emitter renders every wasm32 access through it, inline: in the
+// first case gc folds it to the sum, which is what the assembly captured
+// from the pure form holds; in the second the check stays cheap enough
+// (a panic, not a call) to inline even into the largest functions. The
+// fused-region chase sees through it (it recognizes the calls the
+// emitter marks).
+func memEA32(lim uint64, addr uint32, offset, size uint64) uint64 {
+	ea := uint64(addr) + offset
+	if !memReserved && ea+size > lim {
+		panic("wasm: memory access out of bounds")
+	}
+	return ea
+}
+
+// memEA32S is memEA32 for a shared memory, whose size other agents move
+// at any moment: it reads memory.size afresh, and only where it compares.
+func memEA32S(m *Module, addr uint32, offset, size uint64) uint64 {
+	ea := uint64(addr) + offset
+	if !memReserved && ea+size > m.memSize.Load() {
+		panic("wasm: memory access out of bounds")
+	}
+	return ea
+}
+
 // memoryGrow grows m.memory by n wasm pages (64 KiB each). Returns the
 // previous page count, or -1 if the new size would exceed maxMem or
 // wasmMemHardCap. n may be 0, which simply returns the current size.
@@ -857,6 +893,12 @@ func memoryGrow(m *Module, n int32) int32 {
 	}
 	if want > wasmMemHardCap() {
 		return -1
+	}
+	if memReserved {
+		if !memGrowReserved(m, cur, want) {
+			return -1
+		}
+		return prev
 	}
 	if m.memShared {
 		// The backing array already spans the declared maximum (New
@@ -899,6 +941,55 @@ func memoryGrow(m *Module, n int32) int32 {
 	// the data pointer untouched so don't need this refresh.
 	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
 	return prev
+}
+
+// memGrowReserved is memory.grow from cur to want bytes for a memory that
+// is the head of a reservation (memReserved, see memreserve_on.go). Within
+// the reservation's limit the pages it gains are opened in place before
+// memory.size says they are there, so no agent can see the new size and
+// fault on a page still closed; a shared memory's slice already spans its
+// ceiling, any other's grows with it. Past the limit, a memory of the
+// instance's own moves to a larger reservation of its own, as one on the Go
+// heap moves to a larger allocation (memoryGrow): for the ceiling the
+// instance has, or twice what it had while it has none. A shared memory
+// (other agents hold its address) or one the embedder mapped never moves.
+// It reports false when the memory may not grow that far or the pages
+// cannot be had.
+func memGrowReserved(m *Module, cur, want uint64) bool {
+	mem := m.memory[:cap(m.memory)]
+	if limit := uint64(len(mem)) - memReserveGuard; want <= limit {
+		if memProtect(mem, cur, want, true) != nil {
+			return false
+		}
+		if !m.memShared {
+			m.memory = mem[:want]
+		}
+		m.memSize.Store(want)
+		return true
+	}
+	if m.memShared || m.memRes == nil {
+		return false
+	}
+	ceiling := m.maxMem
+	if ceiling == 0 {
+		ceiling = max(want, 2*(uint64(len(mem))-memReserveGuard))
+	}
+	if ceiling > memReserveMax {
+		ceiling = max(want, memReserveMax)
+	}
+	old := m.memRes
+	grown, err := memOpen(m, want, ceiling)
+	if err != nil {
+		return false
+	}
+	copy(grown, m.memory[:cur])
+	// The old reservation is unmapped once nothing refers to it
+	// (memOwn); the copy above was its last use.
+	runtime.KeepAlive(old)
+	m.memory = grown[:want]
+	m.M = unsafe.Pointer(unsafe.SliceData(m.memory))
+	m.memSize.Store(want)
+	return true
 }
 
 // accessMemory runs f with the module's current linear memory while
@@ -2519,6 +2610,9 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 		// process down instead of silently unwinding the goroutine.
 		defer func() {
 			if r := recover(); r != nil {
+				// A fault in the memory's reservation is an access
+				// past memory.size (see memreserve_on.go).
+				r = memFaultTrap(child, r)
 				println("wasm2go: wasi thread", tid, "trapped:")
 				switch v := r.(type) {
 				case error:
@@ -2529,6 +2623,9 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 				panic(r)
 			}
 		}()
+		// The agent runs guest code: a fault on its goroutine must panic
+		// (memEnter), as on every entry into guest code.
+		memEnter()
 		body(child, tid)
 	}()
 	return tid
@@ -2652,19 +2749,30 @@ func simd_v128_load(m *Module, addr int32, offset int32) [2]uint64 {
 // The simd_scalar_* helpers are the pure fallback bodies of the
 // scalar-chain vocabulary inside fused regions (see internal/simdfuse):
 // the per-block scale computations quantized kernels run between vector
-// statements. The loads are UNCHECKED on purpose — they replace the
-// emitter's own unchecked scalar derefs (`*(*uint16)(unsafe.Add(mBase,
-// uint32(a)))`), whose safety rests on the same memoryGrow hard cap.
-// The arithmetic wraps mod 2^32 exactly like the wasm ops it lowers.
+// statements. They replace the emitter's own scalar accesses
+// (`*(*uint16)(unsafe.Add(mBase, memEA32(...)))`) and keep their
+// bounds: the effective address is the unsigned i32 address plus the
+// u32 offset, without wrapping, and an access past memory.size traps —
+// by the explicit comparison where memory is no reservation, by the
+// fault it takes where it is one (see memEA32). The arithmetic wraps mod
+// 2^32 exactly like the wasm ops it lowers.
 
 //go:noinline
-func simd_scalar_i32_load16_u(m *Module, addr int32) int32 {
-	return int32(*(*uint16)(unsafe.Add(m.M, uintptr(uint32(addr)))))
+func simd_scalar_i32_load16_u(m *Module, addr int32, offset int32) int32 {
+	ea := uint64(uint32(addr)) + uint64(uint32(offset))
+	if !memReserved && ea+2 > m.memSize.Load() {
+		wasm_trap_mem_oob()
+	}
+	return int32(*(*uint16)(unsafe.Add(m.M, uintptr(ea))))
 }
 
 //go:noinline
-func simd_scalar_f32_load(m *Module, addr int32) float32 {
-	return *(*float32)(unsafe.Add(m.M, uintptr(uint32(addr))))
+func simd_scalar_f32_load(m *Module, addr int32, offset int32) float32 {
+	ea := uint64(uint32(addr)) + uint64(uint32(offset))
+	if !memReserved && ea+4 > m.memSize.Load() {
+		wasm_trap_mem_oob()
+	}
+	return *(*float32)(unsafe.Add(m.M, uintptr(ea)))
 }
 
 //go:noinline
@@ -2680,16 +2788,20 @@ func simd_scalar_f32_mul(a float32, b float32) float32 { return a * b }
 // the per-block scale computations become 64-bit address arithmetic
 // (a wasm64 module's pointer math genuinely does not wrap at 32 bits),
 // and the loads index full-width. Only the address-carrying ops change
-// width; f32_mul is a value op and reuses the wasm32 helper.
+// width; f32_mul is a value op and reuses the wasm32 helper. A memory64
+// access joins a fused region only when no check stands in front of it
+// (a dominating check covers it, see "Bounds checks" in
+// emit_memguard.go); its offset is part of the address and the offset
+// operand is 0.
 
 //go:noinline
-func simd_m64_scalar_i32_load16_u(m *Module, addr int64) int64 {
-	return int64(*(*uint16)(unsafe.Add(m.M, uintptr(uint64(addr)))))
+func simd_m64_scalar_i32_load16_u(m *Module, addr int64, offset int64) int64 {
+	return int64(*(*uint16)(unsafe.Add(m.M, uintptr(uint64(addr)+uint64(offset)))))
 }
 
 //go:noinline
-func simd_m64_scalar_f32_load(m *Module, addr int64) float32 {
-	return *(*float32)(unsafe.Add(m.M, uintptr(uint64(addr))))
+func simd_m64_scalar_f32_load(m *Module, addr int64, offset int64) float32 {
+	return *(*float32)(unsafe.Add(m.M, uintptr(uint64(addr)+uint64(offset))))
 }
 
 //go:noinline
@@ -3198,6 +3310,12 @@ func memoryGrow64(m *Module, n int64) int64 {
 	}
 	if m.maxMem != 0 && want > m.maxMem {
 		return -1
+	}
+	if memReserved {
+		if !memGrowReserved(m, cur, want) {
+			return -1
+		}
+		return prev
 	}
 	if m.memShared {
 		// Same contract as memoryGrow: the backing array of a shared

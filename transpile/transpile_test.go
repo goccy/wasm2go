@@ -152,6 +152,9 @@ func TestTranspileEndToEnd(t *testing.T) {
 	for name, data := range res.Sidecars {
 		writeFile("pkg/"+name, data)
 	}
+	for name, data := range res.AuxFiles {
+		writeFile("pkg/"+name, data)
+	}
 	writeFile("main.go", []byte(`package main
 
 import (
@@ -213,6 +216,9 @@ func TestTranspileEHEndToEnd(t *testing.T) {
 		writeFile("pkg/"+rel, data)
 	}
 	for name, data := range res.Sidecars {
+		writeFile("pkg/"+name, data)
+	}
+	for name, data := range res.AuxFiles {
 		writeFile("pkg/"+name, data)
 	}
 	writeFile("main.go", []byte(`package main
@@ -283,6 +289,9 @@ func TestTranspileEHDelegate(t *testing.T) {
 	for name, data := range res.Sidecars {
 		writeFile("pkg/"+name, data)
 	}
+	for name, data := range res.AuxFiles {
+		writeFile("pkg/"+name, data)
+	}
 	writeFile("main.go", []byte(`package main
 
 import (
@@ -345,6 +354,9 @@ func TestTranspileBrTableStructured(t *testing.T) {
 		write("pkg/"+rel, data)
 	}
 	for name, data := range res.Sidecars {
+		write("pkg/"+name, data)
+	}
+	for name, data := range res.AuxFiles {
 		write("pkg/"+name, data)
 	}
 	write("main.go", []byte(`package main
@@ -420,6 +432,9 @@ func TestTranspileEHLoopCatch(t *testing.T) {
 	for name, data := range res.Sidecars {
 		write("pkg/"+name, data)
 	}
+	for name, data := range res.AuxFiles {
+		write("pkg/"+name, data)
+	}
 	write("main.go", []byte(`package main
 
 import (
@@ -478,6 +493,9 @@ func TestTranspileEHLoopBreakInTry(t *testing.T) {
 		write("pkg/"+rel, data)
 	}
 	for name, data := range res.Sidecars {
+		write("pkg/"+name, data)
+	}
+	for name, data := range res.AuxFiles {
 		write("pkg/"+name, data)
 	}
 	write("main.go", []byte(`package main
@@ -545,6 +563,9 @@ func TestTranspileEHCatchReturns(t *testing.T) {
 		write("pkg/"+rel, data)
 	}
 	for name, data := range res.Sidecars {
+		write("pkg/"+name, data)
+	}
+	for name, data := range res.AuxFiles {
 		write("pkg/"+name, data)
 	}
 	write("main.go", []byte(`package main
@@ -616,6 +637,9 @@ func TestTranspileEHMultiPackage(t *testing.T) {
 	for name, data := range res.Sidecars {
 		write(filepath.Join("wmod", name), data)
 	}
+	for name, data := range res.AuxFiles {
+		write(filepath.Join("wmod", name), data)
+	}
 	// The exported wasm function `run` becomes the free function wmod.Run(m).
 	write("main.go", []byte(`package main
 
@@ -684,6 +708,9 @@ func TestTranspileSetjmpLongjmpEndToEnd(t *testing.T) {
 		writeFile("pkg/"+rel, data)
 	}
 	for name, data := range res.Sidecars {
+		writeFile("pkg/"+name, data)
+	}
+	for name, data := range res.AuxFiles {
 		writeFile("pkg/"+name, data)
 	}
 	writeFile("main.go", []byte(`package main

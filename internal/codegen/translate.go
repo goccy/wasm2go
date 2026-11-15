@@ -364,9 +364,9 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// emitHelpers runs (the pure fallback render), so lazy helperRef
 	// registration is too late — pre-register like the others.
 	t.helpers["wasm_trap_unreachable"] = true
-	// The bounds checks in front of memory64 accesses trap through these
+	// The bounds checks in front of memory accesses trap through these
 	// (see memAccessGuard), for the same reason registered up front.
-	if m.Memory64() && len(m.Memories) > 0 {
+	if len(m.Memories) > 0 {
 		t.helpers["wasm_trap_mem_oob"] = true
 		t.helpers["wasm_trap_atomic_oob"] = true
 		t.helpers["wasm_trap_atomic_unaligned"] = true
@@ -754,22 +754,61 @@ func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
 	if t.multiPackage {
 		saveGlobals = "SaveGlobals"
 	}
+	limitMax, limitDefault, fixed := t.memReserveShape()
 	return sharedimage.Files(sharedimage.Names{
-		Pkg:         pkg,
-		Module:      "Module",
-		Memory:      t.fieldName("memory"),
-		MemMu:       t.fieldName("memMu"),
-		MemSize:     t.fieldName("memSize"),
-		DataEnd:     t.fieldName("dataEnd"),
-		SaveGlobals: saveGlobals,
+		Pkg:            pkg,
+		Module:         "Module",
+		Memory:         t.fieldName("memory"),
+		MemMu:          t.fieldName("memMu"),
+		MemSize:        t.fieldName("memSize"),
+		DataEnd:        t.fieldName("dataEnd"),
+		MemRes:         t.fieldName("memRes"),
+		SaveGlobals:    saveGlobals,
+		Exported:       t.multiPackage,
+		ReserveGuard:   memReserveGuard,
+		ReserveMax:     limitMax,
+		ReserveDefault: limitDefault,
+		ReserveFixed:   fixed,
 	})
+}
+
+// memReserveGuard is how far a linear memory's reservation runs past its
+// limit (the largest size the memory in it may have): as far as a u32
+// static offset plus the widest plain access can reach. A wasm32 access (a
+// u32 address plus a u32 offset, computed without wrapping) then always
+// lands inside its reservation, and so does a memory64 one whose address
+// is below the limit and whose offset plus width is at most this much.
+const memReserveGuard = 1<<32 + 1<<16
+
+// memReserveMax64 is the largest limit a memory64 reservation may have:
+// half the 48-bit address space the 64-bit hosts give a process (Linux
+// and macOS on amd64 and arm64 give it 2^47 bytes, which this would fill;
+// a request the host cannot place fails when it is mapped).
+const memReserveMax64 = 1 << 47
+
+// memReserveDefault64 is the limit of a memory64 reservation for a memory
+// nobody gave a ceiling (the allocating constructors' without a declared
+// maximum): 8 GiB.
+const memReserveDefault64 = 1 << 33
+
+// memReserveShape returns the shape of the module's memory reservations
+// (see memreserve.go.txt): the largest limit one may have, the limit of
+// one for a memory nobody gave a ceiling, and whether every reservation
+// has the largest limit. A wasm32 memory is below 4 GiB, so every one of
+// its reservations has that limit (fixed) and its accesses need no check.
+// A memory64 reservation is as large as its memory's ceiling asks.
+func (t *translator) memReserveShape() (limitMax, limitDefault uint64, fixed bool) {
+	if !t.mod.Memory64() || len(t.mod.Memories) == 0 {
+		return 1 << 32, 1 << 32, true
+	}
+	return memReserveMax64, memReserveDefault64, false
 }
 
 // finalizeSinglePkgWithAsm is the asm-always-on tail of single-package
 // Translate. It splits the Go source produced by the translator into
 // a shared file (Module struct, helpers, exports, ...) — written to
 // the caller's w — and a `<pkg>_pure.go` file holding the function
-// bodies under `//go:build !amd64 && !arm64`. The asm bundle goes
+// bodies under pureFallbackTag. The asm bundle goes
 // into Result.Files. On asm-target GOARCHs the pure file is dormant
 // and the asm bodies in `<pkg>/amd64.s` (and arm64.s) take over.
 func finalizeSinglePkgWithAsm(m *wasm.Module, opts Options, w io.Writer, goSrc []byte, sidecars map[string][]byte, auxFiles map[string][]byte) (Result, error) {
@@ -800,10 +839,16 @@ func pureFallbackTag(opts Options) string {
 	if opts.PureOnly {
 		return ""
 	}
-	// The asm bundle covers arm64 and amd64/v2 (its SIMD splices are
-	// SSE4.1); every other target — including GOAMD64=v1 — runs pure.
-	return "//go:build !arm64 && (!amd64 || !amd64.v2)"
+	return "//go:build " + PureConstraint
 }
+
+// PureConstraint is the build constraint of the pure function bodies:
+// wherever the gcasm bundle's assembly does not apply. The bundle covers
+// arm64 and amd64/v2 (its SIMD splices are SSE4.1) where linear memory
+// is a reservation — the assembly is captured from the bodies compiled
+// in that form (sharedimage.ReservedConstraint) — and every other target,
+// GOAMD64=v1 included, runs pure.
+const PureConstraint = "!(" + sharedimage.ReservedConstraint + ") || !arm64 && (!amd64 || !amd64.v2)"
 
 // emitSidecarDecls returns //go:embed var decls for each registered sidecar.
 func (t *translator) emitSidecarDecls() []ast.Decl {
@@ -1837,6 +1882,17 @@ func (t *translator) emitModuleStruct() ast.Decl {
 			Names: []*ast.Ident{newID(t.fieldName("dataEnd"))},
 			Type:  newID("uint64"),
 		})
+		// memRes is the reservation the instance owns, when a constructor
+		// made the instance's memory itself (memAlloc, memAdopt of a
+		// memory that was no reservation): the reservation is unmapped
+		// when no copy of the instance refers to it. A pointer, so that a
+		// wasi-threads agent's struct copy keeps it alive too. nil when
+		// the memory is a mapping its caller owns, and in builds whose
+		// memory is no reservation (memreserve_off.go).
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("memRes"))},
+			Type:  &ast.StarExpr{X: newID("memReservation")},
+		})
 		// memShared records whether the memory was declared shared, which
 		// is what makes the reslice-free grow above legal.
 		fields = append(fields, &ast.Field{
@@ -2253,28 +2309,46 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 					}},
 				},
 			)
-			if mem.Limits.Shared {
-				// A shared memory's slice spans the whole allocation from
-				// the start, as the allocating constructor's spans its
-				// ceiling: growth only moves memSize, bounded by the
-				// slice's length.
-				memRhs = newID("memory")
-			} else {
-				// The guest's memory is the first memSize bytes of the
-				// allocation; the rest is its capacity. Everything that
-				// bounds an access by the slice's length then refuses
-				// what lies past memory.size, and memory.grow reslices
-				// into the capacity in place — the allocation is the
-				// ceiling (maxMem below), so the memory never moves.
-				memRhs = &ast.SliceExpr{X: newID("memory"), High: newID("memSize")}
-			}
+			// memAdopt (memreserve_*.go) makes the allocation the
+			// instance's memory. The guest's memory is its first memSize
+			// bytes; a shared memory's slice spans the whole ceiling from
+			// the start, as the allocating constructor's does: growth only
+			// moves memSize. Where memory is a reservation, the pages past
+			// memory.size become inaccessible (an allocation that is no
+			// reservation is copied into one first); elsewhere the slice's
+			// length bounds every host access by memory.size and
+			// memory.grow reslices into the capacity in place. Either way
+			// the memory grows in place up to the ceiling it returns, which is
+			// maxMem below.
+			body.List = append(body.List, &ast.AssignStmt{
+				Tok: token.DEFINE,
+				Lhs: []ast.Expr{newID("__mem"), newID("__memCeiling")},
+				Rhs: []ast.Expr{&ast.CallExpr{Fun: t.helperRef("memAdopt"), Args: []ast.Expr{
+					newID("m"), newID("memory"), newID("memSize"), newID(strconv.FormatBool(mem.Limits.Shared)),
+				}}},
+			})
+			memRhs = newID("__mem")
 		} else {
+			// memAlloc (memreserve_*.go): a fresh reservation with its
+			// first minBytes open, or a Go allocation with room to grow.
+			// The ceiling it is given is how far the memory is expected
+			// to grow: a shared memory's (its slice spans it), the
+			// declared maximum, or nothing (0) for a memory without one.
+			ceiling := ast.Expr(uintLit(0))
+			if mem.Limits.Shared {
+				ceiling = &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{lenArg}}
+			} else if mem.Limits.HasMax && mem.Limits.Max <= maxPages {
+				ceiling = uintLit(mem.Limits.Max * 65536)
+			}
+			accessible := ast.Expr(uintLit(minBytesU))
 			memRhs = &ast.CallExpr{
-				Fun: newID("make"),
+				Fun: t.helperRef("memAlloc"),
 				Args: []ast.Expr{
-					&ast.ArrayType{Elt: newID("byte")},
-					lenArg,
-					capArg,
+					newID("m"),
+					&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{lenArg}},
+					accessible,
+					&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{capArg}},
+					ceiling,
 				},
 			}
 		}
@@ -2360,7 +2434,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			}
 			maxRhs := ast.Expr(uintLit(mem.Limits.Max * 65536))
 			if memFromArg {
-				maxRhs = memLenExpr()
+				maxRhs = newID("__memCeiling") // from memAdopt
 			}
 			body.List = append(body.List, &ast.AssignStmt{
 				Tok: token.ASSIGN,
@@ -2376,7 +2450,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				maxRhs = uintLit(0)
 			}
 			if memFromArg {
-				maxRhs = memLenExpr()
+				maxRhs = newID("__memCeiling") // from memAdopt
 			}
 			body.List = append(body.List, &ast.AssignStmt{
 				Tok: token.ASSIGN,
@@ -2780,6 +2854,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// snapshotted memory and a second run would trap on it. Everything the
 	// start section does is in the snapshot already.
 	if t.mod.Start != nil && *t.mod.Start >= t.mod.NumImportedFuncs && mode != newFromSnapshot {
+		body.List = append(body.List, t.guestEntryGuard()...)
 		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
 			Fun:  t.funcRef(*t.mod.Start),
 			Args: []ast.Expr{newID("m")},
@@ -3063,19 +3138,9 @@ func (t *translator) compileBodyViaSSA(funcIdx uint32, fn wasm.Function) (*ast.B
 		// emits correctly either way.
 		fmt.Fprintf(os.Stderr, "wasm2go: SSA fixpoint cap reached at function %s\n", t.funcName(funcIdx))
 	}
-	// FoldMemAddend runs ONCE after the fixpoint, never inside it: it
-	// requires that no later ConstProp can constify the base it leaves
-	// behind (see the pass doc for the wraparound hazard). It moves
-	// large constant addends of access bases into the AuxInt offset so
-	// the emitter's _consts-table guard sees them — a constant that
-	// stays in the base sum bypasses the guard and can fail to
-	// assemble on arm64 ("constant is not in pool").
-	if pass.FoldMemAddend(ssaFn, largeConstThreshold) {
-		pass.DCE(ssaFn)
-	}
 	// Bounds-check coalescing for v128 load groups. After the fixpoint
-	// and FoldMemAddend so the address expressions it groups on are in
-	// their final constant-folded shape. The coalesced check is exact
+	// so the address expressions it groups on are in their final
+	// constant-folded shape. The coalesced check is exact
 	// only while memSize stays below the wasmMemHardCap margin under
 	// 2^32 (see the helper's doc); growth is capped there by
 	// memoryGrow, but a module whose declared MINIMUM already exceeds
@@ -3348,6 +3413,33 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt, defsEmitted
 	return nil
 }
 
+// guestEntryGuard is the head of every entry into guest code that does not
+// recover panics itself (an export, a constructor running the start
+// section), where linear memory is a reservation:
+//
+//	if memReserved {
+//		defer memLeave(m, memEnter())
+//	}
+//
+// memEnter sets panic-on-fault for the goroutine, so that an access past
+// memory.size, which faults on an inaccessible page of the reservation,
+// panics instead of ending the process; memLeave restores the setting and
+// passes the panic on as the trap it stands for (see memreserve_on.go).
+// memReserved is a constant: a build whose memory is no reservation
+// compiles the statement away. Nothing for a module without memory.
+func (t *translator) guestEntryGuard() []ast.Stmt {
+	if len(t.mod.Memories) == 0 {
+		return nil
+	}
+	return []ast.Stmt{&ast.IfStmt{
+		Cond: t.helperRef("memReserved"),
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.DeferStmt{Call: &ast.CallExpr{
+			Fun:  t.helperRef("memLeave"),
+			Args: []ast.Expr{newID("m"), &ast.CallExpr{Fun: t.helperRef("memEnter")}},
+		}}}},
+	}}
+}
+
 // buildSafeInvokeBody constructs the body statements that wrap a single
 // `packed = <callExpr>` line with global-snapshot save/restore and a
 // recover-into-err defer. Used by emitOneExportFunc to inline the same
@@ -3384,6 +3476,11 @@ func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 			Rhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(fld)}},
 		})
 	}
+	// The fault setting is set and restored around the call (the guard's
+	// deferred memLeave runs after the recover below, which leaves it no
+	// panic to pass on), and a recovered fault in the memory's
+	// reservation becomes the trap it stands for.
+	stmts = append(stmts, t.guestEntryGuard()...)
 	recoverBody := &ast.BlockStmt{}
 	recoverBody.List = append(recoverBody.List, &ast.AssignStmt{
 		Tok: token.DEFINE,
@@ -3391,6 +3488,13 @@ func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 		Rhs: []ast.Expr{&ast.CallExpr{Fun: newID("recover")}},
 	})
 	ifBody := &ast.BlockStmt{}
+	if len(t.mod.Memories) > 0 {
+		ifBody.List = append(ifBody.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID("r")},
+			Rhs: []ast.Expr{&ast.CallExpr{Fun: t.helperRef("memFaultTrap"), Args: []ast.Expr{newID("m"), newID("r")}}},
+		})
+	}
 	for _, s := range snaps {
 		ifBody.List = append(ifBody.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
@@ -3580,7 +3684,7 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 			Recv: recv,
 			Name: newID(methodName),
 			Type: &ast.FuncType{Params: params, Results: results},
-			Body: &ast.BlockStmt{List: []ast.Stmt{bodyStmt}},
+			Body: &ast.BlockStmt{List: append(t.guestEntryGuard(), bodyStmt)},
 		})
 	}
 	// Per-export dispatch is always on whenever BulkExportPrefix
