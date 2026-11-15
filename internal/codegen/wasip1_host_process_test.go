@@ -374,6 +374,26 @@ func TestOpenOfAFIFOWithoutWaiting(t *testing.T) {
 	}
 }
 
+// awaitHostInput waits, for up to five seconds, until the host descriptor
+// behind stream has input.
+func awaitHostInput(t *testing.T, stream any) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var ready bool
+		if !hostDescriptor(stream, func(fd uintptr) { ready = hostReadyNow(int(fd), hostPollIn)&hostPollIn != 0 }) {
+			t.Fatal("the stream has no descriptor of the host")
+		}
+		if ready {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the host has no input for the stream after 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // A readiness probe that has no time left still finds what is there: input
 // in a pipe, a datagram, a connection waiting at a listener. The time a
 // probe is given bounds its wait, not its look — a probe that is scheduled
@@ -440,6 +460,10 @@ func TestProbeWithNoTimeLeftFindsWhatIsThere(t *testing.T) {
 		t.Fatalf("sendto: %d bytes rc=%d", sent, rc)
 	}
 	clientName := localName(t, w, m, client)
+	// The host may deliver a datagram on the loopback interface after the
+	// send returns (darwin hands it to the interface's input thread): wait
+	// until the host has it, then probe with no time left.
+	awaitHostInput(t, dgram)
 	if !sop.probeDatagram(dgram, past(), nil) {
 		t.Fatal("a datagram socket with a datagram waiting is not ready")
 	}
