@@ -1992,7 +1992,9 @@ func (t *translator) installDataSegmentsFunc(calls []ast.Stmt) ast.Decl {
 
 // memLenExpr is uint64(len(memory)): with a caller-supplied memory the
 // allocation itself is the ceiling, so the wasm's declared maximum does not
-// enter into it.
+// enter into it. It names the constructor's parameter, the whole
+// allocation, not the Module's memory field, which (unless the memory is
+// shared) is only memory.size long.
 func memLenExpr() ast.Expr {
 	return &ast.CallExpr{
 		Fun:  newID("uint64"),
@@ -2190,7 +2192,57 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		}
 		var memRhs ast.Expr
 		if memFromArg {
-			memRhs = newID("memory")
+			// The image the caller handed us is already initialized; its
+			// grown size travels with it. It must respect the same
+			// implementation limit memoryGrow enforces — the coalesced
+			// SIMD bounds check is only exact below it. A memory64 uses
+			// the mem64 hard cap instead. And it must lie inside the
+			// allocation: the guest's memory is a part of it.
+			capBytes := uint64(wasmMemHardCapBytes)
+			if mem.Is64 {
+				capBytes = 1 << 48 // mem64HardCap
+			}
+			body.List = append(body.List,
+				&ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("memSize"),
+						Op: token.GTR,
+						Y:  uintLit(capBytes),
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{
+						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+							stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
+						}}},
+					}},
+				},
+				&ast.IfStmt{
+					Cond: &ast.BinaryExpr{
+						X:  newID("memSize"),
+						Op: token.GTR,
+						Y:  memLenExpr(),
+					},
+					Body: &ast.BlockStmt{List: []ast.Stmt{
+						&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+							stringLit("wasm2go: memory size exceeds the memory handed in"),
+						}}},
+					}},
+				},
+			)
+			if mem.Limits.Shared {
+				// A shared memory's slice spans the whole allocation from
+				// the start, as the allocating constructor's spans its
+				// ceiling: growth only moves memSize, bounded by the
+				// slice's length.
+				memRhs = newID("memory")
+			} else {
+				// The guest's memory is the first memSize bytes of the
+				// allocation; the rest is its capacity. Everything that
+				// bounds an access by the slice's length then refuses
+				// what lies past memory.size, and memory.grow reslices
+				// into the capacity in place — the allocation is the
+				// ceiling (maxMem below), so the memory never moves.
+				memRhs = &ast.SliceExpr{X: newID("memory"), High: newID("memSize")}
+			}
 		} else {
 			memRhs = &ast.CallExpr{
 				Fun: newID("make"),
@@ -2233,28 +2285,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		})
 		sizeArg := ast.Expr(uintLit(minBytesU))
 		if memFromArg {
-			// The image the caller handed us is already initialized; its
-			// grown size travels with it. It must respect the same
-			// implementation limit memoryGrow enforces — the coalesced
-			// SIMD bounds check is only exact below it. A memory64 uses
-			// the mem64 hard cap instead.
-			capBytes := uint64(wasmMemHardCapBytes)
-			if mem.Is64 {
-				capBytes = 1 << 48 // mem64HardCap
-			}
 			sizeArg = newID("memSize")
-			body.List = append(body.List, &ast.IfStmt{
-				Cond: &ast.BinaryExpr{
-					X:  newID("memSize"),
-					Op: token.GTR,
-					Y:  uintLit(capBytes),
-				},
-				Body: &ast.BlockStmt{List: []ast.Stmt{
-					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
-						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
-					}}},
-				}},
-			})
 		}
 		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
 			Fun: &ast.SelectorExpr{

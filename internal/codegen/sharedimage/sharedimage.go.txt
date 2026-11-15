@@ -432,7 +432,8 @@ func ForkMemory(m *{{.Module}}, from *SharedImage, ceiling uint64) (*MemoryFork,
 	mapped := from != nil && from.f != nil
 	anonymous := from != nil && from.anonymous
 	if mapped || anonymous {
-		// A memory that grew is a shorter slice of its mapping.
+		// The memory is the first memory.size bytes of its mapping (all
+		// of it, for a shared memory); the mapping is its capacity.
 		mem = mem[:cap(mem)]
 		ceiling = uint64(len(mem))
 	}
