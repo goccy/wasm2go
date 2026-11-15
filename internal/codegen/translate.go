@@ -1823,10 +1823,12 @@ func (t *translator) emitModuleStruct() ast.Decl {
 		// here, at compile time) and memoryInit raises it for the PASSIVE ones,
 		// whose destinations are wasm constants the host cannot see until the
 		// start section runs them. SharedImage is the consumer: it may share
-		// everything below this line and must zero everything above it.
+		// everything below this line and must zero everything above it. A
+		// uint64 on every module, so that a memory64's segments above 4 GiB
+		// are described as they are.
 		fields = append(fields, &ast.Field{
 			Names: []*ast.Ident{newID(t.fieldName("dataEnd"))},
-			Type:  newID("uint32"),
+			Type:  newID("uint64"),
 		})
 		// memShared records whether the memory was declared shared, which
 		// is what makes the reslice-free grow above legal.

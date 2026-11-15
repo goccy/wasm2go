@@ -54,8 +54,9 @@ type Module struct {
 	// (see memoryInit) because the offsets are wasm constants the host never
 	// sees otherwise. An embedding that shares an initialized memory image
 	// needs it: the image may carry everything BELOW this line and must carry
-	// zeros above it. Zero until the start section has run.
-	dataEnd uint32
+	// zeros above it. Zero until the start section has run. A uint64: a
+	// memory64's segments may lie anywhere in its 64-bit address space.
+	dataEnd uint64
 	// threadStart runs the guest's wasi_thread_start export. New() assigns it
 	// when the wasm exports one. A field (not an interface assertion on the
 	// Module) because multi-package output emits exports as FREE FUNCTIONS in
@@ -1161,7 +1162,7 @@ func memoryInit(m *Module, seg int, dst int32, src int32, n int32) {
 	// NOT carry BSS (the start section's "already ran" flag and the C++ static
 	// state — inheriting either is fatal). The offsets are only known here, at
 	// the memory.init that installs them.
-	if end := uint32(dst) + uint32(n); end > m.dataEnd {
+	if end := uint64(uint32(dst)) + uint64(uint32(n)); end > m.dataEnd {
 		m.dataEnd = end
 	}
 	d := m.memory[uint32(dst) : uint32(dst)+uint32(n)]
@@ -3267,17 +3268,11 @@ func memoryInit64(m *Module, seg int, dst int64, src int32, n int32) {
 		dstEnd < uint64(dst) || dstEnd > m.memSize.Load() {
 		wasm_trap_meminit_oob()
 	}
-	if dstEnd > uint64(m.dataEnd) {
-		// Same bookkeeping as the 32-bit memoryInit: the end of the
-		// data-segment region is where BSS begins, and image-sharing
-		// embeddings must know it. dataEnd is a uint32; a segment
-		// landing beyond 4GiB saturates it, which makes the sharing
-		// layer refuse the image instead of truncating the extent.
-		if dstEnd >= uint64(^uint32(0)) {
-			m.dataEnd = ^uint32(0)
-		} else {
-			m.dataEnd = uint32(dstEnd)
-		}
+	// Same bookkeeping as the 32-bit memoryInit: the end of the
+	// data-segment region is where BSS begins, and image-sharing
+	// embeddings must know it, above 4 GiB as below.
+	if dstEnd > m.dataEnd {
+		m.dataEnd = dstEnd
 	}
 	d := m.memory[uint64(dst):dstEnd]
 	s := data[uint32(src) : uint32(src)+uint32(n)]
