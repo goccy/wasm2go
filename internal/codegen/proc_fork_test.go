@@ -24,7 +24,7 @@ const (
 // newForkTestModule returns a module with its own linear memory, standing in
 // for the separate module instance a forked guest runs in.
 func newForkTestModule() *Module {
-	return &Module{memory: make([]byte, 1<<16)}
+	return newGuestModule(1 << 16)
 }
 
 // fdReadString reads up to n bytes from fd through Fd_read.

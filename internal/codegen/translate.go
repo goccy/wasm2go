@@ -3591,6 +3591,12 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 			}}}
 		}
 		out = append(out, &ast.FuncDecl{
+			Doc: &ast.CommentGroup{List: []*ast.Comment{
+				{Text: "// Memory returns the module's linear memory slice. The guest's memory is"},
+				{Text: "// its first memory.size bytes. For a shared memory the slice spans the"},
+				{Text: "// memory's whole ceiling, since another agent's memory.grow may raise"},
+				{Text: "// memory.size at any moment; for any other memory it is memory.size long."},
+			}},
 			Recv: recv,
 			Name: newID("Memory"),
 			Type: &ast.FuncType{

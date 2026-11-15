@@ -62,6 +62,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -71,9 +72,12 @@ import (
 // output package; this in-package Module exists so the WasiStubs methods
 // below are real, compilable Go (and therefore directly testable). The
 // embedded-source path strips the package + import header at emit time
-// and lets the generated Module shadow this one.
+// and lets the generated Module shadow this one. It has the generated
+// Module's fields the stubs read: the memory slice and memSize, the size
+// the guest sees (see guestMemory).
 type Module struct {
-	memory []byte
+	memory  []byte
+	memSize *atomic.Uint64
 }
 
 // accessMemory is the in-package stand-in for the runtime helper of the same
@@ -2159,12 +2163,13 @@ func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
 }
 
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
-// ptr (0) yields "". ok is false on an out-of-bounds or unterminated read.
+// ptr (0) yields "". ok is false on an out-of-bounds or unterminated read:
+// a string whose NUL is not within the guest's memory (guestMemory).
 func (w *WasiStubs) readCStr(m *Module, ptr uint64) (s string, ok bool) {
 	if ptr == 0 {
 		return "", true
 	}
-	mem := m.memory
+	mem := w.guestMemory(m)
 	if ptr > uint64(len(mem)) {
 		return "", false
 	}
@@ -3320,16 +3325,29 @@ func (w *WasiStubs) checkNet(op string) bool {
 	return hook(op)
 }
 
+// guestMemory returns the guest's linear memory as the guest sees it: the
+// first memory.size bytes (memSize) of the module's memory slice. Every
+// bound the stubs put on a guest address comes from here, so that an
+// address at or past memory.size is refused as wasm refuses it. For a
+// shared memory the slice spans the memory's whole ceiling from the start
+// and only memSize says how much of it the guest may touch; another agent
+// may grow the memory at any moment, which raises memSize and leaves the
+// slice and its backing array as they are, so a view taken here stays
+// valid. Any other memory's slice is memory.size long.
+func (w *WasiStubs) guestMemory(m *Module) []byte {
+	return m.memory[:m.memSize.Load()]
+}
+
 // memBytes returns the n bytes of guest memory at off, m.memory[off :
-// off+n], or nil when any of them lies outside the memory (the wasi
-// function should then return EFAULT / EINVAL). off and n are the guest's
-// address and size at full width: a wasm32 guest's zero-extended (zext), a
-// memory64 guest's as they are. No sum of them wraps around, so a guest
-// address with bits above the memory's size set never aliases memory
-// below it. Callers must hold any locks they need on the wasm side;
-// WasiStubs.mu is independent.
+// off+n], or nil when any of them lies outside the guest's memory
+// (guestMemory; the wasi function should then return EFAULT / EINVAL).
+// off and n are the guest's address and size at full width: a wasm32
+// guest's zero-extended (zext), a memory64 guest's as they are. No sum of
+// them wraps around, so a guest address with bits above the memory's size
+// set never aliases memory below it. Callers must hold any locks they need
+// on the wasm side; WasiStubs.mu is independent.
 func (w *WasiStubs) memBytes(m *Module, off, n uint64) []byte {
-	mem := m.memory
+	mem := w.guestMemory(m)
 	size := uint64(len(mem))
 	if off > size || n > size-off {
 		return nil
@@ -9409,13 +9427,14 @@ func (w *WasiStubs) SetOutsideInterrupt(interrupt func()) (previous func()) {
 }
 
 // raiseSignalFlagLocked stores 1 in the guest's flag word. The guest runs on
-// another goroutine and may be growing its memory, hence accessMemory.
-// Caller holds w.mu.
+// another goroutine and may be growing its memory, hence accessMemory: the
+// word is looked up in the guest's memory (memBytes) under the lock growth
+// takes. Caller holds w.mu.
 func (w *WasiStubs) raiseSignalFlagLocked() {
-	addr := w.sig.flagAddr
-	accessMemory(w.sig.flagModule, func(mem []byte) {
-		if size := uint64(len(mem)); addr <= size && 4 <= size-addr {
-			binary.LittleEndian.PutUint32(mem[addr:], 1)
+	flagModule, addr := w.sig.flagModule, w.sig.flagAddr
+	accessMemory(flagModule, func([]byte) {
+		if b := w.memBytes(flagModule, addr, 4); b != nil {
+			binary.LittleEndian.PutUint32(b, 1)
 		}
 	})
 }

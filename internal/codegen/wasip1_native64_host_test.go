@@ -46,7 +46,7 @@ func TestWasi64_HostDescriptorsAreReadAndWrittenAsByFdRead(t *testing.T) {
 	}
 	takeSignals(t, w, m)
 
-	big := &Module{memory: make([]byte, 1<<21)}
+	big := newGuestModule(1 << 21)
 	const size = 1 << 20
 	for i := 0; i < size; i++ {
 		big.memory[4096+i] = byte(i)

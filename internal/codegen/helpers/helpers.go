@@ -903,7 +903,17 @@ func memoryGrow(m *Module, n int32) int32 {
 // neither be resliced nor relocated, so f's writes land in the array
 // the guest observes; a grow that raced in just before blocks until f
 // returns and then copies f's writes forward with the rest of the
-// contents. Determinism notes for callers:
+// contents.
+//
+// mem is the memory's whole slice. The guest's memory is its first
+// memory.size bytes (memSize), and an address at or past that is not the
+// guest's. For any memory but a shared one the two are the same length.
+// A shared memory's slice spans its whole ceiling from the start and
+// stays that way, since another agent's memory.grow may raise memSize
+// at any moment outside f; f gets the whole array and bounds what it
+// touches by memSize itself.
+//
+// Determinism notes for callers:
 //
 //   - f MUST NOT call back into the module or into memoryGrow — that
 //     would self-deadlock.

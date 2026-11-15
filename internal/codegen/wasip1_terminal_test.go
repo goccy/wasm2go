@@ -485,7 +485,7 @@ func TestTerminal_BlockingWriteIsEndedByASignal(t *testing.T) {
 	}
 
 	const size = 1 << 20
-	big := &Module{memory: make([]byte, size+8192)}
+	big := newGuestModule(size + 8192)
 	makeIovec(big, 64, 4096, size)
 	postSoon(w, wasiSIGUSR1)
 	start := time.Now()

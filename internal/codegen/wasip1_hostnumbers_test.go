@@ -75,7 +75,7 @@ func TestWasi_ErrorsKeepTheirNumber(t *testing.T) {
 // hostNumbersOf reads a whole family through the import.
 func hostNumbersOf(t *testing.T, w *WasiStubs, family int32) map[string]int64 {
 	t.Helper()
-	m := &Module{memory: make([]byte, 1<<12)}
+	m := newGuestModule(1 << 12)
 	const namePtr, nameCap, lenPtr, valuePtr = 16, 64, 128, 136
 	numbers := map[string]int64{}
 	for index := int32(0); ; index++ {
@@ -99,7 +99,7 @@ func hostNumbersOf(t *testing.T, w *WasiStubs, family int32) map[string]int64 {
 // them, family by family; any other guest keeps its own.
 func TestWasi_HostNumbers(t *testing.T) {
 	w := DefaultWASI()
-	m := &Module{memory: make([]byte, 1<<12)}
+	m := newGuestModule(1 << 12)
 	if got := w.Host_numbering(m); got != 0 {
 		t.Errorf("host_numbering of a sandboxed guest = %d, want 0", got)
 	}
