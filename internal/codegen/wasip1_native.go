@@ -9042,6 +9042,105 @@ func (w *WasiStubs) procUserByName(m *Module, namePtr uint64, nameLen int32, buf
 	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
 }
 
+// hostDatabaseEntries returns the entries of a database file of the host
+// in the files' format (passwd(5), group(5)): one entry a line, its fields
+// separated by colons; a line that is empty, a comment, or an entry of the
+// NIS compatibility syntax (+ or - first) is none. The fields of an entry
+// whose ids (fields idFields) are not numbers are left out too.
+func hostDatabaseEntries(path string, minFields int, idFields ...int) [][]string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var entries [][]string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" || line[0] == '#' || line[0] == '+' || line[0] == '-' {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < minFields {
+			continue
+		}
+		numeric := true
+		for _, i := range idFields {
+			if _, err := strconv.ParseUint(fields[i], 10, 32); err != nil {
+				numeric = false
+			}
+		}
+		if numeric {
+			entries = append(entries, fields)
+		}
+	}
+	return entries
+}
+
+// Proc_user_at is a NON-STANDARD host import (name "proc_user_at") backing
+// getpwent: the index-th entry of the host's user database, the file
+// /etc/passwd (the source os/user reads as well), as Proc_user_by_id hands
+// an entry back, with its shell. Returns 0, or a negative errno: ENOENT past
+// the last entry — at once, for an instance that is not the host process —
+// and ERANGE when the buffer is too small.
+func (w *WasiStubs) Proc_user_at(m *Module, index, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUserAt(m, index, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_user_at64 is Proc_user_at for a memory64 guest.
+func (w *WasiStubs) Proc_user_at64(m *Module, index int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUserAt(m, index, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUserAt is the body of Proc_user_at and Proc_user_at64.
+func (w *WasiStubs) procUserAt(m *Module, index int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	// name:password:uid:gid:gecos:home:shell
+	entries := hostDatabaseEntries("/etc/passwd", 7, 2, 3)
+	if index < 0 || int(index) >= len(entries) {
+		return -_wasiENOENT
+	}
+	e := entries[index]
+	uid, _ := strconv.ParseUint(e[2], 10, 32)
+	gid, _ := strconv.ParseUint(e[3], 10, 32)
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(uid))
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(gid))
+	rec = appendWasiString(rec, e[0])
+	rec = appendWasiString(rec, e[4])
+	rec = appendWasiString(rec, e[5])
+	rec = appendWasiString(rec, e[6])
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_group_at is a NON-STANDARD host import (name "proc_group_at")
+// backing getgrent: the index-th entry of the host's group database, the
+// file /etc/group, as Proc_group_by_id hands an entry back. See
+// Proc_user_at.
+func (w *WasiStubs) Proc_group_at(m *Module, index, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procGroupAt(m, index, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_group_at64 is Proc_group_at for a memory64 guest.
+func (w *WasiStubs) Proc_group_at64(m *Module, index int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procGroupAt(m, index, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procGroupAt is the body of Proc_group_at and Proc_group_at64.
+func (w *WasiStubs) procGroupAt(m *Module, index int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if !w.hostIdentity() {
+		return -_wasiENOENT
+	}
+	// name:password:gid:members
+	entries := hostDatabaseEntries("/etc/group", 3, 2)
+	if index < 0 || int(index) >= len(entries) {
+		return -_wasiENOENT
+	}
+	e := entries[index]
+	gid, _ := strconv.ParseUint(e[2], 10, 32)
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(gid))
+	rec = appendWasiString(rec, e[0])
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
 // writeGroup answers a group lookup with the group's record: u32 gid, then
 // the group name as a string (appendWasiString). The host's group lookup
 // (os/user) does not report a group's members, so the record carries none.
@@ -13262,6 +13361,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"awaitDial":                 true,
 			"sendDatagram":              true,
 			"userRecord":                true,
+			"hostDatabaseEntries":       true,
 			"pollReady":                 true,
 			"probeWritable":             true,
 			"takeTurn":                  true,

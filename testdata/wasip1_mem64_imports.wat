@@ -165,6 +165,10 @@
     (func $proc_groups (param i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_user_by_id"
     (func $proc_user_by_id (param i32 i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_user_at"
+    (func $proc_user_at (param i32 i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_group_at"
+    (func $proc_group_at (param i32 i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_user_by_name"
     (func $proc_user_by_name (param i64 i32 i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_group_by_id"
@@ -363,6 +367,8 @@
     (drop (call $proc_ids (i64.const 0)))
     (drop (call $proc_groups (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_user_by_id (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_user_at (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_group_at (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_user_by_name (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_group_by_id (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_group_by_name (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
