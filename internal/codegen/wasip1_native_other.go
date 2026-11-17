@@ -278,7 +278,7 @@ type hostWaker struct{}
 // instance took over.
 type hostStandard struct{}
 
-func (w *WasiStubs) restoreStandardLocked() {}
+func (w *WasiStubs) endStandardLocked() {}
 
 func (w *WasiStubs) leavesStandardLocked() bool { return true }
 

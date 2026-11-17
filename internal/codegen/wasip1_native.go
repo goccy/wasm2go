@@ -1486,12 +1486,11 @@ type WasiStubs struct {
 	// on first use, nil until then and on a host without such waits.
 	// Guarded by mu.
 	waker *hostWaker
-	// standard is the standard descriptors of the host process as they
-	// were before the guest had them, for an instance that has them as its
-	// own (see restoreStandardLocked): what the guest does to descriptors
-	// 0, 1 and 2 it does to the process's, and nothing else remembers what
-	// they were. nil for an instance that took none; a forked instance has
-	// its parent's. Guarded by mu.
+	// standard is which standard descriptors of the host process the
+	// instance has as its own (see takeStandardLocked): what the guest does
+	// to descriptors 0, 1 and 2 it does to the process's. nil for an
+	// instance that took none; a forked instance has its parent's. Guarded
+	// by mu.
 	standard *hostStandard
 }
 
@@ -1850,7 +1849,7 @@ func (w *WasiStubs) CloseAll() error {
 		delete(w.fdsLocked(), fd)
 	}
 	w.closeHostWakerLocked()
-	w.restoreStandardLocked()
+	w.endStandardLocked()
 	// Nobody is left to wait for this instance's processes: the finished
 	// ones are gone, and the running ones go when they finish (finishProc
 	// finds them missing from the table).
@@ -7778,8 +7777,9 @@ const (
 //     and the standard descriptors when the instance's streams are not
 //     those: an embedder that keeps descriptors of its own while such a
 //     guest runs opens them before, or duplicates them to 1024 or above.
-//     The standard descriptors the guest was given are put back as they
-//     were when the instance ends (CloseAll).
+//     What the guest does to the standard descriptors it was given it does
+//     to the process's, for good: one it closed stays closed and one it
+//     redirected stays redirected when the instance ends (CloseAll).
 //
 // Without it (the default) the guest is an isolated process of its own:
 // pid 42, parent 1, user and group 0, empty user and group databases, no

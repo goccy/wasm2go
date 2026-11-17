@@ -1124,12 +1124,12 @@ func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen {
 		shared := hostTable.open[fd]
 		hostTable.mu.Unlock()
 		if shared != nil && shared.host() != nil {
-			w.keepStandardLocked(fd)
+			w.takeStandardLocked(fd)
 			shared.addRef()
 			return shared
 		}
 		if op, err := newHostOpen(fd, ""); err == nil {
-			w.keepStandardLocked(fd)
+			w.takeStandardLocked(fd)
 			hostEnter(fd, op)
 			return op
 		}
@@ -1137,69 +1137,58 @@ func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen {
 	return &wasiOpen{stdio: stdio}
 }
 
-// keepStandardLocked keeps a duplicate of standard descriptor fd of the
-// host process (0, 1 or 2) as it is before the guest has it, for
-// restoreStandardLocked to put back. Caller holds w.mu.
-func (w *WasiStubs) keepStandardLocked(fd int) {
+// takeStandardLocked records that the instance has standard descriptor fd
+// of the host process (0, 1 or 2) as its own. Nothing is kept of it beside
+// the guest's: the program is the process, and what it does to the
+// descriptor — a close, a redirection — is done to the process's for good.
+// A copy would keep a pipe open after the program closed it, and the
+// reader at its other end would never see the end of input. Caller holds
+// w.mu.
+func (w *WasiStubs) takeStandardLocked(fd int) {
 	if w.standard == nil {
-		w.standard = &hostStandard{kept: [3]int{-1, -1, -1}}
+		w.standard = &hostStandard{}
 	}
-	if kept, err := hostDup(fd, hostFloor()); err == nil {
-		w.standard.kept[fd] = kept
-	}
+	w.standard.taken[fd] = true
 }
 
-// restoreStandardLocked gives the host process its standard descriptors
-// back as they were when the instance took them: whatever the guest left
-// under 0, 1 and 2 — a file it redirected a stream to, nothing after a
-// close — is replaced. The program is over; the process it ran in goes on,
-// and reports, or runs the next program, through them. Caller holds w.mu.
-func (w *WasiStubs) restoreStandardLocked() {
+// endStandardLocked ends the family's hold on the standard descriptors of
+// the host process, when its first process ends: what is under 0, 1 and 2
+// is the process's from then on, as the program left it. A forked process
+// has its parent's record of them, to know which are the family's; the
+// first process ends it. Caller holds w.mu.
+func (w *WasiStubs) endStandardLocked() {
 	if w.standard == nil || w.forked {
-		// A forked process has its parent's record of them, to know which
-		// are the family's; they are the first process's to give back.
 		return
 	}
-	syscall.ForkLock.RLock()
-	for fd, kept := range w.standard.kept {
-		if kept < 0 {
-			continue
-		}
-		_ = hostDup2(kept, fd)
-		_ = syscall.Close(kept)
-	}
-	syscall.ForkLock.RUnlock()
-	w.standard.returned.Store(true)
+	w.standard.ended.Store(true)
 	w.standard = nil
 }
 
 // leavesStandardLocked reports whether the instance, when it ends, leaves
 // open what it has under the numbers of the standard descriptors of the
-// host process (endWasiOpen). The first process of a family does: it gives
-// the process its descriptors back in their place. A forked process that
-// ends while the family runs on closes them like its other descriptors —
-// they are files of the program's, and a number that stayed taken by
-// nobody would not be the lowest free one for the process that next closes
-// its standard output and opens a file. Once the first process has given
-// the descriptors back, what is under the numbers is the host process's
-// again, and a forked process that outlived it leaves it alone. Caller
-// holds w.mu.
+// host process (endWasiOpen). The first process of a family does: what the
+// program left there is the process's. A forked process that ends while
+// the family runs on closes them like its other descriptors — they are
+// files of the program's, and a number that stayed taken by nobody would
+// not be the lowest free one for the process that next closes its standard
+// output and opens a file. Once the first process has ended, what is under
+// the numbers is the host process's, and a forked process that outlived it
+// leaves it alone. Caller holds w.mu.
 func (w *WasiStubs) leavesStandardLocked() bool {
-	return !w.forked || w.standard == nil || w.standard.returned.Load()
+	return !w.forked || w.standard == nil || w.standard.ended.Load()
 }
 
 // hostStandard is the standard descriptors of the host process an instance
-// took over: duplicates of 0, 1 and 2 as they were, -1 for one it did not
-// take. The processes forked from the instance share the record; kept does
-// not change once the instance's table is set up.
+// took over: true for each of 0, 1 and 2 it took. The processes forked
+// from the instance share the record; taken does not change once the
+// instance's table is set up.
 type hostStandard struct {
-	kept [3]int
-	// returned is set when the first process of the family has put the
-	// descriptors back (restoreStandardLocked). The forked processes ask
-	// it when they end (leavesStandardLocked); they cannot ask the first
-	// process itself, whose lock is not theirs to take from under their
-	// own.
-	returned atomic.Bool
+	taken [3]bool
+	// ended is set when the first process of the family has ended
+	// (endStandardLocked). The forked processes ask it when they end
+	// (leavesStandardLocked); they cannot ask the first process itself,
+	// whose lock is not theirs to take from under their own.
+	ended atomic.Bool
 }
 
 // madeOutside reports whether the descriptor is one that code outside the
@@ -1529,7 +1518,7 @@ func (w *WasiStubs) addHostFDFromLocked(op *wasiOpen, min int) (int32, error) {
 // — no guest gets that number — and neither is one that code outside the
 // guest made, which is the instance's under its number. Caller holds w.mu.
 func (w *WasiStubs) othersNumberLocked(fd int) bool {
-	if fd <= 2 && (w.standard == nil || w.standard.kept[fd] < 0) {
+	if fd <= 2 && (w.standard == nil || !w.standard.taken[fd]) {
 		return true
 	}
 	owner, reserved := hostOwner(fd)
@@ -1555,7 +1544,7 @@ func (w *WasiStubs) hostNumberFreeLocked(fd int) bool {
 	if fd >= hostFloor() {
 		return false
 	}
-	if fd <= 2 && (w.standard == nil || w.standard.kept[fd] < 0) {
+	if fd <= 2 && (w.standard == nil || !w.standard.taken[fd]) {
 		return false
 	}
 	owner, reserved := hostOwner(fd)

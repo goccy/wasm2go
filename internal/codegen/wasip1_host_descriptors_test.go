@@ -749,14 +749,32 @@ func descriptorIdentity(t *testing.T, fd int) [2]uint64 {
 	return [2]uint64{uint64(st.Dev), uint64(st.Ino)}
 }
 
-func TestHostDescriptors_StandardDescriptorsAreTheProcesssAndAreGivenBack(t *testing.T) {
+// keepTestStandardOutput puts descriptor 1 of the test process back as it
+// is now when the test ends: a guest that has it as its own changes it for
+// good.
+func keepTestStandardOutput(t *testing.T) {
+	t.Helper()
+	KeepRuntimeDescriptorsHigh()
+	saved, err := hostDup(1, hostFloor())
+	if err != nil {
+		t.Fatalf("dup(1): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = hostDup2(saved, 1)
+		_ = syscall.Close(saved)
+	})
+}
+
+// Standard output that is the process's own is the guest's: what the guest
+// does to it, it does to descriptor 1 of the process, and that stays when
+// the instance ends.
+func TestHostDescriptors_StandardDescriptorsAreTheProcesssAndStayAsTheGuestLeftThem(t *testing.T) {
 	dir := t.TempDir()
+	keepTestStandardOutput(t)
 	w, m := newTestStubs(t, dir)
 	// The instance's standard output is the process's own.
 	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), os.Stdout, &bytes.Buffer{}
-	KeepRuntimeDescriptorsHigh()
 	w.hostProcess = true
-	before := descriptorIdentity(t, 1)
 
 	if host, ok := w.HostDescriptor(1); !ok || host != 1 {
 		t.Fatalf("standard output is descriptor %d of the host (%v), want 1", host, ok)
@@ -781,32 +799,64 @@ func TestHostDescriptors_StandardDescriptorsAreTheProcesssAndAreGivenBack(t *tes
 	if err := syscall.Fstat(1, &st); err != syscall.EBADF {
 		t.Fatalf("after the guest closed 1, fstat(1) = %v, want EBADF", err)
 	}
-	// When the instance ends, the process has its standard output back.
+	// When the instance ends, it stays closed: the program was the process.
 	if err := w.CloseAll(); err != nil {
 		t.Fatalf("CloseAll: %v", err)
 	}
-	if after := descriptorIdentity(t, 1); after != before {
-		t.Fatalf("descriptor 1 of the process is %v after the instance ended, was %v", after, before)
+	if err := syscall.Fstat(1, &st); err != syscall.EBADF {
+		t.Fatalf("after the instance ended, fstat(1) = %v, want EBADF", err)
 	}
 	if got, _ := os.ReadFile(filepath.Join(dir, "out.txt")); string(got) != "written outside the guest\n" {
 		t.Fatalf("the file holds %q", got)
 	}
 }
 
+// A pipe that is the process's standard output ends when the guest closes
+// standard output: the reader at its other end is at the end of input,
+// with nothing of the runtime's holding the pipe open.
+func TestHostDescriptors_APipeOnStandardOutputEndsWhenTheGuestClosesIt(t *testing.T) {
+	keepTestStandardOutput(t)
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(p[0])
+	if err := hostDup2(p[1], 1); err != nil {
+		t.Fatal(err)
+	}
+	_ = syscall.Close(p[1])
+	w, m := newTestStubs(t, t.TempDir())
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), os.Stdout, &bytes.Buffer{}
+	w.hostProcess = true
+	if rc := fdWriteString(w, m, 1, "out"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	closeTestFd(t, w, m, 1)
+	if err := syscall.SetNonblock(p[0], true); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	if n, err := syscall.Read(p[0], buf); n != 3 || err != nil || string(buf[:n]) != "out" {
+		t.Fatalf("read = %d %q, %v; want what the guest wrote", n, buf[:max(n, 0)], err)
+	}
+	if n, err := syscall.Read(p[0], buf); n != 0 || err != nil {
+		t.Fatalf("read after the guest closed standard output = %d, %v; want the end of input", n, err)
+	}
+	_ = w.CloseAll()
+}
+
 // A forked process that ends while its family runs on closes what it has
 // under the numbers of the standard descriptors like its other descriptors:
 // the number is free in the process again, and the process that next closes
 // its standard output and opens a file gets the file as descriptor 1 of the
-// host. When the first process ends, the host process has its own standard
-// output back.
+// host. When the first process ends, what it left there is the process's.
 func TestHostDescriptors_AForkedProcessThatEndsFreesTheStandardNumbers(t *testing.T) {
 	dir := t.TempDir()
+	keepTestStandardOutput(t)
 	w, m := newTestStubs(t, dir)
 	// The instance's standard output is the process's own.
 	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), os.Stdout, &bytes.Buffer{}
-	KeepRuntimeDescriptorsHigh()
 	w.hostProcess = true
-	before := descriptorIdentity(t, 1)
 	ended := false
 	defer func() {
 		if !ended {
@@ -861,8 +911,8 @@ func TestHostDescriptors_AForkedProcessThatEndsFreesTheStandardNumbers(t *testin
 	if err := w.CloseAll(); err != nil {
 		t.Fatalf("CloseAll: %v", err)
 	}
-	if after := descriptorIdentity(t, 1); after != before {
-		t.Fatalf("descriptor 1 of the process is %v after the first process ended, was %v", after, before)
+	if !sameFile(t, 1, filepath.Join(dir, "again.txt")) {
+		t.Fatalf("after the first process ended, descriptor 1 of the process is not the file it left there")
 	}
 }
 
