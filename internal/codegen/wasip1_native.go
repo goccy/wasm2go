@@ -1553,6 +1553,62 @@ type wasiPIDs struct {
 	// process whose pid it knows — a sibling, its parent's parent, a
 	// grandchild — and only its own children are in its own table.
 	procs map[int32]*wasiProc
+	// groups holds, for a process group of the family, the process groups
+	// of the host that commands lead for it: a process that leads its group
+	// or its session within the runtime and execs a command has the command
+	// lead a group of the host. A signal to the family's group goes to each
+	// for as long as the host has it, which is while a process is left in
+	// it — after the command has ended and the process it replaced has been
+	// waited for, as a signal to a group reaches every member until there
+	// is none (Proc::Simple kills the shell of `sh -c` and then its group).
+	// The host gives the number of such a group to no other process while
+	// the group exists.
+	groups map[int32][]int
+}
+
+// addGroup records that the host's process group hostPgid is one of the
+// family's group pgid.
+func (p *wasiPIDs) addGroup(pgid int32, hostPgid int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.groups == nil {
+		p.groups = map[int32][]int{}
+	}
+	p.groups[pgid] = append(p.groups[pgid], hostPgid)
+}
+
+// hostGroups returns the host's process groups recorded for the family's
+// group pgid, or for every group of the family when all is set.
+func (p *wasiPIDs) hostGroups(pgid int32, all bool) []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !all {
+		return append([]int(nil), p.groups[pgid]...)
+	}
+	var hosts []int
+	for _, g := range p.groups {
+		hosts = append(hosts, g...)
+	}
+	return hosts
+}
+
+// dropGroup forgets a process group the host no longer has.
+func (p *wasiPIDs) dropGroup(hostPgid int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for pgid, g := range p.groups {
+		for i, h := range g {
+			if h == hostPgid {
+				g = append(g[:i], g[i+1:]...)
+				break
+			}
+		}
+		if len(g) == 0 {
+			delete(p.groups, pgid)
+		} else {
+			p.groups[pgid] = g
+		}
+	}
 }
 
 // enter makes proc reachable by pid for every instance of the family.
@@ -2449,6 +2505,13 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		pid = w.addProcLocked(proc)
 	}
 	w.enterProcLocked(pid)
+	if attr := cmd.SysProcAttr; attr != nil && commandLeadsGroup(attr) {
+		// The command leads a group of the host for the process's group
+		// within the runtime (see wasiPIDs.groups).
+		if pids, group := w.pidsLocked(), w.groupLocked(); pids.allocated(group) {
+			pids.addGroup(group, cmd.Process.Pid)
+		}
+	}
 	killed := w.sig.killPending()
 	w.mu.Unlock()
 	if killed {
@@ -8912,7 +8975,10 @@ func (w *WasiStubs) Proc_exec_next64(m *Module, on int32) int32 {
 // through the OS as well when the guest is the host process: that reaches
 // the host process itself (and so the first process of the family) and the
 // commands the family started. In a group the family formed, the commands
-// its members started are signalled with them.
+// its members started are signalled with them, and so are the groups of
+// the host that commands lead for it, for as long as the host has them
+// (wasiPIDs.groups): what the command of a process that led the group
+// started is in one, also once the command and that process are gone.
 //
 // Returns 0, or a negative errno: ESRCH when the group has no process,
 // EINVAL for a signal the host does not have.
@@ -8975,6 +9041,16 @@ func (w *WasiStubs) killGroup(pid, sig int32) int32 {
 			}
 		}
 	}
+	if !real && known {
+		for _, host := range pids.hostGroups(pgid, everyone) {
+			switch err := signalHostProcess(-host, hostSig); {
+			case err == nil:
+				reached = true
+			case errors.Is(err, syscall.ESRCH):
+				pids.dropGroup(host)
+			}
+		}
+	}
 	if real {
 		if err := signalHostProcess(-int(pgid), hostSig); err == nil {
 			reached = true
@@ -8996,9 +9072,9 @@ func processDirIs(dir string) bool {
 }
 
 // signalCommands sends a signal to the running commands this instance
-// started: to the whole process group of a command that leads one, as the
-// command of a process that led its group or its session does (the signal
-// is one to that group).
+// started, but for one that leads a process group of the host: that group
+// is the instance's group's, which killGroup signals as one
+// (wasiPIDs.groups).
 func (w *WasiStubs) signalCommands(sig syscall.Signal) {
 	w.mu.Lock()
 	var cmds []*exec.Cmd
@@ -9015,9 +9091,7 @@ func (w *WasiStubs) signalCommands(sig syscall.Signal) {
 	w.mu.Unlock()
 	for _, cmd := range cmds {
 		if attr := cmd.SysProcAttr; attr != nil && commandLeadsGroup(attr) {
-			if signalHostProcess(-cmd.Process.Pid, sig) == nil {
-				continue
-			}
+			continue
 		}
 		_ = cmd.Process.Signal(sig)
 	}
