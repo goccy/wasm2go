@@ -2355,12 +2355,12 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	} else {
 		cmd.Args = []string{path}
 	}
-	// A command the first process of the family starts inherits the
-	// directory of the host process, which is its own, as a child of fork
-	// and exec does: it is not changed into, which would fail for a
-	// directory the user may no longer search (EACCES), where the process
-	// can stay.
-	if cwd != "" && !inProcessDir {
+	// A command started in the directory of the host process inherits
+	// it, as a child of fork and exec does: it is not changed into, which
+	// would fail for a directory the user may no longer search (EACCES),
+	// where the process can stay. The first process of the family is
+	// always there; a forked one is while it has not changed directory.
+	if cwd != "" && !inProcessDir && !processDirIs(cwd) {
 		cmd.Dir = cwd
 	}
 	// Sandbox: the child sees ONLY the guest-provided environment; a nil
@@ -8973,6 +8973,15 @@ func (w *WasiStubs) killGroup(pid, sig int32) int32 {
 	return _wasiESUCCESS
 }
 
+// processDirIs reports whether dir is the working directory of the host
+// process, as getcwd(2) names it: os.Getwd looks at ".", which a directory
+// that cannot be searched refuses. A name with a symbolic link in it is
+// not the name getcwd gives, and is taken for another directory.
+func processDirIs(dir string) bool {
+	wd, err := syscall.Getwd()
+	return err == nil && wd == dir
+}
+
 // signalCommands sends a signal to the running commands this instance
 // started: to the whole process group of a command that leads one, as the
 // command of a process that led its group or its session does (the signal
@@ -13467,6 +13476,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"streamHungUp":              true,
 			"streamFailed":              true,
 			"ownDescriptorName":         true,
+			"processDirIs":              true,
 			"ownDescriptorDirs":         true,
 			"ownDescriptorDir":          true,
 			"modeAllows":                true,
