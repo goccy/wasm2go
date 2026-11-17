@@ -2303,6 +2303,12 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	cin := w.childReaderLocked(stdinFd)
 	cout := w.childWriterLocked(stdoutFd, w.stdout)
 	cerr := w.childWriterLocked(stderrFd, w.stderr)
+	// A standard descriptor the guest has closed is closed in the command,
+	// as a child that execs has it (`cmd <&-`).
+	var closed [3]bool
+	for i, fd := range [3]int32{stdinFd, stdoutFd, stderrFd} {
+		closed[i] = fd >= 0 && w.openLocked(fd) == nil
+	}
 	// A descriptor of the host process is handed over as it is, whatever
 	// it is open for: as a duplicate, closed once the command has its own.
 	if file, host := w.hostChildFileLocked(stdinFd); host {
@@ -2379,7 +2385,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	} else if leadsGroup {
 		cmd.SysProcAttr = commandGroup()
 	}
-	if err := startCommand(cmd); err != nil {
+	if err := startCommand(cmd, closed); err != nil {
 		return -mapExecError(err)
 	}
 

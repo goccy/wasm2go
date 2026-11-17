@@ -442,8 +442,9 @@ func (w *WasiStubs) fdIoctl(m *Module, fd, request, buffer int32, argAddr uint64
 // runtime does not follow.
 func forwardSIGPIPEToIgnore() {}
 
-// startCommand starts cmd; no guest takes descriptors in on this platform.
-func startCommand(cmd *exec.Cmd) error { return cmd.Start() }
+// startCommand starts cmd; no guest takes descriptors in on this platform,
+// and a command gets /dev/null for a standard descriptor that is closed.
+func startCommand(cmd *exec.Cmd, closed [3]bool) error { return cmd.Start() }
 
 func waitCommand(cmd *exec.Cmd) error { return cmd.Wait() }
 

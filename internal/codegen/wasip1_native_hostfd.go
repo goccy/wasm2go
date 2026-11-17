@@ -2452,14 +2452,16 @@ func hostPipe() (r, wr *wasiOpen, err error) {
 // meantime is recorded along — its entry is in the host's table soon
 // after, and a recorded number keeps only guests from taking it in, which
 // none would anyway.
-func startCommand(cmd *exec.Cmd) error {
+//
+// A standard descriptor closed says is closed in the command (startProcess).
+func startCommand(cmd *exec.Cmd, closed [3]bool) error {
 	hostTable.making.RLock()
 	defer hostTable.making.RUnlock()
 	before := map[int]bool{}
 	for _, fd := range nobodysDescriptors() {
 		before[fd] = true
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startProcess(cmd, closed); err != nil {
 		return err
 	}
 	for _, fd := range nobodysDescriptors() {
@@ -2476,6 +2478,40 @@ func waitCommand(cmd *exec.Cmd) error {
 	err := cmd.Wait()
 	hostReleaseCommand(cmd)
 	return err
+}
+
+// startProcess starts cmd with the standard descriptors closed says (0, 1,
+// 2) closed, as the guest's are. os/exec gives a command /dev/null for a
+// stream it has nothing for, so such a command is started by
+// os.StartProcess, whose nil file is a closed descriptor, and the process
+// is cmd's to wait for (cmd.Wait). That hands the command its other
+// streams as the files they are; where one is not a file (a stream of the
+// embedder's, which os/exec copies), the command is started by os/exec and
+// gets /dev/null for the closed one.
+func startProcess(cmd *exec.Cmd, closed [3]bool) error {
+	if closed == [3]bool{} {
+		return cmd.Start()
+	}
+	files := make([]*os.File, 3, 3+len(cmd.ExtraFiles))
+	for i, stream := range []any{cmd.Stdin, cmd.Stdout, cmd.Stderr} {
+		if closed[i] {
+			continue
+		}
+		file, isFile := stream.(*os.File)
+		if !isFile || file == nil {
+			return cmd.Start()
+		}
+		files[i] = file
+	}
+	files = append(files, cmd.ExtraFiles...)
+	process, err := os.StartProcess(cmd.Path, cmd.Args, &os.ProcAttr{
+		Dir: cmd.Dir, Env: cmd.Env, Files: files, Sys: cmd.SysProcAttr,
+	})
+	if err != nil {
+		return err
+	}
+	cmd.Process = process
+	return nil
 }
 
 // nobodysDescriptors returns the descriptors of the process above the

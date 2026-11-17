@@ -1375,7 +1375,7 @@ func TestHostDescriptors_ACommandsDescriptorsAreTheRuntimesUntilItIsWaitedFor(t 
 	var out bytes.Buffer
 	cmd := exec.Command("/bin/sh", "-c", `read line; echo "got $line"`)
 	cmd.Stdin, cmd.Stdout = in, &out
-	if err := startCommand(cmd); err != nil {
+	if err := startCommand(cmd, [3]bool{}); err != nil {
 		in.Close()
 		t.Fatal(err)
 	}
@@ -1470,4 +1470,39 @@ func TestHostDescriptors_TheListingOfOwnDescriptorsIsTheGuests(t *testing.T) {
 		t.Fatalf("the forked process's listing %v has %d, made outside the guest", listed, outside)
 	}
 	closeTestFd(t, w, m, outside)
+}
+
+// A standard descriptor the guest has closed is closed in a command it
+// starts, as in the command a child execs (`cmd <&-`): the command does
+// not get /dev/null in its place.
+func TestHostDescriptors_ACommandHasTheStandardDescriptorsTheGuestClosedClosed(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh not available")
+	}
+	dir := t.TempDir()
+	w, m := newHostGuest(t, dir)
+	out := createTestFile(t, w, "out.txt")
+	for _, fd := range []int32{1, 2} {
+		if rc := w.Fd_dup2(m, out, fd); rc != _wasiESUCCESS {
+			t.Fatalf("Fd_dup2 onto %d rc=%d", fd, rc)
+		}
+	}
+	closeTestFd(t, w, m, out)
+	closeTestFd(t, w, m, 0)
+	pathOff := writeCStr(m, 1000, "/bin/sh")
+	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "if (true 3<&0) 2>/dev/null; then echo open; else echo closed; fi"})
+	const pidOff, statusOff int32 = 4000, 4004
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, 0, 1, 2, 0, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	pid := int32(readU32(m.memory, int(pidOff)))
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if status := readU32(m.memory, int(statusOff)); status != 0 {
+		t.Fatalf("wait status = %#x, want 0", status)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "out.txt")); string(got) != "closed\n" {
+		t.Fatalf("the command's standard input was %q, want closed", got)
+	}
 }
