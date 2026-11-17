@@ -692,3 +692,10 @@ func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
 
 // restoreHostActionsOutside has nothing to put back.
 func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}
+
+// signalHostSelf sends the host process a signal (see the Linux version,
+// which sends it to the calling thread; the runtime knows no native
+// signal action on this platform, see hostActionsOutside).
+func signalHostSelf(sig syscall.Signal) error {
+	return syscall.Kill(syscall.Getpid(), sig)
+}

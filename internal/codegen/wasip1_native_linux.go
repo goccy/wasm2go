@@ -603,6 +603,16 @@ type kernelSigaction struct {
 }
 
 // hostSignalAction returns the kernel's action for the host signal.
+// signalHostSelf sends the host process a signal the way perl's kill of
+// its own pid has it delivered: to the thread that sends it, so that the
+// handler native code installed for it (an event loop's signal watcher)
+// has run by the time the call returns, as it has in a process of one
+// thread. Sent to the process, any of the runtime's threads would take it,
+// some time later.
+func signalHostSelf(sig syscall.Signal) error {
+	return syscall.Tgkill(os.Getpid(), syscall.Gettid(), sig)
+}
+
 func hostSignalAction(sig syscall.Signal) (act kernelSigaction, ok bool) {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return act, false

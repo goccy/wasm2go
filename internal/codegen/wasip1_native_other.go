@@ -449,3 +449,9 @@ func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
 
 // restoreHostActionsOutside has nothing to put back on this platform.
 func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}
+
+// signalHostSelf sends the host process a signal, which the runtime cannot
+// do on this platform.
+func signalHostSelf(sig syscall.Signal) error {
+	return errors.ErrUnsupported
+}

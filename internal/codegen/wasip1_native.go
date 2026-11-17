@@ -3073,7 +3073,12 @@ func (w *WasiStubs) killOutside(pid, sig int32) int32 {
 	if int(pid) == os.Getpid() && w.firstOfFamily().takeAsHostProcess(sig) {
 		return _wasiESUCCESS
 	}
-	err := signalHostProcess(int(pid), hostSig)
+	var err error
+	if int(pid) == os.Getpid() {
+		err = signalHostSelf(hostSig)
+	} else {
+		err = signalHostProcess(int(pid), hostSig)
+	}
 	switch {
 	case err == nil:
 		return _wasiESUCCESS
