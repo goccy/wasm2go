@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -1293,5 +1294,59 @@ func TestHostDescriptors_APipeEndsWhenTheGuestClosesIt(t *testing.T) {
 	closeTestFd(t, w, m, r2)
 	if _, err := syscall.Write(writer, []byte("y")); err != syscall.EPIPE {
 		t.Fatalf("write after the guest closed the read end: %v, want EPIPE", err)
+	}
+}
+
+// What the Go runtime keeps for a command whose streams it copies (the
+// pipe it copies the output through) is the runtime's while the command
+// runs, and nobody's once the command has been waited for. That cannot be
+// left to a look at the number later: the host may give a new pipe exactly
+// what fstat said of the closed one, and native code's new pipe under the
+// number would be taken for the runtime's.
+func TestHostDescriptors_ACommandsDescriptorsAreTheRuntimesUntilItIsWaitedFor(t *testing.T) {
+	KeepRuntimeDescriptorsHigh()
+	recorded := func(cmd *exec.Cmd) (fds []int) {
+		hostTable.mu.Lock()
+		defer hostTable.mu.Unlock()
+		for fd, r := range hostTable.reserved {
+			if r.cmd == cmd {
+				fds = append(fds, fd)
+			}
+		}
+		return fds
+	}
+	in, feed, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer feed.Close()
+	var out bytes.Buffer
+	cmd := exec.Command("/bin/sh", "-c", `read line; echo "got $line"`)
+	cmd.Stdin, cmd.Stdout = in, &out
+	if err := startCommand(cmd); err != nil {
+		in.Close()
+		t.Fatal(err)
+	}
+	in.Close()
+	running := recorded(cmd)
+	if len(running) == 0 {
+		t.Fatalf("nothing is recorded for a command whose output is copied")
+	}
+	for _, fd := range running {
+		if _, reserved := hostOwner(fd); !reserved {
+			t.Errorf("descriptor %d, which the Go runtime keeps for the running command, is not the runtime's", fd)
+		}
+	}
+	if _, err := feed.Write([]byte("a line\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitCommand(cmd); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if got := out.String(); got != "got a line\n" {
+		t.Fatalf("the command's output is %q", got)
+	}
+	if left := recorded(cmd); len(left) != 0 {
+		t.Fatalf("descriptors %v are still the runtime's after the command was waited for", left)
 	}
 }

@@ -418,6 +418,8 @@ func forwardSIGPIPEToIgnore() {}
 // startCommand starts cmd; no guest takes descriptors in on this platform.
 func startCommand(cmd *exec.Cmd) error { return cmd.Start() }
 
+func waitCommand(cmd *exec.Cmd) error { return cmd.Wait() }
+
 // hostChildState would ask the host about a child of this process, which
 // the runtime cannot do on this platform: pid is taken for no child.
 func hostChildState(pid int) (status int32, child, ended bool) { return 0, false, false }

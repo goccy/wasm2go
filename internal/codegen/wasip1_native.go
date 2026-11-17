@@ -1514,7 +1514,7 @@ func (proc *wasiProc) release() {
 	if proc.cmd == nil {
 		return
 	}
-	proc.reap.Do(func() { _ = proc.cmd.Wait() })
+	proc.reap.Do(func() { _ = waitCommand(proc.cmd) })
 }
 
 // wasiPIDs hands out pid tokens and knows the processes of a fork family by
@@ -1883,7 +1883,7 @@ func (w *WasiStubs) KillCommands() {
 			continue
 		}
 		<-proc.done
-		proc.reap.Do(func() { _ = cmd.Wait() })
+		proc.reap.Do(func() { _ = waitCommand(cmd) })
 	}
 }
 
@@ -2357,7 +2357,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		}
 		if !ended {
 			proc.reap.Do(func() {
-				werr := cmd.Wait()
+				werr := waitCommand(cmd)
 				status = encodeWaitStatus(cmd.ProcessState)
 				// A non-zero exit or signal surfaces as *exec.ExitError
 				// and is the normal path (status already encoded from

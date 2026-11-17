@@ -66,12 +66,11 @@ var hostTable struct {
 	open map[int]*wasiOpen
 	// reserved holds the descriptors below floor that the runtime has for
 	// itself: the ones the Go runtime made its poller and its signal
-	// delivery with, and what else the process had open for itself when
-	// its first guest became the host process. No guest gets at them by
-	// number. Each is recorded with what it was (hostIdentity): a number
-	// whose descriptor was closed since, and given to something else, is
-	// the runtime's no longer.
-	reserved map[int]hostIdentity
+	// delivery with, what else the process had open for itself when its
+	// first guest became the host process, and what the Go runtime keeps
+	// for a command until it has been waited for (startCommand). No guest
+	// gets at them by number.
+	reserved map[int]hostReservation
 	// floor is the lowest number the runtime gives a descriptor of its
 	// own that it can place (see hostFloor). From there up every number is
 	// the runtime's.
@@ -149,18 +148,47 @@ func hostIdentityOf(fd int) (id hostIdentity, ok bool) {
 	return hostIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino), mode: uint32(st.Mode) & syscall.S_IFMT}, true
 }
 
-// hostReserve records that fd is a descriptor of the runtime's own.
-func hostReserve(fd int) {
+// hostReservation is a descriptor recorded as the runtime's own.
+type hostReservation struct {
+	// id is what the descriptor was: a number whose descriptor was closed
+	// since, and given to something else, is the runtime's no longer —
+	// as far as fstat tells one from the other, which it does not for
+	// every kind (see cmd).
+	id hostIdentity
+	// cmd is the command the Go runtime keeps the descriptor for, until
+	// the command has been waited for (hostReleaseCommand); nil for one
+	// the runtime keeps for good. That end cannot be learnt from the
+	// descriptor: the host may give a new pipe exactly what fstat says of
+	// a closed one (macOS nearly always does), and gives every descriptor
+	// of an anonymous inode (a pidfd, an epoll instance) the same.
+	cmd *exec.Cmd
+}
+
+// hostReserve records that fd is a descriptor of the runtime's own: for
+// good, or while cmd is not waited for.
+func hostReserve(fd int, cmd *exec.Cmd) {
 	id, ok := hostIdentityOf(fd)
 	if !ok {
 		return
 	}
 	hostTable.mu.Lock()
 	if hostTable.reserved == nil {
-		hostTable.reserved = map[int]hostIdentity{}
+		hostTable.reserved = map[int]hostReservation{}
 	}
-	hostTable.reserved[fd] = id
+	hostTable.reserved[fd] = hostReservation{id: id, cmd: cmd}
 	hostTable.mu.Unlock()
+}
+
+// hostReleaseCommand forgets the descriptors recorded for cmd: it has been
+// waited for, and package os/exec has closed what it kept for it.
+func hostReleaseCommand(cmd *exec.Cmd) {
+	hostTable.mu.Lock()
+	defer hostTable.mu.Unlock()
+	for fd, r := range hostTable.reserved {
+		if r.cmd == cmd {
+			delete(hostTable.reserved, fd)
+		}
+	}
 }
 
 // hostLowRange is how many of the lowest descriptor numbers are kept free
@@ -187,7 +215,7 @@ func KeepRuntimeDescriptorsHigh() {
 		// to commands is the runtime's or the embedder's own.
 		for _, fd := range openDescriptors() {
 			if flags, err := descriptorFlags(fd, syscall.F_GETFD); err == nil && fd > 2 && flags&syscall.FD_CLOEXEC != 0 {
-				hostReserve(fd)
+				hostReserve(fd, nil)
 			}
 		}
 		// Fill the low numbers, have the poller made, and free them again.
@@ -234,7 +262,7 @@ func KeepRuntimeDescriptorsHigh() {
 		}
 		for _, fd := range openDescriptors() {
 			if !known[fd] {
-				hostReserve(fd)
+				hostReserve(fd, nil)
 			}
 		}
 	})
@@ -1301,7 +1329,7 @@ func hostOwner(fd int) (op *wasiOpen, reserved bool) {
 	hostTable.mu.Lock()
 	defer hostTable.mu.Unlock()
 	if was, recorded := hostTable.reserved[fd]; recorded {
-		if now, open := hostIdentityOf(fd); open && now == was {
+		if now, open := hostIdentityOf(fd); open && now == was.id {
 			reserved = true
 		} else {
 			// The runtime's descriptor is gone; the number is free again,
@@ -2294,8 +2322,9 @@ func hostPipe() (r, wr *wasiOpen, err error) {
 // are not files through, the handle of the process (a pidfd, where the
 // kernel has them). Some it keeps until the command has been waited for.
 // The start excludes a guest taking a descriptor in (hostTable.making),
-// and what it left open that is nobody's is recorded as the runtime's
-// before it ends. A descriptor another process of the family makes in the
+// and what it left open that is nobody's is recorded as the runtime's for
+// the command before it ends, until the command has been waited for
+// (waitCommand). A descriptor another process of the family makes in the
 // meantime is recorded along — its entry is in the host's table soon
 // after, and a recorded number keeps only guests from taking it in, which
 // none would anyway.
@@ -2311,10 +2340,18 @@ func startCommand(cmd *exec.Cmd) error {
 	}
 	for _, fd := range nobodysDescriptors() {
 		if !before[fd] {
-			hostReserve(fd)
+			hostReserve(fd, cmd)
 		}
 	}
 	return nil
+}
+
+// waitCommand waits for cmd, which startCommand started, and forgets what
+// was recorded for it: package os/exec has closed it by then.
+func waitCommand(cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	hostReleaseCommand(cmd)
+	return err
 }
 
 // nobodysDescriptors returns the descriptors of the process above the
