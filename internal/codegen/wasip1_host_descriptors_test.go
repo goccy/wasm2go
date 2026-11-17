@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -1400,4 +1401,73 @@ func TestHostDescriptors_ACommandsDescriptorsAreTheRuntimesUntilItIsWaitedFor(t 
 	if left := recorded(cmd); len(left) != 0 {
 		t.Fatalf("descriptors %v are still the runtime's after the command was waited for", left)
 	}
+}
+
+// ownListing returns the numbers the guest's /dev/fd lists, and the number
+// of the directory, which is among them.
+func ownListing(t *testing.T, w *WasiStubs, m *Module) (map[int32]bool, int32) {
+	t.Helper()
+	fd, errno := w.pathOpen("dev/fd", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open dev/fd errno=%d", errno)
+	}
+	defer closeTestFd(t, w, m, fd)
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	entries, err := op.readDirCached(true)
+	if err != nil {
+		t.Fatalf("read dev/fd: %v", err)
+	}
+	listed := map[int32]bool{}
+	for _, e := range entries[2:] {
+		n, err := strconv.Atoi(e.Name())
+		if err != nil {
+			t.Fatalf("dev/fd lists %q", e.Name())
+		}
+		listed[int32(n)] = true
+	}
+	if !listed[fd] {
+		t.Fatalf("dev/fd does not list its own descriptor %d: %v", fd, listed)
+	}
+	return listed, fd
+}
+
+// /dev/fd of a guest whose descriptors are the host process's lists the
+// guest's: those of its table and those code outside it made, which it
+// takes in when it uses them; never the runtime's, from hostFloor up. A
+// forked process lists its own table: not a number it closed that its
+// parent still has, nor a descriptor code outside the guest made, which is
+// not the forked process's.
+func TestHostDescriptors_TheListingOfOwnDescriptorsIsTheGuests(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newHostGuest(t, dir)
+	kept := createTestFile(t, w, "kept.txt")
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(p[1])
+	outside := int32(p[0])
+	listed, _ := ownListing(t, w, m)
+	if !listed[kept] || !listed[outside] {
+		t.Fatalf("the guest's listing %v lacks its file %d or the descriptor %d made outside it", listed, kept, outside)
+	}
+	for fd := range listed {
+		if int(fd) >= hostFloor() {
+			t.Fatalf("the guest's listing %v has the runtime's %d", listed, fd)
+		}
+	}
+	child := w.Fork()
+	defer child.CloseAll()
+	cm := newForkTestModule()
+	closeTestFd(t, child, cm, kept)
+	listed, own := ownListing(t, child, cm)
+	if listed[kept] && own != kept {
+		t.Fatalf("the forked process's listing %v has %d, which it closed", listed, kept)
+	}
+	if listed[outside] {
+		t.Fatalf("the forked process's listing %v has %d, made outside the guest", listed, outside)
+	}
+	closeTestFd(t, w, m, outside)
 }

@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -31,10 +34,11 @@ func writeSubFd(m *Module, off int32, userdata uint64, etype byte, fd int32) {
 	binary.LittleEndian.PutUint32(m.memory[off+16:], uint32(fd))
 }
 
-// /dev/stdout, /dev/fd/N and /proc/self/fd/N are the opener's own
-// descriptors: what is written to the descriptor opened under such a name
-// goes where the guest's descriptor goes (a forked process's standard
-// output, a stream of the embedder's), not to the host process's.
+// /dev/stdout, /dev/fd/N, /proc/self/fd/N and /proc/PID/fd/N for the
+// opener's pid are the opener's own descriptors: what is written to the
+// descriptor opened under such a name goes where the guest's descriptor
+// goes (a forked process's standard output, a stream of the embedder's),
+// not to the host process's.
 func TestWasi_OwnDescriptorNames(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -42,10 +46,11 @@ func TestWasi_OwnDescriptorNames(t *testing.T) {
 		ok   bool
 	}{
 		{"dev/stdin", 0, true}, {"/dev/stdout", 1, true}, {"dev/stderr", 2, true},
-		{"dev/fd/7", 7, true}, {"proc/self/fd/12", 12, true},
+		{"dev/fd/7", 7, true}, {"proc/self/fd/12", 12, true}, {"proc/4242/fd/5", 5, true},
 		{"dev/fd/", 0, false}, {"dev/fd/07", 0, false}, {"dev/fd/x", 0, false}, {"dev/null", 0, false},
+		{"proc/4243/fd/5", 0, false}, {"proc/4242/fd", 0, false},
 	} {
-		if n, ok := ownDescriptorName(tc.name); n != tc.n || ok != tc.ok {
+		if n, ok := ownDescriptorName(tc.name, 4242); n != tc.n || ok != tc.ok {
 			t.Errorf("ownDescriptorName(%q) = %d, %v; want %d, %v", tc.name, n, ok, tc.n, tc.ok)
 		}
 	}
@@ -455,5 +460,45 @@ func TestWasi_SockGetaddrinfoNumericAndHook(t *testing.T) {
 	w.SetResolveHook(func(host string) bool { return false })
 	if rc := w.Sock_getaddrinfo(m, hostOff, 7, outOff); rc != -_wasiEACCES {
 		t.Fatalf("denied getaddrinfo rc=%d, want -EACCES", rc)
+	}
+}
+
+// /dev/fd, /proc/self/fd and /proc/PID/fd for the guest's own pid list the
+// guest's descriptors, that of the directory among them: not the host
+// process's, and also under the pid of a forked process, which the host
+// has nothing under. Opened for writing, such a directory is a directory.
+func TestWasi_OwnDescriptorListing(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	file := createTestFile(t, w, "a.txt")
+	w.mu.Lock()
+	pid := w.processIDLocked()
+	w.mu.Unlock()
+	for _, dir := range []string{"dev/fd", "/proc/self/fd/", "proc/" + strconv.Itoa(int(pid)) + "/fd"} {
+		fd, errno := w.pathOpen(dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("open %s errno=%d", dir, errno)
+		}
+		w.mu.Lock()
+		op := w.openLocked(fd)
+		w.mu.Unlock()
+		entries, err := op.readDirCached(true)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		want := []string{".", ".."}
+		numbers := []string{"0", "1", "2", strconv.Itoa(int(file)), strconv.Itoa(int(fd))}
+		sort.Strings(numbers)
+		want = append(want, numbers...)
+		if strings.Join(names, " ") != strings.Join(want, " ") {
+			t.Errorf("%s lists %q, want %q", dir, names, want)
+		}
+		closeTestFd(t, w, m, fd)
+	}
+	if _, errno := w.pathOpen("dev/fd", 0, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiEISDIR {
+		t.Fatalf("open dev/fd for writing errno=%d, want EISDIR", errno)
 	}
 }

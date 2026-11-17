@@ -6058,10 +6058,10 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 
 // ownDescriptorName returns the descriptor a path names that stands for a
 // descriptor of the process that opens it: /dev/stdin, /dev/stdout,
-// /dev/stderr (0, 1, 2), /dev/fd/N and /proc/self/fd/N. The names are the
-// system's (rel is relative to the root, as the guest's C library gives
-// it).
-func ownDescriptorName(rel string) (int32, bool) {
+// /dev/stderr (0, 1, 2), /dev/fd/N, /proc/self/fd/N and /proc/PID/fd/N for
+// the process's own pid. The names are the system's (rel is relative to
+// the root, as the guest's C library gives it).
+func ownDescriptorName(rel string, pid int32) (int32, bool) {
 	rel = strings.TrimPrefix(rel, "/")
 	switch rel {
 	case "dev/stdin":
@@ -6071,8 +6071,8 @@ func ownDescriptorName(rel string) (int32, bool) {
 	case "dev/stderr":
 		return 2, true
 	}
-	for _, dir := range []string{"dev/fd/", "proc/self/fd/"} {
-		if num, ok := strings.CutPrefix(rel, dir); ok {
+	for _, dir := range ownDescriptorDirs(pid) {
+		if num, ok := strings.CutPrefix(rel, dir+"/"); ok {
 			n, err := strconv.ParseUint(num, 10, 31)
 			if err != nil || strconv.FormatUint(n, 10) != num {
 				return 0, false
@@ -6081,6 +6081,83 @@ func ownDescriptorName(rel string) (int32, bool) {
 		}
 	}
 	return 0, false
+}
+
+// ownDescriptorDirs returns the directories that list the descriptors of
+// the process that reads them, relative to the root: /dev/fd, /proc/self/fd
+// and /proc/PID/fd for the process's own pid.
+func ownDescriptorDirs(pid int32) []string {
+	return []string{"dev/fd", "proc/self/fd", "proc/" + strconv.Itoa(int(pid)) + "/fd"}
+}
+
+// ownDescriptorDir reports whether rel names a directory of
+// ownDescriptorDirs.
+func ownDescriptorDir(rel string, pid int32) bool {
+	rel = strings.TrimSuffix(strings.TrimPrefix(rel, "/"), "/")
+	for _, dir := range ownDescriptorDirs(pid) {
+		if rel == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// descriptorListing is what a directory of ownDescriptorDirs is to the
+// guest: an entry for each of its open descriptors, named by the number,
+// as they were when it opened the directory. The host would list the host
+// process's, which are the runtime's and the other processes' of the family
+// as well, and has nothing under the pid of a forked process.
+type descriptorListing struct {
+	name    string
+	numbers []int32
+}
+
+func (d *descriptorListing) Read(p []byte) (int, error)              { return 0, syscall.EISDIR }
+func (d *descriptorListing) ReadAt(p []byte, off int64) (int, error) { return 0, syscall.EISDIR }
+func (d *descriptorListing) Write(p []byte) (int, error)             { return 0, syscall.EBADF }
+func (d *descriptorListing) WriteAt(p []byte, off int64) (int, error) {
+	return 0, syscall.EBADF
+}
+func (d *descriptorListing) Seek(offset int64, whence int) (int64, error) { return 0, nil }
+func (d *descriptorListing) Close() error                                 { return nil }
+func (d *descriptorListing) Stat() (os.FileInfo, error) {
+	return memFileInfo{name: d.name, mode: os.ModeDir | 0o500}, nil
+}
+func (d *descriptorListing) Sync() error                  { return nil }
+func (d *descriptorListing) Truncate(size int64) error    { return syscall.EISDIR }
+func (d *descriptorListing) Chmod(mode os.FileMode) error { return syscall.EPERM }
+func (d *descriptorListing) Name() string                 { return d.name }
+
+// ReadDir returns every entry, whatever n is: the runtime reads a directory
+// whole (readDirCached).
+func (d *descriptorListing) ReadDir(n int) ([]os.DirEntry, error) {
+	entries := make([]os.DirEntry, 0, len(d.numbers))
+	for _, fd := range d.numbers {
+		entries = append(entries, memDirEntry{&memNode{name: strconv.Itoa(int(fd)), mode: 0o700}})
+	}
+	return entries, nil
+}
+
+// ownDescriptorsLocked returns the numbers of the guest's open descriptors
+// in order: the entries of its table, and the descriptors of the host
+// process that are the guest's although its table does not have them yet
+// (outsideDescriptorsLocked). The numbers of the root directory are the
+// runtime's (rootNumberLocked). Caller holds w.mu.
+func (w *WasiStubs) ownDescriptorsLocked() []int32 {
+	var fds []int32
+	for fd, op := range w.fdsLocked() {
+		if w.rootNumberLocked(fd) {
+			continue
+		}
+		if h := op.host(); h.madeOutside() && !h.current() {
+			// code outside the guest closed it (hostOpenLocked)
+			continue
+		}
+		fds = append(fds, fd)
+	}
+	fds = append(fds, w.outsideDescriptorsLocked()...)
+	sort.Slice(fds, func(i, j int) bool { return fds[i] < fds[j] })
+	return fds
 }
 
 // pathOpenMode is pathOpen with the mode of open(2): a file the call
@@ -6097,7 +6174,20 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		}
 		rel = strings.TrimPrefix(*w.terminal, "/")
 	}
-	if n, named := ownDescriptorName(rel); named {
+	if ownDescriptorDir(rel, w.processIDLocked()) {
+		// The guest's own descriptors, as a directory: one that is
+		// opened for writing is a directory still.
+		defer w.mu.Unlock()
+		if oflags&(0x1|0x8) != 0 || fsRightsBase&(1<<6) != 0 { // O_CREAT, O_TRUNC; FD_WRITE
+			return -1, _wasiEISDIR
+		}
+		listing := &descriptorListing{name: filepath.Base(strings.TrimSuffix(rel, "/"))}
+		op := &wasiOpen{f: listing, isDir: true, path: rel, noWrite: true}
+		fd := w.addFDLocked(op)
+		listing.numbers = w.ownDescriptorsLocked()
+		return fd, _wasiESUCCESS
+	}
+	if n, named := ownDescriptorName(rel, w.processIDLocked()); named {
 		// The opener's own descriptor: the host would open the host
 		// process's (a forked process's standard output is not the host
 		// process's, nor is a stream of the embedder's). The new
@@ -13305,42 +13395,43 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		// stand-in, the embed vars, this very function, etc.) is
 		// stripped.
 		keepTypeNames: map[string]bool{
-			"WasiExitError":    true,
-			"WasiSignalError":  true,
-			"HostIDs":          true,
-			"Syslogger":        true,
-			"wasiZoneMoment":   true,
-			"posixZoneRule":    true,
-			"posixZone":        true,
-			"posixZoneScanner": true,
-			"SyslogMessage":    true,
-			"wasiSocket":       true,
-			"wasiSockAddr":     true,
-			"wasiDial":         true,
-			"datagramSocket":   true,
-			"wasiService":      true,
-			"deadlineListener": true,
-			"wasiSignals":      true,
-			"wasiOpen":         true,
-			"wasiProc":         true,
-			"wasiPIDs":         true,
-			"deadlineReader":   true,
-			"streamWriter":     true,
-			"pollProbe":        true,
-			"recordLock":       true,
-			"WasiStubs":        true,
-			"wasiABI":          true,
-			"dotDirEntry":      true,
-			"FS":               true,
-			"File":             true,
-			"osFS":             true,
-			"FileLock":         true,
-			"fileStat":         true,
-			"MemFS":            true,
-			"memFile":          true,
-			"memNode":          true,
-			"memFileInfo":      true,
-			"memDirEntry":      true,
+			"WasiExitError":     true,
+			"WasiSignalError":   true,
+			"HostIDs":           true,
+			"Syslogger":         true,
+			"wasiZoneMoment":    true,
+			"posixZoneRule":     true,
+			"posixZone":         true,
+			"posixZoneScanner":  true,
+			"SyslogMessage":     true,
+			"wasiSocket":        true,
+			"wasiSockAddr":      true,
+			"wasiDial":          true,
+			"datagramSocket":    true,
+			"wasiService":       true,
+			"deadlineListener":  true,
+			"wasiSignals":       true,
+			"wasiOpen":          true,
+			"wasiProc":          true,
+			"wasiPIDs":          true,
+			"deadlineReader":    true,
+			"streamWriter":      true,
+			"pollProbe":         true,
+			"recordLock":        true,
+			"WasiStubs":         true,
+			"wasiABI":           true,
+			"dotDirEntry":       true,
+			"descriptorListing": true,
+			"FS":                true,
+			"File":              true,
+			"osFS":              true,
+			"FileLock":          true,
+			"fileStat":          true,
+			"MemFS":             true,
+			"memFile":           true,
+			"memNode":           true,
+			"memFileInfo":       true,
+			"memDirEntry":       true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                    true,
@@ -13370,6 +13461,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"streamHungUp":              true,
 			"streamFailed":              true,
 			"ownDescriptorName":         true,
+			"ownDescriptorDirs":         true,
+			"ownDescriptorDir":          true,
 			"modeAllows":                true,
 			"restoreHostSignal":         true,
 			"readNow":                   true,

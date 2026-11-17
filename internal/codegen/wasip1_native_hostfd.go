@@ -1326,6 +1326,25 @@ func (w *WasiStubs) inheritableOutsideLocked() []*hostFile {
 	return out
 }
 
+// outsideDescriptorsLocked returns the numbers of the descriptors of the
+// host process that the instance's table does not have and that the guest
+// takes in when it uses them (takeInOutsideLocked): the open ones that
+// code outside the guest made, which are the guest's. Caller holds w.mu.
+func (w *WasiStubs) outsideDescriptorsLocked() []int32 {
+	if !w.hostDescriptorsLocked() || w.forked {
+		return nil
+	}
+	fds := w.fdsLocked()
+	var out []int32
+	for _, fd := range openDescriptors() {
+		if _, known := fds[int32(fd)]; known || !w.hostNumberFreeLocked(fd) {
+			continue
+		}
+		out = append(out, int32(fd))
+	}
+	return out
+}
+
 // closeOnExec returns the close-on-exec flag of the descriptor, and sets it
 // to value first when set is true.
 func (h *hostFile) closeOnExec(set, value bool) (was bool, err error) {
