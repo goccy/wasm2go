@@ -2324,6 +2324,9 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		}
 	}
 	hostPID := w.hostProcess
+	// The host process follows every change of directory of the first
+	// process of the family (Proc_chdir): its directory is that process's.
+	inProcessDir := w.hostProcess && !w.forked
 	w.mu.Unlock()
 	// The duplicates made for the child are this process's to close, once
 	// the child has its own.
@@ -2346,7 +2349,12 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	} else {
 		cmd.Args = []string{path}
 	}
-	if cwd != "" {
+	// A command the first process of the family starts inherits the
+	// directory of the host process, which is its own, as a child of fork
+	// and exec does: it is not changed into, which would fail for a
+	// directory the user may no longer search (EACCES), where the process
+	// can stay.
+	if cwd != "" && !inProcessDir {
 		cmd.Dir = cwd
 	}
 	// Sandbox: the child sees ONLY the guest-provided environment; a nil
