@@ -11160,6 +11160,8 @@ const (
 	wasiSockOptType      int32 = 9  // SO_TYPE (read only): wasiSockTypeStream or wasiSockTypeDgram
 	wasiSockOptAccepting int32 = 10 // SO_ACCEPTCONN (read only): 1 for a listening socket
 	wasiSockOptV6Only    int32 = 11 // IPV6_V6ONLY: takes effect when the socket is bound or connected
+	wasiSockOptBroadcast int32 = 12 // SO_BROADCAST
+	wasiSockOptDefer     int32 = 13 // TCP_DEFER_ACCEPT: seconds
 )
 
 // The two timeouts of a socket, as Sock_timeout names them.
@@ -11258,7 +11260,8 @@ func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 	var err error
 	tcp, _ := op.netConn().(*net.TCPConn)
 	switch option {
-	case wasiSockOptReuseAddr, wasiSockOptReusePort:
+	case wasiSockOptReuseAddr, wasiSockOptReusePort, wasiSockOptBroadcast, wasiSockOptDefer:
+		// remembered: the host's socket is made with the defaults
 	case wasiSockOptV6Only:
 		if op.family != wasiSockFamilyIPv6 {
 			return -_wasiENOPROTOOPT
@@ -11362,7 +11365,8 @@ func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int
 			value = wasiSockTypeDgram
 		}
 	case wasiSockOptReuseAddr, wasiSockOptReusePort, wasiSockOptKeepAlive, wasiSockOptNoDelay,
-		wasiSockOptRcvBuf, wasiSockOptSndBuf, wasiSockOptLinger, wasiSockOptV6Only:
+		wasiSockOptRcvBuf, wasiSockOptSndBuf, wasiSockOptLinger, wasiSockOptV6Only,
+		wasiSockOptBroadcast, wasiSockOptDefer:
 		if option == wasiSockOptV6Only && op.family != wasiSockFamilyIPv6 {
 			return -_wasiENOPROTOOPT
 		}

@@ -14,6 +14,10 @@ import (
 // (SO_...) in the tables of the host's numbers.
 const hostNumberFamilySocketOption int32 = 9
 
+// hostNumberFamilyTCPOption is the family of the options of level
+// IPPROTO_TCP in the host's table of numbers.
+const hostNumberFamilyTCPOption int32 = 12
+
 // The sockets of a guest whose descriptors are the host process's (see
 // wasip1_native_hostfd.go): a socket is the host's socket from the moment
 // it is made, under the host's number, and what it is bound to, connected
@@ -489,6 +493,16 @@ func hostSocketOption(option int32) (level, name int, ok bool) {
 		return syscall.SOL_SOCKET, syscall.SO_ACCEPTCONN, true
 	case wasiSockOptV6Only:
 		return syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, true
+	case wasiSockOptBroadcast:
+		return syscall.SOL_SOCKET, syscall.SO_BROADCAST, true
+	case wasiSockOptDefer:
+		// a Linux option, which package syscall has on Linux alone
+		for _, number := range hostNumberTable(hostNumberFamilyTCPOption) {
+			if number.name == "TCP_DEFER_ACCEPT" {
+				return syscall.IPPROTO_TCP, int(number.value), true
+			}
+		}
+		return 0, 0, false
 	}
 	return 0, 0, false
 }
