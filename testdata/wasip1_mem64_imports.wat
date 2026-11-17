@@ -91,6 +91,10 @@
     (func $pipe (param i64) (result i32)))
   (import "wasi_snapshot_preview1" "fd_dup"
     (func $fd_dup (param i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_dupfd"
+    (func $fd_dupfd (param i32 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_lock"
+    (func $fd_lock (param i32 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "fd_dup2"
     (func $fd_dup2 (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_cloexec"
@@ -322,6 +326,8 @@
     (drop (call $proc_wait_any (i32.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $pipe (i64.const 0)))
     (drop (call $fd_dup (i32.const 0) (i64.const 0)))
+    (drop (call $fd_dupfd (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $fd_lock (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $fd_dup2 (i32.const 0) (i32.const 0)))
     (drop (call $fd_cloexec (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_open (i32.const 0) (i32.const 0)))

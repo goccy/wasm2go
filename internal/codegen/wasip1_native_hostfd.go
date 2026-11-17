@@ -1529,13 +1529,13 @@ func (w *WasiStubs) hostNumberFreeLocked(fd int) bool {
 	return owner == nil && !reserved
 }
 
-// freeNumberLocked returns the lowest number that is free in the instance's
-// table and is no open descriptor of the host process: the number for an
-// entry that is not a descriptor of the host (a stream of the embedder's, a
-// file of another filesystem backend). Caller holds w.mu.
-func (w *WasiStubs) freeNumberLocked() int32 {
+// freeNumberLocked returns the lowest number, at least min, that is free in
+// the instance's table and is no open descriptor of the host process: the
+// number for an entry that is not a descriptor of the host (a stream of the
+// embedder's, a file of another filesystem backend). Caller holds w.mu.
+func (w *WasiStubs) freeNumberLocked(min int32) int32 {
 	fds := w.fdsLocked()
-	for fd := int32(0); ; fd++ {
+	for fd := min; ; fd++ {
 		if _, used := fds[fd]; used {
 			continue
 		}
@@ -1547,15 +1547,16 @@ func (w *WasiStubs) freeNumberLocked() int32 {
 	}
 }
 
-// dupHostLocked is dup(2) for an entry that is a descriptor of the host:
-// the duplicate is a descriptor of its own that shares the open file, under
-// the number the host gives it. Caller holds w.mu.
-func (w *WasiStubs) dupHostLocked(op *wasiOpen) (int32, error) {
+// dupHostLocked is dup(2) for an entry that is a descriptor of the host, or
+// fcntl's F_DUPFD with min: the duplicate is a descriptor of its own that
+// shares the open file, under the number the host gives it, the lowest free
+// one that is at least min. Caller holds w.mu.
+func (w *WasiStubs) dupHostLocked(op *wasiOpen, min int) (int32, error) {
 	fd, err := op.host().hold()
 	if err != nil {
 		return -1, err
 	}
-	nfd, err := hostDup(fd, 0)
+	nfd, err := hostDup(fd, min)
 	op.host().release()
 	if err != nil {
 		return -1, err
@@ -2338,6 +2339,48 @@ func (h *hostFile) flock(lock FileLock) error {
 			return err
 		}
 	}
+}
+
+// withNumber calls use with the descriptor's number, which stays its own
+// until use returns.
+func (h *hostFile) withNumber(use func(fd uintptr) error) error {
+	fd, err := h.hold()
+	if err != nil {
+		return err
+	}
+	defer h.release()
+	return use(uintptr(fd))
+}
+
+// hostRecordLock is fcntl(2) F_GETLK (recordLockGet, which writes the lock
+// in the way back into lk) or F_SETLK (recordLockSet) on the host's
+// descriptor fd.
+func hostRecordLock(fd uintptr, cmd int32, lk *recordLock) error {
+	types := [3]int16{syscall.F_RDLCK, syscall.F_WRLCK, syscall.F_UNLCK}
+	fl := syscall.Flock_t{Type: types[lk.typ], Whence: int16(lk.whence), Start: lk.start, Len: lk.len}
+	op := syscall.F_SETLK
+	if cmd == recordLockGet {
+		op = syscall.F_GETLK
+	}
+	for {
+		err := syscall.FcntlFlock(fd, op, &fl)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		break
+	}
+	if cmd == recordLockGet {
+		for i, t := range types {
+			if fl.Type == t {
+				lk.typ = int32(i)
+			}
+		}
+		lk.whence, lk.start, lk.len, lk.pid = int32(fl.Whence), fl.Start, fl.Len, int32(fl.Pid)
+	}
+	return nil
 }
 
 // hostPipe makes a pipe of the host and returns the entries of its two

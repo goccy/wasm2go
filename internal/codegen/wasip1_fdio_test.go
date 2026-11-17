@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -28,6 +29,88 @@ func writeSubFd(m *Module, off int32, userdata uint64, etype byte, fd int32) {
 	binary.LittleEndian.PutUint64(m.memory[off:], userdata)
 	m.memory[off+8] = etype
 	binary.LittleEndian.PutUint32(m.memory[off+16:], uint32(fd))
+}
+
+// fd_lock takes POSIX record locks of the host's files: a write lock is
+// taken, F_GETLK reports none in the way of this process's own lock (record
+// locks are the process's), and a descriptor with no file of the host
+// behind it is ENOTSUP.
+func TestWasi_FdLockTakesRecordLocks(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("record locks of the host on linux and darwin")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1|1<<6 /* FD_READ|FD_WRITE */, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	const lockOff int32 = 200
+	put := func(typ int32) {
+		for i := int32(0); i < 32; i++ {
+			m.memory[lockOff+i] = 0
+		}
+		binary.LittleEndian.PutUint32(m.memory[lockOff:], uint32(typ))
+	}
+	put(1) // F_WRLCK, the whole file
+	if rc := w.Fd_lock(m, fd, recordLockSet, lockOff); rc != _wasiESUCCESS {
+		t.Fatalf("F_SETLK write lock rc=%d", rc)
+	}
+	put(1)
+	if rc := w.Fd_lock(m, fd, recordLockGet, lockOff); rc != _wasiESUCCESS {
+		t.Fatalf("F_GETLK rc=%d", rc)
+	}
+	if typ := binary.LittleEndian.Uint32(m.memory[lockOff:]); typ != 2 {
+		t.Fatalf("F_GETLK of this process's own lock: type %d, want F_UNLCK (2)", typ)
+	}
+	put(2)
+	if rc := w.Fd_lock(m, fd, recordLockWait, lockOff); rc != _wasiESUCCESS {
+		t.Fatalf("F_SETLKW unlock rc=%d", rc)
+	}
+	put(3)
+	if rc := w.Fd_lock(m, fd, recordLockSet, lockOff); rc != -_wasiEINVAL {
+		t.Fatalf("a lock of type 3 rc=%d, want -EINVAL", rc)
+	}
+	put(1)
+	if rc := w.Fd_lock(m, 99, recordLockSet, lockOff); rc != -_wasiEBADF {
+		t.Fatalf("a closed number rc=%d, want -EBADF", rc)
+	}
+}
+
+// fd_dupfd is fcntl's F_DUPFD: the duplicate gets the lowest free number
+// that is at least the one asked for, and a negative one is EINVAL.
+func TestWasi_FdDupfdTakesTheLowestNumberFromMin(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	const outOff int32 = 100
+	if rc := w.Fd_dupfd(m, fd, 20, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != 20 {
+		t.Fatalf("Fd_dupfd(min 20) = %d, want 20", got)
+	}
+	if rc := w.Fd_dupfd(m, fd, 20, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != 21 {
+		t.Fatalf("Fd_dupfd(min 20) with 20 taken = %d, want 21", got)
+	}
+	if rc := w.Fd_dupfd(m, fd, -1, outOff); rc != _wasiEINVAL {
+		t.Fatalf("Fd_dupfd(min -1) rc=%d, want EINVAL", rc)
+	}
+	if rc := w.Fd_dupfd(m, 99, 0, outOff); rc != _wasiEBADF {
+		t.Fatalf("Fd_dupfd of a closed number rc=%d, want EBADF", rc)
+	}
 }
 
 func TestWasi_FdDupSharesOffsetAndDefersClose(t *testing.T) {

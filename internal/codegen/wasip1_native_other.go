@@ -250,6 +250,14 @@ func (h *hostFile) flock(lock FileLock) error { return errors.ErrUnsupported }
 func (h *hostFile) pending() uint64           { return 0 }
 func (h *hostFile) childFile() *os.File       { return nil }
 
+func (h *hostFile) withNumber(use func(fd uintptr) error) error {
+	return errors.ErrUnsupported
+}
+
+// hostRecordLock would take a record lock of the host's descriptor, which
+// the runtime cannot do on this platform.
+func hostRecordLock(fd uintptr, cmd int32, lk *recordLock) error { return errors.ErrUnsupported }
+
 // host returns the descriptor of the host process the entry is: none.
 func (op *wasiOpen) host() *hostFile { return nil }
 
@@ -296,7 +304,7 @@ func KeepRuntimeDescriptorsHigh() {}
 
 func (w *WasiStubs) hostDescriptorsLocked() bool                     { return false }
 func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen         { return &wasiOpen{stdio: stdio} }
-func (w *WasiStubs) freeNumberLocked() int32                         { return 0 }
+func (w *WasiStubs) freeNumberLocked(min int32) int32                { return min }
 func (w *WasiStubs) hostOpenLocked(fd int32, op *wasiOpen) *wasiOpen { return op }
 func (h *hostFile) madeOutside() bool                                { return false }
 func (h *hostFile) current() bool                                    { return false }
@@ -304,7 +312,10 @@ func (w *WasiStubs) inheritableOutsideLocked() []*hostFile           { return ni
 func (h *hostFile) closeOnExec(set, value bool) (bool, error)        { return false, errors.ErrUnsupported }
 func (w *WasiStubs) closeHostWakerLocked()                           {}
 func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error)     { return -1, errors.ErrUnsupported }
-func (w *WasiStubs) dupHostLocked(op *wasiOpen) (int32, error)       { return -1, errors.ErrUnsupported }
+func (w *WasiStubs) dupHostLocked(op *wasiOpen, min int) (int32, error) {
+	return -1, errors.ErrUnsupported
+}
+
 func (w *WasiStubs) dup2HostLocked(src *wasiOpen, to int32) error {
 	return errors.ErrUnsupported
 }

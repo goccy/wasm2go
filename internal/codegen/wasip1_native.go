@@ -2033,10 +2033,16 @@ func (w *WasiStubs) rootNumberLocked(fd int32) bool {
 // host (those come in through addHostFDLocked, under their own numbers) and
 // must not be mistaken for one. Caller holds w.mu.
 func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
+	return w.addFDFromLocked(op, 0)
+}
+
+// addFDFromLocked enters op under the lowest free number that is at least
+// min (fcntl's F_DUPFD).
+func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) int32 {
 	fds := w.fdsLocked()
-	fd := int32(0)
+	fd := min
 	if w.hostDescriptorsLocked() {
-		fd = w.freeNumberLocked()
+		fd = w.freeNumberLocked(min)
 	} else {
 		for {
 			if _, used := fds[fd]; !used && fd != wasiPreopenFD {
@@ -5244,6 +5250,134 @@ func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
 	return w.Fd_flock(m, fd, lock, wait)
 }
 
+// recordLock is a POSIX record lock as Fd_lock passes it: the record at
+// its lockPtr, 32 bytes, little-endian.
+//
+//	i32 type    0 F_RDLCK, 1 F_WRLCK, 2 F_UNLCK
+//	i32 whence  0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END
+//	i64 start
+//	i64 len     0: to the end of the file, however long it grows
+//	i32 pid     F_GETLK: the process that holds the lock in the way
+//	i32 (pad)
+type recordLock struct {
+	typ, whence int32
+	start, len  int64
+	pid         int32
+}
+
+// The commands of Fd_lock.
+const (
+	recordLockGet  int32 = 0 // F_GETLK
+	recordLockSet  int32 = 1 // F_SETLK
+	recordLockWait int32 = 2 // F_SETLKW
+)
+
+// Fd_lock is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_lock") backing fcntl's F_GETLK, F_SETLK and F_SETLKW: a POSIX
+// record lock of a file, by the host's fcntl(2). cmd is recordLockGet,
+// recordLockSet or recordLockWait, and lockPtr the lock (recordLock).
+// recordLockGet writes back the lock that would be in the way of the one
+// asked about, or that one with type F_UNLCK when none would. A lock held
+// elsewhere is waited for (recordLockWait) by trying again, as Fd_flock
+// does, until a signal is posted to the guest (EINTR). Returns 0 or a
+// negative errno: EAGAIN or EACCES for a lock held elsewhere, ENOTSUP for a
+// descriptor with no file of the host behind it (a stream of the
+// embedder's, a file of an in-memory filesystem), which has no other
+// process to exclude.
+func (w *WasiStubs) Fd_lock(m *Module, fd, cmd, lockPtr int32) int32 {
+	return w.fdLock(m, fd, cmd, zext(lockPtr))
+}
+
+// Fd_lock64 is Fd_lock for a memory64 guest.
+func (w *WasiStubs) Fd_lock64(m *Module, fd, cmd int32, lockPtr int64) int32 {
+	return w.fdLock(m, fd, cmd, uint64(lockPtr))
+}
+
+// fdLock is the body of Fd_lock and Fd_lock64.
+func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
+	rec := w.memBytes(m, lockPtr, 32)
+	if rec == nil {
+		return -_wasiEFAULT
+	}
+	lk := recordLock{
+		typ:    int32(binary.LittleEndian.Uint32(rec[0:])),
+		whence: int32(binary.LittleEndian.Uint32(rec[4:])),
+		start:  int64(binary.LittleEndian.Uint64(rec[8:])),
+		len:    int64(binary.LittleEndian.Uint64(rec[16:])),
+	}
+	if cmd < recordLockGet || cmd > recordLockWait || lk.typ < 0 || lk.typ > 2 || lk.whence < 0 || lk.whence > 2 {
+		return -_wasiEINVAL
+	}
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	var file func(use func(fd uintptr) error) error
+	switch {
+	case op.host() != nil:
+		file = op.host().withNumber
+	default:
+		f, ok := op.f.(*os.File)
+		if !ok {
+			return -_wasiENOTSUP
+		}
+		file = func(use func(fd uintptr) error) error {
+			rc, err := f.SyscallConn()
+			if err != nil {
+				return err
+			}
+			var useErr error
+			if err := rc.Control(func(fd uintptr) { useErr = use(fd) }); err != nil {
+				return err
+			}
+			return useErr
+		}
+	}
+	if cmd == recordLockGet {
+		err := file(func(fd uintptr) error { return hostRecordLock(fd, recordLockGet, &lk) })
+		if err != nil {
+			return -mapOSError(err)
+		}
+		binary.LittleEndian.PutUint32(rec[0:], uint32(lk.typ))
+		binary.LittleEndian.PutUint32(rec[4:], uint32(lk.whence))
+		binary.LittleEndian.PutUint64(rec[8:], uint64(lk.start))
+		binary.LittleEndian.PutUint64(rec[16:], uint64(lk.len))
+		binary.LittleEndian.PutUint32(rec[24:], uint32(lk.pid))
+		return _wasiESUCCESS
+	}
+	// A blocked lock request cannot be withdrawn, and the wait has to end
+	// when a signal is posted to the guest: a lock held elsewhere is waited
+	// for by trying again, at growing intervals.
+	retry := flockRetryMin
+	for {
+		err := file(func(fd uintptr) error { return hostRecordLock(fd, recordLockSet, &lk) })
+		if err == nil {
+			return _wasiESUCCESS
+		}
+		if cmd != recordLockWait || lk.typ == 2 || !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EACCES)) {
+			return -mapOSError(err)
+		}
+		posted := make(chan struct{})
+		if !w.beginBlocking(func() { close(posted) }) {
+			return -_wasiEINTR
+		}
+		timer := time.NewTimer(retry)
+		select {
+		case <-timer.C:
+		case <-posted:
+			timer.Stop()
+		}
+		if w.endBlocking() {
+			return -_wasiEINTR
+		}
+		if retry *= 2; retry > flockRetryMax {
+			retry = flockRetryMax
+		}
+	}
+}
+
 // The interval at which a waiting Fd_flock tries again: it starts at the
 // minimum and doubles up to the maximum.
 const (
@@ -5570,18 +5704,54 @@ func (w *WasiStubs) fdDup(m *Module, fd int32, outPtr uint64) int32 {
 	if op == nil {
 		return _wasiEBADF
 	}
+	return w.dupLocked(op, 0, out)
+}
+
+// dupLocked enters a duplicate of op under the lowest free number that is
+// at least min, and writes the number at out. Caller holds w.mu.
+func (w *WasiStubs) dupLocked(op *wasiOpen, min int32, out []byte) int32 {
 	if op.host() != nil {
-		nfd, err := w.dupHostLocked(op)
+		nfd, err := w.dupHostLocked(op, int(min))
 		if err != nil {
 			return mapOSError(err)
 		}
 		binary.LittleEndian.PutUint32(out, uint32(nfd))
 		return _wasiESUCCESS
 	}
-	nfd := w.addFDLocked(op)
+	nfd := w.addFDFromLocked(op, min)
 	op.addRef()
 	binary.LittleEndian.PutUint32(out, uint32(nfd))
 	return _wasiESUCCESS
+}
+
+// Fd_dupfd is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// name "fd_dupfd") backing fcntl's F_DUPFD: fd_dup, under the lowest free
+// number that is at least min. EINVAL for a negative min.
+func (w *WasiStubs) Fd_dupfd(m *Module, fd, min, outPtr int32) int32 {
+	return w.fdDupfd(m, fd, min, zext(outPtr))
+}
+
+// Fd_dupfd64 is Fd_dupfd for a memory64 guest.
+func (w *WasiStubs) Fd_dupfd64(m *Module, fd, min int32, outPtr int64) int32 {
+	return w.fdDupfd(m, fd, min, uint64(outPtr))
+}
+
+// fdDupfd is the body of Fd_dupfd and Fd_dupfd64.
+func (w *WasiStubs) fdDupfd(m *Module, fd, min int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
+	if out == nil {
+		return _wasiEFAULT
+	}
+	if min < 0 {
+		return _wasiEINVAL
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	op := w.openLocked(fd)
+	if op == nil {
+		return _wasiEBADF
+	}
+	return w.dupLocked(op, min, out)
 }
 
 // Fd_dup2 is a NON-STANDARD host import (module wasi_snapshot_preview1,
@@ -12989,6 +13159,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"deadlineReader":   true,
 			"streamWriter":     true,
 			"pollProbe":        true,
+			"recordLock":       true,
 			"WasiStubs":        true,
 			"wasiABI":          true,
 			"dotDirEntry":      true,
