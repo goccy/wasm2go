@@ -153,6 +153,16 @@ func signalHostProcess(pid int, sig syscall.Signal) error {
 	return syscall.Kill(pid, sig)
 }
 
+// commandGroup returns the attributes of a command that leads a process
+// group of its own.
+func commandGroup() *syscall.SysProcAttr { return &syscall.SysProcAttr{Setpgid: true} }
+
+// commandLeadsGroup reports whether a command started with attr leads a
+// process group: one of its own, or that of a session of its own.
+func commandLeadsGroup(attr *syscall.SysProcAttr) bool {
+	return (attr.Setpgid && attr.Pgid == 0) || attr.Setsid
+}
+
 // hostProcessGroup returns the process group of a process of the host, 0
 // naming the host process itself.
 func hostProcessGroup(pid int) (int, error) {

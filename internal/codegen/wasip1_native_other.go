@@ -62,6 +62,14 @@ func signalHostProcess(pid int, sig syscall.Signal) error {
 	return errors.ErrUnsupported
 }
 
+// commandGroup would give a command a process group of its own, which this
+// platform does not have.
+func commandGroup() *syscall.SysProcAttr { return nil }
+
+// commandLeadsGroup reports false: no command leads a process group on this
+// platform.
+func commandLeadsGroup(attr *syscall.SysProcAttr) bool { return false }
+
 // hostProcessGroup returns the process group of a process of the host,
 // which this platform does not have.
 func hostProcessGroup(pid int) (int, error) {

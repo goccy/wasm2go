@@ -2294,6 +2294,10 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	if leads && w.terminal != nil {
 		terminal = *w.terminal
 	}
+	// So does one that leads its process group within the runtime (setpgrp
+	// before exec): the command leads a group of its own, which a signal to
+	// the process group reaches with every process the command starts.
+	leadsGroup := w.execNext && !leads && w.forked && w.groupLocked() == w.processIDLocked()
 	w.execNext = false
 	inherited, borrowed := w.inheritedFilesLocked()
 	cin := w.childReaderLocked(stdinFd)
@@ -2364,6 +2368,8 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 			files = append(files, file)
 		}
 		cmd.SysProcAttr = commandTerminal(terminal, files)
+	} else if leadsGroup {
+		cmd.SysProcAttr = commandGroup()
 	}
 	if err := startCommand(cmd); err != nil {
 		return -mapExecError(err)
@@ -8864,7 +8870,9 @@ func (w *WasiStubs) killGroup(pid, sig int32) int32 {
 }
 
 // signalCommands sends a signal to the running commands this instance
-// started.
+// started: to the whole process group of a command that leads one, as the
+// command of a process that led its group or its session does (the signal
+// is one to that group).
 func (w *WasiStubs) signalCommands(sig syscall.Signal) {
 	w.mu.Lock()
 	var cmds []*exec.Cmd
@@ -8880,6 +8888,11 @@ func (w *WasiStubs) signalCommands(sig syscall.Signal) {
 	}
 	w.mu.Unlock()
 	for _, cmd := range cmds {
+		if attr := cmd.SysProcAttr; attr != nil && commandLeadsGroup(attr) {
+			if signalHostProcess(-cmd.Process.Pid, sig) == nil {
+				continue
+			}
+		}
 		_ = cmd.Process.Signal(sig)
 	}
 }
