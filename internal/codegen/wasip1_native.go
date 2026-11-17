@@ -1474,6 +1474,12 @@ type WasiStubs struct {
 	// execNext records that the next command the process starts is the
 	// one it becomes (Proc_exec_next). Guarded by mu.
 	execNext bool
+	// execing records that the process has become the command it started
+	// (from its start until Proc_exec has waited for it). A signal to the
+	// process's group reaches the command as a member of the group
+	// (killGroup), and is not posted to the process as well, which would
+	// pass it on to the command a second time (Proc_exec). Guarded by mu.
+	execing bool
 	// cloexec holds the descriptor numbers the guest has marked
 	// close-on-exec (Fd_cloexec). A number that is given to a new
 	// descriptor starts unmarked. Guarded by mu.
@@ -2489,6 +2495,9 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	}()
 
 	w.mu.Lock()
+	if becomes {
+		w.execing = true
+	}
 	var pid int32
 	if hostPID {
 		// The pid is the host's to give. It gives the number to no other
@@ -3002,9 +3011,18 @@ func (w *WasiStubs) procExec(m *Module, pid int32, statusOutPtr uint64) int32 {
 	}
 	w.mu.Lock()
 	w.dropProcLocked(pid)
+	w.execing = false
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
+}
+
+// becameCommand reports whether the process has become the command it
+// started (execing).
+func (w *WasiStubs) becameCommand() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.execing
 }
 
 // awaitInterruptibly blocks the guest until done is closed. It reports false
@@ -9019,7 +9037,11 @@ func (w *WasiStubs) killGroup(pid, sig int32) int32 {
 		if sig == 0 {
 			continue
 		}
-		if proc.kill != nil {
+		// A member that has become a command (exec) takes the signal as
+		// that command, which the commands of the group are signalled
+		// for below; posted to the member, it would reach the command
+		// twice.
+		if proc.kill != nil && !inst.becameCommand() {
 			_ = proc.kill(sig)
 		}
 		if !real && known {
