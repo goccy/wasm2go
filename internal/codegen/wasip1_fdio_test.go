@@ -31,6 +31,49 @@ func writeSubFd(m *Module, off int32, userdata uint64, etype byte, fd int32) {
 	binary.LittleEndian.PutUint32(m.memory[off+16:], uint32(fd))
 }
 
+// /dev/stdout, /dev/fd/N and /proc/self/fd/N are the opener's own
+// descriptors: what is written to the descriptor opened under such a name
+// goes where the guest's descriptor goes (a forked process's standard
+// output, a stream of the embedder's), not to the host process's.
+func TestWasi_OwnDescriptorNames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		n    int32
+		ok   bool
+	}{
+		{"dev/stdin", 0, true}, {"/dev/stdout", 1, true}, {"dev/stderr", 2, true},
+		{"dev/fd/7", 7, true}, {"proc/self/fd/12", 12, true},
+		{"dev/fd/", 0, false}, {"dev/fd/07", 0, false}, {"dev/fd/x", 0, false}, {"dev/null", 0, false},
+	} {
+		if n, ok := ownDescriptorName(tc.name); n != tc.n || ok != tc.ok {
+			t.Errorf("ownDescriptorName(%q) = %d, %v; want %d, %v", tc.name, n, ok, tc.n, tc.ok)
+		}
+	}
+	if hostSuite {
+		t.Skip("the standard descriptors of the host suite are the test process's")
+	}
+	w, m := newTestStubs(t, t.TempDir())
+	var out bytes.Buffer
+	w.SetStdout(&out)
+	fd, errno := w.pathOpen("dev/stdout", 0, 0, 1<<6 /* FD_WRITE */, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open dev/stdout errno=%d", errno)
+	}
+	iovOff, bufOff, nOff := int32(200), int32(300), int32(400)
+	copy(m.memory[bufOff:], "through the name\n")
+	binary.LittleEndian.PutUint32(m.memory[iovOff:], uint32(bufOff))
+	binary.LittleEndian.PutUint32(m.memory[iovOff+4:], uint32(len("through the name\n")))
+	if rc := w.Fd_write(m, fd, iovOff, 1, nOff); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	if out.String() != "through the name\n" {
+		t.Fatalf("the guest's standard output got %q", out.String())
+	}
+	if _, errno := w.pathOpen("dev/fd/9", 0, 0, 1<<1, 0); errno != _wasiENOENT {
+		t.Fatalf("open dev/fd/9 of a number that is not open: errno=%d, want ENOENT", errno)
+	}
+}
+
 // fd_lock takes POSIX record locks of the host's files: a write lock is
 // taken, F_GETLK reports none in the way of this process's own lock (record
 // locks are the process's), and a descriptor with no file of the host

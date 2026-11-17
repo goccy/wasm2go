@@ -6042,6 +6042,33 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 	return w.pathOpenMode(rel, dirflags, oflags, fsRightsBase, fdflags, wasiDefaultFileMode)
 }
 
+// ownDescriptorName returns the descriptor a path names that stands for a
+// descriptor of the process that opens it: /dev/stdin, /dev/stdout,
+// /dev/stderr (0, 1, 2), /dev/fd/N and /proc/self/fd/N. The names are the
+// system's (rel is relative to the root, as the guest's C library gives
+// it).
+func ownDescriptorName(rel string) (int32, bool) {
+	rel = strings.TrimPrefix(rel, "/")
+	switch rel {
+	case "dev/stdin":
+		return 0, true
+	case "dev/stdout":
+		return 1, true
+	case "dev/stderr":
+		return 2, true
+	}
+	for _, dir := range []string{"dev/fd/", "proc/self/fd/"} {
+		if num, ok := strings.CutPrefix(rel, dir); ok {
+			n, err := strconv.ParseUint(num, 10, 31)
+			if err != nil || strconv.FormatUint(n, 10) != num {
+				return 0, false
+			}
+			return int32(n), true
+		}
+	}
+	return 0, false
+}
+
 // pathOpenMode is pathOpen with the mode of open(2): a file the call
 // creates gets mode, less the instance's umask.
 func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
@@ -6055,6 +6082,23 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 			return -1, _wasiENXIO
 		}
 		rel = strings.TrimPrefix(*w.terminal, "/")
+	}
+	if n, named := ownDescriptorName(rel); named {
+		// The opener's own descriptor: the host would open the host
+		// process's (a forked process's standard output is not the host
+		// process's, nor is a stream of the embedder's). The new
+		// descriptor shares the open file, as /dev/fd/N does on darwin
+		// and the BSDs; a number that is not open is no such file.
+		defer w.mu.Unlock()
+		op := w.openLocked(n)
+		if op == nil {
+			return -1, _wasiENOENT
+		}
+		var out [4]byte
+		if errno := w.dupLocked(op, 0, out[:]); errno != _wasiESUCCESS {
+			return -1, errno
+		}
+		return int32(binary.LittleEndian.Uint32(out[:])), _wasiESUCCESS
 	}
 	forked := w.forked
 	fsys := w.fsys
@@ -13201,6 +13245,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"hostDescriptor":            true,
 			"streamHungUp":              true,
 			"streamFailed":              true,
+			"ownDescriptorName":         true,
 			"modeAllows":                true,
 			"restoreHostSignal":         true,
 			"readNow":                   true,
