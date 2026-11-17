@@ -170,6 +170,53 @@ func TestOSFSInterface(t *testing.T) {
 	}
 }
 
+// The host filesystem renames as rename(2) does: a file onto a directory is
+// EISDIR, a directory onto an empty directory replaces it, and one onto a
+// directory with something in it is ENOTEMPTY, 55 (or EEXIST, which POSIX
+// allows too). os.Rename answers EEXIST for every one of them.
+func TestOSFSRenameIsTheSystemCall(t *testing.T) {
+	root := t.TempDir()
+	fsys := osFS{root: root}
+	for _, dir := range []string{"target", "empty", "full", "moved"} {
+		if err := fsys.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{"file", "full/inside"} {
+		f, err := fsys.OpenFile(file, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+	if err := fsys.Rename("file", "target"); mapOSError(err) != _wasiEISDIR {
+		t.Errorf("a file onto a directory: %v (errno %d), want EISDIR", err, mapOSError(err))
+	}
+	if err := fsys.Rename("moved", "empty"); err != nil {
+		t.Errorf("a directory onto an empty directory: %v", err)
+	}
+	if err := fsys.Rename("target", "full"); mapOSError(err) != 55 && mapOSError(err) != _wasiEEXIST {
+		t.Errorf("a directory onto a full one: %v (errno %d), want ENOTEMPTY", err, mapOSError(err))
+	}
+	if err := fsys.Rename("file", "renamed"); err != nil {
+		t.Errorf("a file to a new name: %v", err)
+	}
+}
+
+// On the host's own root, the guest's "." (what its C library makes of "/")
+// is "/": rmdir("/") is the host's rmdir("/"), EBUSY, not rmdir("/."),
+// which is EINVAL on Linux.
+func TestOSFSRootIsSlash(t *testing.T) {
+	for _, root := range []string{"", "/"} {
+		if got := (osFS{root: root}).join("."); got != "/" {
+			t.Errorf("osFS{root: %q}.join(\".\") = %q, want /", root, got)
+		}
+		if got := (osFS{root: root}).join("etc"); got != "/etc" {
+			t.Errorf("osFS{root: %q}.join(\"etc\") = %q, want /etc", root, got)
+		}
+	}
+}
+
 func TestMemFSInterface(t *testing.T) {
 	fsys := NewMemFS()
 	exerciseFS(t, fsys, false)

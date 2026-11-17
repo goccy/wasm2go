@@ -299,6 +299,12 @@ func NewOSFS(root string) FS { return osFS{root: root} }
 
 func (o osFS) join(name string) string {
 	if o.root == "" || o.root == "/" {
+		// "." is the root itself, which the guest's C library names so: a
+		// call on "/" is the host's call on "/" (rmdir of it is EBUSY;
+		// of "/." it would be EINVAL).
+		if name == "." {
+			return "/"
+		}
 		return "/" + name
 	}
 	return filepath.Join(o.root, name)
@@ -367,12 +373,28 @@ func (o osFS) Flock(f File, lock FileLock, wait bool) error {
 	return flockOSFile(of, lock, wait)
 }
 func (o osFS) Remove(name string) error               { return os.Remove(o.join(name)) }
-func (o osFS) Rename(a, b string) error               { return os.Rename(o.join(a), o.join(b)) }
 func (o osFS) Stat(name string) (os.FileInfo, error)  { return os.Stat(o.join(name)) }
 func (o osFS) Lstat(name string) (os.FileInfo, error) { return os.Lstat(o.join(name)) }
 func (o osFS) Symlink(target, name string) error      { return os.Symlink(target, o.join(name)) }
 func (o osFS) Readlink(name string) (string, error)   { return os.Readlink(o.join(name)) }
 func (o osFS) Link(a, b string) error                 { return os.Link(o.join(a), o.join(b)) }
+
+// Rename is rename(2): a file renamed onto a directory fails with EISDIR,
+// and a directory renamed onto an empty one replaces it. os.Rename refuses
+// every rename onto a directory with EEXIST, which no system call does.
+func (o osFS) Rename(a, b string) error {
+	from, to := o.join(a), o.join(b)
+	for {
+		err := syscall.Rename(from, to)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+		}
+		return nil
+	}
+}
 
 // MemFS is an in-memory read/write FS. Each value is an independent tree, so
 // two interpreters given separate MemFS values cannot observe each other's
