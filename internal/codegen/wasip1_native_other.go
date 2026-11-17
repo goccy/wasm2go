@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// hostONonblock is the open flag of the host that opens a file without
+// waiting. This platform's opens (WASI has no such flag in its syscall
+// package) wait as they will: it has no FIFOs the runtime opens.
+const hostONonblock = 0
+
 // processUmask returns the file mode creation mask of the host process.
 // This platform has none the runtime can read, so none is applied.
 func processUmask() os.FileMode { return 0 }

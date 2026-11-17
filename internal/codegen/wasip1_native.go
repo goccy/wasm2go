@@ -5856,7 +5856,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		openFile = func(name string, flag int, perm os.FileMode) (File, error) {
 			f, err := hostFS.OpenDescriptor(name, flag, perm)
 			if errors.Is(err, errors.ErrUnsupported) {
-				return fsys.OpenFile(name, flag&^syscall.O_NONBLOCK, perm)
+				return fsys.OpenFile(name, flag&^hostONonblock, perm)
 			}
 			return f, err
 		}
@@ -5950,7 +5950,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		// FIFO whether or not anyone writes to it, a writer is refused
 		// (ENXIO) while nobody reads. A descriptor of the host's is in the
 		// mode it was opened in, whatever it is.
-		if f, err = openFile(rel, flag|syscall.O_NONBLOCK, w.createMode(mode)); err != nil {
+		if f, err = openFile(rel, flag|hostONonblock, w.createMode(mode)); err != nil {
 			return -1, mapOSError(err)
 		}
 	default:
@@ -6024,7 +6024,7 @@ func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMo
 		other = os.O_RDONLY
 	}
 	for {
-		end, endErr := openFile(rel, other|syscall.O_NONBLOCK, 0)
+		end, endErr := openFile(rel, other|hostONonblock, 0)
 		if endErr == nil {
 			// The other end is open: the host's open returns, now or as
 			// soon as it gets as far as looking for it.

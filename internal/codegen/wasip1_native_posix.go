@@ -722,3 +722,7 @@ func forwardSIGPIPEToIgnore() {
 		restoreHostSignal(syscall.SIGPIPE)
 	})
 }
+
+// hostONonblock is the open flag of the host that opens a file without
+// waiting (a FIFO nobody writes to, or reads from).
+const hostONonblock = syscall.O_NONBLOCK
