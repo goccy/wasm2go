@@ -2297,7 +2297,19 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	// before exec): the command leads a group of its own, which a signal to
 	// the process group reaches with every process the command starts.
 	leadsGroup := w.execNext && !leads && w.forked && w.groupLocked() == w.processIDLocked()
+	// A command that cannot be started does not take the process's place:
+	// the next one started does, as the next candidate of a search of PATH
+	// (posix_spawnp tries each).
+	becomes := w.execNext
 	w.execNext = false
+	started := false
+	defer func() {
+		if becomes && !started {
+			w.mu.Lock()
+			w.execNext = true
+			w.mu.Unlock()
+		}
+	}()
 	inherited, borrowed := w.inheritedFilesLocked()
 	cin := w.childReaderLocked(stdinFd)
 	cout := w.childWriterLocked(stdoutFd, w.stdout)
@@ -2387,6 +2399,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	if err := startCommand(cmd, closed); err != nil {
 		return -mapExecError(err)
 	}
+	started = true
 
 	proc := &wasiProc{cmd: cmd, done: make(chan struct{})}
 	go func() {
