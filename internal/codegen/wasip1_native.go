@@ -9467,13 +9467,15 @@ const wasiDefaultIgnoredSignals = uint64(1)<<(17-1) | // SIGCHLD
 	uint64(1)<<(23-1) | // SIGURG
 	uint64(1)<<(28-1) // SIGWINCH
 
-// The signals whose default action is to end the process, but which do
-// nothing to a Go program that has not asked for them: the Go runtime catches
-// them and carries on. (SIGHUP, SIGINT and SIGTERM end a Go program as they
-// end any process; the signals of a fault, SIGPROF and SIGPIPE have a meaning
-// of their own to the runtime and are left to it unless the guest handles
-// them.)
+// The signals whose default action is to end the process, but which a Go
+// program that has not asked for them takes otherwise: the Go runtime
+// catches them and carries on, or, for SIGQUIT and SIGABRT, prints its
+// goroutines and exits with status 2 instead of dying of the signal.
+// (SIGHUP, SIGINT and SIGTERM end a Go program as they end any process; the
+// signals of a fault, SIGPROF and SIGPIPE have a meaning of their own to the
+// runtime and are left to it unless the guest handles them.)
 const wasiSignalsHeldByRuntime = uint64(1)<<(3-1) | // SIGQUIT
+	uint64(1)<<(6-1) | // SIGABRT
 	uint64(1)<<(10-1) | // SIGUSR1
 	uint64(1)<<(12-1) | // SIGUSR2
 	uint64(1)<<(14-1) | // SIGALRM
