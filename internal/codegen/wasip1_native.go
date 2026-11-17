@@ -10467,6 +10467,19 @@ func (w *WasiStubs) fireDueTimerLocked() {
 		s.timer.Stop()
 		s.timer = nil
 	}
+	if w.hostProcess && !w.forked {
+		if hostSig, known := hostSignalOf(wasiSIGALRM); known {
+			if _, outside := hostActionsOutside()[hostSig]; outside {
+				// Code outside the guest made its own handler the
+				// process's action for SIGALRM (an event loop's signal
+				// watcher, as libev's): the alarm is the process's, and
+				// goes to that handler, as the kernel's alarm does. The
+				// guest takes it from there if the handler passes it on.
+				_ = signalHostSelf(hostSig)
+				return
+			}
+		}
+	}
 	w.postSignalLocked(wasiSIGALRM)
 }
 
