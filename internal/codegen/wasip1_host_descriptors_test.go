@@ -383,11 +383,62 @@ func TestHostDescriptors_ForkedProcessesShareNumbersUntilTheyDiverge(t *testing.
 
 }
 
-// A new descriptor above the standard ones is a descriptor of the host
-// under its number, whatever the other processes of the family hold: the
-// number is what a program hands to a native library. A parent that closed
-// a descriptor its fork child still has does not get that number for its
-// next one — under it the host has the child's file.
+// A process forked from the guest runs no code outside it, so its new
+// descriptor has the lowest number free for it, as a child process's open
+// gives it, also where its parent still has a descriptor under the number:
+// the descriptor of the host is then one above the range programs use,
+// which only the child's table connects with the number. F_DUPFD gives the
+// lowest number free for it that is at least its minimum.
+func TestHostDescriptors_AForkedProcessGetsTheLowestNumberFreeForIt(t *testing.T) {
+	const out int32 = 5300
+	dir := t.TempDir()
+	w, m := newHostGuest(t, dir)
+	kept := createTestFile(t, w, "kept.txt")
+	child := w.Fork()
+	defer child.CloseAll()
+	cm := newForkTestModule()
+
+	closeTestFd(t, child, cm, kept)
+	again := createTestFile(t, child, "again.txt")
+	if again != kept {
+		t.Fatalf("the child's next descriptor is %d, want %d, the number it closed", again, kept)
+	}
+	if host, ok := child.HostDescriptor(again); ok && host == uintptr(kept) {
+		t.Fatalf("the child's file is descriptor %d of the host, the parent's", host)
+	}
+	if rc := fdWriteString(child, cm, again, "child"); rc != _wasiESUCCESS {
+		t.Fatalf("child write rc=%d", rc)
+	}
+	if rc := fdWriteString(w, m, kept, "parent"); rc != _wasiESUCCESS {
+		t.Fatalf("parent write rc=%d", rc)
+	}
+	if !sameFile(t, guestIsHost(t, w, kept), filepath.Join(dir, "kept.txt")) {
+		t.Fatalf("descriptor %d of the host is no longer the parent's file", kept)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "kept.txt")); string(got) != "parent" {
+		t.Fatalf("the parent's file holds %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "again.txt")); string(got) != "child" {
+		t.Fatalf("the child's file holds %q", got)
+	}
+
+	// The number is free for the child again, and below the minimum.
+	source := createTestFile(t, child, "source.txt")
+	closeTestFd(t, child, cm, again)
+	if rc := child.Fd_dupfd(cm, source, kept+1, out); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if nfd := int32(binary.LittleEndian.Uint32(cm.memory[out:])); nfd < kept+1 {
+		t.Fatalf("F_DUPFD with the minimum %d gave %d", kept+1, nfd)
+	}
+}
+
+// A new descriptor above the standard ones that the first process of a
+// family makes is a descriptor of the host under its number, whatever the
+// other processes of the family hold: the number is what a program hands
+// to a native library. A parent that closed a descriptor its fork child
+// still has does not get that number for its next one — under it the host
+// has the child's file.
 func TestHostDescriptors_ANewDescriptorIsTheHostsWhileAnotherProcessHoldsALowerNumber(t *testing.T) {
 	const out int32 = 5300
 	for _, tc := range []struct {

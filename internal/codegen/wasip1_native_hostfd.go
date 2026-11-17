@@ -1406,6 +1406,14 @@ func hostOwner(fd int) (op *wasiOpen, reserved bool) {
 // is moved above the range programs use and has no number outside the
 // guest, like the file dup2 puts under such a number (dup2HostLocked).
 //
+// A process forked from the guest runs no code outside the guest (native
+// code dies there), so none of its numbers means the descriptor outside
+// it: there every number is as the standard ones, the lowest that is free
+// for the process, as a child process's open gives it. A program counts on
+// that there too: Proc::Daemon closes every descriptor of the daemon it
+// forks and opens /dev/null until the numbers perl's handles still have
+// are open again.
+//
 // Where the instance has something else under the descriptor's own number
 // (a stream of the embedder's, a file it holds under a number that was
 // another process's), the descriptor is moved to the instance's lowest
@@ -1413,6 +1421,13 @@ func hostOwner(fd int) (op *wasiOpen, reserved bool) {
 //
 // Caller holds w.mu.
 func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
+	return w.addHostFDFromLocked(op, 0)
+}
+
+// addHostFDFromLocked is addHostFDLocked for a number that is at least min
+// (dup and fcntl's F_DUPFD, whose descriptor the host gave a number that
+// is at least min as well).
+func (w *WasiStubs) addHostFDFromLocked(op *wasiOpen, min int) (int32, error) {
 	h := op.host()
 	fd, err := h.number()
 	if err != nil {
@@ -1430,7 +1445,7 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 		}
 	}
 	number, floor := -1, hostFloor()
-	for n := 0; number < 0; n++ {
+	for n := min; number < 0; n++ {
 		if n >= floor {
 			return -1, syscall.EMFILE
 		}
@@ -1441,7 +1456,7 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 			number = n
 			break
 		}
-		if n <= 2 && w.othersNumberLocked(n) {
+		if (n <= 2 || w.forked) && w.othersNumberLocked(n) {
 			moved, err := hostDup(fd, floor)
 			if err != nil {
 				return -1, err
@@ -1486,13 +1501,12 @@ func (w *WasiStubs) addHostFDLocked(op *wasiOpen) (int32, error) {
 	return int32(number), nil
 }
 
-// othersNumberLocked reports whether fd, the number of a standard
-// descriptor that the instance's table has nothing under, is in the process
-// the descriptor of somebody the instance never sees there: another guest's
-// entry (a process of the family that still has what this one closed), or
-// a standard descriptor of the process that the instance was not given.
-// Such a number is free for the instance, and what it puts there has no
-// number outside it. A descriptor of the runtime's own is not one of these
+// othersNumberLocked reports whether fd, a number that the instance's table
+// has nothing under, is in the process the descriptor of somebody the
+// instance never sees there: another guest's entry (a process of the family
+// that still has what this one closed), or a standard descriptor of the
+// process that the instance was not given. Such a number is free for the
+// instance, and what it puts there has no number outside it. A descriptor of the runtime's own is not one of these
 // — no guest gets that number — and neither is one that code outside the
 // guest made, which is the instance's under its number. Caller holds w.mu.
 func (w *WasiStubs) othersNumberLocked(fd int) bool {
@@ -1539,6 +1553,11 @@ func (w *WasiStubs) freeNumberLocked(min int32) int32 {
 		if _, used := fds[fd]; used {
 			continue
 		}
+		if w.forked && w.othersNumberLocked(int(fd)) {
+			// Its parent's, which a forked process's own number does not
+			// stand for outside it (addHostFDLocked).
+			return fd
+		}
 		var st syscall.Stat_t
 		if err := syscall.Fstat(int(fd), &st); err == nil {
 			continue
@@ -1561,7 +1580,7 @@ func (w *WasiStubs) dupHostLocked(op *wasiOpen, min int) (int32, error) {
 	if err != nil {
 		return -1, err
 	}
-	return w.addHostFDLocked(op.hostCopy(nfd))
+	return w.addHostFDFromLocked(op.hostCopy(nfd), min)
 }
 
 // hostCopy returns the entry for nfd, a duplicate of the descriptor op is.
