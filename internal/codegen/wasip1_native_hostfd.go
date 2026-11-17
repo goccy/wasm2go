@@ -1536,7 +1536,20 @@ func (w *WasiStubs) dup2HostLocked(src *wasiOpen, to int32) error {
 		delete(fds, to)
 	}
 	var nfd int
-	if w.hostNumberFreeLocked(int(to)) {
+	free := w.hostNumberFreeLocked(int(to))
+	if free && w.forked {
+		// A process forked from the guest is in the host process with the
+		// code outside the guest that runs for the guest it was forked
+		// from: a number open in the host process is that code's (an event
+		// loop's pipe), or the guest's it shares. Its descriptor of that
+		// number is one of its own, under a number of the runtime's, as a
+		// child process's dup2 replaces its own copy only.
+		var st syscall.Stat_t
+		if syscall.Fstat(int(to), &st) == nil {
+			free = false
+		}
+	}
+	if free {
 		syscall.ForkLock.RLock()
 		err = hostDup2(fd, int(to))
 		if err == nil && to > 2 {

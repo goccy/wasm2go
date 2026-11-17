@@ -987,6 +987,37 @@ func TestHostDescriptors_AForkedGuestLeavesOutsideDescriptorsAlone(t *testing.T)
 	if got, rc := fdReadString(w, m, r, 16); rc != _wasiESUCCESS || got != "through" {
 		t.Fatalf("the guest's read = %q rc=%d", got, rc)
 	}
+	// A descriptor of its own the forked process puts under that number
+	// (dup2, as a child does before it execs a command that expects it
+	// there) is its own: the host's descriptor of the number is left as it
+	// was, and the forked process reads and writes its own.
+	// (a descriptor the guest it was forked from never used: the code
+	// outside the guest keeps it to itself, as an event loop its pipe)
+	var p2 [2]int
+	if err := syscall.Pipe(p2[:]); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(p2[0])
+	defer syscall.Close(p2[1])
+	untouched := int32(p2[0])
+	qr, qw := newTestPipe(t, child, m)
+	var before syscall.Stat_t
+	if err := syscall.Fstat(int(untouched), &before); err != nil {
+		t.Fatal(err)
+	}
+	if rc := child.Fd_dup2(m, qw, untouched); rc != _wasiESUCCESS {
+		t.Fatalf("the forked guest's dup2 onto the number rc=%d", rc)
+	}
+	var after syscall.Stat_t
+	if err := syscall.Fstat(int(untouched), &after); err != nil || after.Ino != before.Ino {
+		t.Fatalf("the host's descriptor after the forked guest's dup2: %v (inode %d, was %d)", err, after.Ino, before.Ino)
+	}
+	if rc := fdWriteString(child, m, untouched, "own"); rc != _wasiESUCCESS {
+		t.Fatalf("the forked guest's write through its own descriptor rc=%d", rc)
+	}
+	if got, rc := fdReadString(child, m, qr, 8); rc != _wasiESUCCESS || got != "own" {
+		t.Fatalf("read the forked guest's write: %q rc=%d", got, rc)
+	}
 }
 
 // A descriptor that code outside the guest made — a native library — is
