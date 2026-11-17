@@ -1183,8 +1183,16 @@ func (w *WasiStubs) hostOpenLocked(fd int32, op *wasiOpen) *wasiOpen {
 // entry (hostFile.outside): its close-on-exec flag is the host's own, and
 // the entry is checked against the host before every use. Caller holds
 // w.mu.
+//
+// A process forked from the guest (Fork) takes in none: such a descriptor
+// is the process's, of the code outside the guest that made it, which runs
+// for the guest that is the host process, not for the forked one. The
+// forked guest has no copy of it to close, as a child process would have:
+// its close would close the descriptor under that code (an event loop's
+// wakeup descriptor, which a child closes when it closes every descriptor
+// before it execs a command). It gets EBADF for the number instead.
 func (w *WasiStubs) takeInOutsideLocked(fd int32) *wasiOpen {
-	if fd < 0 {
+	if fd < 0 || w.forked {
 		return nil
 	}
 	hostTable.making.Lock()

@@ -950,6 +950,45 @@ func TestHostDescriptors_SocketsAnswerAsTheHost(t *testing.T) {
 	}
 }
 
+// A process forked from the guest does not take in a descriptor that code
+// outside the guest made: that code runs for the guest it was forked from,
+// and the descriptor stays open for it when the forked process closes the
+// number, as it does when it closes every descriptor before it starts a
+// command. The forked process gets EBADF for it. Before, the forked
+// process's close closed the host's descriptor under the other's code.
+func TestHostDescriptors_AForkedGuestLeavesOutsideDescriptorsAlone(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, m := newHostGuest(t, dir)
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(p[0])
+	defer syscall.Close(p[1])
+	r, wr := int32(p[0]), int32(p[1])
+	child := w.Fork()
+	defer child.CloseAll()
+	if rc := child.Fd_close(m, r); rc != _wasiEBADF {
+		t.Fatalf("the forked guest's close rc=%d, want EBADF", rc)
+	}
+	if rc := fdWriteString(child, m, wr, "x"); rc != _wasiEBADF {
+		t.Fatalf("the forked guest's write rc=%d, want EBADF", rc)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(r), &st); err != nil {
+		t.Fatalf("the host's descriptor after the forked guest closed it: %v", err)
+	}
+	if rc := fdWriteString(w, m, wr, "through"); rc != _wasiESUCCESS {
+		t.Fatalf("the guest's write rc=%d", rc)
+	}
+	if got, rc := fdReadString(w, m, r, 16); rc != _wasiESUCCESS || got != "through" {
+		t.Fatalf("the guest's read = %q rc=%d", got, rc)
+	}
+}
+
 // A descriptor that code outside the guest made — a native library — is
 // the guest's under its number, like one it opened itself.
 func TestHostDescriptors_ADescriptorMadeOutsideTheGuestIsTheGuests(t *testing.T) {
