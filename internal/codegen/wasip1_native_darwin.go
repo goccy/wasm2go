@@ -687,6 +687,9 @@ func cStringLen(p *byte) int {
 // is not asked, so no action is known to be code outside the runtime's.
 type kernelSigaction struct{}
 
+// hostSignalIgnored reports false: see kernelSigaction.
+func hostSignalIgnored(sig syscall.Signal) bool { return false }
+
 // hostActionsOutside returns nil: see kernelSigaction.
 func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
 

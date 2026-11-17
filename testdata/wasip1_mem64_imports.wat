@@ -217,6 +217,8 @@
     (func $proc_signal_dispositions (param i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_signal_take"
     (func $proc_signal_take (param i64) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_signal_ignored"
+    (func $proc_signal_ignored (param i32) (result i32)))
   (import "wasi_snapshot_preview1" "proc_itimer"
     (func $proc_itimer (param i32 i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_terminate"
@@ -383,6 +385,7 @@
     (drop (call $proc_signal_register (i64.const 0)))
     (drop (call $proc_signal_dispositions (i64.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $proc_signal_take (i64.const 0)))
+    (drop (call $proc_signal_ignored (i32.const 0)))
     (drop (call $proc_itimer (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (call $proc_terminate (i32.const 0))
     (drop (call $proc_fork (i64.const 0)))

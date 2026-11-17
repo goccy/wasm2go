@@ -622,6 +622,14 @@ func hostSignalAction(sig syscall.Signal) (act kernelSigaction, ok bool) {
 	return act, errno == 0
 }
 
+// hostSignalIgnored reports whether the host process ignores the host signal
+// (its action is SIG_IGN).
+func hostSignalIgnored(sig syscall.Signal) bool {
+	const sigIGN = 1
+	act, ok := hostSignalAction(sig)
+	return ok && act.handler == sigIGN
+}
+
 // hostActionsOutside returns the actions of the host process's signals that
 // code outside the runtime made its own: a handler of a native library
 // (libev's, an rsignal of a module), installed after the Go runtime

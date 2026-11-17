@@ -453,6 +453,10 @@ func hostAccess(path string, amode uint32, effective bool) (errno int32, asked b
 // platform does not have.
 type kernelSigaction struct{}
 
+// hostSignalIgnored reports false: the runtime does not ask the kernel on
+// this platform.
+func hostSignalIgnored(sig syscall.Signal) bool { return false }
+
 // hostActionsOutside returns nil on this platform.
 func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
 

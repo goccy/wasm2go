@@ -4337,9 +4337,15 @@ func (w *WasiStubs) sendFd(op *wasiOpen, dst io.Writer, bufs [][]byte, flags int
 // decides — the default ends it, as it ends a process writing into a closed
 // pipe. A send that asked for no signal (wasiMsgNoSignal in flags) gets the
 // errno alone.
+//
+// A process that ignores SIGPIPE gets the errno alone too. Code outside the
+// guest may have made that the action of the host process (a network
+// library ignores SIGPIPE when it is loaded, so that a reset peer is an
+// error of the write), and the guest, which is that process, does not die
+// of it then.
 func (w *WasiStubs) writeFailure(err error, flags int32) int32 {
 	errno := mapNetError(err)
-	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 {
+	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 && !w.processIgnores(wasiSIGPIPE) {
 		w.PostSignal(wasiSIGPIPE)
 	}
 	return errno
@@ -9925,6 +9931,43 @@ func (w *WasiStubs) stopTimerLocked() {
 	}
 	s.timer.Stop()
 	s.timer, s.timerEvery = nil, 0
+}
+
+// Proc_signal_ignored is a NON-STANDARD host import (name
+// "proc_signal_ignored"): 1 when the host process ignores the guest's
+// signal sig by an action the runtime did not set, 0 otherwise. A guest that
+// is the host process, or a pseudo-process forked from it, shares its
+// signal actions with code outside the guest: a native library sets a signal
+// to SIG_IGN with the host's sigaction (a network client ignores SIGPIPE),
+// and the guest's C library reports and keeps that action, as the action of
+// the process, where its own is the default one (sigaction(2) shows the
+// action of the process, whoever set it). Any other guest, and a host the
+// runtime cannot ask, gets 0.
+func (w *WasiStubs) Proc_signal_ignored(m *Module, sig int32) int32 {
+	if w.processIgnores(sig) {
+		return 1
+	}
+	return 0
+}
+
+// Proc_signal_ignored64 is Proc_signal_ignored for a memory64 guest.
+func (w *WasiStubs) Proc_signal_ignored64(m *Module, sig int32) int32 {
+	return w.Proc_signal_ignored(m, sig)
+}
+
+// processIgnores reports whether the guest is the host process (or a
+// pseudo-process forked from it) and that process ignores the guest's
+// signal sig by an action the runtime did not set for the guest.
+func (w *WasiStubs) processIgnores(sig int32) bool {
+	bit := wasiSignalBit(sig)
+	w.mu.Lock()
+	mine := w.hostProcess && bit != 0 && w.sig.hostIgnored&bit == 0
+	w.mu.Unlock()
+	if !mine {
+		return false
+	}
+	hostSig, known := hostSignalOf(sig)
+	return known && hostSignalIgnored(hostSig)
 }
 
 // Proc_terminate is a NON-STANDARD host import (name "proc_terminate"): the
