@@ -592,3 +592,62 @@ const (
 	hostATFDCWD   = -100
 	hostATEAccess = 0x200
 )
+
+// kernelSigaction is struct sigaction as the kernel's rt_sigaction takes it
+// on amd64 and arm64.
+type kernelSigaction struct {
+	handler  uintptr
+	flags    uint64
+	restorer uintptr
+	mask     uint64
+}
+
+// hostSignalAction returns the kernel's action for the host signal.
+func hostSignalAction(sig syscall.Signal) (act kernelSigaction, ok bool) {
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		return act, false
+	}
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(sig), 0,
+		uintptr(unsafe.Pointer(&act)), unsafe.Sizeof(act.mask), 0, 0)
+	return act, errno == 0
+}
+
+// hostActionsOutside returns the actions of the host process's signals that
+// code outside the runtime made its own: a handler of a native library
+// (libev's, an rsignal of a module), installed after the Go runtime
+// installed its own for every signal. They are told apart by the handler:
+// the Go runtime has one for all the signals it takes, which is its handler
+// of SIGURG (the signal it preempts goroutines with, always its own). nil
+// when there are none, or where the kernel cannot be asked.
+func hostActionsOutside() map[syscall.Signal]kernelSigaction {
+	own, ok := hostSignalAction(syscall.SIGURG)
+	const sigIGN = 1
+	if !ok || own.handler <= sigIGN {
+		return nil
+	}
+	var outside map[syscall.Signal]kernelSigaction
+	for sig := syscall.Signal(1); sig < 65; sig++ {
+		if sig == syscall.SIGKILL || sig == syscall.SIGSTOP {
+			continue
+		}
+		if act, ok := hostSignalAction(sig); ok && act.handler > sigIGN && act.handler != own.handler {
+			if outside == nil {
+				outside = map[syscall.Signal]kernelSigaction{}
+			}
+			outside[sig] = act
+		}
+	}
+	return outside
+}
+
+// restoreHostActionsOutside puts the actions hostActionsOutside returned
+// back, after the Go runtime has installed its own handler for a signal
+// again (os/signal does that when a program asks for a signal, and when it
+// stops asking).
+func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {
+	for sig, act := range outside {
+		act := act
+		_, _, _ = syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(sig),
+			uintptr(unsafe.Pointer(&act)), 0, unsafe.Sizeof(act.mask), 0, 0)
+	}
+}

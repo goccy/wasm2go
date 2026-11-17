@@ -3110,12 +3110,22 @@ func (w *WasiStubs) firstOfFamily() *WasiStubs {
 // process), and is not dealt with here; nor is any signal once the guest is
 // gone or before it has registered.
 func (w *WasiStubs) takeAsHostProcess(sig int32) bool {
+	if hostSig, known := hostSignalOf(sig); known {
+		if _, outside := hostActionsOutside()[hostSig]; outside {
+			// Code outside the guest made its own handler the process's
+			// action for the signal (an event loop's signal watcher):
+			// the process takes it, as it would from anyone.
+			return false
+		}
+	}
 	bit := wasiSignalBit(sig)
 	uncatchable := wasiSignalBit(wasiSIGKILL) | wasiSignalBit(wasiSIGSTOP)
 	w.mu.Lock()
 	s := &w.sig
 	mine := w.hostProcess && !w.forked && !w.ended && s.flagModule != nil && bit&^uncatchable != 0
-	posted := mine && (s.handled|wasiSignalsHeldByRuntime&^s.ignored)&bit != 0
+	// A signal the guest blocks stays pending for it, whatever its action
+	// is, until the guest unblocks it.
+	posted := mine && (s.handled|(wasiSignalsHeldByRuntime|s.blocked)&^s.ignored)&bit != 0
 	dropped := mine && s.hostIgnored&bit != 0
 	w.mu.Unlock()
 	if posted {
@@ -9939,6 +9949,21 @@ func (w *WasiStubs) syncHostSignalsLocked() {
 		uncatchable := wasiSignalBit(wasiSIGKILL) | wasiSignalBit(wasiSIGSTOP)
 		relay = (s.handled | wasiSignalsHeldByRuntime&^s.ignored) &^ (uncatchable | wasiSignalBit(wasiSIGCHLD))
 		ignore = s.ignored &^ (uncatchable | wasiDefaultIgnoredSignals)
+	}
+	// os/signal installs the Go runtime's handler again for a signal it is
+	// asked for, and when it stops being asked for one. A handler that code
+	// outside the guest made the process's action (libev's, for its signal
+	// watchers) is put back afterwards, unless the guest changed what it
+	// does with that very signal now: the last to set an action has it, as
+	// in a process of its own.
+	if outside := hostActionsOutside(); outside != nil {
+		changed := (relay ^ s.relayed) | (ignore ^ s.hostIgnored)
+		for hostSig := range outside {
+			if sig := guestSignalOf(hostSig); sig != 0 && changed&wasiSignalBit(sig) != 0 {
+				delete(outside, hostSig)
+			}
+		}
+		defer restoreHostActionsOutside(outside)
 	}
 	// Ignoring or resetting a signal undoes a subscription to it, so this
 	// comes before the subscription is brought up to date.

@@ -439,3 +439,13 @@ func hostHostByName(name string) (official string, addrs [][4]byte, asked bool) 
 func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
 	return 0, false
 }
+
+// kernelSigaction would be the kernel's action of a signal, which this
+// platform does not have.
+type kernelSigaction struct{}
+
+// hostActionsOutside returns nil on this platform.
+func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
+
+// restoreHostActionsOutside has nothing to put back on this platform.
+func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}

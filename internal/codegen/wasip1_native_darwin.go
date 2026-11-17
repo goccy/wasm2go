@@ -682,3 +682,13 @@ func cStringLen(p *byte) int {
 	}
 	return n
 }
+
+// hostSignalAction would be the kernel's action of a signal; this platform's
+// is not asked, so no action is known to be code outside the runtime's.
+type kernelSigaction struct{}
+
+// hostActionsOutside returns nil: see kernelSigaction.
+func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
+
+// restoreHostActionsOutside has nothing to put back.
+func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}
