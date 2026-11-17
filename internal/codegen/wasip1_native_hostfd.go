@@ -933,6 +933,43 @@ type hostPollSet struct {
 	fds  []hostPoll
 }
 
+// addErrors enters the descriptor of h for subscription sub, a
+// subscription for reading of a descriptor open only for writing: it asks
+// the host for nothing but what poll(2) reports unasked (POLLERR, POLLHUP,
+// POLLNVAL). It reports false when the descriptor is gone.
+func (s *hostPollSet) addErrors(sub int, h *hostFile) bool {
+	fd, err := h.number()
+	if err != nil {
+		return false
+	}
+	s.subs = append(s.subs, sub)
+	s.read = append(s.read, true)
+	s.fds = append(s.fds, hostPoll{fd: int32(fd)})
+	return true
+}
+
+// errorsOnly reports whether subscription sub was entered by addErrors.
+func (s *hostPollSet) errorsOnly(sub int) bool {
+	for i, p := range s.fds {
+		if s.subs[i] == sub {
+			return p.events == 0
+		}
+	}
+	return false
+}
+
+// failed reports whether the last poll found the descriptor of subscription
+// sub in error (POLLERR), which poll(2) reports whether it was asked for or
+// not.
+func (s *hostPollSet) failed(sub int) bool {
+	for i, p := range s.fds {
+		if s.subs[i] == sub {
+			return p.revents&hostPollErr != 0
+		}
+	}
+	return false
+}
+
 // add enters the descriptor of h for subscription sub, for reading or for
 // writing. It reports false when the descriptor is gone.
 func (s *hostPollSet) add(sub int, h *hostFile, read bool) bool {
@@ -974,6 +1011,12 @@ func (s *hostPollSet) hungUp(sub int) bool {
 		}
 	}
 	return false
+}
+
+// hostFailed asks the host whether a descriptor of its own is in error
+// (POLLERR).
+func hostFailed(fd uintptr) bool {
+	return hostReadyNow(int(fd), 0)&hostPollErr != 0
 }
 
 // hostHungUp asks the host whether a descriptor of its own has been hung up

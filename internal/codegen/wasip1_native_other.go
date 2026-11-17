@@ -277,6 +277,13 @@ func (s *hostPollSet) ready(mark func(sub int)) bool                        { re
 func (s *hostPollSet) await(w *WasiStubs, until time.Time) int32            { return _wasiENOSYS }
 func (s *hostPollSet) awaitStoppable(until time.Time, stop <-chan struct{}) {}
 func (s *hostPollSet) hungUp(sub int) bool                                  { return false }
+func (s *hostPollSet) addErrors(sub int, h *hostFile) bool                  { return false }
+func (s *hostPollSet) errorsOnly(sub int) bool                              { return false }
+func (s *hostPollSet) failed(sub int) bool                                  { return false }
+
+// hostFailed would ask the host whether a descriptor of its own is in
+// error, which the runtime cannot do on this platform.
+func hostFailed(fd uintptr) bool { return false }
 
 // hostHungUp would ask the host whether a descriptor of its own has been
 // hung up on, which the runtime cannot do on this platform.

@@ -6553,6 +6553,23 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		if readable, writable := op.access(); (ev.isRead && !readable) || (!ev.isRead && !writable && op.stdio == 0) {
 			if op.plainFile() {
 				ready[i], anyReady = true, true
+				continue
+			}
+			// A stream open only for writing is never readable, but
+			// poll(2) reports what happens to it whether asked or not:
+			// POLLERR once nobody reads it any more (the reader of a pipe
+			// has closed it). The guest asks about that with a
+			// subscription for reading, having asked for neither.
+			if ev.isRead && writable {
+				if h := op.host(); h != nil {
+					if !hostSet.addErrors(i, h) {
+						errnos[i] = _wasiEBADF
+						ready[i], anyReady = true, true
+					}
+				} else if dst != nil && streamFailed(dst) {
+					errnos[i] = _wasiEPIPE
+					ready[i], anyReady = true, true
+				}
 			}
 			continue
 		}
@@ -6775,6 +6792,15 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		if !ready[i] {
 			continue
 		}
+		// A stream open only for writing that is in error is ready for
+		// the call that finds out, and the event of the subscription for
+		// reading that asked about it says so (EPIPE), as poll(2) reports
+		// POLLERR: a write to it fails at once. The event for writing
+		// carries no error: the guest's select would leave the descriptor
+		// out of its sets.
+		if errnos[i] == 0 && hostSet.errorsOnly(i) && hostSet.failed(i) {
+			errnos[i] = _wasiEPIPE
+		}
 		// The hang-up goes with events for reading only. The guest's C
 		// library takes it on an event for writing as the end of
 		// writability (POLLHUP contradicts POLLWRNORM), and its select()
@@ -6821,6 +6847,15 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 // descriptor has hung up. The guest's poll() reports it as POLLHUP. It is
 // set on events for reading only (see Poll_oneoff).
 const wasiEventHangup uint16 = 1
+
+// streamFailed reports whether a stream is in error, as poll(2) tells it
+// with POLLERR: the reader of a pipe has closed it. Only the host can tell,
+// for a stream that is a descriptor of its own.
+func streamFailed(stream any) bool {
+	var failed bool
+	hostDescriptor(stream, func(fd uintptr) { failed = hostFailed(fd) })
+	return failed
+}
 
 // streamHungUp reports whether a stream has been hung up on, as poll(2)
 // tells it with POLLHUP: the writers of a pipe have all closed it, a
@@ -12929,6 +12964,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVecFailure":            true,
 			"hostDescriptor":            true,
 			"streamHungUp":              true,
+			"streamFailed":              true,
 			"modeAllows":                true,
 			"restoreHostSignal":         true,
 			"readNow":                   true,
