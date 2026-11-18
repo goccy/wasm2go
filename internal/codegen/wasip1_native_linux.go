@@ -677,6 +677,21 @@ func takeHostSignalBack(sig syscall.Signal) {
 		uintptr(unsafe.Pointer(&own)), 0, unsafe.Sizeof(own.mask), 0, 0)
 }
 
+// hostChildSignalTakenOutside reports whether code outside the runtime made
+// a handler of its own the host process's action of SIGCHLD (see
+// hostActionsOutside): libev's default loop makes one when EV loads, and
+// takeHostSignalBack gives the signal back to the runtime when the guest
+// sets what it does with it afterwards.
+func hostChildSignalTakenOutside() bool {
+	own, ok := hostSignalAction(syscall.SIGURG)
+	const sigIGN = 1
+	if !ok || own.handler <= sigIGN {
+		return false
+	}
+	act, ok := hostSignalAction(syscall.SIGCHLD)
+	return ok && act.handler > sigIGN && act.handler != own.handler
+}
+
 // restoreHostActionsOutside puts the actions hostActionsOutside returned
 // back, after the Go runtime has installed its own handler for a signal
 // again (os/signal does that when a program asks for a signal, and when it

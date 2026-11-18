@@ -484,6 +484,10 @@ func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
 // takeHostSignalBack does nothing on this platform (see hostActionsOutside).
 func takeHostSignalBack(sig syscall.Signal) {}
 
+// hostChildSignalTakenOutside reports false: the runtime does not ask the
+// kernel on this platform.
+func hostChildSignalTakenOutside() bool { return false }
+
 // restoreHostActionsOutside has nothing to put back on this platform.
 func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}
 

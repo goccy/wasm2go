@@ -2177,10 +2177,17 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 		close(w.procFinished)
 		w.procFinished = nil
 	}
+	// A handler native code made the host process's action of SIGCHLD
+	// after the guest last said what it does with the signal has the
+	// signal, as in a process where the last sigaction wins: the guest's
+	// own disposition no longer applies, and the host's SIGCHLD reaches the
+	// handler (the kernel sends it for a command, the host for a fork
+	// child).
+	nativeHasChld := hostChildSignalTakenOutside()
 	// A process whose parent instance is gone (CloseAll emptied the table)
 	// has nobody to wait for it: it does not stay behind as a zombie. Nor
 	// does the child of a process that ignores SIGCHLD.
-	if w.sig.reapsChildren() {
+	if w.sig.reapsChildren() && !nativeHasChld {
 		w.reapFinishedLocked()
 	}
 	waitedFor := false
@@ -2204,7 +2211,9 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 	}
 	w.mu.Unlock()
 	// The parent is told, as the kernel tells a process whose child ended.
-	w.PostSignal(wasiSIGCHLD)
+	if !nativeHasChld {
+		w.PostSignal(wasiSIGCHLD)
+	}
 }
 
 // reapFinishedLocked forgets every process of this instance that has ended:

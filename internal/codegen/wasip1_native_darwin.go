@@ -697,6 +697,9 @@ func hostActionsOutside() map[syscall.Signal]kernelSigaction { return nil }
 // native signal action here (see hostActionsOutside).
 func takeHostSignalBack(sig syscall.Signal) {}
 
+// hostChildSignalTakenOutside reports false: see kernelSigaction.
+func hostChildSignalTakenOutside() bool { return false }
+
 // restoreHostActionsOutside has nothing to put back.
 func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}
 
