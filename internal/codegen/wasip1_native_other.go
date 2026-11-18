@@ -496,3 +496,8 @@ func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {}
 func signalHostSelf(sig syscall.Signal) error {
 	return errors.ErrUnsupported
 }
+
+// hostRawSyscall makes no call on this platform (see Sys_syscall).
+func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (uintptr, error) {
+	return 0, syscall.ENOSYS
+}

@@ -14015,6 +14015,56 @@ func (t *translator) wasmImportsWasi() bool {
 // imports, whose bodies are per platform (wasip1_native_terminal.go,
 // wasip1_native_other.go), follow.
 
+// Sys_syscall is a NON-STANDARD host import (name "sys_syscall") backing
+// perl's syscall(): the host's system call of the number, with the nargs
+// (at most six) u64 arguments at argsPtr; an argument whose bit is set in
+// ptrs is an address of the guest's memory (a string's buffer), which the
+// call is given as the address the process has it at. Its result is
+// written at resultPtr (i64). Returns 0, or a negative errno: ENOSYS where
+// the guest is not the host process (its descriptors and identity are not
+// the process's own, which the call would act on) or the host makes no raw
+// calls.
+func (w *WasiStubs) Sys_syscall(m *Module, number int64, argsPtr, nargs, ptrs, resultPtr int32) int32 {
+	return w.sysSyscall(m, number, zext(argsPtr), nargs, ptrs, zext(resultPtr))
+}
+
+// Sys_syscall64 is Sys_syscall for a memory64 guest.
+func (w *WasiStubs) Sys_syscall64(m *Module, number int64, argsPtr int64, nargs, ptrs int32, resultPtr int64) int32 {
+	return w.sysSyscall(m, number, uint64(argsPtr), nargs, ptrs, uint64(resultPtr))
+}
+
+// sysSyscall is the body of Sys_syscall and Sys_syscall64.
+func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, ptrs int32, resultPtr uint64) int32 {
+	w.mu.Lock()
+	host := w.hostProcess
+	w.mu.Unlock()
+	if !host {
+		return -_wasiENOSYS
+	}
+	if nargs < 0 || nargs > 6 {
+		return -_wasiEINVAL
+	}
+	raw := w.memBytes(m, argsPtr, uint64(nargs)*8)
+	out := w.memBytes(m, resultPtr, 8)
+	if raw == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	mem := w.guestMemory(m)
+	var args [6]uint64
+	for i := 0; i < int(nargs); i++ {
+		args[i] = binary.LittleEndian.Uint64(raw[i*8:])
+		if ptrs&(1<<i) != 0 && args[i] >= uint64(len(mem)) {
+			return -_wasiEFAULT
+		}
+	}
+	r, err := hostRawSyscall(uintptr(number), args, uint32(ptrs), mem)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(r))
+	return _wasiESUCCESS
+}
+
 // Tty_getattr is a NON-STANDARD host import (name "tty_getattr") backing
 // tcgetattr: the settings of the terminal fd are written at recordPtr, as
 // struct termios of the guest's C library, in the host's numbers. Returns 0

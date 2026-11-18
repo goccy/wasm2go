@@ -703,3 +703,23 @@ func restoreHostActionsOutside(outside map[syscall.Signal]kernelSigaction) {
 			uintptr(unsafe.Pointer(&act)), 0, unsafe.Sizeof(act.mask), 0, 0)
 	}
 }
+
+// hostRawSyscall makes the system call number with args, an argument whose
+// bit is set in ptrs being the offset of a byte of mem, which the call is
+// given the address of (see Sys_syscall).
+func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (uintptr, error) {
+	var a [6]uintptr
+	for i, v := range args {
+		if ptrs&(1<<i) != 0 {
+			a[i] = uintptr(unsafe.Pointer(&mem[v]))
+		} else {
+			a[i] = uintptr(v)
+		}
+	}
+	r, _, errno := syscall.Syscall6(number, a[0], a[1], a[2], a[3], a[4], a[5])
+	runtime.KeepAlive(mem)
+	if errno != 0 {
+		return 0, errno
+	}
+	return r, nil
+}
