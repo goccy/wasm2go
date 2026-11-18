@@ -1,4 +1,4 @@
-//go:build linux
+//go:build darwin || linux
 
 package codegen
 
@@ -9,111 +9,171 @@ import (
 	"unsafe"
 )
 
-// System V IPC on Linux (see "System V IPC" in wasip1_native.go). The
-// guest's numbers are Linux's, so commands and flags go to the kernel as
-// they are. The guest's structures are laid out as the kernel's are on a
-// 64-bit architecture (asm-generic's ipc64_perm, msqid64_ds, semid64_ds and
-// shmid64_ds); x86-64 has a semid64_ds of its own, with a word after each
-// time, which ipcLayout says.
+// System V IPC on a system that has it (see "System V IPC" in
+// wasip1_native.go). The guest's numbers are Linux's and its structures
+// Linux's 64-bit ones; the system's file of the platform (wasip1_native_
+// linux.go, wasip1_native_darwin.go) says what the host's are: ipcCall
+// makes a call, ipcHostLayout gives the host's structure of a kind, and
+// ipcHostCommand the host's number of a command.
 
-// The guest's commands of msgctl, semctl and shmctl that take a buffer.
+// The C library's calls of System V IPC, for ipcCall.
 const (
-	ipcCmdSet    = 1
-	ipcCmdStat   = 2
-	ipcCmdGetAll = 13
-	ipcCmdSetVal = 16
-	ipcCmdSetAll = 17
+	ipcOpMsgget = iota
+	ipcOpSemget
+	ipcOpShmget
+	ipcOpMsgctl
+	ipcOpSemctl
+	ipcOpShmctl
+	ipcOpSemop
+	ipcOpMsgsnd
+	ipcOpMsgrcv
+	ipcOpShmat
+	ipcOpShmdt
 )
 
-// ipcField is a field of an IPC structure: where the guest has it, where
-// the kernel has it, and its size in bytes.
+// The guest's commands of msgctl, semctl and shmctl.
+const (
+	ipcCmdRmid    = 0
+	ipcCmdSet     = 1
+	ipcCmdStat    = 2
+	ipcCmdGetPid  = 11
+	ipcCmdGetVal  = 12
+	ipcCmdGetAll  = 13
+	ipcCmdGetNcnt = 14
+	ipcCmdGetZcnt = 15
+	ipcCmdSetVal  = 16
+	ipcCmdSetAll  = 17
+)
+
+// ipcField is a field of an IPC structure: where the guest has it and its
+// size there, and where the host has it and its size there. A field of two
+// sizes is an unsigned integer in both.
 type ipcField struct {
-	guest, host, size int
+	guest, guestSize, host, hostSize int
 }
 
-// ipcLayout returns the size of the kernel's structure of the kind and its
-// fields, and the size of the guest's. The permissions (struct ipc_perm,
-// the first 48 bytes) are laid out alike in both: key, uid, gid, cuid,
-// cgid, mode, the sequence number and two unused words.
-func ipcLayout(kind int32) (hostSize, guestSize int, fields []ipcField) {
-	perm := ipcField{0, 0, 48}
-	switch kind {
-	case ipcKindMsg:
-		// stime rtime ctime cbytes qnum qbytes, lspid lrpid
-		return 120, 120, []ipcField{perm, {48, 48, 48}, {96, 96, 8}}
-	case ipcKindShm:
-		// segsz atime dtime ctime, cpid lpid, nattch
-		return 112, 112, []ipcField{perm, {48, 48, 32}, {80, 80, 8}, {88, 88, 8}}
-	case ipcKindSem:
-		if runtime.GOARCH == "amd64" {
-			// otime, unused, ctime, unused, nsems
-			return 104, 88, []ipcField{perm, {48, 48, 8}, {56, 64, 8}, {64, 80, 8}}
-		}
-		// otime ctime nsems
-		return 88, 88, []ipcField{perm, {48, 48, 24}}
+// The guest's structures (perl-wasm's scripts/include/sys/*.h): their
+// sizes, and the fields each kind has where the guest has them.
+var ipcGuestSize = map[int32]int{ipcKindMsg: 120, ipcKindSem: 88, ipcKindShm: 112}
+
+// The fields of the guest's structures that tell how big an object is:
+// the number of semaphores of a set, the size of a segment.
+const (
+	ipcGuestSemNsems = 64
+	ipcGuestShmSegsz = 48
+)
+
+// ipcHostToGuest fills the guest's structure of the kind from the host's.
+func ipcHostToGuest(kind int32, host, guest []byte) {
+	clear(guest)
+	for _, f := range ipcHostLayout(kind).fields {
+		ipcCopyField(guest[f.guest:f.guest+f.guestSize], host[f.host:f.host+f.hostSize])
 	}
-	return 0, 0, nil
 }
 
-// The system calls of each kind.
-var ipcCtlCall = map[int32]uintptr{ipcKindMsg: syscall.SYS_MSGCTL, ipcKindSem: syscall.SYS_SEMCTL, ipcKindShm: syscall.SYS_SHMCTL}
+// ipcGuestToHost fills the host's structure of the kind from the guest's.
+func ipcGuestToHost(kind int32, guest, host []byte) {
+	clear(host)
+	for _, f := range ipcHostLayout(kind).fields {
+		ipcCopyField(host[f.host:f.host+f.hostSize], guest[f.guest:f.guest+f.guestSize])
+	}
+}
+
+// ipcCopyField copies a field into one of the same size or, between sizes,
+// as the unsigned little-endian integer it is.
+func ipcCopyField(dst, src []byte) {
+	if len(dst) == len(src) {
+		copy(dst, src)
+		return
+	}
+	var v uint64
+	for i := len(src) - 1; i >= 0; i-- {
+		v = v<<8 | uint64(src[i])
+	}
+	for i := range dst {
+		dst[i] = byte(v)
+		v >>= 8
+	}
+}
+
+// ipcHostStruct is the host's structure of a kind: its size and its
+// fields.
+type ipcHostStruct struct {
+	size   int
+	fields []ipcField
+}
+
+// ipcGuestField reads the guest field at off (an unsigned integer of
+// ipcHostLayout's size for it) of a host structure.
+func ipcHostValue(kind int32, host []byte, guestOff int) uint64 {
+	for _, f := range ipcHostLayout(kind).fields {
+		if f.guest == guestOff && f.guestSize == 8 {
+			v := make([]byte, 8)
+			ipcCopyField(v, host[f.host:f.host+f.hostSize])
+			return binary.LittleEndian.Uint64(v)
+		}
+	}
+	return 0
+}
+
+// The control call of each kind.
+var ipcCtlOp = map[int32]int{ipcKindMsg: ipcOpMsgctl, ipcKindSem: ipcOpSemctl, ipcKindShm: ipcOpShmctl}
 
 // hostIPCGet makes msgget, semget or shmget.
 func hostIPCGet(kind, key int32, arg uint64, flags int32) (int32, error) {
 	var r uintptr
-	var errno syscall.Errno
+	var err error
 	switch kind {
 	case ipcKindMsg:
-		r, _, errno = syscall.Syscall(syscall.SYS_MSGGET, uintptr(key), uintptr(flags), 0)
+		r, err = ipcCall(ipcOpMsgget, uintptr(key), uintptr(flags))
 	case ipcKindSem:
-		r, _, errno = syscall.Syscall(syscall.SYS_SEMGET, uintptr(key), uintptr(arg), uintptr(flags))
+		r, err = ipcCall(ipcOpSemget, uintptr(key), uintptr(arg), uintptr(flags))
 	case ipcKindShm:
-		r, _, errno = syscall.Syscall(syscall.SYS_SHMGET, uintptr(key), uintptr(arg), uintptr(flags))
+		r, err = ipcCall(ipcOpShmget, uintptr(key), uintptr(arg), uintptr(flags))
 	default:
 		return -1, syscall.EINVAL
 	}
-	if errno != 0 {
-		return -1, errno
+	if err != nil {
+		return -1, err
 	}
 	return int32(r), nil
 }
 
-// ipcCtl makes the control call of the kind with the kernel's argument arg
-// (a word: a value, or an address).
-func ipcCtl(kind, id, num, cmd int32, arg uintptr) (int64, error) {
+// ipcCtl makes the control call of the kind with the host's command and
+// argument (a word: a value, or an address).
+func ipcCtl(kind, id, num, hostCmd int32, arg uintptr) (int64, error) {
 	var r uintptr
-	var errno syscall.Errno
+	var err error
 	if kind == ipcKindSem {
-		r, _, errno = syscall.Syscall6(syscall.SYS_SEMCTL, uintptr(id), uintptr(num), uintptr(cmd), arg, 0, 0)
+		r, err = ipcCall(ipcOpSemctl, uintptr(id), uintptr(num), uintptr(hostCmd), arg)
 	} else {
-		r, _, errno = syscall.Syscall(ipcCtlCall[kind], uintptr(id), uintptr(cmd), arg)
+		r, err = ipcCall(ipcCtlOp[kind], uintptr(id), uintptr(hostCmd), arg)
 	}
-	if errno != 0 {
-		return -1, errno
+	if err != nil {
+		return -1, err
 	}
 	return int64(int32(r)), nil
 }
 
-// ipcStat reads the kernel's structure of the object into a buffer of its
-// size.
+// ipcStat reads the host's structure of the object.
 func ipcStat(kind, id int32) ([]byte, error) {
-	hostSize, _, _ := ipcLayout(kind)
-	host := make([]byte, hostSize)
-	_, err := ipcCtl(kind, id, 0, ipcCmdStat, uintptr(unsafe.Pointer(&host[0])))
+	host := make([]byte, ipcHostLayout(kind).size)
+	_, err := ipcCtl(kind, id, 0, ipcHostCommand(ipcCmdStat), uintptr(unsafe.Pointer(&host[0])))
 	runtime.KeepAlive(host)
 	return host, err
 }
 
-// hostIPCCtl makes msgctl, semctl or shmctl. buf gives the n bytes of the
-// guest's buffer, or nil when they are not all in its memory.
+// hostIPCCtl makes msgctl, semctl or shmctl with the guest's command. buf
+// gives the n bytes of the guest's buffer, or nil when they are not all in
+// its memory.
 func hostIPCCtl(kind, id, num, cmd int32, arg int64, buf func(n uint64) []byte) (int64, error) {
-	if _, ok := ipcCtlCall[kind]; !ok {
+	if _, ok := ipcCtlOp[kind]; !ok {
 		return -1, syscall.EINVAL
 	}
-	hostSize, guestSize, fields := ipcLayout(kind)
+	hostCmd := ipcHostCommand(cmd)
 	switch {
 	case cmd == ipcCmdStat:
-		guest := buf(uint64(guestSize))
+		guest := buf(uint64(ipcGuestSize[kind]))
 		if guest == nil {
 			return -1, syscall.EFAULT
 		}
@@ -121,91 +181,74 @@ func hostIPCCtl(kind, id, num, cmd int32, arg int64, buf func(n uint64) []byte) 
 		if err != nil {
 			return -1, err
 		}
-		clear(guest)
-		for _, f := range fields {
-			copy(guest[f.guest:f.guest+f.size], host[f.host:f.host+f.size])
-		}
+		ipcHostToGuest(kind, host, guest)
 		return 0, nil
 	case cmd == ipcCmdSet:
-		guest := buf(uint64(guestSize))
+		guest := buf(uint64(ipcGuestSize[kind]))
 		if guest == nil {
 			return -1, syscall.EFAULT
 		}
-		host := make([]byte, hostSize)
-		for _, f := range fields {
-			copy(host[f.host:f.host+f.size], guest[f.guest:f.guest+f.size])
-		}
-		r, err := ipcCtl(kind, id, num, cmd, uintptr(unsafe.Pointer(&host[0])))
+		host := make([]byte, ipcHostLayout(kind).size)
+		ipcGuestToHost(kind, guest, host)
+		r, err := ipcCtl(kind, id, num, hostCmd, uintptr(unsafe.Pointer(&host[0])))
 		runtime.KeepAlive(host)
 		return r, err
 	case kind == ipcKindSem && (cmd == ipcCmdGetAll || cmd == ipcCmdSetAll):
-		// the values of the set's semaphores, an unsigned short each
+		// the values of the set's semaphores, an unsigned short each, as
+		// many as the set has
 		host, err := ipcStat(kind, id)
 		if err != nil {
 			return -1, err
 		}
-		nsemsAt := 64
-		if runtime.GOARCH == "amd64" {
-			nsemsAt = 80
-		}
-		nsems := binary.LittleEndian.Uint64(host[nsemsAt:])
+		nsems := ipcHostValue(kind, host, ipcGuestSemNsems)
 		values := buf(2 * nsems)
 		if values == nil {
 			return -1, syscall.EFAULT
 		}
 		if nsems == 0 {
-			return ipcCtl(kind, id, num, cmd, 0)
+			return ipcCtl(kind, id, num, hostCmd, 0)
 		}
-		r, err := ipcCtl(kind, id, num, cmd, uintptr(unsafe.Pointer(&values[0])))
+		r, err := ipcCtl(kind, id, num, hostCmd, uintptr(unsafe.Pointer(&values[0])))
 		runtime.KeepAlive(values)
 		return r, err
 	case kind == ipcKindSem && cmd == ipcCmdSetVal:
-		return ipcCtl(kind, id, num, cmd, uintptr(int32(arg)))
+		return ipcCtl(kind, id, num, hostCmd, uintptr(int32(arg)))
+	case cmd == ipcCmdRmid,
+		kind == ipcKindSem && (cmd == ipcCmdGetPid || cmd == ipcCmdGetVal || cmd == ipcCmdGetNcnt || cmd == ipcCmdGetZcnt):
+		return ipcCtl(kind, id, num, hostCmd, 0)
 	}
-	// the commands with no buffer (IPC_RMID, GETVAL, GETPID, GETNCNT,
-	// GETZCNT); the others, which read or write a structure the guest has
-	// no layout of (IPC_INFO, SEM_INFO, MSG_STAT, ...), are refused
-	switch cmd {
-	case 0, 11, 12, 14, 15:
-		return ipcCtl(kind, id, num, cmd, 0)
-	}
+	// the commands that read or write a structure the guest has no layout
+	// of (IPC_INFO, SEM_INFO, MSG_STAT, ...)
 	return -1, syscall.EINVAL
 }
 
-// hostIPCSemop makes semop with the guest's nops operations.
+// hostIPCSemop makes semop with the guest's nops operations (struct sembuf
+// is alike on every host).
 func hostIPCSemop(id int32, ops []byte, nops uint64) error {
 	var p uintptr
 	if len(ops) > 0 {
 		p = uintptr(unsafe.Pointer(&ops[0]))
 	}
-	_, _, errno := syscall.Syscall(syscall.SYS_SEMOP, uintptr(id), p, uintptr(nops))
+	_, err := ipcCall(ipcOpSemop, uintptr(id), p, uintptr(nops))
 	runtime.KeepAlive(ops)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return err
 }
 
-// hostIPCMsgsnd makes msgsnd with the guest's message (its type, then its
-// bytes).
+// hostIPCMsgsnd makes msgsnd with the guest's message (its type, a long,
+// then its bytes, alike on every 64-bit host).
 func hostIPCMsgsnd(id int32, msg []byte, flags int32) error {
-	_, _, errno := syscall.Syscall6(syscall.SYS_MSGSND, uintptr(id), uintptr(unsafe.Pointer(&msg[0])),
-		uintptr(len(msg)-8), uintptr(flags), 0, 0)
+	_, err := ipcCall(ipcOpMsgsnd, uintptr(id), uintptr(unsafe.Pointer(&msg[0])), uintptr(len(msg)-8), uintptr(flags))
 	runtime.KeepAlive(msg)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return err
 }
 
 // hostIPCMsgrcv makes msgrcv into the guest's buffer (the type, then room
 // for the bytes) and returns the number of the message's bytes.
 func hostIPCMsgrcv(id int32, msg []byte, typ int64, flags int32) (int64, error) {
-	r, _, errno := syscall.Syscall6(syscall.SYS_MSGRCV, uintptr(id), uintptr(unsafe.Pointer(&msg[0])),
-		uintptr(len(msg)-8), uintptr(typ), uintptr(flags), 0)
+	r, err := ipcCall(ipcOpMsgrcv, uintptr(id), uintptr(unsafe.Pointer(&msg[0])), uintptr(len(msg)-8), uintptr(typ), uintptr(flags))
 	runtime.KeepAlive(msg)
-	if errno != 0 {
-		return -1, errno
+	if err != nil {
+		return -1, err
 	}
 	return int64(r), nil
 }
@@ -218,30 +261,27 @@ func hostIPCShmCopy(id int32, buf []byte, pos uint64, write bool) error {
 	if err != nil {
 		return err
 	}
-	segsz := binary.LittleEndian.Uint64(host[48:])
+	segsz := ipcHostValue(ipcKindShm, host, ipcGuestShmSegsz)
 	if pos > segsz || uint64(len(buf)) > segsz-pos {
 		return syscall.EFAULT
 	}
-	const shmRdonly = 010000
-	flags := uintptr(shmRdonly)
+	flags := uintptr(ipcHostShmRdonly)
 	if write {
 		flags = 0
 	}
-	addr, _, errno := syscall.Syscall(syscall.SYS_SHMAT, uintptr(id), 0, flags)
-	if errno != 0 {
-		return errno
+	addr, err := ipcCall(ipcOpShmat, uintptr(id), 0, flags)
+	if err != nil {
+		return err
 	}
 	// the segment is memory of the process's, outside Go's heap: its bytes
-	// are seen through the address the kernel gave (the bits of the word
-	// read as a pointer)
+	// are seen through the address the host gave (the bits of the word read
+	// as a pointer)
 	segment := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&addr))), segsz)
 	if write {
 		copy(segment[pos:], buf)
 	} else {
 		copy(buf, segment[pos:])
 	}
-	if _, _, errno := syscall.Syscall(syscall.SYS_SHMDT, addr, 0, 0); errno != 0 {
-		return errno
-	}
-	return nil
+	_, err = ipcCall(ipcOpShmdt, addr)
+	return err
 }

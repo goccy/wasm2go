@@ -729,3 +729,103 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (ui
 	}
 	return r, nil
 }
+
+// ----- System V IPC (see wasip1_native_ipc.go) ------------------------------
+//
+// The C library's calls, through trampolines of the assembly files, as the
+// functions above are called. semctl is the system call's own entry, which
+// takes the union semun in the place of its fourth argument.
+//
+//go:cgo_import_dynamic libc_msgget msgget "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_semget semget "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_shmget shmget "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_msgctl msgctl "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc___semctl __semctl "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_shmctl shmctl "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_semop semop "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_msgsnd msgsnd "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_msgrcv msgrcv "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_shmat shmat "/usr/lib/libSystem.B.dylib"
+//go:cgo_import_dynamic libc_shmdt shmdt "/usr/lib/libSystem.B.dylib"
+
+var hostLibcMsgget, hostLibcSemget, hostLibcShmget, hostLibcMsgctl, hostLibcSemctl, hostLibcShmctl,
+	hostLibcSemop, hostLibcMsgsnd, hostLibcMsgrcv, hostLibcShmat, hostLibcShmdt uintptr
+
+// ipcCall makes the call op with the arguments (at most five). shmat and
+// msgrcv say they failed by -1 in a whole word, the others in an int.
+func ipcCall(op int, args ...uintptr) (uintptr, error) {
+	fn := [...]*uintptr{
+		ipcOpMsgget: &hostLibcMsgget, ipcOpSemget: &hostLibcSemget, ipcOpShmget: &hostLibcShmget,
+		ipcOpMsgctl: &hostLibcMsgctl, ipcOpSemctl: &hostLibcSemctl, ipcOpShmctl: &hostLibcShmctl,
+		ipcOpSemop: &hostLibcSemop, ipcOpMsgsnd: &hostLibcMsgsnd, ipcOpMsgrcv: &hostLibcMsgrcv,
+		ipcOpShmat: &hostLibcShmat, ipcOpShmdt: &hostLibcShmdt,
+	}[op]
+	var a [5]uintptr
+	copy(a[:], args)
+	r, _, errno := hostLibcCall6(*fn, a[0], a[1], a[2], a[3], a[4], 0)
+	failed := int32(r) == -1
+	if op == ipcOpShmat || op == ipcOpMsgrcv {
+		failed = r == ^uintptr(0)
+	}
+	if failed {
+		if errno == 0 {
+			errno = syscall.EINVAL
+		}
+		return 0, errno
+	}
+	return r, nil
+}
+
+// ipcHostCommand is the host's number of the guest's command (Linux's):
+// the commands of semctl that read and set the values have numbers of
+// their own here.
+func ipcHostCommand(cmd int32) int32 {
+	switch cmd {
+	case ipcCmdGetNcnt:
+		return 3
+	case ipcCmdGetPid:
+		return 4
+	case ipcCmdGetVal:
+		return 5
+	case ipcCmdGetAll:
+		return 6
+	case ipcCmdGetZcnt:
+		return 7
+	case ipcCmdSetVal:
+		return 8
+	case ipcCmdSetAll:
+		return 9
+	}
+	return cmd
+}
+
+// shmat's SHM_RDONLY.
+const ipcHostShmRdonly = 010000
+
+// The C library's structures (struct ipc_perm, semid_ds, shmid_ds and
+// msqid_ds of the UNIX 03 interfaces, packed to 4 bytes): the permissions
+// put the key last and have a short mode and sequence number, a set's
+// number of semaphores and a segment's number of attaches are shorts.
+var (
+	ipcDarwinPerm = []ipcField{{0, 4, 20, 4}, {4, 4, 0, 4}, {8, 4, 4, 4}, {12, 4, 8, 4}, {16, 4, 12, 4},
+		{20, 4, 16, 2}, {24, 4, 18, 2}}
+	ipcDarwinMsg = ipcHostStruct{116, append(ipcDarwinPerm[:len(ipcDarwinPerm):len(ipcDarwinPerm)],
+		ipcField{48, 8, 64, 8}, ipcField{56, 8, 76, 8}, ipcField{64, 8, 88, 8}, ipcField{72, 8, 32, 8},
+		ipcField{80, 8, 40, 8}, ipcField{88, 8, 48, 8}, ipcField{96, 4, 56, 4}, ipcField{100, 4, 60, 4})}
+	ipcDarwinShm = ipcHostStruct{76, append(ipcDarwinPerm[:len(ipcDarwinPerm):len(ipcDarwinPerm)],
+		ipcField{48, 8, 24, 8}, ipcField{56, 8, 44, 8}, ipcField{64, 8, 52, 8}, ipcField{72, 8, 60, 8},
+		ipcField{80, 4, 36, 4}, ipcField{84, 4, 32, 4}, ipcField{88, 8, 40, 2})}
+	ipcDarwinSem = ipcHostStruct{72, append(ipcDarwinPerm[:len(ipcDarwinPerm):len(ipcDarwinPerm)],
+		ipcField{48, 8, 32, 8}, ipcField{56, 8, 44, 8}, ipcField{64, 8, 28, 2})}
+)
+
+// ipcHostLayout is the C library's structure of the kind.
+func ipcHostLayout(kind int32) ipcHostStruct {
+	switch kind {
+	case ipcKindMsg:
+		return ipcDarwinMsg
+	case ipcKindShm:
+		return ipcDarwinShm
+	}
+	return ipcDarwinSem
+}

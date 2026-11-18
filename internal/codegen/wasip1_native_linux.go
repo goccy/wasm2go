@@ -723,3 +723,58 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (ui
 	}
 	return r, nil
 }
+
+// ----- System V IPC (see wasip1_native_ipc.go) ------------------------------
+
+// The system calls of the C library's calls of System V IPC.
+var ipcSyscall = [...]uintptr{
+	ipcOpMsgget: syscall.SYS_MSGGET, ipcOpSemget: syscall.SYS_SEMGET, ipcOpShmget: syscall.SYS_SHMGET,
+	ipcOpMsgctl: syscall.SYS_MSGCTL, ipcOpSemctl: syscall.SYS_SEMCTL, ipcOpShmctl: syscall.SYS_SHMCTL,
+	ipcOpSemop: syscall.SYS_SEMOP, ipcOpMsgsnd: syscall.SYS_MSGSND, ipcOpMsgrcv: syscall.SYS_MSGRCV,
+	ipcOpShmat: syscall.SYS_SHMAT, ipcOpShmdt: syscall.SYS_SHMDT,
+}
+
+// ipcCall makes the call op with the arguments (at most five).
+func ipcCall(op int, args ...uintptr) (uintptr, error) {
+	var a [5]uintptr
+	copy(a[:], args)
+	r, _, errno := syscall.Syscall6(ipcSyscall[op], a[0], a[1], a[2], a[3], a[4], 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return r, nil
+}
+
+// ipcHostCommand is the host's number of the guest's command: Linux's are
+// the guest's.
+func ipcHostCommand(cmd int32) int32 { return cmd }
+
+// shmat's SHM_RDONLY.
+const ipcHostShmRdonly = 010000
+
+// The kernel's structures of a 64-bit architecture (asm-generic's
+// ipc64_perm, msqid64_ds, semid64_ds and shmid64_ds), which the guest's
+// are laid out as; x86-64 has a semid64_ds of its own, with a word after
+// each time.
+var (
+	ipcLinuxPerm = ipcField{0, 48, 0, 48}
+	ipcLinuxMsg  = ipcHostStruct{120, []ipcField{ipcLinuxPerm, {48, 48, 48, 48}, {96, 8, 96, 8}}}
+	ipcLinuxShm  = ipcHostStruct{112, []ipcField{ipcLinuxPerm, {48, 8, 48, 8}, {56, 24, 56, 24}, {80, 8, 80, 8}, {88, 8, 88, 8}}}
+	ipcLinuxSem  = ipcHostStruct{88, []ipcField{ipcLinuxPerm, {48, 16, 48, 16}, {64, 8, 64, 8}}}
+	// otime, a word, ctime, a word, nsems
+	ipcLinuxSemAMD64 = ipcHostStruct{104, []ipcField{ipcLinuxPerm, {48, 8, 48, 8}, {56, 8, 64, 8}, {64, 8, 80, 8}}}
+)
+
+// ipcHostLayout is the kernel's structure of the kind.
+func ipcHostLayout(kind int32) ipcHostStruct {
+	switch kind {
+	case ipcKindMsg:
+		return ipcLinuxMsg
+	case ipcKindShm:
+		return ipcLinuxShm
+	}
+	if runtime.GOARCH == "amd64" {
+		return ipcLinuxSemAMD64
+	}
+	return ipcLinuxSem
+}
