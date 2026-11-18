@@ -68,3 +68,57 @@ func main() {
 	fmt.Println("a keeps", a.Peek(2000), a.Peek(5000))
 }
 `
+
+// TestAnonymousMemoryCopiesAnInstanceNothingElseHolds gives AnonymousMemory
+// instances nothing else refers to, while the collector runs all the time:
+// the instance's memory, which a finalizer unmaps once the instance is gone,
+// is read until the copy is done (go-perl boots every interpreter so, and
+// the copy faulted on memory unmapped under it).
+func TestAnonymousMemoryCopiesAnInstanceNothingElseHolds(t *testing.T) {
+	got := runMem64(t, buildMem64Main(t, "cg_sharedimage_high.wat", anonymousMemoryAloneMain, transpile.Options{}))
+	if got != "40 copies hold the data end and the touched pages" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+const anonymousMemoryAloneMain = `package main
+
+import (
+	"fmt"
+	"runtime"
+	"runtime/debug"
+
+	"m64test/pkg"
+)
+
+const ceiling = 512 * 65536
+
+func main() {
+	debug.SetGCPercent(1)
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				runtime.GC()
+			}
+		}
+	}()
+	const copies = 40
+	for i := 0; i < copies; i++ {
+		_, mem, err := pkg.AnonymousMemory(pkg.New(), ceiling)
+		if err != nil {
+			panic(err)
+		}
+		if string(mem[24<<20:24<<20+3]) != "END" || mem[23<<20] != 7 {
+			fmt.Println("copy", i, "lacks what the instance held")
+			return
+		}
+		pkg.UnmapMemory(mem)
+	}
+	close(stop)
+	fmt.Println(copies, "copies hold the data end and the touched pages")
+}
+`

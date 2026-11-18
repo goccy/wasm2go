@@ -311,6 +311,10 @@ func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, e
 	}
 	memRegister(mem, ceiling)
 	src := from.{{.Memory}}[:dataEnd]
+	// src is from's memory, which a finalizer unmaps once from is gone (a
+	// reservation of its own): from is kept until the copy is done, past
+	// its last use, which the collector may otherwise take for its end.
+	defer runtime.KeepAlive(from)
 	img := &SharedImage{dataEnd: dataEnd, anonymous: true,
 		err: fmt.Errorf("wasm2go: memory of an instance's own is no image to map")}
 	if runs, ok := touchedOwnPages(from, src); ok {
