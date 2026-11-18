@@ -404,6 +404,18 @@ func (h *hostFile) pipeBeside(fd int) int {
 	return made
 }
 
+// noBeside keeps anything of the runtime's from being put beside the
+// descriptor (see beside), and closes what is there: a standard descriptor
+// of the host process, which native code redirects without the runtime
+// hearing of it (dup2 of a pipe onto 2 around a call, as Data::Peek's DDump
+// does), so that a descriptor beside would keep the end the program wrote
+// through open, and the reader would never see the end of the pipe.
+func (h *hostFile) noBeside() {
+	if beside := h.beside.Swap(-1); beside > 0 {
+		_ = syscall.Close(int(beside))
+	}
+}
+
 // waits reports whether a read or write of the descriptor can wait: it is a
 // pipe, a socket or a character device (a terminal), and not a file,
 // directory or block device, whose reads and writes return at once.
@@ -1125,11 +1137,13 @@ func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen {
 		hostTable.mu.Unlock()
 		if shared != nil && shared.host() != nil {
 			w.takeStandardLocked(fd)
+			shared.host().noBeside()
 			shared.addRef()
 			return shared
 		}
 		if op, err := newHostOpen(fd, ""); err == nil {
 			w.takeStandardLocked(fd)
+			op.host().noBeside()
 			hostEnter(fd, op)
 			return op
 		}
