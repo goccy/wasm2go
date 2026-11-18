@@ -287,6 +287,18 @@
     (func $sock_reverse (param i32 i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sys_syscall"
     (func $sys_syscall (param i64 i64 i32 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "ipc_get"
+    (func $ipc_get (param i32 i32 i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "ipc_ctl"
+    (func $ipc_ctl (param i32 i32 i32 i32 i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "ipc_semop"
+    (func $ipc_semop (param i32 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "ipc_msgsnd"
+    (func $ipc_msgsnd (param i32 i64 i64 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "ipc_msgrcv"
+    (func $ipc_msgrcv (param i32 i64 i64 i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "ipc_shmcopy"
+    (func $ipc_shmcopy (param i32 i64 i64 i64 i32) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -430,5 +442,11 @@
     (drop (call $sock_getaddrinfo (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_reverse (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sys_syscall (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_get (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_ctl (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $ipc_semop (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $ipc_msgsnd (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $ipc_msgrcv (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_shmcopy (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
   )
 )
