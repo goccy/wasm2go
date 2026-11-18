@@ -10302,7 +10302,21 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s := &w.sig
+	// What the guest does with SIGCHLD changes: the last to set an action
+	// has it, as in a process of its own. The runtime does not catch the
+	// host's SIGCHLD (it posts the signal itself when a process of the
+	// instance ends), so a handler native code made the process's action
+	// (libev's, which reaps every child with waitpid(-1)) stayed it, and ran
+	// for every end of a child the host process was told of, reaping the
+	// child before the program's own handler could (IO::Async's
+	// watch_process under Mojo's EV reactor never saw the child end). The
+	// process's action of the signal is the runtime's again, whose handler
+	// leaves it to the runtime (takeHostSignalBack).
+	takesChld := ((s.handled^uint64(handled))|(s.ignored^uint64(ignored)))&wasiSignalBit(wasiSIGCHLD) != 0
 	s.handled, s.ignored, s.blocked = uint64(handled), uint64(ignored), uint64(blocked)
+	if takesChld && w.hostProcess && !w.forked {
+		takeHostSignalBack(syscall.SIGCHLD)
+	}
 	s.pending &^= s.discards()
 	if s.reapsChildren() {
 		w.reapFinishedLocked()
