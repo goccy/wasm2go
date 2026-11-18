@@ -334,6 +334,49 @@ func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, e
 	return img, mem, nil
 }
 
+// AnonymousMemoryInPlace is AnonymousMemory without an instance to copy
+// from: build gets the fresh mapping, installs the data segments with the
+// generated InstallDataSegments and constructs the module on it with
+// NewWithMemory, as an InPlaceImageBuilder does. The image returned stands
+// for the memory in ForkMemory, as AnonymousMemory's does.
+func AnonymousMemoryInPlace(ceiling uint64, build InPlaceImageBuilder) (*SharedImage, *{{.Module}}, []byte, error) {
+	if !mmapSupported {
+		return nil, nil, nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+	}
+	if initialMemoryBytes > ceiling {
+		return nil, nil, nil, fmt.Errorf("wasm2go: the module's initial memory (%d bytes) does not fit in a memory of %d bytes", uint64(initialMemoryBytes), ceiling)
+	}
+	length, err := mappingLength(ceiling)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// Accessible as far as the module's initial memory reaches, as
+	// AnonymousMemory's mapping is as far as from's memory does: the
+	// builder writes the data segments before NewWithMemory takes the
+	// mapping as the instance's memory.
+	mem, err := mmapAnonymous(length, min(int(initialMemoryBytes), length))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// NewWithMemory takes the mapping as its memory in place, which it may
+	// only do to a mapping it knows.
+	memRegister(mem, ceiling)
+	m, err := build(mem)
+	if err != nil {
+		unmapMemory(mem)
+		return nil, nil, nil, fmt.Errorf("wasm2go: building an instance on memory of its own: %w", err)
+	}
+	img := &SharedImage{dataEnd: m.{{.DataEnd}}, anonymous: true,
+		err: fmt.Errorf("wasm2go: memory of an instance's own is no image to map")}
+	return img, m, mem, nil
+}
+
+// initialMemoryBytes is the module's declared initial linear-memory size:
+// the generated InstallDataSegments writes below it, and the generated
+// InitialMemoryBytes, which says the same, is out of this package's reach
+// where the module's packages are several.
+const initialMemoryBytes = {{.InitialBytes}}
+
 // Err reports why the image is unavailable, or nil. A caller that gets an
 // error must build each instance's memory itself.
 func (s *SharedImage) Err() error { return s.err }

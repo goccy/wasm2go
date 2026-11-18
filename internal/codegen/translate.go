@@ -769,6 +769,7 @@ func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
 		ReserveMax:     limitMax,
 		ReserveDefault: limitDefault,
 		ReserveFixed:   fixed,
+		InitialBytes:   t.mod.Memories[0].Limits.Min * 65536,
 	})
 }
 

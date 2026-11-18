@@ -72,6 +72,10 @@ type Names struct {
 	ReserveMax     uint64
 	ReserveDefault uint64
 	ReserveFixed   bool
+
+	// InitialBytes is the module's declared initial linear-memory size
+	// (its InitialMemoryBytes).
+	InitialBytes uint64
 }
 
 // ReservedConstraint is the build constraint under which a linear memory
