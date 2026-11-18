@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -642,7 +643,9 @@ func TestWasi_FdReaddir(t *testing.T) {
 	if used == 0 {
 		t.Fatalf("Fd_readdir wrote no bytes")
 	}
-	// Walk dirents to assert "." and ".." come first.
+	// Walk the dirents: every name of the directory, "." and ".." among
+	// them, in the order the system lists them (which
+	// TestReaddir_HostDirectoryInTheSystemsOrder compares with ls -f).
 	off := int(bufOff)
 	names := []string{}
 	for off-int(bufOff) < int(used) {
@@ -665,8 +668,9 @@ func TestWasi_FdReaddir(t *testing.T) {
 		names = append(names, string(m.memory[nameStart:nameStart+int(namelen)]))
 		off = nameStart + int(namelen)
 	}
-	if len(names) < 2 || names[0] != "." || names[1] != ".." {
-		t.Fatalf("Fd_readdir first two entries should be . and ..; got %v", names)
+	sort.Strings(names)
+	if got, want := strings.Join(names, " "), ". .. alpha beta gamma"; got != want {
+		t.Fatalf("Fd_readdir lists %q, want %q in any order", got, want)
 	}
 }
 
