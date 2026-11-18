@@ -222,6 +222,23 @@ func hostIPCCtl(kind, id, num, cmd int32, arg int64, buf func(n uint64) []byte) 
 	return -1, syscall.EINVAL
 }
 
+// ipcBlockingCall makes call, a call that can wait in the kernel (semop,
+// msgsnd and msgrcv without IPC_NOWAIT), so that a signal posted to the
+// guest meanwhile ends it with EINTR, as a signal ends it in a process
+// (interruptibleHostCall). A call that was done before the signal came is
+// kept, and the signal is noticed by the next call that waits.
+func (w *WasiStubs) ipcBlockingCall(call func() error) error {
+	var err error
+	called, interrupted := w.interruptibleHostCall(func() { err = call() })
+	if !called {
+		return syscall.EINTR
+	}
+	if interrupted && err == nil {
+		w.keepInterrupt()
+	}
+	return err
+}
+
 // hostIPCSemop makes semop with the guest's nops operations (struct sembuf
 // is alike on every host).
 func hostIPCSemop(id int32, ops []byte, nops uint64) error {

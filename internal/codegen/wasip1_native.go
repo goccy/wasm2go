@@ -14274,7 +14274,7 @@ func (w *WasiStubs) ipcSemop(m *Module, id int32, opsPtr, nops uint64) int32 {
 	if ops == nil {
 		return -_wasiEFAULT
 	}
-	if err := hostIPCSemop(id, ops, nops); err != nil {
+	if err := w.ipcBlockingCall(func() error { return hostIPCSemop(id, ops, nops) }); err != nil {
 		return -mapOSError(err)
 	}
 	return _wasiESUCCESS
@@ -14302,7 +14302,7 @@ func (w *WasiStubs) ipcMsgsnd(m *Module, id int32, msgPtr, size uint64, flags in
 	if msg == nil {
 		return -_wasiEFAULT
 	}
-	if err := hostIPCMsgsnd(id, msg, flags); err != nil {
+	if err := w.ipcBlockingCall(func() error { return hostIPCMsgsnd(id, msg, flags) }); err != nil {
 		return -mapOSError(err)
 	}
 	return _wasiESUCCESS
@@ -14332,7 +14332,11 @@ func (w *WasiStubs) ipcMsgrcv(m *Module, id int32, msgPtr, size uint64, typ int6
 	if msg == nil || out == nil {
 		return -_wasiEFAULT
 	}
-	n, err := hostIPCMsgrcv(id, msg, typ, flags)
+	var n int64
+	err := w.ipcBlockingCall(func() (err error) {
+		n, err = hostIPCMsgrcv(id, msg, typ, flags)
+		return err
+	})
 	if err != nil {
 		return -mapOSError(err)
 	}

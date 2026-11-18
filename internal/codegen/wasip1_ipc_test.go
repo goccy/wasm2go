@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+	"time"
 )
 
 // The System V IPC imports reach the host's objects, in the guest's numbers
@@ -93,5 +94,37 @@ func TestIPCImportsReachTheHostsObjects(t *testing.T) {
 	sandboxed, sm := newTestStubs(t, t.TempDir())
 	if rc := sandboxed.Ipc_get(sm, ipcKindSem, 0, 1, ipcCreat|0600, idAt); rc != -_wasiENOSYS {
 		t.Errorf("a guest that is not the host process: rc %d, want %d", rc, -_wasiENOSYS)
+	}
+}
+
+// A semop that waits for a semaphore ends with EINTR when a signal is posted
+// to the guest meanwhile, as a signal ends it in a process; without a signal
+// it waits until the semaphore is raised.
+func TestIPCSemopIsInterruptedByASignal(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	w.hostProcess = true
+	const idAt, resultAt, opsAt = 4096, 4104, 8192
+	if rc := w.Ipc_get(m, ipcKindSem, 0, 1, 01000|0600, idAt); rc != 0 {
+		t.Fatalf("ipc_get: rc %d", rc)
+	}
+	sem := int32(binary.LittleEndian.Uint32(m.memory[idAt:]))
+	defer w.Ipc_ctl(m, ipcKindSem, sem, 0, 0 /* IPC_RMID */, 0, opsAt, resultAt)
+	// sem_num 0, sem_op -1, sem_flg 0: waits, the value being 0
+	binary.LittleEndian.PutUint16(m.memory[opsAt:], 0)
+	binary.LittleEndian.PutUint16(m.memory[opsAt+2:], uint16(0xffff))
+	binary.LittleEndian.PutUint16(m.memory[opsAt+4:], 0)
+	postSoon(w, wasiSIGUSR1)
+	if rc := w.Ipc_semop(m, sem, opsAt, 1); rc != -_wasiEINTR {
+		t.Fatalf("a waiting semop with a signal posted: rc %d, want %d", rc, -_wasiEINTR)
+	}
+	takeSignals(t, w, m)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		om := newForkTestModule()
+		binary.LittleEndian.PutUint16(om.memory[opsAt+2:], 1)
+		w.Ipc_semop(om, sem, opsAt, 1)
+	}()
+	if rc := w.Ipc_semop(m, sem, opsAt, 1); rc != 0 {
+		t.Fatalf("a waiting semop the semaphore is raised for: rc %d", rc)
 	}
 }

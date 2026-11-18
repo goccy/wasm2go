@@ -17,6 +17,8 @@ func hostIPCCtl(kind, id, num, cmd int32, arg int64, buf func(n uint64) []byte) 
 
 func hostIPCSemop(id int32, ops []byte, nops uint64) error { return syscall.ENOSYS }
 
+func (w *WasiStubs) ipcBlockingCall(call func() error) error { return call() }
+
 func hostIPCMsgsnd(id int32, msg []byte, flags int32) error { return syscall.ENOSYS }
 
 func hostIPCMsgrcv(id int32, msg []byte, typ int64, flags int32) (int64, error) {
