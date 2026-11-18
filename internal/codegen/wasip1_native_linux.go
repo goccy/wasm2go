@@ -658,6 +658,25 @@ func hostActionsOutside() map[syscall.Signal]kernelSigaction {
 	return outside
 }
 
+// takeHostSignalBack makes the Go runtime's handler the host process's
+// action of the signal again when code outside the runtime made a handler of
+// its own the action. os/signal cannot: the Go runtime installs its handler
+// only for a signal it does not handle already, and it handles every signal
+// from its start, whatever was installed over its handler since. Its action
+// is the one it has for SIGURG (see hostActionsOutside).
+func takeHostSignalBack(sig syscall.Signal) {
+	own, ok := hostSignalAction(syscall.SIGURG)
+	const sigIGN = 1
+	if !ok || own.handler <= sigIGN {
+		return
+	}
+	if act, ok := hostSignalAction(sig); !ok || act.handler <= sigIGN || act.handler == own.handler {
+		return
+	}
+	_, _, _ = syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(sig),
+		uintptr(unsafe.Pointer(&own)), 0, unsafe.Sizeof(own.mask), 0, 0)
+}
+
 // restoreHostActionsOutside puts the actions hostActionsOutside returned
 // back, after the Go runtime has installed its own handler for a signal
 // again (os/signal does that when a program asks for a signal, and when it
