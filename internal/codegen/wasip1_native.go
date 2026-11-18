@@ -13592,6 +13592,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"memNode":           true,
 			"memFileInfo":       true,
 			"memDirEntry":       true,
+			"forkedSyscall":     true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                    true,
@@ -13615,6 +13616,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"encodeHostWaitStatus":      true,
 			"totalBytesPlusNul":         true,
 			"zext":                      true,
+			"forkedSyscallMade":         true,
+			"cpuTimeClock":              true,
 			"readVec":                   true,
 			"readVecFailure":            true,
 			"hostDescriptor":            true,
@@ -14023,11 +14026,12 @@ func (t *translator) wasmImportsWasi() bool {
 // written at resultPtr (i64). Returns 0, or a negative errno: ENOSYS where
 // the guest is not the host process (its descriptors and identity are not
 // the process's own, which the call would act on) or the host makes no raw
-// calls. A process forked from the guest (Fork) makes none either, and is
-// told so apart, by sysSyscallForked: a raw call acts on the operating
-// system's process, which such a process shares with the guest it was
-// forked from (execve would replace them all, getpid names the first one,
-// chdir moves every one).
+// calls. A process forked from the guest (Fork) makes only the calls that
+// depend on no state of the operating system's process
+// (forkedSyscallMade), and is told apart, by sysSyscallForked, when the
+// call is not made: such a process shares the operating system's process
+// with the guest it was forked from (execve would replace them all, getpid
+// names the first one, chdir moves every one).
 func (w *WasiStubs) Sys_syscall(m *Module, number int64, argsPtr, nargs, ptrs, resultPtr int32) int32 {
 	return w.sysSyscall(m, number, zext(argsPtr), nargs, ptrs, zext(resultPtr))
 }
@@ -14037,20 +14041,103 @@ func (w *WasiStubs) Sys_syscall64(m *Module, number int64, argsPtr int64, nargs,
 	return w.sysSyscall(m, number, uint64(argsPtr), nargs, ptrs, uint64(resultPtr))
 }
 
-// sysSyscall is the body of Sys_syscall and Sys_syscall64.
 // sysSyscallForked is what sys_syscall returns to a process forked from the
-// guest: no errno, as the call was not made at all.
+// guest for a call it does not make (forkedSyscallMade): no errno, as the
+// call was not made at all.
 const sysSyscallForked = 1
 
+// forkedSyscall is a range of numbers of system calls that a process forked
+// from the guest makes (forkedSyscallMade).
+type forkedSyscall struct {
+	first, last int64
+	// clock: the first argument is a clock id, and the call is made for
+	// every clock but a CPU-time one (cpuTimeClock)
+	clock bool
+}
+
+// forkedSyscallMade reports whether sys_syscall makes the system call of the
+// number, with args, for a process forked from the guest (a pseudo-process,
+// Fork). Such a process shares the operating system's process with the
+// guest it was forked from, so a call is made only when what the kernel
+// does for it depends on no state of that process (its identity,
+// descriptors, working directory, signals, memory maps, credentials and
+// limits, exec and exit): the call then gives the forked process what it
+// would give a process of its own. The table of each host lists those
+// calls, each depending on no such state for this reason:
+//
+//   - getrandom, and darwin's getentropy: bytes of the kernel's random
+//     pool, which is the system's;
+//   - clock_gettime, clock_getres: the time and the resolution of a clock of
+//     the system, for every clock but a CPU-time one (cpuTimeClock), which
+//     counts the time of the operating system's process or of a thread;
+//   - gettimeofday, time: the time of the system;
+//   - uname: the name and the version of the system;
+//   - sched_yield: gives the calling thread's CPU to another thread;
+//   - getcpu: the CPU the calling thread runs on.
+//
+// The table also lists the numbers below the first one every architecture
+// shares (424) that the architecture leaves unassigned, by its table of
+// system calls: such a number is no system call and never becomes one (a
+// call added later takes a shared number), so the kernel answers it as for
+// any process (ENOSYS, or what a seccomp filter of the process says).
+// Every other number is not made: from 424 up, a number that is not listed
+// may be a call added after the table.
+func forkedSyscallMade(number int64, args *[6]uint64) bool {
+	var table []forkedSyscall
+	switch runtime.GOOS + "/" + runtime.GOARCH {
+	case "linux/amd64":
+		// arch/x86/entry/syscalls/syscall_64.tbl
+		table = []forkedSyscall{
+			{24, 24, false},   // sched_yield
+			{63, 63, false},   // uname
+			{96, 96, false},   // gettimeofday
+			{201, 201, false}, // time
+			{228, 229, true},  // clock_gettime, clock_getres
+			{309, 309, false}, // getcpu
+			{318, 318, false}, // getrandom
+			{336, 423, false}, // unassigned: after uretprobe (335), up to the shared numbers
+		}
+	case "linux/arm64":
+		// include/uapi/asm-generic/unistd.h, for a 64-bit architecture
+		table = []forkedSyscall{
+			{113, 114, true},  // clock_gettime, clock_getres
+			{124, 124, false}, // sched_yield
+			{160, 160, false}, // uname
+			{168, 169, false}, // getcpu, gettimeofday
+			{244, 259, false}, // unassigned: the architecture's own calls (__NR_arch_specific_syscall), of which arm64 has none
+			{278, 278, false}, // getrandom
+			{295, 423, false}, // unassigned: after kexec_file_load (294); 403-423 are calls of 32-bit architectures only
+		}
+	case "darwin/amd64", "darwin/arm64":
+		// bsd/kern/syscalls.master
+		table = []forkedSyscall{
+			{116, 116, false}, // gettimeofday
+			{500, 500, false}, // getentropy
+		}
+	}
+	for _, c := range table {
+		if c.first <= number && number <= c.last {
+			return !c.clock || !cpuTimeClock(int32(args[0]))
+		}
+	}
+	return false
+}
+
+// cpuTimeClock reports whether a clock id of linux names a CPU-time clock:
+// CLOCK_PROCESS_CPUTIME_ID (2), CLOCK_THREAD_CPUTIME_ID (3), or a negative
+// id, the CPU-time clock of a given process or thread
+// (clock_getcpuclockid, pthread_getcpuclockid).
+func cpuTimeClock(id int32) bool {
+	return id < 0 || id == 2 || id == 3
+}
+
+// sysSyscall is the body of Sys_syscall and Sys_syscall64.
 func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, ptrs int32, resultPtr uint64) int32 {
 	w.mu.Lock()
 	host, forked := w.hostProcess, w.forked
 	w.mu.Unlock()
 	if !host {
 		return -_wasiENOSYS
-	}
-	if forked {
-		return sysSyscallForked
 	}
 	if nargs < 0 || nargs > 6 {
 		return -_wasiEINVAL
@@ -14067,6 +14154,9 @@ func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, p
 		if ptrs&(1<<i) != 0 && args[i] >= uint64(len(mem)) {
 			return -_wasiEFAULT
 		}
+	}
+	if forked && !forkedSyscallMade(number, &args) {
+		return sysSyscallForked
 	}
 	r, err := hostRawSyscall(uintptr(number), args, uint32(ptrs), mem)
 	if err != nil {
