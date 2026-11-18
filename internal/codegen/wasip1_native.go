@@ -14023,7 +14023,11 @@ func (t *translator) wasmImportsWasi() bool {
 // written at resultPtr (i64). Returns 0, or a negative errno: ENOSYS where
 // the guest is not the host process (its descriptors and identity are not
 // the process's own, which the call would act on) or the host makes no raw
-// calls.
+// calls. A process forked from the guest (Fork) makes none either, and is
+// told so apart, by sysSyscallForked: a raw call acts on the operating
+// system's process, which such a process shares with the guest it was
+// forked from (execve would replace them all, getpid names the first one,
+// chdir moves every one).
 func (w *WasiStubs) Sys_syscall(m *Module, number int64, argsPtr, nargs, ptrs, resultPtr int32) int32 {
 	return w.sysSyscall(m, number, zext(argsPtr), nargs, ptrs, zext(resultPtr))
 }
@@ -14034,12 +14038,19 @@ func (w *WasiStubs) Sys_syscall64(m *Module, number int64, argsPtr int64, nargs,
 }
 
 // sysSyscall is the body of Sys_syscall and Sys_syscall64.
+// sysSyscallForked is what sys_syscall returns to a process forked from the
+// guest: no errno, as the call was not made at all.
+const sysSyscallForked = 1
+
 func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, ptrs int32, resultPtr uint64) int32 {
 	w.mu.Lock()
-	host := w.hostProcess
+	host, forked := w.hostProcess, w.forked
 	w.mu.Unlock()
 	if !host {
 		return -_wasiENOSYS
+	}
+	if forked {
+		return sysSyscallForked
 	}
 	if nargs < 0 || nargs > 6 {
 		return -_wasiEINVAL
