@@ -23,6 +23,10 @@ func memUnregister(mem []byte) {}
 
 func memProtect(mem []byte, from, to uint64, rw bool) error { return nil }
 
+// touchedOwnPages: no memory of this build is a reservation, so every page
+// below the data end is compared with zeros (AnonymousMemory).
+func touchedOwnPages(m *{{.Module}}, src []byte) ([]pageRun, bool) { return nil, false }
+
 // memMappingLength reports that a mapping is as long as its ceiling here.
 func memMappingLength(ceiling uint64) (int, bool, error) { return 0, false, nil }
 
