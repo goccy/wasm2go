@@ -285,6 +285,8 @@
     (func $sock_getaddrinfo (param i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_reverse"
     (func $sock_reverse (param i32 i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sys_syscall"
+    (func $sys_syscall (param i64 i64 i32 i32 i64) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -427,5 +429,6 @@
     (drop (call $sock_pair (i64.const 0)))
     (drop (call $sock_getaddrinfo (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_reverse (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sys_syscall (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
   )
 )
