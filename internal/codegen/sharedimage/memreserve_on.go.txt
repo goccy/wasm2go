@@ -207,6 +207,21 @@ func memOwn(m *{{.Module}}, mem []byte) {
 	})
 }
 
+// touchedOwnPages returns the pages of src, the head of m's memory, that
+// the process has touched (privatePages), when m's memory is a reservation
+// of m's own (memOwn): an anonymous mapping, every page of which that was
+// never touched reads as zeros. ok is false for any other memory (a
+// mapping of an image, whose untouched pages hold the image's data), or
+// where the platform does not tell.
+func touchedOwnPages(m *{{.Module}}, src []byte) ([]pageRun, bool) {
+	own := m.{{.MemRes}}
+	if own == nil || len(src) == 0 || unsafe.SliceData(own.mem) != unsafe.SliceData(src) {
+		return nil, false
+	}
+	runs, _, ok := privatePages(src)
+	return runs, ok
+}
+
 // memAdopt makes memory, handed to a constructor with memSize bytes of the
 // guest's memory in it, the instance's memory, and returns it sliced as the
 // instance sees it (memory.size long, or a shared memory's whole ceiling)

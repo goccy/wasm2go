@@ -282,7 +282,10 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 // and its memory keeps one address for its whole life, growing up to
 // ceiling (native code that holds pointers into it needs that). Pages of
 // from's memory that are all zeros are not copied: they stay untouched,
-// costing nothing.
+// costing nothing. Where from's memory is a reservation of its own and the
+// platform tells which pages of a mapping the process has touched
+// (privatePages), only those are copied, and the others are not read
+// either: an untouched page of such a mapping is all zeros.
 //
 // The image returned stands for that memory in ForkMemory, as the image an
 // instance's memory is a mapping of: the first fork of the instance writes
@@ -308,6 +311,14 @@ func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, e
 	}
 	memRegister(mem, ceiling)
 	src := from.{{.Memory}}[:dataEnd]
+	img := &SharedImage{dataEnd: dataEnd, anonymous: true,
+		err: fmt.Errorf("wasm2go: memory of an instance's own is no image to map")}
+	if runs, ok := touchedOwnPages(from, src); ok {
+		for _, r := range runs {
+			copy(mem[r.from:r.to], src[r.from:r.to])
+		}
+		return img, mem, nil
+	}
 	page := os.Getpagesize()
 	zeros := make([]byte, page)
 	for at := 0; at < len(src); at += page {
@@ -316,8 +327,6 @@ func AnonymousMemory(from *{{.Module}}, ceiling uint64) (*SharedImage, []byte, e
 			copy(mem[at:end], src[at:end])
 		}
 	}
-	img := &SharedImage{dataEnd: dataEnd, anonymous: true,
-		err: fmt.Errorf("wasm2go: memory of an instance's own is no image to map")}
 	return img, mem, nil
 }
 
