@@ -494,7 +494,10 @@ func main() {
 	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &lim); err != nil {
 		panic(err)
 	}
-	lim.Cur = 1 << 20
+	// below the length of the memory's mapping in every build: the ceiling
+	// where the memory is a Go allocation (wasm2go_boundschecks), the
+	// ceiling and more where it is a reservation
+	lim.Cur = ceiling / 4
 	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &lim); err != nil {
 		panic(err)
 	}
