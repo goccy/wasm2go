@@ -1851,9 +1851,18 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		standard:    w.standard,
 		terminal:    w.terminal,
 	}
-	if len(w.cloexec) > 0 {
-		child.cloexec = make(map[int32]bool, len(w.cloexec))
-		for fd := range w.cloexec {
+	// The child's flags are its table's, as they are now: the kernel's of
+	// the process's own descriptors (cloexecIsTheKernels), the table's of
+	// the rest.
+	for fd, op := range w.fdsLocked() {
+		marked := w.cloexec[fd]
+		if w.cloexecIsTheKernels(op, fd) && !op.host().madeOutside() {
+			marked, _ = op.host().closeOnExec(false, false)
+		}
+		if marked {
+			if child.cloexec == nil {
+				child.cloexec = map[int32]bool{}
+			}
 			child.cloexec[fd] = true
 		}
 	}
@@ -2569,15 +2578,18 @@ const wasiInheritedFDLimit int32 = 1024
 // holds w.mu.
 func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
 	for fd, op := range w.fdsLocked() {
-		if fd < 3 || fd >= wasiInheritedFDLimit || w.cloexec[fd] {
+		if fd < 3 || fd >= wasiInheritedFDLimit {
 			continue
 		}
-		if h := op.host(); h.madeOutside() {
+		if w.cloexecIsTheKernels(op, fd) {
 			// The flag is the host's own (Fd_cloexec), and so is whether
 			// the descriptor is still what the entry was made for.
+			h := op.host()
 			if marked, err := h.closeOnExec(false, false); err != nil || marked || !h.current() {
 				continue
 			}
+		} else if w.cloexec[fd] {
+			continue
 		}
 		var file *os.File
 		switch {
@@ -2659,10 +2671,11 @@ func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) in
 	if op == nil {
 		return -_wasiEBADF
 	}
-	if h := op.host(); h.madeOutside() {
-		// The flag of a descriptor that code outside the guest made is
-		// the host's own: that code set it, and reads it.
-		was, err := h.closeOnExec(set != 0, value != 0)
+	if w.cloexecIsTheKernels(op, fd) {
+		// The flag is the host's own: of a descriptor code outside the
+		// guest made, and of the process's own descriptor of the number
+		// (a command code outside the guest starts inherits by it).
+		was, err := op.host().closeOnExec(set != 0, value != 0)
 		if err != nil {
 			return -mapOSError(err)
 		}

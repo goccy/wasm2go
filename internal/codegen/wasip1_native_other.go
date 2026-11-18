@@ -315,6 +315,7 @@ func (w *WasiStubs) hostStandardLocked(stdio int8) *wasiOpen         { return &w
 func (w *WasiStubs) freeNumberLocked(min int32) int32                { return min }
 func (w *WasiStubs) hostOpenLocked(fd int32, op *wasiOpen) *wasiOpen { return op }
 func (h *hostFile) madeOutside() bool                                { return false }
+func (w *WasiStubs) cloexecIsTheKernels(op *wasiOpen, n int32) bool  { return false }
 func (h *hostFile) current() bool                                    { return false }
 func (w *WasiStubs) inheritableOutsideLocked() []*hostFile           { return nil }
 func (w *WasiStubs) outsideDescriptorsLocked() []int32               { return nil }

@@ -990,15 +990,14 @@ func (h *hostFile) filetype(dgram bool) byte {
 }
 
 // inheritedHostDescriptor makes the entry for a descriptor the process was
-// started with. It is close-on-exec from here on, like every descriptor the
-// runtime holds: whether a command the guest starts gets it is the guest's
-// to say (Fd_cloexec), and it does unless the guest says otherwise.
+// started with. Whether a command started later gets it is the guest's to
+// say (Fd_cloexec), and it does unless the guest says otherwise: its flag
+// is the kernel's (cloexecIsTheKernels), as the process was given it.
 func inheritedHostDescriptor(fd int) *wasiOpen {
 	op, err := newHostOpen(fd, "")
 	if err != nil {
 		return nil
 	}
-	syscall.CloseOnExec(fd)
 	return op
 }
 
@@ -1273,6 +1272,24 @@ type hostStandard struct {
 // madeOutside reports whether the descriptor is one that code outside the
 // guest made (see outside); false for no descriptor.
 func (h *hostFile) madeOutside() bool { return h != nil && h.outside }
+
+// cloexecIsTheKernels reports whether the close-on-exec flag of op, the
+// guest's descriptor n, is the kernel's flag of the descriptor
+// (closeOnExec): for a descriptor code outside the guest made, and for one
+// of the guest that is the host process's own under the same number, in
+// the instance that is the host process (not a process forked from it).
+// Code outside the guest reads that flag, and a command it starts inherits
+// by it, as a command the guest starts does. Every other entry's flag is
+// the instance's table (w.cloexec): one under a number the host gives
+// something else, and every one of a forked process, whose descriptors are
+// not the process's under its numbers. Caller holds w.mu.
+func (w *WasiStubs) cloexecIsTheKernels(op *wasiOpen, n int32) bool {
+	h := op.host()
+	if h == nil {
+		return false
+	}
+	return h.madeOutside() || w.hostProcess && !w.forked && int(h.fd.Load()) == int(n)
+}
 
 // current reports whether the host still has under the number what the
 // entry was made for.
@@ -1577,9 +1594,14 @@ func (w *WasiStubs) addHostFDFromLocked(op *wasiOpen, min int) (int32, error) {
 		h.fd.Store(int32(moved))
 		number = moved
 	}
-	if number <= 2 {
-		// A standard descriptor is the host process's as well, and code
-		// outside the guest that starts a command counts on handing it on.
+	if number <= 2 || w.hostProcess && !w.forked {
+		// A descriptor the guest makes is inherited by a command until the
+		// guest says otherwise, as dup, open, pipe and socket make one
+		// (perl marks those above $^F close-on-exec itself). The process's
+		// own descriptor of the number has that flag in the kernel
+		// (cloexecIsTheKernels); a standard descriptor is the host
+		// process's as well, and code outside the guest that starts a
+		// command counts on handing it on.
 		hostKeepOnExec(number)
 	}
 	hostEnter(number, op)
@@ -1730,7 +1752,11 @@ func (w *WasiStubs) dup2HostLocked(src *wasiOpen, to int32) error {
 	if free {
 		syscall.ForkLock.RLock()
 		err = hostDup2(fd, int(to))
-		if err == nil && to > 2 {
+		// dup2 leaves the duplicate inheritable, and the kernel's flag is
+		// the guest's in the instance that is the host process
+		// (cloexecIsTheKernels); a forked process keeps its flags in its
+		// table, and its descriptors close-on-exec.
+		if err == nil && to > 2 && w.forked {
 			syscall.CloseOnExec(int(to))
 		}
 		syscall.ForkLock.RUnlock()
