@@ -269,9 +269,13 @@ func KeepRuntimeDescriptorsHigh() {
 }
 
 // openDescriptors returns the descriptors of the host process that are
-// open, in ascending order. The names in /dev/fd are read and nothing is
-// asked about them: not every descriptor has a file there that can be
-// looked at (the queue of the runtime's poller has none on some hosts).
+// open, in ascending order. The names in /dev/fd are read, and of each only
+// whether it is still open is asked (F_GETFD, which every descriptor
+// answers; not every one has a file there that can be looked at, as the
+// queue of the runtime's poller has none on some hosts): the reading of
+// the directory may itself make a descriptor that is gone when it returns
+// (darwin's getdirentries reads a duplicate through fdopendir), and its
+// number is free for the next descriptor made.
 func openDescriptors() []int {
 	var fds []int
 	dir, err := syscall.Open("/dev/fd", syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
@@ -296,6 +300,9 @@ func openDescriptors() []int {
 			fd = fd*10 + int(c-'0')
 		}
 		if !digits || fd == dir {
+			continue
+		}
+		if _, err := descriptorFlags(fd, syscall.F_GETFD); err != nil {
 			continue
 		}
 		fds = append(fds, fd)

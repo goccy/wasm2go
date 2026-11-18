@@ -581,6 +581,22 @@ func TestHostDescriptors_WhatTheRuntimeKeepsForACommandIsNotTakenIn(t *testing.T
 	}
 }
 
+// The descriptors of the process the runtime lists are the ones open when
+// the listing is done: not one the reading of /dev/fd made for itself and
+// closed (darwin reads the directory through a duplicate), whose number the
+// next descriptor made gets. The start of a command took the pipe os/exec
+// made for it under that number for one that was open before, and did not
+// record it as the runtime's: a guest took it in.
+func TestHostDescriptors_TheListingHasOnlyOpenDescriptors(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		for _, fd := range openDescriptors() {
+			if _, err := descriptorFlags(fd, syscall.F_GETFD); err != nil {
+				t.Fatalf("round %d: descriptor %d is listed, and is not open: %v", round, fd, err)
+			}
+		}
+	}
+}
+
 // What a forked process does to a standard descriptor is its own: it closes
 // standard output and opens a file, which is its descriptor 1, and the
 // parent's standard output is untouched.
