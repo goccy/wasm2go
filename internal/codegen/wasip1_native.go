@@ -13804,6 +13804,10 @@ var (
 	wasip1NativeHostSockRaw []byte
 	//go:embed wasip1_native_terminal.go
 	wasip1NativeTerminalRaw []byte
+	//go:embed wasip1_native_ipc.go
+	wasip1NativeIPCRaw []byte
+	//go:embed wasip1_native_ipc_other.go
+	wasip1NativeIPCOtherRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_linux_headers.go
@@ -13836,6 +13840,8 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 		"wasip1_native_hostfd.go":      wasip1NativeHostFDRaw,
 		"wasip1_native_hostsock.go":    wasip1NativeHostSockRaw,
 		"wasip1_native_terminal.go":    wasip1NativeTerminalRaw,
+		"wasip1_native_ipc.go":         wasip1NativeIPCRaw,
+		"wasip1_native_ipc_other.go":   wasip1NativeIPCOtherRaw,
 
 		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,
@@ -14164,6 +14170,209 @@ func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, p
 	}
 	binary.LittleEndian.PutUint64(out, uint64(r))
 	return _wasiESUCCESS
+}
+
+// ----- System V IPC ---------------------------------------------------------
+//
+// The NON-STANDARD imports ipc_get, ipc_ctl, ipc_semop, ipc_msgsnd,
+// ipc_msgrcv and ipc_shmcopy back the C library's System V IPC (perl-wasm's
+// perl_ipc.cc): the host's semaphore sets, message queues and shared memory
+// segments, which other processes of the system share. The guest names
+// them in its C library's numbers (Linux's) and lays their structures out
+// as Linux does on a 64-bit architecture (scripts/include/sys/ipc.h); the
+// host translates both into its own (hostIPCCtl and the other functions
+// of the platform's file). A guest that is not the host process gets
+// ENOSYS, as for sys_syscall: the objects are the system's. Each returns 0
+// or a negative errno.
+
+// The kinds of object of ipc_get and ipc_ctl.
+const (
+	ipcKindMsg = 0
+	ipcKindSem = 1
+	ipcKindShm = 2
+)
+
+// Ipc_get backs msgget, semget and shmget: the id of the object of the kind
+// with the key is written at idPtr (i32); arg is the number of semaphores
+// of a set, or the size of a segment.
+func (w *WasiStubs) Ipc_get(m *Module, kind, key int32, arg int64, flags, idPtr int32) int32 {
+	return w.ipcGet(m, kind, key, uint64(arg), flags, zext(idPtr))
+}
+
+// Ipc_get64 is Ipc_get for a memory64 guest.
+func (w *WasiStubs) Ipc_get64(m *Module, kind, key int32, arg int64, flags int32, idPtr int64) int32 {
+	return w.ipcGet(m, kind, key, uint64(arg), flags, uint64(idPtr))
+}
+
+func (w *WasiStubs) ipcGet(m *Module, kind, key int32, arg uint64, flags int32, idPtr uint64) int32 {
+	if !w.ipcAllowed() {
+		return -_wasiENOSYS
+	}
+	out := w.memBytes(m, idPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	id, err := hostIPCGet(kind, key, arg, flags)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	binary.LittleEndian.PutUint32(out, uint32(id))
+	return _wasiESUCCESS
+}
+
+// Ipc_ctl backs msgctl, semctl and shmctl: the command cmd (the guest's
+// number) on the object id of the kind, num being the semaphore of a set.
+// For IPC_STAT and IPC_SET bufPtr is the kind's structure; for GETALL and
+// SETALL the values of the set's semaphores, an unsigned short each; for
+// SETVAL arg is the value. What the call returns is written at resultPtr
+// (i64).
+func (w *WasiStubs) Ipc_ctl(m *Module, kind, id, num, cmd int32, arg int64, bufPtr, resultPtr int32) int32 {
+	return w.ipcCtl(m, kind, id, num, cmd, arg, zext(bufPtr), zext(resultPtr))
+}
+
+// Ipc_ctl64 is Ipc_ctl for a memory64 guest.
+func (w *WasiStubs) Ipc_ctl64(m *Module, kind, id, num, cmd int32, arg, bufPtr, resultPtr int64) int32 {
+	return w.ipcCtl(m, kind, id, num, cmd, arg, uint64(bufPtr), uint64(resultPtr))
+}
+
+func (w *WasiStubs) ipcCtl(m *Module, kind, id, num, cmd int32, arg int64, bufPtr, resultPtr uint64) int32 {
+	if !w.ipcAllowed() {
+		return -_wasiENOSYS
+	}
+	out := w.memBytes(m, resultPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	buf := func(n uint64) []byte { return w.memBytes(m, bufPtr, n) }
+	r, err := hostIPCCtl(kind, id, num, cmd, arg, buf)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(r))
+	return _wasiESUCCESS
+}
+
+// Ipc_semop backs semop: the nops operations at opsPtr, struct sembuf each
+// (unsigned short sem_num, short sem_op, short sem_flg, as on every host).
+func (w *WasiStubs) Ipc_semop(m *Module, id, opsPtr int32, nops int64) int32 {
+	return w.ipcSemop(m, id, zext(opsPtr), uint64(nops))
+}
+
+// Ipc_semop64 is Ipc_semop for a memory64 guest.
+func (w *WasiStubs) Ipc_semop64(m *Module, id int32, opsPtr, nops int64) int32 {
+	return w.ipcSemop(m, id, uint64(opsPtr), uint64(nops))
+}
+
+func (w *WasiStubs) ipcSemop(m *Module, id int32, opsPtr, nops uint64) int32 {
+	if !w.ipcAllowed() {
+		return -_wasiENOSYS
+	}
+	if nops > 1<<20 {
+		return -_wasiE2BIG
+	}
+	ops := w.memBytes(m, opsPtr, nops*6)
+	if ops == nil {
+		return -_wasiEFAULT
+	}
+	if err := hostIPCSemop(id, ops, nops); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Ipc_msgsnd backs msgsnd: the message at msgPtr, its type (a long, 8
+// bytes) and then size bytes.
+func (w *WasiStubs) Ipc_msgsnd(m *Module, id, msgPtr int32, size int64, flags int32) int32 {
+	return w.ipcMsgsnd(m, id, zext(msgPtr), uint64(size), flags)
+}
+
+// Ipc_msgsnd64 is Ipc_msgsnd for a memory64 guest.
+func (w *WasiStubs) Ipc_msgsnd64(m *Module, id int32, msgPtr, size int64, flags int32) int32 {
+	return w.ipcMsgsnd(m, id, uint64(msgPtr), uint64(size), flags)
+}
+
+func (w *WasiStubs) ipcMsgsnd(m *Module, id int32, msgPtr, size uint64, flags int32) int32 {
+	if !w.ipcAllowed() {
+		return -_wasiENOSYS
+	}
+	if size > 1<<40 {
+		return -_wasiEINVAL
+	}
+	msg := w.memBytes(m, msgPtr, 8+size)
+	if msg == nil {
+		return -_wasiEFAULT
+	}
+	if err := hostIPCMsgsnd(id, msg, flags); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Ipc_msgrcv backs msgrcv: a message of the type is received into msgPtr
+// (its type, then at most size bytes); the number of its bytes is written
+// at receivedPtr (i64).
+func (w *WasiStubs) Ipc_msgrcv(m *Module, id, msgPtr int32, size, typ int64, flags, receivedPtr int32) int32 {
+	return w.ipcMsgrcv(m, id, zext(msgPtr), uint64(size), typ, flags, zext(receivedPtr))
+}
+
+// Ipc_msgrcv64 is Ipc_msgrcv for a memory64 guest.
+func (w *WasiStubs) Ipc_msgrcv64(m *Module, id int32, msgPtr, size, typ int64, flags int32, receivedPtr int64) int32 {
+	return w.ipcMsgrcv(m, id, uint64(msgPtr), uint64(size), typ, flags, uint64(receivedPtr))
+}
+
+func (w *WasiStubs) ipcMsgrcv(m *Module, id int32, msgPtr, size uint64, typ int64, flags int32, receivedPtr uint64) int32 {
+	if !w.ipcAllowed() {
+		return -_wasiENOSYS
+	}
+	if size > 1<<40 {
+		return -_wasiEINVAL
+	}
+	msg := w.memBytes(m, msgPtr, 8+size)
+	out := w.memBytes(m, receivedPtr, 8)
+	if msg == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	n, err := hostIPCMsgrcv(id, msg, typ, flags)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(n))
+	return _wasiESUCCESS
+}
+
+// Ipc_shmcopy backs perl's shmread and shmwrite (shm_copy): size bytes
+// between the segment id, from its byte pos, and bufPtr; into bufPtr when
+// write is 0, out of it otherwise. A segment cannot be mapped into the
+// guest's memory, so the host attaches it to its own for the copy.
+func (w *WasiStubs) Ipc_shmcopy(m *Module, id, bufPtr int32, pos, size int64, write int32) int32 {
+	return w.ipcShmcopy(m, id, zext(bufPtr), uint64(pos), uint64(size), write)
+}
+
+// Ipc_shmcopy64 is Ipc_shmcopy for a memory64 guest.
+func (w *WasiStubs) Ipc_shmcopy64(m *Module, id int32, bufPtr, pos, size int64, write int32) int32 {
+	return w.ipcShmcopy(m, id, uint64(bufPtr), uint64(pos), uint64(size), write)
+}
+
+func (w *WasiStubs) ipcShmcopy(m *Module, id int32, bufPtr, pos, size uint64, write int32) int32 {
+	if !w.ipcAllowed() {
+		return -_wasiENOSYS
+	}
+	buf := w.memBytes(m, bufPtr, size)
+	if buf == nil {
+		return -_wasiEFAULT
+	}
+	if err := hostIPCShmCopy(id, buf, pos, write != 0); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// ipcAllowed reports whether the guest may use the system's IPC objects:
+// a guest that is the host process may.
+func (w *WasiStubs) ipcAllowed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.hostProcess
 }
 
 // Tty_getattr is a NON-STANDARD host import (name "tty_getattr") backing

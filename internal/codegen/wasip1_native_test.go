@@ -1437,13 +1437,15 @@ func TestWasip1EmitPlatformCompanions(t *testing.T) {
 	}
 	companions := tr.emitWasip1Platform("x")
 	wantConstraints := map[string]string{
-		"wasip1_native_posix.go":    "darwin || linux",
-		"wasip1_native_linux.go":    "linux",
-		"wasip1_native_darwin.go":   "darwin",
-		"wasip1_native_other.go":    "!darwin && !linux",
-		"wasip1_native_hostfd.go":   "darwin || linux",
-		"wasip1_native_hostsock.go": "darwin || linux",
-		"wasip1_native_terminal.go": "darwin || linux",
+		"wasip1_native_posix.go":     "darwin || linux",
+		"wasip1_native_linux.go":     "linux",
+		"wasip1_native_darwin.go":    "darwin",
+		"wasip1_native_other.go":     "!darwin && !linux",
+		"wasip1_native_hostfd.go":    "darwin || linux",
+		"wasip1_native_hostsock.go":  "darwin || linux",
+		"wasip1_native_terminal.go":  "darwin || linux",
+		"wasip1_native_ipc.go":       "linux",
+		"wasip1_native_ipc_other.go": "!linux",
 
 		"wasip1_hostnumbers_linux.go":           "linux",
 		"wasip1_hostnumbers_linux_headers.go":   "linux && !(mips || mipsle || mips64 || mips64le)",
