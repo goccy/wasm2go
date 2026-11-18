@@ -714,7 +714,14 @@ func TestHostDescriptors_ADirectoryIsReadThroughItsDescriptor(t *testing.T) {
 		}
 		names = append(names, name)
 	}
-	want := []string{"./", "../", "one", "sub/", "two"}
+	// in the order the system lists them (TestReaddir_HostDirectoryInTheSystemsOrder)
+	var want []string
+	for _, name := range systemOrder(t, dir) {
+		if name == "." || name == ".." || name == "sub" {
+			name += "/"
+		}
+		want = append(want, name)
+	}
 	if len(names) != len(want) {
 		t.Fatalf("entries = %v, want %v", names, want)
 	}

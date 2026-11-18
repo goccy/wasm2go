@@ -501,3 +501,24 @@ func signalHostSelf(sig syscall.Signal) error {
 func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (uintptr, error) {
 	return 0, syscall.ENOSYS
 }
+
+// hostDirListing lists a directory of the host's file system (an *os.File,
+// which osFS opens) in the order the system gives its names, which Go's
+// ReadDir keeps. ReadDir leaves "." and ".." out, and they come first. ok
+// is false for a directory of another file system.
+func hostDirListing(f File) ([]os.DirEntry, bool, error) {
+	d, isHost := f.(*os.File)
+	if !isHost {
+		return nil, false, nil
+	}
+	if _, err := d.Seek(0, 0); err != nil {
+		return nil, true, err
+	}
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return nil, true, err
+	}
+	out := make([]os.DirEntry, 0, len(entries)+2)
+	out = append(out, dotEntry(d.Name(), "."), dotEntry(d.Name(), ".."))
+	return append(out, entries...), true, nil
+}

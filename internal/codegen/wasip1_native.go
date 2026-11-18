@@ -5960,6 +5960,12 @@ func (w *WasiStubs) Fd_renumber64(m *Module, from, to int64) int32 {
 // Fd_readdir, so paged reads (cookie-driven) walk the same snapshot.
 // With rewind the snapshot is taken afresh. The returned slice is never
 // modified afterwards, so it stays valid after a later rewind.
+//
+// A directory of the host's lists its names in the order the system gives
+// them, "." and ".." among them where the system puts them, as readdir(3)
+// does (hostDirListing). A directory of a file system of the embedder's
+// own (MemFS) has no order of its own: it lists "." and ".." first and
+// then its names sorted, the same every time.
 func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
@@ -5972,6 +5978,13 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	if op.f == nil {
 		return nil, syscall.EBADF
 	}
+	if out, ok, err := hostDirListing(op.f); ok {
+		if err != nil {
+			return nil, err
+		}
+		op.dirCache = out
+		return out, nil
+	}
 	if _, err := op.f.Seek(0, 0); err != nil {
 		return nil, err
 	}
@@ -5979,13 +5992,9 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	// WASI expects "." and ".." as the first two entries; synthesise
-	// them so they receive cookies 1 and 2 respectively.
 	out := make([]os.DirEntry, 0, len(entries)+2)
 	out = append(out, dotEntry(op.path, "."), dotEntry(op.path, ".."))
 	out = append(out, entries...)
-	// Sort the real entries for deterministic Fd_readdir output. The
-	// "." and ".." entries stay at the front.
 	sort.SliceStable(out[2:], func(i, j int) bool {
 		return out[2+i].Name() < out[2+j].Name()
 	})

@@ -674,6 +674,23 @@ func (h *hostFile) names() ([]hostName, error) {
 		return nil, err
 	}
 	defer h.release()
+	all, err := readHostDirents(fd)
+	if err != nil {
+		return nil, err
+	}
+	out := all[:0]
+	for _, entry := range all {
+		if entry.name != "." && entry.name != ".." {
+			out = append(out, entry)
+		}
+	}
+	return out, nil
+}
+
+// readHostDirents reads the names in the directory open as fd from its
+// beginning, in the order the system gives them, "." and ".." where it
+// has them.
+func readHostDirents(fd int) ([]hostName, error) {
 	if _, err := syscall.Seek(fd, 0, 0); err != nil {
 		return nil, os.NewSyscallError("lseek", err)
 	}
@@ -717,11 +734,52 @@ func (h *hostFile) names() ([]hostName, error) {
 					break
 				}
 			}
-			if s := string(name); s != "." && s != ".." {
-				out = append(out, hostName{name: s, typ: rec[typeAt]})
-			}
+			out = append(out, hostName{name: string(name), typ: rec[typeAt]})
 		}
 	}
+}
+
+// hostDirListing lists a directory of the host's in the order the system
+// gives its names, with "." and ".." where the system puts them, as
+// readdir(3) gives them to perl: a directory open in the host process's
+// own table (hostFile), or opened through the host's file system (an
+// *os.File, which osFS opens). ok is false for a directory of another file
+// system.
+func hostDirListing(f File) (list []os.DirEntry, ok bool, err error) {
+	var dir string
+	var names []hostName
+	switch d := f.(type) {
+	case *hostFile:
+		fd, holdErr := d.hold()
+		if holdErr != nil {
+			return nil, true, holdErr
+		}
+		names, err = readHostDirents(fd)
+		d.release()
+		dir = d.path
+	case *os.File:
+		rc, connErr := d.SyscallConn()
+		if connErr != nil {
+			return nil, true, connErr
+		}
+		if readErr := rc.Read(func(fd uintptr) bool {
+			names, err = readHostDirents(int(fd))
+			return true
+		}); readErr != nil {
+			return nil, true, readErr
+		}
+		dir = d.Name()
+	default:
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	list = make([]os.DirEntry, 0, len(names))
+	for _, entry := range names {
+		list = append(list, &hostDirEntry{dir: dir, name: entry.name, typ: entry.typ})
+	}
+	return list, true, nil
 }
 
 // ReadDir reads the whole directory, whatever n is: the one caller asks
