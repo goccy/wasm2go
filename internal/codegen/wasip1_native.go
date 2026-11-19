@@ -3415,9 +3415,12 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 		var nbytes uint64
 		if op := ops[i]; op != nil && ev.isRead && errnos[i] == 0 {
+			// A file that was not probed, or refused the probe's
+			// deadline, is a regular file.
+			regular := probeIndex[i] < 0 || probes[probeIndex[i]].refused
 			if _, pending := op.aheadReady(); pending > 0 {
 				nbytes = uint64(pending)
-			} else if op.f != nil && probeIndex[i] < 0 {
+			} else if op.f != nil && regular {
 				// Regular file: pass through the bytes left to read
 				// (best-effort; the read itself reports the real state).
 				if st, err := op.f.Stat(); err == nil {

@@ -169,3 +169,28 @@ func TestWasi_PollRegularFileBesideIdlePipe(t *testing.T) {
 		t.Fatalf("poll with ready descriptors took %v", d)
 	}
 }
+
+// A read subscription of a regular file reports the bytes left to read in
+// the event's nbytes, as it did before streams were probed: a regular file
+// behind an *os.File looks like a stream (it has SetReadDeadline) until the
+// deadline is refused, and that refusal must not cost it its byte count.
+// wasi-libc's FIONREAD reads nbytes. Before, it came back as 0.
+func TestWasi_PollRegularFileReportsBytesLeft(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fileFd, errno := w.pathOpen("f.txt", 0, 0, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	if s, rc := fdReadString(w, m, fileFd, 3); rc != _wasiESUCCESS || s != "012" {
+		t.Fatalf("read = %q rc=%d", s, rc)
+	}
+	writeSubFd(m, pollSubsOff, 7, 1 /* fd_read */, fileFd)
+	wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+	if nbytes := binary.LittleEndian.Uint64(m.memory[pollEvOff+16:]); nbytes != 7 {
+		t.Fatalf("nbytes = %d, want the 7 bytes left", nbytes)
+	}
+}
