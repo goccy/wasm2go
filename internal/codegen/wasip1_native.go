@@ -3511,18 +3511,22 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 		op.mu.Unlock()
 		w.mu.Unlock()
 		if connected {
-			if cerr := conn.Close(); cerr != nil {
-				return mapOSError(cerr)
-			}
-			return -_wasiEISCONN
+			return dropConn(conn, _wasiEISCONN)
 		}
 		return _wasiESUCCESS
 	}
 	w.mu.Unlock()
-	if cerr := conn.Close(); cerr != nil {
-		return mapOSError(cerr)
+	return dropConn(conn, _wasiEBADF)
+}
+
+// dropConn closes a connection a socket will not keep and returns what the
+// connect that made it reports, as a negative errno like Sock_connect's
+// other results: errno, or the close's failure when there was one.
+func dropConn(conn net.Conn, errno int32) int32 {
+	if err := conn.Close(); err != nil {
+		return -mapOSError(err)
 	}
-	return -_wasiEBADF
+	return -errno
 }
 
 // Sock_accept accepts the next incoming TCP/Unix connection on the
@@ -3776,6 +3780,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"putStrVec64":             true,
 			"readVec":                 true,
 			"pollReadable":            true,
+			"dropConn":                true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
