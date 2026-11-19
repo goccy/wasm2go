@@ -3618,45 +3618,21 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	if conn == nil {
 		return _wasiENOTSOCK
 	}
-	iovBytes := uint64(uint32(riDataLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, riData, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, riData, riDataLen)
 	lenOut := w.memSlice(m, roDataLenPtr, 4)
 	// ro_flags is a __wasi_roflags_t — a 16-bit value. wasi-libc packs it
 	// immediately before ro_datalen (only 2 bytes apart), so writing 4 bytes
 	// here would clobber the low half of ro_datalen and make recv() report 0
 	// bytes received even when data arrived.
 	flagsOut := w.memSlice(m, roFlagsPtr, 2)
-	if iovecs == nil || lenOut == nil || flagsOut == nil {
+	if !ok || lenOut == nil || flagsOut == nil {
 		return _wasiEFAULT
 	}
-	var total uint32
-	for i := int32(0); i < riDataLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		if got, served := op.takeAhead([][]byte{buf}); served {
-			total += uint32(got)
-			break
-		}
-		n, err := conn.Read(buf)
-		for n == 0 && errors.Is(err, os.ErrDeadlineExceeded) {
-			// another instance's readiness probe; see readVec
-			runtime.Gosched()
-			n, err = conn.Read(buf)
-		}
-		total += uint32(n)
-		if err != nil {
-			break
-		}
-	}
+	// A receive is a read of the connection, as Fd_read's is of a stream:
+	// probed input first, the iovecs filled in order, done at a short read.
+	n := op.readInput(conn, bufs)
 	binary.LittleEndian.PutUint16(flagsOut, 0)
-	binary.LittleEndian.PutUint32(lenOut, total)
+	binary.LittleEndian.PutUint32(lenOut, uint32(n))
 	return _wasiESUCCESS
 }
 
