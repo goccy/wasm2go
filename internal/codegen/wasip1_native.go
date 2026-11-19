@@ -999,10 +999,25 @@ func (w *WasiStubs) Fork() *WasiStubs {
 func (w *WasiStubs) CloseAll() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.closeFromLocked(0)
+}
+
+// closeFromLocked closes every fd numbered lowFd or higher, lowest first, as
+// fd_close would, and joins the close errors in that order. Caller holds
+// w.mu.
+func (w *WasiStubs) closeFromLocked(lowFd int32) error {
+	fds := w.fdsLocked()
+	var doomed []int32
+	for fd := range fds {
+		if fd >= lowFd {
+			doomed = append(doomed, fd)
+		}
+	}
+	sort.Slice(doomed, func(i, j int) bool { return doomed[i] < doomed[j] })
 	var err error
-	for fd, op := range w.fdsLocked() {
-		err = errors.Join(err, closeWasiOpen(op))
-		delete(w.fdsLocked(), fd)
+	for _, fd := range doomed {
+		err = errors.Join(err, closeWasiOpen(fds[fd]))
+		delete(fds, fd)
 	}
 	return err
 }
@@ -1013,20 +1028,12 @@ func (w *WasiStubs) CloseAll() error {
 // the process it started has its own descriptors, and the fds this instance
 // still holds — close-on-exec ones included — must go, or a peer waiting for
 // end-of-file on one of them waits for as long as the command runs. Returns
-// 0, or a positive errno for the first close that failed (every fd in range
-// is closed regardless).
+// 0, or a positive errno for the lowest fd whose close failed (every fd in
+// range is closed regardless).
 func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var err error
-	for fd, op := range w.fdsLocked() {
-		if fd < lowFd {
-			continue
-		}
-		err = errors.Join(err, closeWasiOpen(op))
-		delete(w.fdsLocked(), fd)
-	}
-	if err != nil {
+	if err := w.closeFromLocked(lowFd); err != nil {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
@@ -1049,6 +1056,13 @@ func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 		}
 	}
 	return w.fdTable
+}
+
+// fdEntry returns the entry of fd, or nil when fd is not open.
+func (w *WasiStubs) fdEntry(fd int32) *wasiOpen {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.fdsLocked()[fd]
 }
 
 // addFDLocked stores op under the lowest fd number not in use, as POSIX
@@ -2011,9 +2025,7 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 // only the cache update because Go's net layer manages blocking mode
 // internally.
 func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil {
 		return _wasiEBADF
 	}
@@ -2048,9 +2060,7 @@ func (w *WasiStubs) Fd_filestat_get(m *Module, fd, ptr int32) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil && fd != wasiPreopenFD {
 		return _wasiEBADF
 	}
@@ -2081,9 +2091,7 @@ func (w *WasiStubs) Fd_filestat_get(m *Module, fd, ptr int32) int32 {
 }
 
 func (w *WasiStubs) Fd_filestat_set_size(m *Module, fd int32, size int64) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2325,9 +2333,7 @@ func (w *WasiStubs) fdDstLocked(fd int32) (io.Writer, *wasiOpen) {
 }
 
 func (w *WasiStubs) Fd_pread(m *Module, fd, iovs, iovsLen int32, offset int64, nreadPtr int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2367,9 +2373,7 @@ func (w *WasiStubs) Fd_pread(m *Module, fd, iovs, iovsLen int32, offset int64, n
 }
 
 func (w *WasiStubs) Fd_pwrite(m *Module, fd, iovs, iovsLen int32, offset int64, nwrittenPtr int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2418,9 +2422,7 @@ func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr
 // fdSeek is the layout-independent body of fd_seek, shared by the
 // wasm32 and wasm64 bindings.
 func (w *WasiStubs) fdSeek(fd int32, offset int64, whence int) (int64, int32) {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return 0, _wasiEBADF
 	}
@@ -2436,9 +2438,7 @@ func (w *WasiStubs) Fd_tell(m *Module, fd, offsetPtr int32) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2467,9 +2467,7 @@ func (w *WasiStubs) Fd_write(m *Module, fd, iovs, iovsLen, nwrittenPtr int32) in
 	return _wasiESUCCESS
 }
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2480,9 +2478,7 @@ func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 }
 
 func (w *WasiStubs) Fd_datasync(m *Module, fd int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2495,9 +2491,7 @@ func (w *WasiStubs) Fd_datasync(m *Module, fd int32) int32 {
 }
 
 func (w *WasiStubs) Fd_advise(m *Module, fd int32, offset, length int64, advice int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2507,9 +2501,7 @@ func (w *WasiStubs) Fd_advise(m *Module, fd int32, offset, length int64, advice 
 }
 
 func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2742,9 +2734,7 @@ func (w *WasiStubs) Fd_readdir(m *Module, fd, buf, buflen int32, cookie int64, b
 // byte count used. The dirent wire format has no pointer-width fields,
 // so wasm32 and wasm64 share it; only the bufused out-pointer differs.
 func (w *WasiStubs) fdReaddir(fd int32, bufSlice []byte, cookie int64) (int, int32) {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.f == nil || !op.isDir {
 		return 0, _wasiEBADF
 	}
@@ -3547,9 +3537,7 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	if op == nil || op.listener == nil {
 		return _wasiENOTSOCK
 	}
@@ -3568,9 +3556,7 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	if !w.checkNet("recv") {
 		return _wasiEACCES
 	}
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	var conn net.Conn
 	if op != nil {
 		conn = op.netConn()
@@ -3624,9 +3610,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	if !w.checkNet("send") {
 		return _wasiEACCES
 	}
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	var conn net.Conn
 	if op != nil {
 		conn = op.netConn()
@@ -3662,9 +3646,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 }
 
 func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
-	w.mu.Lock()
-	op := w.fdsLocked()[fd]
-	w.mu.Unlock()
+	op := w.fdEntry(fd)
 	var conn net.Conn
 	if op != nil {
 		conn = op.netConn()
