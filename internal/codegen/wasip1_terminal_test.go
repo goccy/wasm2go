@@ -87,9 +87,23 @@ func openTerminal(t *testing.T, w *WasiStubs, path string) int32 {
 // terminalDevice returns the device a descriptor of the guest's is open on.
 func terminalDevice(t *testing.T, w *WasiStubs, fd int32) uint64 {
 	t.Helper()
-	host, ok := w.HostDescriptor(fd)
-	if !ok {
-		t.Fatalf("descriptor %d has no descriptor of the host", fd)
+	// The host's descriptor behind the entry, under whatever number it has:
+	// HostDescriptor gives none for a forked process's own file that sits
+	// under a number other than the guest's, as such files do.
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil {
+		t.Fatalf("descriptor %d is not open", fd)
+	}
+	var host uintptr
+	if h := op.host(); h != nil {
+		host = uintptr(h.fd.Load())
+	} else {
+		var ok bool
+		if host, ok = w.HostDescriptor(fd); !ok {
+			t.Fatalf("descriptor %d has no descriptor of the host", fd)
+		}
 	}
 	device, ok := hostTerminalIdentity(int(host))
 	if !ok {
