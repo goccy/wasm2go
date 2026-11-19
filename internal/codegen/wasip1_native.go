@@ -604,9 +604,14 @@ type wasiOpen struct {
 	// guarded by mu.
 	ahead    []byte
 	aheadEnd error
-	// probing serializes readiness probes of this stream, so two probes
-	// cannot append the chunks they read to ahead out of order.
-	probing sync.Mutex
+	// turn is the turn at the descriptor's input: whoever reads the stream —
+	// a guest's read or a readiness probe, of this instance or of one that
+	// shares the entry after Fork — holds it, so input a probe takes is
+	// seen by the read that comes next instead of being missed by a read
+	// already waiting on the stream, and a probe's read deadline is set and
+	// cleared while nobody else uses the stream. A buffered channel so that
+	// a probe can give up waiting for it. Made on first use; guarded by mu.
+	turn chan struct{}
 }
 
 // deadlineReader is a stream whose blocking read can be bounded: a pipe, a
@@ -650,14 +655,103 @@ func (op *wasiOpen) aheadReady() (ready bool, pending int) {
 	return len(op.ahead) > 0 || op.aheadEnd != nil, len(op.ahead)
 }
 
-// probeRead reads src once — the caller has set the read deadline — and
-// keeps what arrives in ahead. It reports whether the descriptor is now
-// readable.
-func (op *wasiOpen) probeRead(src deadlineReader) bool {
-	op.probing.Lock()
-	defer op.probing.Unlock()
-	if ready, _ := op.aheadReady(); ready {
+// inputTurn returns the channel that holds the turn at op's input.
+func (op *wasiOpen) inputTurn() chan struct{} {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.turn == nil {
+		op.turn = make(chan struct{}, 1)
+	}
+	return op.turn
+}
+
+// takeInputTurn waits for the turn at op's input, no longer than until (the
+// zero time is no limit) and not after stop is closed, and reports whether
+// it got it. A turn that is free is taken even when until has passed.
+func (op *wasiOpen) takeInputTurn(until time.Time, stop <-chan struct{}) bool {
+	turn := op.inputTurn()
+	select {
+	case turn <- struct{}{}:
 		return true
+	default:
+	}
+	var expired <-chan time.Time
+	if !until.IsZero() {
+		timer := time.NewTimer(time.Until(until))
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case turn <- struct{}{}:
+		return true
+	case <-expired:
+		return false
+	case <-stop:
+		return false
+	}
+}
+
+// passInputTurn gives the turn at op's input back.
+func (op *wasiOpen) passInputTurn() { <-op.inputTurn() }
+
+// readInput is a guest's read of op's input from src: in its turn, the
+// input a probe took comes first, then the stream.
+func (op *wasiOpen) readInput(src io.Reader, bufs [][]byte) uint64 {
+	op.takeInputTurn(time.Time{}, nil)
+	defer op.passInputTurn()
+	if n, ok := op.takeAhead(bufs); ok {
+		return n
+	}
+	return readVec(src, bufs)
+}
+
+// probeRead is a readiness probe of op's input: in its turn, it reads src
+// once — no longer than until (the zero time is no limit), and not after
+// stop is closed — and keeps what arrives in ahead. ready reports whether
+// the descriptor is readable; refused that src takes no read deadline, so
+// it was not read: a stream like that is a regular file, whose read does
+// not block.
+func (op *wasiOpen) probeRead(src deadlineReader, until time.Time, stop <-chan struct{}) (ready, refused bool) {
+	if ready, _ := op.aheadReady(); ready {
+		return true, false
+	}
+	if !op.takeInputTurn(until, stop) {
+		ready, _ := op.aheadReady()
+		return ready, false
+	}
+	defer op.passInputTurn()
+	// Whoever had the turn before may have left input behind.
+	if ready, _ := op.aheadReady(); ready {
+		return true, false
+	}
+	select {
+	case <-stop:
+		// Another descriptor is ready: this one only gets the time it takes
+		// to look.
+		if look := time.Now().Add(pollProbeGrace); until.IsZero() || look.Before(until) {
+			until = look
+		}
+	default:
+	}
+	if err := src.SetReadDeadline(until); err != nil {
+		return false, true
+	}
+	// No deadline is left behind: later reads of the stream must block.
+	defer src.SetReadDeadline(time.Time{})
+	if stop != nil {
+		// stop ends the read in progress; the watcher is gone before the
+		// deadline is cleared.
+		read, watched := make(chan struct{}), make(chan struct{})
+		defer func() { <-watched }()
+		defer close(read)
+		go func() {
+			defer close(watched)
+			select {
+			case <-stop:
+				_ = src.SetReadDeadline(time.Now())
+			case <-read:
+			}
+		}()
 	}
 	buf := make([]byte, 32<<10)
 	n, err := src.Read(buf)
@@ -667,7 +761,7 @@ func (op *wasiOpen) probeRead(src deadlineReader) bool {
 	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
 		op.aheadEnd = err
 	}
-	return len(op.ahead) > 0 || op.aheadEnd != nil
+	return len(op.ahead) > 0 || op.aheadEnd != nil, false
 }
 
 // netConn returns the connection attached to a socket entry, or nil.
@@ -2212,15 +2306,7 @@ func (w *WasiStubs) Fd_read(m *Module, fd, iovs, iovsLen, nreadPtr int32) int32 
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	var n uint64
-	served := false
-	if op != nil {
-		n, served = op.takeAhead(bufs)
-	}
-	if !served {
-		n = readVec(src, bufs)
-	}
-	binary.LittleEndian.PutUint32(nreadSlice, uint32(n))
+	binary.LittleEndian.PutUint32(nreadSlice, uint32(op.readInput(src, bufs)))
 	return _wasiESUCCESS
 }
 
@@ -3304,7 +3390,7 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 		}
 		pollReadable(probes, deadline)
 		for i := range fdEvents {
-			if at := probeIndex[i]; at >= 0 && probes[at].ready {
+			if at := probeIndex[i]; at >= 0 && (probes[at].ready || probes[at].refused) {
 				ready[i], anyReady = true, true
 			}
 		}
@@ -3351,76 +3437,37 @@ func (w *WasiStubs) Poll_oneoff(m *Module, inPtr, outPtr, nsubs, neventsPtr int3
 
 // pollProbe is one stream poll_oneoff has to probe for input.
 type pollProbe struct {
-	op    *wasiOpen
-	src   deadlineReader
-	ready bool
+	op      *wasiOpen
+	src     deadlineReader
+	ready   bool
+	refused bool // src took no read deadline: not a stream (see probeRead)
 }
 
 // pollReadable waits until one of the streams has input (or reached its
-// end), or until deadline — the zero time means no limit — and records
-// which are readable. The readiness test is a read: whatever arrives is
-// kept on the descriptor and handed to the guest's next read of it.
-//
-// A stream that refuses a read deadline is one whose read does not block
-// (a regular file behind an *os.File), and counts as readable.
+// end), or until the zero-time-means-no-limit deadline, and records which
+// are readable. The readiness test is a read: whatever arrives is kept on
+// the descriptor and handed to the guest's next read of it. Once one stream
+// is found readable, or turns out to be no stream, the others stop waiting.
 func pollReadable(probes []pollProbe, deadline time.Time) {
-	var armed []*pollProbe
-	for i := range probes {
-		pr := &probes[i]
-		if err := pr.src.SetReadDeadline(deadline); err != nil {
-			pr.ready = true
-			continue
-		}
-		armed = append(armed, pr)
-	}
-	// Leave no deadline behind: later reads of these streams must block.
-	defer func() {
-		for _, pr := range armed {
-			_ = pr.src.SetReadDeadline(time.Time{})
-		}
-	}()
-	if len(armed) == 0 {
+	if len(probes) == 1 {
+		pr := &probes[0]
+		pr.ready, pr.refused = pr.op.probeRead(pr.src, deadline, nil)
 		return
 	}
-	if len(armed) < len(probes) {
-		// Something is readable already: the others only get the time it
-		// takes to look.
-		grace := time.Now().Add(pollProbeGrace)
-		for _, pr := range armed {
-			_ = pr.src.SetReadDeadline(grace)
-		}
-	}
-	if len(armed) == 1 {
-		armed[0].ready = armed[0].op.probeRead(armed[0].src)
-		return
-	}
+	stop := make(chan struct{})
+	var once sync.Once
 	var wg sync.WaitGroup
-	hit := make(chan struct{}, len(armed))
-	for _, pr := range armed {
+	for i := range probes {
 		wg.Add(1)
 		go func(pr *pollProbe) {
 			defer wg.Done()
-			if pr.ready = pr.op.probeRead(pr.src); pr.ready {
-				hit <- struct{}{}
+			pr.ready, pr.refused = pr.op.probeRead(pr.src, deadline, stop)
+			if pr.ready || pr.refused {
+				once.Do(func() { close(stop) })
 			}
-		}(pr)
+		}(&probes[i])
 	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-hit:
-		// One is readable: stop waiting on the rest. Their reads end at
-		// once, keeping whatever they had already received.
-		now := time.Now()
-		for _, pr := range armed {
-			_ = pr.src.SetReadDeadline(now)
-		}
-		<-done
-	case <-done:
-	}
+	wg.Wait()
 }
 
 func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64) {
@@ -4305,13 +4352,7 @@ func (w *WasiStubs) Fd_read64(m *Module, fd, iovs, iovsLen, nreadPtr int64) int3
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	// Input a readiness probe took out of the stream comes first, as in
-	// Fd_read.
-	n, served := op.takeAhead(bufs)
-	if !served {
-		n = readVec(src, bufs)
-	}
-	binary.LittleEndian.PutUint64(nreadSlice, n)
+	binary.LittleEndian.PutUint64(nreadSlice, op.readInput(src, bufs))
 	return _wasiESUCCESS
 }
 
