@@ -1474,18 +1474,14 @@ func (fb *fusedTreeBuilder) pairDebug() string {
 	return out
 }
 
-// fuseDebugEnabled gates the window-trial diagnostics: with
-// Options.FuseDebug set, every failed fusion trial of at least four
-// candidates prints its width and first refusal to stderr. This is
-// the histogram workflow that localized both the K=4 unlock and the
-// memory64 window-starvation regressions. Set from Translate (the
-// transpiler runs one module per process, so a package flag suffices
-// and keeps fuseDebugf callable without threading a receiver through
-// every walk helper).
-var fuseDebugEnabled bool
-
-func fuseDebugf(format string, args ...interface{}) {
-	if fuseDebugEnabled {
+// fuseDebugf prints a window-trial diagnostic to stderr when the
+// translation runs with Options.FuseDebug: every failed fusion trial of at
+// least four candidates prints its width and first refusal. This is the
+// histogram workflow that localized both the K=4 unlock and the memory64
+// window-starvation regressions. The setting is the translation's own, so
+// translations running at once each print only their own diagnostics.
+func (sc *simdScalarizer) fuseDebugf(format string, args ...interface{}) {
+	if sc.em != nil && sc.em.t != nil && sc.em.t.opts.FuseDebug {
 		fmt.Fprintf(os.Stderr, "wasm2go: fuse-debug: "+format+"\n", args...)
 	}
 }
@@ -1850,7 +1846,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		}
 		if rootsOverCap || (len(roots) == 0 && !hasStore) {
 			if w >= 4 {
-				fuseDebugf("w=%d roots=%d overCap=%v", w, len(roots), rootsOverCap)
+				sc.fuseDebugf("w=%d roots=%d overCap=%v", w, len(roots), rootsOverCap)
 			}
 			continue // over the root cap, or a window with no live output
 		}
@@ -1865,7 +1861,7 @@ func (sc *simdScalarizer) tryFuseWindowEx(list []ast.Stmt, start int, prelude *[
 		roots = fb.scheduleNodes(roots)
 		if pl := fb.peakLive(roots); pl > fusedPoolBudget-floatPoolCost(len(fb.floats)) {
 			if w >= 4 {
-				fuseDebugf("w=%d peakLive=%d budget=%d floats=%d roots=%d", w, pl, fusedPoolBudget-floatPoolCost(len(fb.floats)), len(fb.floats), len(roots))
+				sc.fuseDebugf("w=%d peakLive=%d budget=%d floats=%d roots=%d", w, pl, fusedPoolBudget-floatPoolCost(len(fb.floats)), len(fb.floats), len(roots))
 			}
 			continue // would exhaust the splice synthesizers' vector pool
 		}

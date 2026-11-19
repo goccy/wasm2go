@@ -284,7 +284,7 @@ func (sc *simdScalarizer) wideCounters() bool {
 // result. Diagnostics only; the caller emits the loop as the window
 // path would have.
 func (sc *simdScalarizer) loopReject(tag string) (ast.Stmt, bool) {
-	fuseDebugf("FUSELOOP reject %s (fn=%s)", tag, sc.fnNameForDebug())
+	sc.fuseDebugf("FUSELOOP reject %s (fn=%s)", tag, sc.fnNameForDebug())
 	return nil, false
 }
 
@@ -832,7 +832,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 	derivedOf := func(e ast.Expr, target string) (ast.Expr, bool) {
 		bin, ok := e.(*ast.BinaryExpr)
 		if !ok || bin.Op != token.ADD {
-			fuseDebugf("FUSELOOP reject derived-bump-shape")
+			sc.fuseDebugf("FUSELOOP reject derived-bump-shape")
 			return nil, false
 		}
 		x, y := bin.X, bin.Y
@@ -841,7 +841,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		}
 		id, ok := x.(*ast.Ident)
 		if !ok || id.Name != target {
-			fuseDebugf("FUSELOOP reject derived-bump-target")
+			sc.fuseDebugf("FUSELOOP reject derived-bump-target")
 			return nil, false
 		}
 		if _, cok := resolveC(y); cok {
@@ -850,7 +850,7 @@ func (sc *simdScalarizer) tryFuseLoop(f *ast.ForStmt, prelude *[]ast.Stmt) (ast.
 		if yid, ok := y.(*ast.Ident); ok && !bodyWrites[yid.Name] {
 			return y, true
 		}
-		fuseDebugf("FUSELOOP reject derived-bump-delta")
+		sc.fuseDebugf("FUSELOOP reject derived-bump-delta")
 		return nil, false
 	}
 	wpreDef := func(name string) *ast.AssignStmt {

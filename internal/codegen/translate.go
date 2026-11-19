@@ -272,7 +272,6 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if opts.Package == "" {
 		return Result{}, fmt.Errorf("wasm2go: Options.Package is required")
 	}
-	fuseDebugEnabled = opts.FuseDebug
 	lower.SetNoInlineExports(m, opts.NoInlineExports)
 	if m.Memory64() {
 		for _, mem := range m.Memories {
