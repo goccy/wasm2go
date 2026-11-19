@@ -1393,7 +1393,13 @@ func (w *WasiStubs) takeInOutsideLocked(fd int32) *wasiOpen {
 // starts inherits: the open ones that are the instance's to have and are
 // not close-on-exec, which is how code outside the guest leaves a
 // descriptor it means a command to get. Caller holds w.mu.
+//
+// They are looked for under hostTable.making, held for writing as a
+// take-over holds it, so that a descriptor the runtime is making for itself
+// or for a guest, nobody's for the moment, is not taken for one.
 func (w *WasiStubs) inheritableOutsideLocked() []*hostFile {
+	hostTable.making.Lock()
+	defer hostTable.making.Unlock()
 	fds := w.fdsLocked()
 	var out []*hostFile
 	for _, fd := range openDescriptors() {
@@ -1594,6 +1600,8 @@ func (w *WasiStubs) addHostFDFromLocked(op *wasiOpen, min int) (int32, error) {
 		h.fd.Store(int32(moved))
 		number = moved
 	}
+	hostEnter(number, op)
+	fds[int32(number)] = op
 	if number <= 2 || w.hostProcess && !w.forked {
 		// A descriptor the guest makes is inherited by a command until the
 		// guest says otherwise, as dup, open, pipe and socket make one
@@ -1601,11 +1609,10 @@ func (w *WasiStubs) addHostFDFromLocked(op *wasiOpen, min int) (int32, error) {
 		// own descriptor of the number has that flag in the kernel
 		// (cloexecIsTheKernels); a standard descriptor is the host
 		// process's as well, and code outside the guest that starts a
-		// command counts on handing it on.
+		// command counts on handing it on. It is the instance's entry by
+		// then, which no command is given as left open outside the guest.
 		hostKeepOnExec(number)
 	}
-	hostEnter(number, op)
-	fds[int32(number)] = op
 	delete(w.cloexec, int32(number))
 	return int32(number), nil
 }
@@ -1750,6 +1757,10 @@ func (w *WasiStubs) dup2HostLocked(src *wasiOpen, to int32) error {
 		}
 	}
 	if free {
+		// Until the duplicate is the instance's entry (hostEnter) it is
+		// nobody's descriptor under a low number (hostTable.making).
+		hostTable.making.RLock()
+		defer hostTable.making.RUnlock()
 		syscall.ForkLock.RLock()
 		err = hostDup2(fd, int(to))
 		// dup2 leaves the duplicate inheritable, and the kernel's flag is
@@ -1787,7 +1798,14 @@ func (w *WasiStubs) hostWakerLocked() (*hostWaker, error) {
 	if w.waker != nil {
 		return w.waker, nil
 	}
+	// The pipe has low numbers until its ends are moved above the range
+	// programs use, nobody's and not close-on-exec: it is made under
+	// hostTable.making, which keeps a command from being given it as a
+	// descriptor code outside the guest left open, and a guest from taking
+	// it in.
 	var p [2]int
+	hostTable.making.RLock()
+	defer hostTable.making.RUnlock()
 	syscall.ForkLock.RLock()
 	err := syscall.Pipe(p[:])
 	var ends [2]int
@@ -2341,14 +2359,24 @@ func hostPollStoppable(fds []hostPoll, until time.Time, stop <-chan struct{}) {
 		hostPollUntil(fds, until)
 		return
 	}
-	var p [2]int
+	// The pipe is the runtime's: its ends are moved above the range
+	// programs use before anything can see them under low numbers
+	// (hostTable.making), as the waker's are.
+	var low, p [2]int
+	hostTable.making.RLock()
 	syscall.ForkLock.RLock()
-	err := syscall.Pipe(p[:])
+	err := syscall.Pipe(low[:])
 	if err == nil {
-		syscall.CloseOnExec(p[0])
-		syscall.CloseOnExec(p[1])
+		if p[0], err = hostDup(low[0], hostFloor()); err == nil {
+			if p[1], err = hostDup(low[1], hostFloor()); err != nil {
+				_ = syscall.Close(p[0])
+			}
+		}
+		_ = syscall.Close(low[0])
+		_ = syscall.Close(low[1])
 	}
 	syscall.ForkLock.RUnlock()
+	hostTable.making.RUnlock()
 	if err != nil {
 		return
 	}
@@ -2518,7 +2546,11 @@ func hostRecordLock(fd uintptr, cmd int32, lk *recordLock) error {
 // hostPipe makes a pipe of the host and returns the entries of its two
 // ends.
 func hostPipe() (r, wr *wasiOpen, err error) {
+	// Until its ends are close-on-exec they are not to be handed to a
+	// command as descriptors code outside the guest left open
+	// (hostTable.making).
 	var p [2]int
+	hostTable.making.RLock()
 	syscall.ForkLock.RLock()
 	err = syscall.Pipe(p[:])
 	if err == nil {
@@ -2526,6 +2558,7 @@ func hostPipe() (r, wr *wasiOpen, err error) {
 		syscall.CloseOnExec(p[1])
 	}
 	syscall.ForkLock.RUnlock()
+	hostTable.making.RUnlock()
 	if err != nil {
 		return nil, nil, err
 	}
