@@ -1349,10 +1349,26 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 		cmd.Env = []string{}
 	}
 	// stdin/stdout/stderr are whatever the guest's fds refer to: the
-	// instance streams, a file, a guest pipe end, or nothing for a closed
-	// fd. A pipe end's dynamic type is *os.File, so Go's exec passes the
-	// fd straight to the child; capture works by the guest reading the pipe's
-	// other end via Fd_read.
+	// instance streams, a file, a guest pipe end, a connection, or nothing
+	// for a closed fd. A pipe end's dynamic type is *os.File, so Go's exec
+	// passes the fd straight to the child; capture works by the guest
+	// reading the pipe's other end via Fd_read. A connection with a
+	// descriptor is passed the same way (connFile).
+	var dups []*os.File
+	defer func() {
+		for _, f := range dups {
+			_ = f.Close()
+		}
+	}()
+	if f := connFile(cin); f != nil {
+		cin, dups = f, append(dups, f)
+	}
+	if f := connFile(cout); f != nil {
+		cout, dups = f, append(dups, f)
+	}
+	if f := connFile(cerr); f != nil {
+		cerr, dups = f, append(dups, f)
+	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = cin, cout, cerr
 	if err := cmd.Start(); err != nil {
 		return -mapExecError(err)
@@ -1378,6 +1394,29 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
+}
+
+// connFile returns a duplicate of the descriptor behind a connection, for a
+// spawned process to get as one of its standard descriptors, or nil when
+// stream is no connection or has no descriptor. os/exec hands a child an
+// *os.File as it is, but anything else through a pipe and a goroutine that
+// copies it, which Wait waits for: for a connection, until the peer closes
+// it, long after the child is gone, and meanwhile the goroutine takes input
+// meant for the guest. The duplicate is the caller's to close once the
+// child has started.
+func connFile(stream any) *os.File {
+	if _, ok := stream.(net.Conn); !ok {
+		return nil
+	}
+	withFile, ok := stream.(interface{ File() (*os.File, error) })
+	if !ok {
+		return nil
+	}
+	f, err := withFile.File()
+	if err != nil {
+		return nil
+	}
+	return f
 }
 
 // childReaderLocked resolves the stdin of a spawned process. A negative fd
@@ -3834,6 +3873,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVec":                 true,
 			"pollReadable":            true,
 			"dropConn":                true,
+			"connFile":                true,
 			"writeVec":                true,
 			"Args_get":                true,
 			"Args_sizes_get":          true,
