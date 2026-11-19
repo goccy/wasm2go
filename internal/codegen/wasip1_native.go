@@ -632,8 +632,11 @@ func (op *wasiOpen) takeAhead(bufs [][]byte) (n uint64, ok bool) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	if len(op.ahead) == 0 {
-		// A probe that hit end of input leaves a zero-byte read behind.
-		return 0, op.aheadEnd != nil
+		// A probe that hit end of input leaves one zero-byte read behind;
+		// the read after it goes to the stream, as it would have.
+		ended := op.aheadEnd != nil
+		op.aheadEnd = nil
+		return 0, ended
 	}
 	for _, buf := range bufs {
 		c := copy(buf, op.ahead)
@@ -1744,8 +1747,27 @@ func (w *WasiStubs) SetArgs(args []string) {
 func (w *WasiStubs) SetStdin(r io.Reader) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if r != nil {
-		w.stdin = r
+	if r == nil {
+		return
+	}
+	w.stdin = r
+	// Input a readiness probe kept on an entry is the old stream's, and the
+	// entry may be shared with an instance this one was forked from or
+	// into, whose stdin has not changed: the fds referring to stdin get one
+	// new entry, shared among them as the old one was.
+	var fresh *wasiOpen
+	fds := w.fdsLocked()
+	for fd, op := range fds {
+		if op.stdio != 1 {
+			continue
+		}
+		_ = closeWasiOpen(op) // a stream entry holds no descriptor
+		if fresh == nil {
+			fresh = &wasiOpen{stdio: 1}
+		} else {
+			fresh.addRef()
+		}
+		fds[fd] = fresh
 	}
 }
 
