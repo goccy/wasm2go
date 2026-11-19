@@ -1567,6 +1567,11 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 	w.mu.Lock()
 	proc.kill = kill
 	w.mu.Unlock()
+	// The hook may have given the parent new memory while it snapshotted
+	// it: the pid goes into the memory the parent has now.
+	if out = w.memSlice(m, pidOutPtr, 4); out == nil {
+		return -_wasiEFAULT
+	}
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
 }

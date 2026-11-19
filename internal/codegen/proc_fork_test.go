@@ -601,6 +601,26 @@ func TestWasi_ProcForkHook(t *testing.T) {
 	}
 }
 
+// The child's pid reaches the parent's linear memory as it is when the hook
+// returns: a hook may give the parent new memory while it snapshots it (to
+// share a copy-on-write image with the child, say). Before, the pid was
+// written into the memory the parent had before the hook ran.
+func TestWasi_ProcForkWritesThePidAfterTheHook(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const pidOff int32 = 4000
+	w.SetForkHook(func(parent *Module, child *WasiStubs, pid int32, exited func(status int32)) (func(sig int32) error, error) {
+		parent.memory = append([]byte(nil), parent.memory...)
+		go exited(0)
+		return nil, nil
+	})
+	if rc := w.Proc_fork(m, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_fork rc=%d", rc)
+	}
+	if pid := int32(readU32(m.memory, int(pidOff))); pid < wasiFirstPID {
+		t.Fatalf("the parent's memory holds pid %d after the fork, want the child's token", pid)
+	}
+}
+
 func TestWasi_ProcForkHookFailure(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	readFd, writeFd := newTestPipe(t, w, m)
