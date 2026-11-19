@@ -530,8 +530,8 @@ func TestProbeWithNoTimeLeftFindsWhatIsThere(t *testing.T) {
 
 	// a datagram socket
 	server := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, server, int32(loopbackBE), 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, server, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	serverName := localName(t, w, m, server)
 	sop := entry(server)

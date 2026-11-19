@@ -33,8 +33,8 @@ func readSockName(m *Module) sockName {
 // localName returns getsockname of fd.
 func localName(t *testing.T, w *WasiStubs, m *Module, fd int32) sockName {
 	t.Helper()
-	if rc := w.Sock_getsockname(m, fd, sockNameOff); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_getsockname(%d) rc=%d", fd, rc)
+	if rc := sockNameIPv4(w, m, fd, false, sockNameOff); rc != _wasiESUCCESS {
+		t.Fatalf("getsockname(%d) rc=%d", fd, rc)
 	}
 	return readSockName(m)
 }
@@ -44,8 +44,8 @@ func localName(t *testing.T, w *WasiStubs, m *Module, fd int32) sockName {
 func newListener(t *testing.T, w *WasiStubs, m *Module) (fd int32, port int32) {
 	t.Helper()
 	fd = w.Sock_socket(m, 2, wasiSockTypeStream)
-	if rc := w.Sock_bind(m, fd, loopbackBE, 0); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, fd, loopbackBE, 0); rc != _wasiESUCCESS {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	if rc := w.Sock_listen(m, fd, 5); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_listen rc=%d", rc)
@@ -92,18 +92,18 @@ func TestSocket_ServerAndClientInOneInstance(t *testing.T) {
 	if got := localName(t, w, m, server); got != (sockName{family: wasiSockFamilyIPv4}) {
 		t.Fatalf("name of an unbound socket = %+v", got)
 	}
-	if rc := w.Sock_getpeername(m, server, sockNameOff); rc != -_wasiENOTCONN {
-		t.Fatalf("Sock_getpeername of an unconnected socket rc=%d, want -ENOTCONN", rc)
+	if rc := sockNameIPv4(w, m, server, true, sockNameOff); rc != -_wasiENOTCONN {
+		t.Fatalf("getpeername of an unconnected socket rc=%d, want -ENOTCONN", rc)
 	}
 
-	if rc := w.Sock_bind(m, server, loopbackBE, 0); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, server, loopbackBE, 0); rc != _wasiESUCCESS {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	bound := localName(t, w, m, server)
 	if bound.family != wasiSockFamilyIPv4 || bound.ip != uint32(loopbackBE) || bound.port == 0 {
 		t.Fatalf("bound name = %+v, want 127.0.0.1 and a port", bound)
 	}
-	if rc := w.Sock_bind(m, server, loopbackBE, 0); rc != -_wasiEINVAL {
+	if rc := sockBindIPv4(w, m, server, loopbackBE, 0); rc != -_wasiEINVAL {
 		t.Fatalf("second bind rc=%d, want -EINVAL", rc)
 	}
 	// Bound is not listening.
@@ -116,7 +116,7 @@ func TestSocket_ServerAndClientInOneInstance(t *testing.T) {
 
 	// The port is taken.
 	other := w.Sock_socket(m, 2, wasiSockTypeStream)
-	if rc := w.Sock_bind(m, other, loopbackBE, int32(bound.port)); rc != -_wasiEADDRINUSE {
+	if rc := sockBindIPv4(w, m, other, loopbackBE, int32(bound.port)); rc != -_wasiEADDRINUSE {
 		t.Fatalf("bind of a port in use rc=%d, want -EADDRINUSE", rc)
 	}
 
@@ -127,14 +127,14 @@ func TestSocket_ServerAndClientInOneInstance(t *testing.T) {
 	}
 	// Each end names the other.
 	clientLocal := localName(t, w, m, client)
-	if rc := w.Sock_getpeername(m, conn, sockNameOff); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_getpeername rc=%d", rc)
+	if rc := sockNameIPv4(w, m, conn, true, sockNameOff); rc != _wasiESUCCESS {
+		t.Fatalf("getpeername rc=%d", rc)
 	}
 	if peer := readSockName(m); peer != clientLocal {
 		t.Fatalf("peer of the accepted socket = %+v, client is %+v", peer, clientLocal)
 	}
-	if rc := w.Sock_getpeername(m, client, sockNameOff); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_getpeername rc=%d", rc)
+	if rc := sockNameIPv4(w, m, client, true, sockNameOff); rc != _wasiESUCCESS {
+		t.Fatalf("getpeername rc=%d", rc)
 	}
 	if peer := readSockName(m); peer != bound {
 		t.Fatalf("peer of the client = %+v, server is %+v", peer, bound)
@@ -185,8 +185,8 @@ func TestSocket_ListeningIsSubjectToTheNetworkPolicy(t *testing.T) {
 		return op != "listen"
 	})
 	fd := w.Sock_socket(m, 2, wasiSockTypeStream)
-	if rc := w.Sock_bind(m, fd, loopbackBE, 0); rc != -_wasiEACCES {
-		t.Fatalf("Sock_bind rc=%d, want -EACCES", rc)
+	if rc := sockBindIPv4(w, m, fd, loopbackBE, 0); rc != -_wasiEACCES {
+		t.Fatalf("bind rc=%d, want -EACCES", rc)
 	}
 	if rc := w.Sock_listen(m, fd, 1); rc != -_wasiEACCES {
 		t.Fatalf("Sock_listen rc=%d, want -EACCES", rc)
@@ -356,8 +356,8 @@ func TestSocket_BoundSocketConnectsFromItsAddress(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	server, port := newListener(t, w, m)
 	client := w.Sock_socket(m, 2, wasiSockTypeStream)
-	if rc := w.Sock_bind(m, client, loopbackBE, 0); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, client, loopbackBE, 0); rc != _wasiESUCCESS {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	bound := localName(t, w, m, client)
 	if rc := w.Sock_connect(m, client, loopbackBE, port); rc != _wasiESUCCESS {
@@ -367,8 +367,8 @@ func TestSocket_BoundSocketConnectsFromItsAddress(t *testing.T) {
 	if rc != _wasiESUCCESS {
 		t.Fatalf("Sock_accept rc=%d", rc)
 	}
-	if rc := w.Sock_getpeername(m, conn, sockNameOff); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_getpeername rc=%d", rc)
+	if rc := sockNameIPv4(w, m, conn, true, sockNameOff); rc != _wasiESUCCESS {
+		t.Fatalf("getpeername rc=%d", rc)
 	}
 	if peer := readSockName(m); peer != bound {
 		t.Fatalf("the connection came from %+v, the client was bound to %+v", peer, bound)
@@ -437,7 +437,7 @@ func TestSocket_Pair(t *testing.T) {
 	}
 	w, m := newProcTestStubs(t)
 	const fdsOff int32 = 13200
-	if rc := w.Sock_pair(m, fdsOff); rc != _wasiESUCCESS {
+	if rc := sockPairStream(w, m, fdsOff); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_pair rc=%d", rc)
 	}
 	a, b := int32(readU32(m.memory, int(fdsOff))), int32(readU32(m.memory, int(fdsOff)+4))
@@ -482,7 +482,7 @@ func TestSocket_PeerNameUntilTheConnectionIsOver(t *testing.T) {
 	if rc != _wasiESUCCESS {
 		t.Fatalf("accept rc=%d", rc)
 	}
-	peerName := func() int32 { return w.Sock_getpeername(m, client, sockValueOff) }
+	peerName := func() int32 { return sockNameIPv4(w, m, client, true, sockValueOff) }
 	if rc := peerName(); rc != 0 {
 		t.Fatalf("getpeername of the new connection rc=%d", rc)
 	}

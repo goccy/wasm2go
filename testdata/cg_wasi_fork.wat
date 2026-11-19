@@ -1,16 +1,17 @@
-;; cg_wasi_fork.wat — imports the non-standard process imports of the
-;; Go-native wasi runtime (proc_fork, proc_wait, proc_wait_any, proc_kill) so
-;; a generated bundle has to bind them to the emitted WasiStubs methods.
+;; cg_wasi_fork.wat — imports the process imports of the Go-native wasi
+;; runtime's wasmify_posix module (proc_fork, proc_wait, proc_wait_any,
+;; proc_kill) so a generated bundle has to bind them to the emitted WasiStubs
+;; methods.
 ;; Results are left in linear memory: the forked pid at 100, the pid and
 ;; status of the last successful wait at 104 and 108.
 (module
-  (import "wasi_snapshot_preview1" "proc_fork"
+  (import "wasmify_posix" "proc_fork"
     (func $proc_fork (param i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_wait"
+  (import "wasmify_posix" "proc_wait"
     (func $proc_wait (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_wait_any"
+  (import "wasmify_posix" "proc_wait_any"
     (func $proc_wait_any (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_kill"
+  (import "wasmify_posix" "proc_kill"
     (func $proc_kill (param i32 i32) (result i32)))
 
   (memory (export "memory") 1)

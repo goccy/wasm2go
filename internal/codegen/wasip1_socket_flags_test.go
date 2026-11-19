@@ -10,7 +10,7 @@ import (
 // recvFlags is one recvfrom with flags; it returns the bytes and the errno
 // (positive).
 func recvFlags(w *WasiStubs, m *Module, fd, capacity, flags int32) (string, int32) {
-	rc := w.Sock_recvfrom(m, fd, dgBufOff, capacity, flags, dgNameOff, dgLenOff)
+	rc := sockRecvfromIPv4(w, m, fd, dgBufOff, capacity, flags, dgNameOff, dgLenOff)
 	if rc != 0 {
 		return "", -rc
 	}
@@ -20,7 +20,7 @@ func recvFlags(w *WasiStubs, m *Module, fd, capacity, flags int32) (string, int3
 
 func sendFlags(w *WasiStubs, m *Module, fd int32, s string, flags int32) int32 {
 	copy(m.memory[dgBufOff:], s)
-	return -w.Sock_sendto(m, fd, dgBufOff, int32(len(s)), flags, 0, 0, 0, dgLenOff)
+	return -sockSendtoIPv4(w, m, fd, dgBufOff, int32(len(s)), flags, 0, 0, 0, dgLenOff)
 }
 
 // connectedPair returns the two ends of a TCP connection over loopback.
@@ -106,8 +106,8 @@ func TestSocket_ReceiveFlags(t *testing.T) {
 func TestDatagram_PeekLeavesTheDatagram(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	receiver := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, receiver, loopbackBE, 0); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, receiver, loopbackBE, 0); rc != _wasiESUCCESS {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	port := int32(localName(t, w, m, receiver).port)
 	sender := newDatagramSocket(t, w, m)

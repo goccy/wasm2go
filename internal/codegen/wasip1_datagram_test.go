@@ -28,12 +28,12 @@ func newDatagramSocket(t *testing.T, w *WasiStubs, m *Module) int32 {
 
 func sendTo(w *WasiStubs, m *Module, fd int32, s string, ipBE uint32, port int32) (sent uint32, rc int32) {
 	copy(m.memory[dgBufOff:], s)
-	rc = w.Sock_sendto(m, fd, dgBufOff, int32(len(s)), 0, 1, int32(ipBE), port, dgLenOff)
+	rc = sockSendtoIPv4(w, m, fd, dgBufOff, int32(len(s)), 0, 1, int32(ipBE), port, dgLenOff)
 	return readU32(m.memory, int(dgLenOff)), rc
 }
 
 func recvFrom(w *WasiStubs, m *Module, fd, capacity int32) (data string, from sockName, rc int32) {
-	rc = w.Sock_recvfrom(m, fd, dgBufOff, capacity, 0, dgNameOff, dgLenOff)
+	rc = sockRecvfromIPv4(w, m, fd, dgBufOff, capacity, 0, dgNameOff, dgLenOff)
 	if rc != 0 {
 		return "", sockName{}, rc
 	}
@@ -50,14 +50,14 @@ func TestDatagram_SendToAndReceiveFrom(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	w.SetNetAccessHook(func(string) bool { return true })
 	server := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, server, int32(loopbackBE), 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, server, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	serverName := localName(t, w, m, server)
 	if serverName.family != wasiSockFamilyIPv4 || serverName.ip != uint32(loopbackBE) || serverName.port == 0 {
 		t.Fatalf("the bound socket's name = %+v", serverName)
 	}
-	if rc := w.Sock_getpeername(m, server, sockValueOff); rc != -_wasiENOTCONN {
+	if rc := sockNameIPv4(w, m, server, true, sockValueOff); rc != -_wasiENOTCONN {
 		t.Fatalf("getpeername of an unconnected datagram socket rc=%d, want -ENOTCONN", rc)
 	}
 
@@ -108,8 +108,8 @@ func TestDatagram_ConnectedSocketSendsAndReceives(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	w.SetNetAccessHook(func(string) bool { return true })
 	server := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, server, int32(loopbackBE), 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, server, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	port := int32(localName(t, w, m, server).port)
 
@@ -117,7 +117,7 @@ func TestDatagram_ConnectedSocketSendsAndReceives(t *testing.T) {
 	if rc := w.Sock_connect(m, client, int32(loopbackBE), port); rc != 0 {
 		t.Fatalf("Sock_connect rc=%d", rc)
 	}
-	if rc := w.Sock_getpeername(m, client, sockValueOff); rc != 0 || readSockName(m).port != uint32(port) {
+	if rc := sockNameIPv4(w, m, client, true, sockValueOff); rc != 0 || readSockName(m).port != uint32(port) {
 		t.Fatalf("getpeername rc=%d name=%+v", rc, readSockName(m))
 	}
 	// send and write on a connected socket: one datagram each
@@ -130,8 +130,8 @@ func TestDatagram_ConnectedSocketSendsAndReceives(t *testing.T) {
 	// An address on a connected socket is the host's sendto's to judge:
 	// Linux sends the datagram there, the BSDs refuse it.
 	elsewhere := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, elsewhere, int32(loopbackBE), 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, elsewhere, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	_, rc := sendTo(w, m, client, "to another address", uint32(loopbackBE), int32(localName(t, w, m, elsewhere).port))
 	if runtime.GOOS == "linux" {
@@ -175,8 +175,8 @@ func TestDatagram_ReadinessNonBlockingAndSignals(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1)
 	w.SetNetAccessHook(func(string) bool { return true })
 	server := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, server, int32(loopbackBE), 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, server, int32(loopbackBE), 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	port := int32(localName(t, w, m, server).port)
 	client := newDatagramSocket(t, w, m)
@@ -218,7 +218,7 @@ func TestDatagram_IsSubjectToTheNetworkPolicy(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	w.SetNetAccessHook(func(op string) bool { return op != "listen" })
 	sock := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, sock, int32(loopbackBE), 0); rc != -_wasiEACCES {
+	if rc := sockBindIPv4(w, m, sock, int32(loopbackBE), 0); rc != -_wasiEACCES {
 		t.Fatalf("bind without the listen permission rc=%d, want -EACCES", rc)
 	}
 	var asked []string

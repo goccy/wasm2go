@@ -1342,8 +1342,14 @@ func (op *wasiOpen) addRef() {
 	op.mu.Unlock()
 }
 
-// WasiStubs is the default Go-native implementation of wasi_snapshot_preview1.
-// State is owned per-Module via NewWithWASI / DefaultWASI.
+// WasiStubs is the default Go-native implementation of wasi_snapshot_preview1
+// and of wasmify_posix, the module of the POSIX functions WASI does not have
+// (wasmify's shims declare them). One WasiStubs serves both modules of an
+// instance, so the two share its descriptors, processes and signals; the
+// methods documented as NON-STANDARD host imports are wasmify_posix's, except
+// the few marked deprecated, which modules built before wasmify_posix import
+// from wasi_snapshot_preview1. State is owned per-Module via NewWithWASI /
+// DefaultWASI.
 type WasiStubs struct {
 	mu sync.Mutex
 
@@ -1723,7 +1729,8 @@ func (w *WasiStubs) SetFSAccessHook(hook func(path string, write bool) bool) {
 // SetNetAccessHook installs a host-controlled network access policy.
 // hook is called with the operation name before each socket operation;
 // returning false denies it (EACCES). The operations are "listen" (taking a
-// local address to accept connections on: Sock_bind, Sock_listen), "accept",
+// local address to accept connections on: Sock_bind_addr, Sock_listen),
+// "accept",
 // "recv" and "send". Pass nil to clear (unrestricted, the default).
 //
 // NOTE: WASI preview1 has no outbound connect or name resolution, so a
@@ -1989,7 +1996,7 @@ func (w *WasiStubs) CloseDescriptors() error {
 	return err
 }
 
-// Fd_closefrom is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_closefrom is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_closefrom") backing closefrom(): it closes every fd numbered
 // lowFd or higher, each as fd_close would. A guest emulating exec needs it:
 // the process it started has its own descriptors, and the fds this instance
@@ -2305,7 +2312,7 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 	return out, true
 }
 
-// Proc_spawn is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Proc_spawn is a NON-STANDARD host import (module wasmify_posix,
 // name "proc_spawn") backing the bridge's posix_spawn(). It spawns a HOST
 // process: path is the executable, argv/envp are NUL-terminated char** in
 // linear memory. stdinFd/stdoutFd/stderrFd name the guest fds the child gets
@@ -2316,6 +2323,9 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // pid the guest knows the command by is written at pidOutPtr: the command's
 // own pid when the guest is the host process, a pid token otherwise.
 // Returns 0 or a negative errno.
+//
+// It is also served under wasi_snapshot_preview1, which modules built
+// before wasmify_posix existed import it from.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
 }
@@ -2631,7 +2641,7 @@ func (w *WasiStubs) inheritedFilesLocked() (files, borrowed []*os.File) {
 	return files, borrowed
 }
 
-// Fd_cloexec is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_cloexec is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_cloexec") backing fcntl's F_GETFD and F_SETFD: the close-on-exec
 // flag of a descriptor, which decides whether a command the guest starts
 // inherits it (Proc_spawn). The flag as it was is written at oldPtr (u32, 0
@@ -2730,12 +2740,15 @@ func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
 	return dst
 }
 
-// Pipe is a NON-STANDARD host import (module wasi_snapshot_preview1, name
+// Pipe is a NON-STANDARD host import (module wasmify_posix, name
 // "pipe") backing the bridge's pipe()/pipe2(). It creates a host OS pipe and
 // registers both ends as guest fds, writing [readFd, writeFd] (two i32) at
 // fdsOutPtr. The guest reads the read end via Fd_read; the write end is given
 // to a child as its stdout/stderr via Proc_spawn, so subprocess.run can
 // capture output. Returns 0 or a negative errno.
+//
+// It is also served under wasi_snapshot_preview1, which modules built
+// before wasmify_posix existed import it from.
 func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 	return w.pipe(m, zext(fdsOutPtr))
 }
@@ -2793,6 +2806,9 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 // errno: ECHILD for an unknown pid — and, when the guest ignores SIGCHLD,
 // once the process has finished — EINTR when a signal was posted to the
 // guest before the process finished.
+//
+// It is also served under wasi_snapshot_preview1, which modules built
+// before wasmify_posix existed import it from.
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
 	return w.procWait(m, pid, options, zext(statusOutPtr))
 }
@@ -3347,6 +3363,9 @@ func mapExecError(err error) int32 {
 // to an IPv4 address via Go's resolver (numeric IPs pass through), and writes
 // the 4-byte network-order address at outPtr. Returns 0 on success or a
 // negative POSIX-ish errno (the bridge maps it to an EAI_* code).
+//
+// Deprecated: modules built with a current wasmify import sock_resolve from
+// wasmify_posix instead; this one is served for modules built before.
 func (w *WasiStubs) Sock_getaddrinfo(m *Module, nodePtr, nodeLen, outPtr int32) int32 {
 	return w.sockGetaddrinfo(m, zext(nodePtr), nodeLen, zext(outPtr))
 }
@@ -4988,10 +5007,13 @@ func (w *WasiStubs) Fd_allocate64(m *Module, fd, offset, length int64) int32 {
 	return w.Fd_allocate(m, int32(fd), offset, length)
 }
 
-// Path_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Path_chmod is a NON-STANDARD host import (module wasmify_posix,
 // name "path_chmod") backing a bridge-provided chmod(): WASI preview1 has
 // no way to change file modes. The path at (pathPtr,pathLen) is
 // preopen-relative, like path_open's. Returns 0 or a negative errno.
+//
+// It is also served under wasi_snapshot_preview1, which modules built
+// before wasmify_posix existed import it from.
 func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
 	return w.pathChmod(m, zext(pathPtr), pathLen, mode)
 }
@@ -5016,7 +5038,7 @@ func (w *WasiStubs) pathChmod(m *Module, pathPtr uint64, pathLen, mode int32) in
 	return _wasiESUCCESS
 }
 
-// Fd_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_chmod is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_chmod") backing a bridge-provided fchmod(). Returns 0 or a
 // negative errno.
 func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
@@ -5040,7 +5062,7 @@ func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
 	return w.Fd_chmod(m, fd, mode)
 }
 
-// Path_access is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Path_access is a NON-STANDARD host import (module wasmify_posix,
 // name "path_access") backing access() and faccessat(): whether the program
 // may read, write or run a file, or find it at all. WASI preview1 has no
 // call that says so: wasi-libc's faccessat looks at the rights of the
@@ -5170,7 +5192,7 @@ func modeAllows(fi os.FileInfo, st fileStat, amode, uid, gid uint32, groups []ui
 	return (perm>>shift)&amode == amode
 }
 
-// Proc_umask is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Proc_umask is a NON-STANDARD host import (module wasmify_posix,
 // name "proc_umask") backing a bridge-provided umask(): it sets the
 // instance's file mode creation mask and returns the previous one. The
 // mask applies to every file and directory the instance creates from then
@@ -5212,7 +5234,7 @@ func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
 }
 
 // Path_open_mode is a NON-STANDARD host import (module
-// wasi_snapshot_preview1, name "path_open_mode") backing a bridge-provided
+// wasmify_posix, name "path_open_mode") backing a bridge-provided
 // open(): path_open cannot carry the mode argument of open(2), so every
 // file it creates gets the default 0666. This one takes the same arguments
 // for a preopen-relative path, plus that mode, and writes the new fd at
@@ -5242,7 +5264,7 @@ func (w *WasiStubs) openGuestPathMode(m *Module, dirflags int32, pathPtr uint64,
 }
 
 // Path_create_directory_mode is a NON-STANDARD host import (module
-// wasi_snapshot_preview1, name "path_create_directory_mode") backing a
+// wasmify_posix, name "path_create_directory_mode") backing a
 // bridge-provided mkdir(): path_create_directory cannot carry the mode
 // argument of mkdir(2). The path is preopen-relative. Returns 0 or a
 // negative errno.
@@ -5280,7 +5302,7 @@ func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
 	return _wasiESUCCESS
 }
 
-// Fd_flock is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_flock is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_flock") backing a bridge-provided flock(). lock is 0 to unlock,
 // 1 for a shared and 2 for an exclusive lock; wait is non-zero when the
 // call may block until the lock is granted, and otherwise a lock held
@@ -5394,7 +5416,7 @@ const (
 	recordLockWait int32 = 2 // F_SETLKW
 )
 
-// Fd_lock is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_lock is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_lock") backing fcntl's F_GETLK, F_SETLK and F_SETLKW: a POSIX
 // record lock of a file, by the host's fcntl(2). cmd is recordLockGet,
 // recordLockSet or recordLockWait, and lockPtr the lock (recordLock).
@@ -5508,7 +5530,7 @@ const (
 )
 
 // Path_filestat_ext is a NON-STANDARD host import (module
-// wasi_snapshot_preview1, name "path_filestat_ext") backing a
+// wasmify_posix, name "path_filestat_ext") backing a
 // bridge-provided stat/lstat: WASI's filestat carries neither permission
 // bits nor an owner, and its file types have no FIFO, so the bridge merges
 // them in from here. The path is preopen-relative; follow selects stat vs
@@ -5549,7 +5571,7 @@ func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow i
 }
 
 // Fd_filestat_ext is Path_filestat_ext for an open descriptor (module
-// wasi_snapshot_preview1, name "fd_filestat_ext"), backing a
+// wasmify_posix, name "fd_filestat_ext"), backing a
 // bridge-provided fstat. A descriptor that is not a file of the FS backend
 // is described as what it is to the guest: a standard stream that is a
 // file of the host as that file (a terminal, a pipe, a regular file), a
@@ -5706,7 +5728,7 @@ func (w *WasiStubs) HostDescriptor(fd int32) (hostFd uintptr, ok bool) {
 	return hostFd, true
 }
 
-// Fd_path is a NON-STANDARD host import (module wasi_snapshot_preview1, name
+// Fd_path is a NON-STANDARD host import (module wasmify_posix, name
 // "fd_path") backing fchdir(): a guest's libc keeps the working directory
 // as a path, so a directory that is known only by its descriptor has to be
 // named before it can become the working directory. The call hands back the
@@ -5768,6 +5790,9 @@ func writeFilestatExt(out []byte, fi os.FileInfo) {
 // bits, so the bridge merges the real mode in from here. The path is
 // preopen-relative; follow selects stat vs lstat semantics. Writes the
 // unix permission bits at modeOutPtr; returns 0 or a negative errno.
+//
+// Deprecated: modules built with a current wasmify import path_filestat_ext from
+// wasmify_posix instead; this one is served for modules built before.
 func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, modeOutPtr int32) int32 {
 	return w.pathFilestatMode(m, zext(pathPtr), pathLen, follow, zext(modeOutPtr))
 }
@@ -5801,10 +5826,13 @@ func (w *WasiStubs) pathFilestatMode(m *Module, pathPtr uint64, pathLen, follow 
 	return _wasiESUCCESS
 }
 
-// Fd_dup is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_dup is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_dup") backing the bridge's dup(): the new fd shares the same
 // open descriptor (offset included), and the underlying file closes only
 // when the last sharing fd does. Writes the new fd at outPtr.
+//
+// It is also served under wasi_snapshot_preview1, which modules built
+// before wasmify_posix existed import it from.
 func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
 	return w.fdDup(m, fd, zext(outPtr))
 }
@@ -5846,7 +5874,7 @@ func (w *WasiStubs) dupLocked(op *wasiOpen, min int32, out []byte) int32 {
 	return _wasiESUCCESS
 }
 
-// Fd_dupfd is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_dupfd is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_dupfd") backing fcntl's F_DUPFD: fd_dup, under the lowest free
 // number that is at least min. EINVAL for a negative min.
 func (w *WasiStubs) Fd_dupfd(m *Module, fd, min, outPtr int32) int32 {
@@ -5876,9 +5904,12 @@ func (w *WasiStubs) fdDupfd(m *Module, fd, min int32, outPtr uint64) int32 {
 	return w.dupLocked(op, min, out)
 }
 
-// Fd_dup2 is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Fd_dup2 is a NON-STANDARD host import (module wasmify_posix,
 // name "fd_dup2") backing the bridge's dup2(): to becomes another
 // reference to from's descriptor, closing whatever to previously held.
+//
+// It is also served under wasi_snapshot_preview1, which modules built
+// before wasmify_posix existed import it from.
 func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -7446,6 +7477,9 @@ func (w *WasiStubs) Proc_raise64(m *Module, sig int64) int32 {
 // differ from libc to libc): a stream socket (TCP) or a datagram socket
 // (UDP). Returns the new fd, or a negative errno: EPROTONOSUPPORT for
 // another type.
+//
+// Deprecated: modules built with a current wasmify import sock_open from
+// wasmify_posix instead; this one is served for modules built before.
 func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	// The bridge's socket() shim has already validated the family against the
 	// guest's AF_INET before calling us, so we do not re-check domain here
@@ -7497,6 +7531,9 @@ const (
 // existing Sock_send / Sock_recv / Fd_close paths drive it. Returns 0 or a
 // negative errno; see connectStream for what a blocking and a non-blocking
 // socket do. Sock_connect_addr is the same for an address of any family.
+//
+// Deprecated: modules built with a current wasmify import sock_connect_addr from
+// wasmify_posix instead; this one is served for modules built before.
 func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -7974,7 +8011,7 @@ const (
 	wasiIsolatedPPID = 1
 )
 
-// Proc_ids is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Proc_ids is a NON-STANDARD host import (module wasmify_posix,
 // name "proc_ids") backing getpid, getppid and the getuid family. It writes
 // six little-endian u32 at outPtr: pid, ppid, uid, euid, gid, egid. A
 // process made by Proc_fork has the pid it was forked under, and for a
@@ -8594,24 +8631,12 @@ func (w *WasiStubs) sockService(m *Module, namePtr uint64, nameLen, port, byPort
 	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
 }
 
-// Sock_reverse is a NON-STANDARD host import (name "sock_reverse") backing
-// gethostbyaddr and getnameinfo: the name of the host that has the IPv4
-// address ipBE (as it sits in s_addr), as the host's resolver knows it. The
-// record (writeWasiRecord) is the name, without a length prefix. The lookup
-// is subject to the resolve hook, which is asked about the address in
-// dotted form. Returns 0, or a negative errno: ENOENT when the address has
-// no name, EACCES when the hook refuses.
-func (w *WasiStubs) Sock_reverse(m *Module, ipBE, bufPtr, bufLen, neededPtr int32) int32 {
-	return w.reverseLookup(m, socketIPv4(ipBE), zext(bufPtr), bufLen, zext(neededPtr))
-}
-
-// Sock_reverse64 is Sock_reverse for a memory64 guest.
-func (w *WasiStubs) Sock_reverse64(m *Module, ipBE int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
-	return w.reverseLookup(m, socketIPv4(ipBE), uint64(bufPtr), bufLen, uint64(neededPtr))
-}
-
-// reverseLookup is Sock_reverse for the IP address ip, of either family,
-// written in numbers.
+// reverseLookup writes the record of the name of the host that has the IP
+// address ip, of either family, written in numbers, as the host's resolver
+// knows it: the name, without a length prefix (writeWasiRecord). The lookup
+// is subject to the resolve hook, which is asked about ip. Returns 0, or a
+// negative errno: ENOENT when the address has no name, EACCES when the hook
+// refuses.
 func (w *WasiStubs) reverseLookup(m *Module, ip string, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	w.mu.Lock()
 	hook := w.resolveHook
@@ -8633,9 +8658,10 @@ func (w *WasiStubs) reverseLookup(m *Module, ip string, bufPtr uint64, bufLen in
 // "sock_host_by_name") backing gethostbyname(): the IPv4 addresses of the
 // host named at (nodePtr, nodeLen), and its official name, as the host's
 // gethostbyname finds them where the runtime can call it (darwin: the C
-// library's gethostbyname2, which is what perl calls there), and as the
-// runtime's resolver finds them otherwise (the official name is then the
-// name asked about). It is an import of its own, and not Sock_resolve's
+// library's gethostbyname2, which is what a C program's gethostbyname
+// amounts to there), and as the runtime's resolver finds them otherwise
+// (the official name is then the name asked about). It is an import of its
+// own, and not Sock_resolve's
 // lookup of IPv4 addresses, because the two lookups differ on a host where
 // getaddrinfo does more than gethostbyname: darwin's sorts the addresses it
 // finds, for which it opens, and keeps, a socket to the system that
@@ -9795,7 +9821,7 @@ func (w *WasiStubs) zoneMoment(tz string, named bool, t int64, local bool) wasiZ
 // Clock_zone writes, its terminating NUL included.
 const wasiZoneNameSize = 16
 
-// Clock_zone is a NON-STANDARD host import (module wasi_snapshot_preview1,
+// Clock_zone is a NON-STANDARD host import (module wasmify_posix,
 // name "clock_zone") backing the time zone side of a guest's libc
 // (localtime, mktime, strftime's %z and %Z, tzset). (tzPtr, tzLen) is the
 // zone the guest names — the value of its TZ variable — when hasTZ is
@@ -9912,7 +9938,7 @@ func syslogResult(err error) int32 {
 }
 
 // Proc_syslog_open is a NON-STANDARD host import (module
-// wasi_snapshot_preview1, name "proc_syslog_open") backing openlog(): the
+// wasmify_posix, name "proc_syslog_open") backing openlog(): the
 // guest is about to log as (identPtr, identLen) with the given option flags
 // (SyslogOpt*) and default facility number. Returns 0 when the embedder's
 // Syslogger accepts, or a negative errno: ENOSYS when the instance has no
@@ -10277,7 +10303,7 @@ func (w *WasiStubs) interruptDue() bool {
 }
 
 // Proc_signal_register is a NON-STANDARD host import (module
-// wasi_snapshot_preview1, name "proc_signal_register"). The guest names the
+// wasmify_posix, name "proc_signal_register"). The guest names the
 // 32-bit word in its memory that the host sets to 1 whenever a signal is
 // waiting to be taken. A guest calls it whenever it may be running in a
 // module instance the host has not seen yet (a snapshot or fork copy of the
@@ -11159,16 +11185,9 @@ func mapNetError(err error) int32 {
 	return mapOSError(err)
 }
 
-// socketIPv4 renders the address of a sock_bind / sock_connect call: ipBE
-// holds the four octets as they sat in sockaddr_in.sin_addr (the low byte is
-// the first octet).
-func socketIPv4(ipBE int32) string {
-	u := uint32(ipBE)
-	return fmt.Sprintf("%d.%d.%d.%d", u&0xff, (u>>8)&0xff, (u>>16)&0xff, (u>>24)&0xff)
-}
-
-// ipv4SockAddr is the address of a sock_bind / sock_connect call as a
-// socket address: ipBE as socketIPv4 describes it, port in host byte order.
+// ipv4SockAddr is the address of a sock_connect call as a socket address:
+// ipBE holds the four octets as they sat in sockaddr_in.sin_addr (the low
+// byte is the first octet), port is in host byte order.
 func ipv4SockAddr(ipBE, port int32) wasiSockAddr {
 	u := uint32(ipBE)
 	return wasiSockAddr{
@@ -11176,34 +11195,6 @@ func ipv4SockAddr(ipBE, port int32) wasiSockAddr {
 		ip:     net.IP{byte(u), byte(u >> 8), byte(u >> 16), byte(u >> 24)},
 		port:   int(uint16(port)),
 	}
-}
-
-// Sock_bind is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "sock_bind") backing bind() for an IPv4 stream socket: the socket
-// gets the local address ipBE:port (ipBE as in Sock_connect; port in host
-// byte order, 0 for one the host picks). The host's network API binds and
-// listens in one step, so the address is taken — and connections to it
-// queue — from here on; the guest's accept still needs its listen (see
-// Sock_listen). Subject to the network policy's "listen" operation. Returns
-// 0, or a negative errno: EADDRINUSE, EADDRNOTAVAIL, EACCES, EINVAL for a
-// socket that is already bound or connected. Sock_bind_addr is the same for
-// an address of any family.
-func (w *WasiStubs) Sock_bind(m *Module, fd, ipBE, port int32) int32 {
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	if op == nil {
-		return -_wasiEBADF
-	}
-	if !op.isSocket {
-		return -_wasiENOTSOCK
-	}
-	return -w.bindSocket(op, ipv4SockAddr(ipBE, port), "")
-}
-
-// Sock_bind64 is Sock_bind for a memory64 guest.
-func (w *WasiStubs) Sock_bind64(m *Module, fd, ipBE, port int32) int32 {
-	return w.Sock_bind(m, fd, ipBE, port)
 }
 
 // attachListener makes l the listener of a socket entry, unless the entry
@@ -11286,128 +11277,6 @@ const (
 	wasiSockFamilyUnix = 2
 	wasiSockFamilyIPv6 = 3
 )
-
-// writeSockName writes a socket name at outPtr as three little-endian u32:
-// the family (wasiSockFamily*), the IPv4 address with its first octet in the
-// low byte, and the port. A name that is not an IPv4 one has only a family.
-func (w *WasiStubs) writeSockName(m *Module, addr net.Addr, outPtr uint64) int32 {
-	out := w.memBytes(m, outPtr, 12)
-	if out == nil {
-		return -_wasiEFAULT
-	}
-	var family, ip, port uint32
-	switch a := addr.(type) {
-	case *net.TCPAddr:
-		family = wasiSockFamilyIPv4
-		if v4 := a.IP.To4(); v4 != nil {
-			ip = binary.LittleEndian.Uint32(v4)
-		}
-		port = uint32(a.Port)
-	case *net.UDPAddr:
-		family = wasiSockFamilyIPv4
-		if v4 := a.IP.To4(); v4 != nil {
-			ip = binary.LittleEndian.Uint32(v4)
-		}
-		port = uint32(a.Port)
-	case *net.UnixAddr:
-		family = wasiSockFamilyUnix
-	case nil:
-		// a socket that is not bound yet: the unspecified address
-		family = wasiSockFamilyIPv4
-	default:
-		return -_wasiENOTSUP
-	}
-	binary.LittleEndian.PutUint32(out[0:], family)
-	binary.LittleEndian.PutUint32(out[4:], ip)
-	binary.LittleEndian.PutUint32(out[8:], port)
-	return _wasiESUCCESS
-}
-
-// Sock_getsockname is a NON-STANDARD host import (name "sock_getsockname")
-// backing getsockname(): the local name of the socket (see writeSockName) —
-// the address it listens on, the local end of its connection, or the
-// unspecified address while it has neither. Returns 0 or a negative errno.
-func (w *WasiStubs) Sock_getsockname(m *Module, fd, outPtr int32) int32 {
-	return w.sockGetsockname(m, fd, zext(outPtr))
-}
-
-// Sock_getsockname64 is Sock_getsockname for a memory64 guest.
-func (w *WasiStubs) Sock_getsockname64(m *Module, fd int32, outPtr int64) int32 {
-	return w.sockGetsockname(m, fd, uint64(outPtr))
-}
-
-// sockGetsockname is the body of Sock_getsockname and Sock_getsockname64.
-func (w *WasiStubs) sockGetsockname(m *Module, fd int32, outPtr uint64) int32 {
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	if op == nil {
-		return -_wasiEBADF
-	}
-	if h := op.host(); h != nil {
-		addr, errno := op.hostSocketName(h, false)
-		if errno != _wasiESUCCESS {
-			return -errno
-		}
-		return w.writeSockName(m, addr, outPtr)
-	}
-	if conn := op.netConn(); conn != nil {
-		return w.writeSockName(m, conn.LocalAddr(), outPtr)
-	}
-	if l, _ := op.netListener(); l != nil {
-		return w.writeSockName(m, l.Addr(), outPtr)
-	}
-	if !op.isSocket {
-		return -_wasiENOTSOCK
-	}
-	return w.writeSockName(m, nil, outPtr)
-}
-
-// Sock_getpeername is a NON-STANDARD host import (name "sock_getpeername")
-// backing getpeername(): the name of the socket's peer (see writeSockName).
-// Returns 0, or a negative errno: ENOTCONN for a socket without a
-// connection.
-func (w *WasiStubs) Sock_getpeername(m *Module, fd, outPtr int32) int32 {
-	return w.sockGetpeername(m, fd, zext(outPtr))
-}
-
-// Sock_getpeername64 is Sock_getpeername for a memory64 guest.
-func (w *WasiStubs) Sock_getpeername64(m *Module, fd int32, outPtr int64) int32 {
-	return w.sockGetpeername(m, fd, uint64(outPtr))
-}
-
-// sockGetpeername is the body of Sock_getpeername and Sock_getpeername64.
-func (w *WasiStubs) sockGetpeername(m *Module, fd int32, outPtr uint64) int32 {
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	if op == nil {
-		return -_wasiEBADF
-	}
-	if h := op.host(); h != nil {
-		addr, errno := op.hostSocketName(h, true)
-		if errno != _wasiESUCCESS {
-			return -errno
-		}
-		return w.writeSockName(m, addr, outPtr)
-	}
-	conn := op.netConn()
-	if conn == nil {
-		if l, _ := op.netListener(); l == nil && !op.isSocket {
-			return -_wasiENOTSOCK
-		}
-		return -_wasiENOTCONN
-	}
-	peer := conn.RemoteAddr()
-	if peer == nil {
-		// a datagram socket that is bound and not connected
-		return -_wasiENOTCONN
-	}
-	if errno := op.peerLost(conn); errno != _wasiESUCCESS {
-		return -errno
-	}
-	return w.writeSockName(m, peer, outPtr)
-}
 
 // peerLost asks the host whether the stream connection conn of op still has
 // its peer, and returns 0 while it has. A connection that is over — closed
@@ -11664,34 +11533,6 @@ func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int
 		return -_wasiENOPROTOOPT
 	}
 	binary.LittleEndian.PutUint32(out, uint32(value))
-	return _wasiESUCCESS
-}
-
-// Sock_pair is a NON-STANDARD host import (name "sock_pair") backing
-// socketpair(AF_UNIX, SOCK_STREAM): it creates a pair of connected stream
-// sockets and writes their two fds (i32 each) at fdsOutPtr. Returns 0 or a
-// negative errno (ENOTSUP on a host without socket pairs).
-func (w *WasiStubs) Sock_pair(m *Module, fdsOutPtr int32) int32 {
-	return w.sockPair(m, zext(fdsOutPtr))
-}
-
-// Sock_pair64 is Sock_pair for a memory64 guest.
-func (w *WasiStubs) Sock_pair64(m *Module, fdsOutPtr int64) int32 {
-	return w.sockPair(m, uint64(fdsOutPtr))
-}
-
-// sockPair is the body of Sock_pair and Sock_pair64.
-func (w *WasiStubs) sockPair(m *Module, fdsOutPtr uint64) int32 {
-	out := w.memBytes(m, fdsOutPtr, 8)
-	if out == nil {
-		return -_wasiEFAULT
-	}
-	afd, bfd, errno := w.openSocketPair(false)
-	if errno != _wasiESUCCESS {
-		return -errno
-	}
-	binary.LittleEndian.PutUint32(out[0:], uint32(afd))
-	binary.LittleEndian.PutUint32(out[4:], uint32(bfd))
 	return _wasiESUCCESS
 }
 
@@ -12048,172 +11889,6 @@ func (w *WasiStubs) receiveDatagram(op *wasiOpen, conn datagramSocket, bufs [][]
 		n += uint64(c)
 	}
 	return n, from, _wasiESUCCESS
-}
-
-// Sock_sendto is a NON-STANDARD host import (name "sock_sendto") backing
-// sendto(): it sends the bytes at (bufPtr, bufLen) on the socket fd and
-// writes the count sent (u32) at sentPtr. With hasAddr set, a datagram
-// socket sends the datagram to ipBE:port (as in Sock_connect), which is
-// subject to the dial policy with the network "udp"; a socket that has no
-// local address yet gets one the host picks. Without an address — and on a
-// stream socket, where an address means nothing — it is a send to the
-// socket's peer. flags are the send's (wasiMsgDontWait, wasiMsgNoSignal).
-// Returns 0, or a negative errno: ENOTCONN (EDESTADDRREQ's place) for no
-// address on an unconnected datagram socket, and for an address on a
-// connected one what the host's sendto says (see sendDatagram).
-func (w *WasiStubs) Sock_sendto(m *Module, fd, bufPtr, bufLen, flags, hasAddr, ipBE, port, sentPtr int32) int32 {
-	return w.sockSendto(m, fd, zext(bufPtr), bufLen, flags, hasAddr, ipBE, port, zext(sentPtr))
-}
-
-// Sock_sendto64 is Sock_sendto for a memory64 guest.
-func (w *WasiStubs) Sock_sendto64(m *Module, fd int32, bufPtr int64, bufLen, flags, hasAddr, ipBE, port int32, sentPtr int64) int32 {
-	return w.sockSendto(m, fd, uint64(bufPtr), bufLen, flags, hasAddr, ipBE, port, uint64(sentPtr))
-}
-
-// sockSendto is the body of Sock_sendto and Sock_sendto64.
-func (w *WasiStubs) sockSendto(m *Module, fd int32, bufPtr uint64, bufLen, flags, hasAddr, ipBE, port int32, sentPtr uint64) int32 {
-	if !w.checkNet("send") {
-		return -_wasiEACCES
-	}
-	buf := w.memBytes(m, bufPtr, zext(bufLen))
-	out := w.memBytes(m, sentPtr, 4)
-	if (buf == nil && bufLen != 0) || out == nil {
-		return -_wasiEFAULT
-	}
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	hook := w.dialHook
-	w.mu.Unlock()
-	if op == nil {
-		return -_wasiEBADF
-	}
-	if !op.isSocket && op.netConn() == nil {
-		return -_wasiENOTSOCK
-	}
-	h := op.host()
-	if !op.dgram || hasAddr == 0 {
-		if h != nil {
-			n, errno := w.sendHost(op, h, [][]byte{buf}, nil, flags)
-			binary.LittleEndian.PutUint32(out, uint32(n))
-			return -errno
-		}
-		conn := op.netConn()
-		if conn == nil || (op.dgram && conn.RemoteAddr() == nil) {
-			return -_wasiENOTCONN
-		}
-		n, errno := w.sendFd(op, conn, [][]byte{buf}, flags)
-		binary.LittleEndian.PutUint32(out, uint32(n))
-		return -errno
-	}
-	ip := socketIPv4(ipBE)
-	p := int(uint16(port))
-	w.mu.Lock()
-	host := w.resolvedHosts[ip]
-	w.mu.Unlock()
-	if hook != nil && !hook("udp", host, ip, p) {
-		return -_wasiEACCES
-	}
-	if h != nil {
-		n, errno := w.sendHost(op, h, [][]byte{buf}, ipv4SockAddr(ipBE, port).hostSockaddr(""), flags)
-		binary.LittleEndian.PutUint32(out, uint32(n))
-		return -errno
-	}
-	conn, errno := op.datagramConn()
-	if errno != _wasiESUCCESS {
-		return -errno
-	}
-	n, err := sendDatagram(op, conn, buf, &net.UDPAddr{IP: net.ParseIP(ip), Port: p})
-	if err != nil {
-		return -w.writeFailure(err, flags)
-	}
-	binary.LittleEndian.PutUint32(out, uint32(n))
-	return _wasiESUCCESS
-}
-
-// Sock_recvfrom is a NON-STANDARD host import (name "sock_recvfrom") backing
-// recvfrom(): it receives into (bufPtr, bufLen), writes the count received
-// (u32) at receivedPtr and the sender's name at namePtr (see writeSockName;
-// a name of family 0 when there is none to give). A datagram socket hands
-// over one datagram, cut to the buffer, and names who sent it; a stream
-// socket receives like Sock_recv and names its peer. flags are the
-// receive's (wasiMsgPeek, wasiMsgWaitAll, wasiMsgDontWait). Returns 0, or a
-// negative errno: EAGAIN on a non-blocking socket with nothing to receive,
-// EINTR when a signal is posted to the guest while it waits.
-func (w *WasiStubs) Sock_recvfrom(m *Module, fd, bufPtr, bufLen, flags, namePtr, receivedPtr int32) int32 {
-	return w.sockRecvfrom(m, fd, zext(bufPtr), bufLen, flags, zext(namePtr), zext(receivedPtr))
-}
-
-// Sock_recvfrom64 is Sock_recvfrom for a memory64 guest.
-func (w *WasiStubs) Sock_recvfrom64(m *Module, fd int32, bufPtr int64, bufLen, flags int32, namePtr, receivedPtr int64) int32 {
-	return w.sockRecvfrom(m, fd, uint64(bufPtr), bufLen, flags, uint64(namePtr), uint64(receivedPtr))
-}
-
-// sockRecvfrom is the body of Sock_recvfrom and Sock_recvfrom64.
-func (w *WasiStubs) sockRecvfrom(m *Module, fd int32, bufPtr uint64, bufLen, flags int32, namePtr, receivedPtr uint64) int32 {
-	if !w.checkNet("recv") {
-		return -_wasiEACCES
-	}
-	buf := w.memBytes(m, bufPtr, zext(bufLen))
-	out := w.memBytes(m, receivedPtr, 4)
-	name := w.memBytes(m, namePtr, 12)
-	if (buf == nil && bufLen != 0) || out == nil || name == nil {
-		return -_wasiEFAULT
-	}
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	if op == nil {
-		return -_wasiEBADF
-	}
-	if !op.isSocket && op.netConn() == nil {
-		return -_wasiENOTSOCK
-	}
-	for i := range name {
-		name[i] = 0
-	}
-	if h := op.host(); h != nil {
-		n, from, errno := w.receiveFromHost(op, h, buf, flags)
-		if errno != _wasiESUCCESS {
-			return -errno
-		}
-		binary.LittleEndian.PutUint32(out, uint32(n))
-		if from != nil {
-			if rc := w.writeSockName(m, from, namePtr); rc != -_wasiENOTSUP {
-				return rc
-			}
-		}
-		return _wasiESUCCESS
-	}
-	if op.dgram {
-		conn, errno := op.datagramConn()
-		if errno != _wasiESUCCESS {
-			return -errno
-		}
-		n, from, errno := w.receiveDatagram(op, conn, [][]byte{buf}, flags)
-		if errno != _wasiESUCCESS {
-			return -errno
-		}
-		binary.LittleEndian.PutUint32(out, uint32(n))
-		if from != nil {
-			return w.writeSockName(m, from, namePtr)
-		}
-		return _wasiESUCCESS
-	}
-	conn := op.netConn()
-	if conn == nil {
-		return -_wasiENOTCONN
-	}
-	n, errno := w.receiveStream(op, conn, [][]byte{buf}, flags)
-	if errno != _wasiESUCCESS {
-		return -errno
-	}
-	binary.LittleEndian.PutUint32(out, uint32(n))
-	if peer := conn.RemoteAddr(); peer != nil {
-		if rc := w.writeSockName(m, peer, namePtr); rc != -_wasiENOTSUP {
-			return rc
-		}
-	}
-	return _wasiESUCCESS
 }
 
 // wasiFdflagNonblock is the O_NONBLOCK bit of the fdflags (fd_fdstat_set_flags).
@@ -13204,11 +12879,18 @@ func (w *WasiStubs) sockName(m *Module, fd, peer int32, addrPtr uint64) int32 {
 }
 
 // Sock_sendto_addr is a NON-STANDARD host import (name "sock_sendto_addr")
-// backing sendto() for a socket of any family: Sock_sendto with the
-// destination as an address record at addrPtr (0 for none), and its path
-// at (pathPtr, pathLen) for a Unix-domain one. A datagram to an address is
-// subject to the dial policy, as connecting to it is. Returns 0 or a
-// negative errno.
+// backing sendto() for a socket of any family: it sends the bytes at
+// (bufPtr, bufLen) on the socket fd and writes the count sent (u32) at
+// sentPtr. With an address record at addrPtr (0 for none), and its path at
+// (pathPtr, pathLen) for a Unix-domain one, a datagram socket sends the
+// datagram there, which is subject to the dial policy as connecting to it
+// is; a socket that has no local address yet gets one the host picks.
+// Without an address — and on a stream socket, where an address means
+// nothing — it is a send to the socket's peer. flags are the send's
+// (wasiMsgDontWait, wasiMsgNoSignal). Returns 0, or a negative errno:
+// ENOTCONN (EDESTADDRREQ's place) for no address on an unconnected
+// datagram socket, and for an address on a connected one what the host's
+// sendto says (see sendDatagram).
 func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, pathPtr, pathLen, sentPtr int32) int32 {
 	return w.sockSendtoAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(pathPtr), pathLen, zext(sentPtr))
 }
@@ -13317,10 +12999,16 @@ func sendDatagram(op *wasiOpen, conn datagramSocket, buf []byte, to net.Addr) (i
 }
 
 // Sock_recvfrom_addr is a NON-STANDARD host import (name
-// "sock_recvfrom_addr") backing recvfrom() for a socket of any family:
-// Sock_recvfrom with the sender's name written as an address record at
-// addrPtr — of family 0 when there is none to give, as for a datagram from
-// a Unix-domain socket that has no name. Returns 0 or a negative errno.
+// "sock_recvfrom_addr") backing recvfrom() for a socket of any family: it
+// receives into (bufPtr, bufLen), writes the count received (u32) at
+// receivedPtr and the sender's name as an address record at addrPtr — of
+// family 0 when there is none to give, as for a datagram from a Unix-domain
+// socket that has no name. A datagram socket hands over one datagram, cut to
+// the buffer, and names who sent it; a stream socket receives like Sock_recv
+// and names its peer. flags are the receive's (wasiMsgPeek, wasiMsgWaitAll,
+// wasiMsgDontWait). Returns 0, or a negative errno: EAGAIN on a non-blocking
+// socket with nothing to receive, EINTR when a signal is posted to the guest
+// while it waits.
 func (w *WasiStubs) Sock_recvfrom_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, receivedPtr int32) int32 {
 	return w.sockRecvfromAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(receivedPtr))
 }
@@ -13645,7 +13333,6 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"parsePosixZone":            true,
 			"locationMoment":            true,
 			"mapNetError":               true,
-			"socketIPv4":                true,
 			"ipv4SockAddr":              true,
 			"scopeOfZone":               true,
 			"writeSockAddrRecord":       true,
@@ -14034,7 +13721,7 @@ func (t *translator) wasmImportsWasi() bool {
 // wasip1_native_other.go), follow.
 
 // Sys_syscall is a NON-STANDARD host import (name "sys_syscall") backing
-// perl's syscall(): the host's system call of the number, with the nargs
+// syscall(2): the host's system call of the number, with the nargs
 // (at most six) u64 arguments at argsPtr; an argument whose bit is set in
 // ptrs is an address of the guest's memory (a string's buffer), which the
 // call is given as the address the process has it at. Its result is
@@ -14184,11 +13871,12 @@ func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, p
 // ----- System V IPC ---------------------------------------------------------
 //
 // The NON-STANDARD imports ipc_get, ipc_ctl, ipc_semop, ipc_msgsnd,
-// ipc_msgrcv and ipc_shmcopy back the C library's System V IPC (perl-wasm's
-// perl_ipc.cc): the host's semaphore sets, message queues and shared memory
+// ipc_msgrcv and ipc_shmcopy back the C library's System V IPC (wasmify's
+// shims): the host's semaphore sets, message queues and shared memory
 // segments, which other processes of the system share. The guest names
 // them in its C library's numbers (Linux's) and lays their structures out
-// as Linux does on a 64-bit architecture (scripts/include/sys/ipc.h); the
+// as Linux does on a 64-bit architecture (the sys/ipc.h, sem.h, msg.h and
+// shm.h of wasmify's shims); the
 // host translates both into its own (hostIPCCtl and the other functions
 // of the platform's file). A guest that is not the host process gets
 // ENOSYS, as for sys_syscall: the objects are the system's. Each returns 0
@@ -14353,10 +14041,11 @@ func (w *WasiStubs) ipcMsgrcv(m *Module, id int32, msgPtr, size uint64, typ int6
 	return _wasiESUCCESS
 }
 
-// Ipc_shmcopy backs perl's shmread and shmwrite (shm_copy): size bytes
-// between the segment id, from its byte pos, and bufPtr; into bufPtr when
-// write is 0, out of it otherwise. A segment cannot be mapped into the
-// guest's memory, so the host attaches it to its own for the copy.
+// Ipc_shmcopy copies size bytes between the shared memory segment id, from
+// its byte pos, and bufPtr: into bufPtr when write is 0, out of it
+// otherwise. A segment cannot be mapped into the guest's memory, so shmat
+// cannot give the guest a segment; this copy is how a guest reads and writes
+// one (the host attaches it to its own memory for the copy).
 func (w *WasiStubs) Ipc_shmcopy(m *Module, id, bufPtr int32, pos, size int64, write int32) int32 {
 	return w.ipcShmcopy(m, id, zext(bufPtr), uint64(pos), uint64(size), write)
 }

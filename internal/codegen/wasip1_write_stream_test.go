@@ -263,7 +263,7 @@ func TestSocket_NonBlockingSendTakesWhatFits(t *testing.T) {
 	skipWithoutStreamWrites(t)
 	w, m := newProcTestStubs(t)
 	const fdsOff int32 = 13200
-	if rc := w.Sock_pair(m, fdsOff); rc != _wasiESUCCESS {
+	if rc := sockPairStream(w, m, fdsOff); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_pair rc=%d", rc)
 	}
 	a, b := int32(readU32(m.memory, int(fdsOff))), int32(readU32(m.memory, int(fdsOff)+4))

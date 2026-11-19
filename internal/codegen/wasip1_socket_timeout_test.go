@@ -20,8 +20,8 @@ func TestSocket_AcceptingOption(t *testing.T) {
 	if got := accepting(fd); got != 0 {
 		t.Errorf("a new socket accepts: %d", got)
 	}
-	if rc := w.Sock_bind(m, fd, loopbackBE, 0); rc != _wasiESUCCESS {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, fd, loopbackBE, 0); rc != _wasiESUCCESS {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	if got := accepting(fd); got != 0 {
 		t.Errorf("a bound socket accepts: %d", got)

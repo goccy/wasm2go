@@ -52,8 +52,9 @@ type ipcField struct {
 	guest, guestSize, host, hostSize int
 }
 
-// The guest's structures (perl-wasm's scripts/include/sys/*.h): their
-// sizes, and the fields each kind has where the guest has them.
+// The guest's structures (Linux's on a 64-bit architecture, as the sys/*.h
+// of wasmify's shims declare them): their sizes, and the fields each kind
+// has where the guest has them.
 var ipcGuestSize = map[int32]int{ipcKindMsg: 120, ipcKindSem: 88, ipcKindShm: 112}
 
 // The fields of the guest's structures that tell how big an object is:

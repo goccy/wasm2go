@@ -1,13 +1,14 @@
-;; wasip1_mem64_imports.wat — a memory64 module that imports every
-;; wasi_snapshot_preview1 name WasiStubs binds (all the Perl interpreter
-;; uses, and the rest: fd_pread, the legacy sock_* imports, ...), each with
-;; its wasm64 signature: every argument of a standard import widened to i64
-;; (as the wasm2go port of wasi-libc declares them; proc_raise, which that
-;; C library no longer declares, the same way), and for a non-standard one
-;; an i64 for every pointer, long and size_t and an i32 for every int and
-;; unsigned of its C declaration. Its translation must compile against the
-;; *64 bindings of WasiStubs. touch calls every import once so none of them
-;; can be dropped as unused; nothing runs it.
+;; wasip1_mem64_imports.wat — a memory64 module that imports every name
+;; WasiStubs binds, from the module that serves it: wasi_snapshot_preview1
+;; for WASI's own functions (and the four legacy ones still served there),
+;; wasmify_posix for the rest. Each has its wasm64 signature: every argument
+;; of a standard import widened to i64 (as the wasm2go port of wasi-libc
+;; declares them; proc_raise, which that C library no longer declares, the
+;; same way), and for a wasmify_posix one an i64 for every pointer, long and
+;; size_t and an i32 for every int and unsigned of its C declaration. Its
+;; translation must compile against the *64 bindings of WasiStubs. touch
+;; calls every import once so none of them can be dropped as unused; nothing
+;; runs it.
 (module
   (import "wasi_snapshot_preview1" "args_get"
     (func $args_get (param i64 i64) (result i32)))
@@ -81,167 +82,167 @@
     (func $sock_accept (param i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_shutdown"
     (func $sock_shutdown (param i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_spawn"
+  (import "wasmify_posix" "proc_spawn"
     (func $proc_spawn (param i64 i64 i64 i32 i32 i32 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_wait"
+  (import "wasmify_posix" "proc_wait"
     (func $proc_wait (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_wait_any"
+  (import "wasmify_posix" "proc_wait_any"
     (func $proc_wait_any (param i32 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "pipe"
+  (import "wasmify_posix" "pipe"
     (func $pipe (param i64) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_dup"
+  (import "wasmify_posix" "fd_dup"
     (func $fd_dup (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_dupfd"
+  (import "wasmify_posix" "fd_dupfd"
     (func $fd_dupfd (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_lock"
+  (import "wasmify_posix" "fd_lock"
     (func $fd_lock (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_dup2"
+  (import "wasmify_posix" "fd_dup2"
     (func $fd_dup2 (param i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_cloexec"
+  (import "wasmify_posix" "fd_cloexec"
     (func $fd_cloexec (param i32 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_open"
+  (import "wasmify_posix" "sock_open"
     (func $sock_open (param i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_connect_addr"
+  (import "wasmify_posix" "sock_connect_addr"
     (func $sock_connect_addr (param i32 i64 i64 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_bind_addr"
+  (import "wasmify_posix" "sock_bind_addr"
     (func $sock_bind_addr (param i32 i64 i64 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_resolve"
+  (import "wasmify_posix" "sock_resolve"
     (func $sock_resolve (param i64 i32 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_host_by_name"
+  (import "wasmify_posix" "sock_host_by_name"
     (func $sock_host_by_name (param i64 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_reverse_addr"
+  (import "wasmify_posix" "sock_reverse_addr"
     (func $sock_reverse_addr (param i64 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_service"
+  (import "wasmify_posix" "sock_service"
     (func $sock_service (param i64 i32 i32 i32 i64 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_listen"
+  (import "wasmify_posix" "sock_listen"
     (func $sock_listen (param i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_name"
+  (import "wasmify_posix" "sock_name"
     (func $sock_name (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_addr_to_host"
+  (import "wasmify_posix" "sock_addr_to_host"
     (func $sock_addr_to_host (param i64 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_addr_from_host"
+  (import "wasmify_posix" "sock_addr_from_host"
     (func $sock_addr_from_host (param i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_sendto_addr"
+  (import "wasmify_posix" "sock_sendto_addr"
     (func $sock_sendto_addr (param i32 i64 i32 i32 i64 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_recvfrom_addr"
+  (import "wasmify_posix" "sock_recvfrom_addr"
     (func $sock_recvfrom_addr (param i32 i64 i32 i32 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_timeout"
+  (import "wasmify_posix" "sock_timeout"
     (func $sock_timeout (param i32 i32 i32 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_setopt"
+  (import "wasmify_posix" "sock_setopt"
     (func $sock_setopt (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_getopt"
+  (import "wasmify_posix" "sock_getopt"
     (func $sock_getopt (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_socketpair"
+  (import "wasmify_posix" "sock_socketpair"
     (func $sock_socketpair (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "path_chmod"
+  (import "wasmify_posix" "path_chmod"
     (func $path_chmod (param i64 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_chmod"
+  (import "wasmify_posix" "fd_chmod"
     (func $fd_chmod (param i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "path_access"
+  (import "wasmify_posix" "path_access"
     (func $path_access (param i64 i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "path_filestat_ext"
+  (import "wasmify_posix" "path_filestat_ext"
     (func $path_filestat_ext (param i64 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_filestat_ext"
+  (import "wasmify_posix" "fd_filestat_ext"
     (func $fd_filestat_ext (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_umask"
+  (import "wasmify_posix" "proc_umask"
     (func $proc_umask (param i32) (result i32)))
-  (import "wasi_snapshot_preview1" "path_open_mode"
+  (import "wasmify_posix" "path_open_mode"
     (func $path_open_mode (param i32 i64 i32 i32 i64 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "path_create_directory_mode"
+  (import "wasmify_posix" "path_create_directory_mode"
     (func $path_create_directory_mode (param i64 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_chdir"
+  (import "wasmify_posix" "proc_chdir"
     (func $proc_chdir (param i64 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_flock"
+  (import "wasmify_posix" "fd_flock"
     (func $fd_flock (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "host_numbering"
+  (import "wasmify_posix" "host_numbering"
     (func $host_numbering (result i32)))
-  (import "wasi_snapshot_preview1" "host_number_at"
+  (import "wasmify_posix" "host_number_at"
     (func $host_number_at (param i32 i32 i64 i32 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_ioctl"
+  (import "wasmify_posix" "fd_ioctl"
     (func $fd_ioctl (param i32 i32 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_ids"
+  (import "wasmify_posix" "proc_ids"
     (func $proc_ids (param i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_groups"
+  (import "wasmify_posix" "proc_groups"
     (func $proc_groups (param i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_user_by_id"
+  (import "wasmify_posix" "proc_user_by_id"
     (func $proc_user_by_id (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_user_at"
+  (import "wasmify_posix" "proc_user_at"
     (func $proc_user_at (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_group_at"
+  (import "wasmify_posix" "proc_group_at"
     (func $proc_group_at (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_user_by_name"
+  (import "wasmify_posix" "proc_user_by_name"
     (func $proc_user_by_name (param i64 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_group_by_id"
+  (import "wasmify_posix" "proc_group_by_id"
     (func $proc_group_by_id (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_group_by_name"
+  (import "wasmify_posix" "proc_group_by_name"
     (func $proc_group_by_name (param i64 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_setids"
+  (import "wasmify_posix" "proc_setids"
     (func $proc_setids (param i32 i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_setgroups"
+  (import "wasmify_posix" "proc_setgroups"
     (func $proc_setgroups (param i64 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_path"
+  (import "wasmify_posix" "fd_path"
     (func $fd_path (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "path_chown"
+  (import "wasmify_posix" "path_chown"
     (func $path_chown (param i64 i32 i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_chown"
+  (import "wasmify_posix" "fd_chown"
     (func $fd_chown (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "path_mkfifo"
+  (import "wasmify_posix" "path_mkfifo"
     (func $path_mkfifo (param i64 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_getpgid"
+  (import "wasmify_posix" "proc_getpgid"
     (func $proc_getpgid (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_setpgid"
+  (import "wasmify_posix" "proc_setpgid"
     (func $proc_setpgid (param i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_setsid"
+  (import "wasmify_posix" "proc_setsid"
     (func $proc_setsid (param i64) (result i32)))
-  (import "wasi_snapshot_preview1" "tty_getattr"
+  (import "wasmify_posix" "tty_getattr"
     (func $tty_getattr (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "tty_setattr"
+  (import "wasmify_posix" "tty_setattr"
     (func $tty_setattr (param i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "tty_speed"
+  (import "wasmify_posix" "tty_speed"
     (func $tty_speed (param i64 i32 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "tty_control"
+  (import "wasmify_posix" "tty_control"
     (func $tty_control (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "tty_pgrp"
+  (import "wasmify_posix" "tty_pgrp"
     (func $tty_pgrp (param i32 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "tty_name"
+  (import "wasmify_posix" "tty_name"
     (func $tty_name (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_priority"
+  (import "wasmify_posix" "proc_priority"
     (func $proc_priority (param i32 i32 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_uname"
+  (import "wasmify_posix" "proc_uname"
     (func $proc_uname (param i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_setenv"
+  (import "wasmify_posix" "proc_setenv"
     (func $proc_setenv (param i64 i32 i64 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "clock_zone"
+  (import "wasmify_posix" "clock_zone"
     (func $clock_zone (param i64 i32 i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_syslog_open"
+  (import "wasmify_posix" "proc_syslog_open"
     (func $proc_syslog_open (param i64 i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_syslog"
+  (import "wasmify_posix" "proc_syslog"
     (func $proc_syslog (param i32 i32 i32 i64 i32 i64 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_syslog_close"
+  (import "wasmify_posix" "proc_syslog_close"
     (func $proc_syslog_close (result i32)))
-  (import "wasi_snapshot_preview1" "proc_signal_register"
+  (import "wasmify_posix" "proc_signal_register"
     (func $proc_signal_register (param i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_signal_dispositions"
+  (import "wasmify_posix" "proc_signal_dispositions"
     (func $proc_signal_dispositions (param i64 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_signal_take"
+  (import "wasmify_posix" "proc_signal_take"
     (func $proc_signal_take (param i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_signal_ignored"
+  (import "wasmify_posix" "proc_signal_ignored"
     (func $proc_signal_ignored (param i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_itimer"
+  (import "wasmify_posix" "proc_itimer"
     (func $proc_itimer (param i32 i64 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_terminate"
+  (import "wasmify_posix" "proc_terminate"
     (func $proc_terminate (param i32)))
-  (import "wasi_snapshot_preview1" "proc_fork"
+  (import "wasmify_posix" "proc_fork"
     (func $proc_fork (param i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_kill"
+  (import "wasmify_posix" "proc_kill"
     (func $proc_kill (param i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "fd_closefrom"
+  (import "wasmify_posix" "fd_closefrom"
     (func $fd_closefrom (param i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_exec"
+  (import "wasmify_posix" "proc_exec"
     (func $proc_exec (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_exec_next"
+  (import "wasmify_posix" "proc_exec_next"
     (func $proc_exec_next (param i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_times"
+  (import "wasmify_posix" "proc_times"
     (func $proc_times (param i64) (result i32)))
   (import "wasi_snapshot_preview1" "fd_advise"
     (func $fd_advise (param i64 i64 i64 i64) (result i32)))
@@ -269,24 +270,23 @@
     (func $sock_socket (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "sock_connect"
     (func $sock_connect (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_bind"
-    (func $sock_bind (param i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_recvfrom"
-    (func $sock_recvfrom (param i32 i64 i32 i32 i64 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_sendto"
-    (func $sock_sendto (param i32 i64 i32 i32 i32 i32 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_getsockname"
-    (func $sock_getsockname (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_getpeername"
-    (func $sock_getpeername (param i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_pair"
-    (func $sock_pair (param i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_getaddrinfo"
     (func $sock_getaddrinfo (param i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sock_reverse"
-    (func $sock_reverse (param i32 i64 i32 i64) (result i32)))
-  (import "wasi_snapshot_preview1" "sys_syscall"
+  (import "wasmify_posix" "sys_syscall"
     (func $sys_syscall (param i64 i64 i32 i32 i64) (result i32)))
+
+  (import "wasmify_posix" "ipc_get"
+    (func $ipc_get (param i32 i32 i64 i32 i64) (result i32)))
+  (import "wasmify_posix" "ipc_ctl"
+    (func $ipc_ctl (param i32 i32 i32 i32 i64 i64 i64) (result i32)))
+  (import "wasmify_posix" "ipc_semop"
+    (func $ipc_semop (param i32 i64 i64) (result i32)))
+  (import "wasmify_posix" "ipc_msgsnd"
+    (func $ipc_msgsnd (param i32 i64 i64 i32) (result i32)))
+  (import "wasmify_posix" "ipc_msgrcv"
+    (func $ipc_msgrcv (param i32 i64 i64 i64 i32 i64) (result i32)))
+  (import "wasmify_posix" "ipc_shmcopy"
+    (func $ipc_shmcopy (param i32 i64 i64 i64 i32) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -421,14 +421,13 @@
     (drop (call $path_filestat_mode (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_socket (i32.const 0) (i32.const 0)))
     (drop (call $sock_connect (i32.const 0) (i32.const 0) (i32.const 0)))
-    (drop (call $sock_bind (i32.const 0) (i32.const 0) (i32.const 0)))
-    (drop (call $sock_recvfrom (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
-    (drop (call $sock_sendto (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
-    (drop (call $sock_getsockname (i32.const 0) (i64.const 0)))
-    (drop (call $sock_getpeername (i32.const 0) (i64.const 0)))
-    (drop (call $sock_pair (i64.const 0)))
     (drop (call $sock_getaddrinfo (i64.const 0) (i32.const 0) (i64.const 0)))
-    (drop (call $sock_reverse (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sys_syscall (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_get (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_ctl (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $ipc_semop (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $ipc_msgsnd (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $ipc_msgrcv (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_shmcopy (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
   )
 )

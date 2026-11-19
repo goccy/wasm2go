@@ -438,12 +438,13 @@ func TestWasi64_PreadPwriteAreLP64(t *testing.T) {
 }
 
 // sock_send and sock_recv take LP64 iovecs and write a 64-bit so_datalen
-// and ro_datalen for a memory64 guest (ro_flags stays 16 bits); the legacy
-// sock_sendto and sock_recvfrom write an int count, 4 bytes at every width.
+// and ro_datalen for a memory64 guest (ro_flags stays 16 bits);
+// sock_sendto_addr and sock_recvfrom_addr write an int count, 4 bytes at
+// every width.
 func TestWasi64_SocketTransfersAreLP64(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
-	if rc := w.Sock_pair64(m, 1024); rc != _wasiESUCCESS {
-		t.Skipf("sock_pair64: %d", rc)
+	if rc := w.Sock_socketpair64(m, wasiSockFamilyUnix, wasiSockTypeStream, 1024); rc != _wasiESUCCESS {
+		t.Skipf("sock_socketpair64: %d", rc)
 	}
 	a, b := int64(readU32(m.memory, 1024)), int64(readU32(m.memory, 1028))
 
@@ -474,15 +475,15 @@ func TestWasi64_SocketTransfersAreLP64(t *testing.T) {
 
 	copy(m.memory[4200:], "world")
 	fillSentinel(m, 3500, 8)
-	if rc := w.Sock_sendto64(m, int32(a), 4200, 5, 0, 0, 0, 0, 3500); rc != _wasiESUCCESS {
-		t.Fatalf("sock_sendto64 rc=%d", rc)
+	if rc := w.Sock_sendto_addr64(m, int32(a), 4200, 5, 0, 0, 0, 0, 3500); rc != _wasiESUCCESS {
+		t.Fatalf("sock_sendto_addr64 rc=%d", rc)
 	}
 	if got := readU32(m.memory, 3500); got != 5 || readU32(m.memory, 3504) != 0xffffffff {
 		t.Fatalf("sent % x, want 5 in 4 bytes and the next 4 untouched", m.memory[3500:3508])
 	}
 	fillSentinel(m, 3600, 8)
-	if rc := w.Sock_recvfrom64(m, int32(b), 5200, 64, 0, 3700, 3600); rc != _wasiESUCCESS {
-		t.Fatalf("sock_recvfrom64 rc=%d", rc)
+	if rc := w.Sock_recvfrom_addr64(m, int32(b), 5200, 64, 0, 3700, 3600); rc != _wasiESUCCESS {
+		t.Fatalf("sock_recvfrom_addr64 rc=%d", rc)
 	}
 	if got := readU32(m.memory, 3600); got != 5 || readU32(m.memory, 3604) != 0xffffffff {
 		t.Fatalf("received % x, want 5 in 4 bytes and the next 4 untouched", m.memory[3600:3608])
@@ -639,13 +640,13 @@ func TestWasi64_FdReadReceivesOneDatagram(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	w.SetNetAccessHook(func(string) bool { return true })
 	server := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, server, loopbackBE, 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, server, loopbackBE, 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	port := int32(localName(t, w, m, server).port)
 	client := newDatagramSocket(t, w, m)
-	if rc := w.Sock_bind(m, client, loopbackBE, 0); rc != 0 {
-		t.Fatalf("Sock_bind rc=%d", rc)
+	if rc := sockBindIPv4(w, m, client, loopbackBE, 0); rc != 0 {
+		t.Fatalf("bind rc=%d", rc)
 	}
 	clientPort := int32(localName(t, w, m, client).port)
 	if rc := w.Sock_connect(m, client, loopbackBE, port); rc != 0 {
@@ -943,21 +944,23 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"sock_getaddrinfo",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Sock_getaddrinfo(m, 528, 9, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Sock_getaddrinfo64(m, 528, 9, 1024) }},
-		{"sock_socket and sock_getsockname",
+		{"sock_socket and sock_name",
 			func(w *WasiStubs, m *Module, fd int32) int32 {
 				s := w.Sock_socket(m, 0, wasiSockTypeStream)
-				return s | w.Sock_getsockname(m, s, 2048)
+				return s | w.Sock_name(m, s, 0, 2048)
 			},
 			func(w *WasiStubs, m *Module, fd int32) int32 {
 				s := w.Sock_socket64(m, 0, wasiSockTypeStream)
-				return s | w.Sock_getsockname64(m, s, 2048)
+				return s | w.Sock_name64(m, s, 0, 2048)
 			}},
-		{"sock_pair and sock_getpeername",
+		{"sock_socketpair and sock_name of the peer",
 			func(w *WasiStubs, m *Module, fd int32) int32 {
-				return w.Sock_pair(m, 1024) | w.Sock_getpeername(m, int32(readU32(m.memory, 1024)), 2048)
+				return w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 1024) |
+					w.Sock_name(m, int32(readU32(m.memory, 1024)), 1, 2048)
 			},
 			func(w *WasiStubs, m *Module, fd int32) int32 {
-				return w.Sock_pair64(m, 1024) | w.Sock_getpeername64(m, int32(readU32(m.memory, 1024)), 2048)
+				return w.Sock_socketpair64(m, wasiSockFamilyUnix, wasiSockTypeStream, 1024) |
+					w.Sock_name64(m, int32(readU32(m.memory, 1024)), 1, 2048)
 			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
