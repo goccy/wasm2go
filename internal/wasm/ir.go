@@ -191,21 +191,32 @@ type Module struct {
 	NumImportedTags    uint32
 }
 
+// FuncImport returns the import of the function at the given function
+// index, which counts the function imports only (imports of other kinds may
+// come between them); ok is false when the index is not an imported
+// function's.
+func (m *Module) FuncImport(idx uint32) (imp Import, ok bool) {
+	if idx >= m.NumImportedFuncs {
+		return Import{}, false
+	}
+	var i uint32
+	for _, imp := range m.Imports {
+		if imp.Kind != ImportFunc {
+			continue
+		}
+		if i == idx {
+			return imp, true
+		}
+		i++
+	}
+	return Import{}, false
+}
+
 // FuncTypeOf returns the function type at the given function index, accounting
 // for imported functions.
 func (m *Module) FuncTypeOf(idx uint32) FuncType {
-	if idx < m.NumImportedFuncs {
-		// Walk imports in order, picking the idx-th ImportFunc.
-		var i uint32
-		for _, imp := range m.Imports {
-			if imp.Kind != ImportFunc {
-				continue
-			}
-			if i == idx {
-				return m.Types[imp.TypeIdx]
-			}
-			i++
-		}
+	if imp, ok := m.FuncImport(idx); ok {
+		return m.Types[imp.TypeIdx]
 	}
 	return m.Types[m.Functions[idx-m.NumImportedFuncs].TypeIdx]
 }
