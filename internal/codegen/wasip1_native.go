@@ -1585,11 +1585,8 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 		return -_wasiENOSYS
 	}
 	child := w.Fork()
-	proc := &wasiProc{done: make(chan struct{})}
-	w.mu.Lock()
-	pid := w.addProcLocked(proc)
-	w.mu.Unlock()
-	kill, err := hook(m, child, pid, w.procExitFunc(proc))
+	pid, exited := w.NewProc(nil)
+	kill, err := hook(m, child, pid, exited)
 	if err != nil {
 		// The child never ran, so every descriptor it holds is one it
 		// shares with w: this drops the references and normally closes
@@ -1604,7 +1601,9 @@ func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
 		return -_wasiEAGAIN
 	}
 	w.mu.Lock()
-	proc.kill = kill
+	if proc := w.procs[pid]; proc != nil {
+		proc.kill = kill
+	}
 	w.mu.Unlock()
 	// The hook may have given the parent new memory while it snapshotted
 	// it: the pid goes into the memory the parent has now.
