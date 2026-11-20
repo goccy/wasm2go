@@ -9,9 +9,11 @@ import (
 )
 
 // Tests for the widened wasm64-wasip1 ABI bindings (the *64 method
-// family): 8-byte guest pointers, LP64 iovec/prestat layouts, and
-// 64-bit __wasi_size_t out-params. The layout constants asserted here
-// are the contract with the wasm2go wasi-libc port's __wasi_abi_t.
+// family): 8-byte guest pointers, LP64 iovec/prestat/argv layouts, and
+// 64-bit __wasi_size_t out-params; that a *64 method takes the same paths
+// as its wasm32 twin; and that an address is never truncated. The layout
+// constants asserted here are the contract with the wasm2go wasi-libc
+// port's __wasi_abi_t.
 
 // makeIovec64 writes a 1-entry LP64 iovec {u64 buf, u64 len} at iovOff.
 func makeIovec64(m *Module, iovOff, bufOff, bufLen int64) {
@@ -19,23 +21,81 @@ func makeIovec64(m *Module, iovOff, bufOff, bufLen int64) {
 	binary.LittleEndian.PutUint64(m.memory[iovOff+8:], uint64(bufLen))
 }
 
-func TestWasi64_MemSlice64Bounds(t *testing.T) {
+// highAddr is a guest address with a bit above 32 set, on a test memory of
+// 64 KiB: truncated to 32 bits it would be the address 16.
+const highAddr = 1<<32 + 16
+
+// fillSentinel fills n bytes at off with 0xff, so that a test sees how many
+// bytes a call wrote there.
+func fillSentinel(m *Module, off, n int) {
+	for i := 0; i < n; i++ {
+		m.memory[off+i] = 0xff
+	}
+}
+
+func TestWasi64_MemBytesBounds(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
-	if s := w.memSlice64(m, 0, int64(len(m.memory))); s == nil {
+	size := uint64(len(m.memory))
+	if s := w.memBytes(m, 0, size); s == nil {
 		t.Fatal("full-range slice refused")
 	}
-	if s := w.memSlice64(m, int64(len(m.memory))-1, 2); s != nil {
+	if s := w.memBytes(m, size, 0); s == nil || len(s) != 0 {
+		t.Fatal("empty slice at the end of memory refused")
+	}
+	if s := w.memBytes(m, size-1, 2); s != nil {
 		t.Fatal("overrun not refused")
 	}
-	if s := w.memSlice64(m, -1, 1); s != nil {
-		t.Fatal("negative offset not refused")
+	if s := w.memBytes(m, size+1, 0); s != nil {
+		t.Fatal("empty slice past the end not refused")
 	}
-	if s := w.memSlice64(m, 8, -1); s != nil {
-		t.Fatal("negative length not refused")
+	if s := w.memBytes(m, ^uint64(0), 1); s != nil {
+		t.Fatal("address -1 not refused")
 	}
-	// Offsets whose uint64 sum wraps must not slip past the bounds check.
-	if s := w.memSlice64(m, -8, 16); s != nil {
+	if s := w.memBytes(m, 8, ^uint64(0)); s != nil {
+		t.Fatal("size -1 not refused")
+	}
+	// Ranges whose uint64 sum wraps must not slip past the bounds check.
+	if s := w.memBytes(m, ^uint64(0)-7, 16); s != nil {
 		t.Fatal("wrapping range not refused")
+	}
+	// Bits above 32 are never dropped: neither the address nor the size
+	// aliases the low memory they would truncate to.
+	if s := w.memBytes(m, highAddr, 4); s != nil {
+		t.Fatal("address above 4 GiB not refused")
+	}
+	if s := w.memBytes(m, 16, 1<<32+4); s != nil {
+		t.Fatal("size above 4 GiB not refused")
+	}
+	// A wasm32 binding's i32 is unsigned: memSlice zero-extends it.
+	if s := w.memSlice(m, -1, 1); s != nil {
+		t.Fatal("wasm32 address 0xffffffff not refused")
+	}
+	if s := w.memSlice(m, 8, -1); s != nil {
+		t.Fatal("wasm32 size 0xffffffff not refused")
+	}
+	if got := zext(-2); got != 0xfffffffe {
+		t.Fatalf("zext(-2) = %#x", got)
+	}
+}
+
+func TestWasi64_ABIWords(t *testing.T) {
+	b := make([]byte, 8)
+	for i := range b {
+		b[i] = 0xff
+	}
+	wasiABI32.putWord(b, 0x1_2345_6789)
+	if got := binary.LittleEndian.Uint32(b); got != 0x2345_6789 || b[4] != 0xff {
+		t.Fatalf("wasm32 word written as % x", b)
+	}
+	if got := wasiABI32.word(b); got != 0x2345_6789 {
+		t.Fatalf("wasm32 word read as %#x", got)
+	}
+	wasiABI64.putWord(b, 0x1_2345_6789)
+	if got := wasiABI64.word(b); got != 0x1_2345_6789 {
+		t.Fatalf("memory64 word read as %#x", got)
+	}
+	if wasiABI32.wordSize() != 4 || wasiABI64.wordSize() != 8 {
+		t.Fatal("word sizes")
 	}
 }
 
@@ -200,6 +260,8 @@ func TestWasi64_ReaddirAndFilestat(t *testing.T) {
 	}
 	fd := int64(readU32(m.memory, 2048))
 
+	// bufused is a u64: all of its 8 bytes are written.
+	fillSentinel(m, 4096, 8)
 	if rc := w.Fd_readdir64(m, fd, 8192, 1024, 0, 4096); rc != _wasiESUCCESS {
 		t.Fatal("fd_readdir64 failed")
 	}
@@ -242,4 +304,328 @@ func TestWasi64_ProcExit(t *testing.T) {
 		}
 	}()
 	w.Proc_exit64(m, 7)
+}
+
+func TestWasi64_PrestatLayoutsByABI(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	// wasm32: {u8 tag, pad[3], u32 len} — 8 bytes.
+	fillSentinel(m, 0, 16)
+	if rc := w.Fd_prestat_get(m, 3, 0); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_prestat_get rc=%d", rc)
+	}
+	if m.memory[0] != 0 || readU32(m.memory, 4) != 1 || m.memory[8] != 0xff {
+		t.Fatalf("wasm32 prestat % x", m.memory[:16])
+	}
+	// memory64: {u8 tag, pad[7], u64 len} — 16 bytes.
+	fillSentinel(m, 0, 24)
+	if rc := w.Fd_prestat_get64(m, 3, 0); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_prestat_get64 rc=%d", rc)
+	}
+	if m.memory[0] != 0 || readU64(m.memory, 8) != 1 || m.memory[16] != 0xff {
+		t.Fatalf("memory64 prestat % x", m.memory[:24])
+	}
+}
+
+// putIovecs64 writes LP64 iovecs {u64 buf, u64 len} for bufs (offset,
+// length pairs) at iovOff, 16 bytes apart.
+func putIovecs64(m *Module, iovOff int, bufs ...[2]uint64) {
+	for i, b := range bufs {
+		binary.LittleEndian.PutUint64(m.memory[iovOff+16*i:], b[0])
+		binary.LittleEndian.PutUint64(m.memory[iovOff+16*i+8:], b[1])
+	}
+}
+
+func TestWasi64_IovecsAndCountsAreLP64(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	pathOff, pathLen := putPath(m, 1024, "v.txt")
+	if rc := w.Path_open64(m, 3, 0, int64(pathOff), int64(pathLen), 0x1, 1<<1|1<<6, 0, 0, 2048); rc != _wasiESUCCESS {
+		t.Fatalf("path_open64 rc=%d", rc)
+	}
+	fd := int64(readU32(m.memory, 2048))
+
+	// Two iovecs 16 bytes apart gather "scatter" and "-gather".
+	copy(m.memory[4096:], "scatter")
+	copy(m.memory[4200:], "-gather")
+	putIovecs64(m, 3000, [2]uint64{4096, 7}, [2]uint64{4200, 7})
+	fillSentinel(m, 3100, 8)
+	if rc := w.Fd_write64(m, fd, 3000, 2, 3100); rc != _wasiESUCCESS {
+		t.Fatalf("fd_write64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3100); got != 14 {
+		t.Fatalf("nwritten=%#x, want 14 in all 8 bytes", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "v.txt")); err != nil || string(got) != "scatter-gather" {
+		t.Fatalf("file holds %q, err=%v", got, err)
+	}
+
+	// Reading back scatters over two iovecs; nread is 8 bytes.
+	if rc := w.Fd_seek64(m, fd, 0, 0, 3200); rc != _wasiESUCCESS {
+		t.Fatalf("fd_seek64 rc=%d", rc)
+	}
+	putIovecs64(m, 3300, [2]uint64{5000, 4}, [2]uint64{5100, 32})
+	fillSentinel(m, 3400, 8)
+	if rc := w.Fd_read64(m, fd, 3300, 2, 3400); rc != _wasiESUCCESS {
+		t.Fatalf("fd_read64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3400); got != 14 {
+		t.Fatalf("nread=%#x, want 14 in all 8 bytes", got)
+	}
+	if got := string(m.memory[5000:5004]) + string(m.memory[5100:5110]); got != "scatter-gather" {
+		t.Fatalf("read back %q", got)
+	}
+}
+
+// fd_pread and fd_pwrite take LP64 iovecs and write a 64-bit nread and
+// nwritten for a memory64 guest; the wasm32 twins keep 8-byte iovecs and a
+// 4-byte count, and leave the bytes after it alone.
+func TestWasi64_PreadPwriteAreLP64(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	pathOff, pathLen := putPath(m, 1024, "p.txt")
+	if rc := w.Path_open64(m, 3, 0, int64(pathOff), int64(pathLen), 0x1, 1<<1|1<<6, 0, 0, 2048); rc != _wasiESUCCESS {
+		t.Fatalf("path_open64 rc=%d", rc)
+	}
+	fd := int64(readU32(m.memory, 2048))
+
+	copy(m.memory[4096:], "scatter")
+	copy(m.memory[4200:], "-gather")
+	putIovecs64(m, 3000, [2]uint64{4096, 7}, [2]uint64{4200, 7})
+	fillSentinel(m, 3100, 8)
+	if rc := w.Fd_pwrite64(m, fd, 3000, 2, 2, 3100); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pwrite64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3100); got != 14 {
+		t.Fatalf("nwritten=%#x, want 14 in all 8 bytes", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "p.txt")); err != nil || string(got) != "\x00\x00scatter-gather" {
+		t.Fatalf("file holds %q, err=%v", got, err)
+	}
+
+	putIovecs64(m, 3300, [2]uint64{5000, 4}, [2]uint64{5100, 32})
+	fillSentinel(m, 3400, 8)
+	if rc := w.Fd_pread64(m, fd, 3300, 2, 2, 3400); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pread64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 3400); got != 14 {
+		t.Fatalf("nread=%#x, want 14 in all 8 bytes", got)
+	}
+	if got := string(m.memory[5000:5004]) + string(m.memory[5100:5110]); got != "scatter-gather" {
+		t.Fatalf("read back %q", got)
+	}
+
+	// The wasm32 twin: {u32 buf, u32 len} iovecs, a u32 count.
+	binary.LittleEndian.PutUint32(m.memory[3500:], 6000)
+	binary.LittleEndian.PutUint32(m.memory[3504:], 7)
+	fillSentinel(m, 3600, 8)
+	if rc := w.Fd_pread(m, int32(fd), 3500, 1, 9, 3600); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pread rc=%d", rc)
+	}
+	if got := readU32(m.memory, 3600); got != 7 || readU32(m.memory, 3604) != 0xffffffff {
+		t.Fatalf("wasm32 nread % x, want 7 in 4 bytes and the next 4 untouched", m.memory[3600:3608])
+	}
+	if got := string(m.memory[6000:6007]); got != "-gather" {
+		t.Fatalf("wasm32 read back %q", got)
+	}
+	fillSentinel(m, 3700, 8)
+	if rc := w.Fd_pwrite(m, int32(fd), 3500, 1, 16, 3700); rc != _wasiESUCCESS {
+		t.Fatalf("fd_pwrite rc=%d", rc)
+	}
+	if got := readU32(m.memory, 3700); got != 7 || readU32(m.memory, 3704) != 0xffffffff {
+		t.Fatalf("wasm32 nwritten % x, want 7 in 4 bytes and the next 4 untouched", m.memory[3700:3708])
+	}
+}
+
+func TestWasi64_ReadlinkBufusedIsLP64(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink("target-of-link", filepath.Join(dir, "ln")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	w, m := newTestStubs(t, dir)
+	pathOff, pathLen := putPath(m, 1024, "ln")
+	fillSentinel(m, 800, 8)
+	if rc := w.Path_readlink64(m, 3, int64(pathOff), int64(pathLen), 512, 64, 800); rc != _wasiESUCCESS {
+		t.Fatalf("path_readlink64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 800); got != uint64(len("target-of-link")) {
+		t.Fatalf("bufused=%#x, want %d in all 8 bytes", got, len("target-of-link"))
+	}
+	if got := string(m.memory[512 : 512+len("target-of-link")]); got != "target-of-link" {
+		t.Fatalf("target %q", got)
+	}
+}
+
+// A guest address with a bit above 32 set is outside a small memory: every
+// binding refuses it with EFAULT instead of using the low address it would
+// truncate to, and writes nothing.
+func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	fd, errno := w.pathOpen("f", 0, 0, 1<<1|1<<6, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open: %d", errno)
+	}
+	putPath(m, 900, "f")
+	// iovecs in low memory whose buffer or length has a bit above 32 set
+	putIovecs64(m, 1024, [2]uint64{highAddr, 4})
+	putIovecs64(m, 1056, [2]uint64{16, 1<<32 + 4})
+	for i := 16; i < 32; i++ {
+		m.memory[i] = byte(i)
+	}
+
+	for _, tc := range []struct {
+		name string
+		call func() int32
+		want int32
+	}{
+		{"clock_time_get", func() int32 { return w.Clock_time_get64(m, 0, 0, highAddr) }, _wasiEFAULT},
+		{"random_get size", func() int32 { return w.Random_get64(m, 16, 1<<32+4) }, _wasiEFAULT},
+		{"args_get buffer", func() int32 { return w.Args_get64(m, 256, highAddr) }, _wasiEFAULT},
+		{"args_sizes_get", func() int32 { return w.Args_sizes_get64(m, highAddr, 256) }, _wasiEFAULT},
+		{"fd_prestat_get", func() int32 { return w.Fd_prestat_get64(m, 3, highAddr) }, _wasiEFAULT},
+		{"fd_write iovecs", func() int32 { return w.Fd_write64(m, int64(fd), highAddr, 1, 512) }, _wasiEFAULT},
+		{"fd_write buffer", func() int32 { return w.Fd_write64(m, int64(fd), 1024, 1, 512) }, _wasiEFAULT},
+		{"fd_write length", func() int32 { return w.Fd_write64(m, int64(fd), 1056, 1, 512) }, _wasiEFAULT},
+		{"fd_write count", func() int32 { return w.Fd_write64(m, int64(fd), 1056, 0, highAddr) }, _wasiEFAULT},
+		{"fd_read buffer", func() int32 { return w.Fd_read64(m, int64(fd), 1024, 1, 512) }, _wasiEFAULT},
+		{"fd_read count", func() int32 { return w.Fd_read64(m, int64(fd), 1056, 0, highAddr) }, _wasiEFAULT},
+		{"path_open path", func() int32 { return w.Path_open64(m, 3, 0, highAddr, 1, 0, 1<<1, 0, 0, 512) }, _wasiEFAULT},
+		{"path_open path length", func() int32 { return w.Path_open64(m, 3, 0, 900, 1<<32+1, 0, 1<<1, 0, 0, 512) }, _wasiEFAULT},
+	} {
+		before := bytes.Clone(m.memory)
+		if got := tc.call(); got != tc.want {
+			t.Errorf("%s: rc=%d, want %d", tc.name, got, tc.want)
+		}
+		if !bytes.Equal(before, m.memory) {
+			t.Errorf("%s: wrote to guest memory", tc.name)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "f")); err != nil || string(got) != "data" {
+		t.Fatalf("the file holds %q after the refused writes, err=%v", got, err)
+	}
+}
+
+// For an import whose records hold no pointer, the *64 method does exactly
+// what the wasm32 one does: the same result and the same bytes in guest
+// memory, from the same state.
+func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// prep runs on both instances before the call; it returns the fd of
+	// f.txt, opened for reading and writing.
+	prep := func(t *testing.T, w *WasiStubs, m *Module) int32 {
+		t.Helper()
+		w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+		fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1|1<<6, 0)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("open: %d", errno)
+		}
+		putPath(m, 512, "f.txt")
+		return fd
+	}
+	type call func(w *WasiStubs, m *Module, fd int32) int32
+	for _, tc := range []struct {
+		name           string
+		call32, call64 call
+	}{
+		{"clock_res_get",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Clock_res_get(m, 0, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Clock_res_get64(m, 0, 1024) }},
+		{"fd_fdstat_get",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_fdstat_get(m, fd, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_fdstat_get64(m, int64(fd), 1024) }},
+		{"fd_filestat_get",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_filestat_get(m, fd, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_filestat_get64(m, int64(fd), 1024) }},
+		{"fd_seek and fd_tell",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_seek(m, fd, 3, 0, 1024) | w.Fd_tell(m, fd, 1040)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_seek64(m, int64(fd), 3, 0, 1024) | w.Fd_tell64(m, int64(fd), 1040)
+			}},
+		{"fd_prestat_dir_name",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_prestat_dir_name(m, 3, 1024, 4) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_prestat_dir_name64(m, 3, 1024, 4) }},
+		{"path_filestat_get",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_get(m, 3, 1, 512, 5, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_get64(m, 3, 1, 512, 5, 1024) }},
+		{"path_open",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_open(m, 3, 0, 512, 5, 0, 1<<1, 0, 0, 1024)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_open64(m, 3, 0, 512, 5, 0, 1<<1, 0, 0, 1024)
+			}},
+		{"random_get of nothing",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Random_get(m, 1024, 0) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Random_get64(m, 1024, 0) }},
+		{"fd_advise, fd_allocate, fd_datasync and fd_fdstat_set_rights",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_advise(m, fd, 0, 8, 0) | w.Fd_allocate(m, fd, 0, 8) | w.Fd_datasync(m, fd) |
+					w.Fd_fdstat_set_rights(m, fd, 1<<1, 0)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_advise64(m, int64(fd), 0, 8, 0) | w.Fd_allocate64(m, int64(fd), 0, 8) |
+					w.Fd_datasync64(m, int64(fd)) | w.Fd_fdstat_set_rights64(m, int64(fd), 1<<1, 0)
+			}},
+		{"path_create_directory of a name that is taken",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory(m, 3, 512, 5) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory64(m, 3, 512, 5) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w32, m32 := newTestStubs(t, dir)
+			w64, m64 := newTestStubs(t, dir)
+			fd32, fd64 := prep(t, w32, m32), prep(t, w64, m64)
+			rc32, rc64 := tc.call32(w32, m32, fd32), tc.call64(w64, m64, fd64)
+			if rc32 != rc64 {
+				t.Fatalf("rc %d (wasm32) != %d (memory64)", rc32, rc64)
+			}
+			t.Logf("rc=%d", rc32)
+			for i := range m32.memory {
+				if m32.memory[i] != m64.memory[i] {
+					t.Fatalf("guest memory differs first at %d: %#x (wasm32) != %#x (memory64)", i, m32.memory[i], m64.memory[i])
+				}
+			}
+		})
+	}
+}
+
+// An iovec array of more than wasiMaxIovecs entries is refused with EFAULT
+// for both ABIs, even when the guest's memory holds all of it; one of
+// exactly wasiMaxIovecs entries is taken.
+func TestWasi64_IovecCountIsBounded(t *testing.T) {
+	w, _ := newTestStubs(t, t.TempDir())
+	w.stdout = &bytes.Buffer{}
+	// Zeroed memory is an array of empty iovecs at 0 for either ABI; the
+	// count a call writes back goes after wasiMaxIovecs+1 LP64 entries.
+	const countOff = (wasiMaxIovecs + 1) * 16
+	m := newGuestModule(countOff + 8)
+	for _, tc := range []struct {
+		name  string
+		abi   wasiABI
+		write func(iovsLen uint64) int32
+	}{
+		{"wasm32", wasiABI32, func(n uint64) int32 { return w.Fd_write(m, 1, 0, int32(n), countOff) }},
+		{"memory64", wasiABI64, func(n uint64) int32 { return w.Fd_write64(m, 1, 0, int64(n), countOff) }},
+	} {
+		if bufs, ok := w.iovecSlices(m, tc.abi, 0, wasiMaxIovecs); !ok || len(bufs) != wasiMaxIovecs {
+			t.Errorf("%s: iovecSlices of wasiMaxIovecs entries = %d windows, %v", tc.name, len(bufs), ok)
+		}
+		if bufs, ok := w.iovecSlices(m, tc.abi, 0, wasiMaxIovecs+1); ok || bufs != nil {
+			t.Errorf("%s: iovecSlices of wasiMaxIovecs+1 entries = %d windows, %v, want refused", tc.name, len(bufs), ok)
+		}
+		if rc := tc.write(wasiMaxIovecs); rc != _wasiESUCCESS {
+			t.Errorf("%s: fd_write of wasiMaxIovecs iovecs rc=%d", tc.name, rc)
+		}
+		if rc := tc.write(wasiMaxIovecs + 1); rc != _wasiEFAULT {
+			t.Errorf("%s: fd_write of wasiMaxIovecs+1 iovecs rc=%d, want EFAULT", tc.name, rc)
+		}
+	}
 }
