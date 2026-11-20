@@ -4,7 +4,6 @@ package helpers
 
 import (
 	"os"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,11 +17,11 @@ const page = 65536
 // readSink keeps faultAt's load from being optimized away.
 var readSink byte
 
-// faultAt reads m's linear-memory base + off with faults turned into panics
-// and returns what memoryAccessTrap made of the recovered value (nil when the
-// read succeeded).
+// faultAt reads m's linear-memory base + off with faults turned into panics,
+// as the generated entry points arm them, and returns what memoryAccessTrap
+// made of the recovered value (nil when the read succeeded).
 func faultAt(m *Module, off uint64) (got any) {
-	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer setPanicOnFault(setPanicOnFault(true))
 	defer func() {
 		if r := recover(); r != nil {
 			got = memoryAccessTrap(m, r)
@@ -112,7 +111,7 @@ func TestMapLinearMemoryIsGuarded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeOnCleanup(t, f)
 	if err := f.Truncate(2 * page); err != nil {
 		t.Fatal(err)
 	}
@@ -165,10 +164,18 @@ func TestMapLinearMemoryErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ro.Close()
+	closeOnCleanup(t, ro)
 	if _, err := mapLinearMemory(int(ro.Fd()), page, syscall.MAP_SHARED); err == nil {
 		t.Fatal("a writable shared mapping of a read-only file succeeded")
 	}
+}
+
+func closeOnCleanup(t *testing.T, f *os.File) {
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 }
 
 func TestEmptyLinearMemory(t *testing.T) {
