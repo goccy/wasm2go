@@ -7,6 +7,29 @@ import (
 	"syscall"
 )
 
+// osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
+// os package returned.
+func osFileStat(sys any) (fileStat, bool) {
+	st, ok := sys.(*syscall.Stat_t)
+	if !ok {
+		return fileStat{}, false
+	}
+	atime, ctime := statTimes(st)
+	return fileStat{
+		dev:   uint64(st.Dev),
+		ino:   uint64(st.Ino),
+		nlink: uint64(st.Nlink),
+		uid:   st.Uid,
+		gid:   st.Gid,
+		atime: atime,
+		ctime: ctime,
+		// the widths of these differ from host to host
+		rdev:    uint64(st.Rdev),
+		blksize: uint32(st.Blksize),
+		blocks:  uint64(st.Blocks),
+	}, true
+}
+
 // ---- the numbers of the operating system ---------------------------------
 //
 // The host's numbers and wasi's differ: every number has a name in C,

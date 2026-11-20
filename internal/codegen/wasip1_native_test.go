@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -622,7 +623,9 @@ func TestWasi_FdReaddir(t *testing.T) {
 	if used == 0 {
 		t.Fatalf("Fd_readdir wrote no bytes")
 	}
-	// Walk dirents to assert "." and ".." come first.
+	// Walk the dirents: every name of the directory, "." and ".." among
+	// them, in the order the system lists them (which
+	// TestReaddir_HostDirectoryInTheSystemsOrder compares with ls -f).
 	off := int(bufOff)
 	names := []string{}
 	for off-int(bufOff) < int(used) {
@@ -645,8 +648,9 @@ func TestWasi_FdReaddir(t *testing.T) {
 		names = append(names, string(m.memory[nameStart:nameStart+int(namelen)]))
 		off = nameStart + int(namelen)
 	}
-	if len(names) < 2 || names[0] != "." || names[1] != ".." {
-		t.Fatalf("Fd_readdir first two entries should be . and ..; got %v", names)
+	sort.Strings(names)
+	if got, want := strings.Join(names, " "), ". .. alpha beta gamma"; got != want {
+		t.Fatalf("Fd_readdir lists %q, want %q in any order", got, want)
 	}
 }
 
@@ -1460,30 +1464,36 @@ func TestWasi_ResolveFiletimes(t *testing.T) {
 	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Open(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := f.Close(); err != nil {
-			t.Errorf("close f: %v", err)
-		}
-	})
 	// Set explicit times; check resolveFiletimes echoes them.
-	at, mt, err := resolveFiletimes(uint64(time.Unix(100, 0).UnixNano()), uint64(time.Unix(200, 0).UnixNano()), 0x1|0x4, f)
-	if err != nil {
-		t.Fatalf("resolveFiletimes (explicit): %v", err)
+	if filetimesNeedCurrent(0x1 | 0x4) {
+		t.Fatal("explicit atime and mtime should not need the current times")
 	}
+	at, mt := resolveFiletimes(uint64(time.Unix(100, 0).UnixNano()), uint64(time.Unix(200, 0).UnixNano()), 0x1|0x4, nil)
 	if at.Unix() != 100 || mt.Unix() != 200 {
 		t.Fatalf("resolveFiletimes returned %v / %v", at, mt)
 	}
 	// ATIME_NOW + MTIME_NOW.
-	at, mt, err = resolveFiletimes(0, 0, 0x2|0x8, f)
-	if err != nil {
-		t.Fatalf("resolveFiletimes (NOW): %v", err)
-	}
+	at, mt = resolveFiletimes(0, 0, 0x2|0x8, nil)
 	if time.Since(at) > time.Second || time.Since(mt) > time.Second {
 		t.Fatalf("resolveFiletimes NOW too old: %v %v", at, mt)
+	}
+	// A time that is not being set keeps its current value.
+	if err := os.Chtimes(p, time.Unix(300, 0), time.Unix(400, 0)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filetimesNeedCurrent(0x4) {
+		t.Fatal("setting only the mtime should need the current times")
+	}
+	at, mt = resolveFiletimes(0, uint64(time.Unix(500, 0).UnixNano()), 0x4, st)
+	if mt.Unix() != 500 {
+		t.Fatalf("mtime = %v, want 500", mt)
+	}
+	if _, ok := osFileStat(st.Sys()); ok && at.Unix() != 300 {
+		t.Fatalf("atime = %v, want it kept at 300", at)
 	}
 }
 
