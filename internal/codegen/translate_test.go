@@ -91,7 +91,7 @@ func runGoSnippet(t *testing.T, generated string, mainSrc string, sidecars ...ma
 }
 
 // pureGuardRe matches codegen's pure-Go fallback build constraint.
-var pureGuardRe = regexp.MustCompile(`(?m)^//go:build !amd64 && !arm64\n`)
+var pureGuardRe = regexp.MustCompile(`(?m)^//go:build (!amd64 && !arm64|!arm64 && \(!amd64 \|\| !amd64\.v2\))\n`)
 
 // stripPureGuard removes the `//go:build !amd64 && !arm64` constraint from
 // a generated file so codegen's pure-Go function bodies compile and run on
