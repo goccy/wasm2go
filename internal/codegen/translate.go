@@ -2182,7 +2182,8 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			// grown size travels with it. It must respect the same
 			// implementation limit memoryGrow enforces — the coalesced
 			// SIMD bounds check is only exact below it. A memory64 uses
-			// the mem64 hard cap instead.
+			// the mem64 hard cap instead. It must lie inside the
+			// allocation: the guest's memory is a part of it.
 			capBytes := uint64(wasmMemHardCapBytes)
 			if mem.Is64 {
 				capBytes = 1 << 48 // mem64HardCap
@@ -2197,6 +2198,18 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				Body: &ast.BlockStmt{List: []ast.Stmt{
 					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
 						stringLit(fmt.Sprintf("wasm2go: memory size exceeds the implementation limit (%d bytes)", capBytes)),
+					}}},
+				}},
+			})
+			body.List = append(body.List, &ast.IfStmt{
+				Cond: &ast.BinaryExpr{
+					X:  newID("memSize"),
+					Op: token.GTR,
+					Y:  memLenExpr(),
+				},
+				Body: &ast.BlockStmt{List: []ast.Stmt{
+					&ast.ExprStmt{X: &ast.CallExpr{Fun: newID("panic"), Args: []ast.Expr{
+						stringLit("wasm2go: memory size exceeds the memory handed in"),
 					}}},
 				}},
 			})
