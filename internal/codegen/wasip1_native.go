@@ -1285,6 +1285,7 @@ const (
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
 	_wasiENOENT       int32 = 44
+	_wasiENOSPC       int32 = 51
 	_wasiENOTDIR      int32 = 54
 	_wasiENOTSOCK     int32 = 57
 	_wasiENOTSUP      int32 = 58
@@ -1313,8 +1314,10 @@ func mapOSError(err error) int32 {
 		return _wasiEISDIR
 	case errors.Is(err, syscall.EINVAL):
 		return _wasiEINVAL
-	case errors.Is(err, syscall.EBADF):
+	case errors.Is(err, syscall.EBADF), errors.Is(err, fs.ErrClosed):
 		return _wasiEBADF
+	case errors.Is(err, syscall.ENOSPC):
+		return _wasiENOSPC
 	case errors.Is(err, syscall.EAGAIN):
 		return _wasiEAGAIN
 	case errors.Is(err, syscall.EPIPE):
@@ -1878,8 +1881,9 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 		return _wasiEFAULT
 	}
 	_ = op
-	abi.putWord(nreadSlice, readVec(src, bufs))
-	return _wasiESUCCESS
+	n, errno := readVec(src, bufs)
+	abi.putWord(nreadSlice, n)
+	return errno
 }
 
 // wasiMaxIovecs is the most entries a ciovec/iovec array may have.
@@ -1916,32 +1920,40 @@ func (w *WasiStubs) iovecSlices(m *Module, abi wasiABI, iovs, iovsLen uint64) ([
 }
 
 // readVec fills bufs from src in order, stopping at the first error
-// (EOF included) or short read; returns the bytes read. Shared by the
+// (EOF included) or short read; returns the bytes read, or the errno of
+// an error other than EOF that left nothing read. Shared by the
 // wasm32 and wasm64 fd_read bindings — only the iovec layout differs.
-func readVec(src io.Reader, bufs [][]byte) uint64 {
+func readVec(src io.Reader, bufs [][]byte) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := src.Read(buf)
 		total += uint64(n)
+		if err != nil && total == 0 && !errors.Is(err, io.EOF) {
+			return 0, mapOSError(err)
+		}
 		if err != nil || n < len(buf) {
 			break
 		}
 	}
-	return total
+	return total, _wasiESUCCESS
 }
 
 // writeVec drains bufs into dst in order, stopping at the first failed
-// write; returns the bytes written. Shared like readVec.
-func writeVec(dst io.Writer, bufs [][]byte) uint64 {
+// write; returns the bytes written, or the errno of an error that left
+// nothing written. Shared like readVec.
+func writeVec(dst io.Writer, bufs [][]byte) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := dst.Write(buf)
 		total += uint64(n)
+		if err != nil && total == 0 {
+			return 0, mapOSError(err)
+		}
 		if err != nil {
 			break
 		}
 	}
-	return total
+	return total, _wasiESUCCESS
 }
 
 // fdSrcLocked returns the io.Reader for fd and (when applicable) the
@@ -2028,6 +2040,9 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 		n, err := op.f.ReadAt(buf, curOff)
 		total += uint64(n)
 		curOff += int64(n)
+		if err != nil && total == 0 && !errors.Is(err, io.EOF) {
+			return mapOSError(err)
+		}
 		if err != nil || n < len(buf) {
 			break
 		}
@@ -2066,6 +2081,9 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 		n, err := op.f.WriteAt(buf, curOff)
 		total += uint64(n)
 		curOff += int64(n)
+		if err != nil && total == 0 {
+			return mapOSError(err)
+		}
 		if err != nil {
 			break
 		}
@@ -2156,8 +2174,9 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 		abi.putWord(nwrittenSlice, 0)
 		return _wasiEBADF
 	}
-	abi.putWord(nwrittenSlice, writeVec(dst, bufs))
-	return _wasiESUCCESS
+	n, errno := writeVec(dst, bufs)
+	abi.putWord(nwrittenSlice, n)
+	return errno
 }
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()

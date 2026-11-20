@@ -21,6 +21,8 @@ func TestMapOSError(t *testing.T) {
 		{syscall.EISDIR, _wasiEISDIR},
 		{syscall.EINVAL, _wasiEINVAL},
 		{syscall.EBADF, _wasiEBADF},
+		{fs.ErrClosed, _wasiEBADF},
+		{syscall.ENOSPC, _wasiENOSPC},
 		{syscall.EAGAIN, _wasiEAGAIN},
 		{syscall.EPIPE, _wasiEPIPE},
 		{fmt.Errorf("anything else"), _wasiEIO},
