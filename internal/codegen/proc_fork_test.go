@@ -368,7 +368,11 @@ func TestWasi_CloseErrorsAreReported(t *testing.T) {
 		}
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		return w.addFDLocked(&wasiOpen{f: failingCloser{File: f, err: os.ErrPermission}})
+		fd, errno := w.addFDLocked(&wasiOpen{f: failingCloser{File: f, err: os.ErrPermission}})
+		if errno != _wasiESUCCESS {
+			t.Fatalf("addFDLocked errno=%d", errno)
+		}
+		return fd
 	}
 	w, m := newProcTestStubs(t)
 	fd := failing(t, w)

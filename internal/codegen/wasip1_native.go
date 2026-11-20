@@ -912,12 +912,9 @@ func (w *WasiStubs) CloseAll() error {
 
 // Fd_closefrom is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "fd_closefrom") backing closefrom(): it
-// closes every fd numbered lowFd or higher, each as fd_close would. A guest
-// emulating exec needs it: the process it started has its own descriptors,
-// and the fds this instance still holds — close-on-exec ones included —
-// must go, or a peer waiting for end-of-file on one of them waits for as
-// long as the command runs. Returns 0, or a positive errno for the first
-// close that failed (every fd in range is closed regardless).
+// closes every fd numbered lowFd or higher, each as fd_close would. Returns
+// 0, or a positive errno for the first close that failed (every fd in range
+// is closed regardless).
 func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -944,13 +941,10 @@ func (w *WasiStubs) Fd_closefrom64(m *Module, lowFd int32) int32 {
 // table entry and is never handed out for a new descriptor.
 const wasiPreopenFD int32 = 3
 
-// wasiRootFD is a second number of the preopened root directory, which a
-// guest's libc can resolve its paths against instead of wasiPreopenFD: one
-// that no descriptor ever has, so that the root directory is in nobody's
-// way. A libc finds the preopened directory under wasiPreopenFD (that is
-// where WASI has it start looking); one that knows this number names the
-// root by it from then on, in the path calls and where it asks what the
-// directory may be opened for (fd_fdstat_get), and leaves 3 alone.
+// wasiRootFD is a second number of the preopened root directory: the path
+// calls take it for the root, and fd_fdstat_get and fd_filestat_get
+// describe the root under it. No descriptor ever has it: the numbers of
+// descriptors are below it.
 const wasiRootFD int32 = 0x7ffffff0
 
 // rootDirFD reports whether fd names the preopened root directory.
@@ -979,25 +973,32 @@ func (w *WasiStubs) openLocked(fd int32) *wasiOpen {
 
 // addFDLocked stores op under the lowest fd number not in use, as POSIX
 // requires of open, pipe, dup, socket and accept, and returns that number.
-// Caller holds w.mu.
-func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
-	return w.addFDFromLocked(op, 0)
+// When no number is free it closes op and returns an errno: EMFILE, or that
+// of the close when it fails. Caller holds w.mu.
+func (w *WasiStubs) addFDLocked(op *wasiOpen) (int32, int32) {
+	fd, ok := w.addFDFromLocked(op, 0)
+	if !ok {
+		if err := closeWasiOpen(op); err != nil {
+			return -1, mapOSError(err)
+		}
+		return -1, _wasiEMFILE
+	}
+	return fd, _wasiESUCCESS
 }
 
 // addFDFromLocked enters op under the lowest free number that is at least
-// min (fcntl's F_DUPFD).
-func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) int32 {
+// min (fcntl's F_DUPFD) and below wasiRootFD, and reports whether there
+// was one.
+func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) (int32, bool) {
 	fds := w.fdsLocked()
-	fd := min
-	for {
+	for fd := min; fd < wasiRootFD; fd++ {
 		if _, used := fds[fd]; !used && fd != wasiPreopenFD {
-			break
+			fds[fd] = op
+			delete(w.cloexec, fd)
+			return fd, true
 		}
-		fd++
 	}
-	fds[fd] = op
-	delete(w.cloexec, fd)
-	return fd
+	return -1, false
 }
 
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
@@ -1237,10 +1238,22 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 	if err != nil {
 		return -mapOSError(err)
 	}
+	rop := &wasiOpen{f: r, noWrite: true}
 	w.mu.Lock()
-	rfd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
-	wfd := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
+	rfd, errno := w.addFDLocked(rop)
+	wfd, werrno := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
+	if errno == _wasiESUCCESS && werrno != _wasiESUCCESS {
+		// the read end took the last free number
+		delete(w.fdsLocked(), rfd)
+		errno = werrno
+		if err := closeWasiOpen(rop); err != nil {
+			errno = mapOSError(err)
+		}
+	}
 	w.mu.Unlock()
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
 	binary.LittleEndian.PutUint32(out[0:], uint32(rfd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(wfd))
 	return _wasiESUCCESS
@@ -1549,6 +1562,7 @@ const (
 	_wasiEINVAL       int32 = 28
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
+	_wasiEMFILE       int32 = 33
 	_wasiENOENT       int32 = 44
 	_wasiENOSPC       int32 = 51
 	_wasiENOTDIR      int32 = 54
@@ -1883,7 +1897,7 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 	var fdflags uint16
 	// Every right is granted (the host process is the trust boundary),
 	// except that the rights to read and to write say what the descriptor
-	// is open for: it is how libc answers fcntl(F_GETFL).
+	// is open for.
 	rights := ^uint64(0)
 	if op := w.openLocked(fd); op != nil {
 		if read, write := op.access(); !read {
@@ -2630,7 +2644,10 @@ func (w *WasiStubs) fdDup(m *Module, fd int32, outPtr uint64) int32 {
 // dupLocked enters a duplicate of op under the lowest free number that is
 // at least min, and writes the number at out. Caller holds w.mu.
 func (w *WasiStubs) dupLocked(op *wasiOpen, min int32, out []byte) int32 {
-	nfd := w.addFDFromLocked(op, min)
+	nfd, ok := w.addFDFromLocked(op, min)
+	if !ok {
+		return _wasiEMFILE
+	}
 	op.addRef()
 	binary.LittleEndian.PutUint32(out, uint32(nfd))
 	return _wasiESUCCESS
@@ -2654,7 +2671,7 @@ func (w *WasiStubs) fdDupfd(m *Module, fd, min int32, outPtr uint64) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
-	if min < 0 {
+	if min < 0 || min >= wasiRootFD {
 		return _wasiEINVAL
 	}
 	w.mu.Lock()
@@ -2673,7 +2690,7 @@ func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	src := w.openLocked(from)
-	if src == nil {
+	if src == nil || to < 0 || to >= wasiRootFD {
 		return _wasiEBADF
 	}
 	if from == to {
@@ -2682,6 +2699,7 @@ func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 	var closeErr error
 	if dst := w.fdsLocked()[to]; dst != nil {
 		if dst == src {
+			delete(w.cloexec, to)
 			return _wasiESUCCESS
 		}
 		closeErr = closeWasiOpen(dst)
@@ -2713,7 +2731,7 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 		return _wasiEBADF
 	}
 	src := w.openLocked(from)
-	if src == nil {
+	if src == nil || to < 0 || to >= wasiRootFD {
 		return _wasiEBADF
 	}
 	var closeErr error
@@ -3019,7 +3037,7 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(op), _wasiESUCCESS
+	return w.addFDLocked(op)
 }
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -3570,7 +3588,11 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	_ = typ
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{isSocket: true})
+	fd, errno := w.addFDLocked(&wasiOpen{isSocket: true})
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	return fd
 }
 
 // Sock_connect is a NON-STANDARD host import (module wasi_snapshot_preview1,
@@ -3642,8 +3664,11 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 		return mapOSError(err)
 	}
 	w.mu.Lock()
-	newFD := w.addFDLocked(&wasiOpen{conn: conn})
+	newFD, errno := w.addFDLocked(&wasiOpen{conn: conn})
 	w.mu.Unlock()
+	if errno != _wasiESUCCESS {
+		return errno
+	}
 	binary.LittleEndian.PutUint32(out, uint32(newFD))
 	return _wasiESUCCESS
 }

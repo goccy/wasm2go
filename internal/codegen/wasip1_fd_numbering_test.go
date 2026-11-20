@@ -543,6 +543,18 @@ func TestWasi_CloseOnExecBelongsToTheNumber(t *testing.T) {
 		}
 	}
 
+	// So does dup2 onto a number that already has the same descriptor.
+	same := dupTestFd(t, w, m, readFd)
+	if got := closeOnExec(t, w, m, same, 1, 1); got != 0 {
+		t.Fatal("a duplicate is marked close-on-exec")
+	}
+	if rc := w.Fd_dup2(m, readFd, same); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dup2 onto a duplicate rc=%d", rc)
+	}
+	if got := closeOnExec(t, w, m, same, 0, 0); got != 0 {
+		t.Error("Fd_dup2 onto a duplicate left the number marked close-on-exec")
+	}
+
 	if rc := w.Fd_cloexec(m, 999, 0, 0, 6000); rc != -_wasiEBADF {
 		t.Errorf("Fd_cloexec of a closed descriptor rc=%d, want -EBADF", rc)
 	}
