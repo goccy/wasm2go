@@ -1872,16 +1872,21 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	return _wasiESUCCESS
 }
 
+// wasiMaxIovecs is the most entries a ciovec/iovec array may have.
+const wasiMaxIovecs = 1 << 20
+
 // iovecSlices resolves a ciovec/iovec array (iovsLen entries at iovs of a
 // guest pointer and a __wasi_size_t each: {u32 ptr, u32 len} for a wasm32
 // guest, {u64 ptr, u64 len} for a memory64 one) into the backing memory
 // windows. Every entry is validated before any I/O happens, so a bad iovec
-// faults the whole call instead of after a partial transfer.
+// faults the whole call instead of after a partial transfer. An array of
+// more than wasiMaxIovecs entries is refused.
 func (w *WasiStubs) iovecSlices(m *Module, abi wasiABI, iovs, iovsLen uint64) ([][]byte, bool) {
-	// The array may take up to 2 GiB; bound the count before multiplying
-	// so that a pathological iovsLen cannot wrap.
+	// Bound the count before multiplying and before allocating a window
+	// per entry, so that a pathological iovsLen can neither wrap nor size
+	// a host allocation.
 	stride := 2 * abi.wordSize()
-	if iovsLen > 0x7fffffff/stride {
+	if iovsLen > wasiMaxIovecs {
 		return nil, false
 	}
 	iovecs := w.memBytes(m, iovs, iovsLen*stride)

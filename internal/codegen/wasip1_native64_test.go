@@ -596,3 +596,36 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		})
 	}
 }
+
+// An iovec array of more than wasiMaxIovecs entries is refused with EFAULT
+// for both ABIs, even when the guest's memory holds all of it; one of
+// exactly wasiMaxIovecs entries is taken.
+func TestWasi64_IovecCountIsBounded(t *testing.T) {
+	w, _ := newTestStubs(t, t.TempDir())
+	w.stdout = &bytes.Buffer{}
+	// Zeroed memory is an array of empty iovecs at 0 for either ABI; the
+	// count a call writes back goes after wasiMaxIovecs+1 LP64 entries.
+	const countOff = (wasiMaxIovecs + 1) * 16
+	m := newGuestModule(countOff + 8)
+	for _, tc := range []struct {
+		name  string
+		abi   wasiABI
+		write func(iovsLen uint64) int32
+	}{
+		{"wasm32", wasiABI32, func(n uint64) int32 { return w.Fd_write(m, 1, 0, int32(n), countOff) }},
+		{"memory64", wasiABI64, func(n uint64) int32 { return w.Fd_write64(m, 1, 0, int64(n), countOff) }},
+	} {
+		if bufs, ok := w.iovecSlices(m, tc.abi, 0, wasiMaxIovecs); !ok || len(bufs) != wasiMaxIovecs {
+			t.Errorf("%s: iovecSlices of wasiMaxIovecs entries = %d windows, %v", tc.name, len(bufs), ok)
+		}
+		if bufs, ok := w.iovecSlices(m, tc.abi, 0, wasiMaxIovecs+1); ok || bufs != nil {
+			t.Errorf("%s: iovecSlices of wasiMaxIovecs+1 entries = %d windows, %v, want refused", tc.name, len(bufs), ok)
+		}
+		if rc := tc.write(wasiMaxIovecs); rc != _wasiESUCCESS {
+			t.Errorf("%s: fd_write of wasiMaxIovecs iovecs rc=%d", tc.name, rc)
+		}
+		if rc := tc.write(wasiMaxIovecs + 1); rc != _wasiEFAULT {
+			t.Errorf("%s: fd_write of wasiMaxIovecs+1 iovecs rc=%d, want EFAULT", tc.name, rc)
+		}
+	}
+}
