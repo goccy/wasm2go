@@ -1191,7 +1191,9 @@ func (w *WasiStubs) checkNet(op string) bool {
 // and only memSize says how much of it the guest may touch; another agent
 // may grow the memory at any moment, which raises memSize and leaves the
 // slice and its backing array as they are, so a view taken here stays
-// valid. Any other memory's slice is memory.size long.
+// valid. A memory the caller handed to the constructor (NewWithMemory,
+// NewFromSnapshot) may be longer than memSize in the same way, until
+// memory.grow reslices it. Any other memory's slice is memory.size long.
 func (w *WasiStubs) guestMemory(m *Module) []byte {
 	return m.memory[:m.memSize.Load()]
 }
@@ -1230,6 +1232,14 @@ func zext(v int32) uint64 { return uint64(uint32(v)) }
 // tables, prestat, the size a call writes back — are read and written
 // through it. A binding knows it by which of its two methods was called:
 // the wasm32 one passes wasiABI32, its *64 twin wasiABI64.
+//
+// A memory64 module's wasi imports arrive widened (see the wasm2go
+// wasi-libc port's __wasi_abi_t): every argument of a standard import is a
+// pointer-width i64. Codegen binds such a module's imports to the methods
+// named <Name>64 (importMethodName); a wasm32 module binds the ones without
+// the suffix. The two methods of an import are thin wrappers over one body,
+// which takes the guest's addresses as uint64 — a wasm32 guest's
+// zero-extended (zext), a memory64 guest's as they are, never truncated.
 type wasiABI uint64
 
 const (
@@ -1315,7 +1325,7 @@ func mapOSError(err error) int32 {
 
 // totalBytes sums len(s)+1 over s in a uint64 and reports whether the
 // total fits in an int32 (i.e. is representable as a wasm-side i32
-// length). Callers route the result through memSlice and an OOB on a
+// length). Callers route the result through memBytes and an OOB on a
 // pathologically long arg list surfaces as EFAULT to the guest rather
 // than a host-side panic via a wrapped-int32 length.
 func totalBytesPlusNul(ss []string) (int32, bool) {
@@ -1448,7 +1458,7 @@ func (w *WasiStubs) putStrVecSizes(m *Module, abi wasiABI, countPtr, bufLenPtr u
 	return _wasiESUCCESS
 }
 
-func (w *WasiStubs) Clock_res_get(m *Module, clockID, resPtr int32) int32 {
+func (w *WasiStubs) Clock_res_get(m *Module, clockID int32, resPtr int32) int32 {
 	return w.clockResGet(m, clockID, zext(resPtr))
 }
 
@@ -2149,7 +2159,6 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	abi.putWord(nwrittenSlice, writeVec(dst, bufs))
 	return _wasiESUCCESS
 }
-
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	op := w.fdTable[fd]
@@ -3782,20 +3791,3 @@ func (t *translator) wasmImportsWasi() bool {
 	}
 	return false
 }
-
-// ----- wasm64-wasip1 (widened ABI) ------------------------------------------
-//
-// A memory64 module's wasi imports arrive widened (see the wasm2go
-// wasi-libc port's __wasi_abi_t): every argument of a standard import is a
-// pointer-width i64, and the WASI structs that hold pointers or sizes
-// (iovecs, the argv and environ tables, prestat, the sizes a call writes
-// back) use the LP64 layout.
-// Codegen binds such a module's imports to the methods named <Name>64
-// (importMethodName); a wasm32 module binds the ones without the suffix.
-//
-// The two methods of an import are thin wrappers over one body, which
-// takes the guest's addresses as uint64 — a wasm32 guest's zero-extended
-// (zext), a memory64 guest's as they are, never truncated — and, where a
-// record's layout depends on the guest's pointer width, a wasiABI. A *64
-// method therefore does exactly what its wasm32 twin does but for the
-// widths. Each of them sits next to that twin.
