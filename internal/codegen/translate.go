@@ -438,6 +438,11 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 				dropped, len(m.Functions), 100*float64(dropped)/float64(len(m.Functions)))
 		}
 	}
+	for _, imp := range m.Imports {
+		if err := importModuleError(imp); err != nil {
+			return Result{}, err
+		}
+	}
 	t.collectImportModules()
 
 	// BulkExportPrefix with zero matches is almost always a typo;
@@ -564,11 +569,13 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	for name, content := range shared {
-		if t.auxFiles == nil {
-			t.auxFiles = map[string][]byte{}
+	for _, aux := range []map[string][]byte{shared, t.emitWasip1Platform(opts.Package)} {
+		for name, content := range aux {
+			if t.auxFiles == nil {
+				t.auxFiles = map[string][]byte{}
+			}
+			t.auxFiles[name] = content
 		}
-		t.auxFiles[name] = content
 	}
 	res, err := finalizeSinglePkgWithAsm(m, opts, w, goBuf.Bytes(), t.sidecars, t.auxFiles)
 	if err != nil {
@@ -1097,8 +1104,9 @@ func (t *translator) importMethodName(imp wasm.Import) string {
 	// A memory64 module speaks the widened wasip1 ABI (every import
 	// argument is pointer-width i64), so its imports bind to the *64
 	// variants in the wasip1 shim — the 32-bit methods keep their
-	// signatures for every existing wasm32 module.
-	if imp.Module == "wasi_snapshot_preview1" && t.mod.Memory64() {
+	// signatures for every existing wasm32 module. wasmify_posix's
+	// imports are the same shim's (see servingModule).
+	if servedByWASI(imp.Module) && t.mod.Memory64() {
 		name += "64"
 	}
 	return name
@@ -1568,7 +1576,7 @@ func (t *translator) collectImportModules() {
 			// imports are ALL internal disappears from the signature.
 			continue
 		}
-		present[imp.Module] = true
+		present[servingModule(imp.Module)] = true
 	}
 	// Emit the known modules first, in the prescribed order, if the wasm uses them.
 	for _, mod := range knownImportModuleOrder {
@@ -1582,9 +1590,9 @@ func (t *translator) collectImportModules() {
 	// parameter, so append any leftover module in first-seen order (no
 	// hand-written binding targets these, so only per-wasm determinism matters).
 	for _, imp := range t.mod.Imports {
-		if present[imp.Module] {
-			t.importedModules = append(t.importedModules, imp.Module)
-			delete(present, imp.Module)
+		if mod := servingModule(imp.Module); present[mod] {
+			t.importedModules = append(t.importedModules, mod)
+			delete(present, mod)
 		}
 	}
 }
@@ -1596,12 +1604,22 @@ func (t *translator) emitImportInterfaces() []ast.Decl {
 	}
 	// Group imports by module name (internal ones — goroutine-backed
 	// thread-spawn — never surface as interface methods).
+	// wasmify_posix's imports join wasi_snapshot_preview1's interface
+	// (see servingModule); one imported under both names is one method.
 	byMod := map[string][]wasm.Import{}
+	methodSeen := map[string]bool{}
 	for _, imp := range t.mod.Imports {
 		if importHandledInternally(imp) {
 			continue
 		}
-		byMod[imp.Module] = append(byMod[imp.Module], imp)
+		mod := servingModule(imp.Module)
+		if imp.Kind == wasm.ImportFunc && servedByWASI(imp.Module) {
+			if methodSeen[imp.Name] {
+				continue
+			}
+			methodSeen[imp.Name] = true
+		}
+		byMod[mod] = append(byMod[mod], imp)
 	}
 	var decls []ast.Decl
 	for _, mod := range t.importedModules {

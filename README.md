@@ -67,13 +67,16 @@ visible knob for any of those decisions.
 
 When the input wasm imports `wasi_snapshot_preview1`, `wasm2go` emits
 a native Go implementation of every preview1 call alongside the
-translated module. The implementation is one self-contained file
-that only uses Go's standard library (`os`, `time`, `syscall`,
-`net`) — there is no platform-specific file split and no third-party
-dependency, so generated output builds for every `GOOS` Go supports
-(linux, darwin, freebsd, netbsd, openbsd, dragonfly, solaris,
-illumos, aix, windows) without any extra wiring on the consumer
-side.
+translated module. The implementation only uses Go's standard
+library (`os`, `time`, `syscall`, `net`) — there is no third-party
+dependency. Its per-platform parts are emitted as auxiliary files
+with build constraints (`wasip1_native_*.go`,
+`wasip1_hostnumbers_*.go`) that must be written next to the main
+file: the `wasm2go` command writes them when given `-o`, a library
+caller writes `Result.AuxFiles` (multi-package output carries them in
+`Result.Files`). Generated output builds for every `GOOS` Go
+supports (linux, darwin, freebsd, netbsd, openbsd, dragonfly,
+solaris, illumos, aix, windows).
 
 ## Library usage
 

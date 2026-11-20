@@ -49,10 +49,10 @@ type Options = codegen.Options
 //   - Files: in multi-package mode, the relative-path → contents map of
 //     every generated Go file; nil in single-file mode.
 //   - AuxFiles: extra Go-source files that must land next to the main
-//     output (e.g. future runtime companions). Currently always empty —
-//     the WASI runtime is a single self-contained file with no
-//     per-platform splits — but the field is retained so callers can
-//     keep handling it generically.
+//     output: the shared-image runtime and, for a module that imports
+//     WASI, the per-platform companions of the WASI runtime
+//     (wasip1_native_posix.go, wasip1_native_other.go and the
+//     wasip1_hostnumbers_* tables).
 type Result = codegen.Result
 
 // Parse decodes a WebAssembly binary module from r.
@@ -111,6 +111,12 @@ func Translate(w io.Writer, m *Module, opts Options) (Result, error) {
 		treeIn[name] = data
 	}
 	for name, data := range res.Files {
+		treeIn[name] = data
+	}
+	// The auxiliary files are part of the package: the main file calls into
+	// them (the per-platform companions of the wasi host), so the capture
+	// build needs them to compile.
+	for name, data := range res.AuxFiles {
 		treeIn[name] = data
 	}
 	synthSigs := map[string]gcasm.SynthSig{}

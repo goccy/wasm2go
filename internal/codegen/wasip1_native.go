@@ -30,11 +30,14 @@
 // File layout: this file is real, compilable Go and is also //go:embed-ed
 // so the same code that the codegen test suite exercises is the code that
 // gets written into generated output. Everything goes through the Go
-// stdlib (os, time, syscall, net) so no per-platform companion files
-// or third-party dependencies are needed.
+// stdlib (os, time, syscall, net), so no third-party dependencies are
+// needed. The few operations the stdlib only offers per platform live in the
+// wasip1_native_<platform>.go companions, which are emitted next to the
+// generated output with their build constraints.
 package codegen
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	_ "embed"
@@ -1293,8 +1296,10 @@ const (
 	_wasiENOTSOCK     int32 = 57
 	_wasiENOTSUP      int32 = 58
 	_wasiENOSYS       int32 = 52
+	_wasiENXIO        int32 = 60
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
+	_wasiESRCH        int32 = 71
 )
 
 // mapOSError turns an os/filesystem error into a wasi errno, so any
@@ -1304,13 +1309,27 @@ func mapOSError(err error) int32 {
 	if err == nil {
 		return _wasiESUCCESS
 	}
+	// The error number of the system call that failed says exactly which
+	// error it is; what follows tells only the kinds package os knows
+	// apart.
+	var number syscall.Errno
+	if errors.As(err, &number) {
+		if wasi, ok := wasiErrno(number); ok {
+			return wasi
+		}
+	}
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return _wasiENOENT
 	case errors.Is(err, fs.ErrExist):
 		return _wasiEEXIST
+	case errors.Is(err, syscall.EPERM):
+		// before fs.ErrPermission, which stands for EACCES as well
+		return _wasiEPERM
 	case errors.Is(err, fs.ErrPermission):
 		return _wasiEACCES
+	case errors.Is(err, syscall.ESRCH):
+		return _wasiESRCH
 	case errors.Is(err, syscall.ENOTDIR):
 		return _wasiENOTDIR
 	case errors.Is(err, syscall.EISDIR):
@@ -1325,6 +1344,10 @@ func mapOSError(err error) int32 {
 		return _wasiEAGAIN
 	case errors.Is(err, syscall.EPIPE), errors.Is(err, io.ErrClosedPipe):
 		return _wasiEPIPE
+	case errors.Is(err, syscall.ENXIO):
+		return _wasiENXIO
+	case errors.Is(err, errors.ErrUnsupported):
+		return _wasiENOTSUP
 	}
 	return _wasiEIO
 }
@@ -3471,9 +3494,10 @@ var wasip1NativeRaw []byte
 // m.memory get rewritten to m.Memory by capitalizeModuleFieldRefs,
 // matching how helpers are handled.
 //
-// The per-platform companions (wasip1_native_unix.go, _windows.go) are
-// not parsed into the main file's decls — they go out as separate
-// sidecar files so their //go:build constraints stick.
+// The per-platform companions (wasip1_native_posix.go, _other.go and the
+// wasip1_hostnumbers_* tables) are not parsed into the main file's decls —
+// emitWasip1Platform returns them as separate files so their //go:build
+// constraints stick.
 func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 	if !t.wasmImportsWasi() {
 		return nil, nil, nil
@@ -3636,6 +3660,41 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 	}
 
 	return decls, imports, nil
+}
+
+// The per-platform companions of this file, embedded as they are compiled
+// into this package.
+var (
+	//go:embed wasip1_native_posix.go
+	wasip1NativePosixRaw []byte
+	//go:embed wasip1_native_other.go
+	wasip1NativeOtherRaw []byte
+	//go:embed wasip1_hostnumbers_linux.go
+	wasip1HostNumbersLinuxRaw []byte
+	//go:embed wasip1_hostnumbers_darwin.go
+	wasip1HostNumbersDarwinRaw []byte
+)
+
+// emitWasip1Platform returns the per-platform companions of the native wasi
+// implementation — output filename → Go source for package pkg — or nil when
+// the module does not import wasi. They are written out as separate files,
+// next to the one that holds the emitWasip1Native declarations, because their
+// build constraints have to stay attached to them.
+func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
+	if !t.wasmImportsWasi() {
+		return nil
+	}
+	out := map[string][]byte{}
+	for name, raw := range map[string][]byte{
+		"wasip1_native_posix.go": wasip1NativePosixRaw,
+		"wasip1_native_other.go": wasip1NativeOtherRaw,
+
+		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
+		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,
+	} {
+		out[name] = bytes.Replace(raw, []byte("\npackage codegen\n"), []byte("\npackage "+pkg+"\n"), 1)
+	}
+	return out
 }
 
 // codegenStripOpts is the allow-list flavour of strip: any top-level
