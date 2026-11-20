@@ -224,6 +224,10 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	for name, content := range shared {
 		files["base/"+name] = content
 	}
+	// So do the per-platform companions of the native wasi implementation.
+	for name, content := range t.emitWasip1Platform("base") {
+		files["base/"+name] = content
+	}
 
 	// Step 7: serialize main file.
 	t.currentChunk = chunkMain

@@ -1397,10 +1397,9 @@ func TestWasi_DefaultWASI(t *testing.T) {
 // ─── Codegen side: ensure emitter still works ────────────────────────
 
 func TestWasip1EmitNoAuxFiles(t *testing.T) {
-	// The wasi runtime is one file now: everything is in
-	// wasip1_native.go and uses Go's high-level stdlib so no per-
-	// platform companion files are needed. The emitter must not
-	// register any aux file.
+	// emitWasip1Native returns the declarations of wasip1_native.go
+	// and must not register any aux file: the per-platform companions
+	// come from emitWasip1Platform.
 	tr := &translator{
 		opts:            Options{Package: "x", OutputImportPath: "ex/x"},
 		importedModules: []string{"wasi_snapshot_preview1"},

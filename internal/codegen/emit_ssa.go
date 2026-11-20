@@ -1448,7 +1448,7 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 		Fun: &ast.SelectorExpr{
 			X: &ast.SelectorExpr{
 				X:   newID("m"),
-				Sel: newID(em.t.FieldName(MangleModuleField(imp.Module))),
+				Sel: newID(em.t.FieldName(MangleModuleField(servingModule(imp.Module)))),
 			},
 			Sel: newID(em.t.ImportMethodName(imp)),
 		},

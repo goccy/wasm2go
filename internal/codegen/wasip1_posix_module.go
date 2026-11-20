@@ -1,0 +1,64 @@
+package codegen
+
+import (
+	"fmt"
+
+	"github.com/goccy/wasm2go/internal/wasm"
+)
+
+// The host imports of wasm2go's wasi runtime come in two modules:
+//
+//   - wasi_snapshot_preview1, WASI's own functions;
+//   - wasip1_posix_extension, the POSIX functions WASI preview1 does not have: the
+//     ones of posixImports, served by WasiStubs.
+//
+// One WasiStubs answers both: the two share the instance's descriptors,
+// processes and signals. So a module that imports from wasip1_posix_extension gets no
+// interface or constructor parameter of its own for it: its imports become
+// methods of the wasi_snapshot_preview1 interface, which DefaultWASI — or the
+// embedder's implementation passed to NewWithWASI — provides.
+const (
+	wasiModule  = "wasi_snapshot_preview1"
+	posixModule = "wasip1_posix_extension"
+)
+
+// posixImports are the imports of wasip1_posix_extension. A memory64 module
+// binds each to its *64 method, as it does wasi_snapshot_preview1's. They
+// are served under wasi_snapshot_preview1 as well.
+var posixImports = map[string]bool{
+	"fd_dup":     true,
+	"fd_dup2":    true,
+	"path_chmod": true,
+	"pipe":       true,
+	"proc_spawn": true,
+	"proc_wait":  true,
+}
+
+// servingModule returns the import module whose implementation answers an
+// import of mod: wasi_snapshot_preview1's for wasip1_posix_extension (see above), the
+// module itself for any other.
+func servingModule(mod string) string {
+	if mod == posixModule {
+		return wasiModule
+	}
+	return mod
+}
+
+// servedByWASI reports whether an import of mod is answered by the wasi
+// runtime: one of wasi_snapshot_preview1 or of wasip1_posix_extension.
+func servedByWASI(mod string) bool { return servingModule(mod) == wasiModule }
+
+// importModuleError reports a function import the wasi runtime does not
+// serve under the module it names: a name wasip1_posix_extension does not have.
+func importModuleError(imp wasm.Import) error {
+	if imp.Kind != wasm.ImportFunc {
+		return nil
+	}
+	switch imp.Module {
+	case posixModule:
+		if !posixImports[imp.Name] {
+			return fmt.Errorf("import %s.%s: %s has no function %q", imp.Module, imp.Name, posixModule, imp.Name)
+		}
+	}
+	return nil
+}
