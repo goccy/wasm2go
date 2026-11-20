@@ -23,9 +23,24 @@ const (
 )
 
 // posixImports are the imports of wasip1_posix_extension. A memory64 module
-// binds each to its *64 method, as it does wasi_snapshot_preview1's. They
-// are served under wasi_snapshot_preview1 as well.
+// binds each to its *64 method, as it does wasi_snapshot_preview1's.
 var posixImports = map[string]bool{
+	"fd_cloexec":   true,
+	"fd_closefrom": true,
+	"fd_dup":       true,
+	"fd_dup2":      true,
+	"fd_dupfd":     true,
+	"path_chmod":   true,
+	"pipe":         true,
+	"proc_spawn":   true,
+	"proc_wait":    true,
+}
+
+// wasiReleasedPosixImports are the imports of wasip1_posix_extension that
+// are served under wasi_snapshot_preview1 as well: released modules import
+// them from there. Every other import of wasip1_posix_extension is served
+// under wasip1_posix_extension only.
+var wasiReleasedPosixImports = map[string]bool{
 	"fd_dup":     true,
 	"fd_dup2":    true,
 	"path_chmod": true,
@@ -49,7 +64,9 @@ func servingModule(mod string) string {
 func servedByWASI(mod string) bool { return servingModule(mod) == wasiModule }
 
 // importModuleError reports a function import the wasi runtime does not
-// serve under the module it names: a name wasip1_posix_extension does not have.
+// serve under the module it names: a name wasip1_posix_extension does not have,
+// or an import of wasip1_posix_extension named under wasi_snapshot_preview1
+// (other than the ones of wasiReleasedPosixImports).
 func importModuleError(imp wasm.Import) error {
 	if imp.Kind != wasm.ImportFunc {
 		return nil
@@ -58,6 +75,10 @@ func importModuleError(imp wasm.Import) error {
 	case posixModule:
 		if !posixImports[imp.Name] {
 			return fmt.Errorf("import %s.%s: %s has no function %q", imp.Module, imp.Name, posixModule, imp.Name)
+		}
+	case wasiModule:
+		if posixImports[imp.Name] && !wasiReleasedPosixImports[imp.Name] {
+			return fmt.Errorf("import %s.%s: %q is a function of %s, not of %s", imp.Module, imp.Name, imp.Name, posixModule, wasiModule)
 		}
 	}
 	return nil

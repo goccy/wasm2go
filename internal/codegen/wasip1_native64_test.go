@@ -578,6 +578,23 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"path_create_directory of a name that is taken",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory(m, 3, 512, 5) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory64(m, 3, 512, 5) }},
+		{"pipe",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe(m, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe64(m, 1024) }},
+		{"fd_dup and fd_cloexec",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_dup(m, fd, 1024) | w.Fd_cloexec(m, fd, 1, 1, 1028) | w.Fd_cloexec(m, fd, 0, 0, 1032)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_dup64(m, fd, 1024) | w.Fd_cloexec64(m, fd, 1, 1, 1028) | w.Fd_cloexec64(m, fd, 0, 0, 1032)
+			}},
+		{"fd_dupfd, fd_dup2 and fd_closefrom",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_dupfd(m, fd, 10, 1024) | w.Fd_dup2(m, fd, 12) | w.Fd_closefrom(m, 11) | w.Fd_fdstat_get(m, 10, 1040)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Fd_dupfd64(m, fd, 10, 1024) | w.Fd_dup264(m, fd, 12) | w.Fd_closefrom64(m, 11) | w.Fd_fdstat_get64(m, 10, 1040)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w32, m32 := newTestStubs(t, dir)

@@ -30,6 +30,39 @@ func writeSubFd(m *Module, off int32, userdata uint64, etype byte, fd int32) {
 	binary.LittleEndian.PutUint32(m.memory[off+16:], uint32(fd))
 }
 
+// fd_dupfd is fcntl's F_DUPFD: the duplicate gets the lowest free number
+// that is at least the one asked for, and a negative one is EINVAL.
+func TestWasi_FdDupfdTakesTheLowestNumberFromMin(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	const outOff int32 = 100
+	if rc := w.Fd_dupfd(m, fd, 20, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != 20 {
+		t.Fatalf("Fd_dupfd(min 20) = %d, want 20", got)
+	}
+	if rc := w.Fd_dupfd(m, fd, 20, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != 21 {
+		t.Fatalf("Fd_dupfd(min 20) with 20 taken = %d, want 21", got)
+	}
+	if rc := w.Fd_dupfd(m, fd, -1, outOff); rc != _wasiEINVAL {
+		t.Fatalf("Fd_dupfd(min -1) rc=%d, want EINVAL", rc)
+	}
+	if rc := w.Fd_dupfd(m, 99, 0, outOff); rc != _wasiEBADF {
+		t.Fatalf("Fd_dupfd of a closed number rc=%d, want EBADF", rc)
+	}
+}
+
 func TestWasi_FdDupSharesOffsetAndDefersClose(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("abcdef"), 0o644); err != nil {

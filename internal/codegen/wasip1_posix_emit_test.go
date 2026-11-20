@@ -64,16 +64,25 @@ func translateImport(mod, name string) error {
 	return err
 }
 
-// The functions of wasip1_posix_extension are served under either module name; a
-// function wasip1_posix_extension does not have is refused under it.
-func TestPosixModuleRefusesAFunctionItDoesNotHave(t *testing.T) {
+// The functions of wasip1_posix_extension are not served under
+// wasi_snapshot_preview1, except the ones of wasiReleasedPosixImports (pipe,
+// fd_dup2, ...); a function wasip1_posix_extension does not have is refused
+// under it.
+func TestImportsAreServedUnderTheirModuleOnly(t *testing.T) {
 	for _, c := range []struct {
 		mod, name string
 		ok        bool
 	}{
 		{"wasip1_posix_extension", "fd_dup2", true},
 		{"wasip1_posix_extension", "pipe", true},
+		{"wasip1_posix_extension", "fd_closefrom", true},
+		{"wasip1_posix_extension", "fd_dupfd", true},
+		{"wasip1_posix_extension", "fd_cloexec", true},
+		{"wasi_snapshot_preview1", "fd_closefrom", false},
+		{"wasi_snapshot_preview1", "fd_dupfd", false},
+		{"wasi_snapshot_preview1", "fd_cloexec", false},
 		{"wasi_snapshot_preview1", "pipe", true},
+		{"wasi_snapshot_preview1", "fd_dup2", true},
 		{"wasi_snapshot_preview1", "sock_socket", true},
 		{"wasi_snapshot_preview1", "fd_write", true},
 		{"wasip1_posix_extension", "sock_socket", false},

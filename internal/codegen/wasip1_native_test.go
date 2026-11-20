@@ -71,8 +71,6 @@ func TestWasip1TemplateParses(t *testing.T) {
 func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 	t.Helper()
 	w := &WasiStubs{
-		fdTable:    map[int32]*wasiOpen{},
-		nextFD:     4,
 		args:       []string{"prog", "a", "b"},
 		env:        []string{"FOO=bar", "BAZ=qux"},
 		monoStart:  time.Now(),
@@ -171,7 +169,7 @@ func TestWasi_FSAccessHook(t *testing.T) {
 // these fd-less test calls, proving the hook let it pass).
 func TestWasi_NetAccessHook(t *testing.T) {
 	_, m := newTestStubs(t, t.TempDir())
-	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+	w := &WasiStubs{}
 
 	denied := map[string]bool{"send": true}
 	w.SetNetAccessHook(func(op string) bool { return !denied[op] })
@@ -236,7 +234,7 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 	const loopbackBE = int32(0x0100007f)
 
 	_, m := newTestStubs(t, t.TempDir())
-	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+	w := &WasiStubs{}
 
 	// Sock_socket allocates a fresh fd (family is validated by the bridge
 	// shim, not here).
@@ -303,7 +301,7 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 // the resolve whitelist hook denies a blocked host with EACCES.
 func TestWasi_SockGetaddrinfo(t *testing.T) {
 	_, m := newTestStubs(t, t.TempDir())
-	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+	w := &WasiStubs{}
 
 	// Numeric IPv4 → fast path, 4-byte network-order result at outPtr.
 	off, ln := putPath(m, 128, "203.0.113.7")
@@ -816,7 +814,7 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 
 	w, m := newTestStubs(t, t.TempDir())
 	// Register the listener under fd 7.
-	w.fdTable[7] = &wasiOpen{listener: ln}
+	w.fdsLocked()[7] = &wasiOpen{listener: ln}
 
 	// Drive a client in a goroutine. doneShutdown is closed by the main
 	// thread once Sock_shutdown has run; the client must NOT close its
@@ -913,7 +911,7 @@ func TestWasi_SockRecvRoflagsLayout(t *testing.T) {
 		}
 	})
 	_, m := newTestStubs(t, t.TempDir())
-	w := &WasiStubs{fdTable: map[int32]*wasiOpen{5: {conn: c2}}, nextFD: 6}
+	w := &WasiStubs{fdTable: map[int32]*wasiOpen{5: {conn: c2}}}
 
 	go func() {
 		if _, werr := c1.Write([]byte("HELLO")); werr != nil {
@@ -1283,7 +1281,7 @@ func TestWasi_PreopenJoinDefault(t *testing.T) {
 		t.Fatalf("scoped join=%q, want /tmp/abc/foo", got)
 	}
 	// SetPreopenDir installs an osFS rooted at the directory.
-	w := &WasiStubs{fdTable: map[int32]*wasiOpen{}, nextFD: 4}
+	w := &WasiStubs{}
 	w.SetPreopenDir("/tmp/abc")
 	of, ok := w.fsys.(osFS)
 	if !ok || of.root != "/tmp/abc" {
@@ -1684,8 +1682,6 @@ func TestWasi_FdReadStdin(t *testing.T) {
 
 	w := &WasiStubs{
 		stdin:     r,
-		fdTable:   map[int32]*wasiOpen{},
-		nextFD:    4,
 		monoStart: time.Now(),
 	}
 	m := newGuestModule(1 << 14)
@@ -1715,8 +1711,6 @@ func TestWasi_FdWriteToStdoutErr(t *testing.T) {
 	w := &WasiStubs{
 		stdout:    wp,
 		stderr:    wp,
-		fdTable:   map[int32]*wasiOpen{},
-		nextFD:    4,
 		monoStart: time.Now(),
 	}
 	m := newGuestModule(1 << 14)
