@@ -1104,7 +1104,7 @@ func (t *translator) importMethodName(imp wasm.Import) string {
 	// A memory64 module speaks the widened wasip1 ABI (every import
 	// argument is pointer-width i64), so its imports bind to the *64
 	// variants in the wasip1 shim — the 32-bit methods keep their
-	// signatures for every existing wasm32 module. wasmify_posix's
+	// signatures for every existing wasm32 module. wasip1_posix_extension's
 	// imports are the same shim's (see servingModule).
 	if servedByWASI(imp.Module) && t.mod.Memory64() {
 		name += "64"
@@ -1604,7 +1604,7 @@ func (t *translator) emitImportInterfaces() []ast.Decl {
 	}
 	// Group imports by module name (internal ones — goroutine-backed
 	// thread-spawn — never surface as interface methods).
-	// wasmify_posix's imports join wasi_snapshot_preview1's interface
+	// wasip1_posix_extension's imports join wasi_snapshot_preview1's interface
 	// (see servingModule); one imported under both names is one method.
 	byMod := map[string][]wasm.Import{}
 	methodSeen := map[string]bool{}

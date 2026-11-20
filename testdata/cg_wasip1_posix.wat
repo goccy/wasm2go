@@ -1,7 +1,7 @@
-;; cg_wasmify_posix.wat — imports functions of both modules of the Go-native
+;; cg_wasip1_posix.wat — imports functions of both modules of the Go-native
 ;; wasi runtime: wasi_snapshot_preview1's fd_write and fd_read, and
-;; wasmify_posix's pipe and fd_dup. The pipe made through
-;; wasmify_posix is written and read through wasi_snapshot_preview1, so the
+;; wasip1_posix_extension's pipe and fd_dup. The pipe made through
+;; wasip1_posix_extension is written and read through wasi_snapshot_preview1, so the
 ;; two modules have to be served by one WasiStubs with one fd table.
 ;; roundtrip leaves the bytes read at 300 and returns their count, or a
 ;; negative step number when a call fails.
@@ -10,9 +10,9 @@
     (func $fd_write (param i32 i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "fd_read"
     (func $fd_read (param i32 i32 i32 i32) (result i32)))
-  (import "wasmify_posix" "pipe"
+  (import "wasip1_posix_extension" "pipe"
     (func $pipe (param i32) (result i32)))
-  (import "wasmify_posix" "fd_dup"
+  (import "wasip1_posix_extension" "fd_dup"
     (func $fd_dup (param i32 i32) (result i32)))
 
   (memory (export "memory") 1)

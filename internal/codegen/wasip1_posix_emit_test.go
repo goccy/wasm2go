@@ -9,13 +9,13 @@ import (
 	"github.com/goccy/wasm2go/internal/wasm"
 )
 
-// A module that imports from wasmify_posix gets the runtime's
+// A module that imports from wasip1_posix_extension gets the runtime's
 // implementations of them by default — New takes no implementation of its
 // own for that module — and they share the instance's state with
-// wasi_snapshot_preview1's: a pipe made through wasmify_posix is written
+// wasi_snapshot_preview1's: a pipe made through wasip1_posix_extension is written
 // (through a dup made there) and read through wasi_snapshot_preview1.
-func TestWasmifyPosixImportsAreServedByDefault(t *testing.T) {
-	mod := readFixture(t, "cg_wasmify_posix.wasm")
+func TestPosixImportsAreServedByDefault(t *testing.T) {
+	mod := readFixture(t, "cg_wasip1_posix.wasm")
 	var buf bytes.Buffer
 	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
 	if err != nil {
@@ -46,8 +46,8 @@ func main() {
 	if out != want {
 		t.Errorf("output:\n%s\nwant:\n%s", out, want)
 	}
-	if strings.Contains(buf.String(), "Wasmify_posixImports") {
-		t.Errorf("the translation declares an interface of its own for wasmify_posix; its imports belong to wasi_snapshot_preview1's")
+	if strings.Contains(buf.String(), "Wasip1_posix_extensionImports") {
+		t.Errorf("the translation declares an interface of its own for wasip1_posix_extension; its imports belong to wasi_snapshot_preview1's")
 	}
 }
 
@@ -64,20 +64,20 @@ func translateImport(mod, name string) error {
 	return err
 }
 
-// The functions of wasmify_posix are served under either module name; a
-// function wasmify_posix does not have is refused under it.
-func TestImportsAreServedUnderTheirModuleOnly(t *testing.T) {
+// The functions of wasip1_posix_extension are served under either module name; a
+// function wasip1_posix_extension does not have is refused under it.
+func TestPosixModuleRefusesAFunctionItDoesNotHave(t *testing.T) {
 	for _, c := range []struct {
 		mod, name string
 		ok        bool
 	}{
-		{"wasmify_posix", "fd_dup2", true},
-		{"wasmify_posix", "pipe", true},
+		{"wasip1_posix_extension", "fd_dup2", true},
+		{"wasip1_posix_extension", "pipe", true},
 		{"wasi_snapshot_preview1", "pipe", true},
 		{"wasi_snapshot_preview1", "sock_socket", true},
 		{"wasi_snapshot_preview1", "fd_write", true},
-		{"wasmify_posix", "sock_socket", false},
-		{"wasmify_posix", "fd_write", false},
+		{"wasip1_posix_extension", "sock_socket", false},
+		{"wasip1_posix_extension", "fd_write", false},
 	} {
 		err := translateImport(c.mod, c.name)
 		if c.ok && err != nil {
@@ -120,11 +120,11 @@ func interfaceMethods(t *testing.T, src, iface, method string) int {
 	return strings.Count(body, "\t"+method+"(")
 }
 
-// A function imported under both wasmify_posix and wasi_snapshot_preview1
+// A function imported under both wasip1_posix_extension and wasi_snapshot_preview1
 // is one method of the interface; two imports of another module whose
 // names make the same method name stay two.
 func TestOneMethodForAnImportOfBothWASIModules(t *testing.T) {
-	src := translatedImports(t, [2]string{"wasi_snapshot_preview1", "pipe"}, [2]string{"wasmify_posix", "pipe"})
+	src := translatedImports(t, [2]string{"wasi_snapshot_preview1", "pipe"}, [2]string{"wasip1_posix_extension", "pipe"})
 	if n := interfaceMethods(t, src, "Wasi_snapshot_preview1Imports", "Pipe"); n != 1 {
 		t.Errorf("pipe imported under both modules is %d methods, want 1", n)
 	}
