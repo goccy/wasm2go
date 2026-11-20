@@ -7,8 +7,8 @@ import (
 )
 
 // A descriptor is open for reading, for writing or for both, and says so:
-// in the rights fd_fdstat_get reports (libc's fcntl(F_GETFL) reads them)
-// and in what a read or write of it answers.
+// in the rights fd_fdstat_get reports and in what a read or write of it
+// answers.
 
 const accessStatOff int32 = 15000
 

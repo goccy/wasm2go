@@ -634,6 +634,12 @@ func (op *wasiOpen) netConn() net.Conn {
 	return op.conn
 }
 
+// socket reports whether the entry is a socket: one that has neither a
+// file nor a standard stream. A nil entry is none.
+func (op *wasiOpen) socket() bool {
+	return op != nil && op.f == nil && op.stdio == 0
+}
+
 // addRef records one more table slot referring to op.
 func (op *wasiOpen) addRef() {
 	op.mu.Lock()
@@ -973,17 +979,12 @@ func (w *WasiStubs) openLocked(fd int32) *wasiOpen {
 
 // addFDLocked stores op under the lowest fd number not in use, as POSIX
 // requires of open, pipe, dup, socket and accept, and returns that number.
-// When no number is free it closes op and returns an errno: EMFILE, or that
-// of the close when it fails. Caller holds w.mu.
-func (w *WasiStubs) addFDLocked(op *wasiOpen) (int32, int32) {
-	fd, ok := w.addFDFromLocked(op, 0)
-	if !ok {
-		if err := closeWasiOpen(op); err != nil {
-			return -1, mapOSError(err)
-		}
-		return -1, _wasiEMFILE
-	}
-	return fd, _wasiESUCCESS
+// Caller holds w.mu.
+func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
+	// From 0 there is a free number: the table would have to hold an
+	// entry for every number below wasiRootFD.
+	fd, _ := w.addFDFromLocked(op, 0)
+	return fd
 }
 
 // addFDFromLocked enters op under the lowest free number that is at least
@@ -1191,15 +1192,18 @@ func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) in
 
 // childReaderLocked resolves the stdin of a spawned process. A negative fd
 // asks for the instance's stdin. Any other fd is resolved through the fd
-// table like a read of it: the standard stream, file, pipe end or
-// connection it refers to, and nil — no stream, which os/exec turns into
-// the null device — when the fd is closed or cannot be read. Caller holds
-// w.mu.
+// table like a read of it: the standard stream, file or pipe end it refers
+// to, and nil — no stream, which os/exec turns into the null device — when
+// the fd is closed or cannot be read. The fd of a socket asks for the
+// instance's stdin too. Caller holds w.mu.
 func (w *WasiStubs) childReaderLocked(fd int32) io.Reader {
 	if fd < 0 {
 		return w.stdin
 	}
-	src, _ := w.fdSrcLocked(fd)
+	src, op := w.fdSrcLocked(fd)
+	if op.socket() {
+		return w.stdin
+	}
 	return src
 }
 
@@ -1209,7 +1213,10 @@ func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
 	if fd < 0 {
 		return inherited
 	}
-	dst, _ := w.fdDstLocked(fd)
+	dst, op := w.fdDstLocked(fd)
+	if op.socket() {
+		return inherited
+	}
 	return dst
 }
 
@@ -1238,22 +1245,10 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 	if err != nil {
 		return -mapOSError(err)
 	}
-	rop := &wasiOpen{f: r, noWrite: true}
 	w.mu.Lock()
-	rfd, errno := w.addFDLocked(rop)
-	wfd, werrno := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
-	if errno == _wasiESUCCESS && werrno != _wasiESUCCESS {
-		// the read end took the last free number
-		delete(w.fdsLocked(), rfd)
-		errno = werrno
-		if err := closeWasiOpen(rop); err != nil {
-			errno = mapOSError(err)
-		}
-	}
+	rfd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
+	wfd := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
 	w.mu.Unlock()
-	if errno != _wasiESUCCESS {
-		return -errno
-	}
 	binary.LittleEndian.PutUint32(out[0:], uint32(rfd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(wfd))
 	return _wasiESUCCESS
@@ -2655,7 +2650,9 @@ func (w *WasiStubs) dupLocked(op *wasiOpen, min int32, out []byte) int32 {
 
 // Fd_dupfd is a NON-STANDARD host import (module wasip1_posix_extension,
 // name "fd_dupfd") backing fcntl's F_DUPFD: fd_dup, under the lowest free
-// number that is at least min. EINVAL for a negative min.
+// number that is at least min. EINVAL for a min that is negative or not
+// below the numbers descriptors have (wasiRootFD), EMFILE when no number
+// from min on is free.
 func (w *WasiStubs) Fd_dupfd(m *Module, fd, min, outPtr int32) int32 {
 	return w.fdDupfd(m, fd, min, zext(outPtr))
 }
@@ -3037,7 +3034,7 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(op)
+	return w.addFDLocked(op), _wasiESUCCESS
 }
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -3588,11 +3585,7 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	_ = typ
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	fd, errno := w.addFDLocked(&wasiOpen{isSocket: true})
-	if errno != _wasiESUCCESS {
-		return -errno
-	}
-	return fd
+	return w.addFDLocked(&wasiOpen{isSocket: true})
 }
 
 // Sock_connect is a NON-STANDARD host import (module wasi_snapshot_preview1,
@@ -3664,11 +3657,8 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 		return mapOSError(err)
 	}
 	w.mu.Lock()
-	newFD, errno := w.addFDLocked(&wasiOpen{conn: conn})
+	newFD := w.addFDLocked(&wasiOpen{conn: conn})
 	w.mu.Unlock()
-	if errno != _wasiESUCCESS {
-		return errno
-	}
 	binary.LittleEndian.PutUint32(out, uint32(newFD))
 	return _wasiESUCCESS
 }

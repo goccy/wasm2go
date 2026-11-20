@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // dupTestFd duplicates fd through Fd_dup and returns the new fd.
@@ -318,6 +319,57 @@ func TestWasi_SpawnWithClosedStandardOutput(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Fatalf("instance stdout received %q from a child whose stdout was closed", out.String())
+	}
+}
+
+// The number of a socket as a standard stream of a spawned process stands
+// for the instance's stream: the wait for the process does not depend on
+// the socket's peer.
+func TestWasi_SpawnWithSocketAsStandardStream(t *testing.T) {
+	if _, err := os.Stat("/bin/echo"); err != nil {
+		t.Skip("/bin/echo not available")
+	}
+	w, m := newTestStubs(t, t.TempDir())
+	var out bytes.Buffer
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
+	local, peer := net.Pipe()
+	t.Cleanup(func() {
+		if err := peer.Close(); err != nil {
+			t.Errorf("close peer: %v", err)
+		}
+	})
+	w.mu.Lock()
+	sock := w.addFDLocked(&wasiOpen{conn: local})
+	unconnected := w.addFDLocked(&wasiOpen{isSocket: true})
+	w.mu.Unlock()
+	t.Cleanup(func() {
+		if err := w.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+
+	pathOff := writeCStr(m, 1000, "/bin/echo")
+	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "to the instance"})
+	const pidOff, statusOff int32 = 4000, 4004
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, sock, sock, unconnected, 0, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	pid := int32(readU32(m.memory, int(pidOff)))
+	waited := make(chan int32, 1)
+	go func() { waited <- w.Proc_wait(m, pid, 0, statusOff) }()
+	select {
+	case rc := <-waited:
+		if rc != _wasiESUCCESS {
+			t.Fatalf("Proc_wait rc=%d", rc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Proc_wait did not return while the socket's peer is open")
+	}
+	if status := readU32(m.memory, int(statusOff)); status != 0 {
+		t.Fatalf("wait status = %#x, want 0", status)
+	}
+	if out.String() != "to the instance\n" {
+		t.Fatalf("instance stdout = %q, want the command's output", out.String())
 	}
 }
 
