@@ -112,9 +112,10 @@ func openHostFile(t *testing.T, w *WasiStubs, m *Module, dir, name, content stri
 		t.Fatalf("open rc=%d", rc)
 	}
 	fd := int32(readU32(m.memory, 128))
+	f := w.fdTable[fd].f
 	t.Cleanup(func() {
 		// A test may have closed the file itself.
-		if err := w.fdTable[fd].f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			t.Error(err)
 		}
 	})
@@ -155,8 +156,8 @@ func TestWasi_ReadOnClosedFileFails(t *testing.T) {
 			if err := w.fdTable[fd].f.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if rc, n := c.run(w, m, fd, 1); rc != _wasiEBADF {
-				t.Fatalf("rc=%d n=%d, want EBADF", rc, n)
+			if rc, n := c.run(w, m, fd, 1); rc != _wasiEBADF || n != 0 {
+				t.Fatalf("rc=%d n=%d, want EBADF 0", rc, n)
 			}
 		})
 	}
@@ -204,8 +205,10 @@ func TestWasi_ReadOnDirectoryIsEISDIR(t *testing.T) {
 				}
 			})
 			w.fdTable[9] = &wasiOpen{f: f}
-			if rc, n := ioReadCalls[0].run(w, m, 9, 1); rc != _wasiEISDIR {
-				t.Fatalf("rc=%d n=%d, want EISDIR", rc, n)
+			for _, c := range ioReadCalls {
+				if rc, n := c.run(w, m, 9, 1); rc != _wasiEISDIR || n != 0 {
+					t.Errorf("%s: rc=%d n=%d, want EISDIR 0", c.name, rc, n)
+				}
 			}
 		})
 	}
@@ -225,8 +228,8 @@ func TestWasi_IOErrorAfterTransferIsShortCount(t *testing.T) {
 				t.Fatalf("error with a short count: rc=%d n=%d, want ESUCCESS 3", rc, n)
 			}
 			w.fdTable[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{0, failure}}}}
-			if rc, _ := c.run(w, m, 9, 2); rc != _wasiEIO {
-				t.Fatalf("error with nothing transferred: rc=%d, want EIO", rc)
+			if rc, n := c.run(w, m, 9, 2); rc != _wasiEIO || n != 0 {
+				t.Fatalf("error with nothing transferred: rc=%d n=%d, want EIO 0", rc, n)
 			}
 		})
 	}

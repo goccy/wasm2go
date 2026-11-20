@@ -475,6 +475,9 @@ func (f *memFile) Read(p []byte) (int, error) {
 func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
+	if f.node.dir {
+		return 0, &fs.PathError{Op: "read", Path: f.node.name, Err: syscall.EISDIR}
+	}
 	if off >= int64(len(f.node.data)) {
 		return 0, io.EOF
 	}
@@ -1294,9 +1297,9 @@ const (
 	_wasiEPIPE        int32 = 64
 )
 
-// mapOSError turns an os/filesystem error into a wasi errno. Used by the
-// path-based syscalls so any os.PathError surfaces as the appropriate
-// guest-visible code instead of a coarse EIO.
+// mapOSError turns an os/filesystem error into a wasi errno, so any
+// os.PathError surfaces as the appropriate guest-visible code instead of
+// a coarse EIO.
 func mapOSError(err error) int32 {
 	if err == nil {
 		return _wasiESUCCESS
@@ -1921,8 +1924,8 @@ func (w *WasiStubs) iovecSlices(m *Module, abi wasiABI, iovs, iovsLen uint64) ([
 
 // readVec fills bufs from src in order, stopping at the first error
 // (EOF included) or short read; returns the bytes read, or the errno of
-// an error other than EOF that left nothing read. Shared by the
-// wasm32 and wasm64 fd_read bindings — only the iovec layout differs.
+// an error other than EOF that left nothing read. Shared by fd_read and
+// fd_pread.
 func readVec(src io.Reader, bufs [][]byte) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
@@ -1940,7 +1943,7 @@ func readVec(src io.Reader, bufs [][]byte) (uint64, int32) {
 
 // writeVec drains bufs into dst in order, stopping at the first failed
 // write; returns the bytes written, or the errno of an error that left
-// nothing written. Shared like readVec.
+// nothing written. Shared by fd_write and fd_pwrite.
 func writeVec(dst io.Writer, bufs [][]byte) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
@@ -2034,12 +2037,9 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	total, errno := readVec(io.NewSectionReader(op.f, offset, 1<<63-1), bufs)
-	if errno != _wasiESUCCESS {
-		return errno
-	}
-	abi.putWord(nreadSlice, total)
-	return _wasiESUCCESS
+	n, errno := readVec(io.NewSectionReader(op.f, offset, 1<<63-1), bufs)
+	abi.putWord(nreadSlice, n)
+	return errno
 }
 
 func (w *WasiStubs) Fd_pwrite(m *Module, fd, iovs, iovsLen int32, offset int64, nwrittenPtr int32) int32 {
@@ -2066,12 +2066,9 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 	if !ok || nwSlice == nil {
 		return _wasiEFAULT
 	}
-	total, errno := writeVec(io.NewOffsetWriter(op.f, offset), bufs)
-	if errno != _wasiESUCCESS {
-		return errno
-	}
-	abi.putWord(nwSlice, total)
-	return _wasiESUCCESS
+	n, errno := writeVec(io.NewOffsetWriter(op.f, offset), bufs)
+	abi.putWord(nwSlice, n)
+	return errno
 }
 
 func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr int32) int32 {
