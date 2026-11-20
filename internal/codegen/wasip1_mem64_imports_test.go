@@ -30,15 +30,21 @@ func TestWasip1Mem64ImportsCompile(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	src := buf.String()
+	// The calls of the imports are in the function bodies, which are in
+	// the files next to the main one.
+	var bodies strings.Builder
+	for _, data := range res.Files {
+		bodies.Write(data)
+	}
 	imported := map[string]bool{}
 	for _, imp := range mod.Imports {
 		if imp.Kind != wasm.ImportFunc {
 			continue
 		}
 		imported[imp.Name] = true
-		method := strings.ToUpper(imp.Name[:1]) + imp.Name[1:] + "64("
-		if !strings.Contains(src, method) {
-			t.Errorf("import %s does not bind to %s)", imp.Name, method)
+		call := "." + strings.ToUpper(imp.Name[:1]) + imp.Name[1:] + "64("
+		if !strings.Contains(bodies.String(), call) {
+			t.Errorf("import %s is not called as %s)", imp.Name, call)
 		}
 	}
 	// The bindings of WasiStubs are the methods that take the Module first
