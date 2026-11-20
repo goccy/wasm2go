@@ -462,7 +462,7 @@ func (f *memFile) Read(p []byte) (int, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
 	if f.node.dir {
-		return 0, &fs.PathError{Op: "read", Path: f.node.name, Err: fs.ErrInvalid}
+		return 0, &fs.PathError{Op: "read", Path: f.node.name, Err: syscall.EISDIR}
 	}
 	if f.off >= int64(len(f.node.data)) {
 		return 0, io.EOF
@@ -1314,13 +1314,13 @@ func mapOSError(err error) int32 {
 		return _wasiEISDIR
 	case errors.Is(err, syscall.EINVAL):
 		return _wasiEINVAL
-	case errors.Is(err, syscall.EBADF), errors.Is(err, fs.ErrClosed):
+	case errors.Is(err, syscall.EBADF), errors.Is(err, fs.ErrClosed), errors.Is(err, net.ErrClosed):
 		return _wasiEBADF
 	case errors.Is(err, syscall.ENOSPC):
 		return _wasiENOSPC
 	case errors.Is(err, syscall.EAGAIN):
 		return _wasiEAGAIN
-	case errors.Is(err, syscall.EPIPE):
+	case errors.Is(err, syscall.EPIPE), errors.Is(err, io.ErrClosedPipe):
 		return _wasiEPIPE
 	}
 	return _wasiEIO
@@ -2034,18 +2034,9 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	var total uint64
-	curOff := offset
-	for _, buf := range bufs {
-		n, err := op.f.ReadAt(buf, curOff)
-		total += uint64(n)
-		curOff += int64(n)
-		if err != nil && total == 0 && !errors.Is(err, io.EOF) {
-			return mapOSError(err)
-		}
-		if err != nil || n < len(buf) {
-			break
-		}
+	total, errno := readVec(io.NewSectionReader(op.f, offset, 1<<63-1), bufs)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	abi.putWord(nreadSlice, total)
 	return _wasiESUCCESS
@@ -2075,18 +2066,9 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 	if !ok || nwSlice == nil {
 		return _wasiEFAULT
 	}
-	var total uint64
-	curOff := offset
-	for _, buf := range bufs {
-		n, err := op.f.WriteAt(buf, curOff)
-		total += uint64(n)
-		curOff += int64(n)
-		if err != nil && total == 0 {
-			return mapOSError(err)
-		}
-		if err != nil {
-			break
-		}
+	total, errno := writeVec(io.NewOffsetWriter(op.f, offset), bufs)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	abi.putWord(nwSlice, total)
 	return _wasiESUCCESS

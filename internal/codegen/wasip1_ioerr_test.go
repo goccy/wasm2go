@@ -111,7 +111,14 @@ func openHostFile(t *testing.T, w *WasiStubs, m *Module, dir, name, content stri
 	if rc := w.Path_open(m, 3, 0, pathOff, pathLen, 0, 1<<1, 0, 0, 128); rc != _wasiESUCCESS {
 		t.Fatalf("open rc=%d", rc)
 	}
-	return int32(readU32(m.memory, 128))
+	fd := int32(readU32(m.memory, 128))
+	t.Cleanup(func() {
+		// A test may have closed the file itself.
+		if err := w.fdTable[fd].f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			t.Error(err)
+		}
+	})
+	return fd
 }
 
 func TestWasi_WriteOnReadOnlyDescriptorFails(t *testing.T) {
@@ -173,6 +180,35 @@ func TestWasi_ReadAtEOFSucceedsWithZero(t *testing.T) {
 			t.Fatalf("rc=%d n=%d, want ESUCCESS 0", rc, n)
 		}
 	})
+}
+
+func TestWasi_ReadOnDirectoryIsEISDIR(t *testing.T) {
+	dir := t.TempDir()
+	for name, fsys := range map[string]FS{"osFS": osFS{root: dir}, "MemFS": NewMemFS()} {
+		t.Run(name, func(t *testing.T) {
+			w, m := newTestStubs(t, dir)
+			w.fsys = fsys
+			if name == "osFS" && runtime.GOOS == "windows" {
+				t.Skip("reading a directory handle fails differently on Windows")
+			}
+			if err := fsys.Mkdir("d", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			f, err := fsys.OpenFile("d", os.O_RDONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := f.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			w.fdTable[9] = &wasiOpen{f: f}
+			if rc, n := ioReadCalls[0].run(w, m, 9, 1); rc != _wasiEISDIR {
+				t.Fatalf("rc=%d n=%d, want EISDIR", rc, n)
+			}
+		})
+	}
 }
 
 func TestWasi_IOErrorAfterTransferIsShortCount(t *testing.T) {
