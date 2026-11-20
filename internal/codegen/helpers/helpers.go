@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,6 +72,10 @@ type Module struct {
 	threadStart64 func(m *Module, tid int32, arg int64)
 	// threads tracks agents spawned through wasi_thread_spawn.
 	threads *threadPool
+	// memReserve is the guarded reservation backing memory when the
+	// constructor allocated it (see initLinearMemory); nil for a heap
+	// allocation or a caller-supplied memory.
+	memReserve []byte
 }
 
 // ----- Opaque identity helpers ---------------------------------------------
@@ -819,6 +824,56 @@ func memorySize(m *Module) int32 {
 // with codegen's wasmMemHardCapBytes).
 func wasmMemHardCap() uint64 { return (1 << 32) - (1 << 17) }
 
+// initLinearMemory returns m's wasm32 linear memory, minBytes long (see
+// adoptLinearMemory). It panics when the host refuses the reservation:
+// running without one would leave guest accesses unconfined.
+func initLinearMemory(m *Module, minBytes, capBytes uint64) []byte {
+	mem, err := adoptLinearMemory(m, minBytes, capBytes)
+	if err != nil {
+		panic("wasm2go: " + err.Error())
+	}
+	return mem
+}
+
+// adoptLinearMemory allocates a linear memory for m: in a guarded reservation
+// where the host supports one (see newLinearMemory), recorded in m.memReserve,
+// and otherwise on the heap with capBytes capacity. The reservation is not Go
+// heap. Its release is tied to m.threads, which m and every wasi-threads agent
+// copy of it share (and which, holding pointers, is never a tiny allocation
+// whose cleanup could be held back by its neighbours), so it is released once
+// none of them is reachable — and a slice of it is valid only while one is.
+func adoptLinearMemory(m *Module, minBytes, capBytes uint64) ([]byte, error) {
+	mem, reserve, err := newLinearMemory(minBytes, capBytes)
+	if err != nil {
+		return nil, err
+	}
+	if reserve != nil {
+		m.memReserve = reserve
+		runtime.AddCleanup(m.threads, releaseLinearMemory, reserve)
+	}
+	return mem, nil
+}
+
+// memoryAccessTrap maps a value recovered at an export entry point: a memory
+// fault inside m's guarded linear-memory reservation is a guest out-of-bounds
+// access and becomes the wasm trap, any other fault is a host bug and is
+// re-raised, and every other value passes through unchanged.
+func memoryAccessTrap(m *Module, r any) any {
+	f, ok := r.(interface{ Addr() uintptr })
+	if !ok {
+		return r
+	}
+	if guardedLinearMemory && uint64(f.Addr()-uintptr(m.M)) < linearMemoryReserve {
+		return "wasm: out of bounds memory access"
+	}
+	panic(r)
+}
+
+// setPanicOnFault is debug.SetPanicOnFault for the generated entry points,
+// which call it without importing runtime/debug next to parameters named
+// after the module's imports.
+func setPanicOnFault(enabled bool) bool { return debug.SetPanicOnFault(enabled) }
+
 // memoryGrow grows m.memory by n wasm pages (64 KiB each). Returns the
 // previous page count, or -1 if the new size would exceed maxMem or
 // wasmMemHardCap. n may be 0, which simply returns the current size.
@@ -861,6 +916,21 @@ func memoryGrow(m *Module, n int32) int32 {
 		m.memSize.Store(want)
 		return prev
 	}
+	if m.memReserve != nil {
+		// A reserved memory never moves and is writable exactly up to its
+		// size: commit the new pages in place, and m.M stays valid.
+		if err := commitLinearMemory(m.memReserve, cur, want); err != nil {
+			// memory.grow reports a host that cannot supply the pages
+			// the same way as reaching maxMem: -1, which the guest's
+			// allocator turns into its own out-of-memory result. The
+			// host's reason goes to stderr, as nothing else sees it.
+			println("wasm2go: memory.grow:", err.Error())
+			return -1
+		}
+		m.memory = m.memReserve[:want:want]
+		m.memSize.Store(want)
+		return prev
+	}
 	if want <= uint64(cap(m.memory)) {
 		// Spare capacity already covers the new size. The bytes in
 		// [len, want) were zero-filled when the backing array was
@@ -882,7 +952,14 @@ func memoryGrow(m *Module, n int32) int32 {
 	if newCap > wasmMemHardCap() {
 		newCap = wasmMemHardCap()
 	}
-	grown := make([]byte, want, newCap)
+	// The new backing array is a guarded reservation where the host has
+	// them, so a caller-supplied memory that outgrows itself stays confined.
+	grown, err := adoptLinearMemory(m, want, newCap)
+	if err != nil {
+		// Reported to the guest as -1, like the reserved path above.
+		println("wasm2go: memory.grow:", err.Error())
+		return -1
+	}
 	copy(grown, m.memory)
 	m.memory = grown
 	m.memSize.Store(want)
@@ -2496,11 +2573,15 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 	go func() {
 		defer m.threads.wg.Done()
 		defer spinAgentsAdd(-1)
+		// A guest access outside the linear memory faults in its guard
+		// reservation; make that a panic the recover below reports.
+		debug.SetPanicOnFault(true)
 		// A trap on any wasm thread traps the whole instance (wasi-threads
 		// semantics): surface WHERE it happened, then let it take the
 		// process down instead of silently unwinding the goroutine.
 		defer func() {
 			if r := recover(); r != nil {
+				r = memoryAccessTrap(child, r)
 				println("wasm2go: wasi thread", tid, "trapped:")
 				switch v := r.(type) {
 				case error:

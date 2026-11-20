@@ -18,6 +18,10 @@ const mmapSupported = true
 // mappable and everything past the image reads as zeros — which is what a
 // freshly grown wasm page must contain. Mapping past the end of the file
 // instead would fault with SIGBUS on first access.
+//
+// The mapping sits at the start of a guarded reservation (mapLinearMemory):
+// everything past the ceiling faults, so no access the instance makes reaches
+// outside it.
 func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 	fi, err := f.Stat()
 	if err != nil {
@@ -28,8 +32,7 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 			return nil, fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)
 		}
 	}
-	mem, err := syscall.Mmap(int(f.Fd()), 0, ceiling,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE)
+	mem, err := mapLinearMemory(int(f.Fd()), ceiling, syscall.MAP_PRIVATE)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping the shared memory image: %w", err)
 	}
@@ -41,18 +44,19 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 // and IS the image — no intermediate buffer, no copy, no write-out. The
 // caller has already sized the file (sparse) to length.
 func mmapShared(f *os.File, length int) ([]byte, error) {
-	mem, err := syscall.Mmap(int(f.Fd()), 0, length,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	mem, err := mapLinearMemory(int(f.Fd()), length, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping the image for in-place build: %w", err)
 	}
 	return mem, nil
 }
 
+// unmapMemory releases a mapping from mmapImage or mmapShared, together with
+// the reservation around it.
 func unmapMemory(mem []byte) {
 	if len(mem) == 0 {
 		return
 	}
-	_ = syscall.Munmap(mem)
+	releaseLinearMemory(mem)
 }
 
