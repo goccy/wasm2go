@@ -17,13 +17,21 @@ import (
 // module around the given main body.
 func buildMem64(t *testing.T, fixture, mainBody string) string {
 	t.Helper()
+	return buildMem64Main(t, fixture, "package main\n\nimport (\n\t\"fmt\"\n\n\t\"m64test/pkg\"\n)\n\nfunc main() {\n"+mainBody+"}\n", transpile.Options{})
+}
+
+// buildMem64Main is buildMem64 with the whole main.go source and transpile
+// options (Package and OutputImportPath are set here).
+func buildMem64Main(t *testing.T, fixture, mainSrc string, opts transpile.Options) string {
+	t.Helper()
 	bin := testfixture.Wasm(t, fixture)
 	m, err := transpile.Parse(bytes.NewReader(bin))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res, err := transpile.Translate(&buf, m, transpile.Options{Package: "pkg", OutputImportPath: "m64test/pkg"})
+	opts.Package, opts.OutputImportPath = "pkg", "m64test/pkg"
+	res, err := transpile.Translate(&buf, m, opts)
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}
@@ -49,7 +57,7 @@ func buildMem64(t *testing.T, fixture, mainBody string) string {
 			w("pkg/"+name, data)
 		}
 	}
-	w("main.go", []byte("package main\n\nimport (\n\t\"fmt\"\n\n\t\"m64test/pkg\"\n)\n\nfunc main() {\n"+mainBody+"}\n"))
+	w("main.go", []byte(mainSrc))
 	return dir
 }
 

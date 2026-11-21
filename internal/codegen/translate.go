@@ -1181,11 +1181,48 @@ func (t *translator) helperRef(name string) ast.Expr {
 	return newID(name)
 }
 
+// importCall returns `m.<modField>.<MethodName>(args...)`, the call of a
+// function import through its host interface.
+func (t *translator) importCall(imp wasm.Import, args []ast.Expr) ast.Expr {
+	return &ast.CallExpr{
+		Fun: &ast.SelectorExpr{
+			X:   t.fieldRef(MangleModuleField(servingModule(imp.Module))),
+			Sel: newID(t.importMethodName(imp)),
+		},
+		Args: args,
+	}
+}
+
+// callFunc returns the call of the function at the given function index
+// with the given arguments (the module first): the import's host method for
+// an imported function, the defined function otherwise.
+func (t *translator) callFunc(funcIdx uint32, args []ast.Expr) ast.Expr {
+	if imp, ok := t.mod.FuncImport(funcIdx); ok {
+		return t.importCall(imp, args)
+	}
+	return &ast.CallExpr{Fun: t.funcRef(funcIdx), Args: args}
+}
+
 // funcRef returns the AST expression that names a defined-function call
 // target, qualified by chunk package if needed. In LinknameSplit mode,
 // cross-chunk calls are emitted as bare names — the chunk-file assembler
 // later adds //go:linkname forward declarations registered by this call.
+// For an imported function it is a function literal of the import's type
+// that calls the import.
 func (t *translator) funcRef(funcIdx uint32) ast.Expr {
+	if imp, ok := t.mod.FuncImport(funcIdx); ok {
+		ft := t.mod.Types[imp.TypeIdx]
+		args := []ast.Expr{newID("m")}
+		for i := range ft.Params {
+			args = append(args, newID(fmt.Sprintf("l%d", i)))
+		}
+		call := t.importCall(imp, args)
+		var stmt ast.Stmt = &ast.ExprStmt{X: call}
+		if len(ft.Results) > 0 {
+			stmt = &ast.ReturnStmt{Results: []ast.Expr{call}}
+		}
+		return &ast.FuncLit{Type: t.funcSignature(ft, true), Body: &ast.BlockStmt{List: []ast.Stmt{stmt}}}
+	}
 	if !t.multiPackage || t.plan == nil {
 		return newID(t.funcName(funcIdx))
 	}
@@ -2430,13 +2467,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				}
 				chunkBody := &ast.BlockStmt{}
 				for j := start; j < end; j++ {
-					fnIdx := elem.FuncIdxs[j]
-					var rhs ast.Expr
-					if fnIdx < t.mod.NumImportedFuncs {
-						rhs = newID("nil")
-					} else {
-						rhs = t.funcRef(fnIdx)
-					}
+					rhs := t.funcRef(elem.FuncIdxs[j])
 					chunkBody.List = append(chunkBody.List, &ast.AssignStmt{
 						Tok: token.ASSIGN,
 						Lhs: []ast.Expr{&ast.IndexExpr{
@@ -2687,11 +2718,8 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// that already ran it, so the flag it guards itself with is set in the
 	// snapshotted memory and a second run would trap on it. Everything the
 	// start section does is in the snapshot already.
-	if t.mod.Start != nil && *t.mod.Start >= t.mod.NumImportedFuncs && mode != newFromSnapshot {
-		body.List = append(body.List, &ast.ExprStmt{X: &ast.CallExpr{
-			Fun:  t.funcRef(*t.mod.Start),
-			Args: []ast.Expr{newID("m")},
-		}})
+	if t.mod.Start != nil && mode != newFromSnapshot {
+		body.List = append(body.List, &ast.ExprStmt{X: t.callFunc(*t.mod.Start, []ast.Expr{newID("m")})})
 	}
 
 	// A snapshot's globals are as load-bearing as its memory: the guest's TLS
@@ -3155,8 +3183,8 @@ func shardInitElemName(chunkIdx, batch int) string {
 // element-segment init helpers and attaches the helpers to their owning
 // chunk's file. Each helper writes only slots whose underlying funcIdx is
 // owned by the same chunk — bare Fn<idx> references inside the helper need
-// no linkname forwards. Imports (fnIdx < NumImportedFuncs) leave the slot
-// untouched because make([]any, N) already zero-initializes to nil.
+// no linkname forwards. A slot of an imported function is written in the
+// constructor body itself (see funcRef).
 //
 // initBody is the statement list of New()'s body; helper-call statements
 // are appended in chunk-order, batch-order.
@@ -3181,7 +3209,14 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt, defsEmitted
 		}
 		for j, fnIdx := range elem.FuncIdxs {
 			if fnIdx < t.mod.NumImportedFuncs {
-				// nil slot — left to make()'s zero init.
+				initBody.List = append(initBody.List, &ast.AssignStmt{
+					Tok: token.ASSIGN,
+					Lhs: []ast.Expr{&ast.IndexExpr{
+						X:     t.fieldRef(fmt.Sprintf("t%d", elem.TableIdx)),
+						Index: uintLit(uint64(off + int64(j))),
+					}},
+					Rhs: []ast.Expr{t.funcRef(fnIdx)},
+				})
 				continue
 			}
 			ck, ok := t.plan.FuncToChunk[fnIdx]
@@ -3368,10 +3403,7 @@ func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 // remains independently DCE-able because the FnN call is still
 // only reachable through its own function body.
 func (t *translator) emitOneExportFunc(w wexpEntry) ast.Decl {
-	call := &ast.CallExpr{
-		Fun:  t.funcRef(w.funcIndex),
-		Args: []ast.Expr{newID("m"), newID("l0"), newID("l1")},
-	}
+	call := t.callFunc(w.funcIndex, []ast.Expr{newID("m"), newID("l0"), newID("l1")})
 	body := &ast.BlockStmt{List: t.buildSafeInvokeBody(call)}
 	// The (req_ptr, req_len) pair is pointer-width: i32 on wasm32, i64
 	// on a memory64 module (the C bridge declares them void*/size_t).
@@ -3442,10 +3474,7 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 		for i := range ft.Params {
 			callArgs = append(callArgs, newID(fmt.Sprintf("l%d", i)))
 		}
-		callExpr := &ast.CallExpr{
-			Fun:  t.funcRef(exp.Index),
-			Args: callArgs,
-		}
+		callExpr := t.callFunc(exp.Index, callArgs)
 
 		var bodyStmt ast.Stmt
 		if len(ft.Results) > 0 {

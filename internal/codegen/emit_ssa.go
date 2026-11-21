@@ -1411,7 +1411,12 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 	if em.t == nil {
 		return nil, fmt.Errorf("ssa emit: CallImport needs translator binding")
 	}
-	imp := em.t.Module().Imports[v.AuxInt]
+	// AuxInt is the callee's function index, which counts the function
+	// imports only.
+	imp, ok := em.t.Module().FuncImport(uint32(v.AuxInt))
+	if !ok {
+		return nil, fmt.Errorf("ssa emit: CallImport v%d: function %d is not an imported function", v.ID, v.AuxInt)
+	}
 	// wasi-threads: thread-spawn is not a host call at all — a wasm thread is
 	// a goroutine, so it lowers to the threadSpawn helper, which starts the
 	// guest's own wasi_thread_start on one. Keeping it out of the host
@@ -1444,16 +1449,7 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 		}
 		args = append(args, ae)
 	}
-	return &ast.CallExpr{
-		Fun: &ast.SelectorExpr{
-			X: &ast.SelectorExpr{
-				X:   newID("m"),
-				Sel: newID(em.t.FieldName(MangleModuleField(servingModule(imp.Module)))),
-			},
-			Sel: newID(em.t.ImportMethodName(imp)),
-		},
-		Args: args,
-	}, nil
+	return em.t.importCall(imp, args), nil
 }
 
 // emitCallIndirect produces a call via table dispatch:
