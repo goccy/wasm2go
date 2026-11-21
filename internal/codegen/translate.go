@@ -1190,13 +1190,7 @@ func (t *translator) importCall(imp wasm.Import, args []ast.Expr) ast.Expr {
 	// guest's own wasi_thread_start on one. Keeping it out of the host
 	// interface means an embedder gets threads without implementing anything.
 	if importHandledInternally(imp) {
-		// On a memory64 module the start_arg is an i64 linear-memory
-		// pointer, so the spawn routes to the i64-arg helper twin (which
-		// reads the threadStart64 field the mem64 Module struct declares).
-		helper := "threadSpawn"
-		if t.mod.Memory64() {
-			helper = "threadSpawn_m64"
-		}
+		helper := t.internalImportHelper()
 		t.useHelper(helper)
 		return &ast.CallExpr{Fun: t.helperRef(helper), Args: args}
 	}
@@ -1207,6 +1201,18 @@ func (t *translator) importCall(imp wasm.Import, args []ast.Expr) ast.Expr {
 		},
 		Args: args,
 	}
+}
+
+// internalImportHelper returns the runtime helper that serves an import
+// handled internally (see importHandledInternally). On a memory64 module the
+// start_arg is an i64 linear-memory pointer, so the spawn routes to the
+// i64-arg helper twin (which reads the threadStart64 field the mem64 Module
+// struct declares).
+func (t *translator) internalImportHelper() string {
+	if t.mod.Memory64() {
+		return "threadSpawn_m64"
+	}
+	return "threadSpawn"
 }
 
 // callFunc returns the call of the function at the given function index
@@ -1244,8 +1250,8 @@ func (t *translator) funcRef(funcIdx uint32) ast.Expr {
 	}
 	targetChunk, ok := t.plan.FuncToChunk[funcIdx]
 	if !ok {
-		// Imported function or unknown — bare name (will fail later if real
-		// problem, but most likely a cross-cutting helper.)
+		// Unknown — bare name (will fail later if real problem, but most
+		// likely a cross-cutting helper.)
 		return newID(t.funcName(funcIdx))
 	}
 	if targetChunk == t.currentChunk {
@@ -3199,8 +3205,8 @@ func shardInitElemName(chunkIdx, batch int) string {
 // element-segment init helpers and attaches the helpers to their owning
 // chunk's file. Each helper writes only slots whose underlying funcIdx is
 // owned by the same chunk — bare Fn<idx> references inside the helper need
-// no linkname forwards. A slot of an imported function is written in the
-// constructor body itself (see funcRef).
+// no linkname forwards. Slots of imported functions (see funcRef) are
+// written by helpers of the main package, initElemImports_<b>.
 //
 // initBody is the statement list of New()'s body; helper-call statements
 // are appended in chunk-order, batch-order.
@@ -3224,18 +3230,10 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt, defsEmitted
 			return fmt.Errorf("element[%d] offset: %w", i, err)
 		}
 		for j, fnIdx := range elem.FuncIdxs {
-			if fnIdx < t.mod.NumImportedFuncs {
-				initBody.List = append(initBody.List, &ast.AssignStmt{
-					Tok: token.ASSIGN,
-					Lhs: []ast.Expr{&ast.IndexExpr{
-						X:     t.fieldRef(fmt.Sprintf("t%d", elem.TableIdx)),
-						Index: uintLit(uint64(off + int64(j))),
-					}},
-					Rhs: []ast.Expr{t.funcRef(fnIdx)},
-				})
-				continue
-			}
 			ck, ok := t.plan.FuncToChunk[fnIdx]
+			if fnIdx < t.mod.NumImportedFuncs {
+				ck, ok = chunkMain, true
+			}
 			if !ok {
 				return fmt.Errorf("element[%d] slot %d: fn%d has no owning chunk", i, j, fnIdx)
 			}
@@ -3286,13 +3284,21 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt, defsEmitted
 				})
 			}
 			helperName := shardInitElemName(ck, b)
+			if ck == chunkMain {
+				helperName = fmt.Sprintf("initElemImports_%d", b)
+			}
 			if !defsEmitted {
-				t.addChunkExtraDecl(ck, &ast.FuncDecl{
+				decl := &ast.FuncDecl{
 					Name: newID(helperName),
 					Type: helperSig,
 					Body: helperBody,
-				})
-				t.registerLinknameSymbol(-1, helperName, ck, helperSig)
+				}
+				if ck == chunkMain {
+					t.elemInitChunks = append(t.elemInitChunks, decl)
+				} else {
+					t.addChunkExtraDecl(ck, decl)
+					t.registerLinknameSymbol(-1, helperName, ck, helperSig)
+				}
 			}
 			t.currentChunk = prev
 

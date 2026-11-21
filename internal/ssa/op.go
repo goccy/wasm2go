@@ -127,7 +127,8 @@ const (
 	// OpCallIndirect: args = [m, table-index, params..., mem]. Aux = the
 	// expected wasm type index for runtime check.
 	OpCallIndirect
-	// OpCallImport: Aux = (moduleName, methodName). args = [m, params..., mem].
+	// OpCallImport: AuxInt = the callee's function index, which counts the
+	// function imports only. args = [m, params..., mem].
 	OpCallImport
 
 	// --- Multi-result demultiplex ---

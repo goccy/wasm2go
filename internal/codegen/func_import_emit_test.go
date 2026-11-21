@@ -2,6 +2,7 @@ package codegen_test
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/goccy/wasm2go/internal/codegen"
@@ -131,15 +132,11 @@ func main() {
 
 // The wasi-threads thread-spawn import, served by the threadSpawn helper
 // rather than by the host, can be exported and placed in an element
-// segment: the export and the slot spawn through the helper.
+// segment without being called: the export and the slot spawn through the
+// helper, in the single- and the multi-package output.
 func TestThreadSpawnImportExportedAndInATable(t *testing.T) {
-	mod := readFixture(t, "cg_thread_spawn_refs.wasm")
-	var buf bytes.Buffer
-	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
-	if err != nil {
-		t.Fatalf("translate: %v", err)
-	}
-	main := `package main
+	const want = "true true 2\n"
+	const mainSrc = `package main
 
 import (
 	"fmt"
@@ -150,15 +147,41 @@ import (
 
 func main() {
 	m := pkg.New()
-	direct, viaTable := m.Spawn(64) > 0, m.SpawnViaTable(64) > 0
+	direct, viaTable := %[1]s > 0, %[2]s > 0
 	deadline := time.Now().Add(10 * time.Second)
-	for m.Count() < 2 && time.Now().Before(deadline) {
+	for %[3]s < 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	fmt.Println(direct, viaTable, m.Count())
+	fmt.Println(direct, viaTable, %[3]s)
 }
 `
-	if out := runGoSnippetWithAux(t, buf.String(), main, []map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles); out != "true true 2\n" {
-		t.Errorf("output %q, want %q", out, "true true 2\n")
-	}
+	opts := codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"}
+	t.Run("single", func(t *testing.T) {
+		mod := readFixture(t, "cg_thread_spawn_refs.wasm")
+		var buf bytes.Buffer
+		res, err := codegen.Translate(&buf, mod, opts)
+		if err != nil {
+			t.Fatalf("translate: %v", err)
+		}
+		main := fmt.Sprintf(mainSrc, "m.Spawn(64)", "m.SpawnViaTable(64)", "m.Count()")
+		if out := runGoSnippetWithAux(t, buf.String(), main, []map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles); out != want {
+			t.Errorf("output %q, want %q", out, want)
+		}
+	})
+	t.Run("multi", func(t *testing.T) {
+		restore := codegen.SetMultiPackageThreshold(0)
+		defer restore()
+		mod := readFixture(t, "cg_thread_spawn_refs.wasm")
+		res, err := codegen.Translate(nil, mod, opts)
+		if err != nil {
+			t.Fatalf("translate: %v", err)
+		}
+		if _, ok := res.Files["base/base.go"]; !ok {
+			t.Fatalf("output is not multi-package: %v", res.Files)
+		}
+		main := fmt.Sprintf(mainSrc, "pkg.Spawn(m, 64)", "pkg.SpawnViaTable(m, 64)", "pkg.Count(m)")
+		if out := runGoSnippetWithAux(t, "package pkg\n", main, []map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles); out != want {
+			t.Errorf("output %q, want %q", out, want)
+		}
+	})
 }
