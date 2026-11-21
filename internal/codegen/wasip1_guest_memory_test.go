@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"bytes"
 	"sync/atomic"
 	"testing"
 )
@@ -24,9 +25,10 @@ func newSharedGuestModule(size, ceiling int) *Module {
 
 // The stubs bound a guest address by the guest's memory size, not by the
 // length of the memory slice: on a memory whose slice runs past memSize (a
-// shared memory's spans its ceiling), a buffer at memSize is refused and a C
-// string whose NUL lies past memSize is unterminated. Once memSize grows
-// over them they are the guest's.
+// shared memory's spans its ceiling), a buffer at memSize is refused, a C
+// string whose NUL lies past memSize is unterminated, and the signal flag
+// word at memSize is not written. Once memSize grows over them they are the
+// guest's.
 func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 	const size, ceiling = 1 << 16, 4 << 16
 	w := &WasiStubs{}
@@ -51,7 +53,15 @@ func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 		t.Errorf("readCStr of a string unterminated within memSize = %q, ok", s)
 	}
 
-	// The guest's memory grows over both.
+	w.sig.flagModule, w.sig.flagAddr = m, size
+	w.mu.Lock()
+	w.raiseSignalFlagLocked()
+	w.mu.Unlock()
+	if !bytes.Equal(m.memory[size:size+4], make([]byte, 4)) {
+		t.Errorf("the flag word past memSize was written: % x", m.memory[size:size+4])
+	}
+
+	// The guest's memory grows over all three.
 	m.memSize.Store(2 * size)
 	if b := w.memBytes(m, size, 1); len(b) != 1 {
 		t.Errorf("memBytes at the old memSize after growth = %v, want one byte", b)
@@ -62,5 +72,11 @@ func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 	m.memory[size] = 0
 	if s, ok := w.readCStr(m, size-4); !ok || s != "path" {
 		t.Errorf("readCStr after growth = %q, %v, want \"path\", true", s, ok)
+	}
+	w.mu.Lock()
+	w.raiseSignalFlagLocked()
+	w.mu.Unlock()
+	if got := m.memory[size]; got != 1 {
+		t.Errorf("the flag word after growth = %d, want 1", got)
 	}
 }

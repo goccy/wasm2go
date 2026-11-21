@@ -16,6 +16,12 @@ func statTimes(st *syscall.Stat_t) (atime, ctime time.Time) {
 	return time.Unix(st.Atimespec.Unix()), time.Unix(st.Ctimespec.Unix())
 }
 
+// hostSignalByNumber returns the host's signal for a guest signal number
+// the table of hostSignals does not name: on this system, none.
+func hostSignalByNumber(sig int32) (hostSig syscall.Signal, known bool) {
+	return 0, false
+}
+
 // lstatAt would describe name in the directory open as dir; package
 // syscall has no call relative to a directory descriptor on this system,
 // and a path of the host is not looked up instead. osFileDirents records

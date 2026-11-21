@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"os/exec"
 	"runtime"
 	"syscall"
 	"testing"
@@ -231,5 +232,43 @@ func TestPIDTokensAvoidTheProcessIDs(t *testing.T) {
 	}
 	if got[0] != 1004 || got[1] != 1006 {
 		t.Fatalf("pid tokens = %v, want [1004 1006]", got)
+	}
+}
+
+// A spawned process is signalled under the host's number for the signal.
+func TestProcKillMapsTheSignalForASpawnedProcess(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("the runtime signals host processes on darwin and linux only")
+	}
+	path, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep command on this host")
+	}
+	w := NewWASI(WASIConfig{Exec: AllowAllExec})
+	m := newForkTestModule()
+	const pathPtr, argvPtr, arg0Ptr, arg1Ptr, pidPtr, statusPtr = 1024, 2048, 2100, 2200, 3000, 3008
+	copy(m.memory[pathPtr:], path+"\x00")
+	copy(m.memory[arg0Ptr:], "sleep\x00")
+	copy(m.memory[arg1Ptr:], "600\x00")
+	binary.LittleEndian.PutUint32(m.memory[argvPtr:], arg0Ptr)
+	binary.LittleEndian.PutUint32(m.memory[argvPtr+4:], arg1Ptr)
+	binary.LittleEndian.PutUint32(m.memory[argvPtr+8:], 0)
+	if rc := w.Proc_spawn(m, pathPtr, argvPtr, 0, -1, -1, -1, 0, pidPtr); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	pid := int32(readU32(m.memory, pidPtr))
+	t.Cleanup(func() {
+		if rc := w.Proc_kill(m, pid, wasiSIGKILL); rc != _wasiESUCCESS && rc != -_wasiESRCH {
+			t.Errorf("Proc_kill of the command at cleanup rc=%d", rc)
+		}
+	})
+	if rc := w.Proc_kill(m, pid, wasiSIGUSR2); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_kill rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, pid, 0, statusPtr); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if status := int32(readU32(m.memory, statusPtr)); status != wasiSIGUSR2 {
+		t.Fatalf("wait status = %#x, want death by the guest's SIGUSR2 (%d)", status, wasiSIGUSR2)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -539,6 +540,94 @@ func TestWasi_ProcWaitAnyConcurrentFinish(t *testing.T) {
 	}
 }
 
+func TestWasi_ProcKill(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+
+	if rc := w.Proc_kill(m, 4242, 15); rc != -_wasiESRCH {
+		t.Fatalf("unknown pid rc=%d, want -ESRCH", rc)
+	}
+	if rc := w.Proc_kill(m, 4242, 0); rc != -_wasiESRCH {
+		t.Fatalf("unknown pid, signal 0 rc=%d, want -ESRCH", rc)
+	}
+
+	var signals []int32
+	var killErr error
+	pid, exited := w.NewProc(func(sig int32) error {
+		signals = append(signals, sig)
+		return killErr
+	})
+	if rc := w.Proc_kill(m, pid, -1); rc != -_wasiEINVAL {
+		t.Errorf("negative signal rc=%d, want -EINVAL", rc)
+	}
+	if rc := w.Proc_kill(m, pid, 0); rc != _wasiESUCCESS {
+		t.Errorf("existence probe rc=%d", rc)
+	}
+	if rc := w.Proc_kill(m, pid, 15); rc != _wasiESUCCESS {
+		t.Errorf("Proc_kill rc=%d", rc)
+	}
+	// The kill function's error is the errno.
+	killErr = syscall.EPERM
+	if rc := w.Proc_kill(m, pid, 2); rc != -_wasiEPERM {
+		t.Errorf("kill failing with EPERM rc=%d, want -EPERM", rc)
+	}
+	killErr = errors.New("refused")
+	if rc := w.Proc_kill(m, pid, 1); rc != -_wasiEIO {
+		t.Errorf("kill failing with another error rc=%d, want -EIO", rc)
+	}
+	exited(15)
+	if rc := w.Proc_kill(m, pid, 9); rc != _wasiESUCCESS {
+		t.Errorf("signalling a finished, unreaped process rc=%d, want 0", rc)
+	}
+	if len(signals) != 3 || signals[0] != 15 || signals[1] != 2 || signals[2] != 1 {
+		t.Errorf("signals delivered = %v, want [15 2 1]", signals)
+	}
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if rc := w.Proc_kill(m, pid, 15); rc != -_wasiESRCH {
+		t.Errorf("reaped pid rc=%d, want -ESRCH", rc)
+	}
+
+	// A process registered without a kill function exists but cannot be
+	// signalled.
+	quiet, quietExited := w.NewProc(nil)
+	if rc := w.Proc_kill(m, quiet, 0); rc != _wasiESUCCESS {
+		t.Errorf("existence probe without kill rc=%d", rc)
+	}
+	if rc := w.Proc_kill(m, quiet, 15); rc != -_wasiEPERM {
+		t.Errorf("signal without kill rc=%d, want -EPERM", rc)
+	}
+	quietExited(0)
+}
+
+func TestWasi_ProcKillSpawned(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+	pid := spawnTestProc(t, w, m, "/bin/sleep", "30")
+	t.Cleanup(func() {
+		if rc := w.Proc_kill(m, pid, wasiSIGKILL); rc != _wasiESUCCESS && rc != -_wasiESRCH {
+			t.Errorf("Proc_kill of the command at cleanup rc=%d", rc)
+		}
+	})
+	if rc := w.Proc_kill(m, pid, 0); rc != _wasiESUCCESS {
+		t.Fatalf("existence probe rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, pid, 1, statusOff); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG before the signal rc=%d, want -EAGAIN", rc)
+	}
+	if rc := w.Proc_kill(m, pid, wasiSIGTERM); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_kill rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	status := int32(readU32(m.memory, int(statusOff)))
+	if status&0x7f != wasiSIGTERM || status>>8 != 0 {
+		t.Errorf("status = %#x, want death by signal %d", status, wasiSIGTERM)
+	}
+}
+
 func TestWasi_ForkFamilyPidsUnique(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	const statusOff int32 = 4004
@@ -615,5 +704,117 @@ func TestWasi_ProcWaitConcurrentWaiters(t *testing.T) {
 					iter, reported, len(waiters), missed, len(waiters)-1)
 			}
 		}
+	}
+}
+
+// Any process of a fork family is signalled by its pid, whoever its parent
+// is; only its parent waits for it.
+func TestWasi_ProcKillAcrossTheFamily(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+	recorder := func(into *[]int32) func(sig int32) error {
+		return func(sig int32) error {
+			*into = append(*into, sig)
+			return nil
+		}
+	}
+
+	// root has two children; the first has a child of its own.
+	var toFirst, toSecond, toGrandchild []int32
+	firstPid, firstExited := root.NewProc(recorder(&toFirst))
+	first, firstModule := root.Fork(), newForkTestModule()
+	secondPid, secondExited := root.NewProc(recorder(&toSecond))
+	second, secondModule := root.Fork(), newForkTestModule()
+	grandchildPid, grandchildExited := first.NewProc(recorder(&toGrandchild))
+	grandchild, grandchildModule := first.Fork(), newForkTestModule()
+
+	// a sibling, a grandchild, the parent of a fork child, an uncle
+	if rc := second.Proc_kill(secondModule, firstPid, 10); rc != _wasiESUCCESS {
+		t.Errorf("sibling rc=%d", rc)
+	}
+	if rc := root.Proc_kill(m, grandchildPid, 12); rc != _wasiESUCCESS {
+		t.Errorf("grandchild rc=%d", rc)
+	}
+	if rc := grandchild.Proc_kill(grandchildModule, firstPid, 15); rc != _wasiESUCCESS {
+		t.Errorf("parent rc=%d", rc)
+	}
+	if rc := grandchild.Proc_kill(grandchildModule, secondPid, 1); rc != _wasiESUCCESS {
+		t.Errorf("uncle rc=%d", rc)
+	}
+	if rc := second.Proc_kill(secondModule, grandchildPid, 0); rc != _wasiESUCCESS {
+		t.Errorf("existence probe of a nephew rc=%d", rc)
+	}
+	if len(toFirst) != 2 || toFirst[0] != 10 || toFirst[1] != 15 {
+		t.Errorf("signals to the first child = %v, want [10 15]", toFirst)
+	}
+	if len(toSecond) != 1 || toSecond[0] != 1 {
+		t.Errorf("signals to the second child = %v, want [1]", toSecond)
+	}
+	if len(toGrandchild) != 1 || toGrandchild[0] != 12 {
+		t.Errorf("signals to the grandchild = %v, want [12]", toGrandchild)
+	}
+
+	// Waiting is the parent's alone.
+	if rc := second.Proc_wait(secondModule, firstPid, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("waiting for a sibling rc=%d, want -ECHILD", rc)
+	}
+	if rc := root.Proc_wait(m, grandchildPid, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("waiting for a grandchild rc=%d, want -ECHILD", rc)
+	}
+
+	// A finished process is a zombie for the whole family until its parent
+	// has waited for it, and nothing afterwards.
+	secondExited(0)
+	if rc := first.Proc_kill(firstModule, secondPid, 15); rc != _wasiESUCCESS {
+		t.Errorf("signalling a sibling's zombie rc=%d, want 0", rc)
+	}
+	if rc := root.Proc_wait(m, secondPid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if rc := first.Proc_kill(firstModule, secondPid, 15); rc != -_wasiESRCH {
+		t.Errorf("signalling a reaped sibling rc=%d, want -ESRCH", rc)
+	}
+	if len(toSecond) != 1 {
+		t.Errorf("signals to the second child after its end = %v", toSecond)
+	}
+
+	// A process outlives its parent: it stays reachable until it ends, and
+	// then nobody is left to wait for it.
+	if err := first.CloseAll(); err != nil {
+		t.Fatal(err)
+	}
+	firstExited(0)
+	if rc := root.Proc_kill(m, grandchildPid, 2); rc != _wasiESUCCESS {
+		t.Errorf("signalling an orphan rc=%d", rc)
+	}
+	if len(toGrandchild) != 2 || toGrandchild[1] != 2 {
+		t.Errorf("signals to the orphan = %v, want [12 2]", toGrandchild)
+	}
+	grandchildExited(0)
+	if rc := root.Proc_kill(m, grandchildPid, 0); rc != -_wasiESRCH {
+		t.Errorf("probing an orphan that ended rc=%d, want -ESRCH", rc)
+	}
+}
+
+// A number that is no signal is refused for every kind of process, before
+// anything is delivered.
+func TestWasi_ProcKillRefusesANumberThatIsNoSignal(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	var signals []int32
+	pid, exited := w.NewProc(func(sig int32) error {
+		signals = append(signals, sig)
+		return nil
+	})
+	defer exited(0)
+	for _, sig := range []int32{-1, 65} {
+		if rc := w.Proc_kill(m, pid, sig); rc != -_wasiEINVAL {
+			t.Errorf("Proc_kill(%d) rc=%d, want -EINVAL", sig, rc)
+		}
+	}
+	if rc := w.Proc_kill(m, pid, 64); rc != _wasiESUCCESS {
+		t.Errorf("Proc_kill(64) rc=%d", rc)
+	}
+	if len(signals) != 1 || signals[0] != 64 {
+		t.Errorf("signals delivered = %v, want [64]", signals)
 	}
 }
