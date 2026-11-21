@@ -102,6 +102,22 @@
     (func $fd_cloexec (param i32 i32 i32 i64) (result i32)))
   (import "wasip1_posix_extension" "fd_closefrom"
     (func $fd_closefrom (param i32) (result i32)))
+  (import "wasip1_posix_extension" "path_chmod"
+    (func $path_chmod (param i64 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "fd_chmod"
+    (func $fd_chmod (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "path_filestat_ext"
+    (func $path_filestat_ext (param i64 i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "fd_filestat_ext"
+    (func $fd_filestat_ext (param i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "fd_path"
+    (func $fd_path (param i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "path_chown"
+    (func $path_chown (param i64 i32 i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "fd_chown"
+    (func $fd_chown (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_filestat_mode"
+    (func $path_filestat_mode (param i64 i32 i32 i64) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -153,5 +169,13 @@
     (drop (call $fd_dup2 (i32.const 0) (i32.const 0)))
     (drop (call $fd_cloexec (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $fd_closefrom (i32.const 0)))
+    (drop (call $path_chmod (i64.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $fd_chmod (i32.const 0) (i32.const 0)))
+    (drop (call $path_filestat_ext (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $fd_filestat_ext (i32.const 0) (i64.const 0)))
+    (drop (call $fd_path (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $path_chown (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $fd_chown (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $path_filestat_mode (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
   )
 )

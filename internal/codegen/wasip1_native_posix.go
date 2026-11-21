@@ -3,9 +3,50 @@
 package codegen
 
 import (
+	"os"
 	"sync"
 	"syscall"
 )
+
+// osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
+// os package returned.
+func osFileStat(sys any) (fileStat, bool) {
+	st, ok := sys.(*syscall.Stat_t)
+	if !ok {
+		return fileStat{}, false
+	}
+	atime, ctime := statTimes(st)
+	return fileStat{
+		dev:   uint64(st.Dev),
+		ino:   uint64(st.Ino),
+		nlink: uint64(st.Nlink),
+		uid:   st.Uid,
+		gid:   st.Gid,
+		atime: atime,
+		ctime: ctime,
+		// the widths of these differ from host to host
+		rdev:    uint64(st.Rdev),
+		blksize: uint32(st.Blksize),
+		blocks:  uint64(st.Blocks),
+	}, true
+}
+
+// hostRename is rename(2): a file renamed onto a directory fails with
+// EISDIR, and a directory renamed onto an empty one replaces it. os.Rename
+// refuses every rename onto a directory with EEXIST, which no system call
+// does.
+func hostRename(from, to string) error {
+	for {
+		err := syscall.Rename(from, to)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+		}
+		return nil
+	}
+}
 
 // ---- the numbers of the operating system ---------------------------------
 //

@@ -127,6 +127,11 @@ type FS interface {
 	// support the operations the mode implies.
 	OpenFile(name string, flag int, perm os.FileMode) (File, error)
 	Mkdir(name string, perm os.FileMode) error
+	// Chmod sets the permission bits of name, and its setuid, setgid and
+	// sticky bits from the corresponding os.FileMode flags.
+	Chmod(name string, mode os.FileMode) error
+	// Chtimes sets the access and modification times of name.
+	Chtimes(name string, atime, mtime time.Time) error
 	Remove(name string) error
 	Rename(oldName, newName string) error
 	Stat(name string) (os.FileInfo, error)
@@ -149,7 +154,104 @@ type File interface {
 	ReadDir(n int) ([]os.DirEntry, error)
 	Sync() error
 	Truncate(size int64) error
+	// Chmod sets the mode of the open file, as FS.Chmod does by name.
+	Chmod(mode os.FileMode) error
 	Name() string
+}
+
+// fileStat is what POSIX stat reports about a file beyond os.FileInfo. A
+// backend's FileInfo carries it as its Sys value: the in-memory backend as a
+// *fileStat, a backend on the host filesystem as whatever the os package
+// provides, which fileStatOf reads through the platform companion.
+type fileStat struct {
+	dev, ino, nlink uint64
+	uid, gid        uint32
+	atime, ctime    time.Time
+	// rdev is the device a character or block special file stands for,
+	// blksize the preferred block size for I/O on the file (0: the backend
+	// names none) and blocks the number of 512-byte blocks allocated to it.
+	rdev    uint64
+	blksize uint32
+	blocks  uint64
+}
+
+// fileStatOf returns the POSIX metadata of the file fi describes. A FileInfo
+// that carries none describes a file with a single link, owned by uid and gid
+// 0, whose three times are its modification time.
+func fileStatOf(fi os.FileInfo) fileStat {
+	if st, ok := fi.Sys().(*fileStat); ok {
+		return *st
+	}
+	if st, ok := osFileStat(fi.Sys()); ok {
+		return st
+	}
+	return fileStat{nlink: 1, atime: fi.ModTime(), ctime: fi.ModTime()}
+}
+
+// unixFileMode converts the permission and setuid/setgid/sticky bits of a
+// POSIX mode_t into an os.FileMode.
+func unixFileMode(bits uint32) os.FileMode {
+	mode := os.FileMode(bits & 0o777)
+	if bits&0o4000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	if bits&0o2000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if bits&0o1000 != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
+}
+
+// The file type bits of a POSIX mode_t, with the values every Unix gives
+// them: the ones a filestat_ext record carries.
+const (
+	unixTypeMask    uint32 = 0o170000
+	unixTypeFIFO    uint32 = 0o010000
+	unixTypeChar    uint32 = 0o020000
+	unixTypeDir     uint32 = 0o040000
+	unixTypeBlock   uint32 = 0o060000
+	unixTypeRegular uint32 = 0o100000
+	unixTypeSymlink uint32 = 0o120000
+	unixTypeSocket  uint32 = 0o140000
+)
+
+// unixTypeBits returns the file type bits of the POSIX mode_t of a file
+// whose mode is mode. A character device has os.ModeDevice set as well, so
+// it is told apart from a block device first.
+func unixTypeBits(mode os.FileMode) uint32 {
+	switch {
+	case mode.IsDir():
+		return unixTypeDir
+	case mode&os.ModeSymlink != 0:
+		return unixTypeSymlink
+	case mode&os.ModeNamedPipe != 0:
+		return unixTypeFIFO
+	case mode&os.ModeSocket != 0:
+		return unixTypeSocket
+	case mode&os.ModeCharDevice != 0:
+		return unixTypeChar
+	case mode&os.ModeDevice != 0:
+		return unixTypeBlock
+	}
+	return unixTypeRegular
+}
+
+// unixModeBits is the inverse of unixFileMode: the low twelve bits of the
+// POSIX mode_t of a file whose mode is mode.
+func unixModeBits(mode os.FileMode) uint32 {
+	bits := uint32(mode.Perm())
+	if mode&os.ModeSetuid != 0 {
+		bits |= 0o4000
+	}
+	if mode&os.ModeSetgid != 0 {
+		bits |= 0o2000
+	}
+	if mode&os.ModeSticky != 0 {
+		bits |= 0o1000
+	}
+	return bits
 }
 
 // osFS is the default FS backend: a thin pass-through to the host filesystem,
@@ -158,6 +260,12 @@ type osFS struct{ root string }
 
 func (o osFS) join(name string) string {
 	if o.root == "" || o.root == "/" {
+		// "." is the root itself, which the guest's C library names so: a
+		// call on "/" is the host's call on "/" (rmdir of it is EBUSY;
+		// of "/." it would be EINVAL).
+		if name == "." {
+			return "/"
+		}
 		return "/" + name
 	}
 	return filepath.Join(o.root, name)
@@ -172,7 +280,7 @@ func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 func (o osFS) Mkdir(name string, perm os.FileMode) error { return os.Mkdir(o.join(name), perm) }
 func (o osFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(o.join(name), mode) }
 func (o osFS) Remove(name string) error                  { return os.Remove(o.join(name)) }
-func (o osFS) Rename(a, b string) error                  { return os.Rename(o.join(a), o.join(b)) }
+func (o osFS) Rename(a, b string) error                  { return hostRename(o.join(a), o.join(b)) }
 func (o osFS) Stat(name string) (os.FileInfo, error)     { return os.Stat(o.join(name)) }
 func (o osFS) Lstat(name string) (os.FileInfo, error)    { return os.Lstat(o.join(name)) }
 func (o osFS) Symlink(target, name string) error         { return os.Symlink(target, o.join(name)) }
@@ -201,6 +309,10 @@ type memNode struct {
 	modTime  time.Time
 	data     []byte
 	children map[string]*memNode
+	// unlinked is set once the node has no name in the tree any more (it
+	// was removed or replaced), which only its open files can still see:
+	// their stat reports a link count of zero.
+	unlinked bool
 }
 
 func memSplit(name string) []string {
@@ -316,6 +428,7 @@ func (fsys *MemFS) Remove(name string) error {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrInvalid}
 	}
 	delete(parent.children, base)
+	n.unlinked = true
 	return nil
 }
 
@@ -336,6 +449,9 @@ func (fsys *MemFS) Rename(oldName, newName string) error {
 	}
 	delete(op.children, ob)
 	node.name = nb
+	if replaced, ok := np.children[nb]; ok && replaced != node {
+		replaced.unlinked = true
+	}
 	np.children[nb] = node
 	return nil
 }
@@ -359,7 +475,19 @@ func (fsys *MemFS) Readlink(name string) (string, error) {
 	return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
 }
 
-// Chtimes implements the optional chtimesFS capability.
+// Chmod sets the permission bits of name; a MemFS keeps no other mode bits.
+func (fsys *MemFS) Chmod(name string, mode os.FileMode) error {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	n, err := fsys.lookup(name)
+	if err != nil {
+		return &fs.PathError{Op: "chmod", Path: name, Err: err}
+	}
+	n.mode = n.mode&^0o777 | mode&0o777
+	return nil
+}
+
+// Chtimes sets the modification time of name, the only time a MemFS keeps.
 func (fsys *MemFS) Chtimes(name string, _ time.Time, mtime time.Time) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
@@ -406,22 +534,28 @@ func (fsys *MemFS) WriteFile(name string, data []byte, perm os.FileMode) error {
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
+	if replaced, ok := parent.children[base]; ok {
+		replaced.unlinked = true
+	}
 	parent.children[base] = &memNode{name: base, mode: perm & 0o777, modTime: time.Now(), data: cp}
 	return nil
 }
 
 func (n *memNode) info() os.FileInfo {
+	fi := memFileInfo{name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime, unlinked: n.unlinked}
 	if n.dir {
-		return memFileInfo{name: n.name, mode: os.ModeDir | (n.mode & 0o777), modTime: n.modTime}
+		fi.size = 0
+		fi.mode |= os.ModeDir
 	}
-	return memFileInfo{name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime}
+	return fi
 }
 
 type memFileInfo struct {
-	name    string
-	size    int64
-	mode    os.FileMode
-	modTime time.Time
+	name     string
+	size     int64
+	mode     os.FileMode
+	modTime  time.Time
+	unlinked bool
 }
 
 func (fi memFileInfo) Name() string       { return fi.name }
@@ -429,7 +563,21 @@ func (fi memFileInfo) Size() int64        { return fi.size }
 func (fi memFileInfo) Mode() os.FileMode  { return fi.mode }
 func (fi memFileInfo) ModTime() time.Time { return fi.modTime }
 func (fi memFileInfo) IsDir() bool        { return fi.mode.IsDir() }
-func (fi memFileInfo) Sys() any           { return nil }
+
+// Sys reports the file's POSIX metadata: a MemFS has no hard links, so a
+// file has one link until it is removed, and it keeps no owner and no times
+// other than the modification time.
+func (fi memFileInfo) Sys() any {
+	st := &fileStat{nlink: 1, atime: fi.modTime, ctime: fi.modTime,
+		blksize: memBlockSize, blocks: uint64(fi.size+511) / 512}
+	if fi.unlinked {
+		st.nlink = 0
+	}
+	return st
+}
+
+// memBlockSize is the block size an in-memory file reports for I/O.
+const memBlockSize = 4096
 
 type memDirEntry struct{ n *memNode }
 
@@ -454,6 +602,14 @@ type memFile struct {
 func (f *memFile) Name() string { return f.node.name }
 func (f *memFile) Close() error { return nil }
 func (f *memFile) Sync() error  { return nil }
+
+// Chmod sets the permission bits of the open file.
+func (f *memFile) Chmod(mode os.FileMode) error {
+	f.fsys.mu.Lock()
+	defer f.fsys.mu.Unlock()
+	f.node.mode = f.node.mode&^0o777 | mode&0o777
+	return nil
+}
 
 func (f *memFile) Stat() (os.FileInfo, error) {
 	f.fsys.mu.Lock()
@@ -1567,6 +1723,7 @@ const (
 	_wasiENXIO        int32 = 60
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
+	_wasiERANGE       int32 = 68
 	_wasiESRCH        int32 = 71
 )
 
@@ -1905,10 +2062,8 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 			ftype = 2 // a standard stream is a character device
 		} else if op.isDir {
 			ftype = 3
-		} else if op.conn != nil {
+		} else if op.conn != nil || op.listener != nil || op.isSocket {
 			ftype = 6 // socket_stream
-		} else if op.listener != nil {
-			ftype = 6
 		}
 		fdflags = uint16(op.fdflags)
 		op.mu.Unlock()
@@ -1999,24 +2154,37 @@ func (w *WasiStubs) fdFilestatGet(m *Module, fd int32, ptr uint64) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	root := op == nil && rootDirFD(fd)
+	fsys := w.fsys
 	w.mu.Unlock()
 	if op == nil && !root {
 		return _wasiEBADF
 	}
-	if op == nil || op.f == nil {
-		// Synthesise a minimal stat for a standard stream, the preopen
-		// or a socket.
+	if root {
+		st, err := fsys.Stat(".")
+		if err != nil {
+			return mapOSError(err)
+		}
+		writeFilestat(out, st)
+		return _wasiESUCCESS
+	}
+	if op.f == nil {
+		if fi := w.streamFileInfo(op); fi != nil {
+			// A standard stream that is a file of the host is that
+			// file: a terminal, a pipe, a regular file it was
+			// redirected to.
+			writeFilestat(out, fi)
+			return _wasiESUCCESS
+		}
+		// Synthesise a minimal stat for a socket or a standard stream
+		// the embedder supplied.
 		for i := range out {
 			out[i] = 0
 		}
-		// Stay consistent with Fd_fdstat_get's filetype values: a
-		// standard stream is a character device (2); the preopen is a
-		// directory (3); everything else is left as "unknown" (0).
-		switch {
-		case op == nil:
-			out[16] = 3
-		case op.stdio != 0:
-			out[16] = 2
+		// A socket is a stream socket (6). An embedder's stream is a
+		// pipe to the guest, which WASI has no file type for: it stays
+		// "unknown" (0) here, and Fd_filestat_ext names it.
+		if op.socket() {
+			out[16] = 6
 		}
 		return _wasiESUCCESS
 	}
@@ -2057,16 +2225,17 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
-	atime, mtime, err := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, op.f)
-	if err != nil {
-		return mapOSError(err)
-	}
-	// Applied only when the backend tracks timestamps (osFS does); a no-op
-	// success otherwise so timestamp-less backends don't fail the guest.
-	if cf, ok := fsys.(chtimesFS); ok {
-		if err := cf.Chtimes(op.path, atime, mtime); err != nil {
+	var current os.FileInfo
+	if filetimesNeedCurrent(fstFlags) {
+		st, err := op.f.Stat()
+		if err != nil {
 			return mapOSError(err)
 		}
+		current = st
+	}
+	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, current)
+	if err := fsys.Chtimes(op.path, atime, mtime); err != nil {
+		return mapOSError(err)
 	}
 	return _wasiESUCCESS
 }
@@ -2083,25 +2252,24 @@ func combine64(hi, lo int32) uint64 {
 	return (uint64(uint32(hi)) << 32) | uint64(uint32(lo))
 }
 
+// filetimesNeedCurrent reports whether a fstFlags bitmask leaves the access
+// or the modification time as it is (neither its explicit nor its "now" bit
+// is set), so that the file's current times have to be read first.
+func filetimesNeedCurrent(fstFlags int32) bool {
+	return fstFlags&(0x1|0x2) == 0 || fstFlags&(0x4|0x8) == 0
+}
+
 // resolveFiletimes decides the (atime, mtime) pair to apply given a
 // fstFlags bitmask. Bits 0x2 (ATIME_NOW) and 0x8 (MTIME_NOW) override the
-// explicit values with time.Now(). Unset ATIME/MTIME bits keep the
-// existing on-disk time, so f.Stat must succeed when those bits are
-// unset; the error is returned so the caller can surface it as a wasi
-// errno rather than silently writing epoch.
-func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f File) (time.Time, time.Time, error) {
+// explicit values with time.Now(). A time whose bits are both unset keeps
+// its value from current, the file's stat, which the caller supplies
+// whenever filetimesNeedCurrent says one is needed.
+func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, current os.FileInfo) (time.Time, time.Time) {
 	now := time.Now()
 	var atime, mtime time.Time
-	// We only need the current on-disk times when at least one of
-	// ATIME or MTIME is going to be preserved (its bit is unset).
-	needCurrent := fstFlags&(0x1|0x2) == 0 || fstFlags&(0x4|0x8) == 0
-	if needCurrent {
-		st, err := f.Stat()
-		if err != nil {
-			return time.Time{}, time.Time{}, err
-		}
-		atime = st.ModTime()
-		mtime = st.ModTime()
+	if current != nil {
+		atime = fileStatOf(current).atime
+		mtime = current.ModTime()
 	}
 	if fstFlags&0x1 != 0 {
 		atime = time.Unix(0, int64(atimNs))
@@ -2115,7 +2283,7 @@ func resolveFiletimes(atimNs, mtimNs uint64, fstFlags int32, f File) (time.Time,
 	if fstFlags&0x8 != 0 {
 		mtime = now
 	}
-	return atime, mtime, nil
+	return atime, mtime
 }
 
 func (w *WasiStubs) Fd_prestat_get(m *Module, fd, ptr int32) int32 {
@@ -2546,37 +2714,76 @@ func (w *WasiStubs) Fd_allocate64(m *Module, fd, offset, length int64) int32 {
 // Path_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "path_chmod") backing a bridge-provided chmod(): WASI preview1 has
 // no way to change file modes. The path at (pathPtr,pathLen) is
-// preopen-relative, like path_open's. Backends without chmod support
-// (MemFS keeps no modes) report ENOSYS. Returns 0 or a negative errno.
+// preopen-relative, like path_open's. Returns 0 or a negative errno.
 func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
+	return w.pathChmod(m, zext(pathPtr), pathLen, mode)
+}
+
+// Path_chmod64 is Path_chmod for a memory64 guest.
+func (w *WasiStubs) Path_chmod64(m *Module, pathPtr int64, pathLen, mode int32) int32 {
+	return w.pathChmod(m, uint64(pathPtr), pathLen, mode)
+}
+
+// pathChmod is the body of Path_chmod and Path_chmod64.
+func (w *WasiStubs) pathChmod(m *Module, pathPtr uint64, pathLen, mode int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
 	if pathSlice == nil {
 		return -_wasiEFAULT
 	}
 	w.mu.Lock()
 	fsys := w.fsys
 	w.mu.Unlock()
-	ch, ok := fsys.(interface {
-		Chmod(string, os.FileMode) error
-	})
-	if !ok {
-		return -_wasiENOSYS
-	}
-	if err := ch.Chmod(string(pathSlice), os.FileMode(uint32(mode)&0o7777)); err != nil {
+	if err := fsys.Chmod(string(pathSlice), unixFileMode(uint32(mode))); err != nil {
 		return -mapOSError(err)
 	}
 	return _wasiESUCCESS
 }
 
-// Path_filestat_mode is a NON-STANDARD host import (module
-// wasi_snapshot_preview1, name "path_filestat_mode") backing a
-// bridge-provided stat/lstat: WASI's filestat carries no permission
-// bits, so the bridge merges the real mode in from here. The path is
-// preopen-relative; follow selects stat vs lstat semantics. Writes the
-// unix permission bits at modeOutPtr; returns 0 or a negative errno.
-func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, modeOutPtr int32) int32 {
-	pathSlice := w.memSlice(m, pathPtr, pathLen)
-	out := w.memSlice(m, modeOutPtr, 4)
+// Fd_chmod is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "fd_chmod") backing a bridge-provided fchmod(). Returns 0 or a
+// negative errno.
+func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	if op.f == nil {
+		return -_wasiEINVAL
+	}
+	if err := op.f.Chmod(unixFileMode(uint32(mode))); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Fd_chmod64 is Fd_chmod for a memory64 guest.
+func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
+	return w.Fd_chmod(m, fd, mode)
+}
+
+// Path_filestat_ext is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "path_filestat_ext") backing a
+// bridge-provided stat/lstat: WASI's filestat carries neither permission
+// bits nor an owner, and its file types have no FIFO, so the bridge merges
+// them in from here. The path is preopen-relative; follow selects stat vs
+// lstat semantics. Writes the record of wasiFilestatExtSize bytes at
+// outPtr, whose mode is the POSIX mode (the file type bits, unixType*, and
+// the low twelve mode bits), and returns 0 or a negative errno.
+func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPtr int32) int32 {
+	return w.pathFilestatExt(m, zext(pathPtr), pathLen, follow, zext(outPtr))
+}
+
+// Path_filestat_ext64 is Path_filestat_ext for a memory64 guest.
+func (w *WasiStubs) Path_filestat_ext64(m *Module, pathPtr int64, pathLen, follow int32, outPtr int64) int32 {
+	return w.pathFilestatExt(m, uint64(pathPtr), pathLen, follow, uint64(outPtr))
+}
+
+// pathFilestatExt is the body of Path_filestat_ext and Path_filestat_ext64.
+func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow int32, outPtr uint64) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	out := w.memBytes(m, outPtr, wasiFilestatExtSize)
 	if pathSlice == nil || out == nil {
 		return -_wasiEFAULT
 	}
@@ -2593,18 +2800,194 @@ func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, mode
 	if err != nil {
 		return -mapOSError(err)
 	}
-	mode := fi.Mode()
-	bits := uint32(mode.Perm())
-	if mode&os.ModeSetuid != 0 {
-		bits |= 0o4000
+	writeFilestatExt(out, fi)
+	return _wasiESUCCESS
+}
+
+// Fd_filestat_ext is Path_filestat_ext for an open descriptor (module
+// wasip1_posix_extension, name "fd_filestat_ext"), backing a
+// bridge-provided fstat. A descriptor that is not a file of the FS backend
+// is described as what it is to the guest: a standard stream that is a
+// file of the host as that file (a terminal, a pipe, a regular file), a
+// stream the embedder supplied as a pipe, a socket as a socket, the
+// preopened root as the root directory.
+func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
+	return w.fdFilestatExt(m, fd, zext(outPtr))
+}
+
+// Fd_filestat_ext64 is Fd_filestat_ext for a memory64 guest.
+func (w *WasiStubs) Fd_filestat_ext64(m *Module, fd int32, outPtr int64) int32 {
+	return w.fdFilestatExt(m, fd, uint64(outPtr))
+}
+
+// fdFilestatExt is the body of Fd_filestat_ext and Fd_filestat_ext64.
+func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, wasiFilestatExtSize)
+	if out == nil {
+		return -_wasiEFAULT
 	}
-	if mode&os.ModeSetgid != 0 {
-		bits |= 0o2000
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	root := op == nil && rootDirFD(fd)
+	fsys := w.fsys
+	w.mu.Unlock()
+	if op == nil && !root {
+		return -_wasiEBADF
 	}
-	if mode&os.ModeSticky != 0 {
-		bits |= 0o1000
+	if root {
+		fi, err := fsys.Stat(".")
+		if err != nil {
+			return -mapOSError(err)
+		}
+		writeFilestatExt(out, fi)
+		return _wasiESUCCESS
 	}
-	binary.LittleEndian.PutUint32(out, bits)
+	fi := w.streamFileInfo(op)
+	if fi == nil && op.f != nil {
+		var err error
+		if fi, err = op.f.Stat(); err != nil {
+			return -mapOSError(err)
+		}
+	}
+	if fi != nil {
+		writeFilestatExt(out, fi)
+		return _wasiESUCCESS
+	}
+	mode := unixTypeFIFO | 0o600
+	if op.socket() {
+		mode = unixTypeSocket | 0o777
+	}
+	// A descriptor with no file behind it belongs to user and group 0.
+	var uid, gid uint32
+	clear(out)
+	binary.LittleEndian.PutUint32(out[0:], mode)
+	binary.LittleEndian.PutUint32(out[4:], uid)
+	binary.LittleEndian.PutUint32(out[8:], gid)
+	return _wasiESUCCESS
+}
+
+// streamFileInfo describes the host file behind an entry that refers to a
+// standard stream of the instance, or returns nil when the entry is not a
+// standard stream or the stream is not a file of the host (an embedder's
+// reader or writer).
+func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
+	if op == nil || op.stdio == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	var stream any
+	switch op.stdio {
+	case 1:
+		stream = w.stdin
+	case 2:
+		stream = w.stdout
+	case 3:
+		stream = w.stderr
+	}
+	w.mu.Unlock()
+	file, isFile := stream.(*os.File)
+	if !isFile {
+		return nil
+	}
+	fi, err := file.Stat()
+	if err != nil {
+		return nil
+	}
+	return fi
+}
+
+// Fd_path is a NON-STANDARD host import (module wasip1_posix_extension, name
+// "fd_path") backing fchdir(): a guest's libc keeps the working directory
+// as a path, so a directory that is known only by its descriptor has to be
+// named before it can become the working directory. The call hands back the
+// path fd was opened under, absolute in the guest's filesystem ("/" is the
+// preopen root), through writeWasiRecord. It is the name the directory had
+// when it was opened: a caller that needs the directory itself compares
+// what the name leads to now with fstat's answer.
+//
+// Returns 0, or a negative errno: EBADF, ENOTDIR for a descriptor that is
+// not a directory's, ERANGE when the buffer is too small.
+func (w *WasiStubs) Fd_path(m *Module, fd, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.fdPath(m, fd, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Fd_path64 is Fd_path for a memory64 guest.
+func (w *WasiStubs) Fd_path64(m *Module, fd int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.fdPath(m, fd, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// fdPath is the body of Fd_path and Fd_path64.
+func (w *WasiStubs) fdPath(m *Module, fd int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	root := op == nil && rootDirFD(fd)
+	w.mu.Unlock()
+	if op == nil && !root {
+		return -_wasiEBADF
+	}
+	path := "/"
+	if op != nil {
+		if !op.isDir {
+			return -_wasiENOTDIR
+		}
+		path += op.path
+	}
+	return w.writeWasiRecord(m, []byte(path), bufPtr, bufLen, neededPtr)
+}
+
+// wasiFilestatExtSize is the size of the record Path_filestat_ext and
+// Fd_filestat_ext write: u32 mode, uid, gid and block size, then u64 device
+// of a special file and number of 512-byte blocks.
+const wasiFilestatExtSize = 32
+
+// writeFilestatExt writes what Path_filestat_ext and Fd_filestat_ext
+// report about the file fi describes.
+func writeFilestatExt(out []byte, fi os.FileInfo) {
+	st := fileStatOf(fi)
+	binary.LittleEndian.PutUint32(out[0:], unixTypeBits(fi.Mode())|unixModeBits(fi.Mode()))
+	binary.LittleEndian.PutUint32(out[4:], st.uid)
+	binary.LittleEndian.PutUint32(out[8:], st.gid)
+	binary.LittleEndian.PutUint32(out[12:], st.blksize)
+	binary.LittleEndian.PutUint64(out[16:], st.rdev)
+	binary.LittleEndian.PutUint64(out[24:], st.blocks)
+}
+
+// Path_filestat_mode is a NON-STANDARD host import (module
+// wasi_snapshot_preview1, name "path_filestat_mode") backing a
+// bridge-provided stat/lstat: WASI's filestat carries no permission
+// bits, so the bridge merges the real mode in from here. The path is
+// preopen-relative; follow selects stat vs lstat semantics. Writes the
+// unix permission bits at modeOutPtr; returns 0 or a negative errno.
+func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, modeOutPtr int32) int32 {
+	return w.pathFilestatMode(m, zext(pathPtr), pathLen, follow, zext(modeOutPtr))
+}
+
+// Path_filestat_mode64 is Path_filestat_mode for a memory64 guest.
+func (w *WasiStubs) Path_filestat_mode64(m *Module, pathPtr int64, pathLen, follow int32, modeOutPtr int64) int32 {
+	return w.pathFilestatMode(m, uint64(pathPtr), pathLen, follow, uint64(modeOutPtr))
+}
+
+// pathFilestatMode is the body of Path_filestat_mode and Path_filestat_mode64.
+func (w *WasiStubs) pathFilestatMode(m *Module, pathPtr uint64, pathLen, follow int32, modeOutPtr uint64) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	out := w.memBytes(m, modeOutPtr, 4)
+	if pathSlice == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	var fi os.FileInfo
+	var err error
+	if follow != 0 {
+		fi, err = fsys.Stat(string(pathSlice))
+	} else {
+		fi, err = fsys.Lstat(string(pathSlice))
+	}
+	if err != nil {
+		return -mapOSError(err)
+	}
+	binary.LittleEndian.PutUint32(out, unixModeBits(fi.Mode()))
 	return _wasiESUCCESS
 }
 
@@ -2753,6 +3136,12 @@ func (w *WasiStubs) Fd_renumber64(m *Module, from, to int64) int32 {
 // Fd_readdir, so paged reads (cookie-driven) walk the same snapshot.
 // With rewind the snapshot is taken afresh. The returned slice is never
 // modified afterwards, so it stays valid after a later rewind.
+//
+// A directory of the host's lists its names in the order the system gives
+// them, "." and ".." among them where the system puts them on linux and
+// first on every other host (hostDirListing). A directory of a file system
+// of the embedder's own (MemFS) has no order of its own: it lists "." and
+// ".." first and then its names sorted, the same every time.
 func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
@@ -2765,6 +3154,13 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	if op.f == nil {
 		return nil, syscall.EBADF
 	}
+	if out, ok, err := hostDirListing(op.f); ok {
+		if err != nil {
+			return nil, err
+		}
+		op.dirCache = out
+		return out, nil
+	}
 	if _, err := op.f.Seek(0, 0); err != nil {
 		return nil, err
 	}
@@ -2772,13 +3168,9 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	// WASI expects "." and ".." as the first two entries; synthesise
-	// them so they receive cookies 1 and 2 respectively.
 	out := make([]os.DirEntry, 0, len(entries)+2)
 	out = append(out, dotEntry(op.path, "."), dotEntry(op.path, ".."))
 	out = append(out, entries...)
-	// Sort the real entries for deterministic Fd_readdir output. The
-	// "." and ".." entries stay at the front.
 	sort.SliceStable(out[2:], func(i, j int) bool {
 		return out[2+i].Name() < out[2+j].Name()
 	})
@@ -2871,6 +3263,8 @@ func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, i
 			dtype = 6
 		} else if e.Type()&os.ModeSocket != 0 {
 			dtype = 6
+		} else if e.Type()&os.ModeIrregular != 0 {
+			dtype = 0 // unknown
 		}
 		// Assemble the fixed header, then copy header+name into the buffer.
 		// When a record does not fully fit we copy as much as fits so that
@@ -3232,7 +3626,6 @@ func (w *WasiStubs) pathFilestatSetTimes(m *Module, dirFd, flags int32, pathPtr,
 	w.mu.Unlock()
 	rel := string(pathSlice)
 	follow := flags&0x1 != 0
-	now := time.Now()
 	var st os.FileInfo
 	var statErr error
 	if follow {
@@ -3243,34 +3636,11 @@ func (w *WasiStubs) pathFilestatSetTimes(m *Module, dirFd, flags int32, pathPtr,
 	if statErr != nil {
 		return mapOSError(statErr)
 	}
-	atime := st.ModTime()
-	mtime := st.ModTime()
-	if fstFlags&0x1 != 0 {
-		atime = time.Unix(0, int64(atim))
-	}
-	if fstFlags&0x2 != 0 {
-		atime = now
-	}
-	if fstFlags&0x4 != 0 {
-		mtime = time.Unix(0, int64(mtim))
-	}
-	if fstFlags&0x8 != 0 {
-		mtime = now
-	}
-	// Times are only applied when the backend supports them (osFS does). A
-	// backend without timestamps (e.g. a minimal in-memory FS) treats this as
-	// a successful no-op rather than failing the guest.
-	if cf, ok := fsys.(chtimesFS); ok {
-		if err := cf.Chtimes(rel, atime, mtime); err != nil {
-			return mapOSError(err)
-		}
+	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, st)
+	if err := fsys.Chtimes(rel, atime, mtime); err != nil {
+		return mapOSError(err)
 	}
 	return _wasiESUCCESS
-}
-
-// chtimesFS is an optional FS capability for backends that track timestamps.
-type chtimesFS interface {
-	Chtimes(name string, atime, mtime time.Time) error
 }
 
 func (o osFS) Chtimes(name string, atime, mtime time.Time) error {
@@ -3789,36 +4159,134 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 }
 
 // writeFilestat populates the 64-byte WASI filestat structure from a
-// host os.FileInfo. The dev/ino fields come from the per-platform
-// wasiPlatformStatSys helper (unix returns Stat_t.Dev/.Ino; Windows
-// returns zeros).
+// backend's os.FileInfo. The device, inode, link count and the access and
+// status-change times are the POSIX metadata fileStatOf finds in it.
 func writeFilestat(out []byte, st os.FileInfo) {
-	// os.FileInfo does not expose dev/ino portably; report zeros.
-	binary.LittleEndian.PutUint64(out[0:], 0)
-	binary.LittleEndian.PutUint64(out[8:], 0)
+	posix := fileStatOf(st)
+	binary.LittleEndian.PutUint64(out[0:], posix.dev)
+	binary.LittleEndian.PutUint64(out[8:], posix.ino)
+	// WASI's file types: 1 block device, 2 character device, 3 directory,
+	// 4 regular file, 6 stream socket, 7 symbolic link. There is none for
+	// a FIFO, which is therefore "unknown" (0) here — not a socket — and
+	// gets its type from the filestat_ext record.
 	var ftype byte = 4
-	mode := st.Mode()
-	switch {
-	case mode.IsDir():
+	switch unixTypeBits(st.Mode()) {
+	case unixTypeDir:
 		ftype = 3
-	case mode&os.ModeSymlink != 0:
+	case unixTypeSymlink:
 		ftype = 7
-	case mode&os.ModeNamedPipe != 0:
+	case unixTypeFIFO:
+		ftype = 0
+	case unixTypeSocket:
 		ftype = 6
-	case mode&os.ModeSocket != 0:
-		ftype = 6
-	case mode&os.ModeDevice != 0:
-		ftype = 1
-	case mode&os.ModeCharDevice != 0:
+	case unixTypeChar:
 		ftype = 2
+	case unixTypeBlock:
+		ftype = 1
 	}
 	out[16] = ftype
-	binary.LittleEndian.PutUint64(out[24:], 1) // nlink
+	binary.LittleEndian.PutUint64(out[24:], posix.nlink)
 	binary.LittleEndian.PutUint64(out[32:], uint64(st.Size()))
-	nanos := uint64(st.ModTime().UnixNano())
-	binary.LittleEndian.PutUint64(out[40:], nanos) // atim
-	binary.LittleEndian.PutUint64(out[48:], nanos) // mtim
-	binary.LittleEndian.PutUint64(out[56:], nanos) // ctim
+	binary.LittleEndian.PutUint64(out[40:], uint64(posix.atime.UnixNano()))
+	binary.LittleEndian.PutUint64(out[48:], uint64(st.ModTime().UnixNano()))
+	binary.LittleEndian.PutUint64(out[56:], uint64(posix.ctime.UnixNano()))
+}
+
+// Chown changes the owner and group of a file of the host filesystem; -1
+// leaves an id as it is. With follow false a symbolic link itself is
+// changed, not the file it names.
+func (o osFS) Chown(name string, uid, gid int, follow bool) error {
+	if follow {
+		return os.Chown(o.join(name), uid, gid)
+	}
+	return os.Lchown(o.join(name), uid, gid)
+}
+
+// Path_chown is a NON-STANDARD host import (name "path_chown") backing
+// chown and lchown (follow 0) for the preopen-relative path; an id of -1
+// is left as it is. Returns 0, or a negative errno: ENOSYS when the
+// filesystem of the instance keeps no owners.
+func (w *WasiStubs) Path_chown(m *Module, pathPtr, pathLen, uid, gid, follow int32) int32 {
+	return w.pathChown(m, zext(pathPtr), pathLen, uid, gid, follow)
+}
+
+// Path_chown64 is Path_chown for a memory64 guest.
+func (w *WasiStubs) Path_chown64(m *Module, pathPtr int64, pathLen, uid, gid, follow int32) int32 {
+	return w.pathChown(m, uint64(pathPtr), pathLen, uid, gid, follow)
+}
+
+// pathChown is the body of Path_chown and Path_chown64.
+func (w *WasiStubs) pathChown(m *Module, pathPtr uint64, pathLen, uid, gid, follow int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	path := string(pathSlice)
+	if !w.checkFS(path, true) {
+		return -_wasiEACCES
+	}
+	w.mu.Lock()
+	fsys := w.fsys
+	w.mu.Unlock()
+	owner, can := fsys.(interface {
+		Chown(name string, uid, gid int, follow bool) error
+	})
+	if !can {
+		return -_wasiENOSYS
+	}
+	if err := owner.Chown(path, int(uid), int(gid), follow != 0); err != nil {
+		if errors.Is(err, errors.ErrUnsupported) {
+			return -_wasiENOSYS
+		}
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Fd_chown is a NON-STANDARD host import (name "fd_chown") backing fchown.
+// Returns 0, or a negative errno: ENOSYS for a descriptor that is not a
+// file of the host.
+func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	file, isHostFile := op.f.(*os.File)
+	if !isHostFile {
+		return -_wasiENOSYS
+	}
+	if err := file.Chown(int(uid), int(gid)); err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Fd_chown64 is Fd_chown for a memory64 guest.
+func (w *WasiStubs) Fd_chown64(m *Module, fd, uid, gid int32) int32 {
+	return w.Fd_chown(m, fd, uid, gid)
+}
+
+// writeWasiRecord hands a variable-length record to the guest: its size is
+// written at neededPtr, and the record at bufPtr when bufLen bytes are
+// enough for it. Returns 0, or a negative errno: ERANGE when the buffer is
+// too small — the guest then calls again with one of the size it was told.
+func (w *WasiStubs) writeWasiRecord(m *Module, rec []byte, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	needed := w.memBytes(m, neededPtr, 4)
+	if needed == nil || bufLen < 0 {
+		return -_wasiEFAULT
+	}
+	binary.LittleEndian.PutUint32(needed, uint32(len(rec)))
+	if int(bufLen) < len(rec) {
+		return -_wasiERANGE
+	}
+	buf := w.memBytes(m, bufPtr, uint64(len(rec)))
+	if buf == nil {
+		return -_wasiEFAULT
+	}
+	copy(buf, rec)
+	return _wasiESUCCESS
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3839,7 +4307,7 @@ var wasip1NativeRaw []byte
 // m.memory get rewritten to m.Memory by capitalizeModuleFieldRefs,
 // matching how helpers are handled.
 //
-// The per-platform companions (wasip1_native_posix.go, _other.go and the
+// The per-platform companions (the wasip1_native_<platform>.go files and the
 // wasip1_hostnumbers_* tables) are not parsed into the main file's decls —
 // emitWasip1Platform returns them as separate files so their //go:build
 // constraints stick.
@@ -3862,7 +4330,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"FS":            true,
 			"File":          true,
 			"osFS":          true,
-			"chtimesFS":     true,
+			"fileStat":      true,
 			"MemFS":         true,
 			"memFile":       true,
 			"memNode":       true,
@@ -3874,6 +4342,12 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"DefaultWASI":             true,
 			"SetPreopenDir":           true,
 			"NewMemFS":                true,
+			"fileStatOf":              true,
+			"unixFileMode":            true,
+			"unixModeBits":            true,
+			"unixTypeBits":            true,
+			"filetimesNeedCurrent":    true,
+			"writeFilestatExt":        true,
 			"memSplit":                true,
 			"memSlice":                true,
 			"mapOSError":              true,
@@ -4013,8 +4487,14 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 var (
 	//go:embed wasip1_native_posix.go
 	wasip1NativePosixRaw []byte
+	//go:embed wasip1_native_linux.go
+	wasip1NativeLinuxRaw []byte
+	//go:embed wasip1_native_darwin.go
+	wasip1NativeDarwinRaw []byte
 	//go:embed wasip1_native_other.go
 	wasip1NativeOtherRaw []byte
+	//go:embed wasip1_native_hostfd.go
+	wasip1NativeHostFDRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_darwin.go
@@ -4032,8 +4512,11 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 	}
 	out := map[string][]byte{}
 	for name, raw := range map[string][]byte{
-		"wasip1_native_posix.go": wasip1NativePosixRaw,
-		"wasip1_native_other.go": wasip1NativeOtherRaw,
+		"wasip1_native_posix.go":  wasip1NativePosixRaw,
+		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
+		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
+		"wasip1_native_other.go":  wasip1NativeOtherRaw,
+		"wasip1_native_hostfd.go": wasip1NativeHostFDRaw,
 
 		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,

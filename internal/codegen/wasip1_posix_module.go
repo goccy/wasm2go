@@ -25,15 +25,21 @@ const (
 // posixImports are the imports of wasip1_posix_extension. A memory64 module
 // binds each to its *64 method, as it does wasi_snapshot_preview1's.
 var posixImports = map[string]bool{
-	"fd_cloexec":   true,
-	"fd_closefrom": true,
-	"fd_dup":       true,
-	"fd_dup2":      true,
-	"fd_dupfd":     true,
-	"path_chmod":   true,
-	"pipe":         true,
-	"proc_spawn":   true,
-	"proc_wait":    true,
+	"fd_chmod":          true,
+	"fd_chown":          true,
+	"fd_cloexec":        true,
+	"fd_closefrom":      true,
+	"fd_dup":            true,
+	"fd_dup2":           true,
+	"fd_dupfd":          true,
+	"fd_filestat_ext":   true,
+	"fd_path":           true,
+	"path_chmod":        true,
+	"path_chown":        true,
+	"path_filestat_ext": true,
+	"pipe":              true,
+	"proc_spawn":        true,
+	"proc_wait":         true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

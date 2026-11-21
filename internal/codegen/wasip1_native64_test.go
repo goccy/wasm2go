@@ -495,6 +495,12 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"fd_read count", func() int32 { return w.Fd_read64(m, int64(fd), 1056, 0, highAddr) }, _wasiEFAULT},
 		{"path_open path", func() int32 { return w.Path_open64(m, 3, 0, highAddr, 1, 0, 1<<1, 0, 0, 512) }, _wasiEFAULT},
 		{"path_open path length", func() int32 { return w.Path_open64(m, 3, 0, 900, 1<<32+1, 0, 1<<1, 0, 0, 512) }, _wasiEFAULT},
+		{"fd_filestat_ext", func() int32 { return w.Fd_filestat_ext64(m, fd, highAddr) }, -_wasiEFAULT},
+		{"path_filestat_ext", func() int32 { return w.Path_filestat_ext64(m, highAddr, 1, 1, 512) }, -_wasiEFAULT},
+		{"path_filestat_mode", func() int32 { return w.Path_filestat_mode64(m, 900, 1, 1, highAddr) }, -_wasiEFAULT},
+		{"path_chmod", func() int32 { return w.Path_chmod64(m, highAddr, 1, 0o600) }, -_wasiEFAULT},
+		{"path_chown", func() int32 { return w.Path_chown64(m, highAddr, 1, -1, -1, 1) }, -_wasiEFAULT},
+		{"fd_path needed", func() int32 { return w.Fd_path64(m, 3, 512, 64, highAddr) }, -_wasiEFAULT},
 	} {
 		before := bytes.Clone(m.memory)
 		if got := tc.call(); got != tc.want {
@@ -503,6 +509,15 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		if !bytes.Equal(before, m.memory) {
 			t.Errorf("%s: wrote to guest memory", tc.name)
 		}
+	}
+	// A record's size is written before the record: the size lands, the
+	// record at the high address does not land at the low one.
+	before := bytes.Clone(m.memory)
+	if rc := w.Fd_path64(m, 3, highAddr, 64, 512); rc != -_wasiEFAULT {
+		t.Errorf("fd_path record: rc=%d, want %d", rc, -_wasiEFAULT)
+	}
+	if !bytes.Equal(before[:512], m.memory[:512]) || readU32(m.memory, 512) != 1 {
+		t.Errorf("fd_path record: memory % x, size %d", m.memory[16:32], readU32(m.memory, 512))
 	}
 	if got, err := os.ReadFile(filepath.Join(dir, "f")); err != nil || string(got) != "data" {
 		t.Fatalf("the file holds %q after the refused writes, err=%v", got, err)
@@ -578,6 +593,32 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"path_create_directory of a name that is taken",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory(m, 3, 512, 5) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_create_directory64(m, 3, 512, 5) }},
+		{"path_filestat_mode",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_mode(m, 512, 5, 1, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_mode64(m, 512, 5, 1, 1024) }},
+		{"fd_filestat_ext",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_filestat_ext(m, fd, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_filestat_ext64(m, fd, 1024) }},
+		{"path_filestat_ext",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_ext(m, 512, 5, 1, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Path_filestat_ext64(m, 512, 5, 1, 1024) }},
+		{"path_chmod and fd_chmod",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_chmod(m, 512, 5, 0o644) | w.Fd_chmod(m, fd, 0o644)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_chmod64(m, 512, 5, 0o644) | w.Fd_chmod64(m, fd, 0o644)
+			}},
+		{"path_chown and fd_chown of nothing",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_chown(m, 512, 5, -1, -1, 1) | w.Fd_chown(m, fd, -1, -1)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_chown64(m, 512, 5, -1, -1, 1) | w.Fd_chown64(m, fd, -1, -1)
+			}},
+		{"fd_path",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_path(m, 3, 2048, 64, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_path64(m, 3, 2048, 64, 1024) }},
 		{"pipe",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe(m, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe64(m, 1024) }},

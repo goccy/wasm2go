@@ -170,6 +170,79 @@ func TestOSFSInterface(t *testing.T) {
 	}
 }
 
+// The host filesystem renames as rename(2) does: a file onto a directory is
+// EISDIR, a directory onto an empty directory replaces it, and one onto a
+// directory with something in it is ENOTEMPTY, 55 (or EEXIST, which POSIX
+// allows too). os.Rename answers EEXIST for every one of them.
+func TestOSFSRenameIsTheSystemCall(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	root := t.TempDir()
+	fsys := osFS{root: root}
+	for _, dir := range []string{"target", "empty", "full", "moved"} {
+		if err := fsys.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{"file", "full/inside"} {
+		f, err := fsys.OpenFile(file, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fsys.Rename("file", "target"); mapOSError(err) != _wasiEISDIR {
+		t.Errorf("a file onto a directory: %v (errno %d), want EISDIR", err, mapOSError(err))
+	}
+	if err := fsys.Rename("moved", "empty"); err != nil {
+		t.Errorf("a directory onto an empty directory: %v", err)
+	}
+	if err := fsys.Rename("target", "full"); mapOSError(err) != 55 && mapOSError(err) != _wasiEEXIST {
+		t.Errorf("a directory onto a full one: %v (errno %d), want ENOTEMPTY", err, mapOSError(err))
+	}
+	if err := fsys.Rename("file", "renamed"); err != nil {
+		t.Errorf("a file to a new name: %v", err)
+	}
+}
+
+// On every host, a file renamed onto another file replaces it.
+func TestOSFSRenameReplacesAFile(t *testing.T) {
+	root := t.TempDir()
+	fsys := osFS{root: root}
+	for name, data := range map[string]string{"from": "new", "to": "old"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fsys.Rename("from", "to"); err != nil {
+		t.Fatalf("a file onto a file: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "to")); err != nil || string(got) != "new" {
+		t.Errorf("the replaced file holds %q, err=%v; want \"new\"", got, err)
+	}
+	if _, err := fsys.Lstat("from"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the old name after the rename: %v, want it gone", err)
+	}
+	if err := fsys.Rename("nothing", "to"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a rename of a missing file: %v, want a not-exist error", err)
+	}
+}
+
+// On the host's own root, the guest's "." (what its C library makes of "/")
+// is "/": rmdir("/") is the host's rmdir("/"), EBUSY, not rmdir("/."),
+// which is EINVAL on Linux.
+func TestOSFSRootIsSlash(t *testing.T) {
+	for _, root := range []string{"", "/"} {
+		if got := (osFS{root: root}).join("."); got != "/" {
+			t.Errorf("osFS{root: %q}.join(\".\") = %q, want /", root, got)
+		}
+		if got := (osFS{root: root}).join("etc"); got != "/etc" {
+			t.Errorf("osFS{root: %q}.join(\"etc\") = %q, want /etc", root, got)
+		}
+	}
+}
+
 func TestMemFSInterface(t *testing.T) {
 	fsys := NewMemFS()
 	exerciseFS(t, fsys, false)
