@@ -237,8 +237,8 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 	_, m := newTestStubs(t, t.TempDir())
 	w := &WasiStubs{}
 
-	// Sock_socket allocates a fresh fd (family is validated by the bridge
-	// shim, not here).
+	// Sock_socket allocates a fresh fd (family is validated by the caller,
+	// not here).
 	fd := w.Sock_socket(m, 2 /*AF_INET*/, 1 /*SOCK_STREAM*/)
 	if fd < 4 {
 		t.Fatalf("Sock_socket returned bad fd %d", fd)
