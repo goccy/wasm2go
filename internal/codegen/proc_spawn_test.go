@@ -16,6 +16,37 @@ func writeCStr(m *Module, off int32, s string) int32 {
 
 // writeArgv lays out a NULL-terminated char** for argv at off, with each
 // string packed starting at strOff. Returns the argv pointer.
+// Proc_spawn64 reads its strings and string arrays with 64-bit pointers.
+func TestWasi_ProcSpawn64(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	argv := []string{"/bin/sh", "-c", "exit 3"}
+	if _, err := os.Stat(argv[0]); err != nil {
+		t.Skipf("%s not available", argv[0])
+	}
+	const argvOff, strOff, envOff, pidOff, statusOff = 2000, 3000, 4000, 4100, 4104
+	at := int32(strOff)
+	for i, a := range argv {
+		writeCStr(m, at, a)
+		binary.LittleEndian.PutUint64(m.memory[argvOff+i*8:], uint64(at))
+		at += int32(len(a)) + 1
+	}
+	binary.LittleEndian.PutUint64(m.memory[argvOff+len(argv)*8:], 0)
+	binary.LittleEndian.PutUint64(m.memory[envOff:], 0)
+	if rc := w.Proc_spawn64(m, strOff, argvOff, envOff, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn64 rc=%d", rc)
+	}
+	pid := int32(readU32(m.memory, pidOff))
+	if rc := w.Proc_wait64(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait64 rc=%d", rc)
+	}
+	if status := readU32(m.memory, statusOff); status != 3<<8 {
+		t.Fatalf("status = %#x, want %#x", status, 3<<8)
+	}
+	if rc := w.Proc_spawn64(m, strOff, argvOff, envOff, -1, -1, -1, 0, 1<<40); rc != -_wasiEFAULT {
+		t.Fatalf("Proc_spawn64 with the pid beyond the memory rc=%d, want -EFAULT", rc)
+	}
+}
+
 func writeArgv(m *Module, off, strOff int32, argv []string) int32 {
 	p := strOff
 	ptrs := make([]int32, len(argv))

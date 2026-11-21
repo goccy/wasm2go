@@ -106,6 +106,15 @@ the symbolic links the guest creates may still point anywhere for a
 reader on the host. The directory must be one that may be searched,
 and it is held open until the FS's `Close` method is called.
 
+`Process` supplies the guest's identity and accounting: what `getpid`,
+`getppid`, the `getuid` family and `times()` report, the pid whose
+`/proc/PID/fd` lists the guest's descriptors, and the umask the guest
+starts with. A nil one is an isolated process (pid 42, ppid 1, every
+user and group id 0, no CPU time, umask 022). `HostProcess()` returns
+the host process's, or an error where its umask cannot be read without
+changing it; `HostProcessUmask(umask)` is the same with the umask
+given. `HostWASIConfig()` leaves `Process` nil.
+
 ```go
 fsys, err := mymodule.HostFS("/srv/data")
 if err != nil {

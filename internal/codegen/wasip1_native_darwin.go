@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"syscall"
@@ -21,6 +22,24 @@ func statTimes(st *syscall.Stat_t) (atime, ctime time.Time) {
 // the type of every name, so the listing never asks.
 func lstatAt(dir *os.File, name string) (os.FileInfo, error) {
 	return nil, &fs.PathError{Op: "lstatat", Path: name, Err: errors.ErrUnsupported}
+}
+
+// chmodRefused reports whether err is chmod(2)'s refusal of a mode bit to
+// this user or this file: EPERM, or EFTYPE for a sticky bit of a file that
+// is no directory.
+func chmodRefused(err error) bool {
+	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EFTYPE)
+}
+
+// hostFDLink reports that the host has no link for descriptor fd of the
+// host process: /dev/fd/N of this system is no link.
+func hostFDLink(fd uintptr) (string, bool, error) { return "", false, nil }
+
+// readHostUmask returns the file mode creation mask of the host process,
+// which this system has no way to read without changing it:
+// errors.ErrUnsupported.
+func readHostUmask() (os.FileMode, error) {
+	return 0, fmt.Errorf("the umask of the host process cannot be read without changing it: %w", errors.ErrUnsupported)
 }
 
 // osFileDirents returns the names in the directory open as d: "." and

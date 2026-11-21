@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -380,5 +381,239 @@ func TestWasi_CloseErrorsAreReported(t *testing.T) {
 	}
 	if len(w.fdTable) != 0 {
 		t.Errorf("%d fds left after CloseAll", len(w.fdTable))
+	}
+}
+
+func spawnTestProc(t *testing.T, w *WasiStubs, m *Module, argv ...string) int32 {
+	t.Helper()
+	if _, err := os.Stat(argv[0]); err != nil {
+		t.Skipf("%s not available", argv[0])
+	}
+	pathOff := writeCStr(m, 1000, argv[0])
+	argvOff := writeArgv(m, 2000, 3000, argv)
+	const pidOff int32 = 4000
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	return int32(readU32(m.memory, int(pidOff)))
+}
+
+func TestWasi_NewProcWait(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+	pid, exited := w.NewProc(nil)
+	if pid != 1000 {
+		t.Errorf("first pid = %d, want 1000", pid)
+	}
+	if rc := w.Proc_wait(m, pid, 1, statusOff); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG while running rc=%d, want -EAGAIN", rc)
+	}
+	go func() {
+		exited(7 << 8)
+		exited(1 << 8) // a repeated call is ignored
+	}()
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if status := int32(readU32(m.memory, int(statusOff))); status != 7<<8 {
+		t.Errorf("status = %#x, want %#x", status, 7<<8)
+	}
+	if rc := w.Proc_wait(m, pid, 0, statusOff); rc != -_wasiECHILD {
+		t.Errorf("wait after reap rc=%d, want -ECHILD", rc)
+	}
+
+	pid2, exited2 := w.NewProc(nil)
+	exited2(2 << 8)
+	if rc := w.Proc_wait(m, pid2, 1, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("WNOHANG after exit rc=%d", rc)
+	}
+	if status := int32(readU32(m.memory, int(statusOff))); status != 2<<8 {
+		t.Errorf("status = %#x, want %#x", status, 2<<8)
+	}
+}
+
+func TestWasi_ProcWaitAny(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const pidOut, statusOff int32 = 4100, 4104
+	waitAny := func(options int32) (rc, pid, status int32) {
+		rc = w.Proc_wait_any(m, options, pidOut, statusOff)
+		return rc, int32(readU32(m.memory, int(pidOut))), int32(readU32(m.memory, int(statusOff)))
+	}
+
+	if rc, _, _ := waitAny(0); rc != -_wasiECHILD {
+		t.Fatalf("no children rc=%d, want -ECHILD", rc)
+	}
+	if rc, _, _ := waitAny(1); rc != -_wasiECHILD {
+		t.Fatalf("no children, WNOHANG rc=%d, want -ECHILD", rc)
+	}
+
+	ownPid, exited := w.NewProc(nil)
+	if rc, _, _ := waitAny(1); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG with a running child rc=%d, want -EAGAIN", rc)
+	}
+
+	spawnedPid := spawnTestProc(t, w, m, "/bin/sh", "-c", "exit 3")
+	rc, pid, status := waitAny(0)
+	if rc != _wasiESUCCESS || pid != spawnedPid || status != 3<<8 {
+		t.Fatalf("wait any = rc %d pid %d status %#x, want pid %d status %#x", rc, pid, status, spawnedPid, 3<<8)
+	}
+	if rc := w.Proc_wait(m, spawnedPid, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("reaped pid still waitable: rc=%d", rc)
+	}
+
+	if rc, _, _ := waitAny(1); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG with the embedder-run child running rc=%d, want -EAGAIN", rc)
+	}
+	exited(9) // killed by signal 9
+	rc, pid, status = waitAny(1)
+	if rc != _wasiESUCCESS || pid != ownPid || status != 9 {
+		t.Fatalf("wait any = rc %d pid %d status %#x, want pid %d status 0x9", rc, pid, status, ownPid)
+	}
+	if rc, _, _ := waitAny(0); rc != -_wasiECHILD {
+		t.Fatalf("all reaped rc=%d, want -ECHILD", rc)
+	}
+
+	// Several finished at once: the lowest pid is reported first.
+	p1, e1 := w.NewProc(nil)
+	p2, e2 := w.NewProc(nil)
+	e2(2 << 8)
+	e1(1 << 8)
+	if rc, pid, status := waitAny(0); rc != _wasiESUCCESS || pid != p1 || status != 1<<8 {
+		t.Fatalf("first of two = rc %d pid %d status %#x, want pid %d", rc, pid, status, p1)
+	}
+	if rc, pid, status := waitAny(0); rc != _wasiESUCCESS || pid != p2 || status != 2<<8 {
+		t.Fatalf("second of two = rc %d pid %d status %#x, want pid %d", rc, pid, status, p2)
+	}
+
+	if rc := w.Proc_wait_any(m, 0, int32(len(m.memory)), statusOff); rc != -_wasiEFAULT {
+		t.Errorf("bad pid pointer rc=%d, want -EFAULT", rc)
+	}
+}
+
+// A process finishing at any point relative to the waiter's scan must wake
+// the waiter.
+func TestWasi_ProcWaitAnyConcurrentFinish(t *testing.T) {
+	const iterations, procs = 300, 4
+	const pidOut, statusOff int32 = 4100, 4104
+	for iter := 0; iter < iterations; iter++ {
+		w, m := newProcTestStubs(t)
+		want := map[int32]int32{}
+		var start sync.WaitGroup
+		start.Add(1)
+		for i := 0; i < procs; i++ {
+			pid, exited := w.NewProc(nil)
+			status := int32(i+1) << 8
+			want[pid] = status
+			go func() {
+				start.Wait()
+				exited(status)
+			}()
+		}
+		reaped := make(chan map[int32]int32, 1)
+		go func() {
+			got := map[int32]int32{}
+			for i := 0; i < procs; i++ {
+				if i == 0 {
+					start.Done()
+				}
+				if rc := w.Proc_wait_any(m, 0, pidOut, statusOff); rc != _wasiESUCCESS {
+					got[-1] = rc
+					break
+				}
+				got[int32(readU32(m.memory, int(pidOut)))] = int32(readU32(m.memory, int(statusOff)))
+			}
+			reaped <- got
+		}()
+		got := <-reaped
+		if len(got) != len(want) {
+			t.Fatalf("iteration %d: reaped %v, want %v", iter, got, want)
+		}
+		for pid, status := range want {
+			if got[pid] != status {
+				t.Fatalf("iteration %d: reaped %v, want %v", iter, got, want)
+			}
+		}
+		if rc := w.Proc_wait_any(m, 0, pidOut, statusOff); rc != -_wasiECHILD {
+			t.Fatalf("iteration %d: after reaping all rc=%d, want -ECHILD", iter, rc)
+		}
+	}
+}
+
+func TestWasi_ForkFamilyPidsUnique(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	const statusOff int32 = 4004
+	first, _ := w.NewProc(nil)
+	if first != 1000 {
+		t.Errorf("first pid = %d, want 1000", first)
+	}
+	child := w.Fork()
+	grandchild := child.Fork()
+	seen := map[int32]bool{first: true}
+	for i := 0; i < 3; i++ {
+		for _, inst := range []*WasiStubs{grandchild, w, child} {
+			pid, _ := inst.NewProc(nil)
+			if seen[pid] {
+				t.Fatalf("pid %d handed out twice in one fork family", pid)
+			}
+			seen[pid] = true
+		}
+	}
+	// A child does not see its parent's children.
+	if rc := child.Proc_wait(newForkTestModule(), first, 1, statusOff); rc != -_wasiECHILD {
+		t.Errorf("child waiting for the parent's child rc=%d, want -ECHILD", rc)
+	}
+	if rc := w.Proc_wait(m, first, 1, statusOff); rc != -_wasiEAGAIN {
+		t.Errorf("parent waiting for its own running child rc=%d, want -EAGAIN", rc)
+	}
+
+	// Forking before any pid was handed out still shares one allocator.
+	fresh, _ := newProcTestStubs(t)
+	freshChild := fresh.Fork()
+	a, _ := freshChild.NewProc(nil)
+	b, _ := fresh.NewProc(nil)
+	if a != 1000 || b != 1001 {
+		t.Errorf("pids = %d, %d, want 1000, 1001", a, b)
+	}
+}
+
+// A process that several calls wait for at once is reported to one of them;
+// the others find no such child.
+func TestWasi_ProcWaitConcurrentWaiters(t *testing.T) {
+	const statusOff, pidOut int32 = 4004, 4100
+	waitPid := func(w *WasiStubs, pid int32) int32 {
+		return w.Proc_wait(newForkTestModule(), pid, 0, statusOff)
+	}
+	waitAny := func(w *WasiStubs, pid int32) int32 {
+		return w.Proc_wait_any(newForkTestModule(), 0, pidOut, statusOff)
+	}
+	for _, waiters := range [][]func(*WasiStubs, int32) int32{
+		{waitPid, waitPid},
+		{waitPid, waitAny},
+		{waitPid, waitPid, waitAny, waitAny},
+	} {
+		for iter := 0; iter < 100; iter++ {
+			w, _ := newProcTestStubs(t)
+			pid, exited := w.NewProc(nil)
+			results := make(chan int32, len(waiters))
+			for _, wait := range waiters {
+				go func() { results <- wait(w, pid) }()
+			}
+			exited(5 << 8)
+			reported, missed := 0, 0
+			for range waiters {
+				switch rc := <-results; rc {
+				case _wasiESUCCESS:
+					reported++
+				case -_wasiECHILD:
+					missed++
+				default:
+					t.Fatalf("iteration %d: a waiter returned %d", iter, rc)
+				}
+			}
+			if reported != 1 || missed != len(waiters)-1 {
+				t.Fatalf("iteration %d: %d of %d waiters were given the process, %d found no child; want 1 and %d",
+					iter, reported, len(waiters), missed, len(waiters)-1)
+			}
+		}
 	}
 }
