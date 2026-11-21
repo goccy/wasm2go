@@ -151,3 +151,7 @@ func wasiErrno(e syscall.Errno) (int32, bool) {
 	n, ok := wasiErrnoOfHost()[e]
 	return n, ok
 }
+
+// hostONonblock is the open flag of the host that opens a file without
+// waiting (a FIFO nobody writes to, or reads from).
+const hostONonblock = syscall.O_NONBLOCK

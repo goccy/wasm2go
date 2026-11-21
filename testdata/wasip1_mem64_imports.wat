@@ -114,6 +114,8 @@
     (func $path_chown (param i64 i32 i32 i32 i32) (result i32)))
   (import "wasip1_posix_extension" "fd_chown"
     (func $fd_chown (param i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "clock_zone"
+    (func $clock_zone (param i64 i32 i32 i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "path_filestat_mode"
     (func $path_filestat_mode (param i64 i32 i32 i64) (result i32)))
   (import "wasip1_posix_extension" "proc_wait"
@@ -190,6 +192,7 @@
     (drop (call $fd_path (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $path_chown (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $fd_chown (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $clock_zone (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $path_filestat_mode (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_wait (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_wait_any (i32.const 0) (i64.const 0) (i64.const 0)))

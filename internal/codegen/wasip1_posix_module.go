@@ -25,6 +25,7 @@ const (
 // posixImports are the imports of wasip1_posix_extension. A memory64 module
 // binds each to its *64 method, as it does wasi_snapshot_preview1's.
 var posixImports = map[string]bool{
+	"clock_zone":                 true,
 	"fd_chmod":                   true,
 	"fd_chown":                   true,
 	"fd_cloexec":                 true,
