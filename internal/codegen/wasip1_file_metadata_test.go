@@ -123,6 +123,12 @@ func TestWasi_FilestatReportsLinksAndIdentity(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("data"), 0o640); err != nil {
 		t.Fatal(err)
 	}
+	// The access time is set later than now and the modification time
+	// earlier than it.
+	now := time.Now().Truncate(time.Second)
+	if err := os.Chtimes(filepath.Join(dir, "a"), now.Add(time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "other"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +178,8 @@ func TestWasi_FilestatReportsAccessAndChangeTimes(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := time.Now()
-	atime, mtime := time.Unix(1_000_000, 0), time.Unix(2_000_000, 0)
+	// The access times set are later than now.
+	atime, mtime := created.Truncate(time.Second).Add(2*time.Hour), time.Unix(2_000_000, 0)
 	off, n := putPath(m, metaPathOff, "f")
 	if rc := w.Path_filestat_set_times(m, 3, 0x1, off, n, atime.UnixNano(), mtime.UnixNano(), 0x1|0x4); rc != _wasiESUCCESS {
 		t.Fatalf("Path_filestat_set_times rc=%d", rc)
@@ -182,7 +189,7 @@ func TestWasi_FilestatReportsAccessAndChangeTimes(t *testing.T) {
 		t.Fatalf("atim=%d mtim=%d, want %d and %d", st.atim, st.mtim, atime.UnixNano(), mtime.UnixNano())
 	}
 	// The status change time is when the times were set, not either of them.
-	if ctime := time.Unix(0, int64(st.ctim)); ctime.Before(created.Add(-time.Minute)) {
+	if ctime := time.Unix(0, int64(st.ctim)); ctime.Before(created.Add(-time.Minute)) || ctime.After(created.Add(time.Minute)) {
 		t.Fatalf("ctim=%v, want about %v", ctime, created)
 	}
 
@@ -195,7 +202,7 @@ func TestWasi_FilestatReportsAccessAndChangeTimes(t *testing.T) {
 		t.Fatalf("mtime only: atim=%d mtim=%d", st.atim, st.mtim)
 	}
 	fd := openTestFile(t, w, "f")
-	earlier := time.Unix(500_000, 0)
+	earlier := atime.Add(-time.Hour)
 	if rc := w.Fd_filestat_set_times(m, fd, earlier.UnixNano(), 0, 0x1); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_filestat_set_times (atime only) rc=%d", rc)
 	}

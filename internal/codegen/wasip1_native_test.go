@@ -1477,8 +1477,10 @@ func TestWasi_ResolveFiletimes(t *testing.T) {
 	if time.Since(at) > time.Second || time.Since(mt) > time.Second {
 		t.Fatalf("resolveFiletimes NOW too old: %v %v", at, mt)
 	}
-	// A time that is not being set keeps its current value.
-	if err := os.Chtimes(p, time.Unix(300, 0), time.Unix(400, 0)); err != nil {
+	// A time that is not being set keeps its current value. The access
+	// time is set later than now.
+	keptAtime := time.Now().Truncate(time.Second).Add(time.Hour)
+	if err := os.Chtimes(p, keptAtime, time.Unix(400, 0)); err != nil {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(p)
@@ -1492,8 +1494,8 @@ func TestWasi_ResolveFiletimes(t *testing.T) {
 	if mt.Unix() != 500 {
 		t.Fatalf("mtime = %v, want 500", mt)
 	}
-	if _, ok := osFileStat(st.Sys()); ok && at.Unix() != 300 {
-		t.Fatalf("atime = %v, want it kept at 300", at)
+	if _, ok := osFileStat(st.Sys()); ok && !at.Equal(keptAtime) {
+		t.Fatalf("atime = %v, want it kept at %v", at, keptAtime)
 	}
 }
 
