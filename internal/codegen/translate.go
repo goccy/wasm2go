@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -111,6 +112,10 @@ type Options struct {
 	//     start + table-installed functions + reachable calls survive.
 	//   - non-empty: only the named exports are roots (others may
 	//     still survive via the table or transitive calls).
+	//
+	// The fork child export, __wasip1_posix_extension_fork_child of type
+	// () -> i32 in a module that imports the wasi runtime and has a linear
+	// memory, is a root either way.
 	EntryExports []string
 	// KeepDeadFuncs disables whole-function dead-code elimination.
 	// Useful for diffing / debugging.
@@ -1057,34 +1062,32 @@ func (t *translator) fieldRef(field string) ast.Expr {
 	return &ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName(field))}
 }
 
+// baseRef returns the AST reference to name, a declaration of the package
+// that holds the Module: `name` in single-pkg and in base, `base.name` in
+// multi-pkg outside base (chunks and the main package).
+func (t *translator) baseRef(name string) ast.Expr {
+	if t.multiPackage && t.currentChunk != chunkBase {
+		return &ast.SelectorExpr{X: newID("base"), Sel: newID(name)}
+	}
+	return newID(name)
+}
+
 // moduleType returns the AST expression for `*Module`.
 func (t *translator) moduleType() ast.Expr {
-	if t.multiPackage && t.currentChunk != chunkBase {
-		// Chunks and the main package both reference base.Module.
-		// currentChunk == chunkBase is reserved for the base package itself.
-		return &ast.StarExpr{X: &ast.SelectorExpr{X: newID("base"), Sel: newID("Module")}}
-	}
-	return &ast.StarExpr{X: newID("Module")}
+	return &ast.StarExpr{X: t.moduleTypeName()}
 }
 
 // moduleTypeName returns the AST node for the bare Module type (no `*`),
 // suitable for composite literals like `&Module{...}`.
 func (t *translator) moduleTypeName() ast.Expr {
-	if t.multiPackage && t.currentChunk != chunkBase {
-		return &ast.SelectorExpr{X: newID("base"), Sel: newID("Module")}
-	}
-	return newID("Module")
+	return t.baseRef("Module")
 }
 
 // importIfaceTypeRef returns the AST type reference for an import-module
 // interface (e.g. `EnvImports` in single-pkg, `base.EnvImports` in
 // multi-pkg outside base).
 func (t *translator) importIfaceTypeRef(mod string) ast.Expr {
-	name := t.importIfaceName(mod)
-	if t.multiPackage && t.currentChunk != chunkBase {
-		return &ast.SelectorExpr{X: newID("base"), Sel: newID(name)}
-	}
-	return newID(name)
+	return t.baseRef(t.importIfaceName(mod))
 }
 
 // funcName returns the bare function name for a wasm function index. In
@@ -1930,6 +1933,22 @@ func (t *translator) emitModuleStruct() ast.Decl {
 				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID(argType)},
 			}}},
 		})
+		// forkChild and forkModule are what a fork of an instance runs (see
+		// emitForkModule); nil in a module without the fork child export.
+		if t.wasmImportsWasi() {
+			fields = append(fields,
+				&ast.Field{
+					Names: []*ast.Ident{newID(t.fieldName("forkChild"))},
+					Type: &ast.FuncType{
+						Params:  &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}},
+						Results: &ast.FieldList{List: []*ast.Field{{Type: newID("int32")}}},
+					},
+				},
+				&ast.Field{
+					Names: []*ast.Ident{newID(t.fieldName("forkModule"))},
+					Type:  t.forkModuleType(),
+				})
+		}
 	}
 
 	return &ast.GenDecl{
@@ -1992,7 +2011,101 @@ func (t *translator) emitNewFuncs() []ast.Decl {
 		decls = append(decls, t.emitNewFuncsMode(newFromMemory)...)
 		decls = append(decls, t.emitNewFuncsMode(newFromSnapshot)...)
 	}
+	if _, ok := t.forkChildExport(); ok {
+		decls = append(decls, t.emitForkModule())
+	}
 	return decls
+}
+
+// forkChildExportName is the export a fork of an instance enters the child
+// through: a function of type () -> i32 that runs the child and returns its
+// exit status.
+const forkChildExportName = "__wasip1_posix_extension_fork_child"
+
+// forkChildExport returns the function index of the module's fork child
+// export (see isForkChild).
+func (t *translator) forkChildExport() (funcIdx uint32, ok bool) {
+	idx, ok := t.funcExport(forkChildExportName)
+	return idx, ok && isForkChild(t.mod, idx)
+}
+
+// isForkChild reports whether funcIdx, the function of the export
+// forkChildExportName, can be a fork child entry: it is of type () -> i32,
+// and mod has what a fork needs, the wasi runtime and a linear memory.
+func isForkChild(mod *wasm.Module, funcIdx uint32) bool {
+	if len(mod.Memories) == 0 || !slices.ContainsFunc(mod.Imports, func(imp wasm.Import) bool {
+		return !importHandledInternally(imp) && servedByWASI(imp.Module)
+	}) {
+		return false
+	}
+	ft := mod.FuncTypeOf(funcIdx)
+	return len(ft.Params) == 0 && len(ft.Results) == 1 && ft.Results[0] == wasm.ValI32
+}
+
+// funcExport returns the function index of the function export name, if
+// the module has it and its function is reachable.
+func (t *translator) funcExport(name string) (funcIdx uint32, ok bool) {
+	for _, exp := range t.mod.Exports {
+		if exp.Kind == wasm.ExportFunc && exp.Name == name && t.funcReachable(exp.Index) {
+			return exp.Index, true
+		}
+	}
+	return 0, false
+}
+
+// emitForkModule emits forkModule, which every constructor of a module with
+// the fork child export puts in the Module's forkModule field (its forkChild
+// field gets the export itself). It lives with the constructors, which the
+// wasi runtime cannot name from the base package of multi-package output.
+func (t *translator) emitForkModule() ast.Decl {
+	args := t.importArgs(newID("wasi"), func(mod string) ast.Expr { return t.fieldRef(MangleModuleField(mod)) })
+	args = append(args, newID("memory"), newID("memSize"), newID("globals"))
+	return &ast.FuncDecl{
+		Doc: &ast.CommentGroup{List: []*ast.Comment{{
+			Text: "// forkModule builds an instance from a copy of m's memory and globals\n" +
+				"// (NewFromSnapshot): its wasi import is wasi and its other imports are\n" +
+				"// m's. len(memory) is the instance's memory ceiling, as it is for\n" +
+				"// NewFromSnapshot: memory is as long as the instance's memory may grow.",
+		}}},
+		Name: newID("forkModule"),
+		Type: t.forkModuleType(),
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{
+			&ast.CallExpr{Fun: newID("NewFromSnapshot"), Args: args},
+		}}}},
+	}
+}
+
+// forkModuleType is the type of forkModule (see emitForkModule), as the
+// package being emitted names it.
+func (t *translator) forkModuleType() *ast.FuncType {
+	param := func(name string, typ ast.Expr) *ast.Field {
+		return &ast.Field{Names: []*ast.Ident{newID(name)}, Type: typ}
+	}
+	return &ast.FuncType{
+		Params: &ast.FieldList{List: []*ast.Field{
+			param("m", t.moduleType()),
+			param("wasi", &ast.StarExpr{X: t.baseRef("WasiStubs")}),
+			param("memory", &ast.ArrayType{Elt: newID("byte")}),
+			param("memSize", newID("uint64")),
+			param("globals", &ast.ArrayType{Elt: newID("uint64")}),
+		}},
+		Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}},
+	}
+}
+
+// importArgs returns the import arguments of a constructor call, in the
+// order of t.importedModules: wasi for wasi_snapshot_preview1 and imp(mod)
+// for any other module.
+func (t *translator) importArgs(wasi ast.Expr, imp func(mod string) ast.Expr) []ast.Expr {
+	var args []ast.Expr
+	for _, mod := range t.importedModules {
+		if mod == wasiModule {
+			args = append(args, wasi)
+			continue
+		}
+		args = append(args, imp(mod))
+	}
+	return args
 }
 
 // initialMemoryBytesConst emits the module's declared initial linear-memory
@@ -2028,19 +2141,12 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	memFromArg := mode != newAlloc
 	primaryName := "New"
 	emitNativeWASIWrapper := false
-	wasiIdx := -1
 	if t.wasmImportsWasi() {
 		// The function that actually does all the setup work is renamed
 		// to NewWithWASI; the simple-form New() will be appended below
 		// as a thin delegator.
 		primaryName = "NewWithWASI"
 		emitNativeWASIWrapper = true
-		for i, mod := range t.importedModules {
-			if mod == "wasi_snapshot_preview1" {
-				wasiIdx = i
-				break
-			}
-		}
 	}
 
 	// When the module has linear memory and we're emitting the WASI-wrapper
@@ -2710,10 +2816,7 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// base) can launch agents without reaching into this package. The field
 	// follows the memory width (threadStart64 with an i64 start_arg on a
 	// memory64 module), matching the struct declaration.
-	for _, exp := range t.mod.Exports {
-		if exp.Kind != wasm.ExportFunc || exp.Name != "wasi_thread_start" || !t.funcReachable(exp.Index) {
-			continue
-		}
+	if start, ok := t.funcExport("wasi_thread_start"); ok {
 		threadStartField := "threadStart"
 		if t.mod.Memory64() {
 			threadStartField = "threadStart64"
@@ -2725,9 +2828,16 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		body.List = append(body.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
 			Lhs: []ast.Expr{&ast.SelectorExpr{X: newID("m"), Sel: newID(t.fieldName(threadStartField))}},
-			Rhs: []ast.Expr{t.funcRef(exp.Index)},
+			Rhs: []ast.Expr{t.funcRef(start)},
 		})
-		break
+	}
+
+	// Wire what a fork runs (see emitForkModule).
+	if entry, ok := t.forkChildExport(); ok {
+		body.List = append(body.List,
+			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{t.fieldRef("forkChild")}, Rhs: []ast.Expr{t.funcRef(entry)}},
+			&ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{t.fieldRef("forkModule")}, Rhs: []ast.Expr{newID("forkModule")}},
+		)
 	}
 
 	// The wasm start section runs at instantiation, before any export is
@@ -2778,25 +2888,18 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	// parameter and delegates to NewWithWASI with NewWASI(WASIConfig{})
 	// inserted at the wasi position.
 	var wrapperParams []*ast.Field
-	var wrapperArgs []ast.Expr
 	// In multi-package mode WasiStubs, NewWASI and WASIConfig live in base/;
 	// callers outside base reference them through the `base.` prefix.
-	var newWASI, wasiConfig ast.Expr = newID("NewWASI"), newID("WASIConfig")
-	if t.multiPackage && t.currentChunk != chunkBase {
-		newWASI = &ast.SelectorExpr{X: newID("base"), Sel: newID("NewWASI")}
-		wasiConfig = &ast.SelectorExpr{X: newID("base"), Sel: newID("WASIConfig")}
-	}
-	defaultWASICall := &ast.CallExpr{Fun: newWASI, Args: []ast.Expr{&ast.CompositeLit{Type: wasiConfig}}}
-	for i, mod := range t.importedModules {
-		if i == wasiIdx {
-			wrapperArgs = append(wrapperArgs, defaultWASICall)
+	defaultWASICall := &ast.CallExpr{Fun: t.baseRef("NewWASI"), Args: []ast.Expr{&ast.CompositeLit{Type: t.baseRef("WASIConfig")}}}
+	wrapperArgs := t.importArgs(defaultWASICall, func(mod string) ast.Expr { return newID(MangleModuleField(mod)) })
+	for _, mod := range t.importedModules {
+		if mod == wasiModule {
 			continue
 		}
 		wrapperParams = append(wrapperParams, &ast.Field{
 			Names: []*ast.Ident{newID(MangleModuleField(mod))},
 			Type:  t.importIfaceTypeRef(mod),
 		})
-		wrapperArgs = append(wrapperArgs, newID(MangleModuleField(mod)))
 	}
 	wrapperBody := &ast.BlockStmt{List: []ast.Stmt{
 		&ast.ReturnStmt{Results: []ast.Expr{&ast.CallExpr{

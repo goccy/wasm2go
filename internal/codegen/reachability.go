@@ -23,7 +23,8 @@ import (
 //     root, so only functions dead in the wasm itself are dropped.
 //     A non-nil entryExports restricts the export roots to the named
 //     subset (used by whole-program pruning when the caller knows the
-//     real entry set).
+//     real entry set). The fork child export (forkChildExportName, see
+//     isForkChild) is a root either way: a fork enters it.
 //
 // The returned map is keyed by local index: function localIdx is kept
 // iff result[localIdx] is true.
@@ -77,7 +78,7 @@ func computeReachableFuncs(mod *wasm.Module, entryExports map[string]bool, calle
 		// names to keep as reachability roots. Any export not in the
 		// set is dropped from the root set (its function can still
 		// become reachable through the table or a direct call).
-		if entryExports != nil && !entryExports[e.Name] {
+		if entryExports != nil && !entryExports[e.Name] && (e.Name != forkChildExportName || !isForkChild(mod, e.Index)) {
 			continue
 		}
 		addGlobal(e.Index)
