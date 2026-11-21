@@ -3,10 +3,13 @@
 package codegen
 
 import (
+	"math"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
@@ -124,6 +127,188 @@ func hostProcessTimes() (ProcessTimes, error) {
 		ChildrenUser:   time.Duration(children.Utime.Nano()),
 		ChildrenSystem: time.Duration(children.Stime.Nano()),
 	}, nil
+}
+
+// descriptorWaits reports whether a call on the descriptor waits when there
+// is nothing for it: it is not in non-blocking mode, which the descriptors
+// the runtime polls are. Such a descriptor cannot be asked what is there.
+func descriptorWaits(fd uintptr) bool {
+	flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
+	return err != nil || flags&syscall.O_NONBLOCK == 0
+}
+
+// hostIovecs returns the iovecs of the buffers of bufs that have room: no
+// more than IOV_MAX (1024) of them, and no more than INT_MAX bytes in all,
+// more than darwin's readv(2) and writev(2) take (EINVAL), so that a call
+// given more moves fewer bytes, as a short read or write does. tooMany reports that bufs has more buffers
+// with room than one call takes.
+func hostIovecs(bufs [][]byte) (iov []syscall.Iovec, tooMany bool) {
+	left := math.MaxInt32
+	for _, buf := range bufs {
+		if len(buf) == 0 {
+			continue
+		}
+		if len(iov) == 1024 {
+			return iov, true
+		}
+		if left > 0 {
+			v := syscall.Iovec{Base: &buf[0]}
+			v.SetLen(min(len(buf), left))
+			iov, left = append(iov, v), left-min(len(buf), left)
+		}
+	}
+	return iov, false
+}
+
+// writeIovecs is hostIovecs for a write to fd. A datagram socket refuses
+// more buffers than one call takes (EINVAL): a datagram is not split into
+// two. A descriptor that is no socket (ENOTSOCK) takes a short write.
+func writeIovecs(fd uintptr, bufs [][]byte) ([]syscall.Iovec, error) {
+	iov, tooMany := hostIovecs(bufs)
+	if tooMany {
+		typ, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_TYPE)
+		switch {
+		case err == syscall.ENOTSOCK:
+		case err != nil:
+			return nil, os.NewSyscallError("getsockopt", err)
+		case typ != syscall.SOCK_STREAM:
+			return nil, syscall.EINVAL
+		}
+	}
+	return iov, nil
+}
+
+// hostStreamSendLowat returns the low-water mark of socket fd for sending
+// (SO_SNDLOWAT), which a stream socket that poll(2) reports writable has
+// room for, or 0 for a socket of another type, which takes a datagram whole.
+func hostStreamSendLowat(fd uintptr) (int, error) {
+	typ, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_TYPE)
+	if err != nil {
+		return 0, os.NewSyscallError("getsockopt", err)
+	}
+	if typ != syscall.SOCK_STREAM {
+		return 0, nil
+	}
+	lowat, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDLOWAT)
+	if err != nil {
+		return 0, os.NewSyscallError("getsockopt", err)
+	}
+	return lowat, nil
+}
+
+// hostIO makes the system call that call makes once, again on EINTR. again
+// reports that a descriptor in non-blocking mode has nothing or no room
+// right now; otherwise n bytes were moved (none at the end of input), or err
+// says why not.
+func hostIO(call func() (uintptr, syscall.Errno)) (n int, again bool, err error) {
+	for {
+		r, errno := call()
+		switch errno {
+		case 0:
+			return int(r), false, nil
+		case syscall.EINTR:
+			continue
+		case syscall.EAGAIN:
+			return 0, true, nil
+		}
+		return 0, false, errno
+	}
+}
+
+// readvRaw reads from fd into bufs with one readv(2): see hostIO. (Package
+// syscall has no Readv.)
+func readvRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	iov, _ := hostIovecs(bufs)
+	if len(iov) == 0 {
+		return 0, false, nil
+	}
+	return hostIO(func() (uintptr, syscall.Errno) {
+		r, _, errno := syscall.Syscall(syscall.SYS_READV, fd, uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
+		runtime.KeepAlive(iov)
+		return r, errno
+	})
+}
+
+// writevRaw writes bufs to fd with one writev(2): see hostIO. (Package
+// syscall has no Writev.)
+func writevRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	iov, err := writeIovecs(fd, bufs)
+	if err != nil || len(iov) == 0 {
+		return 0, false, err
+	}
+	return hostIO(func() (uintptr, syscall.Errno) {
+		r, _, errno := syscall.Syscall(syscall.SYS_WRITEV, fd, uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
+		runtime.KeepAlive(iov)
+		return r, errno
+	})
+}
+
+// messageIO makes system call trap, recvmsg(2) or sendmsg(2)
+// (hostSysRecvmsg, hostSysSendmsg), on socket fd over iov once, without
+// waiting (MSG_DONTWAIT): see hostIO. (syscall.Recvmsg and SendmsgN take
+// one buffer, not the guest's iovecs.)
+func messageIO(trap, fd uintptr, iov []syscall.Iovec) (n int, again bool, err error) {
+	var h syscall.Msghdr
+	if len(iov) > 0 {
+		h.Iov = &iov[0]
+		for range iov {
+			h.Iovlen++ // its type differs from host to host
+		}
+	}
+	return hostIO(func() (uintptr, syscall.Errno) {
+		r, _, errno := syscall.Syscall(trap, fd, uintptr(unsafe.Pointer(&h)), syscall.MSG_DONTWAIT)
+		runtime.KeepAlive(&h)
+		runtime.KeepAlive(iov)
+		return r, errno
+	})
+}
+
+// recvNow receives into bufs from socket fd without waiting.
+func recvNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	iov, _ := hostIovecs(bufs)
+	return messageIO(hostSysRecvmsg, fd, iov)
+}
+
+// sendNow sends bufs to socket fd without waiting.
+func sendNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	iov, err := writeIovecs(fd, bufs)
+	if err != nil {
+		return 0, false, err
+	}
+	return messageIO(hostSysSendmsg, fd, iov)
+}
+
+// hostCloseFD closes a descriptor of the runtime's own.
+func hostCloseFD(fd int) error {
+	if err := syscall.Close(fd); err != nil {
+		return os.NewSyscallError("close", err)
+	}
+	return nil
+}
+
+// hostStreamWrites says that the host can write to a stream without waiting
+// in the write, and wait for one to have room: see writevRaw and
+// hostWaitReady.
+const hostStreamWrites = true
+
+// openForWriting reports whether the descriptor is open for writing. One the
+// host cannot be asked about counts as open; the write then tells.
+func openForWriting(fd uintptr) bool {
+	flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
+	if err != nil {
+		return true
+	}
+	return flags&syscall.O_ACCMODE != syscall.O_RDONLY
+}
+
+// descriptorFlags returns what fcntl(fd, get) reports: the descriptor flags
+// for F_GETFD, the status flags for F_GETFL.
+func descriptorFlags(fd int, get int) (int, error) {
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(get), 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(flags), nil
 }
 
 // ---- the numbers of the operating system ---------------------------------

@@ -254,6 +254,9 @@ type scriptConn struct {
 func (c *scriptConn) Read(p []byte) (int, error)  { return c.script.next() }
 func (c *scriptConn) Write(p []byte) (int, error) { return c.script.next() }
 
+// SetReadDeadline reports that the scripted connection takes no deadline.
+func (c *scriptConn) SetReadDeadline(time.Time) error { return os.ErrNoDeadline }
+
 func TestWasi_SockIOErrorIsErrnoOnlyWhenNothingMoved(t *testing.T) {
 	failure := errors.New("device failure")
 	for _, c := range []struct {

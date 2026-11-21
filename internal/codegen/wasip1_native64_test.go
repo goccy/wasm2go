@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Tests for the widened wasm64-wasip1 ABI bindings (the *64 method
@@ -454,6 +455,92 @@ func TestWasi64_ReadlinkBufusedIsLP64(t *testing.T) {
 	}
 }
 
+func TestWasi64_PollNeventsIsLP64(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	// One clock subscription that is due at once: the subscription (48
+	// bytes) and the event (32 bytes) are as for wasm32, nevents is a u64.
+	writeSubClock(m, 1024, 0xabcdef, 0)
+	fillSentinel(m, 1200, 8)
+	if rc := w.Poll_oneoff64(m, 1024, 2048, 1, 1200); rc != _wasiESUCCESS {
+		t.Fatalf("poll_oneoff64 rc=%d", rc)
+	}
+	if got := readU64(m.memory, 1200); got != 1 {
+		t.Fatalf("nevents=%#x, want 1 in all 8 bytes", got)
+	}
+	if ud := readU64(m.memory, 2048); ud != 0xabcdef {
+		t.Fatalf("event userdata=%#x", ud)
+	}
+	if errno, etype := binary.LittleEndian.Uint16(m.memory[2056:]), binary.LittleEndian.Uint16(m.memory[2058:]); errno != 0 || etype != 0 {
+		t.Fatalf("event errno=%d type=%d", errno, etype)
+	}
+	// A count whose arrays cannot fit faults instead of wrapping.
+	if rc := w.Poll_oneoff64(m, 1024, 2048, 1<<60, 1200); rc != _wasiEFAULT {
+		t.Fatalf("poll_oneoff64 with 2^60 subscriptions rc=%d, want EFAULT", rc)
+	}
+}
+
+// fdRead64String reads up to n bytes from fd through Fd_read64.
+func fdRead64String(w *WasiStubs, m *Module, fd int32, n int) (string, int32) {
+	putIovecs64(m, 6000, [2]uint64{6200, uint64(n)})
+	rc := w.Fd_read64(m, int64(fd), 6000, 1, 6100)
+	if rc != _wasiESUCCESS {
+		return "", rc
+	}
+	got := readU64(m.memory, 6100)
+	return string(m.memory[6200 : 6200+got]), rc
+}
+
+// fdWrite64String writes s to fd through Fd_write64.
+func fdWrite64String(w *WasiStubs, m *Module, fd int32, s string) (uint64, int32) {
+	copy(m.memory[6300:], s)
+	putIovecs64(m, 6000, [2]uint64{6300, uint64(len(s))})
+	rc := w.Fd_write64(m, int64(fd), 6000, 1, 6100)
+	return readU64(m.memory, 6100), rc
+}
+
+// Fd_read64 waits on a pipe as Fd_read does: until input arrives, and no
+// longer than until a signal is posted (EINTR); a non-blocking one reports
+// EAGAIN.
+func TestWasi64_FdReadWaitsOnAPipeAsFdRead(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	if rc := w.Proc_signal_register64(m, int64(sigFlagOff)); rc != 0 {
+		t.Fatalf("proc_signal_register64 rc=%d", rc)
+	}
+	if rc := w.Proc_signal_dispositions64(m, int64(signalMask(wasiSIGUSR1)), 0, 0); rc != _wasiESUCCESS {
+		t.Fatalf("proc_signal_dispositions64 rc=%d", rc)
+	}
+	readFd, writeFd := newTestPipe(t, w, m)
+	read := func() (got string, rc int32) {
+		returnsWithin(t, "fd_read64", func() { got, rc = fdRead64String(w, m, readFd, 16) })
+		return got, rc
+	}
+
+	postWhenBlocked(w, wasiSIGUSR1)
+	if _, rc := read(); rc != _wasiEINTR {
+		t.Fatalf("read of an idle pipe rc=%d, want EINTR", rc)
+	}
+	if rc := w.Proc_signal_take64(m, int64(sigMaskOff)); rc != _wasiESUCCESS || readU64(m.memory, int(sigMaskOff)) != signalMask(wasiSIGUSR1) {
+		t.Fatalf("proc_signal_take64 rc=%d mask=%#x", rc, readU64(m.memory, int(sigMaskOff)))
+	}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		if n, rc := fdWrite64String(w, newForkTestModule(), writeFd, "late"); rc != _wasiESUCCESS || n != 4 {
+			t.Errorf("fd_write64 = %d bytes rc=%d", n, rc)
+		}
+	}()
+	if got, rc := read(); rc != _wasiESUCCESS || got != "late" {
+		t.Fatalf("read = %q rc=%d, want %q", got, rc, "late")
+	}
+
+	if rc := w.Fd_fdstat_set_flags64(m, int64(readFd), int64(wasiFdflagNonblock)); rc != _wasiESUCCESS {
+		t.Fatalf("fd_fdstat_set_flags64 rc=%d", rc)
+	}
+	if _, rc := read(); rc != _wasiEAGAIN {
+		t.Fatalf("non-blocking read of an idle pipe rc=%d, want EAGAIN", rc)
+	}
+}
+
 // A guest address with a bit above 32 set is outside a small memory: every
 // binding refuses it with EFAULT instead of using the low address it would
 // truncate to, and writes nothing.
@@ -494,6 +581,7 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"fd_read count", func() int32 { return w.Fd_read64(m, int64(fd), 1056, 0, highAddr) }, _wasiEFAULT},
 		{"path_open path", func() int32 { return w.Path_open64(m, 3, 0, highAddr, 1, 0, 1<<1, 0, 0, 512) }, _wasiEFAULT},
 		{"path_open path length", func() int32 { return w.Path_open64(m, 3, 0, 900, 1<<32+1, 0, 1<<1, 0, 0, 512) }, _wasiEFAULT},
+		{"poll_oneoff", func() int32 { return w.Poll_oneoff64(m, highAddr, 512, 1, 600) }, _wasiEFAULT},
 		{"fd_filestat_ext", func() int32 { return w.Fd_filestat_ext64(m, fd, highAddr) }, -_wasiEFAULT},
 		{"path_filestat_ext", func() int32 { return w.Path_filestat_ext64(m, highAddr, 1, 1, 512) }, -_wasiEFAULT},
 		{"path_filestat_mode", func() int32 { return w.Path_filestat_mode64(m, 900, 1, 1, highAddr) }, -_wasiEFAULT},

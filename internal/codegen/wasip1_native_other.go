@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"syscall"
+	"time"
 )
 
 // hostProcessTimes returns the CPU time of the host process and of its
@@ -60,6 +61,83 @@ func guestSignalOf(hostSig syscall.Signal) int32 {
 	return 0
 }
 
+// descriptorWaits reports whether a call on the descriptor waits when there
+// is nothing for it, which the runtime cannot tell on this platform.
+func descriptorWaits(fd uintptr) bool { return true }
+
+// readvRaw would read with readv(2), which the runtime cannot do on this
+// platform.
+func readvRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+// recvNow would receive from a socket without waiting, which the runtime
+// cannot do on this platform.
+func recvNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+// sendNow would send to a socket without waiting, which the runtime cannot
+// do on this platform.
+func sendNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+// hostSendsWithoutWaiting says nothing on this platform, which cannot send
+// without waiting.
+const hostSendsWithoutWaiting = false
+
+// hostStreamSendLowat would ask a socket for its low-water mark, which the
+// runtime cannot do on this platform.
+func hostStreamSendLowat(fd uintptr) (int, error) { return 0, errors.ErrUnsupported }
+
+// hostPipeBuf is PIPE_BUF as POSIX bounds it from below.
+const hostPipeBuf = 512
+
+// hostStreamWrites says whether the host can write to a stream without
+// waiting in the write. The runtime does not know how on this platform, so
+// writes go through the stream's own Write and wait there.
+const hostStreamWrites = false
+
+// writevRaw would write with writev(2), which the runtime cannot do on
+// this platform.
+func writevRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+// openForWriting reports whether the descriptor is open for writing, which
+// the runtime cannot ask on this platform; the write tells.
+func openForWriting(fd uintptr) bool { return true }
+
+// hostPolls says that the runtime cannot wait for a descriptor in poll(2) on
+// this platform: a readiness probe reads the stream instead.
+const hostPolls = false
+
+// hostPollReportsFIFOEnd says nothing on this platform, which has no
+// poll(2).
+const hostPollReportsFIFOEnd = false
+
+// hostWaitReady would wait in poll(2) for descriptors to be ready, which
+// the runtime cannot do on this platform.
+func hostWaitReady(fds []uintptr, wants []int, ready []bool, until time.Time, wake int) error {
+	return errors.ErrUnsupported
+}
+
+// hostWakePipe would make the pipe a wait in poll(2) watches, which the
+// runtime cannot do on this platform.
+func hostWakePipe() (r, w int, err error) { return -1, -1, errors.ErrUnsupported }
+
+// hostWakeWrite would write to a wake pipe, which this platform has none of.
+func hostWakeWrite(w int) error { return errors.ErrUnsupported }
+
+// hostWakeDrain would read a wake pipe empty, which this platform has none
+// of.
+func hostWakeDrain(r int) error { return errors.ErrUnsupported }
+
+// hostCloseFD would close a descriptor of the runtime's own, which this
+// platform has none of.
+func hostCloseFD(fd int) error { return errors.ErrUnsupported }
+
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error; on this platform the errors are told apart
 // by what package os makes of them, except a few of windows.
@@ -86,6 +164,10 @@ func wasiErrno(e syscall.Errno) (int32, bool) {
 	}
 	return 0, false
 }
+
+// hostHungUp would ask the host whether a descriptor of its own has been
+// hung up on, which the runtime cannot do on this platform.
+func hostHungUp(fd uintptr) bool { return false }
 
 // hostDirListing lists a directory of the host's file system (an *os.File,
 // which HostFS opens) in the order the system gives its names, which Go's

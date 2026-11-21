@@ -28,6 +28,46 @@ func hostSignalByNumber(sig int32) (hostSig syscall.Signal, known bool) {
 	return syscall.Signal(sig), sig == 16 || sig == 30 || sig >= 32 && sig <= 64
 }
 
+// hostPollReportsFIFOEnd says that poll(2) here reports POLLHUP on a FIFO
+// whose last writer has closed it.
+const hostPollReportsFIFOEnd = true
+
+// hostSendsWithoutWaiting says that a send to a socket with MSG_DONTWAIT
+// does not wait for room.
+const hostSendsWithoutWaiting = true
+
+// hostPipeBuf is PIPE_BUF: a pipe that poll(2) reports writable takes that
+// much without waiting.
+const hostPipeBuf = 4096
+
+// hostWakePipe makes a pipe whose ends do not wait and are closed on exec:
+// a wait in poll(2) watches its read end, and a byte written to the other
+// end (hostWakeWrite) ends the wait.
+func hostWakePipe() (r, w int, err error) {
+	var p [2]int
+	if err := syscall.Pipe2(p[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
+		return -1, -1, os.NewSyscallError("pipe2", err)
+	}
+	return p[0], p[1], nil
+}
+
+// hostPollCall is poll(2): it waits no longer than timeout, and without
+// limit when timeout is negative.
+func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
+	var limit *syscall.Timespec
+	if timeout >= 0 {
+		ts := syscall.NsecToTimespec(int64(timeout))
+		limit = &ts
+	}
+	var first *hostPoll
+	if len(fds) > 0 {
+		first = &fds[0]
+	}
+	n, _, errno := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)),
+		uintptr(unsafe.Pointer(limit)), 0, 0, 0)
+	return int(n), errno
+}
+
 // openPath is O_PATH, which has this number on every linux GOARCH while
 // package syscall names it on some of them only.
 const openPath = 0x200000
