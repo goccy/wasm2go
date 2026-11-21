@@ -47,8 +47,10 @@ func main() {
 // An imported function that is exported (under a plain and under a
 // bulk-dispatch name), sits in an element segment or is the start function
 // reaches the host method, in the single- and the multi-package output.
+// Every constructor sets the element slot; New and NewWithMemory run the
+// start function once, NewFromSnapshot does not run it.
 func TestReferencesOfFunctionImports(t *testing.T) {
-	const want = "1 101 102 12884901892 <nil>\n"
+	const want = "1 101 102 12884901892 <nil>\n2 103\n2 104\n"
 	opts := codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg", BulkExportPrefix: "w_"}
 	t.Run("single", func(t *testing.T) {
 		mod := readFixture(t, "cg_func_import_refs.wasm")
@@ -75,6 +77,10 @@ func main() {
 	m := pkg.New(env{&inits})
 	packed, err := pkg.Inv_1_2(m, 3, 4)
 	fmt.Println(inits, m.Add(1), m.ViaTable(2), packed, err)
+	w := pkg.NewWithMemory(env{&inits}, make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes)
+	fmt.Println(inits, w.ViaTable(3))
+	s := pkg.NewFromSnapshot(env{&inits}, make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes, nil)
+	fmt.Println(inits, s.ViaTable(4))
 }
 `
 		if out := runGoSnippetWithAux(t, buf.String(), main, []map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles); out != want {
@@ -111,10 +117,48 @@ func main() {
 	m := pkg.New(env{&inits})
 	packed, err := pkg.Inv_1_2(m, 3, 4)
 	fmt.Println(inits, pkg.Add(m, 1), pkg.ViaTable(m, 2), packed, err)
+	w := pkg.NewWithMemory(env{&inits}, make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes)
+	fmt.Println(inits, pkg.ViaTable(w, 3))
+	s := pkg.NewFromSnapshot(env{&inits}, make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes, nil)
+	fmt.Println(inits, pkg.ViaTable(s, 4))
 }
 `
 		if out := runGoSnippetWithAux(t, "package pkg\n", main, []map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles); out != want {
 			t.Errorf("output %q, want %q", out, want)
 		}
 	})
+}
+
+// The wasi-threads thread-spawn import, served by the threadSpawn helper
+// rather than by the host, can be exported and placed in an element
+// segment: the export and the slot spawn through the helper.
+func TestThreadSpawnImportExportedAndInATable(t *testing.T) {
+	mod := readFixture(t, "cg_thread_spawn_refs.wasm")
+	var buf bytes.Buffer
+	res, err := codegen.Translate(&buf, mod, codegen.Options{Package: "pkg", OutputImportPath: "gentest/pkg"})
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	main := `package main
+
+import (
+	"fmt"
+	"time"
+
+	"gentest/pkg"
+)
+
+func main() {
+	m := pkg.New()
+	direct, viaTable := m.Spawn(64) > 0, m.SpawnViaTable(64) > 0
+	deadline := time.Now().Add(10 * time.Second)
+	for m.Count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	fmt.Println(direct, viaTable, m.Count())
+}
+`
+	if out := runGoSnippetWithAux(t, buf.String(), main, []map[string][]byte{res.Sidecars, res.Files}, res.AuxFiles); out != "true true 2\n" {
+		t.Errorf("output %q, want %q", out, "true true 2\n")
+	}
 }

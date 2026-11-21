@@ -1182,8 +1182,24 @@ func (t *translator) helperRef(name string) ast.Expr {
 }
 
 // importCall returns `m.<modField>.<MethodName>(args...)`, the call of a
-// function import through its host interface.
+// function import through its host interface, or the call of the runtime
+// helper that serves an import handled internally.
 func (t *translator) importCall(imp wasm.Import, args []ast.Expr) ast.Expr {
+	// wasi-threads: thread-spawn is not a host call at all — a wasm thread is
+	// a goroutine, so it lowers to the threadSpawn helper, which starts the
+	// guest's own wasi_thread_start on one. Keeping it out of the host
+	// interface means an embedder gets threads without implementing anything.
+	if importHandledInternally(imp) {
+		// On a memory64 module the start_arg is an i64 linear-memory
+		// pointer, so the spawn routes to the i64-arg helper twin (which
+		// reads the threadStart64 field the mem64 Module struct declares).
+		helper := "threadSpawn"
+		if t.mod.Memory64() {
+			helper = "threadSpawn_m64"
+		}
+		t.useHelper(helper)
+		return &ast.CallExpr{Fun: t.helperRef(helper), Args: args}
+	}
 	return &ast.CallExpr{
 		Fun: &ast.SelectorExpr{
 			X:   t.fieldRef(MangleModuleField(servingModule(imp.Module))),

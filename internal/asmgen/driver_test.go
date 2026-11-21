@@ -16,9 +16,8 @@ type fakeDriver struct {
 	funcRefRet   string
 }
 
-func (d *fakeDriver) Module() *wasm.Module      { return d.mod }
-func (d *fakeDriver) MultiPackage() bool        { return d.multipkg }
-func (d *fakeDriver) FieldName(s string) string { return s }
+func (d *fakeDriver) Module() *wasm.Module { return d.mod }
+func (d *fakeDriver) MultiPackage() bool   { return d.multipkg }
 func (d *fakeDriver) FuncName(idx uint32) string {
 	return ""
 }
@@ -26,10 +25,9 @@ func (d *fakeDriver) FuncRefName(idx uint32) string {
 	d.funcRefCalls = append(d.funcRefCalls, idx)
 	return d.funcRefRet
 }
-func (d *fakeDriver) HelperName(name string) string         { return name }
-func (d *fakeDriver) ImportMethodName(_ wasm.Import) string { return "" }
-func (d *fakeDriver) UseHelper(string)                      {}
-func (d *fakeDriver) UsePackage(string)                     {}
+func (d *fakeDriver) HelperName(name string) string { return name }
+func (d *fakeDriver) UseHelper(string)              {}
+func (d *fakeDriver) UsePackage(string)             {}
 
 // TestFuncOptionsFromDriver verifies that
 //   - Module flows through Driver.Module()

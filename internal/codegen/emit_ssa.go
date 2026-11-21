@@ -1417,30 +1417,6 @@ func (em *ssaEmitter) emitCallImport(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 	if !ok {
 		return nil, fmt.Errorf("ssa emit: CallImport v%d: function %d is not an imported function", v.ID, v.AuxInt)
 	}
-	// wasi-threads: thread-spawn is not a host call at all — a wasm thread is
-	// a goroutine, so it lowers to the threadSpawn helper, which starts the
-	// guest's own wasi_thread_start on one. Keeping it out of the host
-	// interface means an embedder gets threads without implementing anything.
-	if imp.Module == "wasi" && imp.Name == "thread-spawn" ||
-		imp.Module == "wasi_snapshot_preview1" && imp.Name == "thread_spawn" {
-		// On a memory64 module the start_arg is an i64 linear-memory
-		// pointer, so the spawn routes to the i64-arg helper twin (which
-		// reads the threadStart64 field the mem64 Module struct declares).
-		helper := "threadSpawn"
-		if em.mem64 {
-			helper = "threadSpawn_m64"
-		}
-		em.useHelper(helper)
-		args := []ast.Expr{newID("m")}
-		for _, a := range v.Args {
-			ae, err := emit(a)
-			if err != nil {
-				return nil, err
-			}
-			args = append(args, ae)
-		}
-		return &ast.CallExpr{Fun: em.helperRef(helper), Args: args}, nil
-	}
 	args := []ast.Expr{newID("m")}
 	for _, a := range v.Args {
 		ae, err := emit(a)
