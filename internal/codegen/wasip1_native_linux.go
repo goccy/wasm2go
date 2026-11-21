@@ -64,7 +64,8 @@ func readHostDirents(fd int) ([]hostName, error) {
 			}
 			rec := rest[:reclen]
 			rest = rest[reclen:]
-			if binary.NativeEndian.Uint64(rec) == 0 {
+			ino := binary.NativeEndian.Uint64(rec)
+			if ino == 0 {
 				continue
 			}
 			name := rec[nameAt:]
@@ -74,7 +75,7 @@ func readHostDirents(fd int) ([]hostName, error) {
 					break
 				}
 			}
-			out = append(out, hostName{name: string(name), typ: rec[typeAt]})
+			out = append(out, hostName{name: string(name), typ: rec[typeAt], ino: ino})
 		}
 	}
 }
