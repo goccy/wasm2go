@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"os"
+	"runtime"
 	"syscall"
 )
 
@@ -20,8 +21,30 @@ func hostRename(from, to string) error { return os.Rename(from, to) }
 
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error; on this platform the errors are told apart
-// by what package os makes of them.
-func wasiErrno(e syscall.Errno) (int32, bool) { return 0, false }
+// by what package os makes of them, except a few of windows.
+func wasiErrno(e syscall.Errno) (int32, bool) {
+	if runtime.GOOS != "windows" {
+		return 0, false
+	}
+	// The numbers of windows' errors that package syscall does not name.
+	switch e {
+	case 39, 112: // ERROR_HANDLE_DISK_FULL, ERROR_DISK_FULL
+		return _wasiENOSPC, true
+	case 120: // ERROR_CALL_NOT_IMPLEMENTED
+		return _wasiENOSYS, true
+	case 131: // ERROR_NEGATIVE_SEEK
+		return _wasiEINVAL, true
+	case 10051: // WSAENETUNREACH
+		return _wasiENETUNREACH, true
+	case 10060: // WSAETIMEDOUT
+		return _wasiETIMEDOUT, true
+	case 10061: // WSAECONNREFUSED
+		return _wasiECONNREFUSED, true
+	case 10065: // WSAEHOSTUNREACH
+		return _wasiEHOSTUNREACH, true
+	}
+	return 0, false
+}
 
 // hostDirListing lists a directory of the host's file system (an *os.File,
 // which osFS opens) in the order the system gives its names, which Go's

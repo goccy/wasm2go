@@ -569,7 +569,11 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	for _, aux := range []map[string][]byte{shared, t.emitWasip1Platform(opts.Package)} {
+	platform, err := t.emitWasip1Platform(opts.Package)
+	if err != nil {
+		return Result{}, err
+	}
+	for _, aux := range []map[string][]byte{shared, platform} {
 		for name, content := range aux {
 			if t.auxFiles == nil {
 				t.auxFiles = map[string][]byte{}

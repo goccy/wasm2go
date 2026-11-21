@@ -239,7 +239,11 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		files["base/"+name] = content
 	}
 	// So do the per-platform companions of the native wasi implementation.
-	for name, content := range t.emitWasip1Platform("base") {
+	platform, err := t.emitWasip1Platform("base")
+	if err != nil {
+		return Result{}, err
+	}
+	for name, content := range platform {
 		files["base/"+name] = content
 	}
 

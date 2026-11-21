@@ -889,6 +889,19 @@ type wasiOpen struct {
 	listener net.Listener
 	isDir    bool
 	isSocket bool // created by Sock_socket, may not yet have a conn
+	// shutClosed is set once Sock_shutdown closes conn, which has no half
+	// close, or listener: a transfer on conn that fails then fails as
+	// after shutdown(2) (see afterShutdown), an accept on listener with
+	// EINVAL.
+	shutClosed atomic.Bool
+	// connClosed is set by whichever closes conn or listener first, a
+	// Sock_shutdown or closing the descriptor, before that one close; the
+	// other then does not close it again, whatever the close returned.
+	connClosed atomic.Bool
+	// regular is set for a regular file, as Path_open found f: a read of
+	// it fills every buffer, where one of a stream returns what has
+	// arrived. Immutable.
+	regular bool
 	// noRead and noWrite record the access mode the descriptor was opened
 	// with: a file opened for writing only cannot be read, the read end of
 	// a pipe cannot be written. Both false is a descriptor open both ways
@@ -1846,17 +1859,20 @@ const (
 	_wasiEBADF        int32 = 8
 	_wasiECHILD       int32 = 12
 	_wasiECONNREFUSED int32 = 14
-	_wasiEISCONN      int32 = 33
+	_wasiEISCONN      int32 = 30
 	_wasiEBUSY        int32 = 10
 	_wasiEEXIST       int32 = 20
 	_wasiEFAULT       int32 = 21
 	_wasiEFBIG        int32 = 22
+	_wasiEHOSTUNREACH int32 = 23
+	_wasiENETUNREACH  int32 = 40
 	_wasiEINVAL       int32 = 28
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
 	_wasiEMFILE       int32 = 33
 	_wasiENOENT       int32 = 44
 	_wasiENOSPC       int32 = 51
+	_wasiENOTCONN     int32 = 53
 	_wasiENOTDIR      int32 = 54
 	_wasiENOTEMPTY    int32 = 55
 	_wasiENOTSOCK     int32 = 57
@@ -1866,7 +1882,9 @@ const (
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
 	_wasiERANGE       int32 = 68
+	_wasiESPIPE       int32 = 70
 	_wasiESRCH        int32 = 71
+	_wasiETIMEDOUT    int32 = 73
 )
 
 // mapOSError turns an os/filesystem error into a wasi errno, so any
@@ -1918,6 +1936,11 @@ func mapOSError(err error) int32 {
 		return _wasiEPIPE
 	case errors.Is(err, syscall.ENXIO):
 		return _wasiENXIO
+	case errors.Is(err, syscall.ESPIPE):
+		return _wasiESPIPE
+	case errors.Is(err, syscall.ENOSYS):
+		// before errors.ErrUnsupported, which ENOSYS is as well
+		return _wasiENOSYS
 	case errors.Is(err, errors.ErrUnsupported):
 		return _wasiENOTSUP
 	}
@@ -2138,10 +2161,10 @@ func closeWasiOpen(op *wasiOpen) error {
 	if op.f != nil {
 		err = errors.Join(err, op.f.Close())
 	}
-	if conn != nil {
+	if conn != nil && op.connClosed.CompareAndSwap(false, true) {
 		err = errors.Join(err, conn.Close())
 	}
-	if op.listener != nil {
+	if op.listener != nil && op.connClosed.CompareAndSwap(false, true) {
 		err = errors.Join(err, op.listener.Close())
 	}
 	return err
@@ -2508,6 +2531,9 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	src, op := w.fdSrcLocked(fd)
 	w.mu.Unlock()
 	if src == nil {
+		if op.socket() {
+			return _wasiENOTCONN
+		}
 		return _wasiEBADF
 	}
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
@@ -2516,10 +2542,9 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	_ = op
-	n, errno := readVec(src, bufs)
+	n, errno := readVec(src, bufs, op.regular)
 	abi.putWord(nreadSlice, n)
-	return errno
+	return op.afterShutdown(errno, false)
 }
 
 // wasiMaxIovecs is the most entries a ciovec/iovec array may have.
@@ -2557,9 +2582,11 @@ func (w *WasiStubs) iovecSlices(m *Module, abi wasiABI, iovs, iovsLen uint64) ([
 
 // readVec fills bufs from src in order, stopping at the first error
 // (EOF included) or short read; returns the bytes read, or the errno of
-// an error other than EOF that left nothing read. Shared by fd_read and
-// fd_pread.
-func readVec(src io.Reader, bufs [][]byte) (uint64, int32) {
+// an error other than EOF that left nothing read. Shared by fd_read,
+// fd_pread and sock_recv. Unless whole is set (src is a regular file), it
+// also stops after the first read that returned data: reading on from a
+// pipe, a terminal or a socket would wait for data that has not come.
+func readVec(src io.Reader, bufs [][]byte, whole bool) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := src.Read(buf)
@@ -2567,7 +2594,7 @@ func readVec(src io.Reader, bufs [][]byte) (uint64, int32) {
 		if err != nil && total == 0 && !errors.Is(err, io.EOF) {
 			return 0, mapOSError(err)
 		}
-		if err != nil || n < len(buf) {
+		if err != nil || n < len(buf) || (n > 0 && !whole) {
 			break
 		}
 	}
@@ -2662,6 +2689,9 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
+	if op.socket() {
+		return _wasiESPIPE
+	}
 	if op == nil || op.f == nil || op.noRead {
 		return _wasiEBADF
 	}
@@ -2671,7 +2701,7 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	n, errno := readVec(io.NewSectionReader(op.f, offset, 1<<63-1), bufs)
+	n, errno := readVec(io.NewSectionReader(op.f, offset, 1<<63-1), bufs, true)
 	abi.putWord(nreadSlice, n)
 	return errno
 }
@@ -2694,6 +2724,9 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
+	if op.socket() {
+		return _wasiESPIPE
+	}
 	if op == nil || op.f == nil || op.noWrite {
 		return _wasiEBADF
 	}
@@ -2726,6 +2759,9 @@ func (w *WasiStubs) fdSeek(m *Module, fd int32, offset, whence int64, newOffPtr 
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
+	if op.socket() {
+		return _wasiESPIPE
+	}
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
@@ -2734,7 +2770,9 @@ func (w *WasiStubs) fdSeek(m *Module, fd int32, offset, whence int64, newOffPtr 
 	}
 	n, err := op.f.Seek(offset, int(whence))
 	if err != nil {
-		return _wasiEINVAL
+		// An error without a number of its own (of a File other than the
+		// host's) is EINVAL, which is what a seek can fail with.
+		return errnoOr(err, _wasiEINVAL)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -2758,12 +2796,15 @@ func (w *WasiStubs) fdTell(m *Module, fd int32, offsetPtr uint64) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
+	if op.socket() {
+		return _wasiESPIPE
+	}
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
 	n, err := op.f.Seek(0, 1) // SEEK_CUR
 	if err != nil {
-		return _wasiEIO
+		return errnoOr(err, _wasiEIO)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -2781,7 +2822,7 @@ func (w *WasiStubs) Fd_write64(m *Module, fd, iovs, iovsLen, nwrittenPtr int64) 
 // fdWrite is the body of Fd_write and Fd_write64.
 func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwrittenPtr uint64) int32 {
 	w.mu.Lock()
-	dst, _ := w.fdDstLocked(fd)
+	dst, op := w.fdDstLocked(fd)
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nwritten is a __wasi_size_t.
@@ -2791,12 +2832,63 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	}
 	if dst == nil {
 		abi.putWord(nwrittenSlice, 0)
+		if op.socket() {
+			// a write of a socket without a connection, as on linux
+			return _wasiEPIPE
+		}
 		return _wasiEBADF
 	}
 	n, errno := writeVec(dst, bufs)
 	abi.putWord(nwrittenSlice, n)
-	return errno
+	return op.afterShutdown(errno, true)
 }
+
+// socketConn returns the entry of the socket fd and its connection, or
+// the errno of an fd without one: EBADF for an fd that is not open,
+// ENOTSOCK for one that is not a socket (the preopened directories
+// included), ENOTCONN for a socket without a connection, whose entry it
+// returns as well.
+func (w *WasiStubs) socketConn(fd int32) (*wasiOpen, net.Conn, int32) {
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	switch {
+	case op == nil && rootDirFD(fd), op != nil && !op.socket():
+		return nil, nil, _wasiENOTSOCK
+	case op == nil:
+		return nil, nil, _wasiEBADF
+	}
+	if conn := op.netConn(); conn != nil {
+		return op, conn, _wasiESUCCESS
+	}
+	return op, nil, _wasiENOTCONN
+}
+
+// errnoOr returns the wasi errno of err, or fallback for an error that
+// carries no error number of the host or one that maps to no errno (EIO
+// for a number other than EIO's).
+func errnoOr(err error, fallback int32) int32 {
+	var number syscall.Errno
+	if errno := mapOSError(err); errors.As(err, &number) && (errno != _wasiEIO || number == syscall.EIO) {
+		return errno
+	}
+	return fallback
+}
+
+// afterShutdown returns the errno of a transfer on op that ended with
+// errno: once Sock_shutdown has closed the connection, which has no half
+// close, a read that fails gets the end of the stream and a write that
+// fails EPIPE, whichever halves the shutdown asked for.
+func (op *wasiOpen) afterShutdown(errno int32, write bool) int32 {
+	switch {
+	case errno == _wasiESUCCESS || !op.shutClosed.Load():
+		return errno
+	case write:
+		return _wasiEPIPE
+	}
+	return _wasiESUCCESS
+}
+
 func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -3620,7 +3712,7 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 		return -1, _wasiENOTDIR
 	}
 	op := &wasiOpen{
-		f: f, isDir: isDir, path: rel, fdflags: fdflags,
+		f: f, isDir: isDir, regular: st.Mode().IsRegular(), path: rel, fdflags: fdflags,
 		noRead:  flag&os.O_WRONLY != 0,
 		noWrite: flag&(os.O_WRONLY|os.O_RDWR) == 0,
 	}
@@ -4173,24 +4265,24 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	u := uint32(ipBE)
 	ip := fmt.Sprintf("%d.%d.%d.%d", u&0xff, (u>>8)&0xff, (u>>16)&0xff, (u>>24)&0xff)
+	op, conn, errno := w.socketConn(fd)
+	switch {
+	case conn != nil, op != nil && op.listener != nil:
+		return -_wasiEISCONN
+	case errno != _wasiENOTCONN:
+		return -errno
+	}
 	w.mu.Lock()
-	op := w.openLocked(fd)
 	hook := w.dialHook
 	host := w.resolvedHosts[ip] // "" for a literal-IP dial with no preceding lookup
 	w.mu.Unlock()
-	if op == nil || !op.isSocket {
-		return -_wasiENOTSOCK
-	}
-	if op.netConn() != nil {
-		return -_wasiEISCONN
-	}
 	p := int(uint16(port))
 	if hook != nil && !hook("tcp", host, ip, p) {
 		return -_wasiEACCES
 	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(p)), 30*time.Second)
 	if err != nil {
-		return -_wasiECONNREFUSED
+		return -errnoOr(err, _wasiECONNREFUSED)
 	}
 	w.mu.Lock()
 	// The fd may have been closed concurrently; re-check before attaching.
@@ -4203,7 +4295,7 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	}
 	w.mu.Unlock()
 	if cerr := conn.Close(); cerr != nil {
-		return mapOSError(cerr)
+		return -mapOSError(cerr)
 	}
 	return -_wasiEBADF
 }
@@ -4228,6 +4320,10 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 	}
 	conn, err := op.listener.Accept()
 	if err != nil {
+		if op.shutClosed.Load() {
+			// the read half was shut, as on linux
+			return _wasiEINVAL
+		}
 		return mapOSError(err)
 	}
 	w.mu.Lock()
@@ -4241,46 +4337,26 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	if !w.checkNet("recv") {
 		return _wasiEACCES
 	}
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	var conn net.Conn
-	if op != nil {
-		conn = op.netConn()
-	}
+	op, conn, errno := w.socketConn(fd)
 	if conn == nil {
-		return _wasiENOTSOCK
+		return errno
 	}
-	iovBytes := uint64(uint32(riDataLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, riData, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, wasiABI32, zext(riData), zext(riDataLen))
 	lenOut := w.memSlice(m, roDataLenPtr, 4)
 	// ro_flags is a __wasi_roflags_t — a 16-bit value. wasi-libc packs it
 	// immediately before ro_datalen (only 2 bytes apart), so writing 4 bytes
 	// here would clobber the low half of ro_datalen and make recv() report 0
 	// bytes received even when data arrived.
 	flagsOut := w.memSlice(m, roFlagsPtr, 2)
-	if iovecs == nil || lenOut == nil || flagsOut == nil {
+	if !ok || lenOut == nil || flagsOut == nil {
 		return _wasiEFAULT
 	}
-	var total uint32
-	for i := int32(0); i < riDataLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := conn.Read(buf)
-		total += uint32(n)
-		if err != nil {
-			break
-		}
+	n, errno := readVec(conn, bufs, false)
+	if errno = op.afterShutdown(errno, false); errno != _wasiESUCCESS {
+		return errno
 	}
 	binary.LittleEndian.PutUint16(flagsOut, 0)
-	binary.LittleEndian.PutUint32(lenOut, total)
+	binary.LittleEndian.PutUint32(lenOut, uint32(n))
 	return _wasiESUCCESS
 }
 
@@ -4288,53 +4364,52 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	if !w.checkNet("send") {
 		return _wasiEACCES
 	}
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	var conn net.Conn
-	if op != nil {
-		conn = op.netConn()
+	op, conn, errno := w.socketConn(fd)
+	if errno == _wasiENOTCONN {
+		// a send of a socket without a connection, as on linux
+		return _wasiEPIPE
 	}
 	if conn == nil {
-		return _wasiENOTSOCK
+		return errno
 	}
-	iovBytes := uint64(uint32(siDataLen)) * 8
-	if iovBytes > 0x7fffffff {
-		return _wasiEFAULT
-	}
-	iovecs := w.memSlice(m, siData, int32(iovBytes))
+	bufs, ok := w.iovecSlices(m, wasiABI32, zext(siData), zext(siDataLen))
 	lenOut := w.memSlice(m, soDataLenPtr, 4)
-	if iovecs == nil || lenOut == nil {
+	if !ok || lenOut == nil {
 		return _wasiEFAULT
 	}
-	var total uint32
-	for i := int32(0); i < siDataLen; i++ {
-		bufPtr := binary.LittleEndian.Uint32(iovecs[i*8:])
-		bufLen := binary.LittleEndian.Uint32(iovecs[i*8+4:])
-		buf := w.memSlice(m, int32(bufPtr), int32(bufLen))
-		if buf == nil {
-			return _wasiEFAULT
-		}
-		n, err := conn.Write(buf)
-		total += uint32(n)
-		if err != nil {
-			break
-		}
+	n, errno := writeVec(conn, bufs)
+	if errno = op.afterShutdown(errno, true); errno != _wasiESUCCESS {
+		return errno
 	}
-	binary.LittleEndian.PutUint32(lenOut, total)
+	binary.LittleEndian.PutUint32(lenOut, uint32(n))
 	return _wasiESUCCESS
 }
 
 func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
-	w.mu.Lock()
-	op := w.openLocked(fd)
-	w.mu.Unlock()
-	var conn net.Conn
-	if op != nil {
-		conn = op.netConn()
+	op, conn, errno := w.socketConn(fd)
+	if conn == nil && errno != _wasiENOTCONN {
+		return errno
+	}
+	if how == 0 || how&^0x3 != 0 {
+		// neither SHUT_RD nor SHUT_WR, or a bit that is neither
+		return _wasiEINVAL
 	}
 	if conn == nil {
-		return _wasiENOTSOCK
+		if op.listener == nil {
+			return errno
+		}
+		// A listening socket has only a read half: shutting it stops
+		// accepting, and an accept that waits fails with EINVAL.
+		if how&0x1 == 0 {
+			return _wasiESUCCESS
+		}
+		op.shutClosed.Store(true)
+		if op.connClosed.CompareAndSwap(false, true) {
+			if err := op.listener.Close(); err != nil {
+				return mapOSError(err)
+			}
+		}
+		return _wasiESUCCESS
 	}
 	type shutdowner interface {
 		CloseRead() error
@@ -4342,8 +4417,15 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	}
 	sh, ok := conn.(shutdowner)
 	if !ok {
-		// Generic conn: just close it. Surface a failure via the wasi
-		// errno so the guest can see write-on-broken-socket failures.
+		// Generic conn: the first shutdown closes it, whichever halves
+		// it shuts, and a later one has nothing left to do. shutClosed
+		// is set first, for a transfer that the close ends. The one close
+		// counts whatever it returns (a conn may let go of its connection
+		// when Close fails); its failure is surfaced via the wasi errno.
+		op.shutClosed.Store(true)
+		if !op.connClosed.CompareAndSwap(false, true) {
+			return _wasiESUCCESS
+		}
 		if err := conn.Close(); err != nil {
 			return mapOSError(err)
 		}
@@ -4556,6 +4638,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"memSplit":                true,
 			"memSlice":                true,
 			"mapOSError":              true,
+			"errnoOr":                 true,
 			"mapExecError":            true,
 			"encodeWaitStatus":        true,
 			"totalBytesPlusNul":       true,
@@ -4680,6 +4763,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"strconv",
 		"strings",
 		"sync",
+		"sync/atomic",
 		"syscall",
 		"time",
 	}
@@ -4711,9 +4795,9 @@ var (
 // the module does not import wasi. They are written out as separate files,
 // next to the one that holds the emitWasip1Native declarations, because their
 // build constraints have to stay attached to them.
-func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
+func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 	if !t.wasmImportsWasi() {
-		return nil
+		return nil, nil
 	}
 	out := map[string][]byte{}
 	for name, raw := range map[string][]byte{
@@ -4726,9 +4810,25 @@ func (t *translator) emitWasip1Platform(pkg string) map[string][]byte {
 		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,
 	} {
-		out[name] = bytes.Replace(raw, []byte("\npackage codegen\n"), []byte("\npackage "+pkg+"\n"), 1)
+		src, err := renamePackage(raw, pkg)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		out[name] = src
 	}
-	return out
+	return out, nil
+}
+
+// renamePackage returns src, a file of package codegen, as a file of
+// package pkg.
+func renamePackage(src []byte, pkg string) ([]byte, error) {
+	for _, eol := range []string{"\n", "\r\n"} {
+		clause := []byte("\npackage codegen" + eol)
+		if bytes.Contains(src, clause) {
+			return bytes.Replace(src, clause, []byte("\npackage "+pkg+eol), 1), nil
+		}
+	}
+	return nil, errors.New("no package clause of package codegen")
 }
 
 // codegenStripOpts is the allow-list flavour of strip: any top-level
