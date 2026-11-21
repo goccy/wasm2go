@@ -59,6 +59,40 @@ func listed(t *testing.T, w *WasiStubs) []string {
 	return names
 }
 
+// fd_readdir gives an entry of a directory of the host's the inode number
+// the system's listing has for it on linux, and on darwin, whose listing
+// is not read for one, a number that is no file's.
+func TestReaddir_HostInodes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := newTestStubs(t, dir)
+	fd, errno := w.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	got := direntInodes(t, w, fd)
+	for name, path := range map[string]string{".": dir, "..": filepath.Dir(dir), "a": filepath.Join(dir, "a"), "b": filepath.Join(dir, "b")} {
+		if runtime.GOOS != "linux" {
+			if got[name]&(1<<63) == 0 {
+				t.Errorf("%s: d_ino %d, want one with the top bit set", name, got[name])
+			}
+			continue
+		}
+		fi, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := fileStatOf(fi).ino; got[name] != want {
+			t.Errorf("%s: d_ino %d, want %d", name, got[name], want)
+		}
+	}
+}
+
 // A directory of the host's lists its names in the order the system gives
 // them, and "." and "..": where the system puts them on linux, first on
 // darwin. ls -f is the system's order for every other name only (GNU ls

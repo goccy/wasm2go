@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -467,6 +470,440 @@ func TestMemFS_ModesLinksAndTimes(t *testing.T) {
 	}
 	if got := pathFilestat(t, w, m, "new", true).nlink; got != 1 {
 		t.Fatalf("nlink of the renamed file = %d, want 1", got)
+	}
+}
+
+// Every file of a MemFS is a file of its own: one device, an inode number
+// of its own, kept across a rename and the same by name and by descriptor.
+func TestMemFS_FilesHaveTheirOwnInode(t *testing.T) {
+	w, m, fsys := memTestStubs(t)
+	if err := fsys.WriteFile("d/a", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Mkdir("e", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opened := openTestFile(t, w, "d/a")
+	if _, errno := w.pathOpen("b", 0x1, 1<<0, 1<<1|1<<6, 0); errno != _wasiESUCCESS {
+		t.Fatalf("create b errno=%d", errno)
+	}
+	root := pathFilestat(t, w, m, ".", true)
+	seen := map[uint64]string{}
+	for _, name := range []string{".", "d", "d/a", "e", "b"} {
+		st := pathFilestat(t, w, m, name, true)
+		if st.dev == 0 || st.dev != root.dev || st.ino == 0 {
+			t.Errorf("%s: dev=%d ino=%d, want dev %d (non-zero) and a non-zero ino", name, st.dev, st.ino, root.dev)
+		}
+		if other, ok := seen[st.ino]; ok {
+			t.Errorf("%s and %s share inode %d", name, other, st.ino)
+		}
+		seen[st.ino] = name
+	}
+	before := pathFilestat(t, w, m, "d/a", true)
+	if got := fdFilestat(t, w, m, opened); got != before {
+		t.Fatalf("fd stat %+v differs from path stat %+v", got, before)
+	}
+	if err := fsys.Rename("d/a", "e/c"); err != nil {
+		t.Fatal(err)
+	}
+	if after := pathFilestat(t, w, m, "e/c", true); after.ino != before.ino || after.dev != before.dev {
+		t.Fatalf("renamed file: dev/ino %d/%d, was %d/%d", after.dev, after.ino, before.dev, before.ino)
+	}
+}
+
+// direntInodes returns the d_ino fd_readdir writes for each name of the
+// directory open at fd.
+func direntInodes(t *testing.T, w *WasiStubs, fd int32) map[string]uint64 {
+	t.Helper()
+	buf := make([]byte, 4096)
+	n, errno := w.fillDirents(fd, buf, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("fillDirents errno=%d", errno)
+	}
+	inos := map[string]uint64{}
+	for off := 0; off+24 <= n; {
+		end := off + 24 + int(binary.LittleEndian.Uint32(buf[off+16:]))
+		inos[string(buf[off+24:end])] = binary.LittleEndian.Uint64(buf[off+8:])
+		off = end
+	}
+	return inos
+}
+
+// fd_readdir lists every entry of a MemFS directory, "." and ".." among
+// them, with the inode number its stat reports.
+func TestMemFS_ReaddirInodesAreTheStatOnes(t *testing.T) {
+	w, m, fsys := memTestStubs(t)
+	for _, name := range []string{"d/a", "d/sub/b"} {
+		if err := fsys.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for dir, want := range map[string]map[string]string{
+		"d":     {".": "d", "..": ".", "a": "d/a", "sub": "d/sub"},
+		"d/sub": {".": "d/sub", "..": "d", "b": "d/sub/b"},
+	} {
+		fd, errno := w.pathOpen(dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("pathOpen(%s) errno=%d", dir, errno)
+		}
+		got := direntInodes(t, w, fd)
+		if len(got) != len(want) {
+			t.Errorf("%s lists %v, want the names of %v", dir, got, want)
+		}
+		for name, path := range want {
+			if ino := pathFilestat(t, w, m, path, true).ino; got[name] != ino {
+				t.Errorf("%s/%s: d_ino %d, want %d (the inode of %s)", dir, name, got[name], ino, path)
+			}
+		}
+		// A rewound listing lists every entry again.
+		if again := direntInodes(t, w, fd); len(again) != len(got) {
+			t.Errorf("%s after rewinddir lists %v, want %v", dir, again, got)
+		}
+	}
+}
+
+// "." and ".." of a MemFS directory are the directory open and the one
+// it is in, wherever it has moved and whatever its old path names now,
+// and whatever file system the stubs have since been given.
+func TestMemFS_ReaddirDotsOfAMovedDirectory(t *testing.T) {
+	w, m, fsys := memTestStubs(t)
+	for _, name := range []string{"a/sub/f", "b/f", "d/sub/f"} {
+		if err := fsys.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open := func(dir string) int32 {
+		fd, errno := w.pathOpen(dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("pathOpen(%s) errno=%d", dir, errno)
+		}
+		return fd
+	}
+	aSub, dSub := open("a/sub"), open("d/sub")
+	if err := fsys.Rename("a/sub", "b/sub"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Rename("d", "e"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Mkdir("d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ino := func(name string) uint64 { return pathFilestat(t, w, m, name, true).ino }
+	want := map[int32][2]uint64{aSub: {ino("b/sub"), ino("b")}, dSub: {ino("e/sub"), ino("e")}}
+	for _, setFS := range []bool{false, true} {
+		if setFS {
+			w.SetFS(NewMemFS())
+		}
+		for fd, dots := range want {
+			if got := direntInodes(t, w, fd); got["."] != dots[0] || got[".."] != dots[1] {
+				t.Errorf("fd %d (SetFS %v): . %d and .. %d, want %d and %d", fd, setFS, got["."], got[".."], dots[0], dots[1])
+			}
+		}
+	}
+}
+
+// A MemFS path through a file fails with ENOTDIR, for every operation.
+func TestMemFS_PathThroughAFile(t *testing.T) {
+	fsys := NewMemFS()
+	if err := fsys.WriteFile("f", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, statErr := fsys.Stat("f/x")
+	_, openErr := fsys.OpenFile("f/x", os.O_RDONLY, 0)
+	_, createErr := fsys.OpenFile("f/x", os.O_RDWR|os.O_CREATE, 0o644)
+	for name, err := range map[string]error{
+		"Stat":      statErr,
+		"OpenFile":  openErr,
+		"create":    createErr,
+		"WriteFile": fsys.WriteFile("f/x", nil, 0o644),
+		"MkdirAll":  fsys.MkdirAll("f/x", 0o755),
+		"Mkdir":     fsys.Mkdir("f/x", 0o755),
+	} {
+		if !errors.Is(err, syscall.ENOTDIR) {
+			t.Errorf("%s through a file: %v, want ENOTDIR", name, err)
+		}
+	}
+}
+
+// statOnceFS is a MemFS whose files answer one Stat, the one Path_open
+// makes, and fail every later one.
+type statOnceFS struct{ *MemFS }
+
+func (fsys statOnceFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	f, err := fsys.MemFS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return &statOnceFile{File: f}, nil
+}
+
+type statOnceFile struct {
+	File
+	stated bool
+}
+
+func (f *statOnceFile) Stat() (os.FileInfo, error) {
+	if f.stated {
+		return nil, errors.New("stat failed")
+	}
+	f.stated = true
+	return f.File.Stat()
+}
+
+// A directory whose stat fails is listed all the same, with "." and ".."
+// numbered from their index.
+func TestReaddir_DirectoryWhoseStatFails(t *testing.T) {
+	w, _ := newTestStubs(t, t.TempDir())
+	fsys := NewMemFS()
+	if err := fsys.WriteFile("d/a", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.SetFS(statOnceFS{fsys})
+	fd, errno := w.pathOpen("d", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	got := direntInodes(t, w, fd)
+	if len(got) != 3 || got["."]&(1<<63) == 0 || got[".."]&(1<<63) == 0 || got["a"] == 0 || got["a"]&(1<<63) != 0 {
+		t.Errorf("listing %v, want ., .. with the top bit set and a with its inode", got)
+	}
+}
+
+// The name of an open MemFS file can be asked while the file is renamed.
+func TestMemFS_NameWhileRenamed(t *testing.T) {
+	fsys := NewMemFS()
+	if err := fsys.WriteFile("a", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := fsys.OpenFile("a", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	renamed := make(chan error, 1)
+	go func() {
+		for i := 0; i < 100; i++ {
+			from, to := "a", "b"
+			if i%2 == 1 {
+				from, to = to, from
+			}
+			if err := fsys.Rename(from, to); err != nil {
+				renamed <- err
+				return
+			}
+		}
+		renamed <- nil
+	}()
+	for i := 0; i < 100; i++ {
+		if name := f.Name(); name != "a" && name != "b" {
+			t.Fatalf("Name() = %q, want a or b", name)
+		}
+	}
+	if err := <-renamed; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A seek to the start of a MemFS directory lists it again from its first
+// entry; asking where the handle is does not.
+func TestMemFS_SeekOfADirectory(t *testing.T) {
+	fsys := NewMemFS()
+	for _, name := range []string{"d/a", "d/b"} {
+		if err := fsys.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := fsys.OpenFile("d", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	next := func() string {
+		t.Helper()
+		entries, err := f.ReadDir(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries[0].Name()
+	}
+	if got := next(); got != "a" {
+		t.Fatalf("first entry %q, want a", got)
+	}
+	if _, err := f.Seek(0, io.SeekCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if got := next(); got != "b" {
+		t.Errorf("after Seek(0, SeekCurrent): %q, want b", got)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if got := next(); got != "a" {
+		t.Errorf("after Seek(0, SeekStart): %q, want a", got)
+	}
+}
+
+// A MemFS directory can be read, and its entries asked about, while its
+// files change.
+func TestMemFS_ReadDirWhileFilesChange(t *testing.T) {
+	fsys := NewMemFS()
+	if err := fsys.WriteFile("d/f", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	changed := make(chan error, 1)
+	defer func() {
+		close(done)
+		if err := <-changed; err != nil {
+			t.Error(err)
+		}
+	}()
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				changed <- nil
+				return
+			default:
+			}
+			if err := fsys.Chmod("d/f", os.FileMode(0o600|i&1)); err != nil {
+				changed <- err
+				return
+			}
+			if err := fsys.WriteFile("d/f", []byte{byte(i)}, 0o644); err != nil {
+				changed <- err
+				return
+			}
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		f, err := fsys.OpenFile("d", os.O_RDONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := f.ReadDir(-1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			fi, err := e.Info()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e.Name() != "f" || e.IsDir() || !fi.Mode().IsRegular() || fi.Size() != 1 {
+				t.Fatalf("entry %s: dir=%v mode=%v size=%d, want the one-byte file f", e.Name(), e.IsDir(), fi.Mode(), fi.Size())
+			}
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// WriteFile onto an existing file writes that file: it keeps its inode and
+// mode, and a descriptor of it reports the new data. It does not write
+// onto a directory.
+func TestMemFS_WriteFileOverAFile(t *testing.T) {
+	w, m, fsys := memTestStubs(t)
+	if err := fsys.WriteFile("f", []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fd := openTestFile(t, w, "f")
+	before := pathFilestat(t, w, m, "f", true)
+	if err := fsys.WriteFile("f", []byte("newer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after := pathFilestat(t, w, m, "f", true)
+	if after.ino != before.ino || after.nlink != 1 || after.size != 5 {
+		t.Fatalf("written file: ino=%d nlink=%d size=%d, want ino %d, nlink 1 and size 5", after.ino, after.nlink, after.size, before.ino)
+	}
+	if got := fdFilestat(t, w, m, fd); got != after {
+		t.Fatalf("fd stat %+v differs from path stat %+v", got, after)
+	}
+	if got := pathFilestatExt(t, w, m, "f").mode; got != 0o600 {
+		t.Fatalf("mode of the written file = %o, want 600", got)
+	}
+
+	if err := fsys.Mkdir("d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.WriteFile("d", nil, 0o644); !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("WriteFile onto a directory: %v, want EISDIR", err)
+	}
+	if got := pathFilestat(t, w, m, "d", true).filetype; got != 3 {
+		t.Fatalf("d after WriteFile onto it: filetype %d, want 3 (directory)", got)
+	}
+}
+
+// A MemFS renames onto an existing name as rename(2) does: a file replaces
+// a file and a directory an empty directory, and anything else fails and
+// leaves both names as they were. A directory does not move into itself,
+// a file not under a file or to a name ending in "/", and a directory with
+// something in it is not removed.
+func TestMemFS_RenameOntoAnExistingName(t *testing.T) {
+	w, m, fsys := memTestStubs(t)
+	for _, name := range []string{"file", "full/x"} {
+		if err := fsys.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, dir := range []string{"dir", "dir/sub", "empty"} {
+		if err := fsys.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		from, to string
+		want     int32
+	}{
+		{"dir", "file", _wasiENOTDIR},
+		{"file", "dir", _wasiEISDIR},
+		{"dir", "full", _wasiENOTEMPTY},
+		{"dir", "dir/new", _wasiEINVAL},
+		{"dir/sub", "dir/sub/new", _wasiEINVAL},
+		{"dir", "dir/sub/new", _wasiEINVAL},
+		{"file", "file/new", _wasiENOTDIR},
+		{"file", "new/", _wasiENOTDIR},
+		{"file/", "new", _wasiENOTDIR},
+		{"file", "dir/", _wasiENOTDIR},
+	} {
+		if err := fsys.Rename(c.from, c.to); mapOSError(err) != c.want {
+			t.Errorf("rename %s onto %s: %v (errno %d), want errno %d", c.from, c.to, err, mapOSError(err), c.want)
+		}
+	}
+	if err := fsys.Remove("full"); mapOSError(err) != _wasiENOTEMPTY {
+		t.Errorf("remove full: %v (errno %d), want ENOTEMPTY", err, mapOSError(err))
+	}
+	for _, name := range []string{"file", "full/x", "dir/sub", "empty"} {
+		if _, err := fsys.Stat(name); err != nil {
+			t.Errorf("%s after the failed renames: %v", name, err)
+		}
+	}
+
+	held, errno := w.pathOpen("empty", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen(empty) errno=%d", errno)
+	}
+	if err := fsys.Rename("dir", "empty"); err != nil {
+		t.Fatalf("a directory onto an empty one: %v", err)
+	}
+	if _, err := fsys.Stat("empty/sub"); err != nil {
+		t.Errorf("empty/sub after the rename: %v", err)
+	}
+	if _, err := fsys.Stat("dir"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("dir after the rename: %v, want it gone", err)
+	}
+	if got := fdFilestat(t, w, m, held).nlink; got != 0 {
+		t.Errorf("nlink of the replaced directory = %d, want 0", got)
 	}
 }
 

@@ -309,22 +309,38 @@ type MemFS struct {
 	// maxFileSize is the size a write or a truncation can make a file;
 	// NewMemFS sets it to memMaxFileSize.
 	maxFileSize int64
+	// lastIno is the inode number of the node made last.
+	lastIno uint64
 }
 
 // NewMemFS returns an empty in-memory filesystem with a root directory.
 func NewMemFS() *MemFS {
-	return &MemFS{root: &memNode{dir: true, mode: os.ModeDir | 0o755, modTime: time.Unix(0, 0), children: map[string]*memNode{}},
-		maxFileSize: memMaxFileSize}
+	return &MemFS{root: &memNode{ino: 1, dir: true, mode: os.ModeDir | 0o755, modTime: time.Unix(0, 0), children: map[string]*memNode{}},
+		maxFileSize: memMaxFileSize, lastIno: 1}
 }
+
+// newIno returns an inode number no other node of fsys has. Caller holds
+// fsys.mu.
+func (fsys *MemFS) newIno() uint64 {
+	fsys.lastIno++
+	return fsys.lastIno
+}
+
+// memDev is the device number of the files of a MemFS.
+const memDev = 1
 
 // memNode is a file or directory in a MemFS tree.
 type memNode struct {
+	ino      uint64
 	name     string
 	dir      bool
 	mode     os.FileMode
 	modTime  time.Time
 	data     []byte
 	children map[string]*memNode
+	// parent is the directory the node is, or was last, in; nil for the
+	// root.
+	parent *memNode
 	// unlinked is set once the node has no name in the tree any more (it
 	// was removed or replaced), which only its open files can still see:
 	// their stat reports a link count of zero.
@@ -357,7 +373,7 @@ func (fsys *MemFS) lookup(name string) (*memNode, error) {
 	n := fsys.root
 	for _, part := range memSplit(name) {
 		if !n.dir {
-			return nil, fs.ErrNotExist
+			return nil, syscall.ENOTDIR
 		}
 		c, ok := n.children[part]
 		if !ok {
@@ -377,8 +393,11 @@ func (fsys *MemFS) lookupParent(name string) (*memNode, string, error) {
 	n := fsys.root
 	for _, part := range parts[:len(parts)-1] {
 		c, ok := n.children[part]
-		if !ok || !c.dir {
+		if !ok {
 			return nil, "", fs.ErrNotExist
+		}
+		if !c.dir {
+			return nil, "", syscall.ENOTDIR
 		}
 		n = c
 	}
@@ -391,13 +410,13 @@ func (fsys *MemFS) OpenFile(name string, flag int, perm os.FileMode) (File, erro
 	node, err := fsys.lookup(name)
 	if err != nil {
 		if flag&os.O_CREATE == 0 {
-			return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 		}
 		parent, base, perr := fsys.lookupParent(name)
 		if perr != nil {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: perr}
 		}
-		node = &memNode{name: base, mode: perm & 0o777, modTime: time.Now()}
+		node = &memNode{ino: fsys.newIno(), name: base, mode: perm & 0o777, modTime: time.Now(), parent: parent}
 		parent.children[base] = node
 	} else {
 		if flag&os.O_EXCL != 0 && flag&os.O_CREATE != 0 {
@@ -425,7 +444,7 @@ func (fsys *MemFS) Mkdir(name string, perm os.FileMode) error {
 	if _, ok := parent.children[base]; ok {
 		return &fs.PathError{Op: "mkdir", Path: name, Err: fs.ErrExist}
 	}
-	parent.children[base] = &memNode{name: base, dir: true, mode: os.ModeDir | (perm & 0o777), modTime: time.Now(), children: map[string]*memNode{}}
+	parent.children[base] = &memNode{ino: fsys.newIno(), name: base, dir: true, mode: os.ModeDir | (perm & 0o777), modTime: time.Now(), children: map[string]*memNode{}, parent: parent}
 	return nil
 }
 
@@ -441,7 +460,7 @@ func (fsys *MemFS) Remove(name string) error {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
 	}
 	if n.dir && len(n.children) > 0 {
-		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrInvalid}
+		return &fs.PathError{Op: "remove", Path: name, Err: syscall.ENOTEMPTY}
 	}
 	delete(parent.children, base)
 	n.unlinked = true
@@ -463,13 +482,48 @@ func (fsys *MemFS) Rename(oldName, newName string) error {
 	if err != nil {
 		return &fs.PathError{Op: "rename", Path: newName, Err: err}
 	}
+	if !node.dir && (strings.HasSuffix(oldName, "/") || strings.HasSuffix(newName, "/")) {
+		// a name ending in "/" is a directory's
+		return &fs.PathError{Op: "rename", Path: newName, Err: syscall.ENOTDIR}
+	}
+	replaced, exists := np.children[nb]
+	if exists && replaced != node {
+		switch {
+		case node.dir && !replaced.dir:
+			err = syscall.ENOTDIR
+		case !node.dir && replaced.dir:
+			err = syscall.EISDIR
+		case replaced.dir && len(replaced.children) > 0:
+			err = syscall.ENOTEMPTY
+		}
+	}
+	if node.dir && fsys.passesThrough(newName, node) {
+		err = syscall.EINVAL
+	}
+	if err != nil {
+		return &fs.PathError{Op: "rename", Path: newName, Err: err}
+	}
 	delete(op.children, ob)
-	node.name = nb
-	if replaced, ok := np.children[nb]; ok && replaced != node {
+	node.name, node.parent = nb, np
+	if exists && replaced != node {
 		replaced.unlinked = true
 	}
 	np.children[nb] = node
 	return nil
+}
+
+// passesThrough reports whether the parent directories of name, which
+// exist, include node: whether name lies in node. Caller holds fsys.mu.
+func (fsys *MemFS) passesThrough(name string, node *memNode) bool {
+	n := fsys.root
+	parts := memSplit(name)
+	for _, part := range parts[:len(parts)-1] {
+		n = n.children[part]
+		if n == node {
+			return true
+		}
+	}
+	return false
 }
 
 func (fsys *MemFS) Stat(name string) (os.FileInfo, error) {
@@ -524,10 +578,10 @@ func (fsys *MemFS) MkdirAll(name string, perm os.FileMode) error {
 	for _, part := range memSplit(name) {
 		c, ok := n.children[part]
 		if !ok {
-			c = &memNode{name: part, dir: true, mode: os.ModeDir | (perm & 0o777), modTime: time.Now(), children: map[string]*memNode{}}
+			c = &memNode{ino: fsys.newIno(), name: part, dir: true, mode: os.ModeDir | (perm & 0o777), modTime: time.Now(), children: map[string]*memNode{}, parent: n}
 			n.children[part] = c
 		} else if !c.dir {
-			return &fs.PathError{Op: "mkdir", Path: name, Err: fs.ErrExist}
+			return &fs.PathError{Op: "mkdir", Path: name, Err: syscall.ENOTDIR}
 		}
 		n = c
 	}
@@ -535,7 +589,8 @@ func (fsys *MemFS) MkdirAll(name string, perm os.FileMode) error {
 }
 
 // WriteFile creates (or overwrites) a file with data, making parent dirs as
-// needed. Exposed for pre-populating the FS.
+// needed; perm is the mode of a file it creates. Exposed for pre-populating
+// the FS.
 func (fsys *MemFS) WriteFile(name string, data []byte, perm os.FileMode) error {
 	if parts := memSplit(name); len(parts) > 1 {
 		if err := fsys.MkdirAll(strings.Join(parts[:len(parts)-1], "/"), 0o755); err != nil {
@@ -550,15 +605,20 @@ func (fsys *MemFS) WriteFile(name string, data []byte, perm os.FileMode) error {
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	if replaced, ok := parent.children[base]; ok {
-		replaced.unlinked = true
+	// An existing file is written over, keeping its inode and mode.
+	if n, ok := parent.children[base]; ok {
+		if n.dir {
+			return &fs.PathError{Op: "writefile", Path: name, Err: syscall.EISDIR}
+		}
+		n.data, n.modTime = cp, time.Now()
+		return nil
 	}
-	parent.children[base] = &memNode{name: base, mode: perm & 0o777, modTime: time.Now(), data: cp}
+	parent.children[base] = &memNode{ino: fsys.newIno(), name: base, mode: perm & 0o777, modTime: time.Now(), data: cp, parent: parent}
 	return nil
 }
 
-func (n *memNode) info() os.FileInfo {
-	fi := memFileInfo{name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime, unlinked: n.unlinked}
+func (n *memNode) info() memFileInfo {
+	fi := memFileInfo{ino: n.ino, name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime, unlinked: n.unlinked}
 	if n.dir {
 		fi.size = 0
 		fi.mode |= os.ModeDir
@@ -567,6 +627,7 @@ func (n *memNode) info() os.FileInfo {
 }
 
 type memFileInfo struct {
+	ino      uint64
 	name     string
 	size     int64
 	mode     os.FileMode
@@ -584,7 +645,7 @@ func (fi memFileInfo) IsDir() bool        { return fi.mode.IsDir() }
 // file has one link until it is removed, and it keeps no owner and no times
 // other than the modification time.
 func (fi memFileInfo) Sys() any {
-	st := &fileStat{nlink: 1, atime: fi.modTime, ctime: fi.modTime,
+	st := &fileStat{dev: memDev, ino: fi.ino, nlink: 1, atime: fi.modTime, ctime: fi.modTime,
 		blksize: memBlockSize, blocks: uint64(fi.size+511) / 512}
 	if fi.unlinked {
 		st.nlink = 0
@@ -595,17 +656,15 @@ func (fi memFileInfo) Sys() any {
 // memBlockSize is the block size an in-memory file reports for I/O.
 const memBlockSize = 4096
 
-type memDirEntry struct{ n *memNode }
+// memDirEntry is an entry of a MemFS directory, as it was when the
+// directory was read.
+type memDirEntry struct{ info memFileInfo }
 
-func (e memDirEntry) Name() string { return e.n.name }
-func (e memDirEntry) IsDir() bool  { return e.n.dir }
-func (e memDirEntry) Type() os.FileMode {
-	if e.n.dir {
-		return os.ModeDir
-	}
-	return 0
-}
-func (e memDirEntry) Info() (os.FileInfo, error) { return e.n.info(), nil }
+func (e memDirEntry) Name() string               { return e.info.Name() }
+func (e memDirEntry) IsDir() bool                { return e.info.IsDir() }
+func (e memDirEntry) Type() os.FileMode          { return e.info.Mode().Type() }
+func (e memDirEntry) Info() (os.FileInfo, error) { return e.info, nil }
+func (e memDirEntry) inode() uint64              { return e.info.ino }
 
 // memFile is an open handle into a MemFS node.
 type memFile struct {
@@ -618,7 +677,22 @@ type memFile struct {
 	appending bool
 }
 
-func (f *memFile) Name() string { return f.node.name }
+func (f *memFile) Name() string {
+	f.fsys.mu.Lock()
+	defer f.fsys.mu.Unlock()
+	return f.node.name
+}
+
+// parentInode returns the inode number of the directory f's node is in:
+// its own for the root.
+func (f *memFile) parentInode() uint64 {
+	f.fsys.mu.Lock()
+	defer f.fsys.mu.Unlock()
+	if f.node.parent == nil {
+		return f.node.ino
+	}
+	return f.node.parent.ino
+}
 func (f *memFile) Close() error { return nil }
 func (f *memFile) Sync() error  { return nil }
 
@@ -743,6 +817,10 @@ func (f *memFile) Seek(offset int64, whence int) (int64, error) {
 		return 0, &fs.PathError{Op: "seek", Path: f.node.name, Err: syscall.EINVAL}
 	}
 	f.off = off
+	if whence == io.SeekStart && offset == 0 {
+		// a directory lists its entries again from the first
+		f.dirOff = 0
+	}
 	return off, nil
 }
 
@@ -787,7 +865,7 @@ func (f *memFile) ReadDir(n int) ([]os.DirEntry, error) {
 	}
 	out := make([]os.DirEntry, 0, end-f.dirOff)
 	for _, name := range names[f.dirOff:end] {
-		out = append(out, memDirEntry{f.node.children[name]})
+		out = append(out, memDirEntry{f.node.children[name].info()})
 	}
 	f.dirOff = end
 	return out, nil
@@ -1780,6 +1858,7 @@ const (
 	_wasiENOENT       int32 = 44
 	_wasiENOSPC       int32 = 51
 	_wasiENOTDIR      int32 = 54
+	_wasiENOTEMPTY    int32 = 55
 	_wasiENOTSOCK     int32 = 57
 	_wasiENOTSUP      int32 = 58
 	_wasiENOSYS       int32 = 52
@@ -1809,6 +1888,9 @@ func mapOSError(err error) int32 {
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return _wasiENOENT
+	case errors.Is(err, syscall.ENOTEMPTY):
+		// before fs.ErrExist, which ENOTEMPTY is as well
+		return _wasiENOTEMPTY
 	case errors.Is(err, fs.ErrExist):
 		return _wasiEEXIST
 	case errors.Is(err, syscall.EPERM):
@@ -3264,8 +3346,21 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
+	// "." is the directory open, ".." the one it is in, where its file
+	// tells (a MemFS file does).
+	dot := &dotDirEntry{name: ".", parent: op.path}
+	// A directory whose stat fails is listed all the same: the stat only
+	// gives "." its number, and without it "." is numbered from its
+	// index, as an entry without a number is.
+	if st, err := op.f.Stat(); err == nil {
+		dot.ino = fileStatOf(st).ino
+	}
+	dotdot := &dotDirEntry{name: "..", parent: op.path}
+	if f, ok := op.f.(interface{ parentInode() uint64 }); ok {
+		dotdot.ino = f.parentInode()
+	}
 	out := make([]os.DirEntry, 0, len(entries)+2)
-	out = append(out, dotEntry(op.path, "."), dotEntry(op.path, ".."))
+	out = append(out, dot, dotdot)
 	out = append(out, entries...)
 	sort.SliceStable(out[2:], func(i, j int) bool {
 		return out[2+i].Name() < out[2+j].Name()
@@ -3283,7 +3378,10 @@ func dotEntry(parent, name string) os.DirEntry {
 
 type dotDirEntry struct {
 	name, parent string
+	ino          uint64 // 0 where the listing does not know it
 }
+
+func (d *dotDirEntry) inode() uint64 { return d.ino }
 
 func (d *dotDirEntry) Name() string { return d.name }
 func (d *dotDirEntry) IsDir() bool  { return true }
@@ -3349,7 +3447,6 @@ func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, i
 		nameBytes := []byte(e.Name())
 		// dirent header: d_next u64 + d_ino u64 + d_namlen u32 + d_type u8 + 3 pad = 24 bytes.
 		const headerLen = 24
-		// os.FileInfo does not expose inode portably; report 0.
 		var dtype byte = 4 // regular file
 		if e.IsDir() {
 			dtype = 3
@@ -3374,10 +3471,15 @@ func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, i
 		// d_ino MUST be non-zero: wasi-libc's readdir treats a dirent with
 		// d_ino == 0 as a deleted/empty slot and SKIPS it, which would make
 		// the whole listing appear empty (e.g. a guest's importer then fails
-		// to load any standard-library module). os.FileInfo has no
-		// portable inode, so synthesize a stable non-zero id from the entry
-		// index.
-		binary.LittleEndian.PutUint64(hdr[8:], uint64(i)+1) // d_ino (nonzero)
+		// to load any standard-library module). It is the inode number the
+		// listing has for the entry; an entry without one gets a stable
+		// number from its index, with the top bit set so that it is no
+		// MemFS file's.
+		ino := 1<<63 | (uint64(i) + 1)
+		if e, ok := e.(interface{ inode() uint64 }); ok && e.inode() != 0 {
+			ino = e.inode()
+		}
+		binary.LittleEndian.PutUint64(hdr[8:], ino) // d_ino
 		binary.LittleEndian.PutUint32(hdr[16:], uint32(len(nameBytes)))
 		hdr[20] = dtype
 		n := copy(bufSlice[written:], hdr[:])

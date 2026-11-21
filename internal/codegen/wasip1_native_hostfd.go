@@ -8,10 +8,12 @@ import (
 )
 
 // hostName is one name of a directory with the file type the directory
-// records for it.
+// records for it, and its inode number where the directory records that
+// too (0 where it does not).
 type hostName struct {
 	name string
 	typ  uint8
+	ino  uint64
 }
 
 // hostDirListing lists a directory of the host's in the order the system
@@ -33,7 +35,7 @@ func hostDirListing(f File) (list []os.DirEntry, ok bool, err error) {
 	}
 	list = make([]os.DirEntry, 0, len(names))
 	for _, entry := range names {
-		list = append(list, &hostDirEntry{dir: dir, name: entry.name, typ: entry.typ})
+		list = append(list, &hostDirEntry{dir: dir, name: entry.name, typ: entry.typ, ino: entry.ino})
 	}
 	return list, true, nil
 }
@@ -41,8 +43,11 @@ func hostDirListing(f File) (list []os.DirEntry, ok bool, err error) {
 // hostDirEntry is an entry of a directory of the host's.
 type hostDirEntry struct {
 	dir, name string
-	typ       uint8 // d_type
+	typ       uint8  // d_type
+	ino       uint64 // d_ino, 0 where the directory does not record it
 }
+
+func (e *hostDirEntry) inode() uint64 { return e.ino }
 
 func (e *hostDirEntry) Name() string { return e.name }
 func (e *hostDirEntry) IsDir() bool  { return e.Type().IsDir() }
