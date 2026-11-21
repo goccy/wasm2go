@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // A failed system call is the error its number says, not the nearest kind
@@ -73,4 +75,86 @@ func TestWasi_ErrorsKeepTheirNumber(t *testing.T) {
 	if _, err := os.Open(filepath.Join(dir, strings.Repeat("n", 5000))); mapOSError(err) != 37 {
 		t.Errorf("opening a name too long = %d, want ENAMETOOLONG (37)", mapOSError(err))
 	}
+}
+
+// A guest's raise applies the default action of the WASI signal to the
+// guest alone: a terminating signal ends it with a *WasiSignalError, an
+// ignored or stopping one returns 0, and the host process receives no
+// signal.
+func TestWasi_ProcRaise(t *testing.T) {
+	// none, CHLD, CONT, STOP, TSTP, TTIN, TTOU, URG, WINCH.
+	ignored := []int32{0, 16, 17, 18, 19, 20, 21, 22, 27}
+	// HUP, INT, ABRT, BUS, USR1, USR2, TERM, SYS, and KILL last.
+	terminating := []int32{1, 2, 6, 7, 10, 12, 15, 30, 9}
+	// Every host signal a raised number is on this host, except the ones
+	// that cannot be caught and the ones the runtime and child processes
+	// deliver on their own.
+	host := make(chan os.Signal, 64)
+	for _, sig := range append(ignored[1:], terminating...) {
+		switch s := syscall.Signal(sig); s {
+		case syscall.SIGKILL, syscall.SIGSTOP, syscall.SIGURG, syscall.SIGCHLD:
+		default:
+			signal.Notify(host, s)
+		}
+	}
+	defer signal.Stop(host)
+	w, m := newTestStubs(t, t.TempDir())
+	raises := []struct {
+		name  string
+		raise func(int32) int32
+	}{
+		{"Proc_raise", func(sig int32) int32 { return w.Proc_raise(m, sig) }},
+		{"Proc_raise64", func(sig int32) int32 { return w.Proc_raise64(m, int64(sig)) }},
+	}
+	for _, r := range raises {
+		for _, sig := range ignored {
+			if rc := r.raise(sig); rc != _wasiESUCCESS {
+				t.Errorf("%s(%d) = %d, want 0", r.name, sig, rc)
+			}
+		}
+		for _, sig := range []int32{-1, 31} {
+			if rc := r.raise(sig); rc != _wasiEINVAL {
+				t.Errorf("%s(%d) = %d, want EINVAL", r.name, sig, rc)
+			}
+		}
+	}
+	for _, sig := range []int64{1 << 32, 1<<32 + 15, -1 << 32} {
+		if rc := w.Proc_raise64(m, sig); rc != _wasiEINVAL {
+			t.Errorf("Proc_raise64(%d) = %d, want EINVAL", sig, rc)
+		}
+	}
+	for _, sig := range terminating {
+		for _, r := range raises {
+			got := signalErrorOf(func() { r.raise(sig) })
+			if got == nil || got.Signal != sig {
+				t.Errorf("%s(%d) ended with %v, want a WasiSignalError for %d", r.name, sig, got, sig)
+			}
+		}
+	}
+	if got, want := (&WasiSignalError{Signal: 15}).Error(), "wasi: terminated by signal 15"; got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+	select {
+	case s := <-host:
+		t.Fatalf("the host process received %v", s)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// signalErrorOf runs f and returns the *WasiSignalError it panics with, or
+// nil if it returns.
+func signalErrorOf(f func()) (sigErr *WasiSignalError) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		e, ok := r.(*WasiSignalError)
+		if !ok {
+			panic(r)
+		}
+		sigErr = e
+	}()
+	f()
+	return nil
 }

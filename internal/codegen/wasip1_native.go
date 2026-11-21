@@ -77,13 +77,25 @@ type Module struct {
 	memSize *atomic.Uint64
 }
 
-// WasiExitError is the sentinel that the recover layer of SafeInvokeExport
-// promotes Proc_exit() panics into, so a wasm-level exit doesn't kill the
-// host process and the caller can read the exit code instead.
+// WasiExitError is the panic value of a guest that called Proc_exit(). A
+// bulk-dispatch function (Inv_<svc>_<mt>) recovers it and returns it wrapped
+// in its error, which errors.As reaches; an export method and the
+// constructor (which runs the start function) let it panic. Either way the
+// caller can read the exit code instead of the host process exiting.
 type WasiExitError struct{ Code int32 }
 
 func (e *WasiExitError) Error() string {
 	return "wasi: proc_exit(" + itoa32(e.Code) + ")"
+}
+
+// WasiSignalError is the panic value of a guest that ended by a signal
+// (Proc_raise), the counterpart of WasiExitError: it reaches the caller the
+// same way, which then knows the instance is gone and which signal ended
+// it. Signal is the guest's number for the signal (WASI numbering).
+type WasiSignalError struct{ Signal int32 }
+
+func (e *WasiSignalError) Error() string {
+	return "wasi: terminated by signal " + itoa32(e.Signal)
 }
 
 // itoa32 is a tiny dependency-free strconv replacement so this file
@@ -3995,8 +4007,8 @@ func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes ui
 }
 
 func (w *WasiStubs) Proc_exit(m *Module, code int32) {
-	// Panic so SafeInvokeExport's recover catches it and surfaces a
-	// *WasiExitError instead of killing the host process.
+	// Panic instead of exiting the host process: the caller gets the
+	// *WasiExitError as WasiExitError's doc says.
 	panic(&WasiExitError{Code: code})
 }
 
@@ -4005,21 +4017,30 @@ func (w *WasiStubs) Proc_exit64(m *Module, code int64) {
 	w.Proc_exit(m, int32(code))
 }
 
+// Proc_raise applies the default action of the WASI signal sig
+// (__wasi_signal_t, 0..30) to the guest alone: no signal reaches the host
+// process. Signal 0 returns 0, as does a signal whose default is to be
+// ignored (CHLD, CONT, URG, WINCH) or to stop the process (STOP, TSTP,
+// TTIN, TTOU), which cannot stop an instance. Every other signal ends the
+// guest with a panic, whose value is a *WasiSignalError. A number outside
+// the enum returns EINVAL.
 func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
-	p, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		return mapOSError(err)
+	switch {
+	case sig < 0 || sig > 30:
+		return _wasiEINVAL
+	case sig == 0, sig >= 16 && sig <= 22, sig == 27: // CHLD..URG, WINCH
+		return _wasiESUCCESS
 	}
-	if err := p.Signal(syscall.Signal(sig)); err != nil {
-		return mapOSError(err)
-	}
-	return _wasiESUCCESS
+	panic(&WasiSignalError{Signal: sig})
 }
 
 // Proc_raise64 is Proc_raise for a memory64 guest: it takes the one
 // argument of the standard import widened to an i64, as a memory64 guest
 // passes every argument of the standard imports.
 func (w *WasiStubs) Proc_raise64(m *Module, sig int64) int32 {
+	if sig != int64(int32(sig)) {
+		return _wasiEINVAL
+	}
 	return w.Proc_raise(m, int32(sig))
 }
 
@@ -4402,21 +4423,22 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		// stand-in, the embed vars, this very function, etc.) is
 		// stripped.
 		keepTypeNames: map[string]bool{
-			"WasiExitError": true,
-			"wasiOpen":      true,
-			"wasiProc":      true,
-			"WasiStubs":     true,
-			"wasiABI":       true,
-			"dotDirEntry":   true,
-			"FS":            true,
-			"File":          true,
-			"osFS":          true,
-			"fileStat":      true,
-			"MemFS":         true,
-			"memFile":       true,
-			"memNode":       true,
-			"memFileInfo":   true,
-			"memDirEntry":   true,
+			"WasiExitError":   true,
+			"WasiSignalError": true,
+			"wasiOpen":        true,
+			"wasiProc":        true,
+			"WasiStubs":       true,
+			"wasiABI":         true,
+			"dotDirEntry":     true,
+			"FS":              true,
+			"File":            true,
+			"osFS":            true,
+			"fileStat":        true,
+			"MemFS":           true,
+			"memFile":         true,
+			"memNode":         true,
+			"memFileInfo":     true,
+			"memDirEntry":     true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                  true,

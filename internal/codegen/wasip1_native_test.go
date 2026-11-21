@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -1082,18 +1081,6 @@ func TestWasi_ProcExit(t *testing.T) {
 	w.Proc_exit(m, 42)
 }
 
-func TestWasi_ProcRaise(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("signal semantics differ on Windows")
-	}
-	// We cannot send a real signal to the test process safely; send
-	// signal 0 which is always a no-op probe in syscall.Kill.
-	w, m := newTestStubs(t, t.TempDir())
-	if rc := w.Proc_raise(m, 0); rc != _wasiESUCCESS {
-		t.Fatalf("Proc_raise(0) rc=%d", rc)
-	}
-}
-
 func TestWasi_FdPrestat(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
 	if rc := w.Fd_prestat_get(m, 3, 0); rc != _wasiESUCCESS {
@@ -1420,6 +1407,45 @@ func TestWasip1EmitNoAuxFiles(t *testing.T) {
 			names = append(names, k)
 		}
 		t.Fatalf("unexpected aux files registered: %v", names)
+	}
+}
+
+// The emitted runtime has the types a guest's end panics with, each with
+// its Error method.
+func TestWasip1EmitKeepsEndErrors(t *testing.T) {
+	tr := &translator{
+		opts:            Options{Package: "x", OutputImportPath: "ex/x"},
+		importedModules: []string{"wasi_snapshot_preview1"},
+		fset:            token.NewFileSet(),
+	}
+	decls, _, err := tr.emitWasip1Native()
+	if err != nil {
+		t.Fatalf("emitWasip1Native err=%v", err)
+	}
+	types, errorMethods := map[string]bool{}, map[string]bool{}
+	for _, d := range decls {
+		switch d := d.(type) {
+		case *ast.GenDecl:
+			for _, s := range d.Specs {
+				if ts, ok := s.(*ast.TypeSpec); ok {
+					types[ts.Name.Name] = true
+				}
+			}
+		case *ast.FuncDecl:
+			if d.Recv == nil || d.Name.Name != "Error" {
+				continue
+			}
+			if star, ok := d.Recv.List[0].Type.(*ast.StarExpr); ok {
+				if id, ok := star.X.(*ast.Ident); ok {
+					errorMethods[id.Name] = true
+				}
+			}
+		}
+	}
+	for _, name := range []string{"WasiExitError", "WasiSignalError"} {
+		if !types[name] || !errorMethods[name] {
+			t.Errorf("emitted runtime: type %s kept=%v, its Error method kept=%v", name, types[name], errorMethods[name])
+		}
 	}
 }
 
