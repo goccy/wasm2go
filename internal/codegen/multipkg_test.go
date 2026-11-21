@@ -18,7 +18,7 @@ import (
 func TestMultiPackageBuildsAndCompiles(t *testing.T) {
 	restore := codegen.SetMultiPackageThreshold(0)
 	defer restore()
-	for _, fx := range []string{"arith.wasm", "wexports.wasm", "cg_wasi.wasm", "cg_indirect.wasm"} {
+	for _, fx := range []string{"arith.wasm", "wexports.wasm", "cg_wasi.wasm", "cg_indirect.wasm", "wasip1_mem64_imports.wat"} {
 		fx := fx
 		t.Run(fx, func(t *testing.T) {
 			mod := readFixture(t, fx)

@@ -49,6 +49,8 @@ import (
 //
 //  1. Compile chunk bodies (registers t.helpers, t.imports for body needs)
 //  2. emitHelpers (adds helpers' stdlib needs to t.imports)
+//     2b. Build the other declarations of base (native wasi, globals
+//     snapshot, Module struct), which add their imports to t.imports
 //  3. Snapshot t.imports as base's view
 //  4. Run main pass (mutates t.imports, populates chunkExtraDecls and
 //     linkname forwards under callerChunk == chunkMain)
@@ -109,6 +111,9 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	// The Module struct lands in base as well, so the imports it uses
+	// (unsafe, sync, sync/atomic) are registered before the snapshot too.
+	moduleStruct := t.emitModuleStruct()
 
 	// Step 3: snapshot t.imports as base's view BEFORE main pass adds
 	// any further dependencies (e.g. "fmt" via SafeInvokeExport).
@@ -201,7 +206,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	t.currentChunk = chunkBase
 	baseFile := &ast.File{Name: newID("base")}
 	baseFile.Decls = append(baseFile.Decls, t.emitImportInterfaces()...)
-	baseFile.Decls = append(baseFile.Decls, t.emitModuleStruct())
+	baseFile.Decls = append(baseFile.Decls, moduleStruct)
 	baseFile.Decls = append(baseFile.Decls, helpers...)
 	baseFile.Decls = append(baseFile.Decls, globalsSnap...)
 	baseFile.Decls = append(baseFile.Decls, wasiDecls...)
