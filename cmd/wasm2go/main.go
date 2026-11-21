@@ -35,7 +35,7 @@ func main() {
 	outDir := flag.String("out-dir", "", "output directory for multi-package mode; required when the wasm exceeds the internal multi-file threshold")
 	bulkExportPrefix := flag.String("bulk-export-prefix", "", "treat exports matching `<prefix><svc>_<mt>` as bulk-dispatch entries (one standalone Inv_<svc>_<mt> per match)")
 	keepDeadFuncs := flag.Bool("keep-dead-funcs", false, "disable whole-function dead-code elimination (useful for diffing)")
-	entryExports := flag.String("entry-exports", "", "comma-separated list of export names that are DCE roots; the literal value \"NONE\" means no export is a root")
+	entryExports := flag.String("entry-exports", "", "comma-separated list of export names that are DCE roots; the literal value \"NONE\" means no export is a root; the fork child export __wasip1_posix_extension_fork_child is always a root")
 	promotionReport := flag.String("promotion-report", "", "write the SSA memory-promotion report (JSON: per-function frame/rodata/slab classification) to this path")
 	pureOnly := flag.Bool("pure", false, "emit the pure-Go backend only (no asm bundle, no arch build tags); the ABIInternal reference for benchmarking")
 	outlineMin := flag.Int("outline", 0, "outline large loops into their own functions; the value is the minimum loop body size in SSA values (0 disables)")
@@ -196,11 +196,6 @@ func main() {
 	}
 }
 
-// parseEntryExports parses the -entry-exports flag into the
-// Options.EntryExports slice. An empty string returns nil (every
-// export is a root). The literal "NONE" returns a non-nil empty
-// slice (no export is a root). Otherwise the value is split on commas
-// with whitespace trimmed and empty fields dropped.
 // splitCommaList splits a comma-separated flag value into trimmed,
 // non-empty entries; "" yields nil.
 func splitCommaList(v string) []string {
@@ -217,6 +212,12 @@ func splitCommaList(v string) []string {
 	return out
 }
 
+// parseEntryExports parses the -entry-exports flag into the
+// Options.EntryExports slice. An empty string returns nil (every
+// export is a root). The literal "NONE" returns a non-nil empty
+// slice (no export is a root). Otherwise the value is split on commas
+// with whitespace trimmed and empty fields dropped. The fork child
+// export __wasip1_posix_extension_fork_child is a root in every case.
 func parseEntryExports(v string) []string {
 	if v == "" {
 		return nil
