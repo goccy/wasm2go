@@ -170,12 +170,27 @@ func TestMem64BeyondFourGiB(t *testing.T) {
 //		free(p);
 //		return 0;
 //	}
+//
+// It runs both as single-file output and as multi-package output, where
+// the exports are free functions of the main package: the multi-package
+// run checks that wasm64 multi-package output with WASI runs.
 func TestMem64Wasip1Hello(t *testing.T) {
-	got := runMem64Wasip1(t, "../testdata/wasip1_mem64_hello.wasm",
-		"m := pkg.NewWithWASI(pkg.DefaultWASI())\n\tm.Start()")
-	want := "hello wasm64: sizeof(void*)=8 sizeof(size_t)=8\nmalloc(67108864) ok, p[last]=-91"
-	if got != want {
-		t.Errorf("wasip1 mem64 output:\ngot:  %q\nwant: %q", got, want)
+	for _, tc := range []struct {
+		name      string
+		threshold int
+		mainBody  string
+	}{
+		{"single-file", -1, "m := pkg.NewWithWASI(pkg.DefaultWASI())\n\tm.Start()"},
+		{"multi-package", 0, "pkg.Start(pkg.New())"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer transpile.SetMultiPackageThreshold(tc.threshold)()
+			got := runMem64Wasip1(t, "../testdata/wasip1_mem64_hello.wasm", tc.mainBody)
+			want := "hello wasm64: sizeof(void*)=8 sizeof(size_t)=8\nmalloc(67108864) ok, p[last]=-91"
+			if got != want {
+				t.Errorf("wasip1 mem64 output:\ngot:  %q\nwant: %q", got, want)
+			}
+		})
 	}
 }
 
