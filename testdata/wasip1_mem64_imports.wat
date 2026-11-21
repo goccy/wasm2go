@@ -1,8 +1,10 @@
 ;; wasip1_mem64_imports.wat — a memory64 module that imports every name
-;; WasiStubs binds for a memory64 guest, each with its wasm64 signature:
-;; every argument of a standard import widened to i64 (as the wasm2go port
-;; of wasi-libc declares them; proc_raise, which that C library no longer
-;; declares, the same way). Its translation must compile against the *64
+;; WasiStubs binds for a memory64 guest, from a module that serves it, each
+;; with its wasm64 signature: every argument of a standard import widened to
+;; i64 (as the wasm2go port of wasi-libc declares them; proc_raise, which
+;; that C library no longer declares, the same way), and for an import of
+;; wasip1_posix_extension an i64 for every pointer and an i32 for every int
+;; of its C declaration. Its translation must compile against the *64
 ;; bindings of WasiStubs. touch calls every import once so none of them can
 ;; be dropped as unused; nothing runs it.
 (module
@@ -88,7 +90,18 @@
     (func $path_create_directory (param i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_raise"
     (func $proc_raise (param i64) (result i32)))
-
+  (import "wasip1_posix_extension" "pipe"
+    (func $pipe (param i64) (result i32)))
+  (import "wasip1_posix_extension" "fd_dup"
+    (func $fd_dup (param i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "fd_dupfd"
+    (func $fd_dupfd (param i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "fd_dup2"
+    (func $fd_dup2 (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "fd_cloexec"
+    (func $fd_cloexec (param i32 i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "fd_closefrom"
+    (func $fd_closefrom (param i32) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -134,5 +147,11 @@
     (drop (call $fd_pwrite (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $path_create_directory (i64.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $proc_raise (i64.const 0)))
+    (drop (call $pipe (i64.const 0)))
+    (drop (call $fd_dup (i32.const 0) (i64.const 0)))
+    (drop (call $fd_dupfd (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $fd_dup2 (i32.const 0) (i32.const 0)))
+    (drop (call $fd_cloexec (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $fd_closefrom (i32.const 0)))
   )
 )

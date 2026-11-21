@@ -3,6 +3,7 @@ package codegen
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,6 +29,90 @@ func writeSubFd(m *Module, off int32, userdata uint64, etype byte, fd int32) {
 	binary.LittleEndian.PutUint64(m.memory[off:], userdata)
 	m.memory[off+8] = etype
 	binary.LittleEndian.PutUint32(m.memory[off+16:], uint32(fd))
+}
+
+// fd_dupfd is fcntl's F_DUPFD: the duplicate gets the lowest free number
+// that is at least the one asked for, and a negative one is EINVAL.
+func TestWasi_FdDupfdTakesTheLowestNumberFromMin(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	const outOff int32 = 100
+	if rc := w.Fd_dupfd(m, fd, 20, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != 20 {
+		t.Fatalf("Fd_dupfd(min 20) = %d, want 20", got)
+	}
+	if rc := w.Fd_dupfd(m, fd, 20, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != 21 {
+		t.Fatalf("Fd_dupfd(min 20) with 20 taken = %d, want 21", got)
+	}
+	if rc := w.Fd_dupfd(m, fd, -1, outOff); rc != _wasiEINVAL {
+		t.Fatalf("Fd_dupfd(min -1) rc=%d, want EINVAL", rc)
+	}
+	if rc := w.Fd_dupfd(m, 99, 0, outOff); rc != _wasiEBADF {
+		t.Fatalf("Fd_dupfd of a closed number rc=%d, want EBADF", rc)
+	}
+	// The numbers of descriptors end below the root's second number.
+	for _, min := range []int32{wasiRootFD, math.MaxInt32} {
+		if rc := w.Fd_dupfd(m, fd, min, outOff); rc != _wasiEINVAL {
+			t.Fatalf("Fd_dupfd(min %#x) rc=%d, want EINVAL", min, rc)
+		}
+	}
+	if rc := w.Fd_dupfd(m, fd, wasiRootFD-1, outOff); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dupfd(the highest number) rc=%d", rc)
+	}
+	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != wasiRootFD-1 {
+		t.Fatalf("Fd_dupfd(the highest number) = %#x, want %#x", got, wasiRootFD-1)
+	}
+	refs := extraRefs(t, w, fd)
+	if rc := w.Fd_dupfd(m, fd, wasiRootFD-1, outOff); rc != _wasiEMFILE {
+		t.Fatalf("Fd_dupfd with no number free rc=%d, want EMFILE", rc)
+	}
+	if got := extraRefs(t, w, fd); got != refs {
+		t.Fatalf("the refused Fd_dupfd left %d extra references, want %d", got, refs)
+	}
+	if ft := fdFiletype(t, w, m, wasiRootFD); ft != 3 {
+		t.Fatalf("the root's number has filetype %d, want directory", ft)
+	}
+}
+
+// fd_dup2 and fd_renumber take a descriptor number for the destination:
+// not a negative one, and not the root's second number or one above it.
+func TestWasi_Dup2AndRenumberRefuseNumbersThatAreNoDescriptors(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	for _, to := range []int32{-1, math.MinInt32, wasiRootFD, math.MaxInt32} {
+		if rc := w.Fd_dup2(m, 1, to); rc != _wasiEBADF {
+			t.Errorf("Fd_dup2(1, %#x) rc=%d, want EBADF", to, rc)
+		}
+		if rc := w.Fd_dup264(m, 1, to); rc != _wasiEBADF {
+			t.Errorf("Fd_dup264(1, %#x) rc=%d, want EBADF", to, rc)
+		}
+		if rc := w.Fd_renumber(m, 1, to); rc != _wasiEBADF {
+			t.Errorf("Fd_renumber(1, %#x) rc=%d, want EBADF", to, rc)
+		}
+		if rc := w.Fd_renumber64(m, 1, int64(to)); rc != _wasiEBADF {
+			t.Errorf("Fd_renumber64(1, %#x) rc=%d, want EBADF", to, rc)
+		}
+	}
+	if len(w.fdTable) != 3 {
+		t.Errorf("the table has %d entries after the refused calls, want 3", len(w.fdTable))
+	}
+	if rc := fdWriteString(w, m, 1, "x"); rc != _wasiESUCCESS {
+		t.Errorf("write to fd 1 after the refused calls rc=%d", rc)
+	}
+	if rc := w.Fd_dup2(m, 1, wasiRootFD-1); rc != _wasiESUCCESS {
+		t.Errorf("Fd_dup2 onto the highest number rc=%d", rc)
+	}
 }
 
 func TestWasi_FdDupSharesOffsetAndDefersClose(t *testing.T) {

@@ -204,7 +204,7 @@ func TestWasi_ReadOnDirectoryIsEISDIR(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			w.fdTable[9] = &wasiOpen{f: f}
+			w.fdsLocked()[9] = &wasiOpen{f: f}
 			for _, c := range ioReadCalls {
 				if rc, n := c.run(w, m, 9, 1); rc != _wasiEISDIR || n != 0 {
 					t.Errorf("%s: rc=%d n=%d, want EISDIR 0", c.name, rc, n)
@@ -219,15 +219,15 @@ func TestWasi_IOErrorAfterTransferIsShortCount(t *testing.T) {
 	for _, c := range append(append([]ioCall{}, ioReadCalls...), ioWriteCalls...) {
 		t.Run(c.name, func(t *testing.T) {
 			w, m := newTestStubs(t, t.TempDir())
-			w.fdTable[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{4, nil}, {0, failure}}}}
+			w.fdsLocked()[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{4, nil}, {0, failure}}}}
 			if rc, n := c.run(w, m, 9, 2); rc != _wasiESUCCESS || n != 4 {
 				t.Fatalf("error after a full buffer: rc=%d n=%d, want ESUCCESS 4", rc, n)
 			}
-			w.fdTable[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{3, failure}}}}
+			w.fdsLocked()[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{3, failure}}}}
 			if rc, n := c.run(w, m, 9, 2); rc != _wasiESUCCESS || n != 3 {
 				t.Fatalf("error with a short count: rc=%d n=%d, want ESUCCESS 3", rc, n)
 			}
-			w.fdTable[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{0, failure}}}}
+			w.fdsLocked()[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{0, failure}}}}
 			if rc, n := c.run(w, m, 9, 2); rc != _wasiEIO || n != 0 {
 				t.Fatalf("error with nothing transferred: rc=%d n=%d, want EIO 0", rc, n)
 			}
