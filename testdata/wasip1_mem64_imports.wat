@@ -148,6 +148,48 @@
     (func $proc_terminate (param i32)))
   (import "wasip1_posix_extension" "proc_kill"
     (func $proc_kill (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "fd_flock"
+    (func $fd_flock (param i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "fd_lock"
+    (func $fd_lock (param i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "host_numbering"
+    (func $host_numbering (result i32)))
+  (import "wasip1_posix_extension" "host_number_at"
+    (func $host_number_at (param i32 i32 i64 i32 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "path_access"
+    (func $path_access (param i64 i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "path_mkfifo"
+    (func $path_mkfifo (param i64 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_groups"
+    (func $proc_groups (param i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_setids"
+    (func $proc_setids (param i32 i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_setgroups"
+    (func $proc_setgroups (param i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_priority"
+    (func $proc_priority (param i32 i32 i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_user_by_id"
+    (func $proc_user_by_id (param i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_user_by_name"
+    (func $proc_user_by_name (param i64 i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_user_at"
+    (func $proc_user_at (param i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_group_by_id"
+    (func $proc_group_by_id (param i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_group_by_name"
+    (func $proc_group_by_name (param i64 i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_group_at"
+    (func $proc_group_at (param i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_uname"
+    (func $proc_uname (param i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_service"
+    (func $sock_service (param i64 i32 i32 i32 i64 i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_syslog_open"
+    (func $proc_syslog_open (param i64 i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_syslog"
+    (func $proc_syslog (param i32 i32 i32 i64 i32 i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_syslog_close"
+    (func $proc_syslog_close (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -223,5 +265,26 @@
     (drop (call $proc_itimer (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (call $proc_terminate (i32.const 0))
     (drop (call $proc_kill (i32.const 0) (i32.const 0)))
+    (drop (call $fd_flock (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $fd_lock (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $host_numbering))
+    (drop (call $host_number_at (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $path_access (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $path_mkfifo (i64.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $proc_groups (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_setids (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $proc_setgroups (i64.const 0) (i32.const 0)))
+    (drop (call $proc_priority (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_user_by_id (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_user_by_name (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_user_at (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_group_by_id (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_group_by_name (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_group_at (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_uname (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_service (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_syslog_open (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $proc_syslog (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $proc_syslog_close))
   )
 )

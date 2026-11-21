@@ -597,6 +597,17 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"proc_ids", func() int32 { return w.Proc_ids64(m, highAddr) }, -_wasiEFAULT},
 		{"proc_times", func() int32 { return w.Proc_times64(m, highAddr) }, -_wasiEFAULT},
 		{"proc_signal_register", func() int32 { return w.Proc_signal_register64(m, highAddr) }, -_wasiEFAULT},
+		{"proc_groups", func() int32 { return w.Proc_groups64(m, 512, 0, highAddr) }, -_wasiEFAULT},
+		{"proc_setgroups", func() int32 { return w.Proc_setgroups64(m, highAddr, 1) }, -_wasiEFAULT},
+		{"proc_priority", func() int32 { return w.Proc_priority64(m, 0, 0, 0, 0, highAddr) }, -_wasiEFAULT},
+		{"proc_user_by_name", func() int32 { return w.Proc_user_by_name64(m, highAddr, 1, 512, 64, 600) }, -_wasiEFAULT},
+		{"proc_group_by_name", func() int32 { return w.Proc_group_by_name64(m, highAddr, 1, 512, 64, 600) }, -_wasiEFAULT},
+		{"sock_service", func() int32 { return w.Sock_service64(m, highAddr, 1, 0, 0, 900, 0, 512, 64, 600) }, -_wasiEFAULT},
+		{"proc_syslog_open", func() int32 { return w.Proc_syslog_open64(m, highAddr, 1, 0, 1) }, -_wasiEFAULT},
+		{"proc_syslog", func() int32 { return w.Proc_syslog64(m, 6, 1, 0, 900, 0, highAddr, 1) }, -_wasiEFAULT},
+		{"path_access", func() int32 { return w.Path_access64(m, highAddr, 1, 0, 0) }, -_wasiEFAULT},
+		{"path_mkfifo", func() int32 { return w.Path_mkfifo64(m, highAddr, 1, 0o600) }, -_wasiEFAULT},
+		{"fd_lock", func() int32 { return w.Fd_lock64(m, fd, 0, highAddr) }, -_wasiEFAULT},
 	} {
 		before := bytes.Clone(m.memory)
 		if got := tc.call(); got != tc.want {
@@ -744,6 +755,46 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 			},
 			func(w *WasiStubs, m *Module, fd int32) int32 {
 				return w.Proc_signal_register64(m, 1024) | w.Proc_signal_take64(m, 1032)
+			}},
+		{"proc_groups, proc_setids, proc_setgroups and proc_priority",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_groups(m, 1024, 4, 1040) | w.Proc_setids(m, 0, 0, -1, -1) | w.Proc_setgroups(m, 1024, 0) |
+					w.Proc_priority(m, 0, 0, 0, 0, 1044)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_groups64(m, 1024, 4, 1040) | w.Proc_setids64(m, 0, 0, -1, -1) | w.Proc_setgroups64(m, 1024, 0) |
+					w.Proc_priority64(m, 0, 0, 0, 0, 1044)
+			}},
+		{"user, group, uname, service and number lookups of nothing",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_user_by_id(m, 0, 1024, 64, 1100) | w.Proc_user_by_name(m, 512, 5, 1024, 64, 1100) |
+					w.Proc_user_at(m, 0, 1024, 64, 1100) | w.Proc_group_by_id(m, 0, 1024, 64, 1100) |
+					w.Proc_group_by_name(m, 512, 5, 1024, 64, 1100) | w.Proc_group_at(m, 0, 1024, 64, 1100) |
+					w.Proc_uname(m, 1024, 64, 1100) | w.Sock_service(m, 512, 5, 0, 0, 512, 0, 1024, 64, 1100) |
+					w.Host_numbering(m) | w.Host_number_at(m, 1, 0, 1024, 16, 1100, 1104)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_user_by_id64(m, 0, 1024, 64, 1100) | w.Proc_user_by_name64(m, 512, 5, 1024, 64, 1100) |
+					w.Proc_user_at64(m, 0, 1024, 64, 1100) | w.Proc_group_by_id64(m, 0, 1024, 64, 1100) |
+					w.Proc_group_by_name64(m, 512, 5, 1024, 64, 1100) | w.Proc_group_at64(m, 0, 1024, 64, 1100) |
+					w.Proc_uname64(m, 1024, 64, 1100) | w.Sock_service64(m, 512, 5, 0, 0, 512, 0, 1024, 64, 1100) |
+					w.Host_numbering64(m) | w.Host_number_at64(m, 1, 0, 1024, 16, 1100, 1104)
+			}},
+		{"syslog without a logger",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_syslog_open(m, 512, 5, 0, 1) | w.Proc_syslog(m, 6, 1, 0, 512, 5, 512, 5) | w.Proc_syslog_close(m)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_syslog_open64(m, 512, 5, 0, 1) | w.Proc_syslog64(m, 6, 1, 0, 512, 5, 512, 5) | w.Proc_syslog_close64(m)
+			}},
+		{"path_access, path_mkfifo, fd_flock and fd_lock",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_access(m, 512, 5, 4, 0) | w.Path_mkfifo(m, 512, 5, 0o600) | w.Fd_flock(m, fd, 1, 0) |
+					w.Fd_lock(m, fd, recordLockGet, 1024)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Path_access64(m, 512, 5, 4, 0) | w.Path_mkfifo64(m, 512, 5, 0o600) | w.Fd_flock64(m, fd, 1, 0) |
+					w.Fd_lock64(m, fd, recordLockGet, 1024)
 			}},
 		{"pipe",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe(m, 1024) },

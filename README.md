@@ -130,6 +130,30 @@ isolated guest: such a `kill` fails with `ESRCH`. Signals reach the
 guest through `PostSignal`. `ForkProc` forks an instance that its
 parent waits for, under a pid token the fork knows as its own.
 
+`Process` also answers `getgroups` and makes the guest's `setuid`
+family, `setgroups` and `setpriority` changes; an isolated process is
+in no supplementary group, has the nice value 0 and changes nothing
+(`ENOSYS`). `Users` is the user and group database (`getpwnam`,
+`getgrgid`, `getpwent`, ...), `System` what `uname` and `gethostname`
+report, `Services` the services database (`getservbyname`,
+`getservbyport`), `Syslog` the system logger of `openlog` and
+`syslog`, and `Numbering` gives the guest the numbers of another system
+in place of those of its own C library. A nil one is none: a lookup
+finds nothing (`ENOENT`), `uname` and `syslog` fail with `ENOSYS`, and
+the guest keeps its own numbers. `HostUsers()`, `HostSystem()`,
+`HostServices()` and `HostSyslog()` give the host's. The guest's
+`flock` locks a file of an `FS` that is a `LockFS` (what `HostFS` and
+`NewMemFS` return); `fcntl`'s record locks and `mkfifo` are the host's.
+On Linux a record lock is the open file description's (`F_OFD_SETLK`),
+so instances of one host process exclude each other; elsewhere it is the
+host process's, shared by all its instances and released by closing any
+descriptor of the file. A lock or an open of a FIFO that waits ends with
+`EINTR` when a signal is posted to the guest; an open of a FIFO with
+`O_NONBLOCK` does not wait. A blocked `F_SETLKW` cannot be called off:
+when it is granted after the guest was told `EINTR`, the range it asked
+for is unlocked again, which also removes a lock the guest held in that
+range before it waited.
+
 ```go
 fsys, err := mymodule.HostFS("/srv/data")
 if err != nil {

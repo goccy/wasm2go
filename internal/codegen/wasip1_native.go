@@ -54,6 +54,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -526,6 +527,9 @@ type MemFS struct {
 	maxFileSize int64
 	// lastIno is the inode number of the node made last.
 	lastIno uint64
+	// lockReleased is broadcast whenever a lock of a node is removed
+	// (Flock); made on first use.
+	lockReleased *sync.Cond
 }
 
 // NewMemFS returns an empty in-memory filesystem with a root directory.
@@ -560,6 +564,9 @@ type memNode struct {
 	// was removed or replaced), which only its open files can still see:
 	// their stat reports a link count of zero.
 	unlinked bool
+	// locks holds the lock (flockShared or flockExclusive) each open file
+	// that holds one has on the node (Flock).
+	locks map[*memFile]int
 }
 
 func memSplit(name string) []string {
@@ -908,8 +915,15 @@ func (f *memFile) parentInode() uint64 {
 	}
 	return f.node.parent.ino
 }
-func (f *memFile) Close() error { return nil }
-func (f *memFile) Sync() error  { return nil }
+
+// Close removes the lock the open file holds (Flock).
+func (f *memFile) Close() error {
+	f.fsys.mu.Lock()
+	defer f.fsys.mu.Unlock()
+	f.unlockLocked()
+	return nil
+}
+func (f *memFile) Sync() error { return nil }
 
 // Chmod sets the permission bits of the open file.
 func (f *memFile) Chmod(mode os.FileMode) error {
@@ -1173,6 +1187,15 @@ type wasiOpen struct {
 	// lowat what it learnt. Guarded by mu.
 	lowatFile *os.File
 	lowat     int
+	// lockPending is closed once a lock call whose wait a signal ended
+	// has returned and what it took is removed again; nil when there is
+	// none (see takeLock). Guarded by mu.
+	lockPending chan struct{}
+	// lockWaits counts, by lock (takeLock's key), the waits for a lock of
+	// the descriptor in progress; lockHeld holds the locks a wait of it
+	// took and no later lock call of it has changed. Guarded by mu.
+	lockWaits map[string]int
+	lockHeld  map[string]bool
 }
 
 // deadlineReader is a stream whose blocking read can be bounded: a pipe, a
@@ -1972,6 +1995,24 @@ type WASIConfig struct {
 	// no process but its own and the ones it made, and its dispositions are
 	// told nobody.
 	Signals Signals
+	// Users is the user and group database of getpwnam, getgrgid and the
+	// like. nil is an empty one: every lookup fails with ENOENT. HostUsers
+	// gives the host's.
+	Users Users
+	// System is what uname and gethostname report. nil is none: they fail
+	// with ENOSYS. HostSystem gives the host's.
+	System System
+	// Services is the services database of getservbyname and
+	// getservbyport. nil is an empty one: every lookup fails with ENOENT.
+	// HostServices gives the host's.
+	Services Services
+	// Numbering gives the guest the numbers of another system (its error
+	// numbers, ...) to use instead of those of its own C library
+	// (host_numbering, host_number_at). nil leaves the guest with its own.
+	Numbering Numbering
+	// Syslog is the system logger of openlog, syslog and closelog. nil is
+	// none: they fail with ENOSYS. HostSyslog gives the host's.
+	Syslog Syslogger
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -6353,8 +6394,40 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	// host's filesystem takes the host process's umask out as well, so
 	// there the instance's umask tightens a mode and does not loosen one;
 	// MemFS creates with the mode as asked.
-	if f, err = openFile(rel, flag, w.createMode(mode)); err != nil {
+	isFIFO := false
+	fi, err := fsys.Stat(rel)
+	if err == nil {
+		isFIFO = fi.Mode()&os.ModeNamedPipe != 0
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return -1, mapOSError(err)
+	}
+	if isFIFO && requireDir {
+		// Not opened: an open of a FIFO would wait for its other end.
+		return -1, _wasiENOTDIR
+	}
+	switch {
+	case isFIFO && fdflags&0x4 != 0: // NONBLOCK
+		// The host's open that does not wait: a reader gets the FIFO
+		// whether or not anyone writes to it, a writer is refused (ENXIO)
+		// while nobody reads.
+		if f, err = openFile(rel, flag|hostONonblock, w.createMode(mode)); err != nil {
+			return -1, mapOSError(err)
+		}
+		// The descriptor waits as any other does: the guest's NONBLOCK is
+		// its fdflags.
+		if err := clearHostNonblock(f); err != nil {
+			return -1, mapOSError(errors.Join(err, f.Close()))
+		}
+	case isFIFO && flag&os.O_RDWR == 0:
+		// An open of one end waits for the other.
+		var errno int32
+		if f, errno = w.openFIFO(openFile, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
+			return -1, errno
+		}
+	default:
+		if f, err = openFile(rel, flag, w.createMode(mode)); err != nil {
+			return -1, mapOSError(err)
+		}
 	}
 	st, statErr := f.Stat()
 	if statErr != nil {
@@ -7588,7 +7661,10 @@ func writeFilestat(out []byte, st os.FileInfo) {
 
 // Process supplies the identity and the accounting of the guest process
 // (WASIConfig.Process). Its methods are called without any lock of the
-// WasiStubs held.
+// WasiStubs held. An error of Groups, SetIDs, SetGroups, Priority or
+// SetPriority fails the guest's call with the errno hookErrno gives: the
+// errno of its name for a syscall.Errno, ENOSYS for errors.ErrUnsupported
+// without one.
 type Process interface {
 	// IDs returns the ids of the guest process.
 	IDs() ProcessIDs
@@ -7601,7 +7677,53 @@ type Process interface {
 	// Umask returns the file mode creation mask the guest starts with. Only
 	// its permission bits are used.
 	Umask() os.FileMode
+	// Groups returns the supplementary group ids of the guest process
+	// (getgroups).
+	Groups() ([]int32, error)
+	// SetIDs makes a change of the guest's user or group ids, a call of the
+	// setuid or setgid family (proc_setids).
+	SetIDs(change IDChange) error
+	// SetGroups sets the supplementary group ids of the guest process
+	// (setgroups).
+	SetGroups(groups []int32) error
+	// Priority returns the nice value of the processes which and who name
+	// (getpriority): which is PRIO_PROCESS (0), PRIO_PGRP (1) or PRIO_USER
+	// (2), who the id of the process, the group or the user, 0 for the
+	// caller's own. The guest's own pid is given as 0.
+	Priority(which, who int32) (int32, error)
+	// SetPriority sets the nice value of the processes which and who name
+	// (setpriority), as Priority names them.
+	SetPriority(which, who, prio int32) error
 }
+
+// IDChange is a change of the user or group ids of the guest process: one
+// call of the setuid or setgid family.
+type IDChange struct {
+	// Call is the call.
+	Call IDCall
+	// IDs are the ids the call is given, in the order it takes them; -1
+	// leaves an id as it is. Those past the ids the call takes are -1.
+	IDs [3]int32
+}
+
+// IDCall names a call of the setuid or setgid family.
+type IDCall int32
+
+// The calls an IDChange makes, with the request numbers proc_setids
+// passes.
+const (
+	IDSetuid    IDCall = iota // setuid(uid)
+	IDSeteuid                 // seteuid(euid)
+	IDSetreuid                // setreuid(ruid, euid)
+	IDSetresuid               // setresuid(ruid, euid, suid)
+	IDSetgid                  // setgid(gid)
+	IDSetegid                 // setegid(egid)
+	IDSetregid                // setregid(rgid, egid)
+	IDSetresgid               // setresgid(rgid, egid, sgid)
+)
+
+// idCallArgs is the number of ids each IDCall takes.
+var idCallArgs = [...]int{IDSetuid: 1, IDSeteuid: 1, IDSetreuid: 2, IDSetresuid: 3, IDSetgid: 1, IDSetegid: 1, IDSetregid: 2, IDSetresgid: 3}
 
 // ProcessIDs are the ids of a guest process.
 type ProcessIDs struct {
@@ -7624,9 +7746,21 @@ func (isolatedProcess) IDs() ProcessIDs              { return ProcessIDs{PID: 42
 func (isolatedProcess) Times() (ProcessTimes, error) { return ProcessTimes{}, nil }
 func (isolatedProcess) Umask() os.FileMode           { return 0o022 }
 
+// An isolated process is in no supplementary group and has the nice value
+// 0; it changes neither its ids, nor its groups, nor its priority (ENOSYS).
+func (isolatedProcess) Groups() ([]int32, error)                 { return nil, nil }
+func (isolatedProcess) SetIDs(IDChange) error                    { return errors.ErrUnsupported }
+func (isolatedProcess) SetGroups([]int32) error                  { return errors.ErrUnsupported }
+func (isolatedProcess) Priority(which, who int32) (int32, error) { return 0, nil }
+func (isolatedProcess) SetPriority(which, who, prio int32) error { return errors.ErrUnsupported }
+
 // HostProcess returns a Process with the identity and the accounting of the
 // host process, for WASIConfig.Process. IDs are os.Getpid, os.Getppid,
-// os.Getuid, os.Geteuid, os.Getgid and os.Getegid. Times are the host's
+// os.Getuid, os.Geteuid, os.Getgid and os.Getegid; Groups is os.Getgroups.
+// SetIDs, SetGroups, Priority and SetPriority are the host's calls of the
+// same name (package syscall's), on the host process: the ids of every
+// instance of a fork family change with it. Where the host has no such call
+// the error is errors.ErrUnsupported. Times are the host's
 // resource usage of the whole host process, which every instance of a fork
 // family is part of, and of the children the host process has waited for;
 // on a system without one the error is errors.ErrUnsupported. Umask is the host
@@ -7662,6 +7796,37 @@ func (hostProcess) IDs() ProcessIDs {
 
 func (hostProcess) Times() (ProcessTimes, error) { return hostProcessTimes() }
 func (p hostProcess) Umask() os.FileMode         { return p.umask }
+
+func (hostProcess) Groups() ([]int32, error) {
+	groups, err := os.Getgroups()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]int32, len(groups))
+	for i, gid := range groups {
+		out[i] = int32(gid)
+	}
+	return out, nil
+}
+
+func (hostProcess) SetIDs(change IDChange) error { return setHostIDs(change) }
+
+func (hostProcess) SetGroups(groups []int32) error {
+	gids := make([]int, len(groups))
+	for i, gid := range groups {
+		gids[i] = int(gid)
+	}
+	return setHostGroups(gids)
+}
+
+func (hostProcess) Priority(which, who int32) (int32, error) {
+	nice, err := hostPriority(int(which), int(who))
+	return int32(nice), err
+}
+
+func (hostProcess) SetPriority(which, who, prio int32) error {
+	return setHostPriority(int(which), int(who), int(prio))
+}
 
 // The guest's signal numbers are Linux's. A host has its own (SIGUSR1 is
 // 10 here and 30 on macOS), so a number never crosses to or from the host
@@ -7750,15 +7915,1729 @@ func (w *WasiStubs) procTimes(m *Module, outPtr uint64) int32 {
 		return -_wasiEFAULT
 	}
 	times, err := w.guestProcess().Times()
-	if errors.Is(err, errors.ErrUnsupported) {
-		return -_wasiENOSYS
-	}
 	if err != nil {
-		return -mapOSError(err)
+		return -hookErrno(err)
 	}
 	for i, d := range [4]time.Duration{times.User, times.System, times.ChildrenUser, times.ChildrenSystem} {
 		binary.LittleEndian.PutUint64(out[i*8:], uint64(d))
 	}
+	return _wasiESUCCESS
+}
+
+// hookErrno returns the errno a guest's call fails with when a value of
+// the configuration (a Process, Users, System, Services or Syslogger)
+// returned err: the errno of its name for an error that carries a
+// syscall.Errno; for any other, ENOSYS for errors.ErrUnsupported, which
+// says that the value cannot do what was asked, and mapOSError's errno
+// otherwise (ENOENT for fs.ErrNotExist).
+func hookErrno(err error) int32 {
+	var number syscall.Errno
+	if !errors.As(err, &number) && errors.Is(err, errors.ErrUnsupported) {
+		return _wasiENOSYS
+	}
+	return mapOSError(err)
+}
+
+// Proc_groups is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_groups") backing getgroups: the Groups of the Process
+// (WASIConfig.Process). It writes the number of supplementary group ids at
+// countPtr and, when capacity (a count of u32 slots at bufPtr) is enough
+// for all of them, the ids themselves. Returns 0, or a negative errno:
+// EINVAL for a negative capacity, ERANGE when capacity is not zero and too
+// small (the count is still written).
+func (w *WasiStubs) Proc_groups(m *Module, bufPtr, capacity, countPtr int32) int32 {
+	return w.procGroups(m, zext(bufPtr), capacity, zext(countPtr))
+}
+
+// Proc_groups64 is Proc_groups for a memory64 guest.
+func (w *WasiStubs) Proc_groups64(m *Module, bufPtr int64, capacity int32, countPtr int64) int32 {
+	return w.procGroups(m, uint64(bufPtr), capacity, uint64(countPtr))
+}
+
+// procGroups is the body of Proc_groups and Proc_groups64.
+func (w *WasiStubs) procGroups(m *Module, bufPtr uint64, capacity int32, countPtr uint64) int32 {
+	if capacity < 0 {
+		return -_wasiEINVAL
+	}
+	countOut := w.memBytes(m, countPtr, 4)
+	if countOut == nil {
+		return -_wasiEFAULT
+	}
+	groups, err := w.guestProcess().Groups()
+	if err != nil {
+		return -hookErrno(err)
+	}
+	binary.LittleEndian.PutUint32(countOut, uint32(len(groups)))
+	if capacity == 0 {
+		return _wasiESUCCESS
+	}
+	if int(capacity) < len(groups) {
+		return -_wasiERANGE
+	}
+	buf := w.memBytes(m, bufPtr, uint64(len(groups))*4)
+	if buf == nil {
+		return -_wasiEFAULT
+	}
+	for i, gid := range groups {
+		binary.LittleEndian.PutUint32(buf[i*4:], uint32(gid))
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_setids is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_setids") backing the setuid and setgid families: request names
+// the call (the IDCall of its number) and a, b, c are its ids, -1 for an id
+// to leave alone. The SetIDs of the Process (WASIConfig.Process) makes the
+// change. Returns 0, or a negative errno: EINVAL for a request it does not
+// know, ENOSYS when the Process changes no ids.
+func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
+	call := IDCall(request)
+	if call < IDSetuid || call > IDSetresgid {
+		return -_wasiEINVAL
+	}
+	change := IDChange{Call: call, IDs: [3]int32{-1, -1, -1}}
+	copy(change.IDs[:idCallArgs[call]], []int32{a, b, c})
+	if err := w.guestProcess().SetIDs(change); err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_setids64 is Proc_setids for a memory64 guest.
+func (w *WasiStubs) Proc_setids64(m *Module, request, a, b, c int32) int32 {
+	return w.Proc_setids(m, request, a, b, c)
+}
+
+// Proc_setgroups is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_setgroups") backing setgroups: the
+// count u32 group ids at listPtr are given to the SetGroups of the Process
+// (WASIConfig.Process). Returns 0, or a negative errno: EINVAL for a count
+// below 0 or above 65536 (NGROUPS_MAX), ENOSYS when the Process changes no
+// groups.
+func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
+	return w.procSetgroups(m, zext(listPtr), count)
+}
+
+// Proc_setgroups64 is Proc_setgroups for a memory64 guest.
+func (w *WasiStubs) Proc_setgroups64(m *Module, listPtr int64, count int32) int32 {
+	return w.procSetgroups(m, uint64(listPtr), count)
+}
+
+// procSetgroups is the body of Proc_setgroups and Proc_setgroups64.
+func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 {
+	if count < 0 || count > 65536 {
+		return -_wasiEINVAL
+	}
+	list := w.memBytes(m, listPtr, uint64(count)*4)
+	if list == nil {
+		return -_wasiEFAULT
+	}
+	groups := make([]int32, count)
+	for i := range groups {
+		groups[i] = int32(binary.LittleEndian.Uint32(list[i*4:]))
+	}
+	if err := w.guestProcess().SetGroups(groups); err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_priority is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_priority") backing getpriority,
+// setpriority and nice: which is PRIO_PROCESS (0), PRIO_PGRP (1) or
+// PRIO_USER (2) and who the id it applies to, 0 for the caller's own; the
+// guest's own pid is passed on as 0, and the pid token of another process
+// of the fork family or of a process the guest spawned is no process of
+// the host: ESRCH. With set non-zero the SetPriority of
+// the Process (WASIConfig.Process) makes value the nice value first. The
+// Priority of the Process, the nice value then in effect, is written at
+// outPtr (i32). Returns 0, or a negative errno: ENOSYS when the Process
+// changes no priority.
+func (w *WasiStubs) Proc_priority(m *Module, which, who, set, value, outPtr int32) int32 {
+	return w.procPriority(m, which, who, set, value, zext(outPtr))
+}
+
+// Proc_priority64 is Proc_priority for a memory64 guest.
+func (w *WasiStubs) Proc_priority64(m *Module, which, who, set, value int32, outPtr int64) int32 {
+	return w.procPriority(m, which, who, set, value, uint64(outPtr))
+}
+
+// procPriority is the body of Proc_priority and Proc_priority64.
+func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	proc := w.guestProcess()
+	if which == 0 && who != 0 {
+		w.mu.Lock()
+		pids := w.pidsLocked()
+		w.mu.Unlock()
+		if who == proc.IDs().PID {
+			// The guest's own pid is always the guest itself, as for
+			// kill.
+			who = 0
+		} else if member, ours := pids.find(who); member != nil || ours {
+			// A process of the fork family, or one the guest spawned,
+			// whose token names no process of the host.
+			return -_wasiESRCH
+		}
+	}
+	if set != 0 {
+		if err := proc.SetPriority(which, who, value); err != nil {
+			return -hookErrno(err)
+		}
+	}
+	nice, err := proc.Priority(which, who)
+	if err != nil {
+		return -hookErrno(err)
+	}
+	binary.LittleEndian.PutUint32(out, uint32(nice))
+	return _wasiESUCCESS
+}
+
+// ----- the user and group database ---------------------------------------------
+
+// Users is a user and group database (WASIConfig.Users): what the guest's
+// getpwuid, getpwnam and getpwent, and getgrgid, getgrnam and getgrent find.
+// UserAt and GroupAt return the i-th entry, from 0, as the guest goes
+// through the database. A lookup that finds nothing, and an At past the
+// last entry, returns an error that is fs.ErrNotExist: the guest's call
+// fails with ENOENT. Any other error fails it with the errno hookErrno
+// gives. Its methods are called without any lock of the WasiStubs held.
+type Users interface {
+	UserByID(uid int32) (User, error)
+	UserByName(name string) (User, error)
+	UserAt(i int) (User, error)
+	GroupByID(gid int32) (Group, error)
+	GroupByName(name string) (Group, error)
+	GroupAt(i int) (Group, error)
+}
+
+// User is an entry of the user database, as passwd(5) has it.
+type User struct {
+	// Name is the login name.
+	Name string
+	// UID and GID are the user's id and the id of its primary group.
+	UID, GID int32
+	// RealName is the user's name (the GECOS field), Home the home
+	// directory and Shell the login shell.
+	RealName, Home, Shell string
+}
+
+// Group is an entry of the group database, as group(5) has it, without
+// its members.
+type Group struct {
+	Name string
+	GID  int32
+}
+
+// noUsers is the empty user and group database of an instance whose
+// configuration names none.
+type noUsers struct{}
+
+func (noUsers) UserByID(int32) (User, error)      { return User{}, fs.ErrNotExist }
+func (noUsers) UserByName(string) (User, error)   { return User{}, fs.ErrNotExist }
+func (noUsers) UserAt(int) (User, error)          { return User{}, fs.ErrNotExist }
+func (noUsers) GroupByID(int32) (Group, error)    { return Group{}, fs.ErrNotExist }
+func (noUsers) GroupByName(string) (Group, error) { return Group{}, fs.ErrNotExist }
+func (noUsers) GroupAt(int) (Group, error)        { return Group{}, fs.ErrNotExist }
+
+// users returns the user and group database of the instance for the
+// import name: an empty one when the configuration names none. The host's
+// (HostUsers) tells WASIConfig.Errors the lines of its files it skips,
+// under name.
+func (w *WasiStubs) users(name string) Users {
+	switch users := w.cfg.Users.(type) {
+	case nil:
+		return noUsers{}
+	case hostUsers:
+		users.report = func(err error) { w.reportError(name, err) }
+		return users
+	default:
+		return users
+	}
+}
+
+// HostUsers returns the user and group database of the host, for
+// WASIConfig.Users. A lookup by id or name is package os/user's, which
+// reports no shell: the Shell of the User is empty. UserAt and GroupAt go
+// through the files /etc/passwd and /etc/group, read anew for each call:
+// their entries in order, without the lines of the NIS compatibility syntax
+// (+ or - first). A line that is no entry (too few fields, an id that is
+// not a number) is skipped and its error told WASIConfig.Errors when the
+// runtime asks; called directly, UserAt and GroupAt return that error. A
+// user or group
+// os/user does not know, and an entry past the last, is fs.ErrNotExist.
+func HostUsers() Users { return hostUsers{} }
+
+// hostUsers is the Users HostUsers returns. report, when it is not nil, is
+// told why a line of /etc/passwd or /etc/group that is no entry was
+// skipped (see usersFor).
+type hostUsers struct{ report func(error) }
+
+func (hostUsers) UserByID(uid int32) (User, error) {
+	return hostUser(user.LookupId(strconv.FormatUint(uint64(uint32(uid)), 10)))
+}
+
+func (hostUsers) UserByName(name string) (User, error) { return hostUser(user.Lookup(name)) }
+
+func (u hostUsers) UserAt(i int) (User, error) {
+	// name:password:uid:gid:gecos:home:shell
+	e, err := hostDatabaseEntry("/etc/passwd", i, u.report, 7, 2, 3)
+	if err != nil {
+		return User{}, err
+	}
+	return User{Name: e.fields[0], UID: e.ids[0], GID: e.ids[1], RealName: e.fields[4], Home: e.fields[5], Shell: e.fields[6]}, nil
+}
+
+func (hostUsers) GroupByID(gid int32) (Group, error) {
+	return hostGroup(user.LookupGroupId(strconv.FormatUint(uint64(uint32(gid)), 10)))
+}
+
+func (hostUsers) GroupByName(name string) (Group, error) { return hostGroup(user.LookupGroup(name)) }
+
+func (u hostUsers) GroupAt(i int) (Group, error) {
+	// name:password:gid:members
+	e, err := hostDatabaseEntry("/etc/group", i, u.report, 3, 2)
+	if err != nil {
+		return Group{}, err
+	}
+	return Group{Name: e.fields[0], GID: e.ids[0]}, nil
+}
+
+// hostUser returns the User of an os/user lookup's result.
+func hostUser(u *user.User, err error) (User, error) {
+	if err != nil {
+		return User{}, hostLookupError(err)
+	}
+	uid, err := parseHostID(u.Uid)
+	if err != nil {
+		return User{}, err
+	}
+	gid, err := parseHostID(u.Gid)
+	if err != nil {
+		return User{}, err
+	}
+	return User{Name: u.Username, UID: uid, GID: gid, RealName: u.Name, Home: u.HomeDir}, nil
+}
+
+// hostGroup returns the Group of an os/user lookup's result.
+func hostGroup(g *user.Group, err error) (Group, error) {
+	if err != nil {
+		return Group{}, hostLookupError(err)
+	}
+	gid, err := parseHostID(g.Gid)
+	if err != nil {
+		return Group{}, err
+	}
+	return Group{Name: g.Name, GID: gid}, nil
+}
+
+// parseHostID returns a user or group id of the host's databases, written
+// as a 32-bit id either unsigned or signed (darwin's nobody is -2, the id
+// 4294967294).
+func parseHostID(text string) (int32, error) {
+	if strings.HasPrefix(text, "-") {
+		id, err := strconv.ParseInt(text, 10, 32)
+		if err != nil {
+			return 0, err
+		}
+		return int32(id), nil
+	}
+	id, err := strconv.ParseUint(text, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	if id <= 1<<31-1 {
+		return int32(id), nil
+	}
+	// An id above the largest int32 is the negative one of the same bits.
+	return int32(int64(id) - 1<<32), nil
+}
+
+// hostLookupError returns err, the error of an os/user lookup, wrapping
+// fs.ErrNotExist as well when it says that there is no such user or group.
+func hostLookupError(err error) error {
+	var (
+		uid   user.UnknownUserIdError
+		name  user.UnknownUserError
+		gid   user.UnknownGroupIdError
+		group user.UnknownGroupError
+	)
+	if errors.As(err, &uid) || errors.As(err, &name) || errors.As(err, &gid) || errors.As(err, &group) {
+		return fmt.Errorf("%w: %w", fs.ErrNotExist, err)
+	}
+	return err
+}
+
+// hostDBEntry is an entry of a database file of the host: its fields, and
+// the ids among them as numbers.
+type hostDBEntry struct {
+	fields []string
+	ids    []int32
+}
+
+// hostDatabaseEntry returns the entry at index of a database file of the
+// host in the files' format (passwd(5), group(5)): one entry a line, at
+// least minFields fields separated by colons, the fields idFields of which
+// are ids. A line that is empty, a comment, or an entry of the NIS
+// compatibility syntax (+ or - first) is no entry; neither is one with too
+// few fields or an id that is not a number: its error is told report and
+// the line skipped, or, without a report, returned. Past the last entry
+// the error is fs.ErrNotExist; the file is read anew for each call.
+func hostDatabaseEntry(path string, index int, report func(error), minFields int, idFields ...int) (hostDBEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return hostDBEntry{}, err
+	}
+	i := index
+	for n, line := range strings.Split(string(data), "\n") {
+		if line == "" || line[0] == '#' || line[0] == '+' || line[0] == '-' {
+			continue
+		}
+		e, err := parseHostDBEntry(line, minFields, idFields)
+		if err != nil {
+			err = fmt.Errorf("%s:%d: %w", path, n+1, err)
+			if report == nil {
+				return hostDBEntry{}, err
+			}
+			report(err)
+			continue
+		}
+		if i == 0 {
+			return e, nil
+		}
+		i--
+	}
+	return hostDBEntry{}, fmt.Errorf("%s has no entry %d: %w", path, index, fs.ErrNotExist)
+}
+
+// parseHostDBEntry returns the entry of a line of a database file of the
+// host (see hostDatabaseEntry).
+func parseHostDBEntry(line string, minFields int, idFields []int) (hostDBEntry, error) {
+	e := hostDBEntry{fields: strings.Split(line, ":")}
+	if len(e.fields) < minFields {
+		return hostDBEntry{}, fmt.Errorf("%d fields, fewer than %d", len(e.fields), minFields)
+	}
+	for _, f := range idFields {
+		id, err := parseHostID(e.fields[f])
+		if err != nil {
+			return hostDBEntry{}, err
+		}
+		e.ids = append(e.ids, id)
+	}
+	return e, nil
+}
+
+// appendWasiString appends s as a little-endian u32 length followed by its
+// bytes: the form every string in a record handed to the guest takes.
+func appendWasiString(rec []byte, s string) []byte {
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(len(s)))
+	return append(rec, s...)
+}
+
+// writeUser answers a user lookup of the guest with the record of u (see
+// Proc_user_by_id), or with the errno of err.
+func (w *WasiStubs) writeUser(m *Module, u User, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if err != nil {
+		return -hookErrno(err)
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(u.UID))
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(u.GID))
+	rec = appendWasiString(rec, u.Name)
+	rec = appendWasiString(rec, u.RealName)
+	rec = appendWasiString(rec, u.Home)
+	rec = appendWasiString(rec, u.Shell)
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// writeGroup answers a group lookup of the guest with the record of g (see
+// Proc_group_by_id), or with the errno of err.
+func (w *WasiStubs) writeGroup(m *Module, g Group, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if err != nil {
+		return -hookErrno(err)
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(g.GID))
+	rec = appendWasiString(rec, g.Name)
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_user_by_id is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_user_by_id") backing getpwuid: the
+// UserByID of the Users (WASIConfig.Users), handed back as a record
+// (writeWasiRecord) of u32 uid, u32 gid, then the login name, the real name,
+// the home directory and the shell as strings (appendWasiString). Returns
+// 0, or a negative errno: ENOENT when there is no such user — always, for an
+// instance without Users — and ERANGE when the buffer is too small.
+func (w *WasiStubs) Proc_user_by_id(m *Module, uid, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUserByID(m, uid, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_user_by_id64 is Proc_user_by_id for a memory64 guest.
+func (w *WasiStubs) Proc_user_by_id64(m *Module, uid int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUserByID(m, uid, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUserByID is the body of Proc_user_by_id and Proc_user_by_id64.
+func (w *WasiStubs) procUserByID(m *Module, uid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	u, err := w.users("proc_user_by_id").UserByID(uid)
+	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_user_by_name is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_user_by_name") backing getpwnam:
+// Proc_user_by_id for the login name at (namePtr, nameLen), by UserByName.
+func (w *WasiStubs) Proc_user_by_name(m *Module, namePtr, nameLen, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUserByName(m, zext(namePtr), nameLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_user_by_name64 is Proc_user_by_name for a memory64 guest.
+func (w *WasiStubs) Proc_user_by_name64(m *Module, namePtr int64, nameLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUserByName(m, uint64(namePtr), nameLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUserByName is the body of Proc_user_by_name and Proc_user_by_name64.
+func (w *WasiStubs) procUserByName(m *Module, namePtr uint64, nameLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	name := w.memBytes(m, namePtr, zext(nameLen))
+	if name == nil {
+		return -_wasiEFAULT
+	}
+	u, err := w.users("proc_user_by_name").UserByName(string(name))
+	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_user_at is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_user_at") backing getpwent: Proc_user_by_id for the index-th
+// entry of the Users, by UserAt. Returns ENOENT past the last entry.
+func (w *WasiStubs) Proc_user_at(m *Module, index, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUserAt(m, index, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_user_at64 is Proc_user_at for a memory64 guest.
+func (w *WasiStubs) Proc_user_at64(m *Module, index int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUserAt(m, index, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUserAt is the body of Proc_user_at and Proc_user_at64.
+func (w *WasiStubs) procUserAt(m *Module, index int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if index < 0 {
+		return -_wasiENOENT
+	}
+	u, err := w.users("proc_user_at").UserAt(int(index))
+	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_group_by_id is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_group_by_id") backing getgrgid: the
+// GroupByID of the Users (WASIConfig.Users), handed back as a record
+// (writeWasiRecord) of u32 gid, then the group's name as a string
+// (appendWasiString). Returns 0 or a negative errno, as Proc_user_by_id.
+func (w *WasiStubs) Proc_group_by_id(m *Module, gid, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procGroupByID(m, gid, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_group_by_id64 is Proc_group_by_id for a memory64 guest.
+func (w *WasiStubs) Proc_group_by_id64(m *Module, gid int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procGroupByID(m, gid, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procGroupByID is the body of Proc_group_by_id and Proc_group_by_id64.
+func (w *WasiStubs) procGroupByID(m *Module, gid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	g, err := w.users("proc_group_by_id").GroupByID(gid)
+	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_group_by_name is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_group_by_name") backing getgrnam:
+// Proc_group_by_id for the name at (namePtr, nameLen), by GroupByName.
+func (w *WasiStubs) Proc_group_by_name(m *Module, namePtr, nameLen, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procGroupByName(m, zext(namePtr), nameLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_group_by_name64 is Proc_group_by_name for a memory64 guest.
+func (w *WasiStubs) Proc_group_by_name64(m *Module, namePtr int64, nameLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procGroupByName(m, uint64(namePtr), nameLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procGroupByName is the body of Proc_group_by_name and Proc_group_by_name64.
+func (w *WasiStubs) procGroupByName(m *Module, namePtr uint64, nameLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	name := w.memBytes(m, namePtr, zext(nameLen))
+	if name == nil {
+		return -_wasiEFAULT
+	}
+	g, err := w.users("proc_group_by_name").GroupByName(string(name))
+	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+}
+
+// Proc_group_at is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_group_at") backing getgrent:
+// Proc_group_by_id for the index-th entry of the Users, by GroupAt.
+// Returns ENOENT past the last entry.
+func (w *WasiStubs) Proc_group_at(m *Module, index, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procGroupAt(m, index, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_group_at64 is Proc_group_at for a memory64 guest.
+func (w *WasiStubs) Proc_group_at64(m *Module, index int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procGroupAt(m, index, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procGroupAt is the body of Proc_group_at and Proc_group_at64.
+func (w *WasiStubs) procGroupAt(m *Module, index int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if index < 0 {
+		return -_wasiENOENT
+	}
+	g, err := w.users("proc_group_at").GroupAt(int(index))
+	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+}
+
+// ----- the system --------------------------------------------------------------
+
+// System is the system the guest runs on (WASIConfig.System): what its
+// uname and gethostname report. An error of Uname fails the guest's call
+// with the errno hookErrno gives. Uname is called without any lock of the
+// WasiStubs held.
+type System interface {
+	Uname() (Uname, error)
+}
+
+// Uname is what uname(2) reports.
+type Uname struct {
+	// Sysname is the name of the system, Nodename the node's name on the
+	// network, Release and Version the system's release and version, and
+	// Machine the machine type.
+	Sysname, Nodename, Release, Version, Machine string
+}
+
+// HostSystem returns the host's system, for WASIConfig.System: its Uname
+// is the host's uname(2) (on darwin, the sysctl values uname reads), and
+// errors.ErrUnsupported on a host the runtime cannot ask.
+func HostSystem() System { return hostSystem{} }
+
+// hostSystem is the System HostSystem returns.
+type hostSystem struct{}
+
+func (hostSystem) Uname() (Uname, error) { return hostUname() }
+
+// Proc_uname is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_uname") backing uname and gethostname: the Uname of the System
+// (WASIConfig.System), handed back as a record (writeWasiRecord) of five
+// strings (appendWasiString): the system's name, the node's name, the
+// release, the version and the machine type. Returns 0, or a negative
+// errno: ENOSYS for an instance without System, ERANGE when the buffer is
+// too small.
+func (w *WasiStubs) Proc_uname(m *Module, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.procUname(m, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Proc_uname64 is Proc_uname for a memory64 guest.
+func (w *WasiStubs) Proc_uname64(m *Module, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.procUname(m, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// procUname is the body of Proc_uname and Proc_uname64.
+func (w *WasiStubs) procUname(m *Module, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	if w.cfg.System == nil {
+		return -_wasiENOSYS
+	}
+	name, err := w.cfg.System.Uname()
+	if err != nil {
+		return -hookErrno(err)
+	}
+	var rec []byte
+	for _, field := range [...]string{name.Sysname, name.Nodename, name.Release, name.Version, name.Machine} {
+		rec = appendWasiString(rec, field)
+	}
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// ----- the services database ---------------------------------------------------
+
+// Services is a services database (WASIConfig.Services): what the guest's
+// getservbyname and getservbyport find. proto is the protocol ("tcp",
+// "udp", ...), or "" for a service of any protocol. A lookup that finds
+// nothing returns an error that is fs.ErrNotExist: the guest's call fails
+// with ENOENT. Any other error fails it with the errno hookErrno gives. Its
+// methods are called without any lock of the WasiStubs held.
+type Services interface {
+	// ServiceByName returns the service called name, by its name or by an
+	// alias.
+	ServiceByName(name, proto string) (Service, error)
+	// ServiceByPort returns the service on port.
+	ServiceByPort(port int, proto string) (Service, error)
+}
+
+// Service is an entry of the services database, as services(5) has it.
+type Service struct {
+	Name    string
+	Aliases []string
+	Port    int
+	Proto   string
+}
+
+// HostServices returns the services database of the host, for
+// WASIConfig.Services: the file /etc/services, read anew for each lookup,
+// whose first entry that matches is the one found. An error reading the
+// file is returned; a line that is no entry is skipped and its error told
+// WASIConfig.Errors when the runtime asks, and returned when the lookup is
+// called directly.
+func HostServices() Services { return hostServices{} }
+
+// hostServices is the Services HostServices returns. report, when it is
+// not nil, is told why a line of /etc/services that is no entry was skipped
+// (see Sock_service).
+type hostServices struct{ report func(error) }
+
+func (h hostServices) ServiceByName(name, proto string) (Service, error) {
+	return findHostService(hostServicesFile, h.report, func(s Service) bool {
+		return (proto == "" || s.Proto == proto) && (s.Name == name || slices.Contains(s.Aliases, name))
+	})
+}
+
+func (h hostServices) ServiceByPort(port int, proto string) (Service, error) {
+	return findHostService(hostServicesFile, h.report, func(s Service) bool {
+		return (proto == "" || s.Proto == proto) && s.Port == port
+	})
+}
+
+// hostServicesFile is the services database of the host.
+const hostServicesFile = "/etc/services"
+
+// findHostService returns the first entry of the services database at path,
+// services(5) — one service a line: its name, port/protocol, and aliases,
+// with comments from a # to the end of the line — that match accepts. A
+// line that is no entry is skipped and its error told report, or, without
+// a report, its error returned.
+func findHostService(path string, report func(error), match func(Service) bool) (Service, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Service{}, err
+	}
+	for n, line := range strings.Split(string(raw), "\n") {
+		line, _, _ = strings.Cut(line, "#")
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		entry, err := parseHostService(fields)
+		if err != nil {
+			err = fmt.Errorf("%s:%d: %w", path, n+1, err)
+			if report == nil {
+				return Service{}, err
+			}
+			report(err)
+			continue
+		}
+		if match(entry) {
+			return entry, nil
+		}
+	}
+	return Service{}, fmt.Errorf("no such service in %s: %w", path, fs.ErrNotExist)
+}
+
+// parseHostService returns the entry of the fields of a line of the
+// services database (see findHostService).
+func parseHostService(fields []string) (Service, error) {
+	if len(fields) < 2 {
+		return Service{}, fmt.Errorf("no port/protocol after %q", fields[0])
+	}
+	portText, proto, isPair := strings.Cut(fields[1], "/")
+	if !isPair {
+		return Service{}, fmt.Errorf("%q is no port/protocol", fields[1])
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		return Service{}, err
+	}
+	return Service{Name: fields[0], Aliases: fields[2:], Port: int(port), Proto: proto}, nil
+}
+
+// Sock_service is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_service") backing getservbyname and getservbyport: the
+// ServiceByName of the Services (WASIConfig.Services) for the name at
+// (namePtr, nameLen) when byPort is 0, its ServiceByPort for port
+// otherwise, for the protocol at (protoPtr, protoLen), any when it is
+// empty. The record (writeWasiRecord) is the port (u32), the name, the
+// protocol, the number of aliases (u32) and the aliases, strings as
+// appendWasiString writes them. Returns 0, or a negative errno: ENOENT when
+// there is no such service — always, for an instance without Services.
+func (w *WasiStubs) Sock_service(m *Module, namePtr, nameLen, port, byPort, protoPtr, protoLen, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.sockService(m, zext(namePtr), nameLen, port, byPort, zext(protoPtr), protoLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Sock_service64 is Sock_service for a memory64 guest.
+func (w *WasiStubs) Sock_service64(m *Module, namePtr int64, nameLen, port, byPort int32, protoPtr int64, protoLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.sockService(m, uint64(namePtr), nameLen, port, byPort, uint64(protoPtr), protoLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// sockService is the body of Sock_service and Sock_service64.
+func (w *WasiStubs) sockService(m *Module, namePtr uint64, nameLen, port, byPort int32, protoPtr uint64, protoLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	nameBytes := w.memBytes(m, namePtr, zext(nameLen))
+	protoBytes := w.memBytes(m, protoPtr, zext(protoLen))
+	if nameBytes == nil || protoBytes == nil {
+		return -_wasiEFAULT
+	}
+	services := w.cfg.Services
+	switch host := services.(type) {
+	case nil:
+		return -_wasiENOENT
+	case hostServices:
+		// The host's tells the lines of its file it skips.
+		host.report = func(err error) { w.reportError("sock_service", err) }
+		services = host
+	}
+	var (
+		entry Service
+		err   error
+	)
+	if byPort != 0 {
+		entry, err = services.ServiceByPort(int(port), string(protoBytes))
+	} else {
+		entry, err = services.ServiceByName(string(nameBytes), string(protoBytes))
+	}
+	if err != nil {
+		return -hookErrno(err)
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, uint32(entry.Port))
+	rec = appendWasiString(rec, entry.Name)
+	rec = appendWasiString(rec, entry.Proto)
+	rec = binary.LittleEndian.AppendUint32(rec, uint32(len(entry.Aliases)))
+	for _, alias := range entry.Aliases {
+		rec = appendWasiString(rec, alias)
+	}
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
+// ----- numbers of another system -----------------------------------------------
+
+// Numbering gives the guest the numbers of another system — its error
+// numbers and the like — in place of those of the guest's own C library
+// (WASIConfig.Numbering), for a guest whose program shares numbers with
+// code that is not the guest's. The numbers come in families, which the
+// guest's C library numbers: family 1 is the error numbers. Its method is
+// called without any lock of the WasiStubs held.
+type Numbering interface {
+	// NumberAt returns the index-th number of family, from 0: the name the
+	// number has in C and its value. ok is false past the last number of
+	// the family, at index 0 for a family it has no numbers of.
+	NumberAt(family, index int32) (name string, value int64, ok bool)
+}
+
+// Host_numbering is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "host_numbering"): it tells the guest whose
+// numbers its program sees. 0: the numbers of the guest's own C library,
+// for an instance without Numbering. 1: the Numbering's
+// (WASIConfig.Numbering), which the guest reads with host_number_at.
+func (w *WasiStubs) Host_numbering(m *Module) int32 {
+	if w.cfg.Numbering == nil {
+		return 0
+	}
+	return 1
+}
+
+// Host_numbering64 is Host_numbering for a memory64 guest.
+func (w *WasiStubs) Host_numbering64(m *Module) int32 {
+	return w.Host_numbering(m)
+}
+
+// Host_number_at is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "host_number_at"): the index-th number of a
+// family of the Numbering (WASIConfig.Numbering). The name the number has
+// in C is written at namePtr (at most nameCap bytes, no terminator) and its
+// length at nameLenPtr (u32); the number at valuePtr (i64). Returns 0, or a
+// negative errno: ENOENT past the last number of the family — at once, for
+// an instance without Numbering — and ERANGE for a name longer than
+// nameCap.
+func (w *WasiStubs) Host_number_at(m *Module, family, index, namePtr, nameCap, nameLenPtr, valuePtr int32) int32 {
+	return w.hostNumberAt(m, family, index, zext(namePtr), nameCap, zext(nameLenPtr), zext(valuePtr))
+}
+
+// Host_number_at64 is Host_number_at for a memory64 guest.
+func (w *WasiStubs) Host_number_at64(m *Module, family, index int32, namePtr int64, nameCap int32, nameLenPtr, valuePtr int64) int32 {
+	return w.hostNumberAt(m, family, index, uint64(namePtr), nameCap, uint64(nameLenPtr), uint64(valuePtr))
+}
+
+// hostNumberAt is the body of Host_number_at and Host_number_at64.
+func (w *WasiStubs) hostNumberAt(m *Module, family, index int32, namePtr uint64, nameCap int32, nameLenPtr, valuePtr uint64) int32 {
+	if w.cfg.Numbering == nil {
+		return -_wasiENOENT
+	}
+	name, value, ok := w.cfg.Numbering.NumberAt(family, index)
+	if !ok {
+		return -_wasiENOENT
+	}
+	if int64(len(name)) > int64(nameCap) {
+		return -_wasiERANGE
+	}
+	nameOut := w.memBytes(m, namePtr, uint64(len(name)))
+	nameLen := w.memBytes(m, nameLenPtr, 4)
+	valueOut := w.memBytes(m, valuePtr, 8)
+	if nameOut == nil || nameLen == nil || valueOut == nil {
+		return -_wasiEFAULT
+	}
+	copy(nameOut, name)
+	binary.LittleEndian.PutUint32(nameLen, uint32(len(name)))
+	binary.LittleEndian.PutUint64(valueOut, uint64(value))
+	return _wasiESUCCESS
+}
+
+// ----- the system logger -------------------------------------------------------
+
+// Syslogger is a system logger as a guest's syslog(3) uses it
+// (WASIConfig.Syslog). An error of its methods fails the guest's call with
+// the errno hookErrno gives.
+//
+// An instance and the instances forked from it share the Syslogger, each
+// calling it from its own goroutine, without any lock of the WasiStubs
+// held.
+type Syslogger interface {
+	// Open is the guest's openlog: it reports whether messages from ident
+	// can be delivered. options and facility are as in SyslogMessage.
+	Open(ident string, options, facility int32) error
+	// Log delivers one message.
+	Log(msg SyslogMessage) error
+	// Close is the guest's closelog.
+	Close() error
+}
+
+// SyslogMessage is one message a guest logs, as syslog(3) takes it apart.
+type SyslogMessage struct {
+	// Severity is the level, 0 (emergency) to 7 (debug).
+	Severity int32
+	// Facility is the facility's number, 0 (kernel) to 23 (local7): the
+	// value syslog.h shifts left by three.
+	Facility int32
+	// Options are the openlog option flags: SyslogOptPID and the rest.
+	Options int32
+	// Ident is the tag openlog set, "" when the guest set none.
+	Ident string
+	// Message is the message text.
+	Message string
+}
+
+// The openlog option flags in SyslogMessage.Options and Syslogger.Open,
+// with the values the guest passes (Linux's).
+const (
+	SyslogOptPID    int32 = 0x01 // LOG_PID: log the process id with each message
+	SyslogOptCons   int32 = 0x02 // LOG_CONS: write to the console when the logger fails
+	SyslogOptNDelay int32 = 0x08 // LOG_NDELAY: connect at openlog
+	SyslogOptPerror int32 = 0x20 // LOG_PERROR: the guest also writes the message to its stderr
+)
+
+// HostSyslog returns the host's system logger, for WASIConfig.Syslog:
+// package log/syslog's connection to the local syslog daemon, at most one
+// for each facility the guest logs with: a message or an openlog with
+// another ident than the facility's connection was made for replaces it.
+// HostSyslog connects for the
+// facility LOG_USER without an ident, and returns the error of that; where
+// package log/syslog has no logger (windows, plan9) the error is
+// errors.ErrUnsupported. The messages are written as package log/syslog
+// writes them, which always tags them with the process id, LOG_PID or not;
+// LOG_CONS and LOG_NDELAY change nothing. An ident of "" is the name of the
+// program (os.Args[0]), as for syslog(3).
+func HostSyslog() (Syslogger, error) { return newHostSyslog() }
+
+// Proc_syslog_open is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_syslog_open") backing openlog(): the
+// guest is about to log as (identPtr, identLen) with the given option flags
+// (SyslogOpt*) and default facility number. Returns 0 when the Syslogger
+// (WASIConfig.Syslog) accepts, or a negative errno: EINVAL for a facility
+// out of range (0..23), ENOSYS for an instance without a Syslogger,
+// otherwise what the logger reported.
+func (w *WasiStubs) Proc_syslog_open(m *Module, identPtr, identLen, options, facility int32) int32 {
+	return w.procSyslogOpen(m, zext(identPtr), identLen, options, facility)
+}
+
+// Proc_syslog_open64 is Proc_syslog_open for a memory64 guest.
+func (w *WasiStubs) Proc_syslog_open64(m *Module, identPtr int64, identLen, options, facility int32) int32 {
+	return w.procSyslogOpen(m, uint64(identPtr), identLen, options, facility)
+}
+
+// procSyslogOpen is the body of Proc_syslog_open and Proc_syslog_open64.
+func (w *WasiStubs) procSyslogOpen(m *Module, identPtr uint64, identLen, options, facility int32) int32 {
+	ident := w.memBytes(m, identPtr, zext(identLen))
+	if ident == nil {
+		return -_wasiEFAULT
+	}
+	if facility < 0 || facility > 23 {
+		return -_wasiEINVAL
+	}
+	if w.cfg.Syslog == nil {
+		return -_wasiENOSYS
+	}
+	if err := w.cfg.Syslog.Open(string(ident), options, facility); err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_syslog is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_syslog") backing syslog(): one message, as the values
+// syslog(3) works with — the severity (0..7), the facility number (0..23),
+// the option flags and ident of the guest's openlog, and the message text.
+// Returns 0 once the Syslogger (WASIConfig.Syslog) has taken the message,
+// or a negative errno: ENOSYS for an instance without one, EINVAL for a
+// severity or facility out of range, otherwise what the logger reported.
+func (w *WasiStubs) Proc_syslog(m *Module, severity, facility, options, identPtr, identLen, msgPtr, msgLen int32) int32 {
+	return w.procSyslog(m, severity, facility, options, zext(identPtr), identLen, zext(msgPtr), msgLen)
+}
+
+// Proc_syslog64 is Proc_syslog for a memory64 guest.
+func (w *WasiStubs) Proc_syslog64(m *Module, severity, facility, options int32, identPtr int64, identLen int32, msgPtr int64, msgLen int32) int32 {
+	return w.procSyslog(m, severity, facility, options, uint64(identPtr), identLen, uint64(msgPtr), msgLen)
+}
+
+// procSyslog is the body of Proc_syslog and Proc_syslog64.
+func (w *WasiStubs) procSyslog(m *Module, severity, facility, options int32, identPtr uint64, identLen int32, msgPtr uint64, msgLen int32) int32 {
+	ident := w.memBytes(m, identPtr, zext(identLen))
+	text := w.memBytes(m, msgPtr, zext(msgLen))
+	if ident == nil || text == nil {
+		return -_wasiEFAULT
+	}
+	if severity < 0 || severity > 7 || facility < 0 || facility > 23 {
+		return -_wasiEINVAL
+	}
+	if w.cfg.Syslog == nil {
+		return -_wasiENOSYS
+	}
+	err := w.cfg.Syslog.Log(SyslogMessage{
+		Severity: severity,
+		Facility: facility,
+		Options:  options,
+		Ident:    string(ident),
+		Message:  string(text),
+	})
+	if err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_syslog_close is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_syslog_close") backing closelog().
+// Returns 0, or a negative errno as Proc_syslog_open.
+func (w *WasiStubs) Proc_syslog_close(m *Module) int32 {
+	if w.cfg.Syslog == nil {
+		return -_wasiENOSYS
+	}
+	if err := w.cfg.Syslog.Close(); err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_syslog_close64 is Proc_syslog_close for a memory64 guest.
+func (w *WasiStubs) Proc_syslog_close64(m *Module) int32 {
+	return w.Proc_syslog_close(m)
+}
+
+// ----- access, FIFOs and locks -------------------------------------------------
+
+// Path_access is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "path_access") backing access and faccessat: whether the guest may
+// make the accesses of amode to the file at the preopen-relative path
+// (pathPtr, pathLen). amode is access's (F_OK 0, or any of X_OK 1, W_OK 2,
+// R_OK 4); flags bit 0 (wasiAccessEffective) asks with the effective ids
+// instead of the real ones, as AT_EACCESS does.
+//
+// A file of the whole host filesystem (HostFS("/")) is asked about with the
+// host's own check (faccessat(2)), which also knows access control lists
+// and read-only mounts, for the host process's ids; where the host cannot
+// say (an effective-id question on darwin from a process whose effective
+// ids are not its real ones, a host without the call), and for a file of
+// any other FS, by its mode bits and owner, for the ids and the
+// supplementary groups of the Process (WASIConfig.Process): user id 0 may
+// read and write anything, and run what has any x bit, or search any
+// directory. Returns 0, or a negative errno: EACCES when the access is
+// refused, ENOENT and the like when the file cannot be found, EINVAL for an
+// amode or flags it does not know.
+func (w *WasiStubs) Path_access(m *Module, pathPtr, pathLen, amode, flags int32) int32 {
+	return w.pathAccess(m, zext(pathPtr), pathLen, amode, flags)
+}
+
+// Path_access64 is Path_access for a memory64 guest.
+func (w *WasiStubs) Path_access64(m *Module, pathPtr int64, pathLen, amode, flags int32) int32 {
+	return w.pathAccess(m, uint64(pathPtr), pathLen, amode, flags)
+}
+
+// The bits of Path_access's amode (access's R_OK, W_OK, X_OK) and flags.
+const (
+	wasiAccessExec      int32 = 1
+	wasiAccessWrite     int32 = 2
+	wasiAccessRead      int32 = 4
+	wasiAccessEffective int32 = 1
+)
+
+// pathAccess is the body of Path_access and Path_access64.
+func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	if amode&^(wasiAccessRead|wasiAccessWrite|wasiAccessExec) != 0 || flags&^wasiAccessEffective != 0 {
+		return -_wasiEINVAL
+	}
+	name, ok := w.allowedPath(string(pathSlice), amode&wasiAccessWrite != 0)
+	if !ok {
+		return -_wasiEACCES
+	}
+	effective := flags&wasiAccessEffective != 0
+	w.mu.Lock()
+	fsys := w.fs()
+	w.mu.Unlock()
+	if whole, isHost := fsys.(osFS); isHost {
+		if errno, asked := hostAccess(whole.join(name), uint32(amode), effective); asked {
+			return -errno
+		}
+	}
+	fi, err := fsys.Stat(name)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	if amode == 0 {
+		return _wasiESUCCESS
+	}
+	proc := w.guestProcess()
+	ids := proc.IDs()
+	uid, gid := ids.UID, ids.GID
+	if effective {
+		uid, gid = ids.EUID, ids.EGID
+	}
+	groups, err := proc.Groups()
+	if err != nil {
+		return -hookErrno(err)
+	}
+	if !modeAllows(fi, fileStatOf(fi), uint32(amode), uint32(uid), uint32(gid), groups) {
+		return -_wasiEACCES
+	}
+	return _wasiESUCCESS
+}
+
+// modeAllows reports whether a process of user uid and group gid (with the
+// supplementary groups) may make the accesses of amode to the file fi
+// describes, by its mode bits, as access(2) decides without access control
+// lists: the owner's bits for its owner, the group's for a member of its
+// group, the others' for the rest; uid 0 may read and write anything, and
+// run what has any x bit, or search any directory.
+func modeAllows(fi os.FileInfo, st fileStat, amode, uid, gid uint32, groups []int32) bool {
+	perm := uint32(fi.Mode().Perm())
+	if uid == 0 {
+		return amode&uint32(wasiAccessExec) == 0 || fi.IsDir() || perm&0o111 != 0
+	}
+	shift := uint32(0)
+	switch {
+	case st.uid == uid:
+		shift = 6
+	case st.gid == gid || slices.Contains(groups, int32(st.gid)):
+		shift = 3
+	}
+	return (perm>>shift)&amode == amode
+}
+
+// Path_mkfifo is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "path_mkfifo") backing mkfifo: it creates a FIFO at the
+// preopen-relative path with the given permission bits, less the
+// instance's umask. Returns 0, or a negative errno: ENOSYS when the
+// filesystem of the instance makes no FIFOs — one only the whole host
+// filesystem (HostFS("/")) makes.
+func (w *WasiStubs) Path_mkfifo(m *Module, pathPtr, pathLen, mode int32) int32 {
+	return w.pathMkfifo(m, zext(pathPtr), pathLen, mode)
+}
+
+// Path_mkfifo64 is Path_mkfifo for a memory64 guest.
+func (w *WasiStubs) Path_mkfifo64(m *Module, pathPtr int64, pathLen, mode int32) int32 {
+	return w.pathMkfifo(m, uint64(pathPtr), pathLen, mode)
+}
+
+// pathMkfifo is the body of Path_mkfifo and Path_mkfifo64.
+func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	name, ok := w.allowedPath(string(pathSlice), true)
+	if !ok {
+		return -_wasiEACCES
+	}
+	w.mu.Lock()
+	fsys := w.fs()
+	w.mu.Unlock()
+	maker, can := fsys.(interface {
+		Mkfifo(name string, perm os.FileMode) error
+	})
+	if !can {
+		return -_wasiENOSYS
+	}
+	if err := maker.Mkfifo(name, w.createMode(unixFileMode(uint32(mode)).Perm())); err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Mkfifo creates a FIFO in the host filesystem.
+func (o osFS) Mkfifo(name string, perm os.FileMode) error {
+	return makeHostFIFO(o.join(name), perm)
+}
+
+// openFIFO opens the FIFO name, which fi describes, for reading or for
+// writing the way a blocking open(2) does: it waits until the other end is
+// open too, on a goroutine of its own, and a signal posted to the guest
+// ends the wait with EINTR. The open cannot be called off, so it is made to
+// return: the FIFO is opened once more, for reading and writing, which is
+// the other end of either and does not wait, and both opens are closed
+// again before the guest is told — an open that was interrupted leaves no
+// end of the FIFO open behind, which the next open of the other end would
+// take for a peer. When that open fails, or opens another file than fi
+// (the name was given to another file meanwhile), its error is told
+// WASIConfig.Errors, and the first open is left to return when someone
+// else opens the FIFO: the goroutine closes what it opened then. So it
+// does too when the wait ends because the guest is ended.
+func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, fi os.FileInfo, flag int, perm os.FileMode) (File, int32) {
+	var f File
+	call := newDetachedCall(func(err error) {
+		if err != nil {
+			return
+		}
+		if err := f.Close(); err != nil {
+			w.reportError("path_open", err)
+		}
+	})
+	defer call.leave()
+	go func() {
+		var err error
+		f, err = openFile(name, flag, perm)
+		call.finish(err)
+	}()
+	if w.awaitInterruptibly(call.done) {
+		err := call.take()
+		if err != nil {
+			return nil, mapOSError(err)
+		}
+		return f, _wasiESUCCESS
+	}
+	end, err := openFile(name, os.O_RDWR, 0)
+	if err != nil {
+		// The guest is told EINTR: no call of its is left to fail with
+		// this.
+		w.reportError("path_open", err)
+		return nil, _wasiEINTR
+	}
+	endInfo, err := end.Stat()
+	if err == nil && !os.SameFile(fi, endInfo) {
+		err = fmt.Errorf("%s is another file than the FIFO whose open waits", name)
+	}
+	if err != nil {
+		w.reportError("path_open", errors.Join(err, end.Close()))
+		return nil, _wasiEINTR
+	}
+	<-call.done
+	closeErr := end.Close()
+	if openErr := call.take(); openErr == nil {
+		closeErr = errors.Join(closeErr, f.Close())
+	}
+	if closeErr != nil {
+		return nil, mapOSError(closeErr)
+	}
+	return nil, _wasiEINTR
+}
+
+// detachedCall is a call made on a goroutine of its own that the guest
+// waits for and may stop waiting for: interrupted by a signal, or ended
+// while it waits. What the call did is undone (undo) when the waiter has
+// left without its result: by the goroutine when the call returns after
+// that, by the waiter when it returned before.
+type detachedCall struct {
+	// done is closed once the call has returned (finish).
+	done chan struct{}
+	// undo undoes what a call that returned err did.
+	undo func(err error)
+
+	mu sync.Mutex
+	// returned, taken and left are set when the call has returned, when
+	// the waiter has taken its result, and when the waiter has left
+	// without it.
+	returned, taken, left bool
+	err                   error
+}
+
+// newDetachedCall returns a detachedCall whose call is undone by undo.
+func newDetachedCall(undo func(err error)) *detachedCall {
+	return &detachedCall{done: make(chan struct{}), undo: undo}
+}
+
+// finish is called by the goroutine with the call's error, once.
+func (c *detachedCall) finish(err error) {
+	c.mu.Lock()
+	c.returned, c.err = true, err
+	left := c.left
+	c.mu.Unlock()
+	close(c.done)
+	if left {
+		c.undo(err)
+	}
+}
+
+// take returns the call's error, which the waiter keeps: nothing is
+// undone. Only after done is closed.
+func (c *detachedCall) take() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.taken = true
+	return c.err
+}
+
+// leave is deferred by the waiter: unless it took the result, the call is
+// undone — now when it has returned, by finish otherwise.
+func (c *detachedCall) leave() {
+	c.mu.Lock()
+	if c.taken || c.left {
+		c.mu.Unlock()
+		return
+	}
+	c.left = true
+	returned, err := c.returned, c.err
+	c.mu.Unlock()
+	if returned {
+		c.undo(err)
+	}
+}
+
+// LockFS is an FS whose files take advisory locks, for the guest's flock
+// (fd_flock). The guest of an FS that is not a LockFS has no such locks:
+// its flock of a file fails with ENOSYS. HostFS and NewMemFS return
+// LockFSes.
+type LockFS interface {
+	FS
+	// Flock applies or removes an advisory lock on f, a file the FS opened,
+	// with the semantics of flock(2): how is LOCK_SH (1) for a shared lock,
+	// LOCK_EX (2) for an exclusive one or LOCK_UN (8) to remove the lock,
+	// with LOCK_NB (4) added for a lock that is not to be waited for — one
+	// that cannot be had at once then fails with syscall.EAGAIN. The lock
+	// belongs to the open file: everything that shares f shares the lock,
+	// another open of the same file competes for it, and closing f removes
+	// it.
+	//
+	// A call that waits runs on a goroutine of its own, without any lock
+	// of the WasiStubs held, and is not called off: when a signal posted to
+	// the guest ends the guest's wait first, the lock the call takes later
+	// is removed at once (LOCK_UN).
+	Flock(f File, how int) error
+}
+
+// The operations of LockFS.Flock: flock(2)'s LOCK_SH, LOCK_EX, LOCK_NB and
+// LOCK_UN, which have these values on every system that has them.
+const (
+	flockShared    = 1
+	flockExclusive = 2
+	flockNonblock  = 4
+	flockUnlock    = 8
+)
+
+// Flock implements LockFS.Flock for the files of the host filesystem.
+func (osFS) Flock(f File, how int) error {
+	file, isHost := f.(*os.File)
+	if !isHost {
+		return syscall.EBADF
+	}
+	return flockOSFile(file, how)
+}
+
+// Flock implements LockFS.Flock for the files of the directory.
+func (rootFS) Flock(f File, how int) error {
+	file, isHost := f.(*os.File)
+	if !isHost {
+		return syscall.EBADF
+	}
+	return flockOSFile(file, how)
+}
+
+// Flock implements LockFS.Flock for the files of this MemFS.
+func (fsys *MemFS) Flock(f File, how int) error {
+	mf, ok := f.(*memFile)
+	if !ok || mf.fsys != fsys {
+		return syscall.EBADF
+	}
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	lock := how &^ flockNonblock
+	switch lock {
+	case flockUnlock:
+		mf.unlockLocked()
+		return nil
+	case flockShared, flockExclusive:
+	default:
+		return syscall.EINVAL
+	}
+	node := mf.node
+	if held, holds := node.locks[mf]; holds {
+		if held == lock {
+			return nil
+		}
+		// As flock(2) converts a lock: the lock held goes first, so a
+		// conversion that waits, or fails because it may not, leaves
+		// the file without one.
+		mf.unlockLocked()
+	}
+	for node.lockConflicts(mf, lock) {
+		if how&flockNonblock != 0 {
+			return syscall.EAGAIN
+		}
+		if fsys.lockReleased == nil {
+			fsys.lockReleased = sync.NewCond(&fsys.mu)
+		}
+		fsys.lockReleased.Wait()
+	}
+	if node.locks == nil {
+		node.locks = map[*memFile]int{}
+	}
+	node.locks[mf] = lock
+	return nil
+}
+
+// lockConflicts reports whether an open file other than f holds a lock on n
+// that rules out f taking lock (flockShared or flockExclusive). Caller
+// holds the MemFS lock.
+func (n *memNode) lockConflicts(f *memFile, lock int) bool {
+	for holder, held := range n.locks {
+		if holder != f && (lock == flockExclusive || held == flockExclusive) {
+			return true
+		}
+	}
+	return false
+}
+
+// unlockLocked removes the lock f holds, if any, and wakes the waiters.
+// Caller holds the MemFS lock.
+func (f *memFile) unlockLocked() {
+	if _, held := f.node.locks[f]; !held {
+		return
+	}
+	delete(f.node.locks, f)
+	if f.fsys.lockReleased != nil {
+		f.fsys.lockReleased.Broadcast()
+	}
+}
+
+// Fd_flock is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "fd_flock") backing flock(). lock is 0 to unlock, 1 for a shared and
+// 2 for an exclusive lock; wait is non-zero when the call may block until
+// the lock is granted, and otherwise a lock held elsewhere makes it fail
+// with EAGAIN. The lock belongs to the open descriptor: every fd that
+// shares it (dup, fork) shares the lock, and the lock goes when the last of
+// them is closed. A file of the FS is locked by the FS (LockFS); a
+// standard stream that is a file of the host (an *os.File) by the host, and
+// any other has no other opener to exclude, so its lock is granted. Returns
+// 0, or a negative errno: ENOSYS for a file of an FS that is no LockFS,
+// EINVAL for a descriptor of no file (a socket); a waiting call ends with
+// EINTR when a signal is posted to the guest (see LockFS).
+func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
+	var how int
+	switch lock {
+	case 0:
+		how = flockUnlock
+	case 1:
+		how = flockShared
+	case 2:
+		how = flockExclusive
+	default:
+		return -_wasiEINVAL
+	}
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	fsys := w.fs()
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	var flock func(how int) error
+	switch {
+	case op.f != nil:
+		locks, can := fsys.(LockFS)
+		if !can {
+			return -_wasiENOSYS
+		}
+		flock = func(how int) error { return locks.Flock(op.f, how) }
+	case op.stdio != 0:
+		stream, isHost := [...]any{w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr}[op.stdio-1].(*os.File)
+		if !isHost {
+			return _wasiESUCCESS
+		}
+		flock = func(how int) error { return flockOSFile(stream, how) }
+	default:
+		return -_wasiEINVAL
+	}
+	set := func(wait bool) error {
+		if !wait && how != flockUnlock {
+			return flock(how | flockNonblock)
+		}
+		return flock(how)
+	}
+	interrupted, err := w.takeLock("fd_flock", fmt.Sprintf("fd_flock %d", how), op, how == flockUnlock, wait != 0, set, func() error { return flock(flockUnlock) })
+	if interrupted {
+		return -_wasiEINTR
+	}
+	if err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Fd_flock64 is Fd_flock for a memory64 guest.
+func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
+	return w.Fd_flock(m, fd, lock, wait)
+}
+
+// takeLock takes or removes (unlocks) a lock of the descriptor op with
+// set, which may wait for a lock held elsewhere when wait is true and
+// must not otherwise. A call that may wait is made once, on a goroutine of
+// its own (detachedCall), and the guest waits for it until a signal is
+// posted to it (awaitInterruptibly): then interrupted is true. When the
+// guest stops waiting — interrupted, or ended while it waits — the lock
+// the call takes later is removed with unlock at once. Until that is done,
+// a lock of op that may wait waits for it first, and one that may not
+// fails with syscall.EAGAIN, so that removing the late lock removes none
+// the guest asked for afterwards. err is the error of set; an error of
+// unlock is told WASIConfig.Errors under name, the name of the import.
+//
+// The descriptor may be shared, and several of its sharers may wait for
+// the same lock (key: the import's name and the lock asked for) at once;
+// their calls all get it when it is granted. So a late grant is removed
+// only when no other wait of the descriptor for that lock is in progress
+// and none has taken it: a lock a wait took counts as held until the
+// descriptor's next lock call by this import (lockHeld).
+func (w *WasiStubs) takeLock(name, key string, op *wasiOpen, unlocks, wait bool, set func(wait bool) error, unlock func() error) (interrupted bool, err error) {
+	op.mu.Lock()
+	pending := op.lockPending
+	op.mu.Unlock()
+	if pending != nil && !unlocks {
+		if !wait {
+			return false, syscall.EAGAIN
+		}
+		if !w.awaitInterruptibly(pending) {
+			return true, nil
+		}
+	}
+	op.mu.Lock()
+	for held := range op.lockHeld {
+		if strings.HasPrefix(held, name+" ") {
+			delete(op.lockHeld, held)
+		}
+	}
+	op.mu.Unlock()
+	if unlocks || !wait {
+		return false, set(false)
+	}
+	released := make(chan struct{})
+	call := newDetachedCall(func(err error) {
+		op.mu.Lock()
+		shared := op.lockWaits[key] > 0 || op.lockHeld[key]
+		op.mu.Unlock()
+		if err == nil && !shared {
+			// A descriptor the guest has closed meanwhile has no lock
+			// left: its close released it.
+			if err := unlock(); err != nil && !errors.Is(err, fs.ErrClosed) {
+				// The guest has stopped waiting: no call of its is left
+				// to fail with this.
+				w.reportError(name, err)
+			}
+		}
+		op.mu.Lock()
+		if op.lockPending == released {
+			op.lockPending = nil
+		}
+		op.mu.Unlock()
+		close(released)
+	})
+	op.mu.Lock()
+	if op.lockWaits == nil {
+		op.lockWaits = map[string]int{}
+	}
+	op.lockWaits[key]++
+	op.mu.Unlock()
+	taken := false
+	defer func() {
+		op.mu.Lock()
+		if op.lockWaits[key]--; op.lockWaits[key] == 0 {
+			delete(op.lockWaits, key)
+		}
+		if !taken {
+			op.lockPending = released
+		}
+		op.mu.Unlock()
+		if !taken {
+			call.leave()
+		}
+	}()
+	go func() { call.finish(set(true)) }()
+	if w.awaitInterruptibly(call.done) {
+		taken = true
+		err := call.take()
+		if err == nil {
+			op.mu.Lock()
+			if op.lockHeld == nil {
+				op.lockHeld = map[string]bool{}
+			}
+			op.lockHeld[key] = true
+			op.mu.Unlock()
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// recordLock is a POSIX record lock as Fd_lock passes it: the record at
+// its lockPtr, 32 bytes, little-endian.
+//
+//	i32 type    0 F_RDLCK, 1 F_WRLCK, 2 F_UNLCK
+//	i32 whence  0 SEEK_SET, 1 SEEK_CUR, 2 SEEK_END
+//	i64 start
+//	i64 len     0: to the end of the file, however long it grows
+//	i32 pid     F_GETLK: the process that holds the lock in the way
+//	i32 (pad)
+type recordLock struct {
+	typ, whence int32
+	start, len  int64
+	pid         int32
+}
+
+// The commands of Fd_lock, and the type of a recordLock that unlocks.
+const (
+	recordLockGet  int32 = 0 // F_GETLK
+	recordLockSet  int32 = 1 // F_SETLK
+	recordLockWait int32 = 2 // F_SETLKW
+	recordUnlock   int32 = 2 // F_UNLCK
+)
+
+// Fd_lock is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "fd_lock") backing fcntl's F_GETLK, F_SETLK and F_SETLKW: a POSIX
+// record lock of a file of the host, by the host's fcntl(2). cmd is
+// recordLockGet, recordLockSet or recordLockWait, and lockPtr the lock
+// (recordLock). recordLockGet writes back the lock that would be in the way
+// of the one asked about, or that one with type F_UNLCK when none would.
+// recordLockWait waits for a lock held elsewhere with one F_SETLKW on a
+// goroutine of its own, until a signal is posted to the guest (EINTR); the
+// range it asked for, made one from the start of the file before the wait,
+// is unlocked again at once when the lock is taken after that (see
+// takeLock). A blocked F_SETLKW cannot be called off, and a record lock is
+// one per range, not one per request: the lock it takes later replaces in
+// that range a lock the guest held there before it waited, of either type,
+// and the unlock then removes that one as well — the guest holds no lock
+// in that range after an interrupted F_SETLKW is granted.
+//
+// On Linux the locks are the open file description's (F_OFD_SETLK,
+// F_OFD_SETLKW, F_OFD_GETLK): the descriptors that share it (dup, fork)
+// share its locks, another open of the file — of the same host process, by
+// another instance or by the same — competes for them, and closing another
+// descriptor of the file keeps them. The pid of a lock in the way is -1
+// when it is such a lock, as Linux reports, and the host's pid of its
+// process for a lock of fcntl's own kind. Elsewhere the locks are the host
+// process's, as fcntl's are: every instance of the process and every
+// descriptor of the file shares them, they do not exclude each other,
+// closing any descriptor of the file releases them all, the unlock after
+// an interrupted wait unlocks that range for the whole process, removing
+// in it what the process locked meanwhile through another descriptor, and
+// a close of the descriptor waits while an F_SETLKW on it waits (the wait
+// holds the descriptor: a duplicate's close would release the process's
+// locks). On Linux the wait is made on a duplicate of the descriptor,
+// which shares its open file description, and holds nothing a close waits
+// for.
+//
+// Returns 0 or a negative errno: EAGAIN or EACCES for a lock held
+// elsewhere, ENOTSUP for a descriptor with no file of the host behind it
+// (a stream of the embedder's, a file of an in-memory filesystem), which
+// has no other process to exclude.
+func (w *WasiStubs) Fd_lock(m *Module, fd, cmd, lockPtr int32) int32 {
+	return w.fdLock(m, fd, cmd, zext(lockPtr))
+}
+
+// Fd_lock64 is Fd_lock for a memory64 guest.
+func (w *WasiStubs) Fd_lock64(m *Module, fd, cmd int32, lockPtr int64) int32 {
+	return w.fdLock(m, fd, cmd, uint64(lockPtr))
+}
+
+// fdLock is the body of Fd_lock and Fd_lock64.
+func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
+	rec := w.memBytes(m, lockPtr, 32)
+	if rec == nil {
+		return -_wasiEFAULT
+	}
+	lk := recordLock{
+		typ:    int32(binary.LittleEndian.Uint32(rec[0:])),
+		whence: int32(binary.LittleEndian.Uint32(rec[4:])),
+		start:  int64(binary.LittleEndian.Uint64(rec[8:])),
+		len:    int64(binary.LittleEndian.Uint64(rec[16:])),
+	}
+	if cmd < recordLockGet || cmd > recordLockWait || lk.typ < 0 || lk.typ > recordUnlock || lk.whence < 0 || lk.whence > 2 {
+		return -_wasiEINVAL
+	}
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	f, isHost := op.f.(*os.File)
+	if !isHost {
+		return -_wasiENOTSUP
+	}
+	if cmd == recordLockGet {
+		if err := hostRecordLock(f, recordLockGet, &lk); err != nil {
+			return -mapOSError(err)
+		}
+		binary.LittleEndian.PutUint32(rec[0:], uint32(lk.typ))
+		binary.LittleEndian.PutUint32(rec[4:], uint32(lk.whence))
+		binary.LittleEndian.PutUint64(rec[8:], uint64(lk.start))
+		binary.LittleEndian.PutUint64(rec[16:], uint64(lk.len))
+		binary.LittleEndian.PutUint32(rec[24:], uint32(lk.pid))
+		return _wasiESUCCESS
+	}
+	if cmd == recordLockWait && lk.typ != recordUnlock {
+		// The lock that is removed again after an interrupted wait is the
+		// range the wait asked for, where it was when it asked.
+		if errno := absoluteRecordLock(f, &lk); errno != _wasiESUCCESS {
+			return -errno
+		}
+	}
+	unlock := lk
+	unlock.typ = recordUnlock
+	set := func(wait bool) error {
+		if wait {
+			return hostRecordLock(f, recordLockWait, &lk)
+		}
+		return hostRecordLock(f, recordLockSet, &lk)
+	}
+	interrupted, err := w.takeLock("fd_lock", fmt.Sprintf("fd_lock %d %d %d %d", lk.typ, lk.whence, lk.start, lk.len), op, lk.typ == recordUnlock, cmd == recordLockWait, set,
+		func() error { return hostRecordLock(f, recordLockSet, &unlock) })
+	if interrupted {
+		return -_wasiEINTR
+	}
+	if err != nil {
+		return -mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
+// absoluteRecordLock makes the range of lk, a lock of the file f, one from
+// the start of the file (SEEK_SET): from the file's offset (SEEK_CUR) or its
+// size (SEEK_END) now. Returns a wasi errno.
+func absoluteRecordLock(f *os.File, lk *recordLock) int32 {
+	var base int64
+	switch lk.whence {
+	case 1: // SEEK_CUR
+		offset, err := f.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return mapOSError(err)
+		}
+		base = offset
+	case 2: // SEEK_END
+		fi, err := f.Stat()
+		if err != nil {
+			return mapOSError(err)
+		}
+		base = fi.Size()
+	}
+	lk.whence, lk.start = 0, lk.start+base
 	return _wasiESUCCESS
 }
 
@@ -9256,6 +11135,26 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"ownNameEntry":      true,
 			"hostProcess":       true,
 			"forkedProcess":     true,
+			"IDChange":          true,
+			"IDCall":            true,
+			"Users":             true,
+			"User":              true,
+			"Group":             true,
+			"noUsers":           true,
+			"hostUsers":         true,
+			"hostDBEntry":       true,
+			"System":            true,
+			"Uname":             true,
+			"hostSystem":        true,
+			"Services":          true,
+			"Service":           true,
+			"hostServices":      true,
+			"Numbering":         true,
+			"Syslogger":         true,
+			"SyslogMessage":     true,
+			"LockFS":            true,
+			"recordLock":        true,
+			"detachedCall":      true,
 			"wasiABI":           true,
 			"dotDirEntry":       true,
 			"descriptorListing": true,
@@ -9286,6 +11185,23 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"AllowAllExec":            true,
 			"HostProcess":             true,
 			"HostProcessUmask":        true,
+			"hookErrno":               true,
+			"HostUsers":               true,
+			"hostUser":                true,
+			"hostGroup":               true,
+			"hostLookupError":         true,
+			"hostDatabaseEntry":       true,
+			"parseHostDBEntry":        true,
+			"parseHostID":             true,
+			"parseHostService":        true,
+			"newDetachedCall":         true,
+			"appendWasiString":        true,
+			"HostSystem":              true,
+			"HostServices":            true,
+			"findHostService":         true,
+			"HostSyslog":              true,
+			"modeAllows":              true,
+			"absoluteRecordLock":      true,
 			"NewMemFS":                true,
 			"fileStatOf":              true,
 			"unixFileMode":            true,
@@ -9398,7 +11314,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"locationMoment":          true,
 			"zoneReading":             true,
 		},
-		keepVarNames: map[string]bool{},
+		keepVarNames: map[string]bool{"idCallArgs": true},
 		keepConstAll: true,
 	})
 	if err != nil {
@@ -9451,6 +11367,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"net",
 		"os",
 		"os/exec",
+		"os/user",
 		"path",
 		"path/filepath",
 		"runtime",

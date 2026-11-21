@@ -36,8 +36,10 @@ func procTimes(w *WasiStubs) ([4]uint64, int32) {
 	return times, rc
 }
 
-// testProcess is a Process with fixed answers.
+// testProcess is a Process with fixed answers, and the groups, ids and
+// priority of an isolated process.
 type testProcess struct {
+	isolatedProcess
 	ids      ProcessIDs
 	times    ProcessTimes
 	timesErr error
