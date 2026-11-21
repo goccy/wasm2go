@@ -5,7 +5,6 @@ package codegen
 import (
 	"os"
 	"syscall"
-	"unsafe"
 )
 
 // hostName is one name of a directory with the file type the directory
@@ -15,78 +14,16 @@ type hostName struct {
 	typ  uint8
 }
 
-// readHostDirents reads the names in the directory open as fd from its
-// beginning, in the order the system gives them, "." and ".." where it
-// has them.
-func readHostDirents(fd int) ([]hostName, error) {
-	if _, err := syscall.Seek(fd, 0, 0); err != nil {
-		return nil, os.NewSyscallError("lseek", err)
-	}
-	var entry syscall.Dirent
-	const (
-		reclenAt = unsafe.Offsetof(entry.Reclen)
-		typeAt   = unsafe.Offsetof(entry.Type)
-		nameAt   = unsafe.Offsetof(entry.Name)
-	)
-	var out []hostName
-	buf := make([]byte, 32<<10)
-	for {
-		n, err := syscall.ReadDirent(fd, buf)
-		if err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return nil, os.NewSyscallError("getdents", err)
-		}
-		if n <= 0 {
-			return out, nil
-		}
-		for rest := buf[:n]; len(rest) > int(nameAt); {
-			reclen := int(uint16(rest[reclenAt]) | uint16(rest[reclenAt+1])<<8)
-			if reclen <= int(nameAt) || reclen > len(rest) {
-				break
-			}
-			rec := rest[:reclen]
-			rest = rest[reclen:]
-			ino := uint64(0)
-			for i := 7; i >= 0; i-- {
-				ino = ino<<8 | uint64(rec[i])
-			}
-			if ino == 0 {
-				continue
-			}
-			name := rec[nameAt:]
-			for i, c := range name {
-				if c == 0 {
-					name = name[:i]
-					break
-				}
-			}
-			out = append(out, hostName{name: string(name), typ: rec[typeAt]})
-		}
-	}
-}
-
 // hostDirListing lists a directory of the host's in the order the system
-// gives its names, with "." and ".." where the system puts them, as
-// readdir(3) gives them: a directory opened through the host's file system
-// (an *os.File, which osFS opens). ok is false for a directory of another
-// file system.
+// gives its names, with "." and ".." where osFileDirents has them: a
+// directory opened through the host's file system (an *os.File, which osFS
+// opens). ok is false for a directory of another file system.
 func hostDirListing(f File) (list []os.DirEntry, ok bool, err error) {
 	var dir string
 	var names []hostName
 	switch d := f.(type) {
 	case *os.File:
-		rc, connErr := d.SyscallConn()
-		if connErr != nil {
-			return nil, true, connErr
-		}
-		if readErr := rc.Read(func(fd uintptr) bool {
-			names, err = readHostDirents(int(fd))
-			return true
-		}); readErr != nil {
-			return nil, true, readErr
-		}
+		names, err = osFileDirents(d)
 		dir = d.Name()
 	default:
 		return nil, false, nil

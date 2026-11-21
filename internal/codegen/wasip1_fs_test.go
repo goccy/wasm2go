@@ -175,6 +175,7 @@ func TestOSFSInterface(t *testing.T) {
 // directory with something in it is ENOTEMPTY, 55 (or EEXIST, which POSIX
 // allows too). os.Rename answers EEXIST for every one of them.
 func TestOSFSRenameIsTheSystemCall(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
 	root := t.TempDir()
 	fsys := osFS{root: root}
 	for _, dir := range []string{"target", "empty", "full", "moved"} {
@@ -202,6 +203,29 @@ func TestOSFSRenameIsTheSystemCall(t *testing.T) {
 	}
 	if err := fsys.Rename("file", "renamed"); err != nil {
 		t.Errorf("a file to a new name: %v", err)
+	}
+}
+
+// On every host, a file renamed onto another file replaces it.
+func TestOSFSRenameReplacesAFile(t *testing.T) {
+	root := t.TempDir()
+	fsys := osFS{root: root}
+	for name, data := range map[string]string{"from": "new", "to": "old"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fsys.Rename("from", "to"); err != nil {
+		t.Fatalf("a file onto a file: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "to")); err != nil || string(got) != "new" {
+		t.Errorf("the replaced file holds %q, err=%v; want \"new\"", got, err)
+	}
+	if _, err := fsys.Lstat("from"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the old name after the rename: %v, want it gone", err)
+	}
+	if err := fsys.Rename("nothing", "to"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a rename of a missing file: %v, want a not-exist error", err)
 	}
 }
 

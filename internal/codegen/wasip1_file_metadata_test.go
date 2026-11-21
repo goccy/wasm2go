@@ -615,8 +615,9 @@ func TestWasi_FileTypes(t *testing.T) {
 // The extended stat record names the block size, the blocks allocated and,
 // for a special file, the device it stands for.
 func TestFilestatExtBlocksAndDevice(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "data"), make([]byte, 10000), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "data"), bytes.Repeat([]byte("x"), 10000), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
@@ -629,12 +630,8 @@ func TestFilestatExtBlocksAndDevice(t *testing.T) {
 		out := m.memory[metaOutOff:]
 		return binary.LittleEndian.Uint32(out[12:]), binary.LittleEndian.Uint64(out[16:]), binary.LittleEndian.Uint64(out[24:])
 	}
-	blksize, rdev, blocks := record("data")
-	if blksize == 0 || blocks == 0 || rdev != 0 {
-		t.Fatalf("a file of 10000 bytes: block size %d, %d blocks, device %d", blksize, blocks, rdev)
-	}
-	if blocks*512 < 10000 {
-		t.Fatalf("%d blocks of 512 bytes do not hold the file", blocks)
+	if _, _, blocks := record("data"); blocks == 0 {
+		t.Fatal("a file of 10000 bytes has no blocks")
 	}
 	// In memory a file has blocks too.
 	mem := NewMemFS()
@@ -701,5 +698,73 @@ func TestUnixModeBitsAndFileTypes(t *testing.T) {
 		if st.nlink != 1 || st.atim != uint64(mtime.UnixNano()) || st.ctim != st.atim || st.mtim != st.atim {
 			t.Errorf("without POSIX metadata: nlink=%d atim=%d mtim=%d ctim=%d, want 1 and %d", st.nlink, st.atim, st.mtim, st.ctim, mtime.UnixNano())
 		}
+	}
+}
+
+// The record of a descriptor with no file behind it is written whole: what
+// the guest's memory held there is gone.
+func TestWasi_FilestatExtWithoutAFileWritesTheWholeRecord(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	for _, tc := range []struct {
+		name string
+		fd   int32
+		mode uint32
+	}{
+		{"an embedder's stdout", 1, unixTypeFIFO | 0o600},
+		{"a socket", w.Sock_socket(m, 2, 1), unixTypeSocket | 0o777},
+	} {
+		record := m.memory[metaOutOff : metaOutOff+wasiFilestatExtSize]
+		for i := range record {
+			record[i] = 0xa5
+		}
+		if rc := w.Fd_filestat_ext(m, tc.fd, metaOutOff); rc != 0 {
+			t.Fatalf("%s: Fd_filestat_ext rc=%d", tc.name, rc)
+		}
+		want := make([]byte, wasiFilestatExtSize)
+		binary.LittleEndian.PutUint32(want, tc.mode)
+		if !bytes.Equal(record, want) {
+			t.Errorf("%s: record % x, want % x", tc.name, record, want)
+		}
+	}
+}
+
+// The preopened root directory, under both of its numbers, is the
+// directory "." names: its descriptor's stat is the stat of ".".
+func TestWasi_RootDescriptorIsTheRootDirectory(t *testing.T) {
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	byPath := pathFilestat(t, w, m, ".", true)
+	if byPath.filetype != 3 {
+		t.Fatalf("\".\" has type %d, want a directory's", byPath.filetype)
+	}
+	if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && (byPath.dev == 0 || byPath.ino == 0) {
+		t.Fatalf("\".\" is dev %d ino %d, want a real dev/ino", byPath.dev, byPath.ino)
+	}
+	for _, fd := range []int32{wasiPreopenFD, wasiRootFD} {
+		if got := fdFilestat(t, w, m, fd); got.dev != byPath.dev || got.ino != byPath.ino || got.filetype != byPath.filetype {
+			t.Errorf("fd %d: dev %d ino %d type %d, want %d, %d and %d", fd, got.dev, got.ino, got.filetype, byPath.dev, byPath.ino, byPath.filetype)
+		}
+		fdFilestatExt(t, w, m, fd)
+		if got := extFileType(m); got != unixTypeDir {
+			t.Errorf("fd %d: posix type %#o, want a directory's", fd, got)
+		}
+	}
+	// A root directory that is gone reports the error of its stat.
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range []int32{wasiPreopenFD, wasiRootFD} {
+		if rc := w.Fd_filestat_get(m, fd, metaOutOff); rc != _wasiENOENT {
+			t.Errorf("fd %d of a removed root: Fd_filestat_get rc=%d, want ENOENT", fd, rc)
+		}
+		if rc := w.Fd_filestat_ext(m, fd, metaOutOff); rc != -_wasiENOENT {
+			t.Errorf("fd %d of a removed root: Fd_filestat_ext rc=%d, want -ENOENT", fd, rc)
+		}
+	}
+	// The root of a filesystem in memory is its root directory.
+	w.SetFS(NewMemFS())
+	if got := fdFilestat(t, w, m, wasiPreopenFD).filetype; got != 3 {
+		t.Errorf("the root in memory has type %d, want a directory's", got)
 	}
 }

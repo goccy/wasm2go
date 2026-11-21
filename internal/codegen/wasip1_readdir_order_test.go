@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -59,7 +60,8 @@ func listed(t *testing.T, w *WasiStubs) []string {
 }
 
 // A directory of the host's lists its names in the order the system gives
-// them, with "." and ".." where the system puts them.
+// them, with "." and ".." where the system puts them on linux and first on
+// darwin.
 func TestReaddir_HostDirectoryInTheSystemsOrder(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range orderTestNames() {
@@ -71,8 +73,17 @@ func TestReaddir_HostDirectoryInTheSystemsOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	var want []string
+	if runtime.GOOS == "darwin" {
+		want = []string{"./", "../"}
+	}
 	for _, name := range systemOrder(t, dir) {
-		if name == "." || name == ".." || name == "sub" {
+		if name == "." || name == ".." {
+			if runtime.GOOS == "darwin" {
+				continue
+			}
+			name += "/"
+		}
+		if name == "sub" {
 			name += "/"
 		}
 		want = append(want, name)
@@ -207,5 +218,38 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 	}
 	if entries, err := op.readDirCached(true); err == nil {
 		t.Errorf("a closed directory lists %d entries", len(entries))
+	}
+}
+
+// A directory that may be read but not searched lists its names.
+func TestReaddir_DirectoryWithoutSearchPermission(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root is not held to the permissions of a directory")
+	}
+	dir := filepath.Join(t.TempDir(), "readable")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "b"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(dir, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Errorf("chmod %s: %v", dir, err)
+		}
+	})
+	w, _ := newTestStubs(t, dir)
+	var got []string
+	for _, name := range listed(t, w) {
+		got = append(got, strings.TrimSuffix(name, "/"))
+	}
+	sort.Strings(got)
+	if strings.Join(got, " ") != ". .. a b" {
+		t.Errorf("lists %q, want . .. a b in any order", got)
 	}
 }

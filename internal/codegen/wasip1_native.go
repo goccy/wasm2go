@@ -280,28 +280,12 @@ func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 func (o osFS) Mkdir(name string, perm os.FileMode) error { return os.Mkdir(o.join(name), perm) }
 func (o osFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(o.join(name), mode) }
 func (o osFS) Remove(name string) error                  { return os.Remove(o.join(name)) }
+func (o osFS) Rename(a, b string) error                  { return hostRename(o.join(a), o.join(b)) }
 func (o osFS) Stat(name string) (os.FileInfo, error)     { return os.Stat(o.join(name)) }
 func (o osFS) Lstat(name string) (os.FileInfo, error)    { return os.Lstat(o.join(name)) }
 func (o osFS) Symlink(target, name string) error         { return os.Symlink(target, o.join(name)) }
 func (o osFS) Readlink(name string) (string, error)      { return os.Readlink(o.join(name)) }
 func (o osFS) Link(a, b string) error                    { return os.Link(o.join(a), o.join(b)) }
-
-// Rename is rename(2): a file renamed onto a directory fails with EISDIR,
-// and a directory renamed onto an empty one replaces it. os.Rename refuses
-// every rename onto a directory with EEXIST, which no system call does.
-func (o osFS) Rename(a, b string) error {
-	from, to := o.join(a), o.join(b)
-	for {
-		err := syscall.Rename(from, to)
-		if err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
-		}
-		return nil
-	}
-}
 
 // MemFS is an in-memory read/write FS. Each value is an independent tree, so
 // two interpreters given separate MemFS values cannot observe each other's
@@ -2170,11 +2154,20 @@ func (w *WasiStubs) fdFilestatGet(m *Module, fd int32, ptr uint64) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	root := op == nil && rootDirFD(fd)
+	fsys := w.fsys
 	w.mu.Unlock()
 	if op == nil && !root {
 		return _wasiEBADF
 	}
-	if op == nil || op.f == nil {
+	if root {
+		st, err := fsys.Stat(".")
+		if err != nil {
+			return mapOSError(err)
+		}
+		writeFilestat(out, st)
+		return _wasiESUCCESS
+	}
+	if op.f == nil {
 		if fi := w.streamFileInfo(op); fi != nil {
 			// A standard stream that is a file of the host is that
 			// file: a terminal, a pipe, a regular file it was
@@ -2182,19 +2175,15 @@ func (w *WasiStubs) fdFilestatGet(m *Module, fd int32, ptr uint64) int32 {
 			writeFilestat(out, fi)
 			return _wasiESUCCESS
 		}
-		// Synthesise a minimal stat for the preopen, a socket, or a
-		// standard stream the embedder supplied.
+		// Synthesise a minimal stat for a socket or a standard stream
+		// the embedder supplied.
 		for i := range out {
 			out[i] = 0
 		}
-		// The preopen is a directory (3) and a socket a stream socket
-		// (6). An embedder's stream is a pipe to the guest, which WASI
-		// has no file type for: it stays "unknown" (0) here, and
-		// Fd_filestat_ext names it.
-		switch {
-		case op == nil:
-			out[16] = 3
-		case op.socket():
+		// A socket is a stream socket (6). An embedder's stream is a
+		// pipe to the guest, which WASI has no file type for: it stays
+		// "unknown" (0) here, and Fd_filestat_ext names it.
+		if op.socket() {
 			out[16] = 6
 		}
 		return _wasiESUCCESS
@@ -2820,7 +2809,8 @@ func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow i
 // bridge-provided fstat. A descriptor that is not a file of the FS backend
 // is described as what it is to the guest: a standard stream that is a
 // file of the host as that file (a terminal, a pipe, a regular file), a
-// stream the embedder supplied as a pipe, a socket as a socket.
+// stream the embedder supplied as a pipe, a socket as a socket, the
+// preopened root as the root directory.
 func (w *WasiStubs) Fd_filestat_ext(m *Module, fd, outPtr int32) int32 {
 	return w.fdFilestatExt(m, fd, zext(outPtr))
 }
@@ -2838,9 +2828,19 @@ func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
 	}
 	w.mu.Lock()
 	op := w.openLocked(fd)
+	root := op == nil && rootDirFD(fd)
+	fsys := w.fsys
 	w.mu.Unlock()
-	if op == nil {
+	if op == nil && !root {
 		return -_wasiEBADF
+	}
+	if root {
+		fi, err := fsys.Stat(".")
+		if err != nil {
+			return -mapOSError(err)
+		}
+		writeFilestatExt(out, fi)
+		return _wasiESUCCESS
 	}
 	fi := w.streamFileInfo(op)
 	if fi == nil && op.f != nil {
@@ -2859,6 +2859,7 @@ func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
 	}
 	// A descriptor with no file behind it belongs to user and group 0.
 	var uid, gid uint32
+	clear(out)
 	binary.LittleEndian.PutUint32(out[0:], mode)
 	binary.LittleEndian.PutUint32(out[4:], uid)
 	binary.LittleEndian.PutUint32(out[8:], gid)
@@ -3137,10 +3138,10 @@ func (w *WasiStubs) Fd_renumber64(m *Module, from, to int64) int32 {
 // modified afterwards, so it stays valid after a later rewind.
 //
 // A directory of the host's lists its names in the order the system gives
-// them, "." and ".." among them where the system puts them, as readdir(3)
-// does (hostDirListing). A directory of a file system of the embedder's
-// own (MemFS) has no order of its own: it lists "." and ".." first and
-// then its names sorted, the same every time.
+// them, "." and ".." among them where the system puts them on linux and
+// first on every other host (hostDirListing). A directory of a file system
+// of the embedder's own (MemFS) has no order of its own: it lists "." and
+// ".." first and then its names sorted, the same every time.
 func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	op.mu.Lock()
 	defer op.mu.Unlock()

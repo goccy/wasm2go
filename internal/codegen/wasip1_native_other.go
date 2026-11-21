@@ -14,6 +14,10 @@ func osFileStat(sys any) (fileStat, bool) {
 	return fileStat{}, false
 }
 
+// hostRename renames a file as os.Rename does on this platform: onto an
+// existing file, it replaces the file.
+func hostRename(from, to string) error { return os.Rename(from, to) }
+
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error; on this platform the errors are told apart
 // by what package os makes of them.

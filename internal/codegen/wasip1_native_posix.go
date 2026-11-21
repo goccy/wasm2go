@@ -3,6 +3,7 @@
 package codegen
 
 import (
+	"os"
 	"sync"
 	"syscall"
 )
@@ -28,6 +29,23 @@ func osFileStat(sys any) (fileStat, bool) {
 		blksize: uint32(st.Blksize),
 		blocks:  uint64(st.Blocks),
 	}, true
+}
+
+// hostRename is rename(2): a file renamed onto a directory fails with
+// EISDIR, and a directory renamed onto an empty one replaces it. os.Rename
+// refuses every rename onto a directory with EEXIST, which no system call
+// does.
+func hostRename(from, to string) error {
+	for {
+		err := syscall.Rename(from, to)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+		}
+		return nil
+	}
 }
 
 // ---- the numbers of the operating system ---------------------------------
