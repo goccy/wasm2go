@@ -47,10 +47,12 @@ func wasiErrno(e syscall.Errno) (int32, bool) {
 }
 
 // hostDirListing lists a directory of the host's file system (an *os.File,
-// which osFS opens) in the order the system gives its names, which Go's
+// which HostFS opens) in the order the system gives its names, which Go's
 // ReadDir keeps. ReadDir leaves "." and ".." out, and they come first. ok
-// is false for a directory of another file system.
-func hostDirListing(f File) ([]os.DirEntry, bool, error) {
+// is false for a directory of another file system. hostPath (the directory
+// is of the whole host filesystem) changes nothing here: dotEntry states
+// "." and ".." by their host paths either way.
+func hostDirListing(f File, hostPath bool) ([]os.DirEntry, bool, error) {
 	d, isHost := f.(*os.File)
 	if !isHost {
 		return nil, false, nil

@@ -4,6 +4,8 @@ package codegen
 
 import (
 	"encoding/binary"
+	"errors"
+	"io/fs"
 	"os"
 	"syscall"
 	"time"
@@ -13,6 +15,36 @@ import (
 // statTimes returns the access and status-change times of a stat result.
 func statTimes(st *syscall.Stat_t) (atime, ctime time.Time) {
 	return time.Unix(st.Atim.Unix()), time.Unix(st.Ctim.Unix())
+}
+
+// openPath is O_PATH, which has this number on every linux GOARCH while
+// package syscall names it on some of them only.
+const openPath = 0x200000
+
+// lstatAt describes name in the directory open as dir, without following
+// a symbolic link: through a descriptor opened relative to dir (O_PATH),
+// so no path of the host is looked up.
+func lstatAt(dir *os.File, name string) (os.FileInfo, error) {
+	rc, err := dir.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var fd int
+	var openErr error
+	if err := rc.Control(func(dirFd uintptr) {
+		fd, openErr = syscall.Openat(int(dirFd), name, openPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	}); err != nil {
+		return nil, err
+	}
+	if openErr != nil {
+		return nil, &fs.PathError{Op: "openat", Path: name, Err: openErr}
+	}
+	f := os.NewFile(uintptr(fd), name)
+	fi, err := f.Stat()
+	if err = errors.Join(err, f.Close()); err != nil {
+		return nil, err
+	}
+	return fi, nil
 }
 
 // osFileDirents reads the names in the directory open as d, in the order

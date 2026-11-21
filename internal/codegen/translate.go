@@ -478,7 +478,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	out.Decls = append(out.Decls, t.emitImportInterfaces()...)
 	out.Decls = append(out.Decls, t.emitModuleStruct())
 	// Native wasi impl (only when -native-wasi is set and the wasm
-	// imports wasi_snapshot_preview1). DefaultWASI() must be declared
+	// imports wasi_snapshot_preview1). NewWASI() must be declared
 	// before emitNewFuncs so the simple-form New() wrapper can refer
 	// to it.
 	wasiDecls, wasiImports, err := t.emitWasip1Native()
@@ -2775,16 +2775,18 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	}
 
 	// Build the simple-form `New(env, ...)` that omits the wasi
-	// parameter and delegates to NewWithWASI with DefaultWASI()
+	// parameter and delegates to NewWithWASI with NewWASI(WASIConfig{})
 	// inserted at the wasi position.
 	var wrapperParams []*ast.Field
 	var wrapperArgs []ast.Expr
-	// In multi-package mode the WasiStubs + DefaultWASI live in base/;
+	// In multi-package mode WasiStubs, NewWASI and WASIConfig live in base/;
 	// callers outside base reference them through the `base.` prefix.
-	var defaultWASICall ast.Expr = &ast.CallExpr{Fun: newID("DefaultWASI")}
+	var newWASI, wasiConfig ast.Expr = newID("NewWASI"), newID("WASIConfig")
 	if t.multiPackage && t.currentChunk != chunkBase {
-		defaultWASICall = &ast.CallExpr{Fun: &ast.SelectorExpr{X: newID("base"), Sel: newID("DefaultWASI")}}
+		newWASI = &ast.SelectorExpr{X: newID("base"), Sel: newID("NewWASI")}
+		wasiConfig = &ast.SelectorExpr{X: newID("base"), Sel: newID("WASIConfig")}
 	}
+	defaultWASICall := &ast.CallExpr{Fun: newWASI, Args: []ast.Expr{&ast.CompositeLit{Type: wasiConfig}}}
 	for i, mod := range t.importedModules {
 		if i == wasiIdx {
 			wrapperArgs = append(wrapperArgs, defaultWASICall)
@@ -2804,9 +2806,10 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 	}}
 	wrapper := &ast.FuncDecl{
 		Doc: &ast.CommentGroup{List: []*ast.Comment{{
-			Text: "// New constructs a *Module using DefaultWASI() for the\n" +
-				"// wasi_snapshot_preview1 import. Use NewWithWASI to plug in a\n" +
-				"// custom implementation (sandboxed FS, captured stdout, ...).",
+			Text: "// New constructs a *Module using NewWASI(WASIConfig{}) for the\n" +
+				"// wasi_snapshot_preview1 import, which gives the guest nothing it\n" +
+				"// is not configured with. Use NewWithWASI to plug in another\n" +
+				"// configuration (NewWASI(HostWASIConfig()), ...) or implementation.",
 		}}},
 		Name: newID("New"),
 		Type: &ast.FuncType{

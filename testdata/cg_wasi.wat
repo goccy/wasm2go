@@ -2,7 +2,7 @@
 ;; NativeWASI codegen path (wasip1_native.go) emits a full Go-native impl.
 ;; say_hello writes a fixed string to stdout; clock_now reads the monotonic
 ;; clock; rand_byte pulls one random byte. Exercised end-to-end with the
-;; generated DefaultWASI backend.
+;; generated WasiStubs backend.
 (module
   (import "wasi_snapshot_preview1" "fd_write"
     (func $fd_write (param i32 i32 i32 i32) (result i32)))

@@ -81,7 +81,7 @@ import (
 )
 
 func main() {
-	m := pkg.NewWithWASI(pkg.DefaultWASI())
+	m := pkg.NewWithWASI(pkg.NewWASI(pkg.HostWASIConfig()))
 	fmt.Println(m != nil)
 }
 `

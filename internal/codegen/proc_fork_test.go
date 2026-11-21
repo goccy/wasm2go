@@ -82,7 +82,7 @@ func readEOFAsync(w *WasiStubs, fd int32) <-chan string {
 func newProcTestStubs(t *testing.T) (*WasiStubs, *Module) {
 	t.Helper()
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	return w, m
 }
 
@@ -146,11 +146,7 @@ func TestWasi_ForkSharesDescriptors(t *testing.T) {
 
 func TestWasi_ForkConfiguration(t *testing.T) {
 	w, m := newProcTestStubs(t)
-	w.SetFSAccessHook(func(string, bool) bool { return true })
-	w.SetNetAccessHook(func(string) bool { return true })
-	w.SetDialHook(func(string, string, string, int) bool { return true })
-	w.SetResolveHook(func(string) bool { return true })
-	w.SetExecHook(func(string, []string) bool { return true })
+	w.cfg.FSAccess = func(string, bool) bool { return true }
 	w.resolvedHosts = map[string]string{"127.0.0.1": "localhost"}
 	w.procs = map[int32]*wasiProc{1000: {done: make(chan struct{})}}
 	if rc := w.Fd_cloexec(m, 2, 1, 1, 5300); rc != _wasiESUCCESS {
@@ -158,17 +154,17 @@ func TestWasi_ForkConfiguration(t *testing.T) {
 	}
 
 	child := w.Fork()
-	if child.stdin != w.stdin || child.stdout != w.stdout || child.stderr != w.stderr {
+	if child.cfg.Stdin != w.cfg.Stdin || child.cfg.Stdout != w.cfg.Stdout || child.cfg.Stderr != w.cfg.Stderr {
 		t.Error("stdio streams not inherited")
 	}
-	if len(child.args) != len(w.args) || len(child.env) != len(w.env) {
+	if len(child.cfg.Args) != len(w.cfg.Args) || len(child.cfg.Env) != len(w.cfg.Env) {
 		t.Error("args/env not inherited")
 	}
-	if child.preopenDir != w.preopenDir || child.fsys != w.fsys || !child.monoStart.Equal(w.monoStart) {
+	if child.cfg.FS != w.cfg.FS || !child.monoStart.Equal(w.monoStart) {
 		t.Error("filesystem or clock configuration not inherited")
 	}
-	if child.fsHook == nil || child.netHook == nil || child.dialHook == nil ||
-		child.resolveHook == nil || child.execHook == nil {
+	if child.cfg.FSAccess == nil || child.cfg.NetAccess == nil || child.cfg.Dial == nil ||
+		child.cfg.Resolve == nil || child.cfg.Exec == nil {
 		t.Error("hooks not inherited")
 	}
 	if len(child.procs) != 0 {

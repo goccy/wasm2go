@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 	"time"
@@ -160,9 +161,9 @@ func exerciseFS(t *testing.T, fsys FS, wantSymlinks bool) {
 
 func TestOSFSInterface(t *testing.T) {
 	root := t.TempDir()
-	exerciseFS(t, osFS{root: root}, true)
-	// The root-scoping join must keep names inside root.
-	if err := (osFS{root: root}).Mkdir("x", 0o755); err != nil {
+	exerciseFS(t, newHostFS(t, root), true)
+	// The names stay inside root.
+	if err := newHostFS(t, root).Mkdir("x", 0o755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "x")); err != nil {
@@ -170,21 +171,22 @@ func TestOSFSInterface(t *testing.T) {
 	}
 }
 
-// The host filesystem renames as rename(2) does: a file onto a directory is
-// EISDIR, a directory onto an empty directory replaces it, and one onto a
-// directory with something in it is ENOTEMPTY, 55 (or EEXIST, which POSIX
-// allows too). os.Rename answers EEXIST for every one of them.
+// The whole host filesystem renames as rename(2) does: a file onto a
+// directory is EISDIR, a directory onto an empty directory replaces it,
+// and one onto a directory with something in it is ENOTEMPTY, 55 (or
+// EEXIST, which POSIX allows too). os.Rename answers EEXIST for every one
+// of them.
 func TestOSFSRenameIsTheSystemCall(t *testing.T) {
 	skipWithoutPOSIXFiles(t)
-	root := t.TempDir()
-	fsys := osFS{root: root}
+	root := hostRelative(t, t.TempDir())
+	fsys := newHostFS(t, "/")
 	for _, dir := range []string{"target", "empty", "full", "moved"} {
-		if err := fsys.Mkdir(dir, 0o755); err != nil {
+		if err := fsys.Mkdir(path.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, file := range []string{"file", "full/inside"} {
-		f, err := fsys.OpenFile(file, os.O_RDWR|os.O_CREATE, 0o644)
+		f, err := fsys.OpenFile(path.Join(root, file), os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -192,16 +194,16 @@ func TestOSFSRenameIsTheSystemCall(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := fsys.Rename("file", "target"); mapOSError(err) != _wasiEISDIR {
+	if err := fsys.Rename(path.Join(root, "file"), path.Join(root, "target")); mapOSError(err) != _wasiEISDIR {
 		t.Errorf("a file onto a directory: %v (errno %d), want EISDIR", err, mapOSError(err))
 	}
-	if err := fsys.Rename("moved", "empty"); err != nil {
+	if err := fsys.Rename(path.Join(root, "moved"), path.Join(root, "empty")); err != nil {
 		t.Errorf("a directory onto an empty directory: %v", err)
 	}
-	if err := fsys.Rename("target", "full"); mapOSError(err) != 55 && mapOSError(err) != _wasiEEXIST {
+	if err := fsys.Rename(path.Join(root, "target"), path.Join(root, "full")); mapOSError(err) != 55 && mapOSError(err) != _wasiEEXIST {
 		t.Errorf("a directory onto a full one: %v (errno %d), want ENOTEMPTY", err, mapOSError(err))
 	}
-	if err := fsys.Rename("file", "renamed"); err != nil {
+	if err := fsys.Rename(path.Join(root, "file"), path.Join(root, "renamed")); err != nil {
 		t.Errorf("a file to a new name: %v", err)
 	}
 }
@@ -209,7 +211,7 @@ func TestOSFSRenameIsTheSystemCall(t *testing.T) {
 // On every host, a file renamed onto another file replaces it.
 func TestOSFSRenameReplacesAFile(t *testing.T) {
 	root := t.TempDir()
-	fsys := osFS{root: root}
+	fsys := newHostFS(t, root)
 	for name, data := range map[string]string{"from": "new", "to": "old"} {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(data), 0o644); err != nil {
 			t.Fatal(err)
@@ -233,12 +235,16 @@ func TestOSFSRenameReplacesAFile(t *testing.T) {
 // is "/": rmdir("/") is the host's rmdir("/"), EBUSY, not rmdir("/."),
 // which is EINVAL on Linux.
 func TestOSFSRootIsSlash(t *testing.T) {
-	for _, root := range []string{"", "/"} {
-		if got := (osFS{root: root}).join("."); got != "/" {
-			t.Errorf("osFS{root: %q}.join(\".\") = %q, want /", root, got)
+	for _, root := range []string{"", "/", "//", "/."} {
+		fsys, ok := newHostFS(t, root).(osFS)
+		if !ok {
+			t.Fatalf("HostFS(%q) is not the whole host filesystem", root)
 		}
-		if got := (osFS{root: root}).join("etc"); got != "/etc" {
-			t.Errorf("osFS{root: %q}.join(\"etc\") = %q, want /etc", root, got)
+		if got := fsys.join("."); got != "/" {
+			t.Errorf("HostFS(%q).join(\".\") = %q, want /", root, got)
+		}
+		if got := fsys.join("etc"); got != "/etc" {
+			t.Errorf("HostFS(%q).join(\"etc\") = %q, want /etc", root, got)
 		}
 	}
 }
@@ -261,31 +267,12 @@ func TestMemFSInterface(t *testing.T) {
 	}
 }
 
-func TestWasiStubsSetters(t *testing.T) {
-	w := &WasiStubs{}
-	// Nil arguments keep the previous value; non-nil replace it.
+func TestNewWASIKeepsConfiguredStreamsAndFS(t *testing.T) {
 	var in, out, errw = &bytesReader{}, &discard{}, &discard{}
-	w.SetStdin(in)
-	w.SetStdout(out)
-	w.SetStderr(errw)
-	if w.stdin != in || w.stdout != out || w.stderr != errw {
-		t.Fatal("setters did not install the streams")
-	}
-	w.SetStdin(nil)
-	w.SetStdout(nil)
-	w.SetStderr(nil)
-	if w.stdin != in || w.stdout != out || w.stderr != errw {
-		t.Fatal("nil must keep the previous streams")
-	}
 	mem := NewMemFS()
-	w.SetFS(mem)
-	if w.fsys != FS(mem) {
-		t.Fatal("SetFS did not install the backend")
-	}
-	w.preopenDir = "/tmp"
-	w.SetFS(nil)
-	if _, ok := w.fsys.(osFS); !ok {
-		t.Fatal("SetFS(nil) must restore the os backend")
+	w := NewWASI(WASIConfig{Stdin: in, Stdout: out, Stderr: errw, FS: mem})
+	if w.cfg.Stdin != in || w.cfg.Stdout != out || w.cfg.Stderr != errw || w.cfg.FS != FS(mem) {
+		t.Fatal("NewWASI did not install the configured streams and filesystem")
 	}
 }
 

@@ -115,7 +115,7 @@ func memTestStubs(t *testing.T) (*WasiStubs, *Module, *MemFS) {
 	t.Helper()
 	w, m := newTestStubs(t, "/")
 	fsys := NewMemFS()
-	w.SetFS(fsys)
+	w.cfg.FS = fsys
 	return w, m, fsys
 }
 
@@ -286,7 +286,7 @@ func TestWasi_ChownByPathAndDescriptor(t *testing.T) {
 	skipWithoutPOSIXFiles(t)
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	if err := os.WriteFile(filepath.Join(dir, "f"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -341,14 +341,14 @@ func TestWasi_ChownByPathAndDescriptor(t *testing.T) {
 	if rc := w.Fd_chown(m, 1, -1, -1); rc != -_wasiENOSYS {
 		t.Errorf("Fd_chown on a stream that is no file rc=%d, want -ENOSYS", rc)
 	}
-	w.SetFSAccessHook(func(string, bool) bool { return false })
+	w.cfg.FSAccess = func(string, bool) bool { return false }
 	if rc := w.Path_chown(m, off, n, -1, -1, 1); rc != -_wasiEACCES {
 		t.Errorf("Path_chown the access hook refuses rc=%d, want -EACCES", rc)
 	}
-	w.SetFSAccessHook(nil)
+	w.cfg.FSAccess = nil
 
 	// A filesystem that keeps no owners has none to change.
-	w.SetFS(noOwnerFS{osFS{root: dir}})
+	w.cfg.FS = noOwnerFS{newHostFS(t, dir)}
 	if rc := w.Path_chown(m, off, n, -1, -1, 1); rc != -_wasiENOSYS {
 		t.Errorf("Path_chown on a filesystem without owners rc=%d, want -ENOSYS", rc)
 	}
@@ -356,7 +356,7 @@ func TestWasi_ChownByPathAndDescriptor(t *testing.T) {
 	if err := mem.WriteFile("f", nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w.SetFS(mem)
+	w.cfg.FS = mem
 	if rc := w.Path_chown(m, off, n, 0, 0, 1); rc != -_wasiENOSYS {
 		t.Errorf("Path_chown in memory rc=%d, want -ENOSYS", rc)
 	}
@@ -371,7 +371,7 @@ func TestWasi_ChownByPathAndDescriptor(t *testing.T) {
 func TestWasi_FileMetadataErrors(t *testing.T) {
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	outside := int32(len(m.memory))
 	off, n := putPath(m, metaPathOff, "nothing")
 	for _, tc := range []struct {
@@ -593,11 +593,11 @@ func TestMemFS_ReaddirDotsOfAMovedDirectory(t *testing.T) {
 	want := map[int32][2]uint64{aSub: {ino("b/sub"), ino("b")}, dSub: {ino("e/sub"), ino("e")}}
 	for _, setFS := range []bool{false, true} {
 		if setFS {
-			w.SetFS(NewMemFS())
+			w.cfg.FS = NewMemFS()
 		}
 		for fd, dots := range want {
 			if got := direntInodes(t, w, fd); got["."] != dots[0] || got[".."] != dots[1] {
-				t.Errorf("fd %d (SetFS %v): . %d and .. %d, want %d and %d", fd, setFS, got["."], got[".."], dots[0], dots[1])
+				t.Errorf("fd %d (MemFS installed %v): . %d and .. %d, want %d and %d", fd, setFS, got["."], got[".."], dots[0], dots[1])
 			}
 		}
 	}
@@ -659,7 +659,7 @@ func TestReaddir_DirectoryWhoseStatFails(t *testing.T) {
 	if err := fsys.WriteFile("d/a", nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w.SetFS(statOnceFS{fsys})
+	w.cfg.FS = statOnceFS{fsys}
 	fd, errno := w.pathOpen("d", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
@@ -910,8 +910,9 @@ func TestMemFS_RenameOntoAnExistingName(t *testing.T) {
 // A directory descriptor reports the path it was opened under, absolute in
 // the guest's filesystem; other descriptors have no such name.
 func TestWasi_FdPathNamesAnOpenDirectory(t *testing.T) {
-	w, m := newTestStubs(t, t.TempDir())
-	if err := os.MkdirAll(filepath.Join(w.preopenDir, "outer", "inner"), 0o755); err != nil {
+	hostDir := t.TempDir()
+	w, m := newTestStubs(t, hostDir)
+	if err := os.MkdirAll(filepath.Join(hostDir, "outer", "inner"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	fdPath := func(fd, capacity int32) (string, int32) {
@@ -944,7 +945,7 @@ func TestWasi_FdPathNamesAnOpenDirectory(t *testing.T) {
 		t.Fatalf("short buffer rc=%d needed=%d, want -ERANGE and %d", rc, readU32(m.memory, int(metaOutOff)), len("/outer/inner"))
 	}
 
-	if err := os.WriteFile(filepath.Join(w.preopenDir, "file"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(hostDir, "file"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	file := openTestFile(t, w, "file")
@@ -966,7 +967,7 @@ func TestWasi_FileTypes(t *testing.T) {
 	skipWithoutPOSIXFiles(t)
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	if err := os.WriteFile(filepath.Join(dir, "file"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1036,7 +1037,7 @@ func TestWasi_FileTypes(t *testing.T) {
 			t.Errorf("close out.log: %v", err)
 		}
 	})
-	w.SetStdout(out)
+	w.cfg.Stdout = out
 	wt, pt = byFd(1)
 	want("stdout redirected to a file", wt, pt, 4, unixTypeRegular)
 	if got := fdFilestatExt(t, w, m, 1).uid; got != uint32(os.Getuid()) {
@@ -1051,7 +1052,7 @@ func TestWasi_FileTypes(t *testing.T) {
 			t.Errorf("close the null device: %v", err)
 		}
 	})
-	w.SetStdin(null)
+	w.cfg.Stdin = null
 	wt, pt = byFd(0)
 	want("stdin from /dev/null", wt, pt, 2, unixTypeChar)
 }
@@ -1083,12 +1084,12 @@ func TestFilestatExtBlocksAndDevice(t *testing.T) {
 	if err := mem.WriteFile("data", make([]byte, 10000), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	w.SetFS(mem)
+	w.cfg.FS = mem
 	if blksize, _, blocks := record("data"); blksize == 0 || blocks != 20 {
 		t.Fatalf("in memory: block size %d, %d blocks; want a block size and 20 blocks", blksize, blocks)
 	}
 	// The null device of the host stands for a device.
-	host := DefaultWASI()
+	host := NewWASI(HostWASIConfig())
 	off := writeCStr(m, 1000, "dev/null")
 	if rc := host.Path_filestat_ext(m, off, 8, 1, metaOutOff); rc != 0 {
 		t.Skipf("the host has no /dev/null: rc=%d", rc)
@@ -1150,7 +1151,7 @@ func TestUnixModeBitsAndFileTypes(t *testing.T) {
 // the guest's memory held there is gone.
 func TestWasi_FilestatExtWithoutAFileWritesTheWholeRecord(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	for _, tc := range []struct {
 		name string
 		fd   int32
@@ -1195,20 +1196,21 @@ func TestWasi_RootDescriptorIsTheRootDirectory(t *testing.T) {
 			t.Errorf("fd %d: posix type %#o, want a directory's", fd, got)
 		}
 	}
-	// A root directory that is gone reports the error of its stat.
+	// A root directory that is gone is still the directory the HostFS
+	// holds open: it is stated through its descriptor.
 	if err := os.Remove(dir); err != nil {
 		t.Fatal(err)
 	}
 	for _, fd := range []int32{wasiPreopenFD, wasiRootFD} {
-		if rc := w.Fd_filestat_get(m, fd, metaOutOff); rc != _wasiENOENT {
-			t.Errorf("fd %d of a removed root: Fd_filestat_get rc=%d, want ENOENT", fd, rc)
+		if got := fdFilestat(t, w, m, fd); got.ino != byPath.ino || got.filetype != 3 {
+			t.Errorf("fd %d of a removed root: ino %d type %d, want %d and a directory's", fd, got.ino, got.filetype, byPath.ino)
 		}
-		if rc := w.Fd_filestat_ext(m, fd, metaOutOff); rc != -_wasiENOENT {
-			t.Errorf("fd %d of a removed root: Fd_filestat_ext rc=%d, want -ENOENT", fd, rc)
+		if rc := w.Fd_filestat_ext(m, fd, metaOutOff); rc != 0 {
+			t.Errorf("fd %d of a removed root: Fd_filestat_ext rc=%d", fd, rc)
 		}
 	}
 	// The root of a filesystem in memory is its root directory.
-	w.SetFS(NewMemFS())
+	w.cfg.FS = NewMemFS()
 	if got := fdFilestat(t, w, m, wasiPreopenFD).filetype; got != 3 {
 		t.Errorf("the root in memory has type %d, want a directory's", got)
 	}

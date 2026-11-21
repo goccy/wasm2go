@@ -187,13 +187,14 @@ func TestMem64Wasip1Hello(t *testing.T) {
 		name      string
 		threshold int
 		mainBody  string
+		imports   []string
 	}{
-		{"single-file", -1, "m := pkg.NewWithWASI(pkg.DefaultWASI())\n\tm.Start()"},
-		{"multi-package", 0, "pkg.Start(pkg.New())"},
+		{"single-file", -1, "m := pkg.NewWithWASI(pkg.NewWASI(pkg.HostWASIConfig()))\n\tm.Start()", nil},
+		{"multi-package", 0, "pkg.Start(pkg.NewWithWASI(base.NewWASI(base.HostWASIConfig())))", []string{"m64wasi/pkg/base"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer transpile.SetMultiPackageThreshold(tc.threshold)()
-			got := runMem64Wasip1(t, "../testdata/wasip1_mem64_hello.wasm", tc.mainBody)
+			got := runMem64Wasip1(t, "../testdata/wasip1_mem64_hello.wasm", tc.mainBody, tc.imports...)
 			want := "hello wasm64: sizeof(void*)=8 sizeof(size_t)=8\nmalloc(67108864) ok, p[last]=-91"
 			if got != want {
 				t.Errorf("wasip1 mem64 output:\ngot:  %q\nwant: %q", got, want)
@@ -247,7 +248,7 @@ func TestMem64Wasip1CppException(t *testing.T) {
 	// The wasm imports the env.__cpp_exception tag alongside wasi, so
 	// the constructor takes an (unused, tag-only) env interface too.
 	got := runMem64Wasip1(t, "../testdata/wasip1_mem64_cpp_eh.wasm",
-		"m := pkg.NewWithWASI(pkg.DefaultWASI(), nil)\n\tm.Start()")
+		"m := pkg.NewWithWASI(pkg.NewWASI(pkg.HostWASIConfig()), nil)\n\tm.Start()")
 	want := strings.Join([]string{
 		"runtime_error: gguf load failed",
 		"custom: 42",
@@ -265,7 +266,8 @@ func TestMem64Wasip1CppException(t *testing.T) {
 
 // runMem64Wasip1 transpiles a checked-in wasm64-wasip1 fixture and runs
 // it with the given constructor statement(s) as the main body.
-func runMem64Wasip1(t *testing.T, fixture, mainBody string) string {
+// imports are the packages main.go imports besides m64wasi/pkg.
+func runMem64Wasip1(t *testing.T, fixture, mainBody string, imports ...string) string {
 	t.Helper()
 	bin, err := os.ReadFile(fixture)
 	if err != nil {
@@ -302,6 +304,10 @@ func runMem64Wasip1(t *testing.T, fixture, mainBody string) string {
 			w("pkg/"+name, data)
 		}
 	}
-	w("main.go", []byte("package main\n\nimport \"m64wasi/pkg\"\n\nfunc main() {\n\t"+mainBody+"\n}\n"))
+	importLines := "\t\"m64wasi/pkg\"\n"
+	for _, p := range imports {
+		importLines += "\t\"" + p + "\"\n"
+	}
+	w("main.go", []byte("package main\n\nimport (\n"+importLines+")\n\nfunc main() {\n\t"+mainBody+"\n}\n"))
 	return runMem64(t, dir)
 }

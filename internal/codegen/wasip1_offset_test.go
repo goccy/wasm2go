@@ -57,7 +57,7 @@ func openDataFile(t *testing.T, w *WasiStubs, fsys FS) File {
 	if _, err := f.Write([]byte("data")); err != nil {
 		t.Fatal(err)
 	}
-	w.fsys = fsys
+	w.cfg.FS = fsys
 	w.fdsLocked()[9] = &wasiOpen{f: f}
 	return f
 }
@@ -80,7 +80,7 @@ func TestWasi_PreadPwriteNegativeOffsetIsEINVAL(t *testing.T) {
 			t.Run(c.name+"/"+name, func(t *testing.T) {
 				dir := t.TempDir()
 				w, m := newTestStubs(t, dir)
-				f := openDataFile(t, w, fsys(dir))
+				f := openDataFile(t, w, fsys(t, dir))
 				for _, offset := range []uint64{1 << 63, math.MaxUint64} {
 					if rc := c.call(w, m, 9, offset); rc != _wasiEINVAL {
 						t.Errorf("offset %#x: rc=%d, want EINVAL", offset, rc)
@@ -205,9 +205,9 @@ func TestWasi_MemFSWritePastMaxSizeIsEFBIG(t *testing.T) {
 }
 
 // testFSs makes each FS the cases below run on.
-var testFSs = map[string]func(dir string) FS{
-	"osFS":  func(dir string) FS { return osFS{root: dir} },
-	"MemFS": func(string) FS { return NewMemFS() },
+var testFSs = map[string]func(t *testing.T, dir string) FS{
+	"osFS":  newHostFS,
+	"MemFS": func(*testing.T, string) FS { return NewMemFS() },
 }
 
 // seekCalls are fd_seek on fd 9, storing the new offset at ioErrResult.
@@ -233,7 +233,7 @@ func TestWasi_SeekOutOfRangeIsEINVAL(t *testing.T) {
 			t.Run(s.name+"/"+name, func(t *testing.T) {
 				dir := t.TempDir()
 				w, m := newTestStubs(t, dir)
-				openDataFile(t, w, fsys(dir))
+				openDataFile(t, w, fsys(t, dir))
 				if rc := s.call(w, m, 2, 0); rc != _wasiESUCCESS {
 					t.Fatalf("seek to 2: rc=%d", rc)
 				}
@@ -281,7 +281,7 @@ func TestWasi_MemFSFileLargerThanLimit(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			w.fsys = fsys
+			w.cfg.FS = fsys
 			w.fdsLocked()[9] = &wasiOpen{f: f}
 			for _, c := range []struct {
 				offset int64
@@ -400,7 +400,7 @@ func TestWasi_SetSizeOfReadOnlyDescriptorIsEINVAL(t *testing.T) {
 			t.Run(c.name+"/"+name, func(t *testing.T) {
 				dir := t.TempDir()
 				w, m := newTestStubs(t, dir)
-				f := openDataFile(t, w, fsys(dir))
+				f := openDataFile(t, w, fsys(t, dir))
 				w.fdsLocked()[9].noWrite = true
 				if rc := c.call(w, m, 9, 2); rc != _wasiEINVAL {
 					t.Errorf("rc=%d, want EINVAL", rc)
@@ -432,7 +432,7 @@ func TestWasi_FdAllocate(t *testing.T) {
 			t.Run(a.name+"/"+name, func(t *testing.T) {
 				dir := t.TempDir()
 				w, m := newTestStubs(t, dir)
-				f := openDataFile(t, w, fsys(dir))
+				f := openDataFile(t, w, fsys(t, dir))
 				cases := []allocate{
 					{-1, 4, _wasiEINVAL}, {0, 0, _wasiEINVAL}, {0, -1, _wasiEINVAL},
 					{math.MaxInt64, 1, _wasiEFBIG},

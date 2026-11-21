@@ -174,7 +174,7 @@ func TestWasi_FdDup2RedirectsAndRestoresStdio(t *testing.T) {
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
 	var out bytes.Buffer
-	w.stdout = &out
+	w.cfg.Stdout = &out
 
 	// Save fd 1 (an alias entry: closing it must not close the stream).
 	const savedOff int32 = 100
@@ -205,7 +205,7 @@ func TestWasi_FdDup2RedirectsAndRestoresStdio(t *testing.T) {
 
 	// While redirected, a spawned child's stdout resolves to the file too.
 	w.mu.Lock()
-	cw := w.childWriterLocked(1, w.stdout)
+	cw := w.childWriterLocked(1, w.cfg.Stdout)
 	w.mu.Unlock()
 	if _, isBuf := cw.(*bytes.Buffer); isBuf {
 		t.Fatal("childWriterLocked(1) ignored the redirection")
@@ -264,7 +264,7 @@ func TestWasi_PathChmodAndFilestatMode(t *testing.T) {
 	}
 
 	// Every backend changes modes; one that lacks the file says so.
-	w.fsys = NewMemFS()
+	w.cfg.FS = NewMemFS()
 	if rc := w.Path_chmod(m, pathOff, 5, 0o600); rc != -_wasiENOENT {
 		t.Fatalf("MemFS Path_chmod of a missing file rc=%d, want -ENOENT", rc)
 	}
@@ -323,6 +323,7 @@ func TestWasi_FdDupEdgeCases(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
+	w.cfg.Stdin = bytes.NewReader(nil)
 
 	if rc := w.Fd_dup(m, 99, 100); rc != _wasiEBADF {
 		t.Fatalf("Fd_dup(bad) rc=%d, want EBADF", rc)
@@ -360,16 +361,16 @@ func TestWasi_FdDupEdgeCases(t *testing.T) {
 	cr := w.childReaderLocked(0)
 	crDefault := w.childReaderLocked(-1)
 	w.mu.Unlock()
-	if cr == w.stdin {
+	if cr == w.cfg.Stdin {
 		t.Fatal("childReaderLocked(0) ignored the redirection")
 	}
-	if crDefault != w.stdin {
+	if crDefault != w.cfg.Stdin {
 		t.Fatal("childReaderLocked(-1) should be the interpreter stdin")
 	}
 
 	// An alias of stderr placed on another fd writes to the stream.
 	var errBuf bytes.Buffer
-	w.stderr = &errBuf
+	w.cfg.Stderr = &errBuf
 	const outOff int32 = 500
 	if rc := w.Fd_dup(m, 2, outOff); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_dup(2) rc=%d", rc)
@@ -411,7 +412,7 @@ func TestWasi_SockGetaddrinfoNumericAndHook(t *testing.T) {
 		t.Fatalf("empty-host getaddrinfo rc=%d", rc)
 	}
 
-	w.SetResolveHook(func(host string) bool { return false })
+	w.cfg.Resolve = func(host string) bool { return false }
 	if rc := w.Sock_getaddrinfo(m, hostOff, 7, outOff); rc != -_wasiEACCES {
 		t.Fatalf("denied getaddrinfo rc=%d, want -EACCES", rc)
 	}
