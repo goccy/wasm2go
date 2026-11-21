@@ -2772,7 +2772,7 @@ func (w *WasiStubs) fdSeek(m *Module, fd int32, offset, whence int64, newOffPtr 
 	if err != nil {
 		// An error without a number of its own (of a File other than the
 		// host's) is EINVAL, which is what a seek can fail with.
-		return errnoOr(err, _wasiEINVAL)
+		return seekErrno(err, _wasiEINVAL)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -2804,7 +2804,7 @@ func (w *WasiStubs) fdTell(m *Module, fd int32, offsetPtr uint64) int32 {
 	}
 	n, err := op.f.Seek(0, 1) // SEEK_CUR
 	if err != nil {
-		return errnoOr(err, _wasiEIO)
+		return seekErrno(err, _wasiEIO)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -2864,15 +2864,25 @@ func (w *WasiStubs) socketConn(fd int32) (*wasiOpen, net.Conn, int32) {
 	return op, nil, _wasiENOTCONN
 }
 
-// errnoOr returns the wasi errno of err, or fallback for an error that
-// carries no error number of the host or one that maps to no errno (EIO
-// for a number other than EIO's).
+// errnoOr returns the wasi errno of err. It returns fallback for an error
+// without an error number of the host, and for a number that mapOSError
+// turns into EIO although the number is not EIO itself.
 func errnoOr(err error, fallback int32) int32 {
 	var number syscall.Errno
 	if errno := mapOSError(err); errors.As(err, &number) && (errno != _wasiEIO || number == syscall.EIO) {
 		return errno
 	}
 	return fallback
+}
+
+// seekErrno is errnoOr for the error of a File's Seek. os.File.Seek of a
+// directory it has read returns EISDIR of its own after the host's seek
+// succeeded; lseek has no such errno, so that error is the fallback too.
+func seekErrno(err error, fallback int32) int32 {
+	if errors.Is(err, syscall.EISDIR) {
+		return fallback
+	}
+	return errnoOr(err, fallback)
 }
 
 // afterShutdown returns the errno of a transfer on op that ended with
@@ -4639,6 +4649,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"memSlice":                true,
 			"mapOSError":              true,
 			"errnoOr":                 true,
+			"seekErrno":               true,
 			"mapExecError":            true,
 			"encodeWaitStatus":        true,
 			"totalBytesPlusNul":       true,

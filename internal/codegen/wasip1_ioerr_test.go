@@ -568,9 +568,10 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 // errnoOr gives the errno of an error with a number and the fallback for
 // one without or with a number that maps to no errno.
 func TestErrnoOr(t *testing.T) {
-	timedOut := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ETIMEDOUT)}
-	if got := errnoOr(timedOut, _wasiECONNREFUSED); got != _wasiETIMEDOUT {
-		t.Errorf("errnoOr(ETIMEDOUT) = %d, want ETIMEDOUT", got)
+	// ENOENT is a number every host maps (to fs.ErrNotExist at least).
+	missing := &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.ENOENT)}
+	if got := errnoOr(missing, _wasiECONNREFUSED); got != _wasiENOENT {
+		t.Errorf("errnoOr(ENOENT) = %d, want ENOENT", got)
 	}
 	if got := errnoOr(errors.New("no number"), _wasiECONNREFUSED); got != _wasiECONNREFUSED {
 		t.Errorf("errnoOr(an error without a number) = %d, want ECONNREFUSED", got)
@@ -581,6 +582,13 @@ func TestErrnoOr(t *testing.T) {
 	}
 	if got := errnoOr(os.NewSyscallError("read", syscall.EIO), _wasiEINVAL); got != _wasiEIO {
 		t.Errorf("errnoOr(EIO) = %d, want EIO", got)
+	}
+	// os.File.Seek's own EISDIR of a directory it has read is no lseek errno.
+	if got := seekErrno(&os.PathError{Op: "seek", Path: "d", Err: syscall.EISDIR}, _wasiEINVAL); got != _wasiEINVAL {
+		t.Errorf("seekErrno(EISDIR) = %d, want EINVAL", got)
+	}
+	if got := seekErrno(&os.PathError{Op: "seek", Path: "f", Err: syscall.EIO}, _wasiEINVAL); got != _wasiEIO {
+		t.Errorf("seekErrno(EIO) = %d, want EIO", got)
 	}
 }
 
@@ -670,7 +678,7 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 				})
 				w, m := newTestStubs(t, t.TempDir())
 				finished := make(chan struct{})
-				var conn net.Conn = c2
+				conn := c2
 				if waiting {
 					conn = &readEndsConn{Conn: c2, finished: finished}
 				}
