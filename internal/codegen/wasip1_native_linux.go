@@ -20,6 +20,14 @@ func statTimes(st *syscall.Stat_t) (atime, ctime time.Time) {
 	return time.Unix(st.Atim.Unix()), time.Unix(st.Ctim.Unix())
 }
 
+// hostSignalByNumber returns the host's signal for a guest signal number
+// the table of hostSignals does not name: Linux numbers its signals as the
+// guest does, so SIGSTKFLT (16), SIGPWR (30) and the real-time signals (32
+// to 64) are the host's signals of the same numbers.
+func hostSignalByNumber(sig int32) (hostSig syscall.Signal, known bool) {
+	return syscall.Signal(sig), sig == 16 || sig == 30 || sig >= 32 && sig <= 64
+}
+
 // openPath is O_PATH, which has this number on every linux GOARCH while
 // package syscall names it on some of them only.
 const openPath = 0x200000

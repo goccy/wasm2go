@@ -42,6 +42,19 @@ func osFileStat(sys any) (fileStat, bool) {
 // existing file, it replaces the file.
 func hostRename(from, to string) error { return os.Rename(from, to) }
 
+// hostSignalOf returns the host's signal for a guest signal number. The
+// runtime does not know this platform's signals, so only number 0, the
+// existence probe of kill, has one.
+func hostSignalOf(sig int32) (hostSig syscall.Signal, known bool) {
+	return 0, sig == 0
+}
+
+// guestSignalOf returns the guest's number for a host signal, or 0 when the
+// guest has none for it — always, on this platform.
+func guestSignalOf(hostSig syscall.Signal) int32 {
+	return 0
+}
+
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error; on this platform the errors are told apart
 // by what package os makes of them, except a few of windows.
