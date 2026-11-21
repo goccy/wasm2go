@@ -60,8 +60,9 @@ func listed(t *testing.T, w *WasiStubs) []string {
 }
 
 // A directory of the host's lists its names in the order the system gives
-// them, with "." and ".." where the system puts them on linux and first on
-// darwin.
+// them, and "." and "..": where the system puts them on linux, first on
+// darwin. ls -f is the system's order for every other name only (GNU ls
+// may move "." and "..").
 func TestReaddir_HostDirectoryInTheSystemsOrder(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range orderTestNames() {
@@ -73,24 +74,34 @@ func TestReaddir_HostDirectoryInTheSystemsOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	var want []string
-	if runtime.GOOS == "darwin" {
-		want = []string{"./", "../"}
-	}
 	for _, name := range systemOrder(t, dir) {
-		if name == "." || name == ".." {
-			if runtime.GOOS == "darwin" {
-				continue
-			}
-			name += "/"
-		}
-		if name == "sub" {
+		switch name {
+		case ".", "..":
+			continue
+		case "sub":
 			name += "/"
 		}
 		want = append(want, name)
 	}
 	w, _ := newTestStubs(t, dir)
-	if got := listed(t, w); strings.Join(got, " ") != strings.Join(want, " ") {
-		t.Errorf("lists %q,\nwant %q", got, want)
+	all := listed(t, w)
+	var got []string
+	dots := 0
+	for _, name := range all {
+		if name == "./" || name == "../" {
+			dots++
+			continue
+		}
+		got = append(got, name)
+	}
+	if dots != 2 {
+		t.Errorf("lists %q, want \"./\" and \"../\" once each", all)
+	}
+	if runtime.GOOS == "darwin" && (len(all) < 2 || all[0] != "./" || all[1] != "../") {
+		t.Errorf("lists %q, want \"./\" and \"../\" first", all)
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("lists %q,\nwant the other names %q", all, want)
 	}
 }
 
