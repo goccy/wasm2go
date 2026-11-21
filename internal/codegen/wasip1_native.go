@@ -650,36 +650,48 @@ func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// memMaxFileSize is the size a MemFS file can grow to: the largest offset
-// of a 32-bit off_t, which a []byte of every host holds.
-const memMaxFileSize = 1<<31 - 1
+// memMaxFileSize is the size a MemFS file can grow to. Growing a file holds
+// its data and a copy up to 1.25 times as large at once: on a 32-bit host
+// the limit is 256 MiB, so that stays far below its address space.
+const memMaxFileSize = min(1<<31-1, 1<<(strconv.IntSize-4)-1)
 
-// validateExtent returns the error of an operation on the n bytes from off:
-// EINVAL for a negative off, EFBIG for an end past memMaxFileSize.
-func (f *memFile) validateExtent(op string, off, n int64) error {
+// validateSize returns the error of making the file size bytes long or of
+// writing from size: EISDIR for a directory, EINVAL for a negative size and
+// EFBIG for a size past memMaxFileSize.
+func (f *memFile) validateSize(op string, size int64) error {
 	switch {
-	case off < 0:
+	case f.node.dir:
+		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EISDIR}
+	case size < 0:
 		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EINVAL}
-	case off > memMaxFileSize-n:
+	case size > memMaxFileSize:
 		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EFBIG}
 	}
 	return nil
 }
 
-// writeAt grows node.data as needed and writes p at off. Caller holds the lock.
+// writeAt grows node.data as needed and writes p at off, up to
+// memMaxFileSize: it writes the bytes below it and fails with EFBIG for the
+// rest. Caller holds the lock.
 func (f *memFile) writeAt(p []byte, off int64) (int, error) {
-	if err := f.validateExtent("write", off, int64(len(p))); err != nil {
+	if err := f.validateSize("write", off); err != nil {
+		return 0, err
+	}
+	var err error
+	if room := memMaxFileSize - off; int64(len(p)) > room {
+		p = p[:room]
+		err = &fs.PathError{Op: "write", Path: f.node.name, Err: syscall.EFBIG}
+	}
+	if len(p) == 0 {
 		return 0, err
 	}
 	end := off + int64(len(p))
 	if end > int64(len(f.node.data)) {
-		grown := make([]byte, end)
-		copy(grown, f.node.data)
-		f.node.data = grown
+		f.node.data = append(f.node.data, make([]byte, end-int64(len(f.node.data)))...)
 	}
 	copy(f.node.data[off:], p)
 	f.node.modTime = time.Now()
-	return len(p), nil
+	return len(p), err
 }
 
 func (f *memFile) Write(p []byte) (int, error) {
@@ -699,16 +711,16 @@ func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 func (f *memFile) Seek(offset int64, whence int) (int64, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
-	off := f.off
+	off := int64(-1) // refused below for a whence that is none of these
 	switch whence {
 	case io.SeekStart:
 		off = offset
 	case io.SeekCurrent:
-		off += offset
+		off = f.off + offset
 	case io.SeekEnd:
 		off = int64(len(f.node.data)) + offset
 	}
-	if off < 0 {
+	if off < 0 || off > memMaxFileSize {
 		return 0, &fs.PathError{Op: "seek", Path: f.node.name, Err: syscall.EINVAL}
 	}
 	f.off = off
@@ -718,15 +730,13 @@ func (f *memFile) Seek(offset int64, whence int) (int64, error) {
 func (f *memFile) Truncate(size int64) error {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
-	if err := f.validateExtent("truncate", size, 0); err != nil {
+	if err := f.validateSize("truncate", size); err != nil {
 		return err
 	}
 	if size <= int64(len(f.node.data)) {
 		f.node.data = f.node.data[:size]
 	} else {
-		grown := make([]byte, size)
-		copy(grown, f.node.data)
-		f.node.data = grown
+		f.node.data = append(f.node.data, make([]byte, size-int64(len(f.node.data)))...)
 	}
 	f.node.modTime = time.Now()
 	return nil
@@ -2236,6 +2246,11 @@ func (w *WasiStubs) Fd_filestat_set_size(m *Module, fd int32, size int64) int32 
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
+	if op.noWrite {
+		// what ftruncate of linux and darwin gives for a descriptor not
+		// open for writing
+		return _wasiEINVAL
+	}
 	if err := op.f.Truncate(size); err != nil {
 		return mapOSError(err)
 	}
@@ -2610,6 +2625,9 @@ func (w *WasiStubs) fdSeek(m *Module, fd int32, offset int64, whence int32, newO
 	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
+	if whence < 0 || whence > 2 {
+		return _wasiEINVAL
+	}
 	n, err := op.f.Seek(offset, int(whence))
 	if err != nil {
 		return _wasiEINVAL
@@ -2734,12 +2752,26 @@ func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
-	if op == nil || op.f == nil {
+	if op == nil || op.f == nil || op.noWrite {
 		return _wasiEBADF
 	}
-	// fallocate "reserves" space; the portable equivalent is Truncate
-	// to offset+length so the file is at least the requested size.
-	if err := op.f.Truncate(offset + length); err != nil {
+	if offset < 0 || length <= 0 {
+		return _wasiEINVAL
+	}
+	end := offset + length
+	if end < 0 {
+		return _wasiEFBIG
+	}
+	// fallocate "reserves" space and never shrinks the file; the portable
+	// equivalent is Truncate to offset+length when that is past the end.
+	st, err := op.f.Stat()
+	if err != nil {
+		return mapOSError(err)
+	}
+	if end <= st.Size() {
+		return _wasiESUCCESS
+	}
+	if err := op.f.Truncate(end); err != nil {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
