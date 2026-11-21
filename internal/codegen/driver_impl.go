@@ -28,9 +28,6 @@ func (t *translator) Module() *wasm.Module { return t.mod }
 // multi-package + linkname-split layout.
 func (t *translator) MultiPackage() bool { return t.multiPackage }
 
-// FieldName is the exported alias for fieldName, satisfying emit.Driver.
-func (t *translator) FieldName(s string) string { return t.fieldName(s) }
-
 // FuncName is the exported alias for funcName, satisfying emit.Driver.
 func (t *translator) FuncName(funcIdx uint32) string { return t.funcName(funcIdx) }
 
@@ -71,12 +68,6 @@ func (t *translator) HelperName(name string) string {
 		return "base." + up
 	}
 	return name
-}
-
-// ImportMethodName is the exported alias for importMethodName,
-// satisfying emit.Driver.
-func (t *translator) ImportMethodName(imp wasm.Import) string {
-	return t.importMethodName(imp)
 }
 
 // UseHelper is the exported alias for useHelper, satisfying emit.Driver.

@@ -6,10 +6,10 @@ import "github.com/goccy/wasm2go/internal/wasm"
 // needs from its host. It captures three categories of dependency:
 //
 //   - Module access (Module): the parsed wasm being translated.
-//   - Identifier resolution (FieldName, FuncName, FuncRefName,
-//     HelperName, ImportMethodName): name spelling rules that depend
-//     on the host's packaging strategy (single-package vs
-//     multi-package + linkname-split) but not on the output language.
+//   - Identifier resolution (FuncName, FuncRefName, HelperName): name
+//     spelling rules that depend on the host's packaging strategy
+//     (single-package vs multi-package + linkname-split) but not on the
+//     output language.
 //   - Side-effect registration (UseHelper, UsePackage): the emitter
 //     announces which runtime helpers and which Go imports the
 //     emitted body relies on so the host can stitch them into the
@@ -39,11 +39,6 @@ type Driver interface {
 	// whether a cross-chunk hop is on the table.
 	MultiPackage() bool
 
-	// FieldName returns the *Module struct field name (multipkg-aware
-	// capitalization). Used wherever the emitter spells out an access
-	// like `m.<field>` so the field is reachable from outside the
-	// owning package in multi-package mode.
-	FieldName(s string) string
 	// FuncName returns the generated function's bare identifier for a
 	// wasm function index (capitalized in multipkg mode, lowercase
 	// otherwise).
@@ -58,10 +53,6 @@ type Driver interface {
 	// mode the base-package qualifier is added when the caller lives
 	// outside the base package.
 	HelperName(name string) string
-	// ImportMethodName returns the Go method name for an imported
-	// wasm function. Always capitalized so it is reachable from the
-	// caller package's host-imports interface.
-	ImportMethodName(imp wasm.Import) string
 
 	// UseHelper records that the named runtime helper is referenced
 	// by an emitted body so the host writes its definition into the

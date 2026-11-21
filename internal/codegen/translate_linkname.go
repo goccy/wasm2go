@@ -85,6 +85,15 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 		chunkBodies[chunkIdx] = bodies
 	}
 
+	// The helper serving an internally handled import may be referenced only
+	// by an export or an element slot, which the main pass (Step 4) emits
+	// after base's helpers are fixed; register it here.
+	for _, imp := range t.mod.Imports {
+		if imp.Kind == wasm.ImportFunc && importHandledInternally(imp) {
+			t.useHelper(t.internalImportHelper())
+		}
+	}
+
 	// Step 2: emit helpers (adds helpers' stdlib imports to t.imports).
 	helpers, err := t.emitHelpers()
 	if err != nil {
