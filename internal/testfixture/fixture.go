@@ -70,7 +70,8 @@ func Wasm(t testing.TB, name string) []byte {
 
 // wat2wasmFlags returns the flags that enable the features the fixtures
 // use (exception handling, threads, memory64) in the installed wat2wasm: a
-// version that enables a feature by default has no flag for it.
+// version that enables a feature by default lists --disable-X instead of
+// --enable-X, and is given nothing for it.
 var wat2wasmFlags = sync.OnceValues(func() ([]string, error) {
 	help, err := exec.Command("wat2wasm", "--help").Output()
 	if err != nil {
