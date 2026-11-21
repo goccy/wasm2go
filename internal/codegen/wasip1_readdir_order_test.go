@@ -197,8 +197,31 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 			t.Errorf("%s, type not recorded: type %v, want %v", name, got, want)
 		}
 	}
-	if got := (&hostDirEntry{dir: dir, name: "nothing"}).Type(); got != 0 {
-		t.Errorf("an entry whose file is gone: type %v, want 0", got)
+	// An entry whose type neither the directory nor the file tells is of
+	// unknown type, in the listing fd_readdir writes too.
+	gone := &hostDirEntry{dir: dir, name: "nothing"}
+	if got := gone.Type(); got != os.ModeIrregular || gone.IsDir() {
+		t.Errorf("an entry whose file is gone: type %v, IsDir() = %v; want %v and false", got, gone.IsDir(), os.ModeIrregular)
+	}
+	unknown, _ := newTestStubs(t, dir)
+	unknownFd, errno := unknown.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	unknown.mu.Lock()
+	listing := unknown.openLocked(unknownFd)
+	unknown.mu.Unlock()
+	// A cookie other than 0 reads on in the listing the descriptor has.
+	listing.mu.Lock()
+	listing.dirCache = []os.DirEntry{gone, gone}
+	listing.mu.Unlock()
+	dirents := make([]byte, 64)
+	n, errno := unknown.fillDirents(unknownFd, dirents, 1)
+	if errno != _wasiESUCCESS || n != 24+len("nothing") {
+		t.Fatalf("fillDirents wrote %d bytes, errno=%d; want one entry", n, errno)
+	}
+	if name, filetype := string(dirents[24:n]), dirents[20]; name != "nothing" || filetype != 0 {
+		t.Errorf("fd_readdir lists %q with filetype %d, want \"nothing\" with 0 (unknown)", name, filetype)
 	}
 	if null := entriesOf("/dev")["null"]; null == nil || null.Type() != os.ModeDevice|os.ModeCharDevice {
 		t.Errorf("/dev/null: entry %v, want a character device", null)

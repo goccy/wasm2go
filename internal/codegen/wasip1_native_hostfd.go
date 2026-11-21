@@ -64,10 +64,13 @@ func (e *hostDirEntry) Type() os.FileMode {
 	case syscall.S_IFREG:
 		return 0
 	}
-	// The directory does not say (DT_UNKNOWN): the file does.
-	if fi, err := e.Info(); err == nil {
-		return fi.Mode().Type()
+	// The directory does not say (DT_UNKNOWN): the file does. A file that
+	// cannot be asked leaves the type unknown. Type has no error to return,
+	// and the listing goes on: the name is listed, and the guest stats it.
+	fi, err := e.Info()
+	if err != nil {
+		return os.ModeIrregular
 	}
-	return 0
+	return fi.Mode().Type()
 }
 func (e *hostDirEntry) Info() (os.FileInfo, error) { return os.Lstat(e.dir + "/" + e.name) }

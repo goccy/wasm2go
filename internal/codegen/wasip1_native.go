@@ -3263,6 +3263,8 @@ func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, i
 			dtype = 6
 		} else if e.Type()&os.ModeSocket != 0 {
 			dtype = 6
+		} else if e.Type()&os.ModeIrregular != 0 {
+			dtype = 0 // unknown
 		}
 		// Assemble the fixed header, then copy header+name into the buffer.
 		// When a record does not fully fit we copy as much as fits so that

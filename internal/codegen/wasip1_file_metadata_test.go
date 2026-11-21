@@ -630,8 +630,9 @@ func TestFilestatExtBlocksAndDevice(t *testing.T) {
 		out := m.memory[metaOutOff:]
 		return binary.LittleEndian.Uint32(out[12:]), binary.LittleEndian.Uint64(out[16:]), binary.LittleEndian.Uint64(out[24:])
 	}
-	if _, _, blocks := record("data"); blocks == 0 {
-		t.Fatal("a file of 10000 bytes has no blocks")
+	blksize, rdev, blocks := record("data")
+	if blksize == 0 || blocks == 0 || rdev != 0 {
+		t.Fatalf("a file of 10000 bytes: block size %d, %d blocks, device %d", blksize, blocks, rdev)
 	}
 	// In memory a file has blocks too.
 	mem := NewMemFS()
