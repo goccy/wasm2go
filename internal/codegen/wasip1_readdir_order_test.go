@@ -156,7 +156,7 @@ func TestReaddir_MemFSDirectorySorted(t *testing.T) {
 	if err := mem.Mkdir("sub", 0o755); err != nil {
 		t.Fatal(err)
 	}
-	w.fsys = mem
+	w.cfg.FS = mem
 	names := orderTestNames()
 	names = append(names, "sub/")
 	sort.Strings(names)
@@ -221,6 +221,15 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 		return byName
 	}
 	entries := entriesOf(dir)
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := dirFile.Close(); err != nil {
+			t.Errorf("close %s: %v", dir, err)
+		}
+	})
 	for name, want := range map[string]os.FileMode{
 		".": os.ModeDir, "..": os.ModeDir, "file": 0, "dir": os.ModeDir, "link": os.ModeSymlink,
 		"fifo": os.ModeNamedPipe, "sock": os.ModeSocket,
@@ -236,15 +245,25 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 		if e.IsDir() != want.IsDir() {
 			t.Errorf("%s: IsDir() = %v", name, e.IsDir())
 		}
-		// An entry whose directory does not record the type asks the file.
-		unknown := &hostDirEntry{dir: dir, name: name}
-		if got := unknown.Type(); got != want {
-			t.Errorf("%s, type not recorded: type %v, want %v", name, got, want)
+		// An entry whose directory does not record the type asks the file:
+		// by its host path in the whole host filesystem, relative to the
+		// directory in a HostFS root where the system has a call for that
+		// (not darwin, whose listing records every type).
+		if got := (&hostDirEntry{dir: dirFile, hostPath: true, name: name}).Type(); got != want {
+			t.Errorf("%s, type not recorded, whole host: type %v, want %v", name, got, want)
+		}
+		unknown := &hostDirEntry{dir: dirFile, name: name}
+		wantUnknown := want
+		if runtime.GOOS == "darwin" {
+			wantUnknown = os.ModeIrregular
+		}
+		if got := unknown.Type(); got != wantUnknown {
+			t.Errorf("%s, type not recorded: type %v, want %v", name, got, wantUnknown)
 		}
 	}
 	// An entry whose type neither the directory nor the file tells is of
 	// unknown type, in the listing fd_readdir writes too.
-	gone := &hostDirEntry{dir: dir, name: "nothing"}
+	gone := &hostDirEntry{dir: dirFile, name: "nothing"}
 	if got := gone.Type(); got != os.ModeIrregular || gone.IsDir() {
 		t.Errorf("an entry whose file is gone: type %v, IsDir() = %v; want %v and false", got, gone.IsDir(), os.ModeIrregular)
 	}
@@ -311,10 +330,23 @@ func TestReaddir_DirectoryWithoutSearchPermission(t *testing.T) {
 			t.Errorf("chmod %s: %v", dir, err)
 		}
 	})
-	w, _ := newTestStubs(t, dir)
+	// On the whole host filesystem: a HostFS of dir itself cannot be made
+	// (os.Root searches its root).
+	w := NewWASI(WASIConfig{FS: newHostFS(t, "/")})
+	fd, errno := w.pathOpen(hostRelative(t, dir), 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	entries, err := op.readDirCached(true)
+	if err != nil {
+		t.Fatalf("readDirCached: %v", err)
+	}
 	var got []string
-	for _, name := range listed(t, w) {
-		got = append(got, strings.TrimSuffix(name, "/"))
+	for _, e := range entries {
+		got = append(got, e.Name())
 	}
 	sort.Strings(got)
 	if strings.Join(got, " ") != ". .. a b" {

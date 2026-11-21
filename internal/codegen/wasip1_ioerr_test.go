@@ -184,7 +184,7 @@ func TestWasi_ReadAtEOFSucceedsWithZero(t *testing.T) {
 	}
 	t.Run("stdin", func(t *testing.T) {
 		w, m := newTestStubs(t, t.TempDir())
-		w.stdin = strings.NewReader("")
+		w.cfg.Stdin = strings.NewReader("")
 		if rc, n := ioReadCalls[0].run(w, m, 0, 1); rc != _wasiESUCCESS || n != 0 {
 			t.Fatalf("rc=%d n=%d, want ESUCCESS 0", rc, n)
 		}
@@ -193,10 +193,10 @@ func TestWasi_ReadAtEOFSucceedsWithZero(t *testing.T) {
 
 func TestWasi_ReadOnDirectoryIsEISDIR(t *testing.T) {
 	dir := t.TempDir()
-	for name, fsys := range map[string]FS{"osFS": osFS{root: dir}, "MemFS": NewMemFS()} {
+	for name, fsys := range map[string]FS{"osFS": newHostFS(t, dir), "MemFS": NewMemFS()} {
 		t.Run(name, func(t *testing.T) {
 			w, m := newTestStubs(t, dir)
-			w.fsys = fsys
+			w.cfg.FS = fsys
 			if name == "osFS" && runtime.GOOS == "windows" {
 				t.Skip("reading a directory handle fails differently on Windows")
 			}
@@ -391,7 +391,7 @@ func TestWasi_StreamReadReturnsWhatHasArrived(t *testing.T) {
 						}
 						peer, own = pw, r
 						if src == "stdin" {
-							w.stdin, fd = r, 0
+							w.cfg.Stdin, fd = r, 0
 						} else {
 							w.fdsLocked()[fd] = &wasiOpen{f: r}
 						}
@@ -543,12 +543,12 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 	}
 
 	// The descriptor goes away while the socket dials.
-	w.SetDialHook(func(network, host, ip string, port int) bool {
+	w.cfg.Dial = func(network, host, ip string, port int) bool {
 		if rc := w.Fd_close(m, 9); rc != _wasiESUCCESS {
 			t.Errorf("Fd_close during the dial: rc=%d", rc)
 		}
 		return true
-	})
+	}
 	port := l.Addr().(*net.TCPAddr).Port
 	if rc := w.Sock_connect(m, 9, 0x0100007f, int32(port)); rc != -_wasiEBADF {
 		t.Errorf("Sock_connect of a socket closed while it dials: rc=%d, want -EBADF", rc)

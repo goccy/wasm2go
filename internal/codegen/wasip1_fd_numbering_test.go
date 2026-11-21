@@ -165,7 +165,7 @@ func TestWasi_ClosedStandardOutputIsReusedByOpen(t *testing.T) {
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
 	var out bytes.Buffer
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
 
 	if ft := fdFiletype(t, w, m, 1); ft != 2 {
 		t.Fatalf("stdout filetype = %d, want character device", ft)
@@ -203,7 +203,7 @@ func TestWasi_ClosedStandardOutputIsReusedByOpen(t *testing.T) {
 		t.Fatalf("offset = %d, want %d", pos, len("to-file"))
 	}
 	w.mu.Lock()
-	cw := w.childWriterLocked(1, w.stdout)
+	cw := w.childWriterLocked(1, w.cfg.Stdout)
 	w.mu.Unlock()
 	if _, isFile := cw.(File); !isFile {
 		t.Fatalf("spawned child's stdout = %T, want the file", cw)
@@ -283,14 +283,14 @@ func TestWasi_ClosedStandardDescriptorsAreBad(t *testing.T) {
 	// instance's own stream when the guest asks for it with -1.
 	w.mu.Lock()
 	cin := w.childReaderLocked(0)
-	cout := w.childWriterLocked(1, w.stdout)
-	cerr := w.childWriterLocked(2, w.stderr)
-	inherited := w.childWriterLocked(-1, w.stdout)
+	cout := w.childWriterLocked(1, w.cfg.Stdout)
+	cerr := w.childWriterLocked(2, w.cfg.Stderr)
+	inherited := w.childWriterLocked(-1, w.cfg.Stdout)
 	w.mu.Unlock()
 	if cin != nil || cout != nil || cerr != nil {
 		t.Errorf("child streams for closed fds = %v, %v, %v; want none", cin, cout, cerr)
 	}
-	if inherited != w.stdout {
+	if inherited != w.cfg.Stdout {
 		t.Errorf("child stream for fd -1 = %v, want the instance's stdout", inherited)
 	}
 }
@@ -301,7 +301,7 @@ func TestWasi_SpawnWithClosedStandardOutput(t *testing.T) {
 	}
 	w, m := newTestStubs(t, t.TempDir())
 	var out bytes.Buffer
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
 	closeTestFd(t, w, m, 1)
 
 	pathOff := writeCStr(m, 1000, "/bin/echo")
@@ -331,7 +331,7 @@ func TestWasi_SpawnWithSocketAsStandardStream(t *testing.T) {
 	}
 	w, m := newTestStubs(t, t.TempDir())
 	var out bytes.Buffer
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
 	local, peer := net.Pipe()
 	t.Cleanup(func() {
 		if err := peer.Close(); err != nil {
@@ -385,7 +385,7 @@ func TestWasi_ForkCopiesClosedStandardDescriptors(t *testing.T) {
 	if rc := fdWriteString(child, cm, 2, "err"); rc != _wasiESUCCESS {
 		t.Fatalf("child write to fd 2 rc=%d", rc)
 	}
-	if got := w.stderr.(*bytes.Buffer).String(); got != "err" {
+	if got := w.cfg.Stderr.(*bytes.Buffer).String(); got != "err" {
 		t.Fatalf("stderr stream = %q, want %q", got, "err")
 	}
 	// The child numbers its descriptors on its own, from its own table.
@@ -414,8 +414,7 @@ func TestWasi_ForkCopiesClosedStandardDescriptors(t *testing.T) {
 
 func TestWasi_HandBuiltStubsStartWithStandardDescriptors(t *testing.T) {
 	var out, errOut bytes.Buffer
-	w := &WasiStubs{stdin: bytes.NewReader([]byte("in")), stdout: &out, stderr: &errOut}
-	w.SetPreopenDir(t.TempDir())
+	w := &WasiStubs{cfg: WASIConfig{Stdin: bytes.NewReader([]byte("in")), Stdout: &out, Stderr: &errOut, FS: newHostFS(t, t.TempDir())}}
 	m := newForkTestModule()
 
 	if got, rc := fdReadString(w, m, 0, 8); rc != _wasiESUCCESS || got != "in" {
@@ -436,20 +435,20 @@ func TestWasi_HandBuiltStubsStartWithStandardDescriptors(t *testing.T) {
 	}
 
 	// Each of these is the first call on a table that was never set up.
-	if r, wr := newTestPipe(t, &WasiStubs{}, m); r != 4 || wr != 5 {
-		t.Fatalf("pipe on fresh stubs = %d,%d, want 4,5", r, wr)
+	if r, wr := newTestPipe(t, &WasiStubs{}, m); r != 3 || wr != 4 {
+		t.Fatalf("pipe on fresh stubs without a filesystem = %d,%d, want 3,4", r, wr)
 	}
-	if fd := (&WasiStubs{}).Sock_socket(m, 2, 1); fd != 4 {
-		t.Fatalf("socket on fresh stubs = %d, want 4", fd)
+	if fd := (&WasiStubs{}).Sock_socket(m, 2, 1); fd != 3 {
+		t.Fatalf("socket on fresh stubs without a filesystem = %d, want 3", fd)
 	}
 	if rc := (&WasiStubs{}).Fd_close(m, 1); rc != _wasiESUCCESS {
 		t.Fatalf("close(1) on fresh stubs rc=%d", rc)
 	}
-	forked := (&WasiStubs{stdout: &out}).Fork()
+	forked := (&WasiStubs{cfg: WASIConfig{Stdout: &out}}).Fork()
 	if rc := fdWriteString(forked, m, 1, "+child"); rc != _wasiESUCCESS || out.String() != "out+child" {
 		t.Fatalf("write fd 1 of a fork of fresh stubs rc=%d, stream %q", rc, out.String())
 	}
-	closed := &WasiStubs{stdout: &out}
+	closed := &WasiStubs{cfg: WASIConfig{Stdout: &out}}
 	if err := closed.CloseAll(); err != nil {
 		t.Fatalf("CloseAll on fresh stubs: %v", err)
 	}
@@ -458,19 +457,16 @@ func TestWasi_HandBuiltStubsStartWithStandardDescriptors(t *testing.T) {
 	}
 }
 
-func TestWasi_StreamRedirectionReachesOpenStandardDescriptors(t *testing.T) {
+func TestWasi_ConfiguredStreamsReachOpenStandardDescriptors(t *testing.T) {
 	w, m := newProcTestStubs(t)
+	var out, errOut bytes.Buffer
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &out, &errOut, bytes.NewReader([]byte("later"))
 	saved := dupTestFd(t, w, m, 1)
 	closeTestFd(t, w, m, 2)
 	file := createTestFile(t, w, "err.txt")
 	if file != 2 {
 		t.Fatalf("open after close(2) = %d, want 2", file)
 	}
-
-	var out, errOut bytes.Buffer
-	w.SetStdout(&out)
-	w.SetStderr(&errOut)
-	w.SetStdin(bytes.NewReader([]byte("later")))
 
 	if rc := fdWriteString(w, m, 1, "a"); rc != _wasiESUCCESS {
 		t.Fatalf("write fd 1 rc=%d", rc)
@@ -497,7 +493,7 @@ func TestWasi_Dup2OntoClosedStandardDescriptor(t *testing.T) {
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
 	var out bytes.Buffer
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
 
 	saved := dupTestFd(t, w, m, 1)
 	closeTestFd(t, w, m, 1)

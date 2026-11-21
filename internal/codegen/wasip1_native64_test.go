@@ -463,7 +463,7 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	fd, errno := w.pathOpen("f", 0, 0, 1<<1|1<<6, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open: %d", errno)
@@ -535,7 +535,7 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 	// f.txt, opened for reading and writing.
 	prep := func(t *testing.T, w *WasiStubs, m *Module) int32 {
 		t.Helper()
-		w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+		w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 		fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1|1<<6, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open: %d", errno)
@@ -659,7 +659,7 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 // exactly wasiMaxIovecs entries is taken.
 func TestWasi64_IovecCountIsBounded(t *testing.T) {
 	w, _ := newTestStubs(t, t.TempDir())
-	w.stdout = &bytes.Buffer{}
+	w.cfg.Stdout = &bytes.Buffer{}
 	// Zeroed memory is an array of empty iovecs at 0 for either ABI; the
 	// count a call writes back goes after wasiMaxIovecs+1 LP64 entries.
 	const countOff = (wasiMaxIovecs + 1) * 16

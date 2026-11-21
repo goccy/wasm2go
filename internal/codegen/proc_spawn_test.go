@@ -37,9 +37,9 @@ func TestWasi_ProcSpawnWait(t *testing.T) {
 	}
 	w, m := newTestStubs(t, t.TempDir())
 	var out bytes.Buffer
-	w.stdout = &out
-	w.stderr = &bytes.Buffer{}
-	w.stdin = bytes.NewReader(nil)
+	w.cfg.Stdout = &out
+	w.cfg.Stderr = &bytes.Buffer{}
+	w.cfg.Stdin = bytes.NewReader(nil)
 
 	pathOff := writeCStr(m, 1000, "/bin/echo")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "hello-proc"})
@@ -69,7 +69,7 @@ func TestWasi_ProcSpawnExitCode(t *testing.T) {
 		t.Skip("/bin/sh not available")
 	}
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdout, w.stderr, w.stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 
 	pathOff := writeCStr(m, 1000, "/bin/sh")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "exit 7"})
@@ -90,9 +90,9 @@ func TestWasi_ProcSpawnExitCode(t *testing.T) {
 
 func TestWasi_ProcSpawnExecHookDenies(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdout, w.stderr, w.stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	var seen string
-	w.SetExecHook(func(path string, argv []string) bool { seen = path; return false })
+	w.cfg.Exec = func(path string, argv []string) bool { seen = path; return false }
 
 	pathOff := writeCStr(m, 1000, "/bin/echo")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "x"})
@@ -106,7 +106,7 @@ func TestWasi_ProcSpawnExecHookDenies(t *testing.T) {
 
 func TestWasi_ProcSpawnNotFound(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdout, w.stderr, w.stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	pathOff := writeCStr(m, 1000, "/no/such/binary-xyz")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/no/such/binary-xyz"})
 	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiENOENT {
@@ -126,7 +126,7 @@ func TestWasi_ProcWaitWNOHANG(t *testing.T) {
 		t.Skip("/bin/sh not available")
 	}
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdout, w.stderr, w.stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	pathOff := writeCStr(m, 1000, "/bin/sh")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "sleep 0.3; exit 3"})
 	const pidOff, statusOff int32 = 4000, 4004
@@ -164,7 +164,7 @@ func TestWasi_PipeCapture(t *testing.T) {
 		t.Skip("/bin/echo not available")
 	}
 	w, m := newTestStubs(t, t.TempDir())
-	w.stdin, w.stdout, w.stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 
 	const pipeOut int32 = 5000
 	if rc := w.Pipe(m, pipeOut); rc != _wasiESUCCESS {

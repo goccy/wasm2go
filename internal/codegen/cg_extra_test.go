@@ -41,8 +41,8 @@ func TestWexportsBulkDispatch(t *testing.T) {
 }
 
 // TestNativeWASIDefault drives the wasi fixture through the auto-on
-// native wasip1 implementation. DefaultWASI() must appear in the
-// generated source and NewWithWASI() must be exposed.
+// native wasip1 implementation. New() must build the zero WASIConfig
+// and NewWithWASI() must be exposed.
 func TestNativeWASIDefault(t *testing.T) {
 	mod := readFixture(t, "cg_wasi.wasm")
 	var buf bytes.Buffer
@@ -53,8 +53,8 @@ func TestNativeWASIDefault(t *testing.T) {
 		t.Fatalf("translate: %v", err)
 	}
 	src := buf.String()
-	if !strings.Contains(src, "DefaultWASI") {
-		t.Errorf("native wasi output missing DefaultWASI(): %s", src)
+	if !strings.Contains(src, "NewWithWASI(NewWASI(WASIConfig{}))") {
+		t.Errorf("New() does not use NewWASI(WASIConfig{}): %s", src)
 	}
 	if !strings.Contains(src, "NewWithWASI") {
 		t.Errorf("native wasi output missing NewWithWASI(): %s", src)

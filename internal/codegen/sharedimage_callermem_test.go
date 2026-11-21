@@ -94,7 +94,7 @@ func trapped(f func()) (msg string) {
 }
 
 func main() {
-	m := pkg.NewWithMemory(pkg.DefaultWASI(), make([]byte, allocation), pkg.InitialMemoryBytes)
+	m := pkg.NewWithMemory(pkg.NewWASI(pkg.HostWASIConfig()), make([]byte, allocation), pkg.InitialMemoryBytes)
 	end := addr(pkg.InitialMemoryBytes)
 	fmt.Println("random_get below the end:", m.Random(end-1, 1))
 	fmt.Println("random_get at the end:", m.Random(end, 1))
@@ -103,23 +103,23 @@ func main() {
 	fmt.Println("random_get in the new page:", m.Random(end, page))
 	fmt.Println("random_get at the grown end:", m.Random(end+page, 1))
 
-	s := pkg.NewFromSnapshot(pkg.DefaultWASI(), make([]byte, allocation), pkg.InitialMemoryBytes, nil)
+	s := pkg.NewFromSnapshot(pkg.NewWASI(pkg.HostWASIConfig()), make([]byte, allocation), pkg.InitialMemoryBytes, nil)
 	fmt.Println("snapshot random_get below the end:", s.Random(end-1, 1))
 	fmt.Println("snapshot random_get at the end:", s.Random(end, 1))
 	fmt.Println("snapshot grows from", s.Grow(1))
 	fmt.Println("snapshot random_get in the new page:", s.Random(end, page))
 
 	fmt.Println("exact:", trapped(func() {
-		pkg.NewWithMemory(pkg.DefaultWASI(), make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes)
+		pkg.NewWithMemory(pkg.NewWASI(pkg.HostWASIConfig()), make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes)
 	}))
 	fmt.Println("exact snapshot:", trapped(func() {
-		pkg.NewFromSnapshot(pkg.DefaultWASI(), make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes, nil)
+		pkg.NewFromSnapshot(pkg.NewWASI(pkg.HostWASIConfig()), make([]byte, pkg.InitialMemoryBytes), pkg.InitialMemoryBytes, nil)
 	}))
 	fmt.Println("oversized:", trapped(func() {
-		pkg.NewWithMemory(pkg.DefaultWASI(), make([]byte, page), pkg.InitialMemoryBytes)
+		pkg.NewWithMemory(pkg.NewWASI(pkg.HostWASIConfig()), make([]byte, page), pkg.InitialMemoryBytes)
 	}))
 	fmt.Println("oversized snapshot:", trapped(func() {
-		pkg.NewFromSnapshot(pkg.DefaultWASI(), make([]byte, page), pkg.InitialMemoryBytes, nil)
+		pkg.NewFromSnapshot(pkg.NewWASI(pkg.HostWASIConfig()), make([]byte, page), pkg.InitialMemoryBytes, nil)
 	}))
 }
 `

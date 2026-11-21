@@ -3,6 +3,8 @@
 package codegen
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"syscall"
 	"time"
@@ -11,6 +13,14 @@ import (
 // statTimes returns the access and status-change times of a stat result.
 func statTimes(st *syscall.Stat_t) (atime, ctime time.Time) {
 	return time.Unix(st.Atimespec.Unix()), time.Unix(st.Ctimespec.Unix())
+}
+
+// lstatAt would describe name in the directory open as dir; package
+// syscall has no call relative to a directory descriptor on this system,
+// and a path of the host is not looked up instead. osFileDirents records
+// the type of every name, so the listing never asks.
+func lstatAt(dir *os.File, name string) (os.FileInfo, error) {
+	return nil, &fs.PathError{Op: "lstatat", Path: name, Err: errors.ErrUnsupported}
 }
 
 // osFileDirents returns the names in the directory open as d: "." and

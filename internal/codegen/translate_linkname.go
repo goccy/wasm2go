@@ -101,7 +101,7 @@ func (t *translator) translateLinknameMulti() (Result, error) {
 	}
 
 	// Step 2b: native wasi impl (only when -native-wasi is on and the
-	// wasm imports wasi_snapshot_preview1). Lives in base/ so DefaultWASI
+	// wasm imports wasi_snapshot_preview1). Lives in base/ so NewWASI
 	// can return *WasiStubs alongside *Module. Imports merged into
 	// t.imports so they land in the snapshot below.
 	t.currentChunk = chunkBase

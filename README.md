@@ -78,6 +78,55 @@ caller writes `Result.AuxFiles` (multi-package output carries them in
 supports (linux, darwin, freebsd, netbsd, openbsd, dragonfly,
 solaris, illumos, aix, windows).
 
+The runtime is built from a `WASIConfig` with `NewWASI(cfg)` and
+passed to `NewWithWASI`. The guest gets only what the configuration
+names: the zero `WASIConfig{}`, which `New()` uses, gives it no
+arguments, no environment, an empty stdin, a stdout and stderr that
+discard what is written, no filesystem (nothing is preopened: every
+call on fd 3 fails with `EBADF`, fd 3 is an ordinary free number, and
+the guest's C library fails every path with `ENOENT`), no process
+spawn, and none of the socket operations the hooks gate: `NetAccess`
+gates `sock_accept`, `sock_recv` and `sock_send`, `Dial` gates
+`sock_connect`, `Resolve` gates `sock_getaddrinfo` (except an empty
+host, which resolves to `INADDR_ANY`), and `Exec` gates `proc_spawn`;
+a nil one denies. `sock_socket`, `sock_shutdown` and `pipe` consult no
+hook. `FSAccess` is consulted on every path operation with the path
+cleaned as `chroot(2)` sees it (`..` of the root is the root; a
+symbolic link's target too) and the `FS` is given that approved path
+(`FSAccess` is a policy on path names); a nil one allows every access
+to the configured `FS`, which is then given the path as the guest wrote
+it. Host
+access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
+`AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
+host process has (its args, environment, stdio and the whole host
+filesystem, with every hook allowing). `HostFS` of a directory other
+than `/` is built on `os.Root`, which refuses every path the guest
+names that escapes it (through `..` or a symbolic link) with `EACCES`;
+the symbolic links the guest creates may still point anywhere for a
+reader on the host. The directory must be one that may be searched,
+and it is held open until the FS's `Close` method is called.
+
+```go
+fsys, err := mymodule.HostFS("/srv/data")
+if err != nil {
+	return err
+}
+defer func() {
+	if err := fsys.(io.Closer).Close(); err != nil {
+		log.Print(err)
+	}
+}()
+m := mymodule.NewWithWASI(mymodule.NewWASI(mymodule.WASIConfig{
+	Args:   []string{"prog"},
+	Stdout: os.Stdout,
+	FS:     fsys,
+}))
+```
+
+For multi-package output these names live in the `base` package
+(`base.NewWASI`, `base.WASIConfig`, `base.HostFS`, ...), and
+`NewWithWASI` stays in the module's package.
+
 ## Library usage
 
 The translator is also importable as a library via the

@@ -159,8 +159,8 @@ func TestMatrixNativeWASI(t *testing.T) {
 			src := buf.String()
 			assertSingleFileCompiles(t, src, res.Sidecars, res.AuxFiles, res.Files)
 			if fx == "cg_wasi.wasm" || fx == "hello.wasm" {
-				if !strings.Contains(src, "DefaultWASI") {
-					t.Errorf("%s: NativeWASI output missing DefaultWASI()", fx)
+				if !strings.Contains(src, "NewWASI") {
+					t.Errorf("%s: NativeWASI output missing NewWASI()", fx)
 				}
 				if !strings.Contains(src, "NewWithWASI") {
 					t.Errorf("%s: NativeWASI output missing NewWithWASI()", fx)
@@ -190,7 +190,7 @@ import (
 )
 
 func main() {
-	m := pkg.New()
+	m := pkg.NewWithWASI(pkg.NewWASI(pkg.HostWASIConfig()))
 	rc := m.SayHello()
 	fmt.Printf("say_hello rc=%d\n", rc)
 	n := m.RandByte()

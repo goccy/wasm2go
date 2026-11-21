@@ -75,12 +75,11 @@ type addr = %s
 const page = 1 << 16
 
 func main() {
-	w := pkg.DefaultWASI()
 	var seen []string
-	w.SetExecHook(func(path string, argv []string) bool {
+	w := pkg.NewWASI(pkg.WASIConfig{Exec: func(path string, argv []string) bool {
 		seen = append(seen, path)
 		return false
-	})
+	}})
 	m := pkg.NewWithWASI(w)
 	end := addr(pkg.InitialMemoryBytes)
 	fmt.Println("memory spans the declared maximum:", len(m.Memory()) == 4*page)

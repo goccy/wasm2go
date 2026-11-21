@@ -15,7 +15,7 @@ import (
 // One WasiStubs answers both: the two share the instance's descriptors,
 // processes and signals. So a module that imports from wasip1_posix_extension gets no
 // interface or constructor parameter of its own for it: its imports become
-// methods of the wasi_snapshot_preview1 interface, which DefaultWASI — or the
+// methods of the wasi_snapshot_preview1 interface, which NewWASI — or the
 // embedder's implementation passed to NewWithWASI — provides.
 const (
 	wasiModule  = "wasi_snapshot_preview1"
