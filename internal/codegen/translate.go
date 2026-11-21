@@ -4009,14 +4009,6 @@ func funcTypeRefsAny(ft *ast.FuncType, names map[string]bool) bool {
 	return found
 }
 
-// capitalizeModuleFieldRefs rewrites `m.<lowercase>` selectors to
-// `m.<Capitalized>` (only). Used by the native-wasi emission path which
-// has no helper-to-helper calls; helper bodies from helpers.go go
-// through rewriteHelperBody instead.
-func capitalizeModuleFieldRefs(body *ast.BlockStmt) *ast.BlockStmt {
-	return rewriteHelperBody(body, nil)
-}
-
 // rewriteHelperBody rewrites a helper body for multi-package output, IN
 // PLACE: `m.<field>` selectors get exported field names, and bare identifiers
 // in the rename set (helper functions, the wasmExc/threads types) get

@@ -132,6 +132,18 @@
     (func $proc_times (param i64) (result i32)))
   (import "wasip1_posix_extension" "proc_spawn"
     (func $proc_spawn (param i64 i64 i64 i32 i32 i32 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_signal_register"
+    (func $proc_signal_register (param i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_signal_dispositions"
+    (func $proc_signal_dispositions (param i64 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_signal_take"
+    (func $proc_signal_take (param i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_itimer"
+    (func $proc_itimer (param i32 i64 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_terminate"
+    (func $proc_terminate (param i32)))
+  (import "wasip1_posix_extension" "proc_kill"
+    (func $proc_kill (param i32 i32) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -199,5 +211,11 @@
     (drop (call $proc_ids (i64.const 0)))
     (drop (call $proc_times (i64.const 0)))
     (drop (call $proc_spawn (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $proc_signal_register (i64.const 0)))
+    (drop (call $proc_signal_dispositions (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $proc_signal_take (i64.const 0)))
+    (drop (call $proc_itimer (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (call $proc_terminate (i32.const 0))
+    (drop (call $proc_kill (i32.const 0) (i32.const 0)))
   )
 )

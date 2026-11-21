@@ -115,6 +115,20 @@ the host process's, or an error where its umask cannot be read without
 changing it; `HostProcessUmask(umask)` is the same with the umask
 given. `HostWASIConfig()` leaves `Process` nil.
 
+`Signals` connects the guest's signals with what is outside it: its
+`Kill` is given the guest's `kill` of a process that is not the
+guest's own (not the guest, not a child or fork it made) or of a
+process group that is not the guest's (the guest and its forks are one
+group; `kill(-1)` reaches them but the guest), and its
+`Dispositions` is told the signals the guest handles, ignores and
+blocks whenever they change, with the reporting instance as the
+`SignalTarget` to post that guest's signals to (a forked instance shares
+its parent's `Signals`). Signal numbers are the guest's (Linux
+numbering); a raise of a WASI signal is turned into it. A nil one is an
+isolated guest: such a `kill` fails with `ESRCH`. Signals reach the
+guest through `PostSignal`. `ForkProc` forks an instance that its
+parent waits for, under a pid token the fork knows as its own.
+
 ```go
 fsys, err := mymodule.HostFS("/srv/data")
 if err != nil {

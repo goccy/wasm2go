@@ -1307,15 +1307,6 @@ func TestWasi_MapOSError(t *testing.T) {
 	}
 }
 
-func TestWasi_Itoa32(t *testing.T) {
-	cases := map[int32]string{0: "0", 1: "1", -42: "-42", 12345: "12345"}
-	for v, want := range cases {
-		if got := itoa32(v); got != want {
-			t.Errorf("itoa32(%d)=%q want %q", v, got, want)
-		}
-	}
-}
-
 func TestWasi_MemSliceOOB(t *testing.T) {
 	w := &WasiStubs{}
 	m := newGuestModule(16)

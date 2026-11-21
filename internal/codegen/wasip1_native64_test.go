@@ -508,6 +508,7 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"path_create_directory_mode", func() int32 { return w.Path_create_directory_mode64(m, highAddr, 1, 0o700) }, -_wasiEFAULT},
 		{"proc_ids", func() int32 { return w.Proc_ids64(m, highAddr) }, -_wasiEFAULT},
 		{"proc_times", func() int32 { return w.Proc_times64(m, highAddr) }, -_wasiEFAULT},
+		{"proc_signal_register", func() int32 { return w.Proc_signal_register64(m, highAddr) }, -_wasiEFAULT},
 	} {
 		before := bytes.Clone(m.memory)
 		if got := tc.call(); got != tc.want {
@@ -645,6 +646,16 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"proc_ids",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_ids(m, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_ids64(m, 1024) }},
+		{"proc_itimer",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_itimer(m, 0, 0, 0, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_itimer64(m, 0, 0, 0, 1024) }},
+		{"proc_signal_register and proc_signal_take",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_signal_register(m, 1024) | w.Proc_signal_take(m, 1032)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_signal_register64(m, 1024) | w.Proc_signal_take64(m, 1032)
+			}},
 		{"pipe",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe(m, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe64(m, 1024) }},
