@@ -95,16 +95,17 @@ cleaned as `chroot(2)` sees it (`..` of the root is the root; a
 symbolic link's target too) and the `FS` is given that approved path
 (`FSAccess` is a policy on path names); a nil one allows every access
 to the configured `FS`, which is then given the path as the guest wrote
-it. Host
+it. `Errors` is told the errors the guest cannot be given (nil drops them). Host
 access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
 `AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
-host process has (its args, environment, stdio and the whole host
-filesystem, with every hook allowing). `HostFS` of a directory other
-than `/` is built on `os.Root`, which refuses every path the guest
-names that escapes it (through `..` or a symbolic link) with `EACCES`;
-the symbolic links the guest creates may still point anywhere for a
-reader on the host. The directory must be one that may be searched,
-and it is held open until the FS's `Close` method is called.
+host process has (its args, environment, stdio, the whole host
+filesystem and its local time zone, with every hook allowing).
+`HostFS` of a directory other than `/` is built on `os.Root`, which
+refuses every path the guest names that escapes it (through `..` or a
+symbolic link) with `EACCES`; the symbolic links the guest creates may
+still point anywhere for a reader on the host. The directory must be
+one that may be searched, and it is held open until the FS's `Close`
+method is called.
 
 `Process` supplies the guest's identity and accounting: what `getpid`,
 `getppid`, the `getuid` family and `times()` report, the pid whose

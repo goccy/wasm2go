@@ -31,6 +31,11 @@ func readHostUmask() (os.FileMode, error) {
 	return 0, fmt.Errorf("the umask of the host process cannot be read without changing it: %w", errors.ErrUnsupported)
 }
 
+// hostONonblock is the open flag of the host that opens a file without
+// waiting. This platform's opens wait as they will: the syscall package of
+// some (js, wasip1) has no such flag.
+const hostONonblock = 0
+
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
 // os package returned. This platform's carries none the runtime knows how to
 // read.
