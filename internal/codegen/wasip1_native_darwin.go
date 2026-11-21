@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 // statTimes returns the access and status-change times of a stat result.
@@ -68,4 +70,65 @@ func osFileDirents(d *os.File) ([]hostName, error) {
 		names = append(names, hostName{name: e.Name(), typ: uint8(unixTypeBits(e.Type()) >> 12)})
 	}
 	return names, nil
+}
+
+// hostPollReportsFIFOEnd says that poll(2) here reports neither POLLIN nor
+// POLLHUP on a FIFO with a name whose last writer has closed it: a read of
+// one finds its end.
+const hostPollReportsFIFOEnd = false
+
+// hostSendsWithoutWaiting says that a send to a socket here waits for room
+// in a socket in blocking mode whatever MSG_DONTWAIT says (an AF_UNIX
+// stream's does).
+const hostSendsWithoutWaiting = false
+
+// hostPipeBuf is PIPE_BUF: a pipe that poll(2) reports writable takes that
+// much without waiting.
+const hostPipeBuf = 512
+
+// The numbers of recvmsg(2) and sendmsg(2).
+const (
+	hostSysRecvmsg = syscall.SYS_RECVMSG
+	hostSysSendmsg = syscall.SYS_SENDMSG
+)
+
+// hostWakePipe makes a pipe whose ends do not wait and are closed on exec:
+// a wait in poll(2) watches its read end, and a byte written to the other
+// end (hostWakeWrite) ends the wait. (os.Pipe hands the ends to the
+// poller of the Go runtime, whose Write waits when the pipe is full.)
+func hostWakePipe() (r, w int, err error) {
+	var p [2]int
+	syscall.ForkLock.RLock()
+	err = syscall.Pipe(p[:])
+	if err == nil {
+		syscall.CloseOnExec(p[0])
+		syscall.CloseOnExec(p[1])
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return -1, -1, os.NewSyscallError("pipe", err)
+	}
+	for _, fd := range p {
+		if err := syscall.SetNonblock(fd, true); err != nil {
+			return -1, -1, errors.Join(os.NewSyscallError("fcntl", err), hostCloseFD(p[0]), hostCloseFD(p[1]))
+		}
+	}
+	return p[0], p[1], nil
+}
+
+// hostPollCall is poll(2): it waits no longer than timeout, and without
+// limit when timeout is negative.
+func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
+	ms := -1
+	if timeout >= 0 {
+		// poll(2) takes an int of milliseconds; a longer wait ends early,
+		// and the caller waits again.
+		ms = int(min((timeout+time.Millisecond-1)/time.Millisecond, math.MaxInt32))
+	}
+	var first *hostPoll
+	if len(fds) > 0 {
+		first = &fds[0]
+	}
+	n, _, errno := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)), uintptr(ms))
+	return int(n), errno
 }

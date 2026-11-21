@@ -66,6 +66,8 @@
     (func $path_symlink (param i64 i64 i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "path_unlink_file"
     (func $path_unlink_file (param i64 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "poll_oneoff"
+    (func $poll_oneoff (param i64 i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "proc_exit"
     (func $proc_exit (param i64)))
   (import "wasi_snapshot_preview1" "random_get"
@@ -180,6 +182,7 @@
     (drop (call $path_rename (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $path_symlink (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $path_unlink_file (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $poll_oneoff (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (call $proc_exit (i64.const 0))
     (drop (call $random_get (i64.const 0) (i64.const 0)))
     (drop (call $sched_yield))

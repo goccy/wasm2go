@@ -4,11 +4,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // A descriptor is open for reading, for writing or for both, and says so:
-// in the rights fd_fdstat_get reports and in what a read or write of it
-// answers.
+// in the rights fd_fdstat_get reports, in what a read or write of it
+// answers, and in what a poll waits for.
 
 const accessStatOff int32 = 15000
 
@@ -42,6 +43,15 @@ func openWith(t *testing.T, w *WasiStubs, m *Module, name string, oflags int32, 
 	return int32(readU32(m.memory, int(fdOff)))
 }
 
+// pollsWithin reports the userdata of the events a poll of fd (for reading
+// or for writing) returns when it may wait for 40ms.
+func pollsWithin(t *testing.T, w *WasiStubs, m *Module, fd int32, etype byte) []uint64 {
+	t.Helper()
+	writeSubFd(m, pollSubsOff, 7, etype, fd)
+	writeSubClock(m, pollSubsOff+48, 9, int64(40*time.Millisecond))
+	return pollUserdata(t, w, m, 2)
+}
+
 func TestWasi_PipeEndsHaveOneDirection(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	readFd, writeFd := newTestPipe(t, w, m)
@@ -54,9 +64,16 @@ func TestWasi_PipeEndsHaveOneDirection(t *testing.T) {
 	if rc := fdWriteString(w, m, readFd, "x"); rc != _wasiEBADF {
 		t.Errorf("write to the read end rc=%d, want EBADF", rc)
 	}
+	// The write end never has input, the read end never room: a poll of
+	// either waits for its timeout.
+	wantUserdata(t, pollsWithin(t, w, m, writeFd, 1 /* fd_read */), 9)
+	wantUserdata(t, pollsWithin(t, w, m, readFd, 2 /* fd_write */), 9)
+	// The right directions are as before.
+	wantUserdata(t, pollsWithin(t, w, m, writeFd, 2), 7)
 	if rc := fdWriteString(w, m, writeFd, "data"); rc != _wasiESUCCESS {
 		t.Fatalf("write rc=%d", rc)
 	}
+	wantUserdata(t, pollsWithin(t, w, m, readFd, 1), 7)
 	if got, rc := fdReadString(w, m, readFd, 16); rc != _wasiESUCCESS || got != "data" {
 		t.Fatalf("read = %q rc=%d", got, rc)
 	}
@@ -94,6 +111,9 @@ func TestWasi_FilesHaveTheAccessTheyWereOpenedWith(t *testing.T) {
 	if rc := fdWriteString(w, m, writeOnly, "CON"); rc != _wasiESUCCESS {
 		t.Errorf("write to a write-only file rc=%d", rc)
 	}
+	// A plain file polls ready whatever it is open for.
+	wantUserdata(t, pollsWithin(t, w, m, writeOnly, 1), 7)
+	wantUserdata(t, pollsWithin(t, w, m, readOnly, 2), 7)
 
 	both := openWith(t, w, m, "f", 0, read|write)
 	wantAccess(t, w, m, "read-write file", both, true, true)

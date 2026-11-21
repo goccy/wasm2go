@@ -3,6 +3,8 @@ package codegen
 import (
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"testing"
@@ -90,6 +92,14 @@ func postWhenBlocked(w *WasiStubs, sig int32) {
 	whenBlocked(w, func() { w.PostSignal(sig) })
 }
 
+// sleepPoll is a guest sleeping for d through poll_oneoff.
+func sleepPoll(t *testing.T, w *WasiStubs, m *Module, d time.Duration) (rc int32) {
+	t.Helper()
+	writeSubClock(m, pollSubsOff, 1, int64(d))
+	returnsWithin(t, "Poll_oneoff", func() { rc = w.Poll_oneoff(m, pollSubsOff, pollEvOff, 1, pollNevOff) })
+	return rc
+}
+
 // Before the guest registers, a signal that does nothing by default is
 // dropped, and one that ends a process ends the guest at its registration.
 func TestSignal_DroppedUntilTheGuestRegisters(t *testing.T) {
@@ -172,10 +182,62 @@ func TestSignal_BlockedSignalWaitsForItsUnblocking(t *testing.T) {
 	}
 }
 
+func TestSignal_InterruptsSleep(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	postWhenBlocked(w, wasiSIGUSR1)
+	start := time.Now()
+	if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("interrupted sleep rc=%d, want EINTR", rc)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("sleep ended after %v", d)
+	}
+	if flag := signalFlag(m); flag != 1 {
+		t.Fatalf("flag = %d, want 1", flag)
+	}
+	// One signal interrupts one call: the next sleep runs its course even
+	// though the guest has not taken the signal yet.
+	start = time.Now()
+	if rc := sleepPoll(t, w, m, 40*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep after the interruption rc=%d", rc)
+	}
+	if d := time.Since(start); d < 30*time.Millisecond {
+		t.Fatalf("second sleep ended after %v", d)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("taken = %#x, want %#x", got, want)
+	}
+}
+
+func TestSignal_PendingSignalEndsTheNextBlockingCallAtOnce(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	w.PostSignal(wasiSIGUSR1)
+	start := time.Now()
+	if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep with a signal waiting rc=%d, want EINTR", rc)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("sleep ended after %v", d)
+	}
+	// A poll that does not wait is not interrupted.
+	w.PostSignal(wasiSIGUSR1)
+	if rc := sleepPoll(t, w, m, 0); rc != _wasiESUCCESS {
+		t.Fatalf("zero-timeout poll rc=%d", rc)
+	}
+	// Once taken, nothing is left to interrupt for.
+	takeSignals(t, w, m)
+	if rc := sleepPoll(t, w, m, 10*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep after take rc=%d", rc)
+	}
+}
+
 // While the guest runs code outside it (a native library it called), a
 // signal posted for it interrupts that code through what its runner
-// registered, once per signal, and it is noticed as any signal is. A signal
-// the guest blocks or discards does nothing to the code. Registrations nest.
+// registered, once per signal; the guest's own blocking calls that follow
+// are not interrupted by it, and it is noticed as any signal is. A signal
+// the guest blocks or discards does nothing to the code; a blocking call of
+// the guest's own made from inside the code (a callback) is ended as
+// always. Registrations nest.
 func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGUSR2)
 	var outer, inner int
@@ -188,6 +250,13 @@ func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	}
 	if flag := signalFlag(m); flag != 1 {
 		t.Fatalf("flag = %d, want 1", flag)
+	}
+	start := time.Now()
+	if rc := sleepPoll(t, w, m, 40*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("a sleep after the signal interrupted the code outside rc=%d, want success", rc)
+	}
+	if d := time.Since(start); d < 30*time.Millisecond {
+		t.Fatalf("the sleep ended after %v", d)
 	}
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
 		t.Fatalf("taken = %#x, want %#x", got, want)
@@ -203,6 +272,16 @@ func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	setDispositions(t, w, m, signalMask(wasiSIGUSR1, wasiSIGUSR2), 0, 0)
 	takeSignals(t, w, m)
 	signalFlag(m)
+
+	// A blocking call of the guest's made from inside the code.
+	postWhenBlocked(w, wasiSIGUSR1)
+	if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("a callback's sleep rc=%d, want EINTR", rc)
+	}
+	if outer != 1 {
+		t.Fatalf("interrupt called while a blocking call of the guest's waited (%d calls)", outer)
+	}
+	takeSignals(t, w, m)
 
 	// Nesting.
 	if prev := w.SetOutsideInterrupt(func() { inner++ }); prev == nil {
@@ -222,6 +301,114 @@ func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	w.PostSignal(wasiSIGUSR1)
 	if outer != 2 {
 		t.Fatalf("interrupt called after the code returned (%d calls)", outer)
+	}
+	// With nothing outside, the signal is left for the next blocking call.
+	if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep with a signal waiting rc=%d, want EINTR", rc)
+	}
+}
+
+func TestSignal_InterruptsPollOnAnIdlePipe(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	readFd, writeFd := newTestPipe(t, w, m)
+	writeSubFd(m, pollSubsOff, 7, 1 /* fd_read */, readFd)
+	postWhenBlocked(w, wasiSIGUSR1)
+	var rc int32
+	returnsWithin(t, "Poll_oneoff", func() { rc = w.Poll_oneoff(m, pollSubsOff, pollEvOff, 1, pollNevOff) })
+	if rc != _wasiEINTR {
+		t.Fatalf("poll on an idle pipe rc=%d, want EINTR", rc)
+	}
+	// The pipe is as it was: input written now is polled and read.
+	if rc := fdWriteString(w, m, writeFd, "data"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+	if got, rc := readWithin(t, w, m, readFd, 16); rc != _wasiESUCCESS || got != "data" {
+		t.Fatalf("read = %q rc=%d", got, rc)
+	}
+}
+
+func TestSignal_InterruptsBlockingPipeRead(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	readFd, writeFd := newTestPipe(t, w, m)
+	postWhenBlocked(w, wasiSIGUSR1)
+	if _, rc := readWithin(t, w, m, readFd, 16); rc != _wasiEINTR {
+		t.Fatalf("read of an idle pipe rc=%d, want EINTR", rc)
+	}
+	takeSignals(t, w, m)
+	// The interruption left no deadline behind: the retried read waits for
+	// the writer.
+	writeSoon(t, w, writeFd, "late")
+	if got, rc := readWithin(t, w, m, readFd, 16); rc != _wasiESUCCESS || got != "late" {
+		t.Fatalf("retried read = %q rc=%d, want %q", got, rc, "late")
+	}
+}
+
+// A signal that is waiting for the guest to notice it interrupts the call
+// that would have to wait, not the one that can be carried out at once: a
+// pipe with room takes a write, input that is there is read — as the system
+// calls behave for a process with a signal pending.
+func TestSignal_PendingSignalLeavesACallThatNeedNotWaitAlone(t *testing.T) {
+	skipWithoutStreamWrites(t)
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	readFd, writeFd := newTestPipe(t, w, m)
+
+	w.PostSignal(wasiSIGUSR1)
+	if rc := fdWriteString(w, m, writeFd, "more"); rc != _wasiESUCCESS {
+		t.Fatalf("write to a pipe with room, a signal waiting: rc=%d, want success", rc)
+	}
+	if got, rc := readWithin(t, w, m, readFd, 16); rc != _wasiESUCCESS || got != "more" {
+		t.Fatalf("read of input that is there, a signal waiting = %q rc=%d, want %q", got, rc, "more")
+	}
+	// The signal is still waiting: the read that has nothing to read is
+	// interrupted, once.
+	start := time.Now()
+	if _, rc := readWithin(t, w, m, readFd, 16); rc != _wasiEINTR {
+		t.Fatalf("read of an idle pipe, a signal waiting: rc=%d, want EINTR", rc)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the read ended after %v", d)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("taken = %#x, want SIGUSR1 (%#x)", got, want)
+	}
+
+	// The end of input is there to be read as well.
+	if rc := w.Fd_close(m, writeFd); rc != _wasiESUCCESS {
+		t.Fatalf("close rc=%d", rc)
+	}
+	w.PostSignal(wasiSIGUSR1)
+	if got, rc := readWithin(t, w, m, readFd, 16); rc != _wasiESUCCESS || got != "" {
+		t.Fatalf("read at the end of input, a signal waiting = %q rc=%d, want the end", got, rc)
+	}
+	takeSignals(t, w, m)
+
+	// A pipe without room: the write would have to wait, and is interrupted.
+	_, writeFd = newTestPipe(t, w, m)
+	fillNonBlocking(t, w, m, writeFd)
+	if rc := w.Fd_fdstat_set_flags(m, writeFd, 0); rc != _wasiESUCCESS {
+		t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+	}
+	w.PostSignal(wasiSIGUSR1)
+	if n, rc := writeChunk(t, w, m, writeFd); rc != _wasiEINTR || n != 0 {
+		t.Fatalf("write to a full pipe, a signal waiting: %d bytes rc=%d, want EINTR", n, rc)
+	}
+	takeSignals(t, w, m)
+}
+
+func TestSignal_NeverInterruptsRegularFileRead(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	fd := openTestFile(t, w, "f")
+	w.PostSignal(wasiSIGTERM)
+	if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "content" {
+		t.Fatalf("file read with a signal waiting = %q rc=%d", got, rc)
 	}
 }
 
@@ -291,6 +478,70 @@ func timerState(t *testing.T, w *WasiStubs, m *Module) (left, every time.Duratio
 	}
 	return time.Duration(binary.LittleEndian.Uint64(m.memory[sigValueOff:])),
 		time.Duration(binary.LittleEndian.Uint64(m.memory[sigValueOff+8:]))
+}
+
+func TestSignal_TimerFiresOnce(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGALRM)
+	if left, every := setTimer(t, w, m, 100*time.Second, 0); left != 0 || every != 0 {
+		t.Fatalf("the first timer reported %v left (every %v) of none", left, every)
+	}
+	if left, _ := timerState(t, w, m); left <= 99*time.Second || left > 100*time.Second {
+		t.Fatalf("a timer of 100s has %v left", left)
+	}
+	if left, _ := setTimer(t, w, m, 300*time.Millisecond, 0); left <= 99*time.Second || left > 100*time.Second {
+		t.Fatalf("replacing the timer reported %v left, want about 100s", left)
+	}
+	start := time.Now()
+	if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
+		t.Fatalf("sleep under a timer rc=%d, want EINTR", rc)
+	}
+	if d := time.Since(start); d < 250*time.Millisecond || d > 10*time.Second {
+		t.Fatalf("the timer fired after %v, want about 300ms", d)
+	}
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+		t.Fatalf("taken = %#x, want SIGALRM", got)
+	}
+	if left, every := timerState(t, w, m); left != 0 || every != 0 {
+		t.Fatalf("%v left (every %v) after a one-shot timer fired", left, every)
+	}
+	// A disarmed timer never fires.
+	setTimer(t, w, m, 300*time.Millisecond, 0)
+	if left, _ := setTimer(t, w, m, 0, 0); left <= 0 || left > 300*time.Millisecond {
+		t.Fatalf("disarming reported %v left, want up to 300ms", left)
+	}
+	if rc := sleepPoll(t, w, m, 600*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep after disarming the timer rc=%d", rc)
+	}
+}
+
+func TestSignal_TimerRepeatsAtItsInterval(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGALRM)
+	setTimer(t, w, m, 50*time.Millisecond, 100*time.Millisecond)
+	if left, every := timerState(t, w, m); left <= 0 || left > 50*time.Millisecond || every != 100*time.Millisecond {
+		t.Fatalf("state = %v left, every %v; want up to 50ms, every 100ms", left, every)
+	}
+	start := time.Now()
+	for firing := 1; firing <= 3; firing++ {
+		if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
+			t.Fatalf("sleep before firing %d rc=%d, want EINTR", firing, rc)
+		}
+		if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+			t.Fatalf("firing %d: taken = %#x, want SIGALRM", firing, got)
+		}
+	}
+	// 50ms, then 150ms and 250ms.
+	if d := time.Since(start); d < 240*time.Millisecond || d > 10*time.Second {
+		t.Fatalf("three firings took %v, want about 250ms", d)
+	}
+	if _, every := timerState(t, w, m); every != 100*time.Millisecond {
+		t.Fatalf("the interval is %v after three firings, want 100ms", every)
+	}
+	if _, every := setTimer(t, w, m, 0, 0); every != 100*time.Millisecond {
+		t.Fatalf("disarming reported an interval of %v, want 100ms", every)
+	}
+	if rc := sleepPoll(t, w, m, 300*time.Millisecond); rc != _wasiESUCCESS {
+		t.Fatalf("sleep after disarming the repeating timer rc=%d", rc)
+	}
 }
 
 // A wait that ends by its timeout after the moment the interval timer was
