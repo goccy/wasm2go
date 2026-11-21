@@ -3,7 +3,7 @@
 //
 // It is the importable counterpart of the `wasm2go` command. External
 // tools that need to drive translation programmatically (for example a
-// code generator that emits a Go bridge over a transpiled module) call
+// code generator that emits Go bindings over a transpiled module) call
 // Translate directly instead of shelling out to the CLI.
 //
 // Usage:

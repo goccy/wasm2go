@@ -326,7 +326,7 @@ func constArgExpr(v *ssa.Value) ast.Expr {
 // into a load-pair and bakes the offset into its tiny immediate field,
 // so a multi-MB offset otherwise fails to assemble. Small offsets stay
 // inline. (The constant-base path was already covered; this pins the
-// runtime-base path that regressed arm64 for wasmify's simplelib bundle.)
+// runtime-base path.)
 func TestMemOffsetExpr_RuntimeBaseLargeOffset(t *testing.T) {
 	em := newSSAEmitter(&translator{})
 

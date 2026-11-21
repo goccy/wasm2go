@@ -157,9 +157,9 @@ func TestMem64BeyondFourGiB(t *testing.T) {
 }
 
 // TestMem64Wasip1Hello runs a real wasm64-wasip1 binary — C compiled
-// with clang -target wasm64-wasip1 against the wasm2go-ported
-// wasi-libc (8-byte pointers, widened all-i64 WASI import ABI) — and
-// pins printf/malloc through the *64 wasip1 bindings.
+// with clang -target wasm64-wasip1 against a wasm64 C library (8-byte
+// pointers, widened all-i64 WASI import ABI) — and pins printf/malloc
+// through the *64 wasip1 bindings.
 //
 // testdata/wasip1_mem64_hello.wasm is checked in because building it
 // needs the wasm64 sysroot (not shipped in wasi-sdk); its source:
