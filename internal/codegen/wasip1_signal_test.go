@@ -912,6 +912,57 @@ func TestSignal_TokensAvoidTheRootsIDs(t *testing.T) {
 	}
 }
 
+// A number handed out as a token before the root is entered stays a token
+// when it is one of the root's ids: its process gone, it names nothing, and
+// it is not passed to the Signals.
+func TestSignal_RootIDsHandedOutStayTokens(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	s := &recordingSignals{}
+	root.cfg.Signals = s
+	pid, exited := root.NewProc(nil)
+	exited(0)
+	if rc := root.Proc_wait(m, pid, 0, sigValueOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	root.cfg.Process = testProcess{ids: ProcessIDs{PID: 42, PPID: pid}}
+	child := root.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	if rc := root.Proc_kill(m, pid, wasiSIGTERM); rc != -_wasiESRCH {
+		t.Fatalf("kill of the reaped token %d rc=%d, want -ESRCH", pid, rc)
+	}
+	if len(s.kills) != 0 {
+		t.Fatalf("the Signals was given %v", s.kills)
+	}
+}
+
+// A ForkProc copy of a Fork copy has the root's pid as its ppid, and its
+// kill of it reaches the root, not the Fork copy.
+func TestSignal_ForkProcOfAForkCopyReachesTheRoot(t *testing.T) {
+	root, m := newSignalGuest(t, wasiSIGUSR1)
+	plain := root.Fork()
+	pm := registeredFork(t, plain, wasiSIGUSR1)
+	grand, _, exited := plain.ForkProc()
+	defer exited(0)
+	gm := registeredFork(t, grand, wasiSIGUSR1)
+	ppid := grand.guestProcess().IDs().PPID
+	if ppid != root.guestPID() {
+		t.Fatalf("ppid = %d, want the root's pid %d", ppid, root.guestPID())
+	}
+	if rc := grand.Proc_kill(gm, ppid, wasiSIGUSR1); rc != _wasiESUCCESS {
+		t.Fatalf("kill(getppid()) rc=%d", rc)
+	}
+	if got, want := takeSignals(t, root, m), signalMask(wasiSIGUSR1); got != want {
+		t.Fatalf("root taken = %#x, want %#x", got, want)
+	}
+	if got := takeSignals(t, plain, pm); got != 0 {
+		t.Fatalf("the Fork copy took %#x", got)
+	}
+}
+
 // Two blocking calls in progress (threads of the guest share the instance)
 // are both woken by a signal: one ends with EINTR, the other waits on.
 func TestSignal_OneOfTwoWaitsEndsByASignal(t *testing.T) {

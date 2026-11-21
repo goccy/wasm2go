@@ -1436,8 +1436,8 @@ func (p *wasiPIDs) enter(pid int32, proc *wasiProc) {
 
 // enterRoot makes the root instance root reachable by ids.PID, the pid of
 // its Process, for the instances forked from it, and keeps that pid and
-// ids.PPID from ever being a token. It does nothing once the root is
-// entered.
+// ids.PPID from being a token from then on; a number already handed out
+// stays the token it is. It does nothing once the root is entered.
 func (p *wasiPIDs) enterRoot(ids ProcessIDs, root *WasiStubs) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1450,7 +1450,11 @@ func (p *wasiPIDs) enterRoot(ids ProcessIDs, root *WasiStubs) {
 	if p.skipped == nil {
 		p.skipped = map[int32]bool{}
 	}
-	p.skipped[ids.PID], p.skipped[ids.PPID] = true, true
+	for _, id := range []int32{ids.PID, ids.PPID} {
+		if id >= p.next {
+			p.skipped[id] = true
+		}
+	}
 	p.rooted, p.rootPID = true, ids.PID
 	p.procs[ids.PID] = &wasiProc{done: make(chan struct{}), instance: root}
 }
@@ -1594,11 +1598,18 @@ func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
 //     children. Pid tokens stay unique across w, the result and everything
 //     later forked from either. The instance not made by Fork, the root of
 //     the family, is known to the family by the pid of its Process from its
-//     first fork on (Proc_kill), and neither that pid nor its ppid is ever a
-//     token;
+//     first fork on (Proc_kill), and neither that pid nor its ppid is a token
+//     from then on;
 //   - no signal is pending and no interval timer is set, and the guest has not
 //     registered for signals: the copy of the guest that runs on the result
 //     registers and reports its dispositions (the ones it inherited) itself.
+//
+// The copy shares the identity of w: the same Process, so its getpid and
+// getppid are w's. From the root on, every copy made by Fork has the root's
+// pid as its own, and that pid names the copy itself in its kill; a copy
+// that a ForkProc of such a copy made has that pid as its ppid, and its
+// kill of it reaches the root. ForkProc is the way to give a copy a pid of
+// its own.
 //
 // The result is independent of w from then on (its own lock, its own fd
 // numbering) and is meant to back a second module instance running on
@@ -1887,8 +1898,11 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 // token (Proc_kill) is posted to the copy (PostSignal), and the copy knows
 // the token as its own pid: its Process reports the token as the pid and
 // the pid of w's Process as the ppid, and the rest as w's Process does. Its
-// kill of the token is a raise, its kill of its parent's pid reaches the
-// parent, and its kill of its process group reaches it once.
+// kill of the token is a raise, its kill of its ppid reaches the instance
+// that pid names, and its kill of its process group reaches it once.
+// ForkProc is the way to give a copy a pid of its own: a copy made by Fork
+// shares w's identity (see Fork), so when w is such a copy the ppid is the
+// root's pid, and the copy's kill of it reaches the root, not w.
 func (w *WasiStubs) ForkProc() (child *WasiStubs, pid int32, exited func(status int32)) {
 	parent := w.guestProcess()
 	ppid := parent.IDs().PID
