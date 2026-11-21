@@ -86,6 +86,13 @@ func TestWasi_PreadPwriteNegativeOffsetIsEINVAL(t *testing.T) {
 						t.Errorf("offset %#x: rc=%d, want EINVAL", offset, rc)
 					}
 				}
+				// The offset is checked before the descriptor.
+				w.fdsLocked()[9].noRead, w.fdsLocked()[9].noWrite = true, true
+				for _, fd := range []int32{9, 99} {
+					if rc := c.call(w, m, fd, 1<<63); rc != _wasiEINVAL {
+						t.Errorf("fd %d: rc=%d, want EINVAL", fd, rc)
+					}
+				}
 				wantSize(t, f, 4)
 			})
 		}
@@ -242,6 +249,12 @@ func TestWasi_SeekOutOfRangeIsEINVAL(t *testing.T) {
 				if rc := w.Fd_tell(m, 9, ioErrResult); rc != _wasiESUCCESS {
 					t.Fatalf("tell rc=%d", rc)
 				}
+				if rc := w.Fd_seek64(m, 9, 0, 1<<32|1, ioErrResult); rc != _wasiEINVAL {
+					t.Errorf("seek whence 1<<32|1: rc=%d, want EINVAL", rc)
+				}
+				if rc := w.Fd_tell(m, 9, ioErrResult); rc != _wasiESUCCESS {
+					t.Fatalf("tell rc=%d", rc)
+				}
 				if got := readU64(m.memory, ioErrResult); got != 2 {
 					t.Fatalf("offset after failed seeks=%d, want 2", got)
 				}
@@ -298,8 +311,58 @@ func TestWasi_MemFSFileLargerThanLimit(t *testing.T) {
 				t.Fatalf("tell=%d, want 32", got)
 			}
 			wantSize(t, f, 32)
+			// It can shrink, but not grow past the limit.
+			if rc := w.Fd_filestat_set_size(m, 9, 20); rc != _wasiESUCCESS {
+				t.Fatalf("set size 20: rc=%d", rc)
+			}
+			wantSize(t, f, 20)
+			if rc := w.Fd_filestat_set_size(m, 9, 24); rc != _wasiEFBIG {
+				t.Fatalf("set size 24: rc=%d, want EFBIG", rc)
+			}
+			wantSize(t, f, 20)
 		})
 	}
+}
+
+func TestMemFS_AppendWritesAtEnd(t *testing.T) {
+	fsys := NewMemFS()
+	open := func(flag int) File {
+		f, err := fsys.OpenFile("log", flag, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := f.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return f
+	}
+	a := open(os.O_WRONLY | os.O_CREATE | os.O_APPEND)
+	b := open(os.O_WRONLY | os.O_APPEND)
+	other := open(os.O_RDWR)
+	for _, w := range []struct {
+		f    File
+		data string
+	}{{a, "ab"}, {b, "cd"}, {a, "ef"}} {
+		if _, err := w.f.Write([]byte(w.data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := other.Truncate(4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Write([]byte("gh")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 6)
+	if _, err := other.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "abcdgh" {
+		t.Fatalf("content=%q, want %q", got, "abcdgh")
+	}
+	wantSize(t, other, 6)
 }
 
 var setSizeCalls = []offsetCall{

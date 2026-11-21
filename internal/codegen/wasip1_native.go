@@ -396,8 +396,8 @@ func (fsys *MemFS) OpenFile(name string, flag int, perm os.FileMode) (File, erro
 			node.modTime = time.Now()
 		}
 	}
-	f := &memFile{fsys: fsys, node: node}
-	if flag&os.O_APPEND != 0 {
+	f := &memFile{fsys: fsys, node: node, appending: flag&os.O_APPEND != 0}
+	if f.appending {
 		f.off = int64(len(node.data))
 	}
 	return f, nil
@@ -601,6 +601,9 @@ type memFile struct {
 	node   *memNode
 	off    int64
 	dirOff int
+	// appending is whether the file was opened with O_APPEND: each Write
+	// starts at the end of the file.
+	appending bool
 }
 
 func (f *memFile) Name() string { return f.node.name }
@@ -698,6 +701,9 @@ func (f *memFile) writeAt(p []byte, off int64) (int, error) {
 func (f *memFile) Write(p []byte) (int, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
+	if f.appending {
+		f.off = int64(len(f.node.data))
+	}
 	n, err := f.writeAt(p, f.off)
 	f.off += int64(n)
 	return n, err
@@ -734,12 +740,12 @@ func (f *memFile) Truncate(size int64) error {
 	if err := f.validateOffset("truncate", size); err != nil {
 		return err
 	}
-	if size > f.fsys.maxFileSize {
-		return &fs.PathError{Op: "truncate", Path: f.node.name, Err: syscall.EFBIG}
-	}
-	if size <= int64(len(f.node.data)) {
+	switch {
+	case size <= int64(len(f.node.data)):
 		f.node.data = f.node.data[:size]
-	} else {
+	case size > f.fsys.maxFileSize:
+		return &fs.PathError{Op: "truncate", Path: f.node.name, Err: syscall.EFBIG}
+	default:
 		f.node.data = append(f.node.data, make([]byte, size-int64(len(f.node.data)))...)
 	}
 	f.node.modTime = time.Now()
@@ -2556,14 +2562,14 @@ func (w *WasiStubs) Fd_pread64(m *Module, fd, iovs, iovsLen, offset, nreadPtr in
 // buffers of the iovecs from offset in the file, and stops at the end of
 // the file, at an error or at a short read.
 func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint64, offset int64, nreadPtr uint64) int32 {
+	if offset < 0 {
+		return _wasiEINVAL
+	}
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil || op.noRead {
 		return _wasiEBADF
-	}
-	if offset < 0 {
-		return _wasiEINVAL
 	}
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nread is a __wasi_size_t.
@@ -2588,14 +2594,14 @@ func (w *WasiStubs) Fd_pwrite64(m *Module, fd, iovs, iovsLen, offset, nwrittenPt
 // fdPwrite is the body of Fd_pwrite and Fd_pwrite64: it writes the
 // buffers of the iovecs from offset in the file, and stops at an error.
 func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint64, offset int64, nwrittenPtr uint64) int32 {
+	if offset < 0 {
+		return _wasiEINVAL
+	}
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
 	if op == nil || op.f == nil || op.noWrite {
 		return _wasiEBADF
-	}
-	if offset < 0 {
-		return _wasiEINVAL
 	}
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nwritten is a __wasi_size_t.
@@ -2609,16 +2615,16 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 }
 
 func (w *WasiStubs) Fd_seek(m *Module, fd int32, offset int64, whence, newOffPtr int32) int32 {
-	return w.fdSeek(m, fd, offset, whence, zext(newOffPtr))
+	return w.fdSeek(m, fd, offset, int64(whence), zext(newOffPtr))
 }
 
 // Fd_seek64 is Fd_seek for a memory64 guest.
 func (w *WasiStubs) Fd_seek64(m *Module, fd, offset, whence, newOffPtr int64) int32 {
-	return w.fdSeek(m, int32(fd), offset, int32(whence), uint64(newOffPtr))
+	return w.fdSeek(m, int32(fd), offset, whence, uint64(newOffPtr))
 }
 
 // fdSeek is the body of Fd_seek and Fd_seek64.
-func (w *WasiStubs) fdSeek(m *Module, fd int32, offset int64, whence int32, newOffPtr uint64) int32 {
+func (w *WasiStubs) fdSeek(m *Module, fd int32, offset, whence int64, newOffPtr uint64) int32 {
 	out := w.memBytes(m, newOffPtr, 8)
 	if out == nil {
 		return _wasiEFAULT
