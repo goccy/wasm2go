@@ -34,14 +34,16 @@ import (
 //
 // Bounds check
 //
-// The wasm spec traps on out-of-bounds memory access. We deliberately
-// drop the runtime bounds check: by the time we reach Go-level
-// codegen, the input wasm has already been validated and the source
-// language has done its own bounds enforcement. An out-of-range
-// address indicates a bug in the input wasm, not a normal trap path.
-// With the check kept, even a per-function shared-panic-block form
-// still leaves a non-trivial PC contribution per access; without it,
-// access cost is zero.
+// The wasm spec traps on out-of-bounds memory access. The access itself
+// carries no bounds check; the memory layout enforces it instead. On
+// 64-bit linux and darwin a wasm32 linear memory sits at the start of a
+// reservation that covers every address an access can form (base + u32
+// address + u32 offset, plus the access width), and only the instance's
+// own pages are mapped readable and writable — see
+// helpers/linearmem_guard.go. An out-of-range access faults in the
+// reservation, and the export entry points turn that fault into the
+// out-of-bounds trap. Access cost stays zero. Other hosts and memory64
+// have no such bound and are not covered.
 //
 // Entry points
 //

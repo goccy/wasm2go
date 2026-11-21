@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 )
 
 // TestMemoryGrowGeometric is the regression test for the O(n^2) startup
@@ -30,7 +31,7 @@ func TestMemoryGrowGeometric(t *testing.T) {
 	m := newTestModule(make([]byte, 65536)) // 1 page
 
 	reallocs := 0
-	prevCap := cap(m.memory)
+	prevData := unsafe.SliceData(m.memory)
 	const grows = 1000
 	for i := 0; i < grows; i++ {
 		before := uint64(len(m.memory))
@@ -41,9 +42,9 @@ func TestMemoryGrowGeometric(t *testing.T) {
 		if uint64(len(m.memory)) != before+65536 {
 			t.Fatalf("grow %d: len=%d want %d", i, len(m.memory), before+65536)
 		}
-		if cap(m.memory) != prevCap {
+		if data := unsafe.SliceData(m.memory); data != prevData {
 			reallocs++
-			prevCap = cap(m.memory)
+			prevData = data
 		}
 	}
 	if want := (grows + 1) * 65536; len(m.memory) != want {

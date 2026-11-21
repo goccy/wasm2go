@@ -371,6 +371,14 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// module has a memory so the API is uniformly available.
 	if len(m.Memories) > 0 {
 		t.helpers["accessMemory"] = true
+		// The constructors and the export entry points of a wasm32 memory
+		// reference these from the main package, which multi-package output
+		// renders after base's helper set is fixed.
+		if !m.Memory64() {
+			t.helpers["initLinearMemory"] = true
+			t.helpers["memoryAccessTrap"] = true
+			t.helpers["setPanicOnFault"] = true
+		}
 		// The Module struct's memMu field needs "sync" — register it
 		// HERE, not only in emitModuleStruct: the multi-package path
 		// snapshots base's import set after emitHelpers but BEFORE
@@ -582,6 +590,7 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		return res, err
 	}
 	t.appendSimdHelperFiles(res.Files)
+	t.appendLinearMemoryFiles(res.Files)
 	t.appendDirectAsmLayoutFile(res.Files)
 	res.FusedSimd = t.FusedTrees()
 	res.FusedLoops = t.FusedLoops()
@@ -1872,6 +1881,12 @@ func (t *translator) emitModuleStruct() ast.Decl {
 				{Type: t.moduleType()}, {Type: newID("int32")}, {Type: newID(argType)},
 			}}},
 		})
+		// memReserve is the guarded reservation the constructor placed the
+		// memory in (see the initLinearMemory helper); nil otherwise.
+		fields = append(fields, &ast.Field{
+			Names: []*ast.Ident{newID(t.fieldName("memReserve"))},
+			Type:  &ast.ArrayType{Elt: newID("byte")},
+		})
 	}
 
 	return &ast.GenDecl{
@@ -2044,6 +2059,8 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		Lhs: []ast.Expr{newID("m")},
 		Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: composite}},
 	})
+	// The start section runs guest code here.
+	body.List = append(body.List, t.propagatingEntryStmts()...)
 
 	// defaultReserveCap is the initial linear-memory slice capacity that
 	// NewWithWASI (and the non-WASI New) pass when emitReserve: minBytes plus
@@ -2154,6 +2171,17 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 		var memRhs ast.Expr
 		if memFromArg {
 			memRhs = newID("memory")
+		} else if !mem.Is64 {
+			// A wasm32 memory goes in a guarded reservation, which confines
+			// every access the generated code can form to the instance.
+			memRhs = &ast.CallExpr{
+				Fun: t.helperRef("initLinearMemory"),
+				Args: []ast.Expr{
+					newID("m"),
+					&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{lenArg}},
+					&ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{capArg}},
+				},
+			}
 		} else {
 			memRhs = &ast.CallExpr{
 				Fun: newID("make"),
@@ -2164,11 +2192,6 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 				},
 			}
 		}
-		body.List = append(body.List, &ast.AssignStmt{
-			Tok: token.ASSIGN,
-			Lhs: []ast.Expr{t.fieldRef("memory")},
-			Rhs: []ast.Expr{memRhs},
-		})
 		// memSize is the size the guest sees; for a shared memory it is the
 		// only thing growth changes.
 		// The pointered shared-state fields exist exactly once, on the
@@ -2193,6 +2216,13 @@ func (t *translator) emitNewFuncsMode(mode newMode) []ast.Decl {
 			Rhs: []ast.Expr{&ast.UnaryExpr{Op: token.AND, X: &ast.CompositeLit{
 				Type: t.threadPoolTypeExpr(),
 			}}},
+		})
+		// After the shared state: initLinearMemory ties the reservation's
+		// release to memSize, which every agent copy shares.
+		body.List = append(body.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{t.fieldRef("memory")},
+			Rhs: []ast.Expr{memRhs},
 		})
 		sizeArg := ast.Expr(uintLit(minBytesU))
 		if memFromArg {
@@ -3275,7 +3305,7 @@ func (t *translator) emitShardedElementInit(initBody *ast.BlockStmt, defsEmitted
 //	return
 func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 	t.use("fmt")
-	var stmts []ast.Stmt
+	stmts := t.panicOnFaultStmts()
 	type snap struct{ saved, field string }
 	var snaps []snap
 	for i := range t.mod.Globals {
@@ -3299,6 +3329,18 @@ func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 		Rhs: []ast.Expr{&ast.CallExpr{Fun: newID("recover")}},
 	})
 	ifBody := &ast.BlockStmt{}
+	if t.guardsLinearMemory() {
+		// r = memoryAccessTrap(m, r): a fault in the linear-memory
+		// reservation is the guest's out-of-bounds access.
+		ifBody.List = append(ifBody.List, &ast.AssignStmt{
+			Tok: token.ASSIGN,
+			Lhs: []ast.Expr{newID("r")},
+			Rhs: []ast.Expr{&ast.CallExpr{
+				Fun:  t.helperRef("memoryAccessTrap"),
+				Args: []ast.Expr{newID("m"), newID("r")},
+			}},
+		})
+	}
 	for _, s := range snaps {
 		ifBody.List = append(ifBody.List, &ast.AssignStmt{
 			Tok: token.ASSIGN,
@@ -3345,6 +3387,84 @@ func (t *translator) buildSafeInvokeBody(callExpr ast.Expr) []ast.Stmt {
 	})
 	stmts = append(stmts, &ast.ReturnStmt{})
 	return stmts
+}
+
+// guardsLinearMemory reports whether the module's memory is a wasm32 one,
+// which the constructors place in a guarded reservation; memory64 has no
+// such bound and keeps its entry points unchanged.
+func (t *translator) guardsLinearMemory() bool {
+	return len(t.mod.Memories) > 0 && !t.mod.Memory64()
+}
+
+// panicOnFaultStmts returns the entry-point preamble
+//
+//	defer setPanicOnFault(setPanicOnFault(true))
+//
+// for a module with a guarded memory: a guest access outside its memory
+// faults in the guard reservation, and this makes that fault a recoverable
+// panic on the calling goroutine instead of a fatal error, restoring the
+// caller's setting on return. Nil otherwise.
+func (t *translator) panicOnFaultStmts() []ast.Stmt {
+	if !t.guardsLinearMemory() {
+		return nil
+	}
+	set := func(arg ast.Expr) *ast.CallExpr {
+		return &ast.CallExpr{Fun: t.helperRef("setPanicOnFault"), Args: []ast.Expr{arg}}
+	}
+	return []ast.Stmt{&ast.DeferStmt{Call: set(set(newID("true")))}}
+}
+
+// propagatingEntryStmts returns the preamble of an entry point that lets a
+// trap reach its caller as a panic (the direct export wrappers, the
+// constructors that run the start section):
+//
+//	defer func(old bool) {
+//		setPanicOnFault(old)
+//		if r := recover(); r != nil {
+//			panic(memoryAccessTrap(m, r))
+//		}
+//	}(setPanicOnFault(true))
+//
+// One deferred call restores the caller's SetPanicOnFault setting and
+// re-raises a fault in the linear-memory reservation as the out-of-bounds
+// trap; its reference to m keeps the Module — and so the memory the guest is
+// running in — reachable for the whole call. Nil for a module without a
+// guarded memory.
+func (t *translator) propagatingEntryStmts() []ast.Stmt {
+	if !t.guardsLinearMemory() {
+		return nil
+	}
+	set := func(arg ast.Expr) *ast.CallExpr {
+		return &ast.CallExpr{Fun: t.helperRef("setPanicOnFault"), Args: []ast.Expr{arg}}
+	}
+	repanic := &ast.IfStmt{
+		Init: &ast.AssignStmt{
+			Tok: token.DEFINE,
+			Lhs: []ast.Expr{newID("r")},
+			Rhs: []ast.Expr{&ast.CallExpr{Fun: newID("recover")}},
+		},
+		Cond: &ast.BinaryExpr{X: newID("r"), Op: token.NEQ, Y: newID("nil")},
+		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ExprStmt{X: &ast.CallExpr{
+			Fun: newID("panic"),
+			Args: []ast.Expr{&ast.CallExpr{
+				Fun:  t.helperRef("memoryAccessTrap"),
+				Args: []ast.Expr{newID("m"), newID("r")},
+			}},
+		}}}},
+	}
+	return []ast.Stmt{&ast.DeferStmt{Call: &ast.CallExpr{
+		Fun: &ast.FuncLit{
+			Type: &ast.FuncType{Params: &ast.FieldList{List: []*ast.Field{{
+				Names: []*ast.Ident{newID("old")},
+				Type:  newID("bool"),
+			}}}},
+			Body: &ast.BlockStmt{List: []ast.Stmt{
+				&ast.ExprStmt{X: set(newID("old"))},
+				repanic,
+			}},
+		},
+		Args: []ast.Expr{set(newID("true"))},
+	}}}
 }
 
 // emitOneExportFunc emits one standalone dispatch function for a single
@@ -3488,7 +3608,7 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 			Recv: recv,
 			Name: newID(methodName),
 			Type: &ast.FuncType{Params: params, Results: results},
-			Body: &ast.BlockStmt{List: []ast.Stmt{bodyStmt}},
+			Body: &ast.BlockStmt{List: append(t.propagatingEntryStmts(), bodyStmt)},
 		})
 	}
 	// Per-export dispatch is always on whenever BulkExportPrefix
@@ -3524,6 +3644,12 @@ func (t *translator) emitExportWrappers() ([]ast.Decl, error) {
 			}}}
 		}
 		out = append(out, &ast.FuncDecl{
+			Doc: &ast.CommentGroup{List: []*ast.Comment{{
+				Text: "// Memory returns the linear memory. A memory in a guarded reservation\n" +
+					"// (wasm32 on 64-bit linux and darwin) lives outside the Go heap, so\n" +
+					"// the slice is valid only while m is reachable and its memory has\n" +
+					"// not been released.",
+			}}},
 			Recv: recv,
 			Name: newID("Memory"),
 			Type: &ast.FuncType{
@@ -3830,6 +3956,8 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 				t.use("time")
 			case "sync":
 				t.use("sync")
+			case "debug":
+				t.use("runtime/debug")
 			}
 			return true
 		})
