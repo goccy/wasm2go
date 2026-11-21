@@ -637,6 +637,9 @@ func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 	if f.node.dir {
 		return 0, &fs.PathError{Op: "read", Path: f.node.name, Err: syscall.EISDIR}
 	}
+	if off < 0 {
+		return 0, &fs.PathError{Op: "read", Path: f.node.name, Err: syscall.EINVAL}
+	}
 	if off >= int64(len(f.node.data)) {
 		return 0, io.EOF
 	}
@@ -647,8 +650,27 @@ func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+// memMaxFileSize is the size a MemFS file can grow to: the largest offset
+// of a 32-bit off_t, which a []byte of every host holds.
+const memMaxFileSize = 1<<31 - 1
+
+// validateExtent returns the error of an operation on the n bytes from off:
+// EINVAL for a negative off, EFBIG for an end past memMaxFileSize.
+func (f *memFile) validateExtent(op string, off, n int64) error {
+	switch {
+	case off < 0:
+		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EINVAL}
+	case off > memMaxFileSize-n:
+		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EFBIG}
+	}
+	return nil
+}
+
 // writeAt grows node.data as needed and writes p at off. Caller holds the lock.
-func (f *memFile) writeAt(p []byte, off int64) int {
+func (f *memFile) writeAt(p []byte, off int64) (int, error) {
+	if err := f.validateExtent("write", off, int64(len(p))); err != nil {
+		return 0, err
+	}
 	end := off + int64(len(p))
 	if end > int64(len(f.node.data)) {
 		grown := make([]byte, end)
@@ -657,40 +679,48 @@ func (f *memFile) writeAt(p []byte, off int64) int {
 	}
 	copy(f.node.data[off:], p)
 	f.node.modTime = time.Now()
-	return len(p)
+	return len(p), nil
 }
 
 func (f *memFile) Write(p []byte) (int, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
-	n := f.writeAt(p, f.off)
+	n, err := f.writeAt(p, f.off)
 	f.off += int64(n)
-	return n, nil
+	return n, err
 }
 
 func (f *memFile) WriteAt(p []byte, off int64) (int, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
-	return f.writeAt(p, off), nil
+	return f.writeAt(p, off)
 }
 
 func (f *memFile) Seek(offset int64, whence int) (int64, error) {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
+	off := f.off
 	switch whence {
 	case io.SeekStart:
-		f.off = offset
+		off = offset
 	case io.SeekCurrent:
-		f.off += offset
+		off += offset
 	case io.SeekEnd:
-		f.off = int64(len(f.node.data)) + offset
+		off = int64(len(f.node.data)) + offset
 	}
-	return f.off, nil
+	if off < 0 {
+		return 0, &fs.PathError{Op: "seek", Path: f.node.name, Err: syscall.EINVAL}
+	}
+	f.off = off
+	return off, nil
 }
 
 func (f *memFile) Truncate(size int64) error {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
+	if err := f.validateExtent("truncate", size, 0); err != nil {
+		return err
+	}
 	if size <= int64(len(f.node.data)) {
 		f.node.data = f.node.data[:size]
 	} else {
@@ -1710,6 +1740,7 @@ const (
 	_wasiEBUSY        int32 = 10
 	_wasiEEXIST       int32 = 20
 	_wasiEFAULT       int32 = 21
+	_wasiEFBIG        int32 = 22
 	_wasiEINVAL       int32 = 28
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
@@ -1765,6 +1796,8 @@ func mapOSError(err error) int32 {
 		return _wasiEBADF
 	case errors.Is(err, syscall.ENOSPC):
 		return _wasiENOSPC
+	case errors.Is(err, syscall.EFBIG):
+		return _wasiEFBIG
 	case errors.Is(err, syscall.EAGAIN):
 		return _wasiEAGAIN
 	case errors.Is(err, syscall.EPIPE), errors.Is(err, io.ErrClosedPipe):
@@ -2510,6 +2543,9 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 	if op == nil || op.f == nil || op.noRead {
 		return _wasiEBADF
 	}
+	if offset < 0 {
+		return _wasiEINVAL
+	}
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nread is a __wasi_size_t.
 	nreadSlice := w.memBytes(m, nreadPtr, abi.wordSize())
@@ -2538,6 +2574,9 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 	w.mu.Unlock()
 	if op == nil || op.f == nil || op.noWrite {
 		return _wasiEBADF
+	}
+	if offset < 0 {
+		return _wasiEINVAL
 	}
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nwritten is a __wasi_size_t.
