@@ -24,7 +24,4 @@
   ;; calls slot 1 of the table, which holds the import
   (func (export "viaTable") (param i32) (result i32)
     (call_indirect (type $unary) (local.get 0) (i32.const 1)))
-
-  (func (export "load") (result i32)
-    (i32.load (i32.const 0)))
 )
