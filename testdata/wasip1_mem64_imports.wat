@@ -1,10 +1,8 @@
 ;; wasip1_mem64_imports.wat — a memory64 module that imports every name
 ;; WasiStubs binds for a memory64 guest, from a module that serves it, each
 ;; with its wasm64 signature: every argument of a standard import widened to
-;; i64 (as the wasm2go port of wasi-libc declares them; proc_raise, which
-;; that C library no longer declares, the same way), and for an import of
-;; wasip1_posix_extension an i64 for every pointer and an i32 for every int
-;; of its C declaration. Its translation must compile against the *64
+;; i64, and for an import of wasip1_posix_extension an i64 for every
+;; pointer and an i32 for every int of its C declaration. Its translation must compile against the *64
 ;; bindings of WasiStubs. touch calls every import once so none of them can
 ;; be dropped as unused; nothing runs it.
 (module

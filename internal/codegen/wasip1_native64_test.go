@@ -12,8 +12,7 @@ import (
 // family): 8-byte guest pointers, LP64 iovec/prestat/argv layouts, and
 // 64-bit __wasi_size_t out-params; that a *64 method takes the same paths
 // as its wasm32 twin; and that an address is never truncated. The layout
-// constants asserted here are the contract with the wasm2go wasi-libc
-// port's __wasi_abi_t.
+// constants asserted here are the LP64 layouts a memory64 guest uses.
 
 // makeIovec64 writes a 1-entry LP64 iovec {u64 buf, u64 len} at iovOff.
 func makeIovec64(m *Module, iovOff, bufOff, bufLen int64) {

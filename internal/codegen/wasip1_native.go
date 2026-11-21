@@ -4016,10 +4016,9 @@ func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
 	return _wasiESUCCESS
 }
 
-// Proc_raise64 is Proc_raise for a memory64 guest. The wasi-libc that
-// memory64 guests are built with declares no proc_raise: this takes the
-// one argument of the standard import widened to an i64, as that C
-// library widens every argument of the standard imports.
+// Proc_raise64 is Proc_raise for a memory64 guest: it takes the one
+// argument of the standard import widened to an i64, as a memory64 guest
+// passes every argument of the standard imports.
 func (w *WasiStubs) Proc_raise64(m *Module, sig int64) int32 {
 	return w.Proc_raise(m, int32(sig))
 }
