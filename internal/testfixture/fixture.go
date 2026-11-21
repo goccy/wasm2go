@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -47,9 +48,11 @@ func Wasm(t testing.TB, name string) []byte {
 		t.Fatalf("testfixture: wat source not found: %s", watPath)
 	}
 
-	// --enable-exceptions lets EH fixtures (try/catch/throw/tag) compile; it
-	// only enables the feature, so non-EH fixtures are unaffected.
-	cmd := exec.Command("wat2wasm", "--enable-exceptions", "--enable-threads", "--enable-memory64", "--output=-", watPath)
+	flags, err := wat2wasmFlags()
+	if err != nil {
+		t.Fatalf("testfixture: %v", err)
+	}
+	cmd := exec.Command("wat2wasm", slices.Concat(flags, []string{"--output=-", watPath})...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -63,6 +66,33 @@ func Wasm(t testing.TB, name string) []byte {
 	cacheMu.Unlock()
 
 	return data
+}
+
+// wat2wasmFlags returns the flags that enable the features the fixtures
+// use (exception handling, threads, memory64) in the installed wat2wasm: a
+// version that enables a feature by default lists --disable-X instead of
+// --enable-X, and is given nothing for it.
+var wat2wasmFlags = sync.OnceValues(func() ([]string, error) {
+	help, err := exec.Command("wat2wasm", "--help").Output()
+	if err != nil {
+		return nil, fmt.Errorf("wat2wasm --help: %w", err)
+	}
+	return flagsOf(help, "--enable-exceptions", "--enable-threads", "--enable-memory64"), nil
+})
+
+// flagsOf returns those of flags that the help text of a command lists.
+func flagsOf(help []byte, flags ...string) []string {
+	listed := map[string]bool{}
+	for _, word := range strings.Fields(string(help)) {
+		listed[word] = true
+	}
+	var out []string
+	for _, f := range flags {
+		if listed[f] {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // WasmPath compiles testdata/<basename>.wat and writes the result to a
