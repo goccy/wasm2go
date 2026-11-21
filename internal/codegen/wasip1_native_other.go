@@ -32,6 +32,10 @@ func readHostUmask() (os.FileMode, error) {
 	return 0, fmt.Errorf("the umask of the host process cannot be read without changing it: %w", errors.ErrUnsupported)
 }
 
+// clearHostNonblock would make the descriptor of f one that waits; no open
+// of this platform is given O_NONBLOCK (hostONonblock).
+func clearHostNonblock(f File) error { return nil }
+
 // hostONonblock is the open flag of the host that opens a file without
 // waiting. This platform's opens wait as they will: the syscall package of
 // some (js, wasip1) has no such flag.
@@ -191,3 +195,44 @@ func hostDirListing(f File, hostPath bool) ([]os.DirEntry, bool, error) {
 	out = append(out, dotEntry(d.Name(), "."), dotEntry(d.Name(), ".."))
 	return append(out, entries...), true, nil
 }
+
+// hostPriority and setHostPriority read and set the nice value of processes
+// of the host, which the runtime cannot do on this platform.
+func hostPriority(which, who int) (int, error) { return 0, errors.ErrUnsupported }
+
+func setHostPriority(which, who, nice int) error { return errors.ErrUnsupported }
+
+// setHostIDs changes the user or group ids of the host process, which this
+// platform does not have.
+func setHostIDs(change IDChange) error { return errors.ErrUnsupported }
+
+// setHostGroups sets the supplementary groups of the host process, which
+// this platform does not have.
+func setHostGroups(gids []int) error { return errors.ErrUnsupported }
+
+// makeHostFIFO creates a FIFO in the host filesystem, which this platform
+// does not have.
+func makeHostFIFO(path string, perm os.FileMode) error { return errors.ErrUnsupported }
+
+// hostUname returns what uname reports, which the runtime cannot ask on this
+// platform.
+func hostUname() (Uname, error) { return Uname{}, errors.ErrUnsupported }
+
+// hostAccess would ask the host about an access to a file, which the
+// runtime cannot do on this platform: asked is false, and Path_access
+// decides by the file's mode bits.
+func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+	return 0, false
+}
+
+// flockOSFile would apply flock(2) to a file of the host process, which the
+// runtime cannot do on this platform.
+func flockOSFile(f *os.File, how int) error { return errors.ErrUnsupported }
+
+// hostRecordLock would take a record lock of a file of the host process,
+// which the runtime cannot do on this platform.
+func hostRecordLock(f *os.File, cmd int32, lk *recordLock) error { return errors.ErrUnsupported }
+
+// newHostSyslog would return the host's system logger, which package
+// log/syslog does not have on this platform.
+func newHostSyslog() (Syslogger, error) { return nil, errors.ErrUnsupported }

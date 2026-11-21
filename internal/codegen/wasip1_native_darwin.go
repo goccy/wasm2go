@@ -132,3 +132,69 @@ func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
 	n, _, errno := syscall.Syscall(syscall.SYS_POLL, uintptr(unsafe.Pointer(first)), uintptr(len(fds)), uintptr(ms))
 	return int(n), errno
 }
+
+// hostPriority and setHostPriority read and set the nice value of a
+// process, a process group or a user of the host.
+func hostPriority(which, who int) (int, error) {
+	return syscall.Getpriority(which, who)
+}
+
+func setHostPriority(which, who, nice int) error {
+	return syscall.Setpriority(which, who, nice)
+}
+
+// setHostRESUID and setHostRESGID set the real, effective and saved ids of
+// the host process. The system has no call that names the saved id: it
+// follows the effective one, and only that request can be met.
+func setHostRESUID(ruid, euid, suid int) error {
+	if suid != -1 && suid != euid {
+		return syscall.EINVAL
+	}
+	return syscall.Setreuid(ruid, euid)
+}
+
+func setHostRESGID(rgid, egid, sgid int) error {
+	if sgid != -1 && sgid != egid {
+		return syscall.EINVAL
+	}
+	return syscall.Setregid(rgid, egid)
+}
+
+// hostUname returns what uname(3) reports, from the sysctl values it reads.
+func hostUname() (Uname, error) {
+	var fields [5]string
+	for i, key := range [...]string{"kern.ostype", "kern.hostname", "kern.osrelease", "kern.version", "hw.machine"} {
+		value, err := syscall.Sysctl(key)
+		if err != nil {
+			return Uname{}, err
+		}
+		fields[i] = value
+	}
+	return Uname{Sysname: fields[0], Nodename: fields[1], Release: fields[2], Version: fields[3], Machine: fields[4]}, nil
+}
+
+// hostAccess asks the host whether the process may make the accesses of
+// amode (access's bits) to the file at path, with its effective ids or its
+// real ones: access(2), which asks with the real ones. Package syscall has
+// no faccessat on this system, so a question with the effective ids is
+// asked only of a process whose effective ids are its real ones; for any
+// other, asked is false.
+func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+	if effective && (os.Geteuid() != os.Getuid() || os.Getegid() != os.Getgid()) {
+		return 0, false
+	}
+	if err := syscall.Access(path, amode); err != nil {
+		return mapOSError(err), true
+	}
+	return _wasiESUCCESS, true
+}
+
+// hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,
+// recordLockSet and recordLockWait: fcntl's F_GETLK, F_SETLK and F_SETLKW,
+// whose locks are the process's.
+var hostRecordLockCommands = [...]int{recordLockGet: syscall.F_GETLK, recordLockSet: syscall.F_SETLK, recordLockWait: syscall.F_SETLKW}
+
+// hostRecordLocksOfDescription says that the record locks of
+// hostRecordLockCommands are the process's, not the open file
+// description's.
+const hostRecordLocksOfDescription = false

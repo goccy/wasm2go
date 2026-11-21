@@ -3,6 +3,10 @@
 package codegen
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/syslog"
 	"math"
 	"os"
 	"runtime"
@@ -394,6 +398,228 @@ var wasiErrnoOfHost = sync.OnceValue(func() map[syscall.Errno]int32 {
 func wasiErrno(e syscall.Errno) (int32, bool) {
 	n, ok := wasiErrnoOfHost()[e]
 	return n, ok
+}
+
+// setHostIDs makes a change of the user or group ids of the host process.
+func setHostIDs(change IDChange) error {
+	a, b, c := int(change.IDs[0]), int(change.IDs[1]), int(change.IDs[2])
+	switch change.Call {
+	case IDSetuid:
+		return syscall.Setuid(a)
+	case IDSeteuid:
+		return syscall.Seteuid(a)
+	case IDSetreuid:
+		return syscall.Setreuid(a, b)
+	case IDSetresuid:
+		return setHostRESUID(a, b, c)
+	case IDSetgid:
+		return syscall.Setgid(a)
+	case IDSetegid:
+		return syscall.Setegid(a)
+	case IDSetregid:
+		return syscall.Setregid(a, b)
+	case IDSetresgid:
+		return setHostRESGID(a, b, c)
+	}
+	return syscall.EINVAL
+}
+
+// setHostGroups sets the supplementary groups of the host process.
+func setHostGroups(gids []int) error { return syscall.Setgroups(gids) }
+
+// makeHostFIFO creates a FIFO in the host filesystem.
+func makeHostFIFO(path string, perm os.FileMode) error {
+	return syscall.Mkfifo(path, uint32(perm.Perm()))
+}
+
+// withHostDescriptor calls use with the descriptor of f. The descriptor is
+// borrowed through SyscallConn rather than taken with Fd, which would
+// switch a pipe or terminal to blocking mode for good.
+func withHostDescriptor(f *os.File, use func(fd uintptr) error) error {
+	conn, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var useErr error
+	if err := conn.Control(func(fd uintptr) { useErr = use(fd) }); err != nil {
+		// Control fails only for a file that is being closed, with an
+		// error of its own that is not fs.ErrClosed.
+		return fmt.Errorf("%w: %w", fs.ErrClosed, err)
+	}
+	return useErr
+}
+
+// withDuplicateDescriptor calls use with a duplicate of the descriptor of
+// f, made close-on-exec while f's descriptor is borrowed and closed when
+// use returns: a call of use that waits holds no reference to f, whose
+// Close would wait for it.
+func withDuplicateDescriptor(f *os.File, use func(fd uintptr) error) error {
+	var dup int
+	if err := withHostDescriptor(f, func(fd uintptr) error {
+		syscall.ForkLock.RLock()
+		defer syscall.ForkLock.RUnlock()
+		var err error
+		if dup, err = syscall.Dup(int(fd)); err != nil {
+			return err
+		}
+		syscall.CloseOnExec(dup)
+		return nil
+	}); err != nil {
+		return err
+	}
+	return errors.Join(use(uintptr(dup)), syscall.Close(dup))
+}
+
+// flockOSFile applies flock(2) with how (LockFS.Flock's) to a file of the
+// host process. A lock that may have to be waited for is taken through a
+// duplicate of the descriptor (withDuplicateDescriptor), which shares the
+// open file description the lock belongs to. A call the delivery of a
+// signal to the host process interrupts (EINTR) is made again.
+func flockOSFile(f *os.File, how int) error {
+	on := withHostDescriptor
+	if how&(syscall.LOCK_NB|syscall.LOCK_UN) == 0 {
+		on = withDuplicateDescriptor
+	}
+	return on(f, func(fd uintptr) error {
+		for {
+			if err := syscall.Flock(int(fd), how); !errors.Is(err, syscall.EINTR) {
+				return err
+			}
+		}
+	})
+}
+
+// hostRecordLock is fcntl(2) F_GETLK (recordLockGet, which writes the lock
+// in the way back into lk), F_SETLK (recordLockSet) or F_SETLKW
+// (recordLockWait) on the descriptor of f, by the commands
+// hostRecordLockCommands names. Where the locks are the open file
+// description's (hostRecordLocksOfDescription), a lock that may have to be
+// waited for is taken through a duplicate of the descriptor
+// (withDuplicateDescriptor); where they are the process's, closing the
+// duplicate would release them, and the wait holds f's descriptor. A call
+// the delivery of a signal to the host process interrupts (EINTR) is made
+// again.
+func hostRecordLock(f *os.File, cmd int32, lk *recordLock) error {
+	types := [3]int16{syscall.F_RDLCK, syscall.F_WRLCK, syscall.F_UNLCK}
+	fl := syscall.Flock_t{Type: types[lk.typ], Whence: int16(lk.whence), Start: lk.start, Len: lk.len}
+	op := hostRecordLockCommands[cmd]
+	on := withHostDescriptor
+	if cmd == recordLockWait && hostRecordLocksOfDescription {
+		on = withDuplicateDescriptor
+	}
+	err := on(f, func(fd uintptr) error {
+		for {
+			if err := syscall.FcntlFlock(fd, op, &fl); !errors.Is(err, syscall.EINTR) {
+				return err
+			}
+		}
+	})
+	if err != nil || cmd != recordLockGet {
+		return err
+	}
+	for i, t := range types {
+		if fl.Type == t {
+			lk.typ = int32(i)
+		}
+	}
+	lk.whence, lk.start, lk.len, lk.pid = int32(fl.Whence), fl.Start, fl.Len, int32(fl.Pid)
+	return nil
+}
+
+// hostSyslogger is the Syslogger HostSyslog returns: at most one connection
+// of package log/syslog for each facility, made for the ident it was last
+// used with. Its lock is held across every write, so a connection Close
+// has closed is never written to (package log/syslog would open it again).
+type hostSyslogger struct {
+	mu      sync.Mutex
+	writers map[int32]*hostSyslogWriter
+}
+
+// hostSyslogWriter is a connection of a hostSyslogger and the ident it was
+// made for.
+type hostSyslogWriter struct {
+	writer *syslog.Writer
+	ident  string
+}
+
+// syslogFacilityUser is the facility LOG_USER, syslog(3)'s default.
+const syslogFacilityUser int32 = 1
+
+// newHostSyslog returns the host's system logger (see HostSyslog).
+func newHostSyslog() (Syslogger, error) {
+	l := &hostSyslogger{writers: map[int32]*hostSyslogWriter{}}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, err := l.writerLocked("", syslogFacilityUser); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// writerLocked returns the connection for facility made for ident. One
+// made for another ident is closed and replaced. Caller holds l.mu.
+func (l *hostSyslogger) writerLocked(ident string, facility int32) (*syslog.Writer, error) {
+	if facility < 0 || facility > 23 {
+		return nil, syscall.EINVAL
+	}
+	if wr := l.writers[facility]; wr != nil {
+		if wr.ident == ident {
+			return wr.writer, nil
+		}
+		delete(l.writers, facility)
+		if err := wr.writer.Close(); err != nil {
+			return nil, err
+		}
+	}
+	wr, err := syslog.New(syslog.Priority(facility<<3)|syslog.LOG_INFO, ident)
+	if err != nil {
+		return nil, err
+	}
+	l.writers[facility] = &hostSyslogWriter{writer: wr, ident: ident}
+	return wr, nil
+}
+
+func (l *hostSyslogger) Open(ident string, options, facility int32) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, err := l.writerLocked(ident, facility)
+	return err
+}
+
+func (l *hostSyslogger) Log(msg SyslogMessage) error {
+	if msg.Severity < 0 || msg.Severity > 7 {
+		return syscall.EINVAL
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	wr, err := l.writerLocked(msg.Ident, msg.Facility)
+	if err != nil {
+		return err
+	}
+	return [...]func(string) error{wr.Emerg, wr.Alert, wr.Crit, wr.Err, wr.Warning, wr.Notice, wr.Info, wr.Debug}[msg.Severity](msg.Message)
+}
+
+// Close closes every connection; a message logged later connects again.
+func (l *hostSyslogger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var err error
+	for facility, wr := range l.writers {
+		err = errors.Join(err, wr.writer.Close())
+		delete(l.writers, facility)
+	}
+	return err
+}
+
+// clearHostNonblock makes the descriptor of f, a file of the host, one
+// that waits (clears O_NONBLOCK). A File of another backend is left as it
+// is.
+func clearHostNonblock(f File) error {
+	file, isHost := f.(*os.File)
+	if !isHost {
+		return nil
+	}
+	return withHostDescriptor(file, func(fd uintptr) error { return syscall.SetNonblock(int(fd), false) })
 }
 
 // hostONonblock is the open flag of the host that opens a file without

@@ -207,3 +207,105 @@ func readHostDirents(fd int) ([]hostName, error) {
 		}
 	}
 }
+
+// hostPriority returns the nice value of a process, a process group or a
+// user of the host. The system call reports it as 20 minus the value. The
+// host process's own (PRIO_PROCESS, 0) is its main thread's: the kernel
+// keeps a nice value for each thread, and 0 names the calling one.
+func hostPriority(which, who int) (int, error) {
+	if which == hostPrioProcess && who == 0 {
+		who = os.Getpid()
+	}
+	raw, err := syscall.Getpriority(which, who)
+	if err != nil {
+		return 0, err
+	}
+	return 20 - raw, nil
+}
+
+// setHostRESUID and setHostRESGID set the real, effective and saved ids of
+// the host process.
+func setHostRESUID(ruid, euid, suid int) error { return syscall.Setresuid(ruid, euid, suid) }
+
+func setHostRESGID(rgid, egid, sgid int) error { return syscall.Setresgid(rgid, egid, sgid) }
+
+// hostUname returns what uname(2) reports.
+func hostUname() (Uname, error) {
+	var name syscall.Utsname
+	if err := syscall.Uname(&name); err != nil {
+		return Uname{}, err
+	}
+	return Uname{
+		Sysname:  utsnameField(name.Sysname[:]),
+		Nodename: utsnameField(name.Nodename[:]),
+		Release:  utsnameField(name.Release[:]),
+		Version:  utsnameField(name.Version[:]),
+		Machine:  utsnameField(name.Machine[:]),
+	}, nil
+}
+
+// utsnameField returns a field of a Utsname, a NUL-terminated string in
+// bytes that are signed on some architectures and unsigned on others.
+func utsnameField[T int8 | uint8](raw []T) string {
+	text := make([]byte, 0, len(raw))
+	for _, c := range raw {
+		if c == 0 {
+			break
+		}
+		text = append(text, byte(c))
+	}
+	return string(text)
+}
+
+// hostAccess asks the host whether the process may make the accesses of
+// amode (access's bits) to the file at path, with its effective ids or its
+// real ones: faccessat(2). asked is true: the host can always say.
+func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+	// faccessat's AT_FDCWD and AT_EACCESS on this system
+	const atFDCWD, atEAccess = -100, 0x200
+	flags := 0
+	if effective {
+		flags = atEAccess
+	}
+	if err := syscall.Faccessat(atFDCWD, path, amode, flags); err != nil {
+		return mapOSError(err), true
+	}
+	return _wasiESUCCESS, true
+}
+
+// hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,
+// recordLockSet and recordLockWait: those of the locks of an open file
+// description, F_OFD_GETLK, F_OFD_SETLK and F_OFD_SETLKW (Linux 3.15), the
+// same on every architecture; package syscall does not name them.
+var hostRecordLockCommands = [...]int{recordLockGet: 36, recordLockSet: 37, recordLockWait: 38}
+
+// hostRecordLocksOfDescription says that the record locks of
+// hostRecordLockCommands are the open file description's.
+const hostRecordLocksOfDescription = true
+
+// hostPrioProcess is PRIO_PROCESS.
+const hostPrioProcess = 0
+
+// setHostPriority sets the nice value of processes of the host. The kernel
+// keeps one for each thread, so the host process's own (PRIO_PROCESS, 0)
+// is set for every thread it has (/proc/self/task); a thread that ends
+// meanwhile (ESRCH) is skipped.
+func setHostPriority(which, who, nice int) error {
+	if which != hostPrioProcess || who != 0 {
+		return syscall.Setpriority(which, who, nice)
+	}
+	tasks, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		tid, err := strconv.Atoi(task.Name())
+		if err != nil {
+			return fmt.Errorf("the thread /proc/self/task/%s: %w", task.Name(), err)
+		}
+		if err := syscall.Setpriority(which, tid, nice); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+	}
+	return nil
+}
