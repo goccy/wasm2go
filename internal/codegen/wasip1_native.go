@@ -294,11 +294,15 @@ func (o osFS) Link(a, b string) error                    { return os.Link(o.join
 type MemFS struct {
 	mu   sync.Mutex
 	root *memNode
+	// maxFileSize is the size a write or a truncation can make a file;
+	// NewMemFS sets it to memMaxFileSize.
+	maxFileSize int64
 }
 
 // NewMemFS returns an empty in-memory filesystem with a root directory.
 func NewMemFS() *MemFS {
-	return &MemFS{root: &memNode{dir: true, mode: os.ModeDir | 0o755, modTime: time.Unix(0, 0), children: map[string]*memNode{}}}
+	return &MemFS{root: &memNode{dir: true, mode: os.ModeDir | 0o755, modTime: time.Unix(0, 0), children: map[string]*memNode{}},
+		maxFileSize: memMaxFileSize}
 }
 
 // memNode is a file or directory in a MemFS tree.
@@ -655,31 +659,28 @@ func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
 // the limit is 256 MiB, so that stays far below its address space.
 const memMaxFileSize = min(1<<31-1, 1<<(strconv.IntSize-4)-1)
 
-// validateSize returns the error of making the file size bytes long or of
-// writing from size: EISDIR for a directory, EINVAL for a negative size and
-// EFBIG for a size past memMaxFileSize.
-func (f *memFile) validateSize(op string, size int64) error {
+// validateOffset returns the error of writing at or truncating to off:
+// EISDIR for a directory and EINVAL for a negative off.
+func (f *memFile) validateOffset(op string, off int64) error {
 	switch {
 	case f.node.dir:
 		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EISDIR}
-	case size < 0:
+	case off < 0:
 		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EINVAL}
-	case size > memMaxFileSize:
-		return &fs.PathError{Op: op, Path: f.node.name, Err: syscall.EFBIG}
 	}
 	return nil
 }
 
 // writeAt grows node.data as needed and writes p at off, up to
-// memMaxFileSize: it writes the bytes below it and fails with EFBIG for the
-// rest. Caller holds the lock.
+// fsys.maxFileSize: it writes the bytes below it and fails with EFBIG for
+// the rest. Caller holds the lock.
 func (f *memFile) writeAt(p []byte, off int64) (int, error) {
-	if err := f.validateSize("write", off); err != nil {
+	if err := f.validateOffset("write", off); err != nil {
 		return 0, err
 	}
 	var err error
-	if room := memMaxFileSize - off; int64(len(p)) > room {
-		p = p[:room]
+	if room := f.fsys.maxFileSize - off; len(p) > 0 && int64(len(p)) > room {
+		p = p[:max(room, 0)]
 		err = &fs.PathError{Op: "write", Path: f.node.name, Err: syscall.EFBIG}
 	}
 	if len(p) == 0 {
@@ -720,7 +721,7 @@ func (f *memFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekEnd:
 		off = int64(len(f.node.data)) + offset
 	}
-	if off < 0 || off > memMaxFileSize {
+	if off < 0 {
 		return 0, &fs.PathError{Op: "seek", Path: f.node.name, Err: syscall.EINVAL}
 	}
 	f.off = off
@@ -730,8 +731,11 @@ func (f *memFile) Seek(offset int64, whence int) (int64, error) {
 func (f *memFile) Truncate(size int64) error {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
-	if err := f.validateSize("truncate", size); err != nil {
+	if err := f.validateOffset("truncate", size); err != nil {
 		return err
+	}
+	if size > f.fsys.maxFileSize {
+		return &fs.PathError{Op: "truncate", Path: f.node.name, Err: syscall.EFBIG}
 	}
 	if size <= int64(len(f.node.data)) {
 		f.node.data = f.node.data[:size]
@@ -2752,11 +2756,14 @@ func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	w.mu.Unlock()
-	if op == nil || op.f == nil || op.noWrite {
+	if op == nil || op.f == nil {
 		return _wasiEBADF
 	}
 	if offset < 0 || length <= 0 {
 		return _wasiEINVAL
+	}
+	if op.noWrite {
+		return _wasiEBADF
 	}
 	end := offset + length
 	if end < 0 {

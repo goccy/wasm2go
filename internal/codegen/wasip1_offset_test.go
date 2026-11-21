@@ -131,12 +131,30 @@ func TestMemFS_InvalidOffsetsAndDirectories(t *testing.T) {
 	}
 }
 
+// testMaxFileSize is the file size limit of a newSmallMemFS.
+const testMaxFileSize = 16
+
+// newSmallMemFS returns a MemFS whose files can grow to testMaxFileSize.
+func newSmallMemFS() *MemFS {
+	fsys := NewMemFS()
+	fsys.maxFileSize = testMaxFileSize
+	return fsys
+}
+
 func TestWasi_MemFSWritePastMaxSizeIsEFBIG(t *testing.T) {
 	for _, c := range pwriteCalls {
 		t.Run(c.name, func(t *testing.T) {
 			w, m := newTestStubs(t, t.TempDir())
 			f := openDataFile(t, w, NewMemFS())
-			for _, offset := range []uint64{memMaxFileSize, memMaxFileSize + 1, 1 << 40, math.MaxInt64} {
+			for _, offset := range []uint64{memMaxFileSize, 1 << 40, math.MaxInt64} {
+				if rc := c.call(w, m, 9, offset); rc != _wasiEFBIG {
+					t.Errorf("offset %#x: rc=%d, want EFBIG", offset, rc)
+				}
+			}
+			wantSize(t, f, 4)
+
+			f = openDataFile(t, w, newSmallMemFS())
+			for _, offset := range []uint64{testMaxFileSize, testMaxFileSize + 1} {
 				if rc := c.call(w, m, 9, offset); rc != _wasiEFBIG {
 					t.Errorf("offset %#x: rc=%d, want EFBIG", offset, rc)
 				}
@@ -144,12 +162,12 @@ func TestWasi_MemFSWritePastMaxSizeIsEFBIG(t *testing.T) {
 			wantSize(t, f, 4)
 			// A write across the limit writes the bytes below it.
 			copy(m.memory[ioErrBuf:], "wxyz")
-			if rc := c.call(w, m, 9, memMaxFileSize-3); rc != _wasiESUCCESS {
+			if rc := c.call(w, m, 9, testMaxFileSize-3); rc != _wasiESUCCESS {
 				t.Fatalf("write across the limit: rc=%d, want ESUCCESS", rc)
 			}
-			wantSize(t, f, memMaxFileSize)
+			wantSize(t, f, testMaxFileSize)
 			got := make([]byte, 3)
-			if _, err := f.ReadAt(got, memMaxFileSize-3); err != nil {
+			if _, err := f.ReadAt(got, testMaxFileSize-3); err != nil {
 				t.Fatal(err)
 			}
 			if string(got) != "wxy" {
@@ -157,10 +175,18 @@ func TestWasi_MemFSWritePastMaxSizeIsEFBIG(t *testing.T) {
 			}
 		})
 	}
+	t.Run("empty write past the limit", func(t *testing.T) {
+		w, _ := newTestStubs(t, t.TempDir())
+		f := openDataFile(t, w, newSmallMemFS())
+		if n, err := f.WriteAt(nil, testMaxFileSize+1); n != 0 || err != nil {
+			t.Fatalf("n=%d err=%v, want 0 and no error", n, err)
+		}
+		wantSize(t, f, 4)
+	})
 	t.Run("Fd_write", func(t *testing.T) {
 		w, m := newTestStubs(t, t.TempDir())
-		f := openDataFile(t, w, NewMemFS())
-		if rc := w.Fd_seek(m, 9, memMaxFileSize, 0, ioErrResult); rc != _wasiESUCCESS {
+		f := openDataFile(t, w, newSmallMemFS())
+		if rc := w.Fd_seek(m, 9, testMaxFileSize, 0, ioErrResult); rc != _wasiESUCCESS {
 			t.Fatalf("seek rc=%d", rc)
 		}
 		makeIovec(m, ioErrIov, ioErrBuf, 4)
@@ -177,23 +203,25 @@ var testFSs = map[string]func(dir string) FS{
 	"MemFS": func(string) FS { return NewMemFS() },
 }
 
+// seekCalls are fd_seek on fd 9, storing the new offset at ioErrResult.
+var seekCalls = []struct {
+	name string
+	call func(w *WasiStubs, m *Module, offset int64, whence int32) int32
+}{
+	{"Fd_seek", func(w *WasiStubs, m *Module, offset int64, whence int32) int32 {
+		return w.Fd_seek(m, 9, offset, whence, ioErrResult)
+	}},
+	{"Fd_seek64", func(w *WasiStubs, m *Module, offset int64, whence int32) int32 {
+		return w.Fd_seek64(m, 9, offset, int64(whence), ioErrResult)
+	}},
+}
+
 func TestWasi_SeekOutOfRangeIsEINVAL(t *testing.T) {
-	seeks := []struct {
-		name string
-		call func(w *WasiStubs, m *Module, offset int64, whence int32) int32
-	}{
-		{"Fd_seek", func(w *WasiStubs, m *Module, offset int64, whence int32) int32 {
-			return w.Fd_seek(m, 9, offset, whence, ioErrResult)
-		}},
-		{"Fd_seek64", func(w *WasiStubs, m *Module, offset int64, whence int32) int32 {
-			return w.Fd_seek64(m, 9, offset, int64(whence), ioErrResult)
-		}},
-	}
 	type seek struct {
 		offset int64
 		whence int32
 	}
-	for _, s := range seeks {
+	for _, s := range seekCalls {
 		for name, fsys := range testFSs {
 			t.Run(s.name+"/"+name, func(t *testing.T) {
 				dir := t.TempDir()
@@ -204,7 +232,7 @@ func TestWasi_SeekOutOfRangeIsEINVAL(t *testing.T) {
 				}
 				cases := []seek{{-1, 0}, {-3, 1}, {-5, 2}, {0, 3}, {0, 4}, {0, -1}}
 				if name == "MemFS" {
-					cases = append(cases, seek{math.MaxInt64, 1}, seek{memMaxFileSize + 1, 0})
+					cases = append(cases, seek{math.MaxInt64, 1})
 				}
 				for _, c := range cases {
 					if rc := s.call(w, m, c.offset, c.whence); rc != _wasiEINVAL {
@@ -219,6 +247,58 @@ func TestWasi_SeekOutOfRangeIsEINVAL(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestWasi_MemFSFileLargerThanLimit(t *testing.T) {
+	content := "0123456789abcdefghijklmnopqrstuv"
+	for _, s := range seekCalls {
+		t.Run(s.name, func(t *testing.T) {
+			w, m := newTestStubs(t, t.TempDir())
+			fsys := newSmallMemFS()
+			if err := fsys.WriteFile("big", []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			f, err := fsys.OpenFile("big", os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := f.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			w.fsys = fsys
+			w.fdsLocked()[9] = &wasiOpen{f: f}
+			for _, c := range []struct {
+				offset int64
+				whence int32
+				want   uint64
+			}{{0, 2, 32}, {-4, 1, 28}, {20, 0, 20}, {8, 1, 28}} {
+				if rc := s.call(w, m, c.offset, c.whence); rc != _wasiESUCCESS {
+					t.Fatalf("seek %d whence %d: rc=%d", c.offset, c.whence, rc)
+				}
+				if got := readU64(m.memory, ioErrResult); got != c.want {
+					t.Fatalf("seek %d whence %d: offset=%d, want %d", c.offset, c.whence, got, c.want)
+				}
+			}
+			makeIovec(m, ioErrIov, ioErrBuf, 8)
+			for _, want := range []string{"stuv", ""} {
+				if rc := w.Fd_read(m, 9, ioErrIov, 1, ioErrResult); rc != _wasiESUCCESS {
+					t.Fatalf("read rc=%d", rc)
+				}
+				if got := string(m.memory[ioErrBuf : ioErrBuf+readU32(m.memory, ioErrResult)]); got != want {
+					t.Fatalf("read %q, want %q", got, want)
+				}
+			}
+			if rc := w.Fd_tell(m, 9, ioErrResult); rc != _wasiESUCCESS {
+				t.Fatalf("tell rc=%d", rc)
+			}
+			if got := readU64(m.memory, ioErrResult); got != 32 {
+				t.Fatalf("tell=%d, want 32", got)
+			}
+			wantSize(t, f, 32)
+		})
 	}
 }
 
@@ -319,6 +399,9 @@ func TestWasi_FdAllocate(t *testing.T) {
 				w.fdsLocked()[9].noWrite = true
 				if rc := a.call(w, m, 0, 16); rc != _wasiEBADF {
 					t.Errorf("allocate on a read-only descriptor: rc=%d, want EBADF", rc)
+				}
+				if rc := a.call(w, m, -1, 16); rc != _wasiEINVAL {
+					t.Errorf("allocate -1+16 on a read-only descriptor: rc=%d, want EINVAL", rc)
 				}
 				wantSize(t, f, 8)
 			})
