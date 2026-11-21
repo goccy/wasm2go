@@ -5,14 +5,63 @@ package codegen
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// Every errno constant of the runtime is the number wasi gives its name.
+func TestWasi_ErrnoConstantsHaveTheirNumber(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "wasip1_native.go", wasip1NativeRaw, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, d := range f.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				t.Fatalf("a const spec %T", spec)
+			}
+			for i, id := range vs.Names {
+				name, isErrno := strings.CutPrefix(id.Name, "_wasiE")
+				if !isErrno || name == "SUCCESS" {
+					continue
+				}
+				if i >= len(vs.Values) {
+					t.Fatalf("%s has no value of its own", id.Name)
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok {
+					t.Fatalf("%s is not a number", id.Name)
+				}
+				n, err := strconv.Atoi(lit.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n <= 0 || n >= len(wasiErrnoNames) || wasiErrnoNames[n] != "E"+name {
+					t.Errorf("%s = %d, which is not wasi's E%s", id.Name, n, name)
+				}
+				seen++
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no errno constant found")
+	}
+}
 
 // A failed system call is the error its number says, not the nearest kind
 // package os knows.

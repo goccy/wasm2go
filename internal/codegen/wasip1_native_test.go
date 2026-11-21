@@ -165,8 +165,8 @@ func TestWasi_FSAccessHook(t *testing.T) {
 
 // TestWasi_NetAccessHook verifies the network policy hook gates the
 // accept/recv/send surface before any socket work happens (a denied op
-// returns EACCES; an allowed op falls through to the normal ENOTSOCK for
-// these fd-less test calls, proving the hook let it pass).
+// returns EACCES; an allowed op falls through to the normal EBADF or
+// ENOTSOCK for these fd-less test calls, proving the hook let it pass).
 func TestWasi_NetAccessHook(t *testing.T) {
 	_, m := newTestStubs(t, t.TempDir())
 	w := &WasiStubs{}
@@ -178,18 +178,18 @@ func TestWasi_NetAccessHook(t *testing.T) {
 	if rc := w.Sock_send(m, 4, 0, 0, 0, 200); rc != _wasiEACCES {
 		t.Fatalf("Sock_send denied: want EACCES, got %d", rc)
 	}
-	// recv is allowed by the hook → passes the hook, then ENOTSOCK (fd 4
-	// has no conn).
-	if rc := w.Sock_recv(m, 4, 0, 0, 0, 200, 204); rc != _wasiENOTSOCK {
-		t.Fatalf("Sock_recv allowed: want ENOTSOCK, got %d", rc)
+	// recv is allowed by the hook → passes the hook, then EBADF (fd 4 is
+	// not open).
+	if rc := w.Sock_recv(m, 4, 0, 0, 0, 200, 204); rc != _wasiEBADF {
+		t.Fatalf("Sock_recv allowed: want EBADF, got %d", rc)
 	}
 	if rc := w.Sock_accept(m, 4, 0, 200); rc != _wasiENOTSOCK {
 		t.Fatalf("Sock_accept allowed: want ENOTSOCK, got %d", rc)
 	}
-	// Clearing the hook makes send fall through to ENOTSOCK too.
+	// Clearing the hook makes send fall through to EBADF too.
 	w.SetNetAccessHook(nil)
-	if rc := w.Sock_send(m, 4, 0, 0, 0, 200); rc != _wasiENOTSOCK {
-		t.Fatalf("Sock_send after clearing hook: want ENOTSOCK, got %d", rc)
+	if rc := w.Sock_send(m, 4, 0, 0, 0, 200); rc != _wasiEBADF {
+		t.Fatalf("Sock_send after clearing hook: want EBADF, got %d", rc)
 	}
 }
 
@@ -276,9 +276,9 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 		t.Fatalf("re-connect: want -EISCONN, got %d", rc)
 	}
 
-	// Connect on a non-socket fd → ENOTSOCK.
-	if rc := w.Sock_connect(m, 999, loopbackBE, int32(port)); rc != -_wasiENOTSOCK {
-		t.Fatalf("connect bad fd: want -ENOTSOCK, got %d", rc)
+	// Connect on an fd that is not open → EBADF.
+	if rc := w.Sock_connect(m, 999, loopbackBE, int32(port)); rc != -_wasiEBADF {
+		t.Fatalf("connect bad fd: want -EBADF, got %d", rc)
 	}
 
 	// Refused destination (closed listener) → ECONNREFUSED.
@@ -1446,6 +1446,22 @@ func TestWasip1EmitKeepsEndErrors(t *testing.T) {
 		if !types[name] || !errorMethods[name] {
 			t.Errorf("emitted runtime: type %s kept=%v, its Error method kept=%v", name, types[name], errorMethods[name])
 		}
+	}
+}
+
+func TestWasip1PlatformFilesRenamePackage(t *testing.T) {
+	for _, eol := range []string{"\n", "\r\n"} {
+		src := "//go:build linux" + eol + eol + "package codegen" + eol + eol + "var x = 1" + eol
+		got, err := renamePackage([]byte(src), "out")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := strings.Replace(src, "package codegen", "package out", 1); string(got) != want {
+			t.Errorf("renamePackage(%q) = %q, want %q", src, got, want)
+		}
+	}
+	if _, err := renamePackage([]byte("package other\n"), "out"); err == nil {
+		t.Error("a file of another package: no error")
 	}
 }
 

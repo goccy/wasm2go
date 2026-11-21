@@ -1,10 +1,12 @@
 package codegen
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net"
+	"os"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -29,6 +31,8 @@ func TestMapOSError(t *testing.T) {
 		{syscall.EAGAIN, _wasiEAGAIN},
 		{syscall.EPIPE, _wasiEPIPE},
 		{io.ErrClosedPipe, _wasiEPIPE},
+		{syscall.ENOSYS, _wasiENOSYS},
+		{&os.PathError{Op: "op", Path: "x", Err: unnumberedENOSYS{}}, _wasiENOSYS},
 		{fmt.Errorf("anything else"), _wasiEIO},
 		// Wrapped errors must still map.
 		{fmt.Errorf("open: %w", fs.ErrNotExist), _wasiENOENT},
@@ -38,6 +42,15 @@ func TestMapOSError(t *testing.T) {
 			t.Errorf("mapOSError(%v) = %d, want %d", c.err, got, c.want)
 		}
 	}
+}
+
+// unnumberedENOSYS is an error that is ENOSYS, and so errors.ErrUnsupported
+// as well, without being a syscall.Errno.
+type unnumberedENOSYS struct{}
+
+func (unnumberedENOSYS) Error() string { return "not implemented" }
+func (unnumberedENOSYS) Is(target error) bool {
+	return target == syscall.ENOSYS || target == errors.ErrUnsupported
 }
 
 func TestMapExecError(t *testing.T) {
