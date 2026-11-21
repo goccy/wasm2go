@@ -49,6 +49,65 @@ func hostRename(from, to string) error {
 	}
 }
 
+// hostSignals maps the guest's signal numbers to the host's signals; see
+// hostSignalOf.
+var hostSignals = map[int32]syscall.Signal{
+	wasiSIGHUP:    syscall.SIGHUP,
+	wasiSIGINT:    syscall.SIGINT,
+	wasiSIGQUIT:   syscall.SIGQUIT,
+	wasiSIGILL:    syscall.SIGILL,
+	wasiSIGTRAP:   syscall.SIGTRAP,
+	wasiSIGABRT:   syscall.SIGABRT,
+	wasiSIGBUS:    syscall.SIGBUS,
+	wasiSIGFPE:    syscall.SIGFPE,
+	wasiSIGKILL:   syscall.SIGKILL,
+	wasiSIGUSR1:   syscall.SIGUSR1,
+	wasiSIGSEGV:   syscall.SIGSEGV,
+	wasiSIGUSR2:   syscall.SIGUSR2,
+	wasiSIGPIPE:   syscall.SIGPIPE,
+	wasiSIGALRM:   syscall.SIGALRM,
+	wasiSIGTERM:   syscall.SIGTERM,
+	wasiSIGCHLD:   syscall.SIGCHLD,
+	wasiSIGCONT:   syscall.SIGCONT,
+	wasiSIGSTOP:   syscall.SIGSTOP,
+	wasiSIGTSTP:   syscall.SIGTSTP,
+	wasiSIGTTIN:   syscall.SIGTTIN,
+	wasiSIGTTOU:   syscall.SIGTTOU,
+	wasiSIGURG:    syscall.SIGURG,
+	wasiSIGXCPU:   syscall.SIGXCPU,
+	wasiSIGXFSZ:   syscall.SIGXFSZ,
+	wasiSIGVTALRM: syscall.SIGVTALRM,
+	wasiSIGPROF:   syscall.SIGPROF,
+	wasiSIGWINCH:  syscall.SIGWINCH,
+	wasiSIGIO:     syscall.SIGIO,
+	wasiSIGSYS:    syscall.SIGSYS,
+}
+
+// hostSignalOf returns the host's signal for a guest signal number. Number
+// 0, the existence probe of kill, is the same everywhere. known is false for
+// a signal this host does not have. A number the table does not name may still
+// be a signal of the host (hostSignalByNumber).
+func hostSignalOf(sig int32) (hostSig syscall.Signal, known bool) {
+	if sig == 0 {
+		return 0, true
+	}
+	if hostSig, known = hostSignals[sig]; known {
+		return hostSig, true
+	}
+	return hostSignalByNumber(sig)
+}
+
+// guestSignalOf returns the guest's number for a host signal, or 0 when the
+// guest has none for it.
+func guestSignalOf(hostSig syscall.Signal) int32 {
+	for sig, candidate := range hostSignals {
+		if candidate == hostSig {
+			return sig
+		}
+	}
+	return 0
+}
+
 // hostProcessTimes returns the CPU time of the host process — user, then
 // system — and of the children it has waited for.
 func hostProcessTimes() (ProcessTimes, error) {
