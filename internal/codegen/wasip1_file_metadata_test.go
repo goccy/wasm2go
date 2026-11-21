@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -1213,5 +1215,199 @@ func TestWasi_RootDescriptorIsTheRootDirectory(t *testing.T) {
 	w.cfg.FS = NewMemFS()
 	if got := fdFilestat(t, w, m, wasiPreopenFD).filetype; got != 3 {
 		t.Errorf("the root in memory has type %d, want a directory's", got)
+	}
+}
+
+// createWithMode creates name through Path_open_mode and returns its mode.
+func createWithMode(t *testing.T, w *WasiStubs, m *Module, name string, mode int32) uint32 {
+	t.Helper()
+	off, n := putPath(m, metaPathOff, name)
+	if rc := w.Path_open_mode(m, 0x1, off, n, 0x1 /* O_CREAT */, 1<<6 /* FD_WRITE */, 0, mode, metaOutOff); rc != 0 {
+		t.Fatalf("Path_open_mode(%s, %o) rc=%d", name, mode, rc)
+	}
+	closeTestFd(t, w, m, int32(readU32(m.memory, int(metaOutOff))))
+	return pathFilestatExt(t, w, m, name).mode
+}
+
+// mkdirWithMode creates name through Path_create_directory_mode and returns
+// its mode.
+func mkdirWithMode(t *testing.T, w *WasiStubs, m *Module, name string, mode int32) uint32 {
+	t.Helper()
+	off, n := putPath(m, metaPathOff, name)
+	if rc := w.Path_create_directory_mode(m, off, n, mode); rc != 0 {
+		t.Fatalf("Path_create_directory_mode(%s, %o) rc=%d", name, mode, rc)
+	}
+	return pathFilestatExt(t, w, m, name).mode
+}
+
+// exerciseCreationModes creates files and directories under several umasks
+// and requires every one to end up with its requested mode less the umask,
+// and less host: the mask the filesystem itself takes out of a mode (the
+// host process's umask for the host's files, none for files in memory).
+func exerciseCreationModes(t *testing.T, w *WasiStubs, m *Module, host os.FileMode) {
+	t.Helper()
+	less := func(mode uint32) uint32 { return mode &^ uint32(host) }
+	// Until the guest sets a umask, the default Process's 022 applies.
+	if got, want := createWithMode(t, w, m, "inherited", 0o666), less(0o644); got != want {
+		t.Errorf("file under the starting umask: %o, want %o", got, want)
+	}
+	if prev := w.Proc_umask(m, 0o027); prev != 0o022 {
+		t.Errorf("first umask returned %o, want the starting umask 022", prev)
+	}
+	if prev := w.Proc_umask(m, 0o027); prev != 0o027 {
+		t.Errorf("second umask returned %o, want 027", prev)
+	}
+	if got, want := createWithMode(t, w, m, "f640", 0o666), less(0o640); got != want {
+		t.Errorf("file 0666 under umask 027: %o, want %o", got, want)
+	}
+	if got, want := createWithMode(t, w, m, "f600", 0o600), less(0o600); got != want {
+		t.Errorf("file 0600 under umask 027: %o, want %o", got, want)
+	}
+	if got, want := mkdirWithMode(t, w, m, "d750", 0o777), less(0o750); got != want {
+		t.Errorf("directory 0777 under umask 027: %o, want %o", got, want)
+	}
+	if got, want := mkdirWithMode(t, w, m, "d700", 0o700), less(0o700); got != want {
+		t.Errorf("directory 0700 under umask 027: %o, want %o", got, want)
+	}
+
+	// path_open and path_create_directory carry no mode: they create with
+	// the conventional 0666 and 0777, less the umask.
+	closeTestFd(t, w, m, createTestFile(t, w, "plain"))
+	if got, want := pathFilestatExt(t, w, m, "plain").mode, less(0o640); got != want {
+		t.Errorf("path_open under umask 027: %o, want %o", got, want)
+	}
+	off, n := putPath(m, metaPathOff, "plaindir")
+	if rc := w.Path_create_directory(m, 3, off, n); rc != _wasiESUCCESS {
+		t.Fatalf("Path_create_directory rc=%d", rc)
+	}
+	if got, want := pathFilestatExt(t, w, m, "plaindir").mode, less(0o750); got != want {
+		t.Errorf("path_create_directory under umask 027: %o, want %o", got, want)
+	}
+
+	// A guest umask looser than the mask of the filesystem does not loosen
+	// a mode.
+	w.Proc_umask(m, 0)
+	if got, want := createWithMode(t, w, m, "f666", 0o666), less(0o666); got != want {
+		t.Errorf("file 0666 under umask 0: %o, want %o", got, want)
+	}
+	if got, want := mkdirWithMode(t, w, m, "d777", 0o777), less(0o777); got != want {
+		t.Errorf("directory 0777 under umask 0: %o, want %o", got, want)
+	}
+	// Opening an existing file with O_CREAT leaves its mode alone.
+	if got, want := createWithMode(t, w, m, "f600", 0o666), less(0o600); got != want {
+		t.Errorf("existing file reopened with O_CREAT: %o, want it kept at %o", got, want)
+	}
+
+	// A forked instance starts with its parent's umask and then has its own.
+	w.Proc_umask(m, 0o077)
+	child := w.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	cm := newForkTestModule()
+	if prev := child.Proc_umask(cm, 0o022); prev != 0o077 {
+		t.Errorf("child's inherited umask = %o, want 077", prev)
+	}
+	if prev := w.Proc_umask(m, 0o077); prev != 0o077 {
+		t.Errorf("parent's umask after the child changed its own = %o, want 077", prev)
+	}
+}
+
+func TestWasi_CreationModeAppliesUmask(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	w, m := newProcTestStubs(t)
+	exerciseCreationModes(t, w, m, hostUmask(t))
+}
+
+func TestWasi_CreationModeAppliesUmaskOnMemFS(t *testing.T) {
+	w, m, _ := memTestStubs(t)
+	exerciseCreationModes(t, w, m, 0)
+}
+
+// path_open_mode and path_create_directory_mode keep the setuid, setgid and
+// sticky bits of the mode; the umask takes only permission bits out. A file
+// that exists is opened as it is.
+func TestWasi_CreationModeKeepsSpecialBits(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	less := uint32(hostUmask(t) | 0o022)
+	w.Proc_umask(m, 0o022)
+	if got, want := mkdirWithMode(t, w, m, "sticky", 0o1777), 0o1777&^less; got != want {
+		t.Errorf("directory 01777 = %o, want %o", got, want)
+	}
+	// The sticky bit is set on a directory its owner may not read, too.
+	if got, want := mkdirWithMode(t, w, m, "unreadable", 0o1333), 0o1333&^less; got != want {
+		t.Errorf("directory 01333 = %o, want %o", got, want)
+	}
+	if got, want := createWithMode(t, w, m, "setgid", 0o2775), 0o2775&^less; got != want {
+		t.Errorf("file 02775 = %o, want %o", got, want)
+	}
+	if got, want := createWithMode(t, w, m, "setgid", 0o4777), 0o2775&^less; got != want {
+		t.Errorf("existing file opened with 04777 = %o, want it kept at %o", got, want)
+	}
+	// O_CREAT of a directory that is there is EISDIR, as open(2) has it.
+	off, n := putPath(m, metaPathOff, "sticky")
+	if rc := w.Path_open_mode(m, 0x1, off, n, 0x1 /* O_CREAT */, 1<<1, 0, 0o2775, metaOutOff); rc != -_wasiEISDIR {
+		t.Errorf("O_CREAT of a directory with 02775 rc=%d, want -EISDIR", rc)
+	}
+	// A refusal of a bit to this user is told from any other failure.
+	if !chmodRefused(&fs.PathError{Op: "chmod", Path: "f", Err: syscall.EPERM}) || chmodRefused(fs.ErrNotExist) {
+		t.Error("chmodRefused does not tell EPERM from another error")
+	}
+	// A symbolic link to no file: the file it leads to is created, with the
+	// bits.
+	if err := os.Symlink("target", filepath.Join(dir, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := createWithMode(t, w, m, "dangling", 0o2775), 0o2775&^less; got != want {
+		t.Errorf("file 02775 through a dangling link = %o, want %o", got, want)
+	}
+	if got, want := pathFilestatExt(t, w, m, "target").mode, 0o2775&^less; got != want {
+		t.Errorf("the file the link leads to = %o, want %o", got, want)
+	}
+}
+
+// hostUmask returns the file mode creation mask of the host process: from
+// /proc/self/status where it has it, otherwise from the mode of a file the
+// host creates with 0777.
+func hostUmask(t *testing.T) os.FileMode {
+	t.Helper()
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if _, rest, found := strings.Cut("\n"+string(status), "\nUmask:"); found {
+		value, _, _ := strings.Cut(rest, "\n")
+		mask, err := strconv.ParseUint(strings.TrimSpace(value), 8, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return os.FileMode(mask)
+	}
+	path := filepath.Join(t.TempDir(), "host")
+	if err := os.WriteFile(path, nil, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return 0o777 &^ fi.Mode().Perm()
+}
+
+// The file mode creation mask a guest sets is its instance's: the mask of
+// the host process stays as it was.
+func TestWasi_UmaskIsTheInstancesOwn(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	host := hostUmask(t)
+	w, m := newTestStubs(t, t.TempDir())
+	if prev := w.Proc_umask(m, 0o077); prev != 0o022 {
+		t.Fatalf("first umask returned %o, want the starting umask 022", prev)
+	}
+	if got := hostUmask(t); got != host {
+		t.Fatalf("host umask = %o after the guest set its own, want %o", got, host)
 	}
 }

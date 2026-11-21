@@ -3,10 +3,33 @@
 package codegen
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"syscall"
 )
+
+// hostProcessTimes returns the CPU time of the host process and of its
+// children, which the runtime cannot read on this platform.
+func hostProcessTimes() (ProcessTimes, error) {
+	return ProcessTimes{}, errors.ErrUnsupported
+}
+
+// chmodRefused reports whether err is the system's refusal of a mode bit
+// to this user, EPERM.
+func chmodRefused(err error) bool { return errors.Is(err, syscall.EPERM) }
+
+// hostFDLink reports that the host has no link for descriptor fd of the
+// host process: this platform names none.
+func hostFDLink(fd uintptr) (string, bool, error) { return "", false, nil }
+
+// readHostUmask returns the file mode creation mask of the host process,
+// which this platform has no way to read without changing it:
+// errors.ErrUnsupported.
+func readHostUmask() (os.FileMode, error) {
+	return 0, fmt.Errorf("the umask of the host process cannot be read without changing it: %w", errors.ErrUnsupported)
+}
 
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
 // os package returned. This platform's carries none the runtime knows how to

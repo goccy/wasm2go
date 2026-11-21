@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
@@ -46,6 +47,24 @@ func hostRename(from, to string) error {
 		}
 		return nil
 	}
+}
+
+// hostProcessTimes returns the CPU time of the host process — user, then
+// system — and of the children it has waited for.
+func hostProcessTimes() (ProcessTimes, error) {
+	var self, children syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &self); err != nil {
+		return ProcessTimes{}, err
+	}
+	if err := syscall.Getrusage(syscall.RUSAGE_CHILDREN, &children); err != nil {
+		return ProcessTimes{}, err
+	}
+	return ProcessTimes{
+		User:           time.Duration(self.Utime.Nano()),
+		System:         time.Duration(self.Stime.Nano()),
+		ChildrenUser:   time.Duration(children.Utime.Nano()),
+		ChildrenSystem: time.Duration(children.Stime.Nano()),
+	}, nil
 }
 
 // ---- the numbers of the operating system ---------------------------------

@@ -36,6 +36,7 @@ package codegen
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	_ "embed"
@@ -48,12 +49,14 @@ import (
 	"go/token"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -371,15 +374,106 @@ func (r rootFS) refused(err error) error {
 	return err
 }
 
+// specialModeBits are the setuid, setgid and sticky bits, which os.Root
+// creates no file with: rootFS creates the file with its permission bits
+// and then sets them with chmod, as package os does for the sticky bit of a
+// directory where mkdir(2) does not set it.
+const specialModeBits = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+
 func (r rootFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
-	f, err := r.root.OpenFile(r.name(name), flag, perm)
+	special := perm & specialModeBits
+	if special == 0 || flag&os.O_CREATE == 0 {
+		f, err := r.root.OpenFile(r.name(name), flag, perm.Perm())
+		if err != nil {
+			return nil, r.refused(err)
+		}
+		return f, nil
+	}
+	// Only a file the call creates gets the bits: it is created
+	// exclusively, and a file that exists is opened as it is. A name that
+	// is there but leads to no file, a symbolic link to none, is opened
+	// once more as open(2) opens it, which creates the file it leads to.
+	f, err := r.root.OpenFile(r.name(name), flag|os.O_EXCL, perm.Perm())
+	created, viaLink := err == nil, false
+	if errors.Is(err, fs.ErrExist) && flag&os.O_EXCL == 0 {
+		f, err = r.root.OpenFile(r.name(name), flag&^os.O_CREATE, perm.Perm())
+		if err == nil {
+			err = refuseDirectory(f, name)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			fi, lerr := r.root.Lstat(r.name(name))
+			switch {
+			case lerr == nil:
+				viaLink = fi.Mode()&os.ModeSymlink != 0
+			case !errors.Is(lerr, fs.ErrNotExist):
+				return nil, r.refused(lerr)
+			}
+			f, err = r.root.OpenFile(r.name(name), flag, perm.Perm())
+			created = err == nil
+		}
+	}
 	if err != nil {
 		return nil, r.refused(err)
+	}
+	if !created {
+		return f, nil
+	}
+	// A bit the system refuses this user or this file is left out, as
+	// open(2) leaves it out. A file the bits cannot be set on otherwise is
+	// removed again, as the call fails; one created through a symbolic
+	// link has no name the call knows, and stays.
+	if err := setSpecialBits(f, special); err != nil && !chmodRefused(err) {
+		err = errors.Join(err, f.Close())
+		if !viaLink {
+			err = errors.Join(err, r.root.Remove(r.name(name)))
+		}
+		return nil, err
 	}
 	return f, nil
 }
 func (r rootFS) Mkdir(name string, perm os.FileMode) error {
-	return r.refused(r.root.Mkdir(r.name(name), perm))
+	if err := r.root.Mkdir(r.name(name), perm.Perm()); err != nil {
+		return r.refused(err)
+	}
+	// mkdir(2) sets no setuid or setgid bit; the sticky bit is set
+	// afterwards, keeping the bits the system gave the directory (a setgid
+	// bit inherited from its parent).
+	if perm&os.ModeSticky == 0 {
+		return nil
+	}
+	fi, err := r.root.Stat(r.name(name))
+	if err == nil {
+		err = r.root.Chmod(r.name(name), fi.Mode()&(os.ModePerm|specialModeBits)|os.ModeSticky)
+	}
+	if err != nil && !chmodRefused(err) {
+		// The directory is removed again, as the call fails; a sticky
+		// bit the system refuses is left out.
+		return errors.Join(r.refused(err), r.root.Remove(r.name(name)))
+	}
+	return nil
+}
+
+// refuseDirectory closes f and returns EISDIR when f is a directory, which
+// open(2) with O_CREAT refuses; nil otherwise.
+func refuseDirectory(f *os.File, name string) error {
+	fi, err := f.Stat()
+	if err == nil && !fi.IsDir() {
+		return nil
+	}
+	if err == nil {
+		err = &fs.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
+	}
+	return errors.Join(err, f.Close())
+}
+
+// setSpecialBits adds special, setuid, setgid and sticky bits, to the mode
+// of the file open as f.
+func setSpecialBits(f *os.File, special os.FileMode) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return f.Chmod(fi.Mode().Perm() | special)
 }
 func (r rootFS) Chmod(name string, mode os.FileMode) error {
 	return r.refused(r.root.Chmod(r.name(name), mode))
@@ -1110,8 +1204,9 @@ func (op *wasiOpen) addRef() {
 // WASIConfig is the configuration a WasiStubs is built from (NewWASI). The
 // guest has what it names and nothing else: the zero WASIConfig gives it no
 // arguments, no environment, an empty stdin, a stdout and a stderr that
-// discard what is written, no filesystem, and no socket operation, outbound
-// connection, name lookup or process spawn. HostWASIConfig is the
+// discard what is written, no filesystem, no socket operation, outbound
+// connection, name lookup or process spawn, and the identity of an isolated
+// process. HostWASIConfig is the
 // configuration of a guest that has what the host process has.
 //
 // Only the hooks below gate the network: Sock_socket, Sock_shutdown and
@@ -1138,15 +1233,22 @@ type WASIConfig struct {
 	// them, path calls included, fails with EBADF, and fd 3 is handed out
 	// like any free number; the guest's C library, finding no preopen,
 	// fails every path with ENOENT; the path operations that take no
-	// directory descriptor (path_chmod, path_chown, path_filestat_ext,
-	// path_filestat_mode) fail with ENOENT.
+	// directory descriptor (path_open_mode, path_create_directory_mode,
+	// path_chmod, path_chown, path_filestat_ext, path_filestat_mode) fail
+	// with ENOENT. The names of the guest's own descriptors (/dev/stdin,
+	// /dev/stdout, /dev/stderr, /dev/fd/N, /proc/self/fd/N, /proc/PID/fd/N,
+	// and /dev/fd, /proc/self/fd and /proc/PID/fd, which list them) are not
+	// the FS's: path_open, path_filestat_get and path_readlink resolve them
+	// without it, and path_open_mode, path_filestat_ext and
+	// path_filestat_mode even when FS is nil.
 	FS FS
 	// FSAccess is a policy on path names. It is consulted before every
 	// path operation, with each guest path it names cleaned as chroot(2)
 	// sees it — path.Clean relative to the preopen, where ".." of the root
 	// is the root (e.g. "a.txt", "sub/a.txt", "." for the root) — and
-	// whether the operation writes: path_open (a write when it creates,
-	// truncates or opens for writing), path_create_directory, path_unlink_file,
+	// whether the operation writes: path_open and path_open_mode (a write
+	// when it creates, truncates or opens for writing),
+	// path_create_directory, path_create_directory_mode, path_unlink_file,
 	// path_remove_directory, path_rename and path_link (both paths),
 	// path_filestat_set_times, path_chmod and path_chown are writes;
 	// path_filestat_get, path_filestat_ext, path_filestat_mode and
@@ -1158,8 +1260,9 @@ type WASIConfig struct {
 	// taken lexically, before any symbolic link; a symbolic link inside
 	// the FS still leads where it points, and keeping the guest inside a
 	// directory against symbolic links is HostFS(dir)'s (os.Root's) job.
-	// Other operations on an open descriptor (fd_*) are not checked. nil allows every access to FS. It is called without the
-	// WasiStubs lock held.
+	// Other operations on an open descriptor (fd_*) and the names of the
+	// guest's own descriptors (see FS) are not checked. nil allows every
+	// access to FS. It is called without the WasiStubs lock held.
 	FSAccess func(path string, write bool) bool
 	// NetAccess is consulted before Sock_accept, Sock_recv and Sock_send
 	// with "accept", "recv" or "send". Returning false denies the operation
@@ -1180,6 +1283,13 @@ type WASIConfig struct {
 	// with the executable path and argv. Returning false denies the spawn
 	// (EACCES). nil denies every one.
 	Exec func(path string, argv []string) bool
+	// Process supplies the guest's identity and accounting: what getpid,
+	// getppid, the getuid family and times report, the pid whose
+	// /proc/PID/fd lists the guest's descriptors, and the umask the guest
+	// starts with. nil is an isolated process: pid 42, ppid 1, every user
+	// and group id 0, no CPU time and umask 022, none of them read from the
+	// host. HostProcess and HostProcessUmask give the host process's.
+	Process Process
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -1198,7 +1308,9 @@ func AllowAllExec(path string, argv []string) bool { return true }
 // HostWASIConfig returns the configuration of a guest that has what the host
 // process has: os.Args, os.Environ(), os.Stdin/Stdout/Stderr, the whole host
 // filesystem (what HostFS("/") returns), and every socket operation, outbound connection,
-// name lookup and process spawn allowed.
+// name lookup and process spawn allowed. Its Process is nil, the isolated
+// one: HostProcess may fail, so a guest has the host process's identity
+// only when the embedder sets it.
 func HostWASIConfig() WASIConfig {
 	return WASIConfig{
 		Args:      os.Args,
@@ -1233,11 +1345,24 @@ type WasiStubs struct {
 	// guest looked it up under (populated by Sock_getaddrinfo, read by
 	// Sock_connect), so the dial hook can be given the host. Guarded by mu.
 	resolvedHosts map[string]string
-	// procs tracks host processes spawned via Proc_spawn, keyed by the pid
-	// handed back to the guest. nextPID is the handle counter (kept distinct
-	// from real OS pids — the guest only ever sees these tokens).
-	procs   map[int32]*wasiProc
-	nextPID int32
+	// procs tracks the processes this instance may wait for — host
+	// processes spawned via Proc_spawn and embedder-run processes
+	// registered via NewProc — keyed by the pid handed back to the guest.
+	procs map[int32]*wasiProc
+	// pids allocates the pid tokens (kept distinct from real OS pids — the
+	// guest only ever sees these tokens). It is created on first use and
+	// shared with every instance derived through Fork, so a token is unique
+	// across a whole fork family.
+	pids *wasiPIDs
+	// procFinished is closed, and dropped so the next waiter makes a fresh
+	// one, whenever a process in procs finishes. Proc_wait_any blocks on it
+	// instead of polling. Guarded by mu.
+	procFinished chan struct{}
+	// umask is the guest's file mode creation mask once it has set one
+	// (Proc_umask); nil means the Umask of the Process applies. It is
+	// per instance because every instance is a process of its own to the
+	// guest. Use it through createMode. Guarded by mu.
+	umask *os.FileMode
 	// cloexec holds the descriptor numbers the guest has marked
 	// close-on-exec (Fd_cloexec). A number that is given to a new
 	// descriptor starts unmarked. Guarded by mu.
@@ -1247,15 +1372,43 @@ type WasiStubs struct {
 	preopenReplaced atomic.Bool
 }
 
-// wasiProc is a host process spawned by Proc_spawn. A background goroutine
-// Waits on the command and publishes the encoded POSIX status, so Proc_wait
-// can support both the blocking (options 0) and non-blocking (WNOHANG) forms
-// without holding the WasiStubs lock across the child's lifetime.
+// wasiProc is a process the guest can wait for: a host process spawned by
+// Proc_spawn (cmd != nil), or a process the embedder runs itself (NewProc)
+// (cmd == nil). Whoever runs the process publishes the encoded POSIX status
+// and closes done, so Proc_wait can support both the blocking (options 0)
+// and non-blocking (WNOHANG) forms without holding the WasiStubs lock across
+// the child's lifetime.
 type wasiProc struct {
 	cmd    *exec.Cmd
 	done   chan struct{}
 	status int32 // POSIX wait status, valid once done is closed
+	// kill delivers a signal to an embedder-run process. nil when the
+	// embedder gave none. It is not changed after NewProc.
+	kill func(sig int32) error
 }
+
+// wasiPIDs hands out pid tokens. One is shared by every WasiStubs of a fork
+// family, each of which has its own lock, hence the separate mutex.
+type wasiPIDs struct {
+	mu sync.Mutex
+	// next is the token handed out next.
+	next int32
+}
+
+// alloc returns the next unused pid token that is none of reserved.
+func (p *wasiPIDs) alloc(reserved ...int32) int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for slices.Contains(reserved, p.next) {
+		p.next++
+	}
+	pid := p.next
+	p.next++
+	return pid
+}
+
+// wasiFirstPID is the first pid token a fresh instance hands out.
+const wasiFirstPID int32 = 1000
 
 // NewWASI returns a WasiStubs whose guest has what cfg gives it (see
 // WASIConfig).
@@ -1301,11 +1454,23 @@ func (w *WasiStubs) stderr() io.Writer {
 	return w.cfg.Stderr
 }
 
+// guestProcess returns the Process of the instance: the isolated one when
+// the configuration names none. Its methods are called without w.mu held.
+func (w *WasiStubs) guestProcess() Process {
+	if w.cfg.Process == nil {
+		return isolatedProcess{}
+	}
+	return w.cfg.Process
+}
+
+// guestPID returns the pid of the Process of the instance.
+func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
+
 // Fork returns the host state for a forked copy of the guest, with fork(2)
 // semantics:
 //
-//   - the configuration is the same WASIConfig, and the clock origin is the
-//     same;
+//   - the configuration is the same WASIConfig, its Process included, and
+//     the clock origin and the file mode creation mask are the same;
 //   - the fd table has the same fd numbers — an fd closed in w, fd 0, 1 or
 //     2 included, is closed in the result — and each slot refers to the SAME
 //     open descriptor as the corresponding slot of w, so the two instances
@@ -1313,7 +1478,8 @@ func (w *WasiStubs) stderr() io.Writer {
 //     is closed only when the last slot referring to it, in any instance, is
 //     closed;
 //   - the process table is empty: a child does not inherit its parent's
-//     children.
+//     children. Pid tokens stay unique across w, the result and everything
+//     later forked from either.
 //
 // The result is independent of w from then on (its own lock, its own fd
 // numbering) and is meant to back a second module instance running on
@@ -1327,6 +1493,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		fdTable:   make(map[int32]*wasiOpen, len(w.fdsLocked())),
 		monoStart: w.monoStart,
 		procs:     map[int32]*wasiProc{},
+		pids:      w.pidsLocked(),
 	}
 	child.preopenReplaced.Store(w.preopenReplaced.Load())
 	if len(w.cloexec) > 0 {
@@ -1334,6 +1501,10 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		for fd := range w.cloexec {
 			child.cloexec[fd] = true
 		}
+	}
+	if w.umask != nil {
+		mask := *w.umask
+		child.umask = &mask
 	}
 	if w.resolvedHosts != nil {
 		child.resolvedHosts = make(map[string]string, len(w.resolvedHosts))
@@ -1457,6 +1628,77 @@ func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) (int32, bool) {
 	return -1, false
 }
 
+// pidsLocked returns the pid allocator, creating it on first use. Caller
+// holds w.mu.
+func (w *WasiStubs) pidsLocked() *wasiPIDs {
+	if w.pids == nil {
+		w.pids = &wasiPIDs{next: wasiFirstPID}
+	}
+	return w.pids
+}
+
+// addProcLocked registers proc under a fresh pid token, as a process this
+// instance waits for. The token is neither the pid nor the ppid of ids, the
+// ids of the Process. Caller holds w.mu.
+func (w *WasiStubs) addProcLocked(proc *wasiProc, ids ProcessIDs) int32 {
+	if w.procs == nil {
+		w.procs = map[int32]*wasiProc{}
+	}
+	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
+	w.procs[pid] = proc
+	return pid
+}
+
+// dropProcLocked removes a process from this instance's table: it has been
+// waited for. Caller holds w.mu.
+func (w *WasiStubs) dropProcLocked(pid int32) {
+	delete(w.procs, pid)
+}
+
+// finishProc publishes the wait status of proc and wakes every waiter.
+// It must be called exactly once per process.
+func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
+	proc.status = status
+	close(proc.done)
+	// Proc_wait_any scans the table and picks up procFinished under one hold
+	// of w.mu, so a finish is either seen by its scan or closes the channel
+	// it then blocks on.
+	w.mu.Lock()
+	if w.procFinished != nil {
+		close(w.procFinished)
+		w.procFinished = nil
+	}
+	w.mu.Unlock()
+}
+
+// NewProc registers a process that the embedder runs itself (not a host
+// process started by Proc_spawn) so the guest can wait for it like any other
+// child. It returns the pid token to hand to the guest, and exited, which
+// the embedder calls with the POSIX wait status when the process ends:
+// (code&0xff)<<8 for a normal exit, the signal number in the low 7 bits for
+// a death by signal. exited may be called from any goroutine; only its first
+// call has an effect.
+//
+// kill, when non-nil, delivers a signal to the process. It is kept with the
+// process; the runtime sends it none.
+func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(status int32)) {
+	proc := &wasiProc{done: make(chan struct{}), kill: kill}
+	ids := w.guestProcess().IDs()
+	w.mu.Lock()
+	pid = w.addProcLocked(proc, ids)
+	w.mu.Unlock()
+	return pid, w.procExitFunc(proc)
+}
+
+// procExitFunc returns the function that reports the end of an embedder-run
+// process.
+func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
+	var once sync.Once
+	return func(status int32) {
+		once.Do(func() { w.finishProc(proc, status) })
+	}
+}
+
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
 // ptr (0) yields "". ok is false on an out-of-bounds or unterminated read:
 // a string whose NUL is not within the guest's memory (guestMemory).
@@ -1513,26 +1755,36 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // covers subprocess.run/call with default streams; capture_output via host
 // pipes is a follow-up.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
-	path, ok := w.readCStr(m, zext(pathPtr))
+	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
+}
+
+// Proc_spawn64 is Proc_spawn for a memory64 guest.
+func (w *WasiStubs) Proc_spawn64(m *Module, pathPtr, argvPtr, envpPtr int64, stdinFd, stdoutFd, stderrFd int32, cwdPtr, pidOutPtr int64) int32 {
+	return w.procSpawn(m, wasiABI64, uint64(pathPtr), uint64(argvPtr), uint64(envpPtr), stdinFd, stdoutFd, stderrFd, uint64(cwdPtr), uint64(pidOutPtr))
+}
+
+// procSpawn is the body of Proc_spawn and Proc_spawn64.
+func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr uint64, stdinFd, stdoutFd, stderrFd int32, cwdPtr, pidOutPtr uint64) int32 {
+	path, ok := w.readCStr(m, pathPtr)
 	if !ok || path == "" {
 		return -_wasiEINVAL
 	}
-	argv, ok := w.readCStrArray(m, wasiABI32, zext(argvPtr))
+	argv, ok := w.readCStrArray(m, abi, argvPtr)
 	if !ok {
 		return -_wasiEFAULT
 	}
-	env, ok := w.readCStrArray(m, wasiABI32, zext(envpPtr))
+	env, ok := w.readCStrArray(m, abi, envpPtr)
 	if !ok {
 		return -_wasiEFAULT
 	}
 	// The guest's working directory lives in its libc (WASI has no chdir
 	// syscall), so the guest passes it explicitly; the child must start
 	// there, not in the host process's cwd.
-	cwd, ok := w.readCStr(m, zext(cwdPtr))
+	cwd, ok := w.readCStr(m, cwdPtr)
 	if !ok {
 		return -_wasiEFAULT
 	}
-	out := w.memSlice(m, pidOutPtr, 4)
+	out := w.memBytes(m, pidOutPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -1572,30 +1824,22 @@ func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, st
 	}
 
 	proc := &wasiProc{cmd: cmd, done: make(chan struct{})}
+	ids := w.guestProcess().IDs()
+	w.mu.Lock()
+	pid := w.addProcLocked(proc, ids)
+	w.mu.Unlock()
 	go func() {
 		werr := cmd.Wait()
-		proc.status = encodeWaitStatus(cmd.ProcessState)
+		status := encodeWaitStatus(cmd.ProcessState)
 		// A non-zero exit or signal surfaces as *exec.ExitError and is the
 		// normal path (status already encoded from ProcessState above). Any
 		// OTHER error means the wait itself failed; report a 127 exit.
 		var exitErr *exec.ExitError
 		if werr != nil && !errors.As(werr, &exitErr) {
-			proc.status = int32(127) << 8
+			status = int32(127) << 8
 		}
-		close(proc.done)
+		w.finishProc(proc, status)
 	}()
-
-	w.mu.Lock()
-	if w.procs == nil {
-		w.procs = map[int32]*wasiProc{}
-	}
-	if w.nextPID == 0 {
-		w.nextPID = 1000
-	}
-	pid := w.nextPID
-	w.nextPID++
-	w.procs[pid] = proc
-	w.mu.Unlock()
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
@@ -1718,7 +1962,17 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 // signalled by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a
 // negative errno (ECHILD for an unknown pid).
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
-	out := w.memSlice(m, statusOutPtr, 4)
+	return w.procWait(m, pid, options, zext(statusOutPtr))
+}
+
+// Proc_wait64 is Proc_wait for a memory64 guest.
+func (w *WasiStubs) Proc_wait64(m *Module, pid, options int32, statusOutPtr int64) int32 {
+	return w.procWait(m, pid, options, uint64(statusOutPtr))
+}
+
+// procWait is the body of Proc_wait and Proc_wait64.
+func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64) int32 {
+	out := w.memBytes(m, statusOutPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -1740,10 +1994,83 @@ func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32
 		<-proc.done
 	}
 	w.mu.Lock()
-	delete(w.procs, pid)
+	if w.procs[pid] != proc {
+		// Another waiter was given the process while this one waited.
+		w.mu.Unlock()
+		return -_wasiECHILD
+	}
+	w.dropProcLocked(pid)
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
+}
+
+// Proc_wait_any is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_wait_any") backing wait() and
+// waitpid(-1): it waits for ANY process of this instance — spawned by
+// Proc_spawn or run by the embedder (NewProc) — to finish, removes it from
+// the process table, and writes its pid token at pidOutPtr and its POSIX
+// wait status at statusOutPtr. When several have finished, the one with the
+// lowest pid is reported. options is the waitpid() options mask; with bit 0
+// (WNOHANG) the call does not block. Returns 0, or a negative errno: ECHILD
+// when the instance has no process at all, EAGAIN when WNOHANG is set and
+// none of them has finished yet.
+func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr int32) int32 {
+	return w.procWaitAny(m, options, zext(pidOutPtr), zext(statusOutPtr))
+}
+
+// Proc_wait_any64 is Proc_wait_any for a memory64 guest.
+func (w *WasiStubs) Proc_wait_any64(m *Module, options int32, pidOutPtr, statusOutPtr int64) int32 {
+	return w.procWaitAny(m, options, uint64(pidOutPtr), uint64(statusOutPtr))
+}
+
+// procWaitAny is the body of Proc_wait_any and Proc_wait_any64.
+func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPtr uint64) int32 {
+	pidOut := w.memBytes(m, pidOutPtr, 4)
+	statusOut := w.memBytes(m, statusOutPtr, 4)
+	if pidOut == nil || statusOut == nil {
+		return -_wasiEFAULT
+	}
+	const wnohang = 1
+	for {
+		w.mu.Lock()
+		if len(w.procs) == 0 {
+			w.mu.Unlock()
+			return -_wasiECHILD
+		}
+		var (
+			pid  int32
+			proc *wasiProc
+		)
+		for p, pr := range w.procs {
+			select {
+			case <-pr.done:
+				if proc == nil || p < pid {
+					pid, proc = p, pr
+				}
+			default:
+			}
+		}
+		if proc != nil {
+			w.dropProcLocked(pid)
+			w.mu.Unlock()
+			binary.LittleEndian.PutUint32(pidOut, uint32(pid))
+			binary.LittleEndian.PutUint32(statusOut, uint32(proc.status))
+			return _wasiESUCCESS
+		}
+		if options&wnohang != 0 {
+			w.mu.Unlock()
+			return -_wasiEAGAIN
+		}
+		// Taken under the same hold of w.mu as the scan above: a process
+		// that finishes from here on closes exactly this channel.
+		if w.procFinished == nil {
+			w.procFinished = make(chan struct{})
+		}
+		finished := w.procFinished
+		w.mu.Unlock()
+		<-finished
+	}
 }
 
 // encodeWaitStatus turns a Go ProcessState into a POSIX wait status int (the
@@ -1982,6 +2309,7 @@ const (
 	_wasiEINVAL       int32 = 28
 	_wasiEIO          int32 = 29
 	_wasiEISDIR       int32 = 31
+	_wasiELOOP        int32 = 32
 	_wasiEMFILE       int32 = 33
 	_wasiENOENT       int32 = 44
 	_wasiENOSPC       int32 = 51
@@ -2446,6 +2774,12 @@ func (w *WasiStubs) fdFilestatGet(m *Module, fd int32, ptr uint64) int32 {
 	if out == nil {
 		return _wasiEFAULT
 	}
+	return w.filestatOf(fd, out)
+}
+
+// filestatOf writes the filestat of Fd_filestat_get for fd to out and
+// returns a wasi errno.
+func (w *WasiStubs) filestatOf(fd int32, out []byte) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	root := op == nil && w.preopened(fd)
@@ -2463,7 +2797,11 @@ func (w *WasiStubs) fdFilestatGet(m *Module, fd int32, ptr uint64) int32 {
 		return _wasiESUCCESS
 	}
 	if op.f == nil {
-		if fi := w.streamFileInfo(op); fi != nil {
+		fi, err := w.streamFileInfo(op)
+		if err != nil {
+			return mapOSError(err)
+		}
+		if fi != nil {
 			// A standard stream that is a file of the host is that
 			// file: a terminal, a pipe, a regular file it was
 			// redirected to.
@@ -3185,6 +3523,123 @@ func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
 	return w.Fd_chmod(m, fd, mode)
 }
 
+// Proc_umask is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_umask") backing umask(): it sets the
+// instance's file mode creation mask and returns the previous one. The
+// mask is taken out of the mode of every file and directory the instance
+// creates from then on (createMode), and a forked instance starts with its
+// parent's (see Fork). Until the guest sets one, the mask is the Umask of
+// the Process (WASIConfig.Process).
+//
+// What a file then gets is its filesystem's to say. The host's filesystem
+// (the default) takes the host process's umask out of the mode as well, as
+// it does for every file the process creates: there the instance's mask
+// takes bits away and gives none back. MemFS creates with the mode it is
+// asked for.
+//
+// A command started by Proc_spawn does not get the instance's mask: it
+// starts with the host process's umask.
+func (w *WasiStubs) Proc_umask(m *Module, mask int32) int32 {
+	next := os.FileMode(uint32(mask) & 0o777)
+	prev := w.guestProcess().Umask().Perm()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.umask != nil {
+		prev = *w.umask
+	}
+	w.umask = &next
+	return int32(prev)
+}
+
+// Proc_umask64 is Proc_umask for a memory64 guest.
+func (w *WasiStubs) Proc_umask64(m *Module, mask int32) int32 {
+	return w.Proc_umask(m, mask)
+}
+
+// createMode returns the mode the instance's filesystem is asked for when
+// the guest creates a file or directory with the requested mode: the
+// instance's umask taken out of it.
+func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
+	w.mu.Lock()
+	umask := w.umask
+	w.mu.Unlock()
+	if umask != nil {
+		return requested &^ *umask
+	}
+	return requested &^ w.guestProcess().Umask().Perm()
+}
+
+// Path_open_mode is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "path_open_mode") backing open(): path_open
+// cannot carry the mode argument of open(2), so every file it creates gets
+// the default 0666. This one takes the same arguments
+// for a preopen-relative path, plus that mode, and writes the new fd at
+// openedFdPtr. Returns 0 or a negative errno.
+func (w *WasiStubs) Path_open_mode(m *Module, dirflags, pathPtr, pathLen, oflags int32, fsRightsBase int64, fdflags, mode, openedFdPtr int32) int32 {
+	return w.openGuestPathMode(m, dirflags, zext(pathPtr), pathLen, oflags, fsRightsBase, fdflags, mode, zext(openedFdPtr))
+}
+
+// Path_open_mode64 is Path_open_mode for a memory64 guest.
+func (w *WasiStubs) Path_open_mode64(m *Module, dirflags int32, pathPtr int64, pathLen, oflags int32, fsRightsBase int64, fdflags, mode int32, openedFdPtr int64) int32 {
+	return w.openGuestPathMode(m, dirflags, uint64(pathPtr), pathLen, oflags, fsRightsBase, fdflags, mode, uint64(openedFdPtr))
+}
+
+// openGuestPathMode is the body of Path_open_mode and Path_open_mode64.
+func (w *WasiStubs) openGuestPathMode(m *Module, dirflags int32, pathPtr uint64, pathLen, oflags int32, fsRightsBase int64, fdflags, mode int32, openedFdPtr uint64) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	outSlice := w.memBytes(m, openedFdPtr, 4)
+	if pathSlice == nil || outSlice == nil {
+		return -_wasiEFAULT
+	}
+	fd, errno := w.pathOpenMode(string(pathSlice), dirflags, oflags, fsRightsBase, fdflags, unixFileMode(uint32(mode)))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	binary.LittleEndian.PutUint32(outSlice, uint32(fd))
+	return _wasiESUCCESS
+}
+
+// Path_create_directory_mode is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "path_create_directory_mode") backing
+// mkdir(): path_create_directory cannot carry the mode argument of
+// mkdir(2). The path is preopen-relative. Returns 0 or a negative errno.
+func (w *WasiStubs) Path_create_directory_mode(m *Module, pathPtr, pathLen, mode int32) int32 {
+	return w.pathCreateDirectoryMode(m, zext(pathPtr), pathLen, mode)
+}
+
+// Path_create_directory_mode64 is Path_create_directory_mode for a memory64 guest.
+func (w *WasiStubs) Path_create_directory_mode64(m *Module, pathPtr int64, pathLen, mode int32) int32 {
+	return w.pathCreateDirectoryMode(m, uint64(pathPtr), pathLen, mode)
+}
+
+// pathCreateDirectoryMode is the body of Path_create_directory_mode and
+// Path_create_directory_mode64.
+func (w *WasiStubs) pathCreateDirectoryMode(m *Module, pathPtr uint64, pathLen, mode int32) int32 {
+	pathSlice := w.memBytes(m, pathPtr, zext(pathLen))
+	if pathSlice == nil {
+		return -_wasiEFAULT
+	}
+	return -w.pathCreateDirectory(string(pathSlice), unixFileMode(uint32(mode)))
+}
+
+// pathCreateDirectory creates the directory rel with the requested mode,
+// less the instance's umask, and returns a wasi errno.
+func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
+	name, ok := w.allowedPath(rel, true)
+	if !ok {
+		return _wasiEACCES
+	}
+	w.mu.Lock()
+	fsys := w.fs()
+	w.mu.Unlock()
+	// As for a file (pathOpenMode): the host's filesystem takes the host
+	// process's umask out of the mode as well, MemFS does not.
+	if err := fsys.Mkdir(name, w.createMode(mode)); err != nil {
+		return mapOSError(err)
+	}
+	return _wasiESUCCESS
+}
+
 // Path_filestat_ext is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "path_filestat_ext") that a guest's
 // stat/lstat can call: WASI's filestat carries neither permission bits nor
@@ -3208,6 +3663,16 @@ func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow i
 	out := w.memBytes(m, outPtr, wasiFilestatExtSize)
 	if pathSlice == nil || out == nil {
 		return -_wasiEFAULT
+	}
+	if fd, fi, _, own, errno := w.ownName(string(pathSlice), follow != 0); own {
+		switch {
+		case errno != _wasiESUCCESS:
+			return -errno
+		case fi == nil:
+			return w.filestatExtOf(fd, out)
+		}
+		writeFilestatExt(out, fi)
+		return _wasiESUCCESS
 	}
 	name, ok := w.allowedPath(string(pathSlice), false)
 	if !ok {
@@ -3252,6 +3717,12 @@ func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
 	if out == nil {
 		return -_wasiEFAULT
 	}
+	return w.filestatExtOf(fd, out)
+}
+
+// filestatExtOf writes the record of Fd_filestat_ext for fd to out and
+// returns 0 or a negative errno.
+func (w *WasiStubs) filestatExtOf(fd int32, out []byte) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
 	root := op == nil && w.preopened(fd)
@@ -3268,12 +3739,9 @@ func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
 		writeFilestatExt(out, fi)
 		return _wasiESUCCESS
 	}
-	fi := w.streamFileInfo(op)
-	if fi == nil && op.f != nil {
-		var err error
-		if fi, err = op.f.Stat(); err != nil {
-			return -mapOSError(err)
-		}
+	fi, err := w.opFileInfo(op)
+	if err != nil {
+		return -mapOSError(err)
 	}
 	if fi != nil {
 		writeFilestatExt(out, fi)
@@ -3296,7 +3764,41 @@ func (w *WasiStubs) fdFilestatExt(m *Module, fd int32, outPtr uint64) int32 {
 // standard stream of the instance, or returns nil when the entry is not a
 // standard stream or the stream is not a file of the host (an embedder's
 // reader or writer).
-func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
+func (w *WasiStubs) streamFileInfo(op *wasiOpen) (os.FileInfo, error) {
+	file := w.streamFile(op)
+	if file == nil {
+		return nil, nil
+	}
+	return file.Stat()
+}
+
+// hostStreamLink returns the target of the host's link for the descriptor
+// of file (hostFDLink), and whether the host has one.
+func hostStreamLink(file *os.File) (string, bool, error) {
+	rc, err := file.SyscallConn()
+	if err != nil {
+		return "", false, err
+	}
+	var (
+		target  string
+		ok      bool
+		linkErr error
+	)
+	if err := rc.Control(func(fd uintptr) { target, ok, linkErr = hostFDLink(fd) }); err != nil {
+		// Control reports a closed file with an error package os does
+		// not export; Stat reports it as os.ErrClosed.
+		if _, statErr := file.Stat(); errors.Is(statErr, os.ErrClosed) {
+			return "", false, statErr
+		}
+		return "", false, err
+	}
+	return target, ok, linkErr
+}
+
+// streamFile returns the host file a standard stream of the instance that
+// op refers to is, or nil when op is no standard stream or the stream is
+// not a file of the host.
+func (w *WasiStubs) streamFile(op *wasiOpen) *os.File {
 	if op == nil || op.stdio == 0 {
 		return nil
 	}
@@ -3311,15 +3813,8 @@ func (w *WasiStubs) streamFileInfo(op *wasiOpen) os.FileInfo {
 		stream = w.stderr()
 	}
 	w.mu.Unlock()
-	file, isFile := stream.(*os.File)
-	if !isFile {
-		return nil
-	}
-	fi, err := file.Stat()
-	if err != nil {
-		return nil
-	}
-	return fi
+	file, _ := stream.(*os.File)
+	return file
 }
 
 // Fd_path is a NON-STANDARD host import (module wasip1_posix_extension, name
@@ -3351,22 +3846,23 @@ func (w *WasiStubs) fdPath(m *Module, fd int32, bufPtr uint64, bufLen int32, nee
 	if op == nil && !root {
 		return -_wasiEBADF
 	}
-	path := "/"
+	name := "/"
 	if op != nil {
 		if !op.isDir {
 			return -_wasiENOTDIR
 		}
-		// Only "." and empty components go; not path.Clean, which would fold
-		// "..", and the host resolves ".." after symbolic links.
-		var parts []string
-		for _, part := range strings.Split(op.path, "/") {
-			if part != "" && part != "." {
-				parts = append(parts, part)
-			}
-		}
-		path += strings.Join(parts, "/")
+		name = guestPath(op.path)
 	}
-	return w.writeWasiRecord(m, []byte(path), bufPtr, bufLen, neededPtr)
+	return w.writeWasiRecord(m, []byte(name), bufPtr, bufLen, neededPtr)
+}
+
+// guestPath returns name, a path relative to the root, as an absolute path
+// of the guest's filesystem. Only "." and empty components go; not
+// path.Clean, which would fold "..", and the host resolves ".." after
+// symbolic links.
+func guestPath(name string) string {
+	parts := slices.DeleteFunc(strings.Split(name, "/"), func(part string) bool { return part == "" || part == "." })
+	return "/" + strings.Join(parts, "/")
 }
 
 // wasiFilestatExtSize is the size of the record Path_filestat_ext and
@@ -3407,6 +3903,21 @@ func (w *WasiStubs) pathFilestatMode(m *Module, pathPtr uint64, pathLen, follow 
 	out := w.memBytes(m, modeOutPtr, 4)
 	if pathSlice == nil || out == nil {
 		return -_wasiEFAULT
+	}
+	if fd, fi, _, own, errno := w.ownName(string(pathSlice), follow != 0); own {
+		switch {
+		case errno != _wasiESUCCESS:
+			return -errno
+		case fi == nil:
+			var rec [wasiFilestatExtSize]byte
+			if rc := w.filestatExtOf(fd, rec[:]); rc != _wasiESUCCESS {
+				return rc
+			}
+			binary.LittleEndian.PutUint32(out, binary.LittleEndian.Uint32(rec[:])&^unixTypeMask)
+			return _wasiESUCCESS
+		}
+		binary.LittleEndian.PutUint32(out, unixModeBits(fi.Mode()))
+		return _wasiESUCCESS
 	}
 	name, ok := w.allowedPath(string(pathSlice), false)
 	if !ok {
@@ -3632,9 +4143,12 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	out := make([]os.DirEntry, 0, len(entries)+2)
 	out = append(out, dot, dotdot)
 	out = append(out, entries...)
-	sort.SliceStable(out[2:], func(i, j int) bool {
-		return out[2+i].Name() < out[2+j].Name()
-	})
+	// A listing of the guest's descriptors has an order of its own.
+	if _, listing := op.f.(*descriptorListing); !listing {
+		sort.SliceStable(out[2:], func(i, j int) bool {
+			return out[2+i].Name() < out[2+j].Name()
+		})
+	}
 	op.dirCache = out
 	return out, nil
 }
@@ -3800,19 +4314,537 @@ func (w *WasiStubs) openGuestPath(m *Module, dirFd, dirflags int32, pathPtr, pat
 	return _wasiESUCCESS
 }
 
+// wasiDefaultFileMode and wasiDefaultDirMode are the modes path_open and
+// path_create_directory request for what they create, as open(2) and
+// mkdir(2) callers conventionally do: neither import has a mode argument.
+// The instance's umask is taken out of them like out of any other.
+const (
+	wasiDefaultFileMode os.FileMode = 0o666
+	wasiDefaultDirMode  os.FileMode = 0o777
+)
+
 // pathOpen is the layout-independent body of path_open: it resolves and
 // opens rel, registers the fd, and returns it. Callers own reading the
 // path and writing the opened fd at their ABI's pointer width.
 func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32) (int32, int32) {
+	return w.pathOpenMode(rel, dirflags, oflags, fsRightsBase, fdflags, wasiDefaultFileMode)
+}
+
+// ownDescriptorPath tells what rel names of the guest's own descriptors, the
+// way the system names the descriptors of the process that opens the name
+// (rel is relative to the root, as the guest's C library gives it):
+//
+//   - a descriptor (named): /dev/stdin, /dev/stdout, /dev/stderr (0, 1, 2),
+//     /dev/fd/N, /proc/self/fd/N and /proc/PID/fd/N for the process's own
+//     pid, in any spelling of what leads to the name: "." elements, ".."
+//     elements at the root and repeated slashes are resolved on the way; a
+//     ".." that takes back an element is not (rootElements). rest is what rel goes on
+//     with after the name, from its slash: empty when rel ends with the
+//     name, and a path from the descriptor, which then has to be a
+//     directory, otherwise;
+//   - a directory that lists the descriptors (dir, its name in its clean
+//     spelling): /dev/fd, /proc/self/fd and /proc/PID/fd, in any spelling;
+//   - nothing (dir empty).
+//
+// pid returns the process's own pid; it is called only for a name that
+// walks into proc/N/fd with N other than self.
+func ownDescriptorPath(rel string, pid func() int32) (fd int32, rest string, named bool, dir string) {
+	// The name is the first prefix of rel, up to a slash or its end, that
+	// cleans to a descriptor's name.
+	for end := 1; end <= len(rel); end++ {
+		if end < len(rel) && rel[end] != '/' {
+			continue
+		}
+		name, ok := rootElements(rel[:end])
+		if !ok {
+			return 0, "", false, ""
+		}
+		if fd, ok := ownDescriptorNumber(name, pid); ok {
+			return fd, rel[end:], true, ""
+		}
+	}
+	name, ok := rootElements(rel)
+	switch {
+	case !ok:
+	case len(name) == 2 && name[0] == "dev" && name[1] == "fd":
+		return 0, "", false, "dev/fd"
+	case len(name) == 3 && ownProcessDir(name, pid):
+		return 0, "", false, "proc/" + name[1] + "/fd"
+	}
+	return 0, "", false, ""
+}
+
+// rootElements returns the elements of name, a path relative to the root,
+// cleaned as chroot(2) sees it: ".." of the root is the root. ok is false
+// when a ".." element takes back an element before it: the host resolves
+// ".." after symbolic links, which /dev/fd and /proc/self are on Linux, so
+// the name is not one of the guest's own descriptors.
+func rootElements(name string) (elems []string, ok bool) {
+	parts := strings.Split(name, "/")
+	if first := slices.IndexFunc(parts, func(part string) bool { return part != "" && part != "." && part != ".." }); first >= 0 && slices.Contains(parts[first:], "..") {
+		return nil, false
+	}
+	return strings.Split(strings.TrimPrefix(path.Clean("/"+name), "/"), "/"), true
+}
+
+// ownProcessDir reports whether name, which has three elements or more,
+// starts with proc/self/fd or proc/PID/fd for the process's own pid.
+func ownProcessDir(name []string, pid func() int32) bool {
+	return name[0] == "proc" && name[2] == "fd" && (name[1] == "self" || name[1] == strconv.Itoa(int(pid())))
+}
+
+// ownDescriptorNumber returns the descriptor a name of ownDescriptorPath
+// stands for, given by its elements in its one clean spelling. A number
+// that no descriptor has — one with a leading zero, one beyond every
+// descriptor's — is a name of the guest's own descriptors too, of none
+// that is open: -1.
+func ownDescriptorNumber(name []string, pid func() int32) (int32, bool) {
+	var num string
+	switch {
+	case len(name) == 2 && name[0] == "dev":
+		switch name[1] {
+		case "stdin":
+			return 0, true
+		case "stdout":
+			return 1, true
+		case "stderr":
+			return 2, true
+		}
+		return 0, false
+	case len(name) == 3 && name[0] == "dev" && name[1] == "fd":
+		num = name[2]
+	case len(name) == 4 && ownProcessDir(name, pid):
+		num = name[3]
+	default:
+		return 0, false
+	}
+	if num == "" || strings.Trim(num, "0123456789") != "" {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(num, 10, 31)
+	if err != nil || (num[0] == '0' && len(num) > 1) {
+		return -1, true
+	}
+	return int32(n), true
+}
+
+// descriptorListing is what a directory that lists the guest's descriptors
+// (ownDescriptorPath) is to the guest: an entry for each of them, named by
+// the number, as they were when it opened the directory. The host would
+// list the host process's, which are the runtime's and the other processes'
+// of the family as well.
+type descriptorListing struct {
+	info    ownNameInfo
+	entries []os.DirEntry
+}
+
+func (d *descriptorListing) Read(p []byte) (int, error)              { return 0, syscall.EISDIR }
+func (d *descriptorListing) ReadAt(p []byte, off int64) (int, error) { return 0, syscall.EISDIR }
+func (d *descriptorListing) Write(p []byte) (int, error)             { return 0, syscall.EBADF }
+func (d *descriptorListing) WriteAt(p []byte, off int64) (int, error) {
+	return 0, syscall.EBADF
+}
+func (d *descriptorListing) Seek(offset int64, whence int) (int64, error) { return 0, nil }
+func (d *descriptorListing) Close() error                                 { return nil }
+func (d *descriptorListing) Stat() (os.FileInfo, error) {
+	return d.info, nil
+}
+func (d *descriptorListing) Sync() error                  { return nil }
+func (d *descriptorListing) Truncate(size int64) error    { return syscall.EISDIR }
+func (d *descriptorListing) Chmod(mode os.FileMode) error { return syscall.EPERM }
+func (d *descriptorListing) Name() string                 { return d.info.name }
+
+// ReadDir returns every entry, whatever n is: the runtime reads a directory
+// whole (readDirCached). The entries are in the order of the numbers and,
+// as on Linux, symbolic links.
+func (d *descriptorListing) ReadDir(n int) ([]os.DirEntry, error) {
+	return d.entries, nil
+}
+
+// ownDescriptorLocked returns the descriptor n, which ownDescriptorPath
+// found named with rest after the name: op, or root for the preopened root
+// at wasiPreopenFD (the root's second number, wasiRootFD, is no descriptor
+// of the guest's). ENOENT for a number that is not open, ENOTDIR when rest
+// asks for a directory and it is not one, ENOTSUP for a name from a
+// directory ("/" and "/." are the directory itself, and a name from it is
+// not resolved). Caller holds w.mu.
+func (w *WasiStubs) ownDescriptorLocked(n int32, rest string) (op *wasiOpen, root bool, errno int32) {
+	op = w.openLocked(n)
+	root = op == nil && n == wasiPreopenFD && w.preopened(n)
+	if op == nil && !root {
+		return nil, false, _wasiENOENT
+	}
+	if rest != "" && !root && !op.isDir {
+		return nil, false, _wasiENOTDIR
+	}
+	if path.Clean("d"+rest) != "d" {
+		return nil, false, _wasiENOTSUP
+	}
+	return op, root, _wasiESUCCESS
+}
+
+// ownAccess reports how descriptor op, or the preopened root, is open.
+func ownAccess(op *wasiOpen, root bool) (read, write bool) {
+	if root {
+		return true, false
+	}
+	return op.access()
+}
+
+// ownNameDev is the device number of the names the runtime makes up for
+// the guest's own descriptors: the directory that lists them, inode number
+// ownListingIno; /dev/stdin, /dev/stdout and /dev/stderr, ownAliasIno plus
+// 0, 1 and 2; the link of each descriptor, ownLinkIno plus its number.
+const (
+	ownNameDev    = 2
+	ownListingIno = 1
+	ownAliasIno   = 2
+	ownLinkIno    = 5
+)
+
+// ownNameInfo describes a name the runtime makes up for the guest's own
+// descriptors. It belongs to the effective user and group of the Process.
+type ownNameInfo struct {
+	name     string
+	mode     os.FileMode
+	size     int64
+	ino      uint64
+	uid, gid uint32
+	modTime  time.Time
+}
+
+func (fi ownNameInfo) Name() string       { return fi.name }
+func (fi ownNameInfo) Size() int64        { return fi.size }
+func (fi ownNameInfo) Mode() os.FileMode  { return fi.mode }
+func (fi ownNameInfo) ModTime() time.Time { return fi.modTime }
+func (fi ownNameInfo) IsDir() bool        { return fi.mode.IsDir() }
+func (fi ownNameInfo) Sys() any {
+	return &fileStat{dev: ownNameDev, ino: fi.ino, nlink: 1, uid: fi.uid, gid: fi.gid, atime: fi.modTime, ctime: fi.modTime}
+}
+
+// ownNameEntry is the entry of descriptor fd in a directory that lists the
+// guest's descriptors.
+type ownNameEntry struct {
+	info ownNameInfo
+	fd   int32
+}
+
+func (e ownNameEntry) Name() string               { return e.info.name }
+func (e ownNameEntry) IsDir() bool                { return false }
+func (e ownNameEntry) Type() os.FileMode          { return e.info.mode.Type() }
+func (e ownNameEntry) Info() (os.FileInfo, error) { return e.info, nil }
+func (e ownNameEntry) inode() uint64              { return e.info.ino }
+
+// listingInfo describes a directory that lists the guest's descriptors,
+// for a Process whose ids are ids.
+func (w *WasiStubs) listingInfo(name string, ids ProcessIDs) ownNameInfo {
+	return ownNameInfo{name: name, mode: os.ModeDir | 0o500, ino: ownListingIno, uid: uint32(ids.EUID), gid: uint32(ids.EGID), modTime: w.monoStart}
+}
+
+// linkInfo describes the link that names descriptor n, open for reading
+// and for writing as read and write tell: as Linux's, its permission bits
+// tell how the descriptor is open. target is what it leads to.
+func (w *WasiStubs) linkInfo(name string, n int32, read, write bool, ids ProcessIDs, target string) ownNameInfo {
+	mode := os.ModeSymlink
+	if read {
+		mode |= 0o500
+	}
+	if write {
+		mode |= 0o300
+	}
+	return ownNameInfo{name: name, mode: mode, size: int64(len(target)), ino: uint64(n) + ownLinkIno, uid: uint32(ids.EUID), gid: uint32(ids.EGID), modTime: w.monoStart}
+}
+
+// streamAlias reports whether rel, a name ownDescriptorPath found of a
+// descriptor with rest after it, is /dev/stdin, /dev/stdout or
+// /dev/stderr: on Linux a link to /proc/self/fd/N.
+func streamAlias(rel, rest string) bool {
+	name, _ := rootElements(strings.TrimSuffix(rel, rest))
+	return len(name) == 2
+}
+
+// aliasInfo describes /dev/stdin, /dev/stdout or /dev/stderr, the link to
+// target, /proc/self/fd/n: as Linux's, open to everyone.
+func (w *WasiStubs) aliasInfo(name string, n int32, ids ProcessIDs, target string) ownNameInfo {
+	return ownNameInfo{name: name, mode: os.ModeSymlink | 0o777, size: int64(len(target)), ino: uint64(n) + ownAliasIno, uid: uint32(ids.EUID), gid: uint32(ids.EGID), modTime: w.monoStart}
+}
+
+// ownLinkTarget returns what the link of descriptor op, or the preopened
+// root, leads to, as Linux names it: the path the descriptor was opened
+// under, absolute in the guest's filesystem ("/" for the root); for a
+// standard stream that is a host file, the target of the host's own link
+// for it where the host has one (hostFDLink), only when the FS is the whole
+// host filesystem, whose names the target is of; pipe:[N] or socket:[N] for a
+// pipe or a socket, N the inode number fstat gives it. It is "" for a
+// descriptor that is none of them, which then has no link. errno is a wasi
+// errno.
+func (w *WasiStubs) ownLinkTarget(op *wasiOpen, root bool) (string, int32) {
+	switch {
+	case root:
+		return "/", _wasiESUCCESS
+	case op.path != "":
+		return guestPath(op.path), _wasiESUCCESS
+	}
+	if _, whole := w.fs().(osFS); whole {
+		if file := w.streamFile(op); file != nil {
+			target, ok, err := hostStreamLink(file)
+			if err != nil {
+				return "", mapOSError(err)
+			}
+			if ok {
+				return target, _wasiESUCCESS
+			}
+		}
+	}
+	fi, err := w.opFileInfo(op)
+	if err != nil {
+		return "", mapOSError(err)
+	}
+	// What fd_filestat_ext tells of a descriptor without a file: a socket,
+	// or a pipe to the guest (a stream the embedder gave), numbered 0.
+	kind, ino := unixTypeFIFO, uint64(0)
+	switch {
+	case fi != nil:
+		kind, ino = unixTypeBits(fi.Mode()), fileStatOf(fi).ino
+	case op.socket():
+		kind = unixTypeSocket
+	}
+	switch kind {
+	case unixTypeFIFO:
+		return fmt.Sprintf("pipe:[%d]", ino), _wasiESUCCESS
+	case unixTypeSocket:
+		return fmt.Sprintf("socket:[%d]", ino), _wasiESUCCESS
+	}
+	return "", _wasiESUCCESS
+}
+
+// opFileInfo describes the file behind op: the host file of a standard
+// stream, or op's own. It is nil for a descriptor that has none (a socket,
+// a stream the embedder gave).
+func (w *WasiStubs) opFileInfo(op *wasiOpen) (os.FileInfo, error) {
+	fi, err := w.streamFileInfo(op)
+	if err != nil || fi != nil || op.f == nil {
+		return fi, err
+	}
+	return op.f.Stat()
+}
+
+// openOwnDescriptor opens n, a descriptor of the opener's own that
+// ownDescriptorPath found named with rest after the name: the host would
+// open the host process's (a stream of the embedder's is not the host
+// process's). The new descriptor shares the open file, as /dev/fd/N does on
+// darwin and the BSDs, so the access asked for has to be one it was opened
+// with; the preopened root, which has no open file to share, is opened
+// anew as the root of the FS, without FSAccess (openRoot). As on Linux the
+// name is a link (/dev/stdin, /dev/stdout and /dev/stderr always, as links
+// to /proc/self/fd/N): ELOOP without the follow flag (dirflags bit 0) when
+// the name ends with it, EEXIST for O_CREAT|O_EXCL. O_DIRECTORY asks for a
+// directory. alias tells that the name is /dev/stdin, /dev/stdout or
+// /dev/stderr (streamAlias).
+func (w *WasiStubs) openOwnDescriptor(n int32, rest string, alias bool, dirflags, oflags int32, fsRightsBase int64, fdflags int32, canRead, canWrite bool) (int32, int32) {
+	w.mu.Lock()
+	op, root, errno := w.ownDescriptorLocked(n, rest)
+	w.mu.Unlock()
+	if errno != _wasiESUCCESS {
+		return -1, errno
+	}
+	if oflags&0x5 == 0x5 { // O_CREAT|O_EXCL
+		return -1, _wasiEEXIST
+	}
+	if dirflags&0x1 == 0 && rest == "" {
+		if alias {
+			return -1, _wasiELOOP
+		}
+		target, errno := w.ownLinkTarget(op, root)
+		if errno != _wasiESUCCESS {
+			return -1, errno
+		}
+		if target != "" {
+			return -1, _wasiELOOP
+		}
+	}
+	read, write := ownAccess(op, root)
+	switch {
+	case oflags&0x2 != 0 && !root && !op.isDir:
+		return -1, _wasiENOTDIR
+	case canRead && !read, canWrite && !write:
+		return -1, _wasiEACCES
+	case root:
+		return w.openRoot(oflags, fdflags)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.openLocked(n) != op {
+		// The number was closed, or given to another descriptor, since.
+		return -1, _wasiENOENT
+	}
+	var out [4]byte
+	if errno := w.dupLocked(op, 0, out[:]); errno != _wasiESUCCESS {
+		return -1, errno
+	}
+	return int32(binary.LittleEndian.Uint32(out[:])), _wasiESUCCESS
+}
+
+// openRoot opens the preopened root anew for a name of the guest's own
+// descriptors, which FSAccess is not asked about: the root of the FS, as a
+// directory open for reading. O_TRUNC of a directory is EISDIR.
+func (w *WasiStubs) openRoot(oflags, fdflags int32) (int32, int32) {
+	if oflags&0x8 != 0 { // O_TRUNC
+		return -1, _wasiEISDIR
+	}
+	fsys := w.fs()
+	f, err := fsys.OpenFile(".", os.O_RDONLY, 0)
+	if err != nil {
+		return -1, mapOSError(err)
+	}
+	_, whole := fsys.(osFS)
+	op := &wasiOpen{f: f, isDir: true, path: ".", fdflags: fdflags, hostPath: whole, noWrite: true}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.addFDLocked(op), _wasiESUCCESS
+}
+
+// openDescriptorListing opens dir, a directory that lists the guest's
+// descriptors, with an entry for each as they are now, its own among them:
+// one that is opened for writing is a directory still.
+func (w *WasiStubs) openDescriptorListing(dir string, oflags int32, canWrite bool) (int32, int32) {
+	if oflags&(0x1|0x8) != 0 || canWrite { // O_CREAT, O_TRUNC
+		return -1, _wasiEISDIR
+	}
+	ids := w.guestProcess().IDs()
+	w.mu.Lock()
+	numbers := w.ownDescriptorsLocked()
+	ops := make([]*wasiOpen, len(numbers))
+	for i, n := range numbers {
+		ops[i] = w.openLocked(n)
+	}
+	w.mu.Unlock()
+	var entries []ownNameEntry
+	for i, n := range numbers {
+		entry, errno := w.listingEntry(n, ops[i], ops[i] == nil, ids)
+		if errno == _wasiEBADF {
+			continue // closed since: no longer one of the descriptors
+		}
+		if errno != _wasiESUCCESS {
+			return -1, errno
+		}
+		entries = append(entries, entry)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	listing := &descriptorListing{info: w.listingInfo(path.Base(dir), ids)}
+	// The entries are complete before w.mu lets anyone else find the
+	// descriptor.
+	fd := w.addFDLocked(&wasiOpen{f: listing, isDir: true, path: dir, noWrite: true})
+	entries = append(entries, ownNameEntry{w.linkInfo(strconv.Itoa(int(fd)), fd, true, false, ids, guestPath(dir)), fd})
+	slices.SortFunc(entries, func(a, b ownNameEntry) int { return cmp.Compare(a.fd, b.fd) })
+	for _, e := range entries {
+		listing.entries = append(listing.entries, e)
+	}
+	return fd, _wasiESUCCESS
+}
+
+// listingEntry is the entry of descriptor n, op or the preopened root, in a
+// directory that lists the guest's descriptors: its link, or the
+// descriptor as what it is when it has none (ownLinkTarget).
+func (w *WasiStubs) listingEntry(n int32, op *wasiOpen, root bool, ids ProcessIDs) (ownNameEntry, int32) {
+	target, errno := w.ownLinkTarget(op, root)
+	if errno != _wasiESUCCESS {
+		return ownNameEntry{}, errno
+	}
+	read, write := ownAccess(op, root)
+	info := w.linkInfo(strconv.Itoa(int(n)), n, read, write, ids, target)
+	if target == "" {
+		fi, err := w.opFileInfo(op)
+		if err != nil {
+			return ownNameEntry{}, mapOSError(err)
+		}
+		info.mode = info.mode.Perm()
+		if fi != nil {
+			info.mode |= fi.Mode().Type()
+		}
+	}
+	return ownNameEntry{info, n}, _wasiESUCCESS
+}
+
+// ownName resolves rel for the calls that describe a name (stat, lstat,
+// readlink) when it is a name of the guest's own descriptors or of a
+// directory that lists them (ownDescriptorPath); own is false when it is
+// neither, and the FS is not asked about it either way. A descriptor's own
+// name is, as on Linux, a symbolic link to the descriptor: followed
+// (follow, or a name that goes on after it) it stands for the descriptor
+// fd, which the caller describes as fstat does; not followed it is the link
+// fi (fd -1), whose target is what ownLinkTarget gives; a descriptor that
+// has no link is the descriptor either way. A listing directory is fi (fd
+// -1).
+// errno is what the name fails with (ownDescriptorLocked).
+func (w *WasiStubs) ownName(rel string, follow bool) (fd int32, fi os.FileInfo, target string, own bool, errno int32) {
+	n, rest, named, dir := ownDescriptorPath(rel, w.guestPID)
+	if !named && dir == "" {
+		return -1, nil, "", false, _wasiESUCCESS
+	}
+	ids := w.guestProcess().IDs()
+	if !named {
+		return -1, w.listingInfo(path.Base(dir), ids), "", true, _wasiESUCCESS
+	}
+	w.mu.Lock()
+	op, root, errno := w.ownDescriptorLocked(n, rest)
+	w.mu.Unlock()
+	if errno != _wasiESUCCESS {
+		return -1, nil, "", true, errno
+	}
+	if follow || rest != "" {
+		return n, nil, "", true, _wasiESUCCESS
+	}
+	if streamAlias(rel, rest) {
+		target = "/proc/self/fd/" + strconv.Itoa(int(n))
+		return -1, w.aliasInfo(path.Base(rel), n, ids, target), target, true, _wasiESUCCESS
+	}
+	if target, errno = w.ownLinkTarget(op, root); errno != _wasiESUCCESS {
+		return -1, nil, "", true, errno
+	}
+	if target == "" {
+		// No link: the name is the descriptor.
+		return n, nil, "", true, _wasiESUCCESS
+	}
+	read, write := ownAccess(op, root)
+	return -1, w.linkInfo(path.Base(rel), n, read, write, ids, target), target, true, _wasiESUCCESS
+}
+
+// ownDescriptorsLocked returns the numbers of the guest's open descriptors,
+// the preopened root at wasiPreopenFD among them, in order. Caller holds
+// w.mu.
+func (w *WasiStubs) ownDescriptorsLocked() []int32 {
+	fds := slices.Collect(maps.Keys(w.fdsLocked()))
+	if w.openLocked(wasiPreopenFD) == nil && w.preopened(wasiPreopenFD) {
+		fds = append(fds, wasiPreopenFD)
+	}
+	slices.Sort(fds)
+	return fds
+}
+
+// pathOpenMode is pathOpen with the mode of open(2): a file the call
+// creates gets mode, less the instance's umask.
+func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
+	// Decode rights into access mode. WASI rights bits: 0=FD_DATASYNC,
+	// 1=FD_READ, 6=FD_WRITE. We treat absent rights as the closest fit:
+	// without FD_WRITE the open is one for reading.
+	canWrite := fsRightsBase&(1<<6) != 0
+	canRead := fsRightsBase&(1<<1) != 0 || !canWrite
+
+	n, rest, named, dir := ownDescriptorPath(rel, w.guestPID)
+	if named {
+		return w.openOwnDescriptor(n, rest, streamAlias(rel, rest), dirflags, oflags, fsRightsBase, fdflags, canRead, canWrite)
+	}
+	if dir != "" {
+		return w.openDescriptorListing(dir, oflags, canWrite)
+	}
 	w.mu.Lock()
 	fsys := w.fs()
+	openFile := fsys.OpenFile
 	w.mu.Unlock()
 	_, whole := fsys.(osFS)
 
-	// Decode rights into access mode. WASI rights bits: 0=FD_DATASYNC,
-	// 1=FD_READ, 6=FD_WRITE. We treat absent rights as the closest fit.
-	canRead := fsRightsBase&(1<<1) != 0
-	canWrite := fsRightsBase&(1<<6) != 0
 	var flag int
 	switch {
 	case canRead && canWrite:
@@ -3873,8 +4905,13 @@ func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase in
 			return -1, _wasiENOENT
 		}
 	}
-	f, err := fsys.OpenFile(rel, flag, 0o644)
-	if err != nil {
+	var f File
+	var err error
+	// The filesystem is asked for the mode less the instance's umask. The
+	// host's filesystem takes the host process's umask out as well, so
+	// there the instance's umask tightens a mode and does not loosen one;
+	// MemFS creates with the mode as asked.
+	if f, err = openFile(rel, flag, w.createMode(mode)); err != nil {
 		return -1, mapOSError(err)
 	}
 	st, statErr := f.Stat()
@@ -3919,17 +4956,7 @@ func (w *WasiStubs) pathCreateDirectoryAt(m *Module, dirFd int32, pathPtr, pathL
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
-	name, ok := w.allowedPath(string(pathSlice), true)
-	if !ok {
-		return _wasiEACCES
-	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
-	if err := fsys.Mkdir(name, 0o755); err != nil {
-		return mapOSError(err)
-	}
-	return _wasiESUCCESS
+	return w.pathCreateDirectory(string(pathSlice), wasiDefaultDirMode)
 }
 
 func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -4062,6 +5089,16 @@ func (w *WasiStubs) pathFilestatGet(m *Module, dirFd, flags int32, pathPtr, path
 	out := w.memBytes(m, outPtr, 64)
 	if pathSlice == nil || out == nil {
 		return _wasiEFAULT
+	}
+	if fd, fi, _, own, errno := w.ownName(string(pathSlice), flags&0x1 != 0); own {
+		switch {
+		case errno != _wasiESUCCESS:
+			return errno
+		case fi == nil:
+			return w.filestatOf(fd, out)
+		}
+		writeFilestat(out, fi)
+		return _wasiESUCCESS
 	}
 	name, ok := w.allowedPath(string(pathSlice), false)
 	if !ok {
@@ -4229,16 +5266,28 @@ func (w *WasiStubs) pathReadlink(m *Module, abi wasiABI, dirFd int32, pathPtr, p
 	if pathSlice == nil || bufSlice == nil || bufused == nil {
 		return _wasiEFAULT
 	}
-	name, ok := w.allowedPath(string(pathSlice), false)
-	if !ok {
-		return _wasiEACCES
-	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
-	target, err := fsys.Readlink(name)
-	if err != nil {
-		return mapOSError(err)
+	var target string
+	if _, _, link, own, errno := w.ownName(string(pathSlice), false); own {
+		// A name that is no link fails as on Linux.
+		if errno != _wasiESUCCESS {
+			return errno
+		}
+		if link == "" {
+			return _wasiEINVAL
+		}
+		target = link
+	} else {
+		name, ok := w.allowedPath(string(pathSlice), false)
+		if !ok {
+			return _wasiEACCES
+		}
+		w.mu.Lock()
+		fsys := w.fs()
+		w.mu.Unlock()
+		var err error
+		if target, err = fsys.Readlink(name); err != nil {
+			return mapOSError(err)
+		}
 	}
 	n := copy(bufSlice, target)
 	abi.putWord(bufused, uint64(n))
@@ -4697,6 +5746,144 @@ func writeFilestat(out []byte, st os.FileInfo) {
 	binary.LittleEndian.PutUint64(out[56:], uint64(posix.ctime.UnixNano()))
 }
 
+// Process supplies the identity and the accounting of the guest process
+// (WASIConfig.Process). Its methods are called without any lock of the
+// WasiStubs held.
+type Process interface {
+	// IDs returns the ids of the guest process.
+	IDs() ProcessIDs
+	// Times returns the CPU time the guest process and the children it has
+	// waited for have used. An error that is errors.ErrUnsupported makes
+	// the guest's times() fail with ENOSYS. The Process of HostProcess
+	// reports the whole host process, which every instance of a fork family
+	// is part of, and the children the host process has waited for.
+	Times() (ProcessTimes, error)
+	// Umask returns the file mode creation mask the guest starts with. Only
+	// its permission bits are used.
+	Umask() os.FileMode
+}
+
+// ProcessIDs are the ids of a guest process.
+type ProcessIDs struct {
+	PID, PPID int32
+	UID, EUID int32
+	GID, EGID int32
+}
+
+// ProcessTimes are the CPU times of a guest process: the user and system
+// time of the process, then those of the children it has waited for.
+type ProcessTimes struct {
+	User, System, ChildrenUser, ChildrenSystem time.Duration
+}
+
+// isolatedProcess is the Process of an instance that has none installed. It
+// reads nothing from the host.
+type isolatedProcess struct{}
+
+func (isolatedProcess) IDs() ProcessIDs              { return ProcessIDs{PID: 42, PPID: 1} }
+func (isolatedProcess) Times() (ProcessTimes, error) { return ProcessTimes{}, nil }
+func (isolatedProcess) Umask() os.FileMode           { return 0o022 }
+
+// HostProcess returns a Process with the identity and the accounting of the
+// host process, for WASIConfig.Process. IDs are os.Getpid, os.Getppid,
+// os.Getuid, os.Geteuid, os.Getgid and os.Getegid. Times are the host's
+// resource usage of the whole host process, which every instance of a fork
+// family is part of, and of the children the host process has waited for;
+// on a system without one the error is errors.ErrUnsupported. Umask is the host
+// process's file mode creation mask when HostProcess is called, read without
+// changing it: on Linux from /proc/self/status, and an error reading it is
+// returned. Where it cannot be read without changing it (another system, or
+// a Linux whose status has no umask) the error is errors.ErrUnsupported:
+// use HostProcessUmask, which takes the umask from the caller.
+func HostProcess() (Process, error) {
+	umask, err := readHostUmask()
+	if err != nil {
+		return nil, err
+	}
+	return hostProcess{umask: umask}, nil
+}
+
+// HostProcessUmask returns the Process of HostProcess with umask as the
+// umask the guest starts with.
+func HostProcessUmask(umask os.FileMode) Process { return hostProcess{umask: umask} }
+
+// hostProcess is the Process HostProcess and HostProcessUmask return.
+type hostProcess struct {
+	umask os.FileMode
+}
+
+func (hostProcess) IDs() ProcessIDs {
+	return ProcessIDs{
+		PID: int32(os.Getpid()), PPID: int32(os.Getppid()),
+		UID: int32(os.Getuid()), EUID: int32(os.Geteuid()),
+		GID: int32(os.Getgid()), EGID: int32(os.Getegid()),
+	}
+}
+
+func (hostProcess) Times() (ProcessTimes, error) { return hostProcessTimes() }
+func (p hostProcess) Umask() os.FileMode         { return p.umask }
+
+// Proc_ids is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_ids") backing getpid, getppid and the getuid family. It writes
+// the IDs of the Process (WASIConfig.Process) at outPtr as six
+// little-endian u32: pid, ppid, uid, euid, gid, egid. Returns 0 or a
+// negative errno.
+func (w *WasiStubs) Proc_ids(m *Module, outPtr int32) int32 {
+	return w.procIDs(m, zext(outPtr))
+}
+
+// Proc_ids64 is Proc_ids for a memory64 guest.
+func (w *WasiStubs) Proc_ids64(m *Module, outPtr int64) int32 {
+	return w.procIDs(m, uint64(outPtr))
+}
+
+// procIDs is the body of Proc_ids and Proc_ids64.
+func (w *WasiStubs) procIDs(m *Module, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 24)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	ids := w.guestProcess().IDs()
+	for i, id := range [6]int32{ids.PID, ids.PPID, ids.UID, ids.EUID, ids.GID, ids.EGID} {
+		binary.LittleEndian.PutUint32(out[i*4:], uint32(id))
+	}
+	return _wasiESUCCESS
+}
+
+// Proc_times is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_times") backing times(2): the Times of the Process
+// (WASIConfig.Process) are written at outPtr as four little-endian u64 of
+// nanoseconds — the user and system CPU time of the process, then those of
+// the children it has waited for. Returns 0, or a negative errno: ENOSYS
+// when the Process does not account for them.
+func (w *WasiStubs) Proc_times(m *Module, outPtr int32) int32 {
+	return w.procTimes(m, zext(outPtr))
+}
+
+// Proc_times64 is Proc_times for a memory64 guest.
+func (w *WasiStubs) Proc_times64(m *Module, outPtr int64) int32 {
+	return w.procTimes(m, uint64(outPtr))
+}
+
+// procTimes is the body of Proc_times and Proc_times64.
+func (w *WasiStubs) procTimes(m *Module, outPtr uint64) int32 {
+	out := w.memBytes(m, outPtr, 32)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	times, err := w.guestProcess().Times()
+	if errors.Is(err, errors.ErrUnsupported) {
+		return -_wasiENOSYS
+	}
+	if err != nil {
+		return -mapOSError(err)
+	}
+	for i, d := range [4]time.Duration{times.User, times.System, times.ChildrenUser, times.ChildrenSystem} {
+		binary.LittleEndian.PutUint64(out[i*8:], uint64(d))
+	}
+	return _wasiESUCCESS
+}
+
 // Chown changes the owner and group of a file of the host filesystem; -1
 // leaves an id as it is. With follow false a symbolic link itself is
 // changed, not the file it names.
@@ -4826,25 +6013,34 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		// stand-in, the embed vars, this very function, etc.) is
 		// stripped.
 		keepTypeNames: map[string]bool{
-			"WasiExitError":   true,
-			"WasiSignalError": true,
-			"wasiOpen":        true,
-			"wasiProc":        true,
-			"WasiStubs":       true,
-			"WASIConfig":      true,
-			"wasiABI":         true,
-			"dotDirEntry":     true,
-			"FS":              true,
-			"File":            true,
-			"osFS":            true,
-			"rootFS":          true,
-			"noFS":            true,
-			"fileStat":        true,
-			"MemFS":           true,
-			"memFile":         true,
-			"memNode":         true,
-			"memFileInfo":     true,
-			"memDirEntry":     true,
+			"WasiExitError":     true,
+			"WasiSignalError":   true,
+			"wasiOpen":          true,
+			"wasiProc":          true,
+			"wasiPIDs":          true,
+			"WasiStubs":         true,
+			"WASIConfig":        true,
+			"Process":           true,
+			"ProcessIDs":        true,
+			"ProcessTimes":      true,
+			"isolatedProcess":   true,
+			"ownNameInfo":       true,
+			"ownNameEntry":      true,
+			"hostProcess":       true,
+			"wasiABI":           true,
+			"dotDirEntry":       true,
+			"descriptorListing": true,
+			"FS":                true,
+			"File":              true,
+			"osFS":              true,
+			"rootFS":            true,
+			"noFS":              true,
+			"fileStat":          true,
+			"MemFS":             true,
+			"memFile":           true,
+			"memNode":           true,
+			"memFileInfo":       true,
+			"memDirEntry":       true,
 		},
 		keepFuncNames: map[string]bool{
 			"itoa32":                  true,
@@ -4855,6 +6051,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"AllowAllDial":            true,
 			"AllowAllResolve":         true,
 			"AllowAllExec":            true,
+			"HostProcess":             true,
+			"HostProcessUmask":        true,
 			"NewMemFS":                true,
 			"fileStatOf":              true,
 			"unixFileMode":            true,
@@ -4914,6 +6112,16 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"Info":                    true,
 			"Fd_readdir":              true,
 			"Path_open":               true,
+			"ownDescriptorPath":       true,
+			"ownDescriptorNumber":     true,
+			"ownProcessDir":           true,
+			"rootElements":            true,
+			"ownAccess":               true,
+			"hostStreamLink":          true,
+			"streamAlias":             true,
+			"refuseDirectory":         true,
+			"guestPath":               true,
+			"setSpecialBits":          true,
 			"Path_create_directory":   true,
 			"Path_unlink_file":        true,
 			"Path_remove_directory":   true,
@@ -4976,6 +6184,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 	}
 
 	imports := []string{
+		"cmp",
 		"context",
 		"crypto/rand",
 		"encoding/binary",
@@ -4983,12 +6192,14 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"fmt",
 		"io",
 		"io/fs",
+		"maps",
 		"net",
 		"os",
 		"os/exec",
 		"path",
 		"path/filepath",
 		"runtime",
+		"slices",
 		"sort",
 		"strconv",
 		"strings",

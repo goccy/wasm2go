@@ -5,8 +5,11 @@ package codegen
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -45,6 +48,51 @@ func lstatAt(dir *os.File, name string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return fi, nil
+}
+
+// chmodRefused reports whether err is chmod(2)'s refusal of a mode bit to
+// this user, EPERM: a setgid bit of a group the user is not in.
+func chmodRefused(err error) bool { return errors.Is(err, syscall.EPERM) }
+
+// hostFDLink returns the target of the host's link for descriptor fd of
+// the host process, /proc/self/fd/fd, and whether the host has one: a
+// system without /proc has none.
+func hostFDLink(fd uintptr) (string, bool, error) {
+	target, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(fd), 10))
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return target, true, nil
+}
+
+// readHostUmask returns the file mode creation mask of the host process,
+// from /proc/self/status.
+func readHostUmask() (os.FileMode, error) {
+	return statusUmask("/proc/self/status")
+}
+
+// statusUmask returns the umask the "Umask:" line of the process status file
+// at path gives (Linux 4.7 and later). A status without that line is one of
+// a system that has no way to read the umask without changing it:
+// errors.ErrUnsupported.
+func statusUmask(path string) (os.FileMode, error) {
+	status, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	_, rest, found := strings.Cut("\n"+string(status), "\nUmask:")
+	if !found {
+		return 0, fmt.Errorf("%s has no umask: %w", path, errors.ErrUnsupported)
+	}
+	value, _, _ := strings.Cut(rest, "\n")
+	mask, err := strconv.ParseUint(strings.TrimSpace(value), 8, 32)
+	if err != nil {
+		return 0, fmt.Errorf("the umask in %s: %w", path, err)
+	}
+	return os.FileMode(mask).Perm(), nil
 }
 
 // osFileDirents reads the names in the directory open as d, in the order

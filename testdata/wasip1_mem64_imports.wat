@@ -116,6 +116,22 @@
     (func $fd_chown (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "path_filestat_mode"
     (func $path_filestat_mode (param i64 i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_wait"
+    (func $proc_wait (param i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_wait_any"
+    (func $proc_wait_any (param i32 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_umask"
+    (func $proc_umask (param i32) (result i32)))
+  (import "wasip1_posix_extension" "path_open_mode"
+    (func $path_open_mode (param i32 i64 i32 i32 i64 i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "path_create_directory_mode"
+    (func $path_create_directory_mode (param i64 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_ids"
+    (func $proc_ids (param i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_times"
+    (func $proc_times (param i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_spawn"
+    (func $proc_spawn (param i64 i64 i64 i32 i32 i32 i64 i64) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -175,5 +191,13 @@
     (drop (call $path_chown (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $fd_chown (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $path_filestat_mode (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_wait (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $proc_wait_any (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $proc_umask (i32.const 0)))
+    (drop (call $path_open_mode (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $path_create_directory_mode (i64.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $proc_ids (i64.const 0)))
+    (drop (call $proc_times (i64.const 0)))
+    (drop (call $proc_spawn (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
   )
 )

@@ -500,6 +500,14 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"path_chmod", func() int32 { return w.Path_chmod64(m, highAddr, 1, 0o600) }, -_wasiEFAULT},
 		{"path_chown", func() int32 { return w.Path_chown64(m, highAddr, 1, -1, -1, 1) }, -_wasiEFAULT},
 		{"fd_path needed", func() int32 { return w.Fd_path64(m, 3, 512, 64, highAddr) }, -_wasiEFAULT},
+		{"proc_wait", func() int32 { return w.Proc_wait64(m, 1000, 1, highAddr) }, -_wasiEFAULT},
+		{"proc_wait_any pid", func() int32 { return w.Proc_wait_any64(m, 1, highAddr, 512) }, -_wasiEFAULT},
+		{"proc_wait_any status", func() int32 { return w.Proc_wait_any64(m, 1, 512, highAddr) }, -_wasiEFAULT},
+		{"path_open_mode path", func() int32 { return w.Path_open_mode64(m, 0, highAddr, 1, 0, 1<<1, 0, 0o600, 512) }, -_wasiEFAULT},
+		{"path_open_mode fd", func() int32 { return w.Path_open_mode64(m, 0, 900, 1, 0, 1<<1, 0, 0o600, highAddr) }, -_wasiEFAULT},
+		{"path_create_directory_mode", func() int32 { return w.Path_create_directory_mode64(m, highAddr, 1, 0o700) }, -_wasiEFAULT},
+		{"proc_ids", func() int32 { return w.Proc_ids64(m, highAddr) }, -_wasiEFAULT},
+		{"proc_times", func() int32 { return w.Proc_times64(m, highAddr) }, -_wasiEFAULT},
 	} {
 		before := bytes.Clone(m.memory)
 		if got := tc.call(); got != tc.want {
@@ -618,6 +626,25 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"fd_path",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_path(m, 3, 2048, 64, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_path64(m, 3, 2048, 64, 1024) }},
+		{"proc_wait and proc_wait_any of no process",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_wait(m, 1000, 0, 1024) | w.Proc_wait_any(m, 0, 1024, 1028)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_wait64(m, 1000, 0, 1024) | w.Proc_wait_any64(m, 0, 1024, 1028)
+			}},
+		{"proc_umask, path_open_mode and path_create_directory_mode",
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_umask(m, 0o22) | w.Path_open_mode(m, 0, 512, 5, 0, 1<<1, 0, 0o600, 1024) |
+					w.Path_create_directory_mode(m, 512, 5, 0o700)
+			},
+			func(w *WasiStubs, m *Module, fd int32) int32 {
+				return w.Proc_umask64(m, 0o22) | w.Path_open_mode64(m, 0, 512, 5, 0, 1<<1, 0, 0o600, 1024) |
+					w.Path_create_directory_mode64(m, 512, 5, 0o700)
+			}},
+		{"proc_ids",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_ids(m, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Proc_ids64(m, 1024) }},
 		{"pipe",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe(m, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe64(m, 1024) }},
