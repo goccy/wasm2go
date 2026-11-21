@@ -549,6 +549,7 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 			t.Fatalf("open: %d", errno)
 		}
 		putPath(m, 512, "f.txt")
+		putPath(m, 544, "UTC")
 		return fd
 	}
 	type call func(w *WasiStubs, m *Module, fd int32) int32
@@ -662,6 +663,9 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 			func(w *WasiStubs, m *Module, fd int32) int32 {
 				return w.Fd_dupfd64(m, fd, 10, 1024) | w.Fd_dup264(m, fd, 12) | w.Fd_closefrom64(m, 11) | w.Fd_fdstat_get64(m, 10, 1040)
 			}},
+		{"clock_zone",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Clock_zone(m, 544, 3, 1, 86400, 0, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Clock_zone64(m, 544, 3, 1, 86400, 0, 1024) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w32, m32 := newTestStubs(t, dir)

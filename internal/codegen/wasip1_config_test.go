@@ -183,6 +183,9 @@ func TestWasi_HostWASIConfig(t *testing.T) {
 	if cfg.FSAccess != nil {
 		t.Error("FSAccess is set, want every access to FS allowed")
 	}
+	if cfg.LocalZone != time.Local {
+		t.Errorf("LocalZone = %v, want time.Local", cfg.LocalZone)
+	}
 	if !cfg.NetAccess("send") || !cfg.Dial("tcp", "example.com", "192.0.2.1", 80) ||
 		!cfg.Resolve("example.com") || !cfg.Exec("/bin/sh", []string{"sh"}) {
 		t.Error("a hook denies")
