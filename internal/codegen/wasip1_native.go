@@ -1254,10 +1254,11 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 }
 
 // Proc_spawn is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "proc_spawn") that a guest's posix_spawn() can call. It spawns a HOST
-// process: path is the executable, argv/envp are NUL-terminated char** in
-// linear memory. The child inherits the interpreter's stdin/stdout/stderr.
-// The new pid token is written at pidOutPtr. Returns 0 or a negative errno.
+// name "proc_spawn") that a guest's posix_spawn() can call. It spawns a
+// HOST process: path is the executable, argv/envp are NUL-terminated char**
+// in linear memory. The child inherits the interpreter's
+// stdin/stdout/stderr. The new pid token is written at pidOutPtr. Returns 0
+// or a negative errno.
 //
 // Only stdio inheritance is supported today (no fd remapping / pipes), which
 // covers subprocess.run/call with default streams; capture_output via host
@@ -1427,10 +1428,10 @@ func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
 }
 
 // Pipe is a NON-STANDARD host import (module wasi_snapshot_preview1, name
-// "pipe") that a guest's pipe()/pipe2() can call. It creates a host OS pipe and
-// registers both ends as guest fds, writing [readFd, writeFd] (two i32) at
-// fdsOutPtr. The guest reads the read end via Fd_read; the write end is given
-// to a child as its stdout/stderr via Proc_spawn, so subprocess.run can
+// "pipe") that a guest's pipe()/pipe2() can call. It creates a host OS pipe
+// and registers both ends as guest fds, writing [readFd, writeFd] (two i32)
+// at fdsOutPtr. The guest reads the read end via Fd_read; the write end is
+// given to a child as its stdout/stderr via Proc_spawn, so subprocess.run can
 // capture output. Returns 0 or a negative errno.
 func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 	return w.pipe(m, zext(fdsOutPtr))
@@ -1460,13 +1461,13 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 	return _wasiESUCCESS
 }
 
-// Proc_wait is a NON-STANDARD host import (name "proc_wait") that a
-// guest's waitpid() can call. It waits for the process token pid and writes the POSIX
-// wait status at statusOutPtr. options is the waitpid() options mask; bit 0
-// (WNOHANG) makes it return without blocking when the child is still running
-// (the guest sees the documented "0 means no child ready" result, signalled
-// by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a negative
-// errno (ECHILD for an unknown pid).
+// Proc_wait is a NON-STANDARD host import (name "proc_wait") that a guest's
+// waitpid() can call. It waits for the process token pid and writes the
+// POSIX wait status at statusOutPtr. options is the waitpid() options mask;
+// bit 0 (WNOHANG) makes it return without blocking when the child is still
+// running (the guest sees the documented "0 means no child ready" result,
+// signalled by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a
+// negative errno (ECHILD for an unknown pid).
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
 	out := w.memSlice(m, statusOutPtr, 4)
 	if out == nil {
@@ -1533,8 +1534,8 @@ func mapExecError(err error) int32 {
 // name "sock_getaddrinfo") that a guest's getaddrinfo() can call. It reads the
 // host string at (nodePtr,nodeLen), consults the resolve whitelist, resolves it
 // to an IPv4 address via Go's resolver (numeric IPs pass through), and writes
-// the 4-byte network-order address at outPtr. Returns 0 on success or a
-// negative POSIX-ish errno (the caller maps it to an EAI_* code).
+// the 4-byte network-order address at outPtr. Returns 0 on success or a negative
+// POSIX-ish errno (the caller maps it to an EAI_* code).
 func (w *WasiStubs) Sock_getaddrinfo(m *Module, nodePtr, nodeLen, outPtr int32) int32 {
 	host := ""
 	if nodeLen > 0 {
@@ -1712,8 +1713,8 @@ func zext(v int32) uint64 { return uint64(uint32(v)) }
 // through it. A binding knows it by which of its two methods was called:
 // the wasm32 one passes wasiABI32, its *64 twin wasiABI64.
 //
-// A memory64 module's wasi imports arrive widened: every argument of a
-// standard import is a pointer-width i64. Codegen binds such a module's imports to the methods
+// A memory64 guest passes every argument of the standard imports as a
+// pointer-width i64. Codegen binds such a module's imports to the methods
 // named <Name>64 (importMethodName); a wasm32 module binds the ones without
 // the suffix. The two methods of an import are thin wrappers over one body,
 // which takes the guest's addresses as uint64 — a wasm32 guest's
@@ -2795,8 +2796,8 @@ func (w *WasiStubs) Fd_allocate64(m *Module, fd, offset, length int64) int32 {
 }
 
 // Path_chmod is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "path_chmod") that a guest's chmod() can call: WASI preview1 has
-// no way to change file modes. The path at (pathPtr,pathLen) is
+// name "path_chmod") that a guest's chmod() can call: WASI preview1 has no
+// way to change file modes. The path at (pathPtr,pathLen) is
 // preopen-relative, like path_open's. Returns 0 or a negative errno.
 func (w *WasiStubs) Path_chmod(m *Module, pathPtr, pathLen, mode int32) int32 {
 	return w.pathChmod(m, zext(pathPtr), pathLen, mode)
@@ -2848,12 +2849,12 @@ func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
 
 // Path_filestat_ext is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "path_filestat_ext") that a guest's
-// stat/lstat can call: WASI's filestat carries neither permission
-// bits nor an owner, and its file types have no FIFO, so the guest merges
-// them in from here. The path is preopen-relative; follow selects stat vs
-// lstat semantics. Writes the record of wasiFilestatExtSize bytes at
-// outPtr, whose mode is the POSIX mode (the file type bits, unixType*, and
-// the low twelve mode bits), and returns 0 or a negative errno.
+// stat/lstat can call: WASI's filestat carries neither permission bits nor
+// an owner, and its file types have no FIFO, so the guest merges them in
+// from here. The path is preopen-relative; follow selects stat vs lstat
+// semantics. Writes the record of wasiFilestatExtSize bytes at outPtr,
+// whose mode is the POSIX mode (the file type bits, unixType*, and the low
+// twelve mode bits), and returns 0 or a negative errno.
 func (w *WasiStubs) Path_filestat_ext(m *Module, pathPtr, pathLen, follow, outPtr int32) int32 {
 	return w.pathFilestatExt(m, zext(pathPtr), pathLen, follow, zext(outPtr))
 }
@@ -2888,9 +2889,9 @@ func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow i
 }
 
 // Fd_filestat_ext is Path_filestat_ext for an open descriptor (module
-// wasip1_posix_extension, name "fd_filestat_ext"), that a guest's
-// fstat can call. A descriptor that is not a file of the FS backend
-// is described as what it is to the guest: a standard stream that is a
+// wasip1_posix_extension, name "fd_filestat_ext") that a guest's fstat
+// can call. A descriptor that is not a file of the FS backend is
+// described as what it is to the guest: a standard stream that is a
 // file of the host as that file (a terminal, a pipe, a regular file), a
 // stream the embedder supplied as a pipe, a socket as a socket, the
 // preopened root as the root directory.
@@ -3037,8 +3038,8 @@ func writeFilestatExt(out []byte, fi os.FileInfo) {
 
 // Path_filestat_mode is a NON-STANDARD host import (module
 // wasi_snapshot_preview1, name "path_filestat_mode") that a guest's
-// stat/lstat can call: WASI's filestat carries no permission
-// bits, so the guest merges the real mode in from here. The path is
+// stat/lstat can call: WASI's filestat carries no permission bits, so
+// the guest merges the real mode in from here. The path is
 // preopen-relative; follow selects stat vs lstat semantics. Writes the
 // unix permission bits at modeOutPtr; returns 0 or a negative errno.
 func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, modeOutPtr int32) int32 {
@@ -3075,9 +3076,9 @@ func (w *WasiStubs) pathFilestatMode(m *Module, pathPtr uint64, pathLen, follow 
 }
 
 // Fd_dup is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "fd_dup") that a guest's dup() can call: the new fd shares the same
-// open descriptor (offset included), and the underlying file closes only
-// when the last sharing fd does. Writes the new fd at outPtr.
+// name "fd_dup") that a guest's dup() can call: the new fd shares the
+// same open descriptor (offset included), and the underlying file closes
+// only when the last sharing fd does. Writes the new fd at outPtr.
 func (w *WasiStubs) Fd_dup(m *Module, fd, outPtr int32) int32 {
 	return w.fdDup(m, fd, zext(outPtr))
 }
@@ -4024,15 +4025,15 @@ func (w *WasiStubs) Proc_raise64(m *Module, sig int64) int32 {
 }
 
 // Sock_socket is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "sock_socket") that a guest's socket() can call. WASI preview1 has no way to create an
-// outbound socket; this gives the guest a host-managed fd whose connection is
-// established later by Sock_connect. domain/type follow the POSIX socket()
-// args (AF_INET / SOCK_STREAM); only TCP over IPv4 is supported. Returns the
-// new fd, or a negative errno on failure.
+// name "sock_socket") that a guest's socket() can call. WASI preview1 has no
+// way to create an outbound socket; this gives the guest a host-managed fd
+// whose connection is established later by Sock_connect. domain/type follow
+// the POSIX socket() args (AF_INET / SOCK_STREAM); only TCP over IPv4 is
+// supported. Returns the new fd, or a negative errno on failure.
 func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
-	// The caller has already validated the family against the guest's
-	// AF_INET, so we do not re-check domain here
-	// (the guest's AF_INET numeric value need not match the host's).
+	// A guest calls this only for AF_INET / SOCK_STREAM: domain and typ
+	// are not checked (the guest's AF_INET numeric value need not match
+	// the host's).
 	_ = domain
 	_ = typ
 	w.mu.Lock()
@@ -4041,12 +4042,12 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 }
 
 // Sock_connect is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "sock_connect") that a guest's connect() can call. ipBE carries the IPv4 address in network byte order
-// exactly as it sat in sockaddr_in.sin_addr.s_addr (so the low byte is the
-// first octet); port is host byte order. It consults the dial whitelist,
-// dials via Go's net, and attaches the resulting conn to the socket fd so the
-// existing Sock_send / Sock_recv / Fd_close paths drive it. Returns 0 or a
-// negative errno.
+// name "sock_connect") that a guest's connect() can call. ipBE carries the
+// IPv4 address in network byte order exactly as it sat in
+// sockaddr_in.sin_addr.s_addr (so the low byte is the first octet); port is
+// host byte order. It consults the dial whitelist, dials via Go's net, and
+// attaches the resulting conn to the socket fd so the existing Sock_send /
+// Sock_recv / Fd_close paths drive it. Returns 0 or a negative errno.
 func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	u := uint32(ipBE)
 	ip := fmt.Sprintf("%d.%d.%d.%d", u&0xff, (u>>8)&0xff, (u>>16)&0xff, (u>>24)&0xff)
