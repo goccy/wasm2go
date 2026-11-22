@@ -34,6 +34,7 @@ func TestShmatOverTheRuntimesMappingOnly(t *testing.T) {
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -78,6 +79,19 @@ func (r *recordingIPC) ShmDetach(at []byte) error {
 	r.calls = append(r.calls, fmt.Sprintf("detach at %d len %s", uintptr(unsafe.Pointer(&at[0]))-r.base, length(len(at))))
 	return nil
 }
+
+// failingIPC is a recordingIPC that attaches no segment 9 and detaches
+// nothing, with an error that has no errno.
+type failingIPC struct{ *recordingIPC }
+
+func (f failingIPC) ShmAttach(id int32, at []byte, flags int32) error {
+	if id == 9 {
+		return errors.New("refused")
+	}
+	return f.recordingIPC.ShmAttach(id, at, flags)
+}
+
+func (failingIPC) ShmDetach(at []byte) error { return errors.New("refused") }
 
 const ceiling = 4 * 65536
 
@@ -162,6 +176,27 @@ func main() {
 	})
 	fmt.Println("shmat while an image is built in place", inPlace, built.Err())
 
+	// A failure without an errno is EIO, told Errors without the lock of
+	// the attachments held: the shmdt Errors makes would wait for it.
+	mem, err = img.Memory(ceiling)
+	if err != nil {
+		fmt.Println("memory:", err)
+		return
+	}
+	var failing *pkg.Module
+	var told []string
+	fw := pkg.NewWASI(pkg.WASIConfig{
+		IPC: failingIPC{&recordingIPC{base: uintptr(unsafe.Pointer(&mem[0])), sizes: map[int32]uint64{7: 65536, 9: 65536}}},
+		Errors: func(op string, err error) {
+			told = append(told, fmt.Sprint(op, " ", err, " ", failing.Shmdt(1<<20)))
+		},
+	})
+	failing = pkg.NewWithMemory(fw, mem, img.Size())
+	fmt.Println("failing shmat", failing.Shmat(9, 65536, 65536, 0), failing.Shmat(7, 65536, 65536, 0))
+	fmt.Println("failing shmdt", failing.Shmdt(65536))
+	fmt.Println("told", told)
+	pkg.UnmapMemory(mem)
+
 	if !hostIPC {
 		return
 	}
@@ -234,6 +269,9 @@ shmat 0
 ` + released + `close after the release <nil> [attach 7 at 65536 len 65536 flags 0]
 shmat on heap memory -48
 shmat while an image is built in place -48 <nil>
+failing shmat -29 0
+failing shmdt -29
+told [ipc_shmat refused -28 ipc_shmdt refused -28]
 `
 	if linux {
 		want += `host shmget of huge pages invalid argument

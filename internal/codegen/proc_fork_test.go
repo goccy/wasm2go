@@ -370,7 +370,7 @@ func TestWasi_CloseErrorsAreReported(t *testing.T) {
 	}
 	w, m := newProcTestStubs(t)
 	fd := failing(t, w)
-	if rc := w.Fd_closefrom(m, fd); rc != mapOSError(os.ErrPermission) {
+	if rc := w.Fd_closefrom(m, fd); rc != errnoOfError(os.ErrPermission) {
 		t.Fatalf("Fd_closefrom rc=%d, want the close's error", rc)
 	}
 	if rc := w.Fd_close(m, fd); rc != _wasiEBADF {

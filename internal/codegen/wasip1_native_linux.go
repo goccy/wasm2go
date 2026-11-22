@@ -334,17 +334,14 @@ func utsnameField[T int8 | uint8](raw []T) string {
 // hostAccess asks the host whether the process may make the accesses of
 // amode (access's bits) to the file at path, with its effective ids or its
 // real ones: faccessat(2). asked is true: the host can always say.
-func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+func hostAccess(path string, amode uint32, effective bool) (asked bool, err error) {
 	// faccessat's AT_FDCWD and AT_EACCESS on this system
 	const atFDCWD, atEAccess = -100, 0x200
 	flags := 0
 	if effective {
 		flags = atEAccess
 	}
-	if err := syscall.Faccessat(atFDCWD, path, amode, flags); err != nil {
-		return mapOSError(err), true
-	}
-	return _wasiESUCCESS, true
+	return true, syscall.Faccessat(atFDCWD, path, amode, flags)
 }
 
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,

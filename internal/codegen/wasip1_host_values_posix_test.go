@@ -339,6 +339,7 @@ func TestFdLockOfTwoInstancesOfAProcess(t *testing.T) {
 
 // The range of a lock to wait for is made one from the start of the file.
 func TestAbsoluteRecordLock(t *testing.T) {
+	w := &WasiStubs{}
 	f, err := os.Create(filepath.Join(t.TempDir(), "f"))
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +355,7 @@ func TestAbsoluteRecordLock(t *testing.T) {
 		start  int64
 	}{{0, 1}, {1, 3}, {2, 7}} {
 		lk := recordLock{typ: 1, whence: c.whence, start: 1, len: 1}
-		if errno := absoluteRecordLock(f, &lk); errno != _wasiESUCCESS || lk.whence != 0 || lk.start != c.start {
+		if errno := w.absoluteRecordLock(f, &lk); errno != _wasiESUCCESS || lk.whence != 0 || lk.start != c.start {
 			t.Fatalf("whence %d: errno %d lock %+v, want start %d from SEEK_SET", c.whence, errno, lk, c.start)
 		}
 	}
@@ -362,11 +363,11 @@ func TestAbsoluteRecordLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	lk := recordLock{whence: 1}
-	if errno := absoluteRecordLock(f, &lk); errno != _wasiEBADF {
+	if errno := w.absoluteRecordLock(f, &lk); errno != _wasiEBADF {
 		t.Fatalf("SEEK_CUR of a closed file errno %d, want EBADF", errno)
 	}
 	lk = recordLock{whence: 2}
-	if errno := absoluteRecordLock(f, &lk); errno != _wasiEBADF {
+	if errno := w.absoluteRecordLock(f, &lk); errno != _wasiEBADF {
 		t.Fatalf("SEEK_END of a closed file errno %d, want EBADF", errno)
 	}
 }

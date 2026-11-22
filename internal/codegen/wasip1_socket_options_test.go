@@ -300,7 +300,7 @@ func TestSocket_TimeoutsSetOnTheHost(t *testing.T) {
 	for _, d := range []time.Duration{time.Nanosecond, 2*time.Second - time.Nanosecond, math.MaxInt64} {
 		var tv syscall.Timeval
 		var failed error
-		if errno := socketCall(op.hostSocket(), func(fd int) {
+		if errno := w.socketCall("test", op.hostSocket(), func(fd int) {
 			if failed = setHostSocketTimeout(fd, false, d); failed == nil {
 				failed = hostGetsockopt(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, unsafe.Pointer(&tv), unsafe.Sizeof(tv))
 			}
@@ -325,7 +325,7 @@ func TestSocket_LingerInSeconds(t *testing.T) {
 	w.mu.Unlock()
 	var linger syscall.Linger
 	var failed error
-	if errno := socketCall(op.hostSocket(), func(fd int) {
+	if errno := w.socketCall("test", op.hostSocket(), func(fd int) {
 		failed = hostGetsockopt(fd, syscall.SOL_SOCKET, hostSOLinger, unsafe.Pointer(&linger), unsafe.Sizeof(linger))
 	}); errno != _wasiESUCCESS || failed != nil {
 		t.Fatalf("getsockopt errno=%d err=%v", errno, failed)

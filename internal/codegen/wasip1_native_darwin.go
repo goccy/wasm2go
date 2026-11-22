@@ -211,14 +211,11 @@ func hostUname() (Uname, error) {
 // no faccessat on this system, so a question with the effective ids is
 // asked only of a process whose effective ids are its real ones; for any
 // other, asked is false.
-func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
+func hostAccess(path string, amode uint32, effective bool) (asked bool, err error) {
 	if effective && (os.Geteuid() != os.Getuid() || os.Getegid() != os.Getgid()) {
-		return 0, false
+		return false, nil
 	}
-	if err := syscall.Access(path, amode); err != nil {
-		return mapOSError(err), true
-	}
-	return _wasiESUCCESS, true
+	return true, syscall.Access(path, amode)
 }
 
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,

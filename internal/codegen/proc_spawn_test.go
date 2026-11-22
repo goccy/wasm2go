@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -142,6 +143,24 @@ func TestWasi_ProcSpawnNotFound(t *testing.T) {
 	argvOff := writeArgv(m, 2000, 3000, []string{"/no/such/binary-xyz"})
 	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiENOENT {
 		t.Fatalf("missing binary rc=%d, want -ENOENT", rc)
+	}
+}
+
+// A command the host cannot start fails with the host's errno: a file that
+// may be executed but is no program is ENOEXEC.
+func TestWasi_ProcSpawnNotAProgram(t *testing.T) {
+	const wasiENOEXEC = 45 // the runtime has no constant of its own for it
+	dir := t.TempDir()
+	w, m := newTestStubs(t, dir)
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
+	prog := filepath.Join(dir, "prog")
+	if err := os.WriteFile(prog, []byte{0, 1, 2, 3}, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pathOff := writeCStr(m, 1000, prog)
+	argvOff := writeArgv(m, 2000, 3000, []string{prog})
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -wasiENOEXEC {
+		t.Fatalf("spawn of no program rc=%d, want -ENOEXEC", rc)
 	}
 }
 

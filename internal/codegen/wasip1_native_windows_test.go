@@ -20,8 +20,8 @@ func TestWasi_WindowsErrorsWithoutAName(t *testing.T) {
 		{10061, _wasiECONNREFUSED},
 		{10065, _wasiEHOSTUNREACH},
 	} {
-		if got := mapOSError(&os.PathError{Op: "seek", Path: "x", Err: c.err}); got != c.want {
-			t.Errorf("mapOSError(%d) = %d, want %d", c.err, got, c.want)
+		if got := errnoOfError(&os.PathError{Op: "seek", Path: "x", Err: c.err}); got != c.want {
+			t.Errorf("errnoOfError(%d) = %d, want %d", c.err, got, c.want)
 		}
 	}
 }

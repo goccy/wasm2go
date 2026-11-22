@@ -975,8 +975,8 @@ func setHostSockOpt(fd int, option, value int32) error {
 
 // getHostSockOpt returns the value of option (wasiSockOpt...) of socket fd
 // (getsockopt(2)), as the host has it: linger in seconds, or -1 for off;
-// SO_ERROR as the guest's errno; SO_TYPE as a wasiSockType. An option the
-// host has not is ENOPROTOOPT.
+// SO_ERROR as the host's error number; SO_TYPE as a wasiSockType. An
+// option the host has not is ENOPROTOOPT.
 func getHostSockOpt(fd int, option int32) (int32, error) {
 	level, name, held := hostSockOpt(option)
 	switch {
@@ -997,11 +997,6 @@ func getHostSockOpt(fd int, option int32) (int32, error) {
 		return 0, os.NewSyscallError("getsockopt", err)
 	}
 	switch option {
-	case wasiSockOptError:
-		if v == 0 {
-			return 0, nil
-		}
-		return mapOSError(syscall.Errno(v)), nil
 	case wasiSockOptType:
 		if v == syscall.SOCK_DGRAM {
 			return wasiSockTypeDgram, nil
@@ -1163,7 +1158,7 @@ func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, st
 		if setup.input != nil {
 			setup.input.finish()
 		}
-		return waitStatusOf(st, err)
+		return w.waitStatusOf(st, err)
 	}}, nil
 }
 

@@ -104,13 +104,13 @@ func TestMemFS_InvalidOffsetsAndDirectories(t *testing.T) {
 	fsys := NewMemFS()
 	f := openDataFile(t, w, fsys)
 	buf := make([]byte, 4)
-	if _, err := f.ReadAt(buf, -1); mapOSError(err) != _wasiEINVAL {
+	if _, err := f.ReadAt(buf, -1); errnoOfError(err) != _wasiEINVAL {
 		t.Errorf("ReadAt: err=%v, want EINVAL", err)
 	}
-	if _, err := f.WriteAt(buf, -1); mapOSError(err) != _wasiEINVAL {
+	if _, err := f.WriteAt(buf, -1); errnoOfError(err) != _wasiEINVAL {
 		t.Errorf("WriteAt: err=%v, want EINVAL", err)
 	}
-	if _, err := f.Seek(0, 3); mapOSError(err) != _wasiEINVAL {
+	if _, err := f.Seek(0, 3); errnoOfError(err) != _wasiEINVAL {
 		t.Errorf("Seek whence 3: err=%v, want EINVAL", err)
 	}
 	wantSize(t, f, 4)
@@ -127,13 +127,13 @@ func TestMemFS_InvalidOffsetsAndDirectories(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if _, err := d.Write(buf); mapOSError(err) != _wasiEISDIR {
+	if _, err := d.Write(buf); errnoOfError(err) != _wasiEISDIR {
 		t.Errorf("Write on a directory: err=%v, want EISDIR", err)
 	}
-	if _, err := d.WriteAt(buf, 0); mapOSError(err) != _wasiEISDIR {
+	if _, err := d.WriteAt(buf, 0); errnoOfError(err) != _wasiEISDIR {
 		t.Errorf("WriteAt on a directory: err=%v, want EISDIR", err)
 	}
-	if err := d.Truncate(1); mapOSError(err) != _wasiEISDIR {
+	if err := d.Truncate(1); errnoOfError(err) != _wasiEISDIR {
 		t.Errorf("Truncate on a directory: err=%v, want EISDIR", err)
 	}
 }

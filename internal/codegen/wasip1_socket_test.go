@@ -208,7 +208,7 @@ func hostNonblocking(t *testing.T, w *WasiStubs, fd int32) bool {
 	w.mu.Unlock()
 	var flags int
 	var err error
-	if errno := socketCall(op.hostSocket(), func(fd int) { flags, err = descriptorFlags(fd, syscall.F_GETFL) }); errno != _wasiESUCCESS || err != nil {
+	if errno := w.socketCall("test", op.hostSocket(), func(fd int) { flags, err = descriptorFlags(fd, syscall.F_GETFL) }); errno != _wasiESUCCESS || err != nil {
 		t.Fatalf("F_GETFL errno=%d err=%v", errno, err)
 	}
 	return flags&syscall.O_NONBLOCK != 0
@@ -1148,7 +1148,7 @@ func TestSocket_LookupIsInterruptible(t *testing.T) {
 	}
 	takeSignals(t, w, m)
 	postWhenBlocked(w, wasiSIGUSR1)
-	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly("sock_resolve", func(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}); errno != _wasiEINTR {
@@ -1156,23 +1156,24 @@ func TestSocket_LookupIsInterruptible(t *testing.T) {
 	}
 	takeSignals(t, w, m)
 	postWhenBlocked(w, wasiSIGUSR1)
-	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly("sock_resolve", func(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}); errno != _wasiESUCCESS {
 		t.Fatalf("lookup that went through errno=%d", errno)
 	}
 	notFound := func(context.Context) error { return &net.DNSError{IsNotFound: true} }
-	if errno := w.lookupInterruptibly(notFound); errno != _wasiEINTR {
+	if errno := w.lookupInterruptibly("sock_resolve", notFound); errno != _wasiEINTR {
 		t.Fatalf("lookup after one that went through a signal errno=%d, want EINTR", errno)
 	}
 	takeSignals(t, w, m)
-	if errno := w.lookupInterruptibly(notFound); errno != _wasiENOENT {
+	if errno := w.lookupInterruptibly("sock_resolve", notFound); errno != _wasiENOENT {
 		t.Fatalf("lookup of no name errno=%d, want ENOENT", errno)
 	}
 }
 
 func TestSocket_LookupErrno(t *testing.T) {
+	w := &WasiStubs{}
 	for _, c := range []struct {
 		err  error
 		want int32
@@ -1182,9 +1183,9 @@ func TestSocket_LookupErrno(t *testing.T) {
 		{&net.DNSError{IsTemporary: true}, _wasiEAGAIN},
 		{&net.DNSError{}, _wasiEIO},
 		{&net.AddrError{Err: "no suitable address found", Addr: "h"}, _wasiENOENT},
-		{errors.ErrUnsupported, _wasiENOTSUP},
+		{errors.ErrUnsupported, _wasiENOSYS},
 	} {
-		if got := lookupErrno(c.err); got != c.want {
+		if got := w.lookupErrno("sock_resolve", c.err); got != c.want {
 			t.Errorf("lookupErrno(%v) = %d, want %d", c.err, got, c.want)
 		}
 	}
@@ -1204,6 +1205,7 @@ func TestSocket_MakingErrorsNameTheirCall(t *testing.T) {
 			t.Fatalf("error %v is wrapped twice", err)
 		}
 	}
+	w := &WasiStubs{}
 	_, err := hostSocketFD(-1, syscall.SOCK_STREAM)
 	once(err, "socket")
 	_, err = hostSocketPairFDs(-1)
@@ -1217,7 +1219,7 @@ func TestSocket_MakingErrorsNameTheirCall(t *testing.T) {
 			t.Errorf("close: %v", err)
 		}
 	})
-	if errno := socketCall(host, func(fd int) { _, _, err = hostAccept(fd) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("test", host, func(fd int) { _, _, err = hostAccept(fd) }); errno != _wasiESUCCESS {
 		t.Fatalf("socketCall errno=%d", errno)
 	}
 	once(err, "accept", "accept4")

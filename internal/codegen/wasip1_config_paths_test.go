@@ -164,8 +164,8 @@ func TestWasi_HostFSRootContainment(t *testing.T) {
 		}
 	}
 	// os.Root's refusal is EACCES.
-	if _, err := w.fs().Stat("../f"); mapOSError(err) != _wasiEACCES {
-		t.Errorf("the escape error %v maps to %d, want EACCES", err, mapOSError(err))
+	if _, err := w.fs().Stat("../f"); errnoOfError(err) != _wasiEACCES {
+		t.Errorf("the escape error %v maps to %d, want EACCES", err, errnoOfError(err))
 	}
 	// A link the guest makes may point anywhere; the guest cannot follow
 	// it out of the root.
@@ -386,8 +386,8 @@ func TestWasi_HostFSEscapeIsPermission(t *testing.T) {
 		"Readlink": readlinkErr,
 		"Link":     fsys.Link("../x", "y"),
 	} {
-		if !errors.Is(err, fs.ErrPermission) || mapOSError(err) != _wasiEACCES {
-			t.Errorf("%s: %v (errno %d), want EACCES", name, err, mapOSError(err))
+		if !errors.Is(err, fs.ErrPermission) || errnoOfError(err) != _wasiEACCES {
+			t.Errorf("%s: %v (errno %d), want EACCES", name, err, errnoOfError(err))
 		}
 	}
 	if _, err := fsys.Stat("missing"); !errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {

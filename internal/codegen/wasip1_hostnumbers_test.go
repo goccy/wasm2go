@@ -81,27 +81,31 @@ func TestWasi_ErrorsKeepTheirNumber(t *testing.T) {
 	} {
 		for _, err := range []error{c.err, &os.PathError{Op: "open", Path: "x", Err: c.err},
 			fmt.Errorf("wrapped: %w", os.NewSyscallError("rename", c.err))} {
-			if got := mapOSError(err); got != c.want {
-				t.Errorf("mapOSError(%v) = %d, want %d", err, got, c.want)
+			if got := errnoOfError(err); got != c.want {
+				t.Errorf("errnoOfError(%v) = %d, want %d", err, got, c.want)
 			}
 		}
 	}
-	// An error of the host's that wasi has no number for is an I/O error.
-	if got := mapOSError(syscall.EHOSTDOWN); got != _wasiEIO {
-		t.Errorf("EHOSTDOWN = %d, want EIO", got)
+	// An error of the host's that wasi has no number for is an I/O error,
+	// one without an errno.
+	if got, known := wasiErrnoOf(syscall.EHOSTDOWN); got != _wasiEIO || known {
+		t.Errorf("EHOSTDOWN = %d, %v, want EIO without an errno", got, known)
 	}
-	if got := mapOSError(&os.PathError{Op: "mount", Path: "x", Err: syscall.ENOTBLK}); got != _wasiEIO {
+	if got, known := wasiErrnoOf(syscall.EIO); got != _wasiEIO || !known {
+		t.Errorf("EIO = %d, %v, want EIO", got, known)
+	}
+	if got := errnoOfError(&os.PathError{Op: "mount", Path: "x", Err: syscall.ENOTBLK}); got != _wasiEIO {
 		t.Errorf("ENOTBLK = %d, want EIO", got)
 	}
 	// An error that is no system call's has its kind.
-	if got := mapOSError(errors.New("no number")); got != _wasiEIO {
+	if got := errnoOfError(errors.New("no number")); got != _wasiEIO {
 		t.Errorf("an error without a number = %d, want EIO", got)
 	}
-	if got := mapOSError(os.ErrNotExist); got != _wasiENOENT {
+	if got := errnoOfError(os.ErrNotExist); got != _wasiENOENT {
 		t.Errorf("os.ErrNotExist = %d, want ENOENT", got)
 	}
-	if got := mapOSError(errors.ErrUnsupported); got != _wasiENOTSUP {
-		t.Errorf("errors.ErrUnsupported = %d, want ENOTSUP", got)
+	if got := errnoOfError(errors.ErrUnsupported); got != _wasiENOSYS {
+		t.Errorf("errors.ErrUnsupported = %d, want ENOSYS", got)
 	}
 
 	// The system calls themselves.
@@ -112,17 +116,17 @@ func TestWasi_ErrorsKeepTheirNumber(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "d", "f"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := mapOSError(os.Remove(filepath.Join(dir, "d"))); got != 55 {
+	if got := errnoOfError(os.Remove(filepath.Join(dir, "d"))); got != 55 {
 		t.Errorf("removing a directory that is not empty = %d, want ENOTEMPTY (55)", got)
 	}
 	if err := os.Symlink("loop", filepath.Join(dir, "loop")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Open(filepath.Join(dir, "loop")); mapOSError(err) != 32 {
-		t.Errorf("opening a link to itself = %d, want ELOOP (32)", mapOSError(err))
+	if _, err := os.Open(filepath.Join(dir, "loop")); errnoOfError(err) != 32 {
+		t.Errorf("opening a link to itself = %d, want ELOOP (32)", errnoOfError(err))
 	}
-	if _, err := os.Open(filepath.Join(dir, strings.Repeat("n", 5000))); mapOSError(err) != 37 {
-		t.Errorf("opening a name too long = %d, want ENAMETOOLONG (37)", mapOSError(err))
+	if _, err := os.Open(filepath.Join(dir, strings.Repeat("n", 5000))); errnoOfError(err) != 37 {
+		t.Errorf("opening a name too long = %d, want ENAMETOOLONG (37)", errnoOfError(err))
 	}
 }
 
