@@ -858,12 +858,16 @@ func TestHostSyslog(t *testing.T) {
 	}
 }
 
-// access by the mode bits of a file of an FS other than the whole host's,
-// for the ids of the Process: the owner's bits for the owner, the group's
-// for a member, the others' for the rest, and anything but running a file
+// modeBitsFS is an FS that is no AccessFS.
+type modeBitsFS struct{ FS }
+
+// access by the mode bits of a file of an FS that is no AccessFS, for the
+// ids of the Process: the owner's bits for the owner, the group's for a
+// member, the others' for the rest, and anything but running a file
 // without an x bit for user 0.
 func TestPathAccessByTheModeBits(t *testing.T) {
 	w, m, fsys := memTestStubs(t)
+	w.cfg.FS = modeBitsFS{fsys}
 	if err := fsys.WriteFile("f", nil, 0o640); err != nil {
 		t.Fatal(err)
 	}

@@ -245,13 +245,9 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 		if e.IsDir() != want.IsDir() {
 			t.Errorf("%s: IsDir() = %v", name, e.IsDir())
 		}
-		// An entry whose directory does not record the type asks the file:
-		// by its host path in the whole host filesystem, relative to the
-		// directory in a HostFS root where the system has a call for that
+		// An entry whose directory does not record the type asks the file,
+		// relative to the directory, where the system has a call for that
 		// (not darwin, whose listing records every type).
-		if got := (&hostDirEntry{dir: dirFile, hostPath: true, name: name}).Type(); got != want {
-			t.Errorf("%s, type not recorded, whole host: type %v, want %v", name, got, want)
-		}
 		unknown := &hostDirEntry{dir: dirFile, name: name}
 		wantUnknown := want
 		if runtime.GOOS == "darwin" {
