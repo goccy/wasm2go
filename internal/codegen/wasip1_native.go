@@ -8494,8 +8494,8 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 }
 
 // Sock_accept64 is Sock_accept for a memory64 guest.
-func (w *WasiStubs) Sock_accept64(m *Module, fd, flags int32, fdOutPtr int64) int32 {
-	return w.sockAccept(m, fd, flags, uint64(fdOutPtr))
+func (w *WasiStubs) Sock_accept64(m *Module, fd, flags, fdOutPtr int64) int32 {
+	return w.sockAccept(m, int32(fd), int32(flags), uint64(fdOutPtr))
 }
 
 // sockAccept is the body of Sock_accept and Sock_accept64.
@@ -8543,8 +8543,8 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 
 // Sock_recv64 is Sock_recv for a memory64 guest, whose ri_data_len and
 // ro_datalen are __wasi_size_t.
-func (w *WasiStubs) Sock_recv64(m *Module, fd int32, riData, riDataLen int64, riFlags int32, roDataLenPtr, roFlagsPtr int64) int32 {
-	return w.sockRecv(m, wasiABI64, fd, uint64(riData), uint64(riDataLen), riFlags, uint64(roDataLenPtr), uint64(roFlagsPtr))
+func (w *WasiStubs) Sock_recv64(m *Module, fd, riData, riDataLen, riFlags, roDataLenPtr, roFlagsPtr int64) int32 {
+	return w.sockRecv(m, wasiABI64, int32(fd), uint64(riData), uint64(riDataLen), int32(riFlags), uint64(roDataLenPtr), uint64(roFlagsPtr))
 }
 
 // sockRecv is the body of Sock_recv and Sock_recv64.
@@ -8602,8 +8602,8 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 
 // Sock_send64 is Sock_send for a memory64 guest, whose si_data_len and
 // so_datalen are __wasi_size_t.
-func (w *WasiStubs) Sock_send64(m *Module, fd int32, siData, siDataLen int64, siFlags int32, soDataLenPtr int64) int32 {
-	return w.sockSend(m, wasiABI64, fd, uint64(siData), uint64(siDataLen), siFlags, uint64(soDataLenPtr))
+func (w *WasiStubs) Sock_send64(m *Module, fd, siData, siDataLen, siFlags, soDataLenPtr int64) int32 {
+	return w.sockSend(m, wasiABI64, int32(fd), uint64(siData), uint64(siDataLen), int32(siFlags), uint64(soDataLenPtr))
 }
 
 // sockSend is the body of Sock_send and Sock_send64.
@@ -10146,8 +10146,8 @@ func (w *WasiStubs) sockHostByName(m *Module, nodePtr uint64, nodeLen int32, buf
 }
 
 // Sock_shutdown64 is Sock_shutdown for a memory64 guest.
-func (w *WasiStubs) Sock_shutdown64(m *Module, fd, how int32) int32 {
-	return w.Sock_shutdown(m, fd, how)
+func (w *WasiStubs) Sock_shutdown64(m *Module, fd, how int64) int32 {
+	return w.Sock_shutdown(m, int32(fd), int32(how))
 }
 
 // writeFilestat populates the 64-byte WASI filestat structure from a

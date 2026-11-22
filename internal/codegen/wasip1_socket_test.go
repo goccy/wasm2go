@@ -617,7 +617,7 @@ func TestSocket_Mem64Twins(t *testing.T) {
 	if rc := w.Sock_connect64(m, client, 0x0100007f, port); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_connect64 rc=%d", rc)
 	}
-	if rc := w.Sock_accept64(m, fd, 0, int64(sockValueOff)); rc != _wasiESUCCESS {
+	if rc := w.Sock_accept64(m, int64(fd), 0, int64(sockValueOff)); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_accept64 rc=%d", rc)
 	}
 	conn := int32(readU32(m.memory, int(sockValueOff)))
@@ -625,11 +625,11 @@ func TestSocket_Mem64Twins(t *testing.T) {
 	copy(m.memory[sockBufOff:], "ok")
 	binary.LittleEndian.PutUint64(m.memory[sockIovOff:], uint64(sockBufOff))
 	binary.LittleEndian.PutUint64(m.memory[sockIovOff+8:], 2)
-	if rc := w.Sock_send64(m, client, int64(sockIovOff), 1, 0, int64(sockLenOff)); rc != _wasiESUCCESS || readU64(m.memory, int(sockLenOff)) != 2 {
+	if rc := w.Sock_send64(m, int64(client), int64(sockIovOff), 1, 0, int64(sockLenOff)); rc != _wasiESUCCESS || readU64(m.memory, int(sockLenOff)) != 2 {
 		t.Fatalf("Sock_send64 rc=%d count=%d", rc, readU64(m.memory, int(sockLenOff)))
 	}
 	binary.LittleEndian.PutUint64(m.memory[sockIovOff+8:], 64)
-	if rc := w.Sock_recv64(m, conn, int64(sockIovOff), 1, 0, int64(sockLenOff), int64(sockFlagsOff)); rc != _wasiESUCCESS || readU64(m.memory, int(sockLenOff)) != 2 {
+	if rc := w.Sock_recv64(m, int64(conn), int64(sockIovOff), 1, 0, int64(sockLenOff), int64(sockFlagsOff)); rc != _wasiESUCCESS || readU64(m.memory, int(sockLenOff)) != 2 {
 		t.Fatalf("Sock_recv64 rc=%d count=%d", rc, readU64(m.memory, int(sockLenOff)))
 	}
 	if rc := w.Sock_sendto_addr64(m, conn, int64(sockBufOff), 2, 0, 0, 0, 0, int64(sockLenOff)); rc != _wasiESUCCESS {
@@ -638,7 +638,7 @@ func TestSocket_Mem64Twins(t *testing.T) {
 	if rc := w.Sock_recvfrom_addr64(m, client, int64(sockBufOff), 64, 0, int64(sockAddr2Off), int64(sockLenOff)); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_recvfrom_addr64 rc=%d", rc)
 	}
-	if rc := w.Sock_shutdown64(m, client, 3); rc != _wasiESUCCESS {
+	if rc := w.Sock_shutdown64(m, int64(client), 3); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_shutdown64 rc=%d", rc)
 	}
 	if rc := w.Sock_socketpair64(m, wasiSockFamilyUnix, wasiSockTypeStream, int64(sockFdsOff)); rc != _wasiESUCCESS {
