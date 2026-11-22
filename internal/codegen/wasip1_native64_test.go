@@ -798,6 +798,9 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 				return w.Path_access64(m, 512, 5, 4, 0) | w.Path_mkfifo64(m, 512, 5, 0o600) | w.Fd_flock64(m, fd, 1, 0) |
 					w.Fd_lock64(m, fd, recordLockGet, 1024)
 			}},
+		{"fd_ioctl of no terminal",
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_ioctl(m, fd, linuxTIOCGWINSZ, 1024) },
+			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_ioctl64(m, fd, linuxTIOCGWINSZ, 1024) }},
 		{"pipe",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe(m, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Pipe64(m, 1024) }},

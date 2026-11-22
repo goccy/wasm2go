@@ -35,6 +35,7 @@ var posixImports = map[string]bool{
 	"fd_dupfd":                   true,
 	"fd_filestat_ext":            true,
 	"fd_flock":                   true,
+	"fd_ioctl":                   true,
 	"fd_lock":                    true,
 	"fd_path":                    true,
 	"host_number_at":             true,

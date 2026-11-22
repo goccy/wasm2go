@@ -150,6 +150,8 @@
     (func $proc_kill (param i32 i32) (result i32)))
   (import "wasip1_posix_extension" "fd_flock"
     (func $fd_flock (param i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "fd_ioctl"
+    (func $fd_ioctl (param i32 i32 i64) (result i32)))
   (import "wasip1_posix_extension" "fd_lock"
     (func $fd_lock (param i32 i32 i64) (result i32)))
   (import "wasip1_posix_extension" "host_numbering"
@@ -313,6 +315,7 @@
     (call $proc_terminate (i32.const 0))
     (drop (call $proc_kill (i32.const 0) (i32.const 0)))
     (drop (call $fd_flock (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $fd_ioctl (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $fd_lock (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $host_numbering))
     (drop (call $host_number_at (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
