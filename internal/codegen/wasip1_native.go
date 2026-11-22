@@ -1518,7 +1518,7 @@ func streamPolled(stream any) bool {
 // until passes (the zero time is no limit) or wake, a descriptor of the
 // host's (-1 for none), is readable. poll(2) is asked about the descriptor
 // numbers, which nothing holds open meanwhile: a close of an entry's slot
-// by the guest wakes the wait first (closeWasiOpen), while a stream that an
+// by the guest wakes the wait (closeWasiOpen), while a stream that an
 // embedder closes as the guest waits for it leaves the wait to its timeout
 // or another event. A stream closed already is ready, and the call on it
 // reports the closing.
@@ -3804,29 +3804,44 @@ func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 // instead of silently dropping the failure.
 func closeWasiOpen(op *wasiOpen) error {
 	op.mu.Lock()
-	// The waits in poll(2) for the descriptor are woken first: the number
-	// they wait on leaves a slot, and may be closed.
-	var err error
-	for wk := range op.waiters {
-		err = errors.Join(err, hostWakeWrite(wk.w))
-	}
 	if op.refs > 0 {
 		// another table slot, of this instance (dup/dup2) or of a forked
-		// one, still references this descriptor
+		// one, still references this descriptor, which stays open: the
+		// waits in poll(2) for it are woken, as the number they wait on
+		// leaves a slot, and wait for it again.
+		err := op.wakeWaitersLocked()
 		op.refs--
 		op.mu.Unlock()
 		return err
 	}
-	conn := op.conn
+	f, conn, listener := op.f, op.conn, op.listener
 	op.mu.Unlock()
-	if op.f != nil {
-		err = errors.Join(err, op.f.Close())
+	var err error
+	if f != nil {
+		err = errors.Join(err, f.Close())
 	}
 	if conn != nil && op.connClosed.CompareAndSwap(false, true) {
 		err = errors.Join(err, conn.Close())
 	}
-	if op.listener != nil && op.connClosed.CompareAndSwap(false, true) {
-		err = errors.Join(err, op.listener.Close())
+	if listener != nil && op.connClosed.CompareAndSwap(false, true) {
+		err = errors.Join(err, listener.Close())
+	}
+	// The waits in poll(2) for the descriptor are woken once it is closed:
+	// one woken before could wait again on the open descriptor, and
+	// nothing would end that wait. Woken now, it finds the descriptor
+	// closed.
+	op.mu.Lock()
+	err = errors.Join(err, op.wakeWaitersLocked())
+	op.mu.Unlock()
+	return err
+}
+
+// wakeWaitersLocked ends the waits in poll(2) for the entry's descriptor
+// (addWaiter). Caller holds op.mu.
+func (op *wasiOpen) wakeWaitersLocked() error {
+	var err error
+	for wk := range op.waiters {
+		err = errors.Join(err, hostWakeWrite(wk.w))
 	}
 	return err
 }
