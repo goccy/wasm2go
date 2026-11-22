@@ -131,7 +131,7 @@ func TestWasi_AcceptTakesLowestFreeNumber(t *testing.T) {
 	}
 	w, m := newProcTestStubs(t)
 	w.mu.Lock()
-	w.fdsLocked()[7] = &wasiOpen{listener: ln}
+	w.setSlotLocked(7, &wasiOpen{listener: ln})
 	w.mu.Unlock()
 	t.Cleanup(func() {
 		if err := w.CloseAll(); err != nil {
