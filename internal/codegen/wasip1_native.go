@@ -2572,13 +2572,72 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 // 0, or a positive errno for the first close that failed (every fd in range
 // is closed regardless).
 func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
-	w.mu.Lock()
-	closing := w.clearSlotsFromLocked(lowFd)
-	w.mu.Unlock()
-	if err := closeWasiOpens(closing); err != nil {
+	if err := w.closeFrom(lowFd); err != nil {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
+}
+
+// closeFrom closes every fd numbered lowFd or higher, each as fd_close
+// would, and joins the close errors.
+func (w *WasiStubs) closeFrom(lowFd int32) error {
+	w.mu.Lock()
+	closing := w.clearSlotsFromLocked(lowFd)
+	w.mu.Unlock()
+	return closeWasiOpens(closing)
+}
+
+// CloseDescriptors closes every descriptor of this instance in its table,
+// each as fd_close would, and nothing else: the preopened directories stay
+// (the root's numbers, wasiPreopenFD and wasiRootFD), and the instance
+// stays what it is to the processes of its family and keeps receiving
+// signals. It is for an embedder that ends an instance whose guest may
+// still be running on another goroutine: the guest finds every descriptor
+// it opened, and its standard ones, closed. CloseAll is still to be called
+// once the guest no longer runs. The close errors are joined.
+func (w *WasiStubs) CloseDescriptors() error {
+	return w.closeFrom(0)
+}
+
+// KillCommands ends the commands this instance started (Proc_spawn) and
+// has not waited for: each one still running is killed, as by SIGKILL,
+// and the call returns once every one killed, or found ended, has ended
+// and what the runtime copied of its output is delivered (startCommand),
+// as os/exec's Cmd.Wait without a WaitDelay: a destination that does not
+// take the output holds the call. A read of an embedder's stdin a copy is
+// in is not waited for, as the runtime cannot end it, except on a system
+// where commands are started by os/exec (not darwin or linux), whose wait
+// waits for that copy too. A command the kill fails for (EPERM) is not
+// waited for: its error is returned. The commands are those in the table
+// when the call takes it: one started afterwards is not killed. They stay
+// in the instance's process table, with the status they end with. The
+// errors of the kills are joined.
+//
+// It is for an embedder that ends an instance without letting it run on,
+// and may be called while the guest is running on another goroutine.
+func (w *WasiStubs) KillCommands() error {
+	w.mu.Lock()
+	var commands []*wasiProc
+	for _, proc := range w.procs {
+		if proc.host != nil {
+			commands = append(commands, proc)
+		}
+	}
+	w.mu.Unlock()
+	var err error
+	var ending []*wasiProc
+	for _, proc := range commands {
+		// A command that has ended already is not killed, and ends.
+		if kerr := proc.host.Kill(); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
+			err = errors.Join(err, kerr)
+			continue
+		}
+		ending = append(ending, proc)
+	}
+	for _, proc := range ending {
+		<-proc.done
+	}
+	return err
 }
 
 // Fd_closefrom64 is Fd_closefrom for a memory64 guest.

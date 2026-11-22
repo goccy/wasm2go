@@ -387,6 +387,24 @@ func TestWasi_SpawnWithSocketAsStandardStream(t *testing.T) {
 	}
 }
 
+// CloseDescriptors closes every descriptor, the standard ones included,
+// and CloseAll still disposes of the instance afterwards.
+func TestWasi_CloseDescriptorsClosesEveryDescriptor(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	r, wr := newTestPipe(t, w, m)
+	if err := w.CloseDescriptors(); err != nil {
+		t.Fatalf("CloseDescriptors: %v", err)
+	}
+	for _, fd := range []int32{0, 1, 2, r, wr} {
+		if rc := w.Fd_fdstat_get(m, fd, 5200); rc != _wasiEBADF {
+			t.Errorf("Fd_fdstat_get(%d) after CloseDescriptors rc=%d, want EBADF", fd, rc)
+		}
+	}
+	if err := w.CloseAll(); err != nil {
+		t.Fatalf("CloseAll after CloseDescriptors: %v", err)
+	}
+}
+
 func TestWasi_ForkCopiesClosedStandardDescriptors(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	closeTestFd(t, w, m, 1)
