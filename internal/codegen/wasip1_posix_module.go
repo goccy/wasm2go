@@ -88,6 +88,9 @@ var posixImports = map[string]bool{
 	"sock_setopt":                true,
 	"sock_socketpair":            true,
 	"sock_timeout":               true,
+
+	"proc_chdir":  true,
+	"proc_setenv": true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that
