@@ -23,6 +23,15 @@ func hostOnMainThread() bool { return false }
 // hostUnshareFS: no thread here has file system attributes of its own.
 func hostUnshareFS() error { return errors.ErrUnsupported }
 
+// withHostTerminal: no file is a terminal of the host's here.
+func withHostTerminal(f *os.File, use func(fd int) error) error { return syscall.ENOTTY }
+
+// hostTerminalIoctl: no request of a terminal is made here
+// (withHostTerminal).
+func hostTerminalIoctl(fd int, request uint32, arg *terminalArg) (int, error) {
+	return 0, syscall.ENOTTY
+}
+
 // hostSetThreadUmask: this platform has no umask.
 func hostSetThreadUmask(mask os.FileMode) {}
 

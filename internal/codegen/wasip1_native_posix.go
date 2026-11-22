@@ -492,6 +492,48 @@ func withDuplicateDescriptor(f *os.File, use func(fd uintptr) error) error {
 	return errors.Join(use(uintptr(dup)), syscall.Close(dup))
 }
 
+// withHostTerminal calls use with a duplicate of the descriptor of f
+// (withDuplicateDescriptor), as a request of a terminal may wait for its
+// output to drain, when f is a terminal (hostTerminal); the error is ENOTTY
+// when it is not.
+func withHostTerminal(f *os.File, use func(fd int) error) error {
+	return withDuplicateDescriptor(f, func(fd uintptr) error {
+		if !hostTerminal(int(fd)) {
+			return syscall.ENOTTY
+		}
+		return use(int(fd))
+	})
+}
+
+// hostIoctlPointer is ioctl(2) with the address of what the request takes.
+// A call the delivery of a signal to the host process interrupts (EINTR) is
+// made again.
+func hostIoctlPointer(fd int, request uint32, arg unsafe.Pointer) (int, error) {
+	for {
+		r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(request), uintptr(arg))
+		if errno == 0 {
+			return int(r), nil
+		}
+		if errno != syscall.EINTR {
+			return 0, errno
+		}
+	}
+}
+
+// hostIoctlValue is hostIoctlPointer for a request that takes an int as it
+// is.
+func hostIoctlValue(fd int, request uint32, arg uintptr) (int, error) {
+	for {
+		r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(request), arg)
+		if errno == 0 {
+			return int(r), nil
+		}
+		if errno != syscall.EINTR {
+			return 0, errno
+		}
+	}
+}
+
 // flockOSFile applies flock(2) with how (LockFS.Flock's) to a file of the
 // host process. A lock that may have to be waited for is taken through a
 // duplicate of the descriptor (withDuplicateDescriptor), which shares the

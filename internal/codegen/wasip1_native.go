@@ -3663,6 +3663,7 @@ const (
 	_wasiENOTEMPTY    int32 = 55
 	_wasiENOTSOCK     int32 = 57
 	_wasiENOTSUP      int32 = 58
+	_wasiENOTTY       int32 = 59
 	_wasiENOSYS       int32 = 52
 	_wasiENXIO        int32 = 60
 	_wasiEPERM        int32 = 63
@@ -11136,6 +11137,283 @@ func (w *WasiStubs) sockService(m *Module, namePtr uint64, nameLen, port, byPort
 	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
 }
 
+// ----- terminals ---------------------------------------------------------------
+//
+// The guest makes the requests of a terminal (Fd_ioctl) as a program of
+// Linux makes them on most of its architectures (asm-generic), whatever the
+// host is: the numbers of the requests are those of
+// include/uapi/asm-generic/ioctls.h, and what they take is an int, struct
+// winsize, or the kernel's struct termios or termios2 with the bits and
+// places of include/uapi/asm-generic/termbits.h. The platform companion
+// makes each request of the host in the host's numbers and layouts
+// (hostTerminalIoctl), as QEMU's linux-user makes a guest's
+// (linux-user/ioctls.h, and target_to_host_termios in
+// linux-user/syscall.c).
+
+// The requests of a terminal a guest makes, as asm-generic numbers them.
+const (
+	linuxTCGETS     = 0x5401
+	linuxTCSETS     = 0x5402
+	linuxTCSETSW    = 0x5403
+	linuxTCSETSF    = 0x5404
+	linuxTCSBRK     = 0x5409
+	linuxTCXONC     = 0x540a
+	linuxTCFLSH     = 0x540b
+	linuxTIOCEXCL   = 0x540c
+	linuxTIOCNXCL   = 0x540d
+	linuxTIOCSCTTY  = 0x540e
+	linuxTIOCGPGRP  = 0x540f
+	linuxTIOCSPGRP  = 0x5410
+	linuxTIOCOUTQ   = 0x5411
+	linuxTIOCGWINSZ = 0x5413
+	linuxTIOCSWINSZ = 0x5414
+	linuxTIOCNOTTY  = 0x5422
+	linuxTIOCGSID   = 0x5429
+	linuxTCGETS2    = 0x802c542a
+	linuxTCSETS2    = 0x402c542b
+	linuxTCSETSW2   = 0x402c542c
+	linuxTCSETSF2   = 0x402c542d
+	linuxTIOCGPTN   = 0x80045430
+	linuxTIOCSPTLCK = 0x40045431
+)
+
+// linuxNCCS is the number of control characters of the kernel's struct
+// termios.
+const linuxNCCS = 19
+
+// What a request of a terminal takes (terminalArg.what): nothing, an int
+// as it is, or the address of an int, of a struct termios, of a struct
+// termios2 or of a struct winsize.
+const (
+	terminalTakesNothing = iota
+	terminalTakesValue
+	terminalTakesInt
+	terminalTakesTermios
+	terminalTakesTermios2
+	terminalTakesWinsize
+)
+
+// linuxTermios is the kernel's struct termios2 (asm-generic): struct
+// termios, then the input and the output speed. In memory it is laid out as
+// the kernel's own, so that it is what a request of a host whose numbers
+// are asm-generic takes.
+type linuxTermios struct {
+	Iflag, Oflag, Cflag, Lflag uint32
+	Line                       uint8
+	Cc                         [linuxNCCS]uint8
+	Ispeed, Ospeed             uint32
+}
+
+// decode reads the struct termios at mem, and the speeds of a struct
+// termios2 when mem holds one.
+func (t *linuxTermios) decode(mem []byte) {
+	t.Iflag = binary.LittleEndian.Uint32(mem[0:])
+	t.Oflag = binary.LittleEndian.Uint32(mem[4:])
+	t.Cflag = binary.LittleEndian.Uint32(mem[8:])
+	t.Lflag = binary.LittleEndian.Uint32(mem[12:])
+	t.Line = mem[16]
+	copy(t.Cc[:], mem[17:])
+	if len(mem) == 44 {
+		t.Ispeed = binary.LittleEndian.Uint32(mem[36:])
+		t.Ospeed = binary.LittleEndian.Uint32(mem[40:])
+	}
+}
+
+// encode writes t at mem as decode reads it.
+func (t *linuxTermios) encode(mem []byte) {
+	binary.LittleEndian.PutUint32(mem[0:], t.Iflag)
+	binary.LittleEndian.PutUint32(mem[4:], t.Oflag)
+	binary.LittleEndian.PutUint32(mem[8:], t.Cflag)
+	binary.LittleEndian.PutUint32(mem[12:], t.Lflag)
+	mem[16] = t.Line
+	copy(mem[17:36], t.Cc[:])
+	if len(mem) == 44 {
+		binary.LittleEndian.PutUint32(mem[36:], t.Ispeed)
+		binary.LittleEndian.PutUint32(mem[40:], t.Ospeed)
+	}
+}
+
+// linuxWinsize is struct winsize, laid out as the kernel's.
+type linuxWinsize struct {
+	Row, Col, Xpixel, Ypixel uint16
+}
+
+// terminalArg is the argument of a request of a terminal (Fd_ioctl): what
+// it takes (terminalTakes...), and whether the call writes it (out) or
+// reads it. value is an int the request takes as it is or at its address,
+// termios and winsize the records it takes.
+type terminalArg struct {
+	what    int
+	out     bool
+	value   int32
+	termios linuxTermios
+	winsize linuxWinsize
+}
+
+// of sets what request takes, and reports whether it is one of the
+// requests of a terminal the runtime makes.
+func (a *terminalArg) of(request uint32) bool {
+	switch request {
+	case linuxTIOCEXCL, linuxTIOCNXCL, linuxTIOCNOTTY:
+		a.what = terminalTakesNothing
+	case linuxTCSBRK, linuxTCXONC, linuxTCFLSH, linuxTIOCSCTTY:
+		a.what = terminalTakesValue
+	case linuxTIOCSPGRP, linuxTIOCSPTLCK:
+		a.what = terminalTakesInt
+	case linuxTIOCGPGRP, linuxTIOCOUTQ, linuxTIOCGSID, linuxTIOCGPTN:
+		a.what, a.out = terminalTakesInt, true
+	case linuxTCSETS, linuxTCSETSW, linuxTCSETSF:
+		a.what = terminalTakesTermios
+	case linuxTCGETS:
+		a.what, a.out = terminalTakesTermios, true
+	case linuxTCSETS2, linuxTCSETSW2, linuxTCSETSF2:
+		a.what = terminalTakesTermios2
+	case linuxTCGETS2:
+		a.what, a.out = terminalTakesTermios2, true
+	case linuxTIOCSWINSZ:
+		a.what = terminalTakesWinsize
+	case linuxTIOCGWINSZ:
+		a.what, a.out = terminalTakesWinsize, true
+	default:
+		return false
+	}
+	return true
+}
+
+// size returns the size of the record at the address the request takes,
+// 0 for one that takes no address.
+func (a *terminalArg) size() uint64 {
+	switch a.what {
+	case terminalTakesInt:
+		return 4
+	case terminalTakesTermios:
+		return 36
+	case terminalTakesTermios2:
+		return 44
+	case terminalTakesWinsize:
+		return 8
+	}
+	return 0
+}
+
+// decode reads the record at mem, size bytes.
+func (a *terminalArg) decode(mem []byte) {
+	switch a.what {
+	case terminalTakesInt:
+		a.value = int32(binary.LittleEndian.Uint32(mem))
+	case terminalTakesTermios, terminalTakesTermios2:
+		a.termios.decode(mem)
+	case terminalTakesWinsize:
+		a.winsize = linuxWinsize{
+			Row:    binary.LittleEndian.Uint16(mem[0:]),
+			Col:    binary.LittleEndian.Uint16(mem[2:]),
+			Xpixel: binary.LittleEndian.Uint16(mem[4:]),
+			Ypixel: binary.LittleEndian.Uint16(mem[6:]),
+		}
+	}
+}
+
+// encode writes the record at mem as decode reads it.
+func (a *terminalArg) encode(mem []byte) {
+	switch a.what {
+	case terminalTakesInt:
+		binary.LittleEndian.PutUint32(mem, uint32(a.value))
+	case terminalTakesTermios, terminalTakesTermios2:
+		a.termios.encode(mem)
+	case terminalTakesWinsize:
+		binary.LittleEndian.PutUint16(mem[0:], a.winsize.Row)
+		binary.LittleEndian.PutUint16(mem[2:], a.winsize.Col)
+		binary.LittleEndian.PutUint16(mem[4:], a.winsize.Xpixel)
+		binary.LittleEndian.PutUint16(mem[6:], a.winsize.Ypixel)
+	}
+}
+
+// Fd_ioctl is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "fd_ioctl") backing ioctl for the requests of a terminal, in Linux's
+// numbers (see "terminals" above): the settings (TCGETS, TCSETS, TCSETSW,
+// TCSETSF and their termios2 forms), the window size (TIOCGWINSZ,
+// TIOCSWINSZ), the line (TCSBRK, TCXONC, TCFLSH), exclusive use
+// (TIOCEXCL, TIOCNXCL), the output queue (TIOCOUTQ), the foreground
+// process group and the session (TIOCGPGRP, TIOCGSID), and a
+// pseudo-terminal's master side (TIOCGPTN, TIOCSPTLCK). arg is the int the
+// request takes, or the address of what it takes. A descriptor is a
+// terminal when it is a terminal of the host: a standard stream of the
+// instance or a file of the FS that is a file of the host (*os.File). The
+// call is made of a duplicate of the host's descriptor, and a request that
+// waits for the output to drain (TCSETSW, TCSETSF, TCSBRK) waits until it
+// has, whatever signal is posted to the guest meanwhile. A terminal of the
+// host is the controlling terminal of no instance without a Process
+// (WASIConfig.Process), and the runtime changes no process's foreground
+// process group or controlling terminal. Returns what the call returned, or
+// a negative errno: EBADF, ENOTTY for a request it does not make and for a
+// descriptor that is no terminal, ENOSYS for TIOCSPGRP, TIOCSCTTY and
+// TIOCNOTTY.
+func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, arg int32) int32 {
+	return w.fdIoctl(m, fd, uint32(request), zext(arg), arg)
+}
+
+// Fd_ioctl64 is Fd_ioctl for a memory64 guest, whose argument is 64 bits
+// wide as an address; as an int it is the low 32.
+func (w *WasiStubs) Fd_ioctl64(m *Module, fd, request int32, arg int64) int32 {
+	return w.fdIoctl(m, fd, uint32(request), uint64(arg), int32(arg))
+}
+
+// fdIoctl is the body of Fd_ioctl and Fd_ioctl64: addr is the argument as
+// an address, value as an int.
+func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, value int32) int32 {
+	w.mu.Lock()
+	op := w.openLocked(fd)
+	w.mu.Unlock()
+	if op == nil {
+		return -_wasiEBADF
+	}
+	arg := terminalArg{value: value}
+	if !arg.of(request) {
+		return -_wasiENOTTY
+	}
+	var file *os.File
+	if op.stdio != 0 {
+		file = w.streamFile(op)
+	} else {
+		file, _ = op.f.(*os.File)
+	}
+	if file == nil {
+		return -_wasiENOTTY
+	}
+	var (
+		mem    []byte
+		result int
+	)
+	err := withHostTerminal(file, func(hostFD int) error {
+		if size := arg.size(); size > 0 {
+			if mem = w.memBytes(m, addr, size); mem == nil {
+				return syscall.EFAULT
+			}
+			if !arg.out {
+				arg.decode(mem)
+			}
+		}
+		switch request {
+		case linuxTIOCGPGRP, linuxTIOCGSID:
+			if w.cfg.Process == nil {
+				return syscall.ENOTTY
+			}
+		case linuxTIOCSPGRP, linuxTIOCSCTTY, linuxTIOCNOTTY:
+			return syscall.ENOSYS
+		}
+		var err error
+		result, err = hostTerminalIoctl(hostFD, request, &arg)
+		return err
+	})
+	if err != nil {
+		return -mapOSError(err)
+	}
+	if arg.out {
+		arg.encode(mem)
+	}
+	return int32(result)
+}
+
 // ----- numbers of another system -----------------------------------------------
 
 // Numbering gives the guest the numbers of another system — its error
@@ -13773,6 +14051,10 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"wasiBlocking":   true,
 			"wasiOutside":    true,
 			"wasiSignalsDue": true,
+
+			"linuxTermios": true,
+			"linuxWinsize": true,
+			"terminalArg":  true,
 		},
 		keepFuncNames: map[string]bool{
 			"NewWASI":                 true,
@@ -14022,6 +14304,11 @@ var (
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_darwin.go
 	wasip1HostNumbersDarwinRaw []byte
+
+	//go:embed wasip1_native_terminal_linux.go
+	wasip1NativeTerminalLinuxRaw []byte
+	//go:embed wasip1_native_terminal_darwin.go
+	wasip1NativeTerminalDarwinRaw []byte
 )
 
 // emitWasip1Platform returns the per-platform companions of the native wasi
@@ -14049,6 +14336,9 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 
 		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,
+
+		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
+		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
 	} {
 		src, err := renamePackage(raw, pkg)
 		if err != nil {
