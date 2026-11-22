@@ -110,22 +110,25 @@ method is called.
 `Process` supplies the values the guest reads of its process: what
 `getpid`, `getppid`, the `getuid` family, `getgroups`, `getpriority`
 and `times()` report, the pid whose `/proc/PID/fd` lists the guest's
-descriptors, and the umask the guest starts with. A nil one is an isolated process (pid 42, ppid 1, every
-user and group id 0, no CPU time, umask 022). `HostProcess()` returns
-the host process's, or an error where its umask cannot be read without
-changing it; `HostProcessUmask(umask)` is the same with the umask
-given. `HostWASIConfig()` leaves `Process` nil.
+descriptors, and the umask the guest starts with. A nil one is an
+isolated process (pid 42, ppid 1, every user and group id 0, no CPU
+time, umask 022). `HostProcess()` returns the host process's, or an
+error where its umask cannot be read without changing it;
+`HostProcessUmask(umask)` is the same with the umask given.
+`HostWASIConfig()` leaves `Process` nil.
 
 `Process` only reads; `ProcessChanges` makes the changes: the
 `setuid` family, `setgroups`, `setpriority` and `umask` of the guest
-of the fork family's root instance. A forked instance's guest changes
-its own values, which no `ProcessChanges` is told. A nil
-`ProcessChanges` changes nothing (`ENOSYS`, and a `umask` of the
-instance's alone). With `HostProcessChanges()` a forked instance changes
-no credentials (`EPERM`): the kernel checks the host process's for every
-instance, so a guest drops privileges before it forks. `HostProcessChanges()` makes the changes the host
-process's. A program that used `HostProcess()` for the changes as well
-sets both:
+of the fork family's root instance. `Process` reads what they change,
+so a `ProcessChanges` needs a `Process` (`NewWASI` panics without one).
+A forked instance's guest changes its nice value and umask alone, and
+keeps the ids and groups of the process the `ProcessChanges` changes:
+a change of them fails with `EPERM`, but for one that leaves them as
+they are (`setuid(getuid())`). A guest drops privileges before it
+forks. A nil `ProcessChanges` changes nothing (`ENOSYS`, and a `umask`
+of the instance's alone). `HostProcessChanges()` makes the changes the
+host process's. A program that used `HostProcess()` for the changes as
+well sets both:
 
 ```go
 proc, err := mymodule.HostProcess()
@@ -136,11 +139,13 @@ cfg := mymodule.WASIConfig{Process: proc, ProcessChanges: mymodule.HostProcessCh
 Each instance's umask is its own. On Linux the files, directories and
 FIFOs an instance makes on the host's filesystem, and the commands it
 starts, are made on an OS thread of the instance's whose umask is the
-instance's (`unshare(CLONE_FS)`), so that the kernel takes it out;
-where `unshare(2)` is refused (Docker's default seccomp profile), and on
-other systems, the runtime takes it out of the mode, and the host
-process's umask applies as well. The thread ends with `CloseAll`, or
-when the garbage collector collects an instance dropped without it.
+instance's (`unshare(CLONE_FS)`), so that the kernel takes it out.
+Where `unshare(2)` is refused (Docker's default seccomp profile), and
+on other systems, the runtime takes the instance's umask out of the
+mode of what it makes, and the host process's umask applies as well;
+a command the instance starts gets the host process's umask only. The
+thread ends with `CloseAll`, or when the garbage collector collects an
+instance dropped without it.
 
 `Signals` connects the guest's signals with what is outside it: its
 `Kill` is given the guest's `kill` of a process that is not the

@@ -1983,14 +1983,17 @@ type WASIConfig struct {
 	// starts with. nil is an isolated process: pid 42, ppid 1, every user
 	// and group id 0, no CPU time and umask 022, none of them read from the
 	// host. HostProcess and HostProcessUmask give the host process's.
+	// It is required with a ProcessChanges, which changes what it reads.
 	Process Process
 	// ProcessChanges makes the changes the guest of the fork family's root
 	// instance makes to its process — its ids, groups, priority and umask —
-	// where they are kept besides the instance (ProcessChanges). A forked
-	// instance's changes are its own and reach no ProcessChanges. nil
-	// changes nothing: the setuid family, setgroups and setpriority fail
-	// with ENOSYS, and the umask is the instance's alone.
-	// HostProcessChanges gives the host process's calls.
+	// where they are kept besides the instance (ProcessChanges); Process
+	// reads them, and NewWASI panics when it is nil. A forked instance's
+	// guest changes its nice value and umask alone, and keeps its ids and
+	// groups: the change of them fails with EPERM. nil changes nothing: the
+	// setuid family, setgroups and setpriority fail with ENOSYS, and the
+	// umask is the instance's alone. HostProcessChanges gives the host
+	// process's calls.
 	ProcessChanges ProcessChanges
 	// LocalZone is the time zone of a guest that names none (Clock_zone
 	// without TZ); nil is UTC.
@@ -2284,8 +2287,12 @@ func (p *wasiPIDs) alloc(reserved ...int32) int32 {
 const wasiFirstPID int32 = 1000
 
 // NewWASI returns a WasiStubs whose guest has what cfg gives it (see
-// WASIConfig).
+// WASIConfig). It panics when cfg has a ProcessChanges without a Process,
+// whose guest would read none of the changes it makes.
 func NewWASI(cfg WASIConfig) *WasiStubs {
+	if cfg.ProcessChanges != nil && cfg.Process == nil {
+		panic(errors.New("wasi: WASIConfig.ProcessChanges is set without WASIConfig.Process"))
+	}
 	cfg.Args = append([]string(nil), cfg.Args...)
 	cfg.Env = append([]string(nil), cfg.Env...)
 	return &WasiStubs{cfg: cfg, monoStart: time.Now()}
@@ -8201,15 +8208,15 @@ func (hostProcessChanges) SetUmask(mask os.FileMode) (os.FileMode, error) {
 	return hostSetUmask(mask)
 }
 
-// processChanged holds what the guest of a forked instance changed its
-// process's ids, groups and nice value to (procChanges): what it reads
-// afterwards in place of the Process's.
+// processChanged holds the ids, groups and nice value of a forked
+// instance's process that are its own: those it started with
+// (forkedChanges) and the nice value its guest set. The guest reads them in
+// place of the Process's.
 type processChanged struct {
-	// ids are the real, effective and saved user ids, then group ids, once
-	// a change of them was made.
+	// ids are the real, effective and saved user ids, then group ids.
 	ids    *[6]int32
 	groups []int32
-	// grouped records that groups were set (an empty list included).
+	// grouped records that groups are known (an empty list included).
 	grouped bool
 	nice    *int32
 }
@@ -8260,7 +8267,7 @@ func (w *WasiStubs) forkedChanges(ids ProcessIDs) *processChanged {
 }
 
 // guestIDs returns the ids of the instance's guest: the Process's, with
-// those the guest of a forked instance changed (procChanges).
+// those a forked instance started with (processChanged).
 func (w *WasiStubs) guestIDs() ProcessIDs {
 	ids := w.guestProcess().IDs()
 	w.mu.Lock()
@@ -8273,7 +8280,7 @@ func (w *WasiStubs) guestIDs() ProcessIDs {
 }
 
 // guestGroups returns the supplementary groups of the instance's guest:
-// the Process's, or those the guest of a forked instance set.
+// the Process's, or those a forked instance started with.
 func (w *WasiStubs) guestGroups() ([]int32, error) {
 	w.mu.Lock()
 	if w.changed != nil && w.changed.grouped {
@@ -8285,17 +8292,6 @@ func (w *WasiStubs) guestGroups() ([]int32, error) {
 	return w.guestProcess().Groups()
 }
 
-// hostCredentials reports whether changes are the host process's
-// (HostProcessChanges): the kernel then checks the credentials of the host
-// process for every instance of the family, which a forked instance, a
-// process of the guest's but not of the host's, cannot change alone — its
-// setuid family and setgroups fail with EPERM. A guest drops privileges in
-// the root instance before it forks.
-func hostCredentials(changes ProcessChanges) bool {
-	_, host := changes.(hostProcessChanges)
-	return host
-}
-
 // changedLocked returns the changes of the instance's guest, made when it
 // had none. Caller holds w.mu.
 func (w *WasiStubs) changedLocked() *processChanged {
@@ -8305,23 +8301,28 @@ func (w *WasiStubs) changedLocked() *processChanged {
 	return w.changed
 }
 
-// changeIDs makes the change of a forked instance's guest to its own ids,
-// as Linux's calls make it (kernel/sys.c; gVisor's Task.SetUID and the
-// rest, pkg/sentry/kernel/task_identity.go): with the effective user id 0
-// any id may be given; otherwise only one of the real, effective and saved
-// ids, the real id of setreuid and setregid only the real or the effective
-// one, else EPERM. setuid and setgid of the superuser set all three; a
-// setreuid or setregid that sets the real id, or the effective one to
-// another than the real id, makes the saved id the new effective one.
-func (w *WasiStubs) changeIDs(change IDChange) error {
+// ensureIDsKept answers the change of a forked instance's guest to its ids.
+// The credentials are those of the process the ProcessChanges changes,
+// which the root instance's guest is, and a forked instance cannot change
+// them alone: a change succeeds only when it leaves the ids as they are
+// (setuid(getuid())), and fails with EPERM otherwise. Whether it leaves
+// them is decided as Linux's calls make the change (kernel/sys.c; gVisor's
+// Task.SetUID and the rest, pkg/sentry/kernel/task_identity.go): with the
+// effective user id 0 any id may be given; otherwise only one of the real,
+// effective and saved ids, the real id of setreuid and setregid only the
+// real or the effective one, else EPERM. setuid and setgid of the
+// superuser set all three; a setreuid or setregid that sets the real id,
+// or the effective one to another than the real id, makes the saved id the
+// new effective one.
+func (w *WasiStubs) ensureIDsKept(change IDChange) error {
 	p := w.guestProcess().IDs()
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	changed := w.changedLocked()
 	ids := [6]int32{p.UID, p.EUID, p.EUID, p.GID, p.EGID, p.EGID}
-	if changed.ids != nil {
-		ids = *changed.ids
+	if w.changed != nil && w.changed.ids != nil {
+		ids = *w.changed.ids
 	}
+	w.mu.Unlock()
+	kept := ids
 	privileged := ids[1] == 0
 	set := ids[0:3]
 	if change.Call >= IDSetgid {
@@ -8374,7 +8375,9 @@ func (w *WasiStubs) changeIDs(change IDChange) error {
 			}
 		}
 	}
-	changed.ids = &ids
+	if ids != kept {
+		return syscall.EPERM
+	}
 	return nil
 }
 
@@ -8539,9 +8542,8 @@ func (w *WasiStubs) procGroups(m *Module, bufPtr uint64, capacity int32, countPt
 // the call (the IDCall of its number) and a, b, c are its ids, -1 for an id
 // to leave alone. The SetIDs of the ProcessChanges (WASIConfig.ProcessChanges)
 // makes the change of the family's root instance; a forked instance's guest
-// changes its own ids (changeIDs), but for the host's ProcessChanges, whose
-// credentials it cannot change alone (hostCredentials: EPERM). Returns 0,
-// or a negative errno: EINVAL for a request it does not know, ENOSYS
+// only keeps its ids (ensureIDsKept: EPERM for a change of them). Returns
+// 0, or a negative errno: EINVAL for a request it does not know, ENOSYS
 // without a ProcessChanges.
 func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 	call := IDCall(request)
@@ -8555,10 +8557,8 @@ func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 	switch {
 	case changes == nil:
 		return -_wasiENOSYS
-	case w.forked && hostCredentials(changes):
-		return -_wasiEPERM
 	case w.forked:
-		err = w.changeIDs(change)
+		err = w.ensureIDsKept(change)
 	default:
 		err = changes.SetIDs(change)
 	}
@@ -8577,11 +8577,11 @@ func (w *WasiStubs) Proc_setids64(m *Module, request, a, b, c int32) int32 {
 // wasip1_posix_extension, name "proc_setgroups") backing setgroups: the
 // count u32 group ids at listPtr are given to the SetGroups of the
 // ProcessChanges (WASIConfig.ProcessChanges) by the family's root instance;
-// a forked instance's guest sets its own, which only a guest of the
-// effective user id 0 may (EPERM), and none for the host's ProcessChanges
-// (hostCredentials: EPERM). Returns 0, or a negative errno: EINVAL
-// for a count below 0 or above 65536 (NGROUPS_MAX), ENOSYS without a
-// ProcessChanges.
+// a forked instance's guest, which cannot change the credentials alone
+// (ensureIDsKept), only gives the groups it has, in any order, and only
+// with the effective user id 0, as Linux asks of any setgroups (EPERM
+// otherwise). Returns 0, or a negative errno: EINVAL for a count below 0
+// or above 65536 (NGROUPS_MAX), ENOSYS without a ProcessChanges.
 func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
 	return w.procSetgroups(m, zext(listPtr), count)
 }
@@ -8608,16 +8608,20 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 	switch {
 	case changes == nil:
 		return -_wasiENOSYS
-	case w.forked && hostCredentials(changes):
-		return -_wasiEPERM
 	case w.forked:
 		if w.guestIDs().EUID != 0 {
 			return -_wasiEPERM
 		}
-		w.mu.Lock()
-		changed := w.changedLocked()
-		changed.groups, changed.grouped = groups, true
-		w.mu.Unlock()
+		has, err := w.guestGroups()
+		if err != nil {
+			return -hookErrno(err)
+		}
+		has = slices.Clone(has)
+		slices.Sort(has)
+		slices.Sort(groups)
+		if !slices.Equal(has, groups) {
+			return -_wasiEPERM
+		}
 	default:
 		if err := changes.SetGroups(groups); err != nil {
 			return -hookErrno(err)
@@ -11886,7 +11890,6 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"Clock_res_get":           true,
 			"Clock_time_get":          true,
 			"closeWasiOpen":           true,
-			"hostCredentials":         true,
 			"withHostUmask":           true,
 			"HostProcessChanges":      true,
 			"newCreationThread":       true,
