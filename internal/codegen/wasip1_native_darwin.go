@@ -294,6 +294,30 @@ func hostAcceptFD(fd int) (int, error) {
 	return conn, socketFDMade(conn)
 }
 
+// blockThreadSignal blocks sig on the calling thread (__pthread_sigmask,
+// which pthread_sigmask(3) calls: Darwin's sigprocmask(2) changes the mask
+// of every thread) and returns what puts the thread's mask back.
+func blockThreadSignal(sig syscall.Signal) (restore func() error, err error) {
+	const sigBlock, sigSetmask = 1, 3
+	set, old := uint32(1)<<(sig-1), uint32(0)
+	if _, _, errno := syscall.RawSyscall(syscall.SYS___PTHREAD_SIGMASK, sigBlock, uintptr(unsafe.Pointer(&set)), uintptr(unsafe.Pointer(&old))); errno != 0 {
+		return nil, os.NewSyscallError("pthread_sigmask", errno)
+	}
+	return func() error {
+		if _, _, errno := syscall.RawSyscall(syscall.SYS___PTHREAD_SIGMASK, sigSetmask, uintptr(unsafe.Pointer(&old)), 0); errno != 0 {
+			return os.NewSyscallError("pthread_sigmask", errno)
+		}
+		return nil
+	}, nil
+}
+
+// hostSiginfo is Darwin's siginfo_t (waitid(2)): si_signo, si_errno,
+// si_code, si_pid, si_uid and si_status, within its 104 bytes.
+type hostSiginfo struct {
+	signo, errno, code, pid, uid, status int32
+	_                                    [104 - 24]byte
+}
+
 // socketFDMade sets the socket fd, made by the caller, closed on exec and
 // in non-blocking mode; on a failure it closes fd.
 func socketFDMade(fd int) error {

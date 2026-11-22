@@ -624,3 +624,30 @@ func (fw *fifoWatch) hasWriter(f File) (bool, error) {
 	}
 	return set[0].ready, nil
 }
+
+// blockThreadSignal blocks sig on the calling thread (rt_sigprocmask(2),
+// whose mask is the thread's) and returns what puts the thread's mask
+// back.
+func blockThreadSignal(sig syscall.Signal) (restore func() error, err error) {
+	const sigBlock, sigSetmask = 0, 2
+	set, old := uint64(1)<<(sig-1), uint64(0)
+	if _, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigBlock, uintptr(unsafe.Pointer(&set)), uintptr(unsafe.Pointer(&old)), 8, 0, 0); errno != 0 {
+		return nil, os.NewSyscallError("rt_sigprocmask", errno)
+	}
+	return func() error {
+		if _, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigSetmask, uintptr(unsafe.Pointer(&old)), 0, 8, 0, 0); errno != 0 {
+			return os.NewSyscallError("rt_sigprocmask", errno)
+		}
+		return nil
+	}, nil
+}
+
+// hostSiginfo is Linux's siginfo_t of a child (waitid(2)): si_signo,
+// si_errno and si_code, then, in the union, aligned as a pointer is,
+// si_pid, si_uid and si_status, and room for the rest of its 128 bytes.
+type hostSiginfo struct {
+	signo, errno, code int32
+	_                  [unsafe.Sizeof(uintptr(0))/4 - 1]int32
+	pid, uid, status   int32
+	_                  [128 - 24]byte
+}

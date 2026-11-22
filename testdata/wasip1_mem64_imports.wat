@@ -200,6 +200,14 @@
     (func $sock_reverse_addr (param i64 i64 i32 i64) (result i32)))
   (import "wasip1_posix_extension" "sock_host_by_name"
     (func $sock_host_by_name (param i64 i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_getpgid"
+    (func $proc_getpgid (param i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_setpgid"
+    (func $proc_setpgid (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_setsid"
+    (func $proc_setsid (param i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_exec"
+    (func $proc_exec (param i64 i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_socket"
     (func $sock_socket (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "sock_connect"
@@ -335,6 +343,10 @@
     (drop (call $proc_itimer (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (call $proc_terminate (i32.const 0))
     (drop (call $proc_kill (i32.const 0) (i32.const 0)))
+    (drop (call $proc_getpgid (i32.const 0) (i64.const 0)))
+    (drop (call $proc_setpgid (i32.const 0) (i32.const 0)))
+    (drop (call $proc_setsid (i64.const 0)))
+    (drop (call $proc_exec (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $fd_flock (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $fd_ioctl (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $fd_lock (i32.const 0) (i32.const 0) (i64.const 0)))

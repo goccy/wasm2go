@@ -450,6 +450,111 @@ func setHostIDs(change IDChange) error {
 // setHostGroups sets the supplementary groups of the host process.
 func setHostGroups(gids []int) error { return syscall.Setgroups(gids) }
 
+// hostGetpgid, hostSetpgid and hostSetsid are getpgid(2), setpgid(2) and
+// setsid(2).
+func hostGetpgid(pid int32) (int32, error) {
+	pgid, err := syscall.Getpgid(int(pid))
+	return int32(pgid), err
+}
+
+func hostSetpgid(pid, pgid int32) error { return syscall.Setpgid(int(pid), int(pgid)) }
+
+func hostSetsid() (int32, error) {
+	sid, err := syscall.Setsid()
+	return int32(sid), err
+}
+
+// hostJobControl reports that the host puts a command in a process group
+// and a session of its own or in a group given (hostJobAttr).
+const hostJobControl = true
+
+// hostJobAttr returns the attributes that start a command in the host's
+// process group and session job names, nil for the host process's.
+func hostJobAttr(job hostJob) *syscall.SysProcAttr {
+	if !job.setsid && !job.setpgid {
+		return nil
+	}
+	return &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid, Foreground: job.foreground, Ctty: job.ctty}
+}
+
+// hostProcessGroup returns the host process's process group (getpgrp(2)).
+func hostProcessGroup() int { return syscall.Getpgrp() }
+
+// hostForeground returns the foreground process group of the terminal fd,
+// the controlling terminal of the host process (tcgetpgrp(3)): ENOTTY for
+// another terminal.
+func hostForeground(fd int) (int, error) {
+	var pgid int32
+	if _, err := hostIoctlPointer(fd, syscall.TIOCGPGRP, unsafe.Pointer(&pgid)); err != nil {
+		return 0, err
+	}
+	return int(pgid), nil
+}
+
+// hostSetForeground makes pgid the foreground process group of the
+// terminal fd (tcsetpgrp(3)) with SIGTTOU blocked on the calling thread: a
+// process of a background group is sent SIGTTOU otherwise, whose default
+// action stops it (POSIX tcsetpgrp; the job control shell of glibc's
+// manual ignores it). The goroutine keeps its thread until the mask is put
+// back.
+func hostSetForeground(fd, pgid int) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	restore, err := blockThreadSignal(syscall.SIGTTOU)
+	if err != nil {
+		return err
+	}
+	value := int32(pgid)
+	_, err = hostIoctlPointer(fd, syscall.TIOCSPGRP, unsafe.Pointer(&value))
+	return errors.Join(err, restore())
+}
+
+// killHostGroup sends sig, the guest's number of a signal, to the host's
+// process group pgid (kill(2) of -pgid): EINVAL for a signal the host has
+// none for.
+func killHostGroup(pgid int, sig int32) error {
+	hostSig, known := hostSignalOf(sig)
+	if !known {
+		return syscall.EINVAL
+	}
+	return syscall.Kill(-pgid, hostSig)
+}
+
+// hostWaitExited waits for the host's process pid, a child of the host
+// process, to end, and returns its wait status for the guest
+// (encodeHostWaitStatus), without reaping it (waitid(2) with WNOWAIT, as
+// os's blockUntilWaitable): it stays a zombie, and its pid its own, until
+// it is reaped.
+func hostWaitExited(pid int) (int32, error) {
+	const pPID = 1 // P_PID, of both Linux and Darwin
+	var info hostSiginfo
+	for {
+		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, pPID, uintptr(pid), uintptr(unsafe.Pointer(&info)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
+		switch errno {
+		case 0:
+			return encodeHostWaitStatus(info.waitStatus()), nil
+		case syscall.EINTR:
+			continue
+		}
+		return 0, os.NewSyscallError("waitid", errno)
+	}
+}
+
+// waitStatus returns the wait status of a child that siginfo_t of waitid
+// tells of: how it ended (si_code, CLD_EXITED 1, CLD_KILLED 2 or
+// CLD_DUMPED 3, the same on Linux and Darwin) and its exit status or
+// signal (si_status).
+func (info *hostSiginfo) waitStatus() syscall.WaitStatus {
+	const cldExited, cldDumped = 1, 3
+	switch info.code {
+	case cldExited:
+		return syscall.WaitStatus(info.status&0xff) << 8
+	case cldDumped:
+		return syscall.WaitStatus(info.status&0x7f | 0x80)
+	}
+	return syscall.WaitStatus(info.status & 0x7f)
+}
+
 // makeHostFIFO creates a FIFO in the host filesystem.
 func makeHostFIFO(path string, perm os.FileMode) error {
 	return syscall.Mkfifo(path, uint32(perm.Perm()))
@@ -490,16 +595,24 @@ func withDuplicateDescriptor(f syscall.Conn, use func(fd uintptr) error) error {
 func duplicateDescriptor(f syscall.Conn) (int, error) {
 	var dup int
 	err := withHostDescriptor(f, func(fd uintptr) error {
-		syscall.ForkLock.RLock()
-		defer syscall.ForkLock.RUnlock()
 		var err error
-		if dup, err = syscall.Dup(int(fd)); err != nil {
-			return err
-		}
-		syscall.CloseOnExec(dup)
-		return nil
+		dup, err = dupHostFD(fd)
+		return err
 	})
 	return dup, err
+}
+
+// dupHostFD returns a duplicate of the descriptor fd, closed on exec: made
+// under syscall.ForkLock, so that no command started meanwhile has it.
+func dupHostFD(fd uintptr) (int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	dup, err := syscall.Dup(int(fd))
+	if err != nil {
+		return -1, err
+	}
+	syscall.CloseOnExec(dup)
+	return dup, nil
 }
 
 // withHostTerminal calls use with a duplicate of the descriptor of f
@@ -1115,8 +1228,8 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (in
 // command writes to either keeps its order. The command's wait delivers
 // what it wrote before it returns, and gives the input the runtime took for
 // it and it did not read back.
-func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
-	report := func(err error) { w.reportError("proc_spawn", err) }
+func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+	report := func(err error) { w.reportError(op, err) }
 	var setup commandSetup
 	for i := range streams {
 		if i == 2 && sameDestination(&streams[1], &streams[2]) {
@@ -1130,7 +1243,7 @@ func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, st
 	var pid int
 	err := withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
 		var err error
-		pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: fds})
+		pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: fds, Sys: hostJobAttr(job)})
 		return err
 	})
 	if err != nil {
@@ -1150,14 +1263,17 @@ func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, st
 	if setup.input != nil {
 		go setup.input.run()
 	}
-	return &hostCommand{process: p, wait: func() int32 {
-		st, err := p.Wait()
+	finish := func() {
 		for _, c := range setup.outputs {
 			c.finish()
 		}
 		if setup.input != nil {
 			setup.input.finish()
 		}
+	}
+	return &hostCommand{process: p, finish: finish, wait: func() int32 {
+		st, err := p.Wait()
+		finish()
 		return w.waitStatusOf(st, err)
 	}}, nil
 }
