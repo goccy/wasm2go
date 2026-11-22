@@ -267,6 +267,27 @@ func TestMemFSInterface(t *testing.T) {
 	}
 }
 
+// A MemFS opens a directory for reading only: an open of it for writing is
+// EISDIR, as open(2)'s is.
+func TestMemFSOpenDirectoryForWriting(t *testing.T) {
+	fsys := NewMemFS()
+	if err := fsys.Mkdir("d", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []int{os.O_WRONLY, os.O_RDWR, os.O_RDWR | os.O_CREATE} {
+		if _, err := fsys.OpenFile("d", flag, 0); mapOSError(err) != _wasiEISDIR {
+			t.Errorf("OpenFile(d, %#x): %v (errno %d), want EISDIR", flag, err, mapOSError(err))
+		}
+	}
+	f, err := fsys.OpenFile("d", os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile(d, O_RDONLY): %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNewWASIKeepsConfiguredStreamsAndFS(t *testing.T) {
 	var in, out, errw = &bytesReader{}, &discard{}, &discard{}
 	mem := NewMemFS()

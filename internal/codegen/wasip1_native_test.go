@@ -826,6 +826,63 @@ func TestWasi_PollOneoffClockSleep(t *testing.T) {
 	}
 }
 
+// An absolute timeout is a time of the subscription's clock: the call
+// returns once that clock reads it. A clock clock_time_get refuses has its
+// event at once, carrying EINVAL, also when a descriptor is ready.
+func TestWasi_PollOneoffAbsoluteClock(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	clockSub := func(off int, clockID int32, at uint64) {
+		binary.LittleEndian.PutUint64(m.memory[off:], uint64(off)) // userdata
+		m.memory[off+8] = 0                                        // eventtype = clock
+		binary.LittleEndian.PutUint32(m.memory[off+16:], uint32(clockID))
+		binary.LittleEndian.PutUint64(m.memory[off+24:], at)
+		binary.LittleEndian.PutUint16(m.memory[off+40:], 1) // ABSTIME
+	}
+	clock := func(clockID int32) uint64 {
+		t.Helper()
+		now, errno := w.clockNanos(clockID)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("clockNanos(%d) errno=%d", clockID, errno)
+		}
+		return now
+	}
+	for _, clockID := range []int32{0, 1} { // CLOCK_REALTIME, CLOCK_MONOTONIC
+		at := clock(clockID) + uint64(20*time.Millisecond)
+		clockSub(0, clockID, at)
+		if rc := w.Poll_oneoff(m, 0, 200, 1, 400); rc != _wasiESUCCESS {
+			t.Fatalf("clock %d: Poll_oneoff rc=%d", clockID, rc)
+		}
+		if now := clock(clockID); now < at {
+			t.Errorf("clock %d: Poll_oneoff returned at %d, before %d", clockID, now, at)
+		}
+		if n, errno := readU32(m.memory, 400), binary.LittleEndian.Uint16(m.memory[208:]); n != 1 || errno != 0 {
+			t.Errorf("clock %d: nevents=%d errno=%d, want 1 event of errno 0", clockID, n, errno)
+		}
+	}
+	// CLOCK_PROCESS_CPUTIME_ID, at a time of the realtime clock soon: the
+	// call does not wait for it.
+	clockSub(0, 2, clock(0)+uint64(20*time.Millisecond))
+	fd, errno := w.pathOpen("f", 0, 0x1 /* O_CREAT */, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("pathOpen errno=%d", errno)
+	}
+	binary.LittleEndian.PutUint64(m.memory[48:], 48) // userdata
+	m.memory[48+8] = 1                               // eventtype = fd_read
+	binary.LittleEndian.PutUint32(m.memory[48+16:], uint32(fd))
+	if rc := w.Poll_oneoff(m, 0, 200, 2, 400); rc != _wasiESUCCESS {
+		t.Fatalf("Poll_oneoff rc=%d", rc)
+	}
+	if n := readU32(m.memory, 400); n != 2 {
+		t.Fatalf("nevents=%d, want 2", n)
+	}
+	for i, want := range [][2]uint64{{0, uint64(_wasiEINVAL)}, {48, 0}} {
+		ev := 200 + 32*i
+		if userdata, errno := readU64(m.memory, ev), binary.LittleEndian.Uint16(m.memory[ev+8:]); userdata != want[0] || uint64(errno) != want[1] {
+			t.Errorf("event %d: userdata=%d errno=%d, want %d %d", i, userdata, errno, want[0], want[1])
+		}
+	}
+}
+
 // ─── Sockets (Tier 3) ───────────────────────────────────────────────
 
 func TestWasi_SockSendRecvShutdown(t *testing.T) {
