@@ -78,12 +78,12 @@ func TestWasi_FdDupfdTakesTheLowestNumberFromMin(t *testing.T) {
 	if got := int32(binary.LittleEndian.Uint32(m.memory[outOff:])); got != wasiRootFD-1 {
 		t.Fatalf("Fd_dupfd(the highest number) = %#x, want %#x", got, wasiRootFD-1)
 	}
-	refs := extraRefs(t, w, fd)
+	refs := slotRefs(t, w, fd)
 	if rc := w.Fd_dupfd(m, fd, wasiRootFD-1, outOff); rc != _wasiEMFILE {
 		t.Fatalf("Fd_dupfd with no number free rc=%d, want EMFILE", rc)
 	}
-	if got := extraRefs(t, w, fd); got != refs {
-		t.Fatalf("the refused Fd_dupfd left %d extra references, want %d", got, refs)
+	if got := slotRefs(t, w, fd); got != refs {
+		t.Fatalf("the refused Fd_dupfd left %d slots, want %d", got, refs)
 	}
 	if ft := fdFiletype(t, w, m, wasiRootFD); ft != 3 {
 		t.Fatalf("the root's number has filetype %d, want directory", ft)

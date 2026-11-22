@@ -898,7 +898,7 @@ func TestWasi_SockSendRecvShutdown(t *testing.T) {
 
 	w, m := newTestStubs(t, t.TempDir())
 	// Register the listener under fd 7.
-	w.fdsLocked()[7] = &wasiOpen{listener: ln}
+	w.setSlotLocked(7, &wasiOpen{listener: ln})
 
 	// Drive a client in a goroutine. doneShutdown is closed by the main
 	// thread once Sock_shutdown has run; the client must NOT close its

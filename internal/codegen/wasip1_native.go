@@ -1157,9 +1157,9 @@ type wasiOpen struct {
 	// Fds 0/1/2 start out with such entries; closing one never touches the
 	// stream itself.
 	stdio int8
-	// refs counts EXTRA table slots sharing this entry (dup/dup2 in one
-	// instance, plus every slot of a forked instance): closeWasiOpen only
-	// closes the descriptor when it reaches zero. Guarded by mu.
+	// refs counts the table slots that hold this entry, of every instance
+	// (dup, dup2, Fork): the descriptor is closed when the last one is
+	// cleared (setSlotLocked, clearSlotLocked). Guarded by mu.
 	refs int32
 	// hostPath records that the descriptor was opened through the whole
 	// host filesystem (osFS), whose files may be looked up by their host
@@ -1429,7 +1429,7 @@ type hostWaitFD struct {
 	stream any
 	want   int
 	ready  bool
-	// op is the entry the stream is behind: a close of one of its slots
+	// op is the entry the stream is behind: the close of its last slot
 	// wakes the wait (closeWasiOpen).
 	op *wasiOpen
 }
@@ -1479,7 +1479,7 @@ func (w *WasiStubs) giveWake(wk *wasiWake, set []hostWaitFD) error {
 }
 
 // addWaiter registers wk as the wake of a wait for the entry's descriptor,
-// which a close of one of its slots writes to (closeWasiOpen).
+// which the close of its last slot writes to (closeWasiOpen).
 func (op *wasiOpen) addWaiter(wk *wasiWake) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
@@ -1520,8 +1520,8 @@ func streamPolled(stream any) bool {
 // ready: at once when until has passed, otherwise waiting until one is,
 // until passes (the zero time is no limit) or wake, a descriptor of the
 // host's (-1 for none), is readable. poll(2) is asked about the descriptor
-// numbers, which nothing holds open meanwhile: a close of an entry's slot
-// by the guest wakes the wait (closeWasiOpen), while a stream that an
+// numbers, which nothing holds open meanwhile: the guest's close of an
+// entry's last slot wakes the wait (closeWasiOpen), while a stream that an
 // embedder closes as the guest waits for it leaves the wait to its timeout
 // or another event. A stream closed already is ready, and the call on it
 // reports the closing.
@@ -1549,9 +1549,9 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake int) error {
 
 // waitHostInterruptibly is waitHostReady for a blocking call of the guest's:
 // the wait ends as well when a signal is posted to the guest, and
-// interrupted reports that the call is to report one, or when a slot of an
-// entry of set is closed. The call takes a wake pipe of the instance's for
-// the wait.
+// interrupted reports that the call is to report one, or when an entry of
+// set is closed (its last slot is cleared). The call takes a wake pipe of
+// the instance's for the wait.
 func (w *WasiStubs) waitHostInterruptibly(call string, set []hostWaitFD, until time.Time) (interrupted bool, err error) {
 	wk, err := w.takeWake()
 	if err != nil {
@@ -1889,13 +1889,6 @@ func (op *wasiOpen) netConn() net.Conn {
 // file nor a standard stream. A nil entry is none.
 func (op *wasiOpen) socket() bool {
 	return op != nil && op.f == nil && op.stdio == 0
-}
-
-// addRef records one more table slot referring to op.
-func (op *wasiOpen) addRef() {
-	op.mu.Lock()
-	op.refs++
-	op.mu.Unlock()
 }
 
 // WASIConfig is the configuration a WasiStubs is built from (NewWASI). The
@@ -2442,6 +2435,10 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		forked:    true,
 	}
 	child.preopenReplaced.Store(w.preopenReplaced.Load())
+	// The child is nobody else's yet: its slots are set without its lock.
+	for fd, op := range w.fdsLocked() {
+		child.setSlotLocked(fd, op)
+	}
 	if len(w.cloexec) > 0 {
 		child.cloexec = make(map[int32]bool, len(w.cloexec))
 		for fd := range w.cloexec {
@@ -2463,10 +2460,6 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		for ip, host := range w.resolvedHosts {
 			child.resolvedHosts[ip] = host
 		}
-	}
-	for fd, op := range w.fdsLocked() {
-		op.addRef()
-		child.fdTable[fd] = op
 	}
 	return child
 }
@@ -2508,11 +2501,7 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 		err = errors.Join(err, hostCloseFD(wk.r), hostCloseFD(wk.w))
 	}
 	w.wakes, w.wakesClosed = nil, true
-	var closing []*wasiOpen
-	for fd, op := range w.fdsLocked() {
-		closing = append(closing, op)
-		delete(w.fdsLocked(), fd)
-	}
+	closing := w.clearSlotsFromLocked(0)
 	// Nobody is left to wait for this instance's processes: the finished
 	// ones are gone, and the running ones go when they finish (finishProc
 	// finds them missing from the table).
@@ -2533,15 +2522,8 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 // 0, or a positive errno for the first close that failed (every fd in range
 // is closed regardless).
 func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
-	var closing []*wasiOpen
 	w.mu.Lock()
-	for fd, op := range w.fdsLocked() {
-		if fd < lowFd {
-			continue
-		}
-		closing = append(closing, op)
-		delete(w.fdsLocked(), fd)
-	}
+	closing := w.clearSlotsFromLocked(lowFd)
 	w.mu.Unlock()
 	if err := closeWasiOpens(closing); err != nil {
 		return mapOSError(err)
@@ -2580,13 +2562,62 @@ func (w *WasiStubs) preopened(fd int32) bool {
 // Caller holds w.mu.
 func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 	if w.fdTable == nil {
-		w.fdTable = map[int32]*wasiOpen{
-			0: {stdio: 1},
-			1: {stdio: 2},
-			2: {stdio: 3},
+		w.fdTable = map[int32]*wasiOpen{}
+		for fd, stdio := range []int8{1, 2, 3} {
+			w.setSlotLocked(int32(fd), &wasiOpen{stdio: stdio})
 		}
 	}
 	return w.fdTable
+}
+
+// setSlotLocked puts op at fd, which holds nothing: op has one more slot
+// (refs), fd is not close-on-exec, and fd wasiPreopenFD names the
+// preopened root no longer (preopened). Caller holds w.mu.
+func (w *WasiStubs) setSlotLocked(fd int32, op *wasiOpen) {
+	op.mu.Lock()
+	op.refs++
+	op.mu.Unlock()
+	w.fdsLocked()[fd] = op
+	delete(w.cloexec, fd)
+	if fd == wasiPreopenFD {
+		w.preopenReplaced.Store(true)
+	}
+}
+
+// clearSlotLocked takes fd out of the table, close-on-exec mark and all.
+// It returns the entry fd held when that was its last slot, of any
+// instance, for the caller to close once w.mu is let go (closeWasiOpen);
+// nil otherwise, and for an fd that holds nothing. Caller holds w.mu.
+func (w *WasiStubs) clearSlotLocked(fd int32) (closing *wasiOpen) {
+	op := w.fdsLocked()[fd]
+	if op == nil {
+		return nil
+	}
+	delete(w.fdsLocked(), fd)
+	delete(w.cloexec, fd)
+	op.mu.Lock()
+	op.refs--
+	last := op.refs == 0
+	op.mu.Unlock()
+	if !last {
+		return nil
+	}
+	return op
+}
+
+// clearSlotsFromLocked clears every fd numbered lowFd or higher
+// (clearSlotLocked) and returns the entries to close. Caller holds w.mu.
+func (w *WasiStubs) clearSlotsFromLocked(lowFd int32) []*wasiOpen {
+	var closing []*wasiOpen
+	for fd := range w.fdsLocked() {
+		if fd < lowFd {
+			continue
+		}
+		if op := w.clearSlotLocked(fd); op != nil {
+			closing = append(closing, op)
+		}
+	}
+	return closing
 }
 
 // openLocked returns the entry the guest knows as descriptor fd, or nil
@@ -2612,8 +2643,7 @@ func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) (int32, bool) {
 	fds := w.fdsLocked()
 	for fd := min; fd < wasiRootFD; fd++ {
 		if _, used := fds[fd]; !used && !w.preopened(fd) {
-			fds[fd] = op
-			delete(w.cloexec, fd)
+			w.setSlotLocked(fd, op)
 			return fd, true
 		}
 	}
@@ -3938,23 +3968,11 @@ func closeWasiOpens(ops []*wasiOpen) error {
 
 // closeWasiOpen releases every underlying handle held by op and
 // joins any Close errors so callers can map them to a wasi errno
-// instead of silently dropping the failure. The caller has taken op's
-// slot out of the table, and does not hold w.mu: a close of a descriptor
-// of the host's waits for the calls that use it meanwhile.
+// instead of silently dropping the failure. The caller has cleared op's
+// last slot (clearSlotLocked), and does not hold w.mu: a close of a
+// descriptor of the host's waits for the calls that use it meanwhile.
 func closeWasiOpen(op *wasiOpen) error {
 	op.mu.Lock()
-	if op.refs > 0 {
-		// another table slot, of this instance (dup/dup2) or of a forked
-		// one, still references this descriptor, which stays open. The
-		// waits in poll(2) for it are woken, as the number they wait on
-		// leaves a slot: a poll_oneoff ends the subscription for that
-		// number with EBADF, and a read (readInterruptibly) waits for the
-		// descriptor again.
-		err := op.wakeWaitersLocked()
-		op.refs--
-		op.mu.Unlock()
-		return err
-	}
 	f, conn, listener := op.f, op.conn, op.listener
 	var host *os.File
 	if op.sock != nil {
@@ -3996,15 +4014,16 @@ func (op *wasiOpen) wakeWaitersLocked() error {
 
 func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	w.mu.Lock()
-	op := w.openLocked(fd)
-	if op == nil {
+	if w.openLocked(fd) == nil {
 		w.mu.Unlock()
 		return _wasiEBADF
 	}
-	delete(w.fdsLocked(), fd)
+	closing := w.clearSlotLocked(fd)
 	w.mu.Unlock()
-	if closeErr := closeWasiOpen(op); closeErr != nil {
-		return mapOSError(closeErr)
+	if closing != nil {
+		if closeErr := closeWasiOpen(closing); closeErr != nil {
+			return mapOSError(closeErr)
+		}
 	}
 	return _wasiESUCCESS
 }
@@ -5918,7 +5937,6 @@ func (w *WasiStubs) dupLocked(op *wasiOpen, min int32, out []byte) int32 {
 	if !ok {
 		return _wasiEMFILE
 	}
-	op.addRef()
 	binary.LittleEndian.PutUint32(out, uint32(nfd))
 	return _wasiESUCCESS
 }
@@ -5969,8 +5987,9 @@ func (w *WasiStubs) Fd_dup2(m *Module, from, to int32) int32 {
 }
 
 // takeDup2 is Fd_dup2 up to the closing of what to held, which it takes
-// out of the table and returns (nil for nothing), to be closed once w.mu
-// is let go (closeReplaced), with the call's errno.
+// out of the table and returns (nil for nothing to close,
+// clearSlotLocked), to be closed once w.mu is let go (closeReplaced), with
+// the call's errno.
 func (w *WasiStubs) takeDup2(from, to int32) (replaced *wasiOpen, errno int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -5981,18 +6000,10 @@ func (w *WasiStubs) takeDup2(from, to int32) (replaced *wasiOpen, errno int32) {
 	if from == to {
 		return nil, _wasiESUCCESS
 	}
-	dst := w.fdsLocked()[to]
-	if dst == src {
-		delete(w.cloexec, to)
-		return nil, _wasiESUCCESS
-	}
-	w.fdsLocked()[to] = src
-	if to == wasiPreopenFD {
-		w.preopenReplaced.Store(true)
-	}
-	delete(w.cloexec, to)
-	src.addRef()
-	return dst, _wasiESUCCESS
+	// A to that holds src already is not its last slot: from holds it.
+	replaced = w.clearSlotLocked(to)
+	w.setSlotLocked(to, src)
+	return replaced, _wasiESUCCESS
 }
 
 // Fd_dup264 is Fd_dup2 for a memory64 guest.
@@ -6001,15 +6012,7 @@ func (w *WasiStubs) Fd_dup264(m *Module, from, to int32) int32 {
 }
 
 func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
-	replaced, moved, errno := w.takeRenumber(from, to)
-	if moved != nil {
-		// The waits in poll(2) for from, which has left the table, are
-		// woken, as for a close (see closeWasiOpen).
-		moved.mu.Lock()
-		err := moved.wakeWaitersLocked()
-		moved.mu.Unlock()
-		w.reportError("fd_renumber", err)
-	}
+	replaced, errno := w.takeRenumber(from, to)
 	w.closeReplaced("fd_renumber", replaced)
 	return errno
 }
@@ -6025,11 +6028,10 @@ func (w *WasiStubs) closeReplaced(call string, op *wasiOpen) {
 }
 
 // takeRenumber is Fd_renumber up to the closing of what to held, which it
-// takes out of the table and returns (nil for nothing), to be closed once
-// w.mu is let go (closeReplaced), with the call's errno. moved is the
-// descriptor that left from, whose waits are to be woken then (nil for
-// none).
-func (w *WasiStubs) takeRenumber(from, to int32) (replaced, moved *wasiOpen, errno int32) {
+// takes out of the table and returns (nil for nothing to close,
+// clearSlotLocked), to be closed once w.mu is let go (closeReplaced), with
+// the call's errno.
+func (w *WasiStubs) takeRenumber(from, to int32) (replaced *wasiOpen, errno int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if from == to {
@@ -6037,22 +6039,19 @@ func (w *WasiStubs) takeRenumber(from, to int32) (replaced, moved *wasiOpen, err
 		// the entry at "to" here — that would destroy the live fd the
 		// caller is trying to keep.
 		if w.openLocked(from) != nil {
-			return nil, nil, _wasiESUCCESS
+			return nil, _wasiESUCCESS
 		}
-		return nil, nil, _wasiEBADF
+		return nil, _wasiEBADF
 	}
 	src := w.openLocked(from)
 	if src == nil || to < 0 || to >= wasiRootFD {
-		return nil, nil, _wasiEBADF
+		return nil, _wasiEBADF
 	}
-	dst := w.fdsLocked()[to]
-	w.fdsLocked()[to] = src
-	if to == wasiPreopenFD {
-		w.preopenReplaced.Store(true)
-	}
-	delete(w.cloexec, to)
-	delete(w.fdsLocked(), from)
-	return dst, src, _wasiESUCCESS
+	// to holds src before from lets it go: from's is not its last slot.
+	replaced = w.clearSlotLocked(to)
+	w.setSlotLocked(to, src)
+	w.clearSlotLocked(from)
+	return replaced, _wasiESUCCESS
 }
 
 // Fd_renumber64 is Fd_renumber for a memory64 guest.
@@ -7612,8 +7611,8 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		return found || slices.ContainsFunc(hostSet, func(e hostWaitFD) bool { return e.ready })
 	}
 	// waitHostWoken waits for hostSet until until passes, stop is closed or
-	// the slot of a subscription is closed (its event carries EBADF), and
-	// reports whether a subscription is ready.
+	// the descriptor of a subscription is closed (its event carries EBADF),
+	// and reports whether a subscription is ready.
 	waitHostWoken := func(until time.Time, stop <-chan struct{}) bool {
 		// A slot closed before the waits were registered woke none of
 		// them: it ends the wait before it starts.
@@ -13600,8 +13599,8 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 			return 0, mapOSError(err)
 		}
 		for !set[0].ready {
-			// Woken without input: a slot of the entry was closed. A
-			// stream closed with it is ready, and the read reports it.
+			// Woken without input: the entry was closed. A closed stream
+			// is ready, and the read reports it.
 			interrupted, err := w.waitHostInterruptibly(call, set, time.Time{})
 			if err != nil {
 				return 0, mapOSError(err)

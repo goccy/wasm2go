@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -541,8 +542,10 @@ func TestSocket_Poll(t *testing.T) {
 	wantUserdata(t, <-polled, 8)
 }
 
-// Two numbers of one descriptor in one poll: closing one ends its
-// subscription with EBADF, and the other waits on.
+// Two numbers of one descriptor in one poll: closing one leaves the
+// descriptor open and the poll waiting, as on Linux. When input ends the
+// wait, the closed number's event carries EBADF, and the other's reports
+// the input.
 func TestWasi_PollOfTwoNumbersOfOneDescriptor(t *testing.T) {
 	if !hostPolls {
 		t.Skip("the host has no poll(2)")
@@ -563,9 +566,29 @@ func TestWasi_PollOfTwoNumbersOfOneDescriptor(t *testing.T) {
 	if rc := w.Fd_close(newForkTestModule(), readFd); rc != _wasiESUCCESS {
 		t.Fatalf("close rc=%d", rc)
 	}
-	wantUserdata(t, <-polled, 7)
-	if errno := binary.LittleEndian.Uint16(m.memory[pollEvOff+8:]); errno != uint16(_wasiEBADF) {
-		t.Fatalf("event errno %d, want EBADF", errno)
+	// The poll still waits: its wake is registered and was not written to.
+	w.mu.Lock()
+	op := w.openLocked(dup)
+	w.mu.Unlock()
+	op.mu.Lock()
+	waiters := slices.Collect(maps.Keys(op.waiters))
+	op.mu.Unlock()
+	if len(waiters) != 1 || woken(t, waiters[0]) {
+		t.Fatalf("the close of one number woke the poll (%d waits registered)", len(waiters))
+	}
+	select {
+	case got := <-polled:
+		t.Fatalf("the poll returned %v after the close of one number", got)
+	default:
+	}
+	if rc := fdWriteString(w, newForkTestModule(), writeFd, "x"); rc != _wasiESUCCESS {
+		t.Fatalf("write rc=%d", rc)
+	}
+	wantUserdata(t, <-polled, 7, 8)
+	for i, want := range []int32{_wasiEBADF, _wasiESUCCESS} {
+		if errno := binary.LittleEndian.Uint16(m.memory[pollEvOff+int32(i)*32+8:]); errno != uint16(want) {
+			t.Fatalf("event %d errno %d, want %d", i, errno, want)
+		}
 	}
 	if rc := w.Fd_close(m, writeFd); rc != _wasiESUCCESS {
 		t.Fatalf("close rc=%d", rc)
