@@ -248,8 +248,8 @@ func hostUname() (Uname, error) { return Uname{}, errors.ErrUnsupported }
 // hostAccess would ask the host about an access to a file, which the
 // runtime cannot do on this platform: asked is false, and Path_access
 // decides by the file's mode bits.
-func hostAccess(path string, amode uint32, effective bool) (errno int32, asked bool) {
-	return 0, false
+func hostAccess(path string, amode uint32, effective bool) (asked bool, err error) {
+	return false, nil
 }
 
 // flockOSFile would apply flock(2) to a file of the host process, which the
@@ -351,7 +351,7 @@ func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, st
 	}
 	return &hostCommand{process: cmd.Process, wait: func() int32 {
 		err := cmd.Wait()
-		return waitStatusOf(cmd.ProcessState, err)
+		return w.waitStatusOf(cmd.ProcessState, err)
 	}}, nil
 }
 

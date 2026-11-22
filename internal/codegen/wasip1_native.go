@@ -1250,18 +1250,20 @@ const pollProbeGrace = 200 * time.Microsecond
 // input, as zero bytes, or the failure, as its errno. The reads after it go
 // to the stream again, which can have input by then (a terminal after its
 // end-of-file character, a FIFO with a new writer).
-func (op *wasiOpen) takeAhead(bufs [][]byte) (n uint64, errno int32, ok bool) {
+func (w *WasiStubs) takeAhead(call string, op *wasiOpen, bufs [][]byte) (n uint64, errno int32, ok bool) {
 	op.mu.Lock()
-	defer op.mu.Unlock()
 	if len(op.ahead) == 0 {
 		end := op.aheadEnd
 		op.aheadEnd = nil
+		op.mu.Unlock()
 		if end == nil || errors.Is(end, io.EOF) {
 			// A probe that hit end of input leaves a zero-byte read behind.
 			return 0, _wasiESUCCESS, end != nil
 		}
-		return 0, mapOSError(end), true
+		// Errors is told without the lock held.
+		return 0, w.guestErrno(call, end), true
 	}
+	defer op.mu.Unlock()
 	return op.copyAheadLocked(bufs, false), _wasiESUCCESS, true
 }
 
@@ -1734,18 +1736,18 @@ func readOnce(src io.Reader, bufs [][]byte) (int, error) {
 // readResult is what the guest's read of a stream returns for a read that
 // got n bytes and err: the count, or the errno of a failure other than the
 // end of input that left nothing read.
-func readResult(n int, err error) (uint64, int32) {
+func (w *WasiStubs) readResult(call string, n int, err error) (uint64, int32) {
 	if err != nil && n == 0 && !errors.Is(err, io.EOF) {
-		return 0, mapOSError(err)
+		return 0, w.guestErrno(call, err)
 	}
 	return uint64(n), _wasiESUCCESS
 }
 
 // readStreamNow reads what src, a descriptor of the host's (streamPolled)
-// and the stream behind this entry, has right now, as a non-blocking
+// and the stream behind the entry op, has right now, as a non-blocking
 // read(2) does: once, and EAGAIN when there is nothing. Nothing is taken
 // beyond what bufs hold.
-func (op *wasiOpen) readStreamNow(src deadlineReader, bufs [][]byte) (uint64, int32) {
+func (w *WasiStubs) readStreamNow(call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
 	file, isFile := src.(*os.File)
 	var mode os.FileMode
 	if isFile {
@@ -1767,7 +1769,8 @@ func (op *wasiOpen) readStreamNow(src deadlineReader, bufs [][]byte) (uint64, in
 		}
 	}) {
 		// Closed meanwhile: the read reports it.
-		return readResult(readOnce(src, bufs))
+		n, err = readOnce(src, bufs)
+		return w.readResult(call, n, err)
 	}
 	if waits {
 		// Any other descriptor in blocking mode (a terminal, an inherited
@@ -1776,12 +1779,13 @@ func (op *wasiOpen) readStreamNow(src deadlineReader, bufs [][]byte) (uint64, in
 		// first, as read(2) after poll(2) does.
 		set := []hostWaitFD{{stream: src, want: hostWantInput}}
 		if err := waitHostReady(set, time.Now(), -1); err != nil {
-			return 0, mapOSError(err)
+			return 0, w.guestErrno(call, err)
 		}
 		if !set[0].ready {
 			return 0, _wasiEAGAIN
 		}
-		return readResult(readOnce(src, bufs))
+		n, err = readOnce(src, bufs)
+		return w.readResult(call, n, err)
 	}
 	if again {
 		return 0, _wasiEAGAIN
@@ -1789,7 +1793,7 @@ func (op *wasiOpen) readStreamNow(src deadlineReader, bufs [][]byte) (uint64, in
 	if err != nil {
 		err = os.NewSyscallError("read", err)
 	}
-	return readResult(n, err)
+	return w.readResult(call, n, err)
 }
 
 // readBlocks reports whether a read of src, the stream behind this entry,
@@ -2054,7 +2058,9 @@ type WASIConfig struct {
 	// without TZ); nil is UTC.
 	LocalZone *time.Location
 	// Errors is told the errors of operations whose caller cannot be given
-	// them (op names the operation); nil drops them.
+	// them (op names the operation), among them an error the guest's call
+	// fails with that has no errno of its own (the call fails with EIO); nil
+	// drops them.
 	Errors func(op string, err error)
 	// Signals connects the guest's signals with processes and signal
 	// handling outside the guest. nil is an isolated guest: its kill reaches
@@ -2637,7 +2643,7 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 // is closed regardless).
 func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
 	if err := w.closeFrom(lowFd); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_closefrom", err)
 	}
 	return _wasiESUCCESS
 }
@@ -3289,7 +3295,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		// exec.Command does.
 		found, err := exec.LookPath(path)
 		if err != nil {
-			return -mapExecError(err)
+			return -w.guestErrno("proc_spawn", err)
 		}
 		path = found
 	}
@@ -3332,7 +3338,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		}
 	}
 	if startErr != nil {
-		return -mapExecError(startErr)
+		return -w.guestErrno("proc_spawn", startErr)
 	}
 
 	proc := &wasiProc{host: cmd.process, done: make(chan struct{})}
@@ -3484,7 +3490,7 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 	}
 	r, wr, err := os.Pipe()
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("pipe", err)
 	}
 	w.mu.Lock()
 	rfd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
@@ -3738,7 +3744,7 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	proc, ours := pids.find(pid)
 	switch {
 	case proc != nil:
-		return killFamilyProc(proc, sig)
+		return w.killFamilyProc(proc, sig)
 	case ours:
 		// A process of the family that is gone: one that has been waited
 		// for, or the root instance.
@@ -3746,7 +3752,7 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	case w.cfg.Signals == nil:
 		return -_wasiESRCH
 	}
-	return -mapOSError(w.cfg.Signals.Kill(pid, sig))
+	return -w.guestErrno("proc_kill", w.cfg.Signals.Kill(pid, sig))
 }
 
 // killGroup signals every process of the fork family but the guest itself,
@@ -3761,7 +3767,7 @@ func (w *WasiStubs) killGroup(sig int32, self bool) int32 {
 		if proc.instance == w {
 			continue
 		}
-		if r := killFamilyProc(proc, sig); rc != _wasiESUCCESS {
+		if r := w.killFamilyProc(proc, sig); rc != _wasiESUCCESS {
 			rc = r
 		}
 	}
@@ -3774,7 +3780,7 @@ func (w *WasiStubs) killGroup(sig int32, self bool) int32 {
 
 // killFamilyProc delivers sig to a process of the fork family; see
 // Proc_kill.
-func killFamilyProc(proc *wasiProc, sig int32) int32 {
+func (w *WasiStubs) killFamilyProc(proc *wasiProc, sig int32) int32 {
 	select {
 	case <-proc.done:
 		return _wasiESUCCESS
@@ -3792,17 +3798,17 @@ func killFamilyProc(proc *wasiProc, sig int32) int32 {
 	case sig == 0:
 		return _wasiESUCCESS
 	case proc.host != nil:
-		return killHostProc(proc.host, sig)
+		return w.killHostProc(proc.host, sig)
 	case proc.kill == nil:
 		return -_wasiEPERM
 	}
-	return -mapOSError(proc.kill(sig))
+	return -w.guestErrno("proc_kill", proc.kill(sig))
 }
 
 // killHostProc delivers sig to a host process started by Proc_spawn.
 // SIGKILL is os.Process.Kill, which every platform has; another signal is
 // the host's signal for it (hostSignalOf).
-func killHostProc(p *os.Process, sig int32) int32 {
+func (w *WasiStubs) killHostProc(p *os.Process, sig int32) int32 {
 	var err error
 	if sig == wasiSIGKILL {
 		err = p.Kill()
@@ -3817,7 +3823,7 @@ func killHostProc(p *os.Process, sig int32) int32 {
 		// It finished after the probe of done.
 		return _wasiESUCCESS
 	}
-	return -mapOSError(err)
+	return -w.guestErrno("proc_kill", err)
 }
 
 // Proc_kill64 is Proc_kill for a memory64 guest.
@@ -3835,10 +3841,12 @@ type hostCommand struct {
 
 // waitStatusOf returns the wait status of a command whose wait returned st
 // and err: that of st (encodeWaitStatus), or a 127 exit when the wait
-// itself failed. A command that exits with a status other than 0, or is
-// killed, is no failure of the wait (exec.ExitError).
-func waitStatusOf(st *os.ProcessState, err error) int32 {
+// itself failed, whose error is told WASIConfig.Errors (op "proc_spawn"). A
+// command that exits with a status other than 0, or is killed, is no
+// failure of the wait (exec.ExitError).
+func (w *WasiStubs) waitStatusOf(st *os.ProcessState, err error) int32 {
 	if exitErr := (*exec.ExitError)(nil); err != nil && !errors.As(err, &exitErr) {
+		w.reportError("proc_spawn", err)
 		return 127 << 8
 	}
 	return encodeWaitStatus(st)
@@ -3875,18 +3883,6 @@ func encodeHostWaitStatus(ws syscall.WaitStatus) int32 {
 		return int32(ws.Signal()) & 0x7f
 	}
 	return int32(ws.ExitStatus()&0xff) << 8
-}
-
-// mapExecError maps an exec.Command Start() failure to a wasi errno.
-func mapExecError(err error) int32 {
-	switch {
-	case errors.Is(err, exec.ErrNotFound), errors.Is(err, fs.ErrNotExist):
-		return _wasiENOENT
-	case errors.Is(err, fs.ErrPermission):
-		return _wasiEACCES
-	default:
-		return _wasiENOENT
-	}
 }
 
 // Sock_getaddrinfo is a NON-STANDARD host import (module wasi_snapshot_preview1,
@@ -4116,12 +4112,26 @@ const (
 	_wasiETIMEDOUT    int32 = 73
 )
 
-// mapOSError turns an os/filesystem error into a wasi errno, so any
-// os.PathError surfaces as the appropriate guest-visible code instead of
-// a coarse EIO.
-func mapOSError(err error) int32 {
+// guestErrno returns the wasi errno of err, the failure of the operation op
+// (the import's name, or the name of the operation that imports share):
+// wasiErrnoOf's. An error it has no errno for is EIO, and told
+// WASIConfig.Errors.
+func (w *WasiStubs) guestErrno(op string, err error) int32 {
+	errno, known := wasiErrnoOf(err)
+	if !known {
+		w.reportError(op, err)
+	}
+	return errno
+}
+
+// wasiErrnoOf returns the wasi errno of err, and whether there is one: that
+// of the syscall.Errno it carries (wrapped or not) when wasi has the error,
+// otherwise that of the kind of error the standard library tells it is
+// (fs.ErrNotExist, errors.ErrUnsupported, a net.Error's Timeout,
+// exec.ErrNotFound and the like). EIO for any other error.
+func wasiErrnoOf(err error) (int32, bool) {
 	if err == nil {
-		return _wasiESUCCESS
+		return _wasiESUCCESS, true
 	}
 	// The error number of the system call that failed says exactly which
 	// error it is; what follows tells only the kinds package os knows
@@ -4129,51 +4139,58 @@ func mapOSError(err error) int32 {
 	var number syscall.Errno
 	if errors.As(err, &number) {
 		if wasi, ok := wasiErrno(number); ok {
-			return wasi
+			return wasi, true
 		}
 	}
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		return _wasiENOENT
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, exec.ErrNotFound):
+		return _wasiENOENT, true
 	case errors.Is(err, syscall.ENOTEMPTY):
 		// before fs.ErrExist, which ENOTEMPTY is as well
-		return _wasiENOTEMPTY
+		return _wasiENOTEMPTY, true
 	case errors.Is(err, fs.ErrExist):
-		return _wasiEEXIST
+		return _wasiEEXIST, true
 	case errors.Is(err, syscall.EPERM):
 		// before fs.ErrPermission, which stands for EACCES as well
-		return _wasiEPERM
+		return _wasiEPERM, true
 	case errors.Is(err, fs.ErrPermission):
-		return _wasiEACCES
+		return _wasiEACCES, true
 	case errors.Is(err, syscall.ESRCH):
-		return _wasiESRCH
+		return _wasiESRCH, true
 	case errors.Is(err, syscall.ENOTDIR):
-		return _wasiENOTDIR
+		return _wasiENOTDIR, true
 	case errors.Is(err, syscall.EISDIR):
-		return _wasiEISDIR
-	case errors.Is(err, syscall.EINVAL):
-		return _wasiEINVAL
+		return _wasiEISDIR, true
+	case errors.Is(err, syscall.EINVAL), errors.Is(err, fs.ErrInvalid):
+		return _wasiEINVAL, true
 	case errors.Is(err, syscall.EBADF), errors.Is(err, fs.ErrClosed), errors.Is(err, net.ErrClosed):
-		return _wasiEBADF
+		return _wasiEBADF, true
 	case errors.Is(err, syscall.ENOSPC):
-		return _wasiENOSPC
+		return _wasiENOSPC, true
 	case errors.Is(err, syscall.EFBIG):
-		return _wasiEFBIG
+		return _wasiEFBIG, true
 	case errors.Is(err, syscall.EAGAIN):
-		return _wasiEAGAIN
+		return _wasiEAGAIN, true
 	case errors.Is(err, syscall.EPIPE), errors.Is(err, io.ErrClosedPipe):
-		return _wasiEPIPE
+		return _wasiEPIPE, true
 	case errors.Is(err, syscall.ENXIO):
-		return _wasiENXIO
+		return _wasiENXIO, true
 	case errors.Is(err, syscall.ESPIPE):
-		return _wasiESPIPE
+		return _wasiESPIPE, true
 	case errors.Is(err, syscall.ENOSYS):
 		// before errors.ErrUnsupported, which ENOSYS is as well
-		return _wasiENOSYS
+		return _wasiENOSYS, true
+	case errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.EOPNOTSUPP):
+		// before errors.ErrUnsupported, which they are as well
+		return _wasiENOTSUP, true
 	case errors.Is(err, errors.ErrUnsupported):
-		return _wasiENOTSUP
+		// what the value or the host does not implement
+		return _wasiENOSYS, true
 	}
-	return _wasiEIO
+	if timeout := net.Error(nil); errors.As(err, &timeout) && timeout.Timeout() {
+		return _wasiETIMEDOUT, true
+	}
+	return _wasiEIO, false
 }
 
 // totalBytes sums len(s)+1 over s in a uint64 and reports whether the
@@ -4435,7 +4452,7 @@ func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	w.mu.Unlock()
 	if closing != nil {
 		if closeErr := closeWasiOpen(closing); closeErr != nil {
-			return mapOSError(closeErr)
+			return w.guestErrno("fd_close", closeErr)
 		}
 	}
 	return _wasiESUCCESS
@@ -4609,7 +4626,7 @@ func (w *WasiStubs) filestatOf(fd int32, out []byte) int32 {
 	if root {
 		st, err := fsys.Stat(".")
 		if err != nil {
-			return mapOSError(err)
+			return w.guestErrno("fd_filestat_get", err)
 		}
 		writeFilestat(out, st)
 		return _wasiESUCCESS
@@ -4617,7 +4634,7 @@ func (w *WasiStubs) filestatOf(fd int32, out []byte) int32 {
 	if op.f == nil {
 		fi, err := w.streamFileInfo(op)
 		if err != nil {
-			return mapOSError(err)
+			return w.guestErrno("fd_filestat_get", err)
 		}
 		if fi != nil {
 			// A standard stream that is a file of the host is that
@@ -4644,7 +4661,7 @@ func (w *WasiStubs) filestatOf(fd int32, out []byte) int32 {
 	}
 	st, err := op.f.Stat()
 	if err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_filestat_get", err)
 	}
 	writeFilestat(out, st)
 	return _wasiESUCCESS
@@ -4663,7 +4680,7 @@ func (w *WasiStubs) Fd_filestat_set_size(m *Module, fd int32, size int64) int32 
 		return _wasiEINVAL
 	}
 	if err := op.f.Truncate(size); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_filestat_set_size", err)
 	}
 	return _wasiESUCCESS
 }
@@ -4694,7 +4711,7 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	if filetimesNeedCurrent(fstFlags) {
 		st, err := op.f.Stat()
 		if err != nil {
-			return mapOSError(err)
+			return w.guestErrno("fd_filestat_set_times", err)
 		}
 		current = st
 	}
@@ -4704,10 +4721,10 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	if f, ok := op.f.(interface {
 		Chtimes(atime, mtime time.Time) error
 	}); ok {
-		return mapOSError(f.Chtimes(atime, mtime))
+		return w.guestErrno("fd_filestat_set_times", f.Chtimes(atime, mtime))
 	}
 	if err := fsys.Chtimes(name, atime, mtime); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_filestat_set_times", err)
 	}
 	return _wasiESUCCESS
 }
@@ -4847,12 +4864,12 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 		abi.putWord(nreadSlice, n)
 		return errno
 	}
-	n, errno, served := op.takeAhead(bufs)
+	n, errno, served := w.takeAhead("fd_read", op, bufs)
 	if !served {
 		if stream, blocks := op.readBlocks(src); blocks {
 			n, errno = w.readStream("fd_read", op, stream, bufs)
 		} else {
-			n, errno = readVec(src, bufs, op.regular)
+			n, errno = w.readVec("fd_read", src, bufs, op.regular)
 		}
 	}
 	abi.putWord(nreadSlice, n)
@@ -4898,13 +4915,13 @@ func (w *WasiStubs) iovecSlices(m *Module, abi wasiABI, iovs, iovsLen uint64) ([
 // fd_pread and sock_recv. Unless whole is set (src is a regular file), it
 // also stops after the first read that returned data: reading on from a
 // pipe, a terminal or a socket would wait for data that has not come.
-func readVec(src io.Reader, bufs [][]byte, whole bool) (uint64, int32) {
+func (w *WasiStubs) readVec(call string, src io.Reader, bufs [][]byte, whole bool) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := src.Read(buf)
 		total += uint64(n)
 		if err != nil && total == 0 && !errors.Is(err, io.EOF) {
-			return 0, mapOSError(err)
+			return 0, w.guestErrno(call, err)
 		}
 		if err != nil || n < len(buf) || (n > 0 && !whole) {
 			break
@@ -4916,13 +4933,13 @@ func readVec(src io.Reader, bufs [][]byte, whole bool) (uint64, int32) {
 // writeVec drains bufs into dst in order, stopping at the first failed
 // write; returns the bytes written, or the errno of an error that left
 // nothing written. Shared by fd_write and fd_pwrite.
-func writeVec(dst io.Writer, bufs [][]byte) (uint64, int32) {
+func (w *WasiStubs) writeVec(call string, dst io.Writer, bufs [][]byte) (uint64, int32) {
 	var total uint64
 	for _, buf := range bufs {
 		n, err := dst.Write(buf)
 		total += uint64(n)
 		if err != nil && total == 0 {
-			return 0, mapOSError(err)
+			return 0, w.guestErrno(call, err)
 		}
 		if err != nil {
 			break
@@ -4941,7 +4958,7 @@ func (w *WasiStubs) writeFd(call string, op *wasiOpen, dst io.Writer, bufs [][]b
 	if stream, blocks := op.writeBlocks(dst); blocks {
 		return w.writeStream(call, op, stream, bufs, flags)
 	}
-	return writeVec(dst, bufs)
+	return w.writeVec(call, dst, bufs)
 }
 
 // The flags of one write to a stream: what the MSG_ flags of send(2) ask
@@ -4978,7 +4995,7 @@ func (w *WasiStubs) writeStream(call string, op *wasiOpen, dst streamWriter, buf
 func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
 	rc, err := dst.SyscallConn()
 	if err != nil {
-		return 0, mapOSError(err)
+		return 0, w.guestErrno(call, err)
 	}
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
 	// Only the holder of the turn at the stream's output enters the host's
@@ -5004,7 +5021,7 @@ func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter,
 	case errors.Is(err, os.ErrNoDeadline):
 		inBlockingMode = true
 	case err != nil:
-		return 0, mapOSError(err)
+		return 0, w.guestErrno(call, err)
 	}
 	// A write that does not wait to a descriptor in blocking mode is one
 	// call: to a socket, a send that does not wait (MSG_DONTWAIT) where the
@@ -5022,7 +5039,7 @@ func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter,
 		} else {
 			set := []hostWaitFD{{stream: dst, want: hostWantRoom}}
 			if err := waitHostReady(set, time.Now(), -1); err != nil {
-				return 0, mapOSError(err)
+				return 0, w.guestErrno(call, err)
 			}
 			if !set[0].ready {
 				return 0, _wasiEAGAIN
@@ -5135,7 +5152,7 @@ func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter,
 	case total > 0:
 		return total, _wasiESUCCESS
 	case failure != nil:
-		return 0, mapOSError(failure)
+		return 0, w.guestErrno(call, failure)
 	case cutShort:
 		return 0, _wasiEINTR
 	case full:
@@ -5266,7 +5283,7 @@ func (w *WasiStubs) fdPread(m *Module, abi wasiABI, fd int32, iovs, iovsLen uint
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
 	}
-	n, errno := readVec(io.NewSectionReader(op.f, offset, 1<<63-1), bufs, true)
+	n, errno := w.readVec("fd_pread", io.NewSectionReader(op.f, offset, 1<<63-1), bufs, true)
 	abi.putWord(nreadSlice, n)
 	return errno
 }
@@ -5301,7 +5318,7 @@ func (w *WasiStubs) fdPwrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen uin
 	if !ok || nwSlice == nil {
 		return _wasiEFAULT
 	}
-	n, errno := writeVec(io.NewOffsetWriter(op.f, offset), bufs)
+	n, errno := w.writeVec("fd_pwrite", io.NewOffsetWriter(op.f, offset), bufs)
 	abi.putWord(nwSlice, n)
 	return errno
 }
@@ -5335,9 +5352,7 @@ func (w *WasiStubs) fdSeek(m *Module, fd int32, offset, whence int64, newOffPtr 
 	}
 	n, err := op.f.Seek(offset, int(whence))
 	if err != nil {
-		// An error without a number of its own (of a File other than the
-		// host's) is EINVAL, which is what a seek can fail with.
-		return seekErrno(err, _wasiEINVAL)
+		return w.guestErrno("fd_seek", err)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -5369,7 +5384,7 @@ func (w *WasiStubs) fdTell(m *Module, fd int32, offsetPtr uint64) int32 {
 	}
 	n, err := op.f.Seek(0, 1) // SEEK_CUR
 	if err != nil {
-		return seekErrno(err, _wasiEIO)
+		return w.guestErrno("fd_tell", err)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -5446,27 +5461,6 @@ func (w *WasiStubs) socketConn(fd int32) (*wasiOpen, net.Conn, int32) {
 	return op, nil, _wasiENOTCONN
 }
 
-// errnoOr returns the wasi errno of err. It returns fallback for an error
-// without an error number of the host, and for a number that mapOSError
-// turns into EIO although the number is not EIO itself.
-func errnoOr(err error, fallback int32) int32 {
-	var number syscall.Errno
-	if errno := mapOSError(err); errors.As(err, &number) && (errno != _wasiEIO || number == syscall.EIO) {
-		return errno
-	}
-	return fallback
-}
-
-// seekErrno is errnoOr for the error of a File's Seek. os.File.Seek of a
-// directory it has read returns EISDIR of its own after the host's seek
-// succeeded; lseek has no such errno, so that error is the fallback too.
-func seekErrno(err error, fallback int32) int32 {
-	if errors.Is(err, syscall.EISDIR) {
-		return fallback
-	}
-	return errnoOr(err, fallback)
-}
-
 // afterShutdown returns the errno of a transfer on op that ended with
 // errno: once Sock_shutdown has closed the connection, which has no half
 // close, a read that fails gets the end of the stream and a write that
@@ -5489,7 +5483,7 @@ func (w *WasiStubs) Fd_sync(m *Module, fd int32) int32 {
 		return _wasiEBADF
 	}
 	if err := op.f.Sync(); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_sync", err)
 	}
 	return _wasiESUCCESS
 }
@@ -5509,7 +5503,7 @@ func (w *WasiStubs) Fd_datasync(m *Module, fd int32) int32 {
 	// fdatasync skips metadata; the portable Sync() is a strict
 	// superset (also flushes metadata) and satisfies the wasi spec.
 	if err := op.f.Sync(); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_datasync", err)
 	}
 	return _wasiESUCCESS
 }
@@ -5557,13 +5551,13 @@ func (w *WasiStubs) Fd_allocate(m *Module, fd int32, offset, length int64) int32
 	// equivalent is Truncate to offset+length when that is past the end.
 	st, err := op.f.Stat()
 	if err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_allocate", err)
 	}
 	if end <= st.Size() {
 		return _wasiESUCCESS
 	}
 	if err := op.f.Truncate(end); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("fd_allocate", err)
 	}
 	return _wasiESUCCESS
 }
@@ -5600,7 +5594,7 @@ func (w *WasiStubs) pathChmod(m *Module, pathPtr uint64, pathLen, mode int32) in
 	fsys := w.fs()
 	w.mu.Unlock()
 	if err := fsys.Chmod(name, unixFileMode(uint32(mode))); err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("path_chmod", err)
 	}
 	return _wasiESUCCESS
 }
@@ -5619,7 +5613,7 @@ func (w *WasiStubs) Fd_chmod(m *Module, fd, mode int32) int32 {
 		return -_wasiEINVAL
 	}
 	if err := op.f.Chmod(unixFileMode(uint32(mode))); err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("fd_chmod", err)
 	}
 	return _wasiESUCCESS
 }
@@ -6015,7 +6009,7 @@ func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
 	fsys := w.fs()
 	w.mu.Unlock()
 	if err := w.create(fsys, mode, func(perm os.FileMode) error { return fsys.Mkdir(name, perm) }); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_create_directory", err)
 	}
 	return _wasiESUCCESS
 }
@@ -6069,7 +6063,7 @@ func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow i
 		fi, err = fsys.Lstat(name)
 	}
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("path_filestat_ext", err)
 	}
 	writeFilestatExt(out, fi)
 	return _wasiESUCCESS
@@ -6114,14 +6108,14 @@ func (w *WasiStubs) filestatExtOf(fd int32, out []byte) int32 {
 	if root {
 		fi, err := fsys.Stat(".")
 		if err != nil {
-			return -mapOSError(err)
+			return -w.guestErrno("fd_filestat_ext", err)
 		}
 		writeFilestatExt(out, fi)
 		return _wasiESUCCESS
 	}
 	fi, err := w.opFileInfo(op)
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("fd_filestat_ext", err)
 	}
 	if fi != nil {
 		writeFilestatExt(out, fi)
@@ -6314,7 +6308,7 @@ func (w *WasiStubs) pathFilestatMode(m *Module, pathPtr uint64, pathLen, follow 
 		fi, err = fsys.Lstat(name)
 	}
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("path_filestat_mode", err)
 	}
 	binary.LittleEndian.PutUint32(out, unixModeBits(fi.Mode()))
 	return _wasiESUCCESS
@@ -6605,7 +6599,7 @@ func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, i
 	// since the previous call.
 	entries, err := op.readDirCached(cookie == 0)
 	if err != nil {
-		return 0, mapOSError(err)
+		return 0, w.guestErrno("fd_readdir", err)
 	}
 	startIdx := int(cookie)
 	if startIdx < 0 {
@@ -6975,7 +6969,7 @@ func (w *WasiStubs) ownLinkTarget(op *wasiOpen, root bool) (string, int32) {
 		if file := w.streamFile(op); file != nil {
 			target, ok, err := hostStreamLink(file)
 			if err != nil {
-				return "", mapOSError(err)
+				return "", w.guestErrno("path_readlink", err)
 			}
 			if ok {
 				return target, _wasiESUCCESS
@@ -6984,7 +6978,7 @@ func (w *WasiStubs) ownLinkTarget(op *wasiOpen, root bool) (string, int32) {
 	}
 	fi, err := w.opFileInfo(op)
 	if err != nil {
-		return "", mapOSError(err)
+		return "", w.guestErrno("path_readlink", err)
 	}
 	// What fd_filestat_ext tells of a descriptor without a file: a socket,
 	// or a pipe to the guest (a stream the embedder gave), numbered 0.
@@ -7081,7 +7075,7 @@ func (w *WasiStubs) openRoot(oflags, fdflags int32) (int32, int32) {
 	fsys := w.fs()
 	f, err := fsys.OpenFile(".", os.O_RDONLY, 0)
 	if err != nil {
-		return -1, mapOSError(err)
+		return -1, w.guestErrno("path_open", err)
 	}
 	_, whole := fsys.(osFS)
 	op := &wasiOpen{f: f, isDir: true, path: ".", fdflags: fdflags, hostPath: whole, noWrite: true}
@@ -7143,7 +7137,7 @@ func (w *WasiStubs) listingEntry(n int32, op *wasiOpen, root bool, ids ProcessID
 	if target == "" {
 		fi, err := w.opFileInfo(op)
 		if err != nil {
-			return ownNameEntry{}, mapOSError(err)
+			return ownNameEntry{}, w.guestErrno("fd_readdir", err)
 		}
 		info.mode = info.mode.Perm()
 		if fi != nil {
@@ -7288,7 +7282,12 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	// platform-specific syscall constants.
 	if noFollow {
 		if li, lerr := fsys.Lstat(rel); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
-			return -1, _wasiENOENT
+			// open(2)'s errnos for a symbolic link: EEXIST with
+			// O_CREAT|O_EXCL, ELOOP with O_NOFOLLOW otherwise
+			if oflags&0x5 == 0x5 {
+				return -1, _wasiEEXIST
+			}
+			return -1, _wasiELOOP
 		}
 	}
 	var f File
@@ -7300,7 +7299,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	if err == nil {
 		isFIFO = fi.Mode()&os.ModeNamedPipe != 0
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return -1, mapOSError(err)
+		return -1, w.guestErrno("path_open", err)
 	}
 	if isFIFO && requireDir {
 		// Not opened: an open of a FIFO would wait for its other end.
@@ -7312,12 +7311,12 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		// whether or not anyone writes to it, a writer is refused (ENXIO)
 		// while nobody reads.
 		if f, err = openFile(rel, flag|hostONonblock, w.createMode(mode)); err != nil {
-			return -1, mapOSError(err)
+			return -1, w.guestErrno("path_open", err)
 		}
 		// The descriptor waits as any other does: the guest's NONBLOCK is
 		// its fdflags.
 		if err := setHostNonblock(f, false); err != nil {
-			return -1, mapOSError(errors.Join(err, f.Close()))
+			return -1, w.guestErrno("path_open", errors.Join(err, f.Close()))
 		}
 	case isFIFO && flag&os.O_RDWR == 0:
 		// An open of one end waits for the other.
@@ -7331,21 +7330,21 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 			f, err = openFile(rel, flag, perm)
 			return err
 		}); err != nil {
-			return -1, mapOSError(err)
+			return -1, w.guestErrno("path_open", err)
 		}
 	default:
 		if f, err = openFile(rel, flag, mode); err != nil {
-			return -1, mapOSError(err)
+			return -1, w.guestErrno("path_open", err)
 		}
 	}
 	st, statErr := f.Stat()
 	if statErr != nil {
-		return -1, mapOSError(errors.Join(statErr, f.Close()))
+		return -1, w.guestErrno("path_open", errors.Join(statErr, f.Close()))
 	}
 	isDir := st.IsDir()
 	if requireDir && !isDir {
 		if cerr := f.Close(); cerr != nil {
-			return -1, mapOSError(cerr)
+			return -1, w.guestErrno("path_open", cerr)
 		}
 		return -1, _wasiENOTDIR
 	}
@@ -7411,13 +7410,13 @@ func (w *WasiStubs) pathUnlinkFile(m *Module, dirFd int32, pathPtr, pathLen uint
 	rel := name
 	st, err := fsys.Lstat(rel)
 	if err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_unlink_file", err)
 	}
 	if st.IsDir() {
 		return _wasiEISDIR
 	}
 	if err := fsys.Remove(rel); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_unlink_file", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7451,13 +7450,13 @@ func (w *WasiStubs) pathRemoveDirectory(m *Module, dirFd int32, pathPtr, pathLen
 	rel := name
 	st, err := fsys.Lstat(rel)
 	if err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_remove_directory", err)
 	}
 	if !st.IsDir() {
 		return _wasiENOTDIR
 	}
 	if err := fsys.Remove(rel); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_remove_directory", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7490,7 +7489,7 @@ func (w *WasiStubs) pathRename(m *Module, oldFd int32, oldPathPtr, oldPathLen ui
 	fsys := w.fs()
 	w.mu.Unlock()
 	if err := fsys.Rename(oldName, newName); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_rename", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7540,7 +7539,7 @@ func (w *WasiStubs) pathFilestatGet(m *Module, dirFd, flags int32, pathPtr, path
 		st, err = fsys.Lstat(rel)
 	}
 	if err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_filestat_get", err)
 	}
 	writeFilestat(out, st)
 	return _wasiESUCCESS
@@ -7582,11 +7581,11 @@ func (w *WasiStubs) pathFilestatSetTimes(m *Module, dirFd, flags int32, pathPtr,
 		st, statErr = fsys.Lstat(rel)
 	}
 	if statErr != nil {
-		return mapOSError(statErr)
+		return w.guestErrno("path_filestat_set_times", statErr)
 	}
 	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, st)
 	if err := fsys.Chtimes(rel, atime, mtime); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_filestat_set_times", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7623,7 +7622,7 @@ func (w *WasiStubs) pathLink(m *Module, oldFd, oldFlags int32, oldPathPtr, oldPa
 	fsys := w.fs()
 	w.mu.Unlock()
 	if err := fsys.Link(oldName, newName); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_link", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7664,7 +7663,7 @@ func (w *WasiStubs) pathSymlink(m *Module, targetPtr, targetLen uint64, dirFd in
 	fsys := w.fs()
 	w.mu.Unlock()
 	if err := fsys.Symlink(string(targetSlice), link); err != nil {
-		return mapOSError(err)
+		return w.guestErrno("path_symlink", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7710,7 +7709,7 @@ func (w *WasiStubs) pathReadlink(m *Module, abi wasiABI, dirFd int32, pathPtr, p
 		w.mu.Unlock()
 		var err error
 		if target, err = fsys.Readlink(name); err != nil {
-			return mapOSError(err)
+			return w.guestErrno("path_readlink", err)
 		}
 	}
 	n := copy(bufSlice, target)
@@ -7987,7 +7986,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			if at := hostIndex[i]; at >= 0 && (slotClosed[i] || hostSet[at].ready || hostErr != nil) {
 				ready[i], anyReady = true, true
 				if hostErr != nil && !slotClosed[i] {
-					errnos[i] = mapOSError(hostErr)
+					errnos[i] = w.guestErrno("poll_oneoff", hostErr)
 				}
 			}
 		}
@@ -8068,7 +8067,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	given := true
 	if waits && len(hostSet) > 0 {
 		if wk, hostErr = w.takeWake(); hostErr != nil {
-			return mapOSError(hostErr)
+			return w.guestErrno("poll_oneoff", hostErr)
 		}
 		for _, e := range hostSet {
 			e.op.addWaiter(wk)
@@ -8139,7 +8138,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			if !given {
 				given = true
 				if err := w.giveWake(wk, hostSet); err != nil {
-					return mapOSError(err)
+					return w.guestErrno("poll_oneoff", err)
 				}
 			}
 			return _wasiEINTR
@@ -8438,7 +8437,7 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	}
 	w.mu.Unlock()
 	if cerr := conn.Close(); cerr != nil {
-		return -mapOSError(cerr)
+		return -w.guestErrno("sock_connect", cerr)
 	}
 	return -_wasiEBADF
 }
@@ -8451,8 +8450,7 @@ func (w *WasiStubs) Sock_connect64(m *Module, fd, ipBE, port int32) int32 {
 // dialInterruptibly dials address on network as package net does, for a
 // host whose sockets the runtime does not make (Sock_connect): a signal
 // posted to the guest meanwhile cancels the dial (EINTR). It returns the
-// connection, or nil and an errno, ECONNREFUSED for a failure without the
-// host's error number. call is the import's name.
+// connection, or nil and an errno. call is the import's name.
 func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, int32) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -8476,7 +8474,7 @@ func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, 
 	case err != nil && interrupted:
 		return nil, _wasiEINTR
 	case err != nil:
-		return nil, errnoOr(err, _wasiECONNREFUSED)
+		return nil, w.guestErrno(call, err)
 	case interrupted:
 		// The dial went through: the next call that waits reports the
 		// signal.
@@ -8528,7 +8526,7 @@ func (w *WasiStubs) sockAccept(m *Module, fd, flags int32, fdOutPtr uint64) int3
 			// the read half was shut, as on linux
 			return _wasiEINVAL
 		}
-		return mapOSError(err)
+		return w.guestErrno("sock_accept", err)
 	}
 	w.mu.Lock()
 	newFD := w.addFDLocked(&wasiOpen{conn: conn})
@@ -8584,7 +8582,7 @@ func (w *WasiStubs) sockRecv(m *Module, abi wasiABI, fd int32, riData, riDataLen
 	if !ok || lenOut == nil || flagsOut == nil {
 		return _wasiEFAULT
 	}
-	n, errno, served := op.takeAhead(bufs)
+	n, errno, served := w.takeAhead("sock_recv", op, bufs)
 	if !served {
 		n, errno = w.readStream("sock_recv", op, conn, bufs)
 	}
@@ -8658,7 +8656,7 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	}
 	if host := op.hostSocket(); host != nil {
 		// a socket of the host's, which the host shuts down as it says
-		return shutdownSocket(host, how)
+		return w.shutdownSocket(host, how)
 	}
 	if conn == nil {
 		if op.listener == nil {
@@ -8672,7 +8670,7 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 		op.shutClosed.Store(true)
 		if op.connClosed.CompareAndSwap(false, true) {
 			if err := op.listener.Close(); err != nil {
-				return mapOSError(err)
+				return w.guestErrno("sock_shutdown", err)
 			}
 		}
 		return _wasiESUCCESS
@@ -8693,7 +8691,7 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 			return _wasiESUCCESS
 		}
 		if err := conn.Close(); err != nil {
-			return mapOSError(err)
+			return w.guestErrno("sock_shutdown", err)
 		}
 		return _wasiESUCCESS
 	}
@@ -8705,7 +8703,7 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 		shErr = errors.Join(shErr, sh.CloseWrite())
 	}
 	if shErr != nil {
-		return mapOSError(shErr)
+		return w.guestErrno("sock_shutdown", shErr)
 	}
 	return _wasiESUCCESS
 }
@@ -8802,11 +8800,11 @@ func (op *wasiOpen) hostSocket() *os.File {
 
 // socketCall runs call on the descriptor of the host socket host. It
 // reports EBADF for a host socket that was closed meanwhile, which is the
-// one failure of Control.
-func socketCall(host *os.File, call func(fd int)) int32 {
+// one failure of Control. name is the import's name.
+func (w *WasiStubs) socketCall(name string, host *os.File, call func(fd int)) int32 {
 	rc, err := host.SyscallConn()
 	if err != nil {
-		return mapOSError(err)
+		return w.guestErrno(name, err)
 	}
 	if rc.Control(func(fd uintptr) { call(int(fd)) }) != nil {
 		return _wasiEBADF
@@ -9022,7 +9020,7 @@ func (w *WasiStubs) listenAllowed(op *wasiOpen, address string) bool {
 // the call binds. A Unix-domain socket that was not bound has no name to be
 // reached at. Returns 0, EACCES when the policy refuses, or the errno of
 // asking the host for the address.
-func (w *WasiStubs) allowReachable(op *wasiOpen, host *os.File, binds bool) int32 {
+func (w *WasiStubs) allowReachable(call string, op *wasiOpen, host *os.File, binds bool) int32 {
 	op.mu.Lock()
 	reachable := op.sock.reachable
 	op.mu.Unlock()
@@ -9031,11 +9029,11 @@ func (w *WasiStubs) allowReachable(op *wasiOpen, host *os.File, binds bool) int3
 	}
 	var local wasiSockAddr
 	var failed error
-	if errno := socketCall(host, func(fd int) { local, failed = hostSocketName(fd, false) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall(call, host, func(fd int) { local, failed = hostSocketName(fd, false) }); errno != _wasiESUCCESS {
 		return errno
 	}
 	if failed != nil {
-		return mapOSError(failed)
+		return w.guestErrno(call, failed)
 	}
 	if local.port == 0 {
 		if !binds {
@@ -9100,23 +9098,23 @@ func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want in
 	for {
 		var again bool
 		var failed error
-		if errno := socketCall(host, func(fd int) { again, failed = attempt(fd) }); errno != _wasiESUCCESS {
+		if errno := w.socketCall(call, host, func(fd int) { again, failed = attempt(fd) }); errno != _wasiESUCCESS {
 			return errno
 		}
 		switch {
 		case !again:
-			return mapOSError(failed)
+			return w.guestErrno(call, failed)
 		case nonblocking:
 			return _wasiEAGAIN
 		case waited && !until.IsZero() && !time.Now().Before(until):
 			return expired
 		case !waited:
 			var timeout time.Duration
-			if errno := socketCall(host, func(fd int) { timeout, failed = hostSocketTimeout(fd, want == hostWantRoom) }); errno != _wasiESUCCESS {
+			if errno := w.socketCall(call, host, func(fd int) { timeout, failed = hostSocketTimeout(fd, want == hostWantRoom) }); errno != _wasiESUCCESS {
 				return errno
 			}
 			if failed != nil {
-				return mapOSError(failed)
+				return w.guestErrno(call, failed)
 			}
 			if timeout > 0 {
 				until = time.Now().Add(timeout)
@@ -9126,7 +9124,7 @@ func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want in
 		set := []hostWaitFD{{stream: host, want: want, op: op}}
 		interrupted, err := w.waitHostInterruptibly(call, set, until)
 		if err != nil {
-			return mapOSError(err)
+			return w.guestErrno(call, err)
 		}
 		if interrupted {
 			return _wasiEINTR
@@ -9286,7 +9284,7 @@ func (w *WasiStubs) Sock_open64(m *Module, family, typ int32) int32 {
 func (w *WasiStubs) openSocketEntry(family int32, dgram bool) int32 {
 	host, err := openHostSocket(family, dgram)
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("sock_open", err)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -9339,11 +9337,11 @@ func (w *WasiStubs) sockBindAddr(m *Module, fd int32, addrPtr, pathPtr uint64, p
 		return -_wasiEACCES
 	}
 	var failed error
-	if errno := socketCall(host, func(fd int) { failed = hostBind(fd, a, hostPath) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("sock_bind_addr", host, func(fd int) { failed = hostBind(fd, a, hostPath) }); errno != _wasiESUCCESS {
 		return -errno
 	}
 	if failed != nil {
-		return -mapOSError(failed)
+		return -w.guestErrno("sock_bind_addr", failed)
 	}
 	op.mu.Lock()
 	op.sock.reachable = true
@@ -9365,14 +9363,14 @@ func (w *WasiStubs) Sock_listen(m *Module, fd, backlog int32) int32 {
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
-	if errno := w.allowReachable(op, host, true); errno != _wasiESUCCESS {
+	if errno := w.allowReachable("sock_listen", op, host, true); errno != _wasiESUCCESS {
 		return -errno
 	}
 	var failed error
-	if errno := socketCall(host, func(fd int) { failed = hostListen(fd, int(backlog)) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("sock_listen", host, func(fd int) { failed = hostListen(fd, int(backlog)) }); errno != _wasiESUCCESS {
 		return -errno
 	}
-	return -mapOSError(failed)
+	return -w.guestErrno("sock_listen", failed)
 }
 
 // Sock_listen64 is Sock_listen for a memory64 guest.
@@ -9466,7 +9464,7 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 	hostPath := ""
 	if a.family == 0 {
 		if op.dgram {
-			if errno := w.allowReachable(op, host, false); errno != _wasiESUCCESS {
+			if errno := w.allowReachable(call, op, host, false); errno != _wasiESUCCESS {
 				return errno
 			}
 		}
@@ -9477,7 +9475,7 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 		}
 	}
 	var started error
-	if errno := socketCall(host, func(fd int) { started = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall(call, host, func(fd int) { started = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
 		return errno
 	}
 	// One the host goes on with: not made at once (EINPROGRESS), or
@@ -9491,7 +9489,7 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 		op.mu.Unlock()
 	}
 	if !underWay || op.nonblocking() {
-		return mapOSError(started)
+		return w.guestErrno(call, started)
 	}
 	if errno := w.socketWait(call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
 		return errno
@@ -9502,13 +9500,13 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 	// here, as gVisor's hostinet connects again (Linux reports the
 	// connection made with 0, darwin with EISCONN).
 	var made error
-	if errno := socketCall(host, func(fd int) { made = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall(call, host, func(fd int) { made = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
 		return errno
 	}
 	if errors.Is(made, syscall.EISCONN) {
 		return _wasiESUCCESS
 	}
-	return mapOSError(made)
+	return w.guestErrno(call, made)
 }
 
 // Sock_name is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -9534,11 +9532,11 @@ func (w *WasiStubs) sockName(m *Module, fd, peer int32, addrPtr uint64) int32 {
 	}
 	var a wasiSockAddr
 	var failed error
-	if errno := socketCall(host, func(fd int) { a, failed = hostSocketName(fd, peer != 0) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("sock_name", host, func(fd int) { a, failed = hostSocketName(fd, peer != 0) }); errno != _wasiESUCCESS {
 		return -errno
 	}
 	if failed != nil {
-		return -mapOSError(failed)
+		return -w.guestErrno("sock_name", failed)
 	}
 	if a.family == wasiSockFamilyUnix {
 		op.mu.Lock()
@@ -9603,7 +9601,7 @@ func (w *WasiStubs) sockSendtoAddr(m *Module, fd int32, bufPtr uint64, bufLen, f
 			if hostPath, errno = w.destination(op, a, path); errno != _wasiESUCCESS {
 				return -errno
 			}
-			if errno := w.allowReachable(op, host, true); errno != _wasiESUCCESS {
+			if errno := w.allowReachable("sock_sendto_addr", op, host, true); errno != _wasiESUCCESS {
 				return -errno
 			}
 		} else if a.family == wasiSockFamilyUnix {
@@ -9712,7 +9710,7 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 	dgram := typ == wasiSockTypeDgram
 	a, b, err := hostSocketPair(dgram)
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("sock_socketpair", err)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -9760,10 +9758,10 @@ func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
 		return -errno
 	}
 	var failed error
-	if errno := socketCall(host, func(fd int) { failed = setHostSockOpt(fd, option, value) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("sock_setopt", host, func(fd int) { failed = setHostSockOpt(fd, option, value) }); errno != _wasiESUCCESS {
 		return -errno
 	}
-	return -mapOSError(failed)
+	return -w.guestErrno("sock_setopt", failed)
 }
 
 // Sock_setopt64 is Sock_setopt for a memory64 guest.
@@ -9797,11 +9795,15 @@ func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int
 	}
 	var value int32
 	var failed error
-	if errno := socketCall(host, func(fd int) { value, failed = getHostSockOpt(fd, option) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("sock_getopt", host, func(fd int) { value, failed = getHostSockOpt(fd, option) }); errno != _wasiESUCCESS {
 		return -errno
 	}
 	if failed != nil {
-		return -mapOSError(failed)
+		return -w.guestErrno("sock_getopt", failed)
+	}
+	if option == wasiSockOptError && value != 0 {
+		// the host's number of the socket's pending error
+		value = w.guestErrno("sock_getopt", syscall.Errno(value))
 	}
 	binary.LittleEndian.PutUint32(out, uint32(value))
 	return _wasiESUCCESS
@@ -9843,7 +9845,7 @@ func (w *WasiStubs) sockTimeout(m *Module, fd, which, set int32, nanos int64, ol
 	send := which == wasiSockTimeoutSend
 	var old time.Duration
 	var failed error
-	if errno := socketCall(host, func(fd int) {
+	if errno := w.socketCall("sock_timeout", host, func(fd int) {
 		if old, failed = hostSocketTimeout(fd, send); failed == nil && set != 0 {
 			failed = setHostSocketTimeout(fd, send, time.Duration(nanos))
 		}
@@ -9851,7 +9853,7 @@ func (w *WasiStubs) sockTimeout(m *Module, fd, which, set int32, nanos int64, ol
 		return -errno
 	}
 	if failed != nil {
-		return -mapOSError(failed)
+		return -w.guestErrno("sock_timeout", failed)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(old))
 	return _wasiESUCCESS
@@ -9859,12 +9861,12 @@ func (w *WasiStubs) sockTimeout(m *Module, fd, which, set int32, nanos int64, ol
 
 // shutdownSocket shuts the halves how (Sock_shutdown's: 1 reading, 2
 // writing) of the host socket host down. It reports an errno: the host's.
-func shutdownSocket(host *os.File, how int32) int32 {
+func (w *WasiStubs) shutdownSocket(host *os.File, how int32) int32 {
 	var failed error
-	if errno := socketCall(host, func(fd int) { failed = hostShutdown(fd, how) }); errno != _wasiESUCCESS {
+	if errno := w.socketCall("sock_shutdown", host, func(fd int) { failed = hostShutdown(fd, how) }); errno != _wasiESUCCESS {
 		return errno
 	}
-	return mapOSError(failed)
+	return w.guestErrno("sock_shutdown", failed)
 }
 
 // ----- name lookups -----------------------------------------------------------
@@ -9873,8 +9875,8 @@ func shutdownSocket(host *os.File, how int32) int32 {
 // context, as a blocking call of the guest's: a signal posted to the guest
 // meanwhile cancels the context and ends the call with EINTR, as WASIX's
 // resolve does (glibc's getaddrinfo() goes on instead). It reports an
-// errno (lookupErrno).
-func (w *WasiStubs) lookupInterruptibly(lookup func(ctx context.Context) error) int32 {
+// errno (lookupErrno); call is the import's name.
+func (w *WasiStubs) lookupInterruptibly(call string, lookup func(ctx context.Context) error) int32 {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var err error
@@ -9883,7 +9885,7 @@ func (w *WasiStubs) lookupInterruptibly(lookup func(ctx context.Context) error) 
 	case refused, interrupted && err != nil:
 		return _wasiEINTR
 	case err != nil:
-		return lookupErrno(err)
+		return w.lookupErrno(call, err)
 	case interrupted:
 		// The lookup went through: the next call that waits reports the
 		// signal.
@@ -9896,8 +9898,8 @@ func (w *WasiStubs) lookupInterruptibly(lookup func(ctx context.Context) error) 
 // for a name or address it knows nothing of or a name with no address of the
 // network's family (package net's *AddrError), EAGAIN for a failure that may
 // pass (a time-out, a server that did not answer), and the error's own
-// otherwise.
-func lookupErrno(err error) int32 {
+// otherwise (guestErrno; call is the import's name).
+func (w *WasiStubs) lookupErrno(call string, err error) int32 {
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		switch {
@@ -9911,7 +9913,7 @@ func lookupErrno(err error) int32 {
 	if errors.As(err, &addrErr) {
 		return _wasiENOENT
 	}
-	return mapOSError(err)
+	return w.guestErrno(call, err)
 }
 
 // resolveHost returns the addresses of host on network ("ip", "ip4", "ip6"), as
@@ -9931,7 +9933,7 @@ func (w *WasiStubs) resolveHost(host, network string) ([]netip.Addr, int32) {
 		return nil, _wasiEACCES
 	}
 	var found []netip.Addr
-	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly("sock_resolve", func(ctx context.Context) error {
 		var err error
 		found, err = net.DefaultResolver.LookupNetIP(ctx, network, host)
 		return err
@@ -9942,7 +9944,7 @@ func (w *WasiStubs) resolveHost(host, network string) ([]netip.Addr, int32) {
 		found[i] = a.Unmap()
 		addr, err := sockAddrOf(found[i])
 		if err != nil {
-			return nil, mapOSError(err)
+			return nil, w.guestErrno("sock_resolve", err)
 		}
 		w.recordResolvedHost(addr.ipText(), host)
 	}
@@ -10034,7 +10036,7 @@ func (w *WasiStubs) sockResolve(m *Module, nodePtr uint64, nodeLen, family int32
 			}
 			addr, err := sockAddrOf(a)
 			if err != nil {
-				return -mapOSError(err)
+				return -w.guestErrno("sock_resolve", err)
 			}
 			if rc := w.writeSockAddr(m, outPtr+uint64(n)*wasiSockAddrSize, addr); rc != _wasiESUCCESS {
 				return rc
@@ -10083,7 +10085,7 @@ func (w *WasiStubs) sockReverseAddr(m *Module, addrPtr, bufPtr uint64, bufLen in
 		return -_wasiEACCES
 	}
 	var names []string
-	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly("sock_reverse_addr", func(ctx context.Context) error {
 		var err error
 		names, err = net.DefaultResolver.LookupAddr(ctx, ip)
 		return err
@@ -10188,7 +10190,7 @@ func writeFilestat(out []byte, st os.FileInfo) {
 // (WASIConfig.Process): the values the guest reads. The changes are another
 // value's (ProcessChanges). Its methods are called without any lock of the
 // WasiStubs held. An error of Groups or Priority fails the guest's call
-// with the errno hookErrno gives: the errno of its name for a
+// with the errno wasiErrnoOf gives: the errno of its name for a
 // syscall.Errno, ENOSYS for errors.ErrUnsupported without one.
 type Process interface {
 	// IDs returns the ids of the guest process.
@@ -10219,7 +10221,7 @@ type Process interface {
 // of its own to its guest but shares the host process, keeps its changes
 // (procChanges). Its methods are called without any lock of the WasiStubs
 // held, those of one instance one at a time. An error fails the guest's
-// call with the errno hookErrno gives, but for SetUmask, whose error is
+// call with the errno wasiErrnoOf gives, but for SetUmask, whose error is
 // told WASIConfig.Errors.
 type ProcessChanges interface {
 	// SetIDs makes a change of the guest's user or group ids, a call of the
@@ -10642,26 +10644,12 @@ func (w *WasiStubs) procTimes(m *Module, outPtr uint64) int32 {
 	}
 	times, err := w.guestProcess().Times()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_times", err)
 	}
 	for i, d := range [4]time.Duration{times.User, times.System, times.ChildrenUser, times.ChildrenSystem} {
 		binary.LittleEndian.PutUint64(out[i*8:], uint64(d))
 	}
 	return _wasiESUCCESS
-}
-
-// hookErrno returns the errno a guest's call fails with when a value of
-// the configuration (a Process, Users, System, Services, Syslogger or IPC)
-// returned err: the errno of its name for an error that carries a
-// syscall.Errno; for any other, ENOSYS for errors.ErrUnsupported, which
-// says that the value cannot do what was asked, and mapOSError's errno
-// otherwise (ENOENT for fs.ErrNotExist).
-func hookErrno(err error) int32 {
-	var number syscall.Errno
-	if !errors.As(err, &number) && errors.Is(err, errors.ErrUnsupported) {
-		return _wasiENOSYS
-	}
-	return mapOSError(err)
 }
 
 // Proc_groups is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -10691,7 +10679,7 @@ func (w *WasiStubs) procGroups(m *Module, bufPtr uint64, capacity int32, countPt
 	}
 	groups, err := w.guestGroups()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_groups", err)
 	}
 	binary.LittleEndian.PutUint32(countOut, uint32(len(groups)))
 	if capacity == 0 {
@@ -10736,7 +10724,7 @@ func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 		err = changes.SetIDs(change)
 	}
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_setids", err)
 	}
 	return _wasiESUCCESS
 }
@@ -10787,7 +10775,7 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 		}
 		has, err := w.guestGroups()
 		if err != nil {
-			return -hookErrno(err)
+			return -w.guestErrno("proc_setgroups", err)
 		}
 		has = slices.Clone(has)
 		slices.Sort(has)
@@ -10797,7 +10785,7 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 		}
 	default:
 		if err := changes.SetGroups(groups); err != nil {
-			return -hookErrno(err)
+			return -w.guestErrno("proc_setgroups", err)
 		}
 	}
 	return _wasiESUCCESS
@@ -10860,7 +10848,7 @@ func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr
 			}
 		default:
 			if err := changes.SetPriority(which, who, value); err != nil {
-				return -hookErrno(err)
+				return -w.guestErrno("proc_priority", err)
 			}
 		}
 	}
@@ -10879,7 +10867,7 @@ func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr
 	}
 	nice, err := proc.Priority(which, who)
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_priority", err)
 	}
 	binary.LittleEndian.PutUint32(out, uint32(nice))
 	return _wasiESUCCESS
@@ -10895,13 +10883,15 @@ func (w *WasiStubs) setOwnNice(own bool, value int32) int32 {
 	euid := w.guestIDs().EUID
 	current, err := w.guestProcess().Priority(0, 0)
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.changed != nil && w.changed.nice != nil {
 		current, err = *w.changed.nice, nil
 	}
 	if err != nil {
-		return hookErrno(err)
+		// Errors is told without the lock held.
+		w.mu.Unlock()
+		return w.guestErrno("proc_priority", err)
 	}
+	defer w.mu.Unlock()
 	if value < current && euid != 0 {
 		return _wasiEACCES
 	}
@@ -10939,7 +10929,7 @@ func (w *WasiStubs) procChdir(m *Module, pathPtr uint64, pathLen int32) int32 {
 	if w.forked || w.cfg.Chdir == nil {
 		return _wasiESUCCESS
 	}
-	return -hookErrno(w.cfg.Chdir(dir))
+	return -w.guestErrno("proc_chdir", w.cfg.Chdir(dir))
 }
 
 // Proc_setenv is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -10971,7 +10961,7 @@ func (w *WasiStubs) procSetenv(m *Module, namePtr uint64, nameLen int32, valuePt
 	if w.forked || w.cfg.Setenv == nil {
 		return _wasiESUCCESS
 	}
-	return -hookErrno(w.cfg.Setenv(string(name), string(value), hasValue == 0))
+	return -w.guestErrno("proc_setenv", w.cfg.Setenv(string(name), string(value), hasValue == 0))
 }
 
 // ----- the user and group database ---------------------------------------------
@@ -10981,7 +10971,7 @@ func (w *WasiStubs) procSetenv(m *Module, namePtr uint64, nameLen int32, valuePt
 // UserAt and GroupAt return the i-th entry, from 0, as the guest goes
 // through the database. A lookup that finds nothing, and an At past the
 // last entry, returns an error that is fs.ErrNotExist: the guest's call
-// fails with ENOENT. Any other error fails it with the errno hookErrno
+// fails with ENOENT. Any other error fails it with the errno wasiErrnoOf
 // gives. Its methods are called without any lock of the WasiStubs held.
 type Users interface {
 	UserByID(uid int32) (User, error)
@@ -11216,10 +11206,10 @@ func appendWasiString(rec []byte, s string) []byte {
 }
 
 // writeUser answers a user lookup of the guest with the record of u (see
-// Proc_user_by_id), or with the errno of err.
-func (w *WasiStubs) writeUser(m *Module, u User, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+// Proc_user_by_id), or with the errno of err; call is the import's name.
+func (w *WasiStubs) writeUser(m *Module, call string, u User, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno(call, err)
 	}
 	rec := binary.LittleEndian.AppendUint32(nil, uint32(u.UID))
 	rec = binary.LittleEndian.AppendUint32(rec, uint32(u.GID))
@@ -11231,10 +11221,10 @@ func (w *WasiStubs) writeUser(m *Module, u User, err error, bufPtr uint64, bufLe
 }
 
 // writeGroup answers a group lookup of the guest with the record of g (see
-// Proc_group_by_id), or with the errno of err.
-func (w *WasiStubs) writeGroup(m *Module, g Group, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+// Proc_group_by_id), or with the errno of err; call is the import's name.
+func (w *WasiStubs) writeGroup(m *Module, call string, g Group, err error, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno(call, err)
 	}
 	rec := binary.LittleEndian.AppendUint32(nil, uint32(g.GID))
 	rec = appendWasiString(rec, g.Name)
@@ -11260,7 +11250,7 @@ func (w *WasiStubs) Proc_user_by_id64(m *Module, uid int32, bufPtr int64, bufLen
 // procUserByID is the body of Proc_user_by_id and Proc_user_by_id64.
 func (w *WasiStubs) procUserByID(m *Module, uid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	u, err := w.users("proc_user_by_id").UserByID(uid)
-	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+	return w.writeUser(m, "proc_user_by_id", u, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_user_by_name is a NON-STANDARD host import (module
@@ -11282,7 +11272,7 @@ func (w *WasiStubs) procUserByName(m *Module, namePtr uint64, nameLen int32, buf
 		return -_wasiEFAULT
 	}
 	u, err := w.users("proc_user_by_name").UserByName(string(name))
-	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+	return w.writeUser(m, "proc_user_by_name", u, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_user_at is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -11303,7 +11293,7 @@ func (w *WasiStubs) procUserAt(m *Module, index int32, bufPtr uint64, bufLen int
 		return -_wasiENOENT
 	}
 	u, err := w.users("proc_user_at").UserAt(int(index))
-	return w.writeUser(m, u, err, bufPtr, bufLen, neededPtr)
+	return w.writeUser(m, "proc_user_at", u, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_group_by_id is a NON-STANDARD host import (module
@@ -11323,7 +11313,7 @@ func (w *WasiStubs) Proc_group_by_id64(m *Module, gid int32, bufPtr int64, bufLe
 // procGroupByID is the body of Proc_group_by_id and Proc_group_by_id64.
 func (w *WasiStubs) procGroupByID(m *Module, gid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
 	g, err := w.users("proc_group_by_id").GroupByID(gid)
-	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+	return w.writeGroup(m, "proc_group_by_id", g, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_group_by_name is a NON-STANDARD host import (module
@@ -11345,7 +11335,7 @@ func (w *WasiStubs) procGroupByName(m *Module, namePtr uint64, nameLen int32, bu
 		return -_wasiEFAULT
 	}
 	g, err := w.users("proc_group_by_name").GroupByName(string(name))
-	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+	return w.writeGroup(m, "proc_group_by_name", g, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_group_at is a NON-STANDARD host import (module
@@ -11367,14 +11357,14 @@ func (w *WasiStubs) procGroupAt(m *Module, index int32, bufPtr uint64, bufLen in
 		return -_wasiENOENT
 	}
 	g, err := w.users("proc_group_at").GroupAt(int(index))
-	return w.writeGroup(m, g, err, bufPtr, bufLen, neededPtr)
+	return w.writeGroup(m, "proc_group_at", g, err, bufPtr, bufLen, neededPtr)
 }
 
 // ----- the system --------------------------------------------------------------
 
 // System is the system the guest runs on (WASIConfig.System): what its
 // uname and gethostname report. An error of Uname fails the guest's call
-// with the errno hookErrno gives. Uname is called without any lock of the
+// with the errno wasiErrnoOf gives. Uname is called without any lock of the
 // WasiStubs held.
 type System interface {
 	Uname() (Uname, error)
@@ -11421,7 +11411,7 @@ func (w *WasiStubs) procUname(m *Module, bufPtr uint64, bufLen int32, neededPtr 
 	}
 	name, err := w.cfg.System.Uname()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_uname", err)
 	}
 	var rec []byte
 	for _, field := range [...]string{name.Sysname, name.Nodename, name.Release, name.Version, name.Machine} {
@@ -11436,7 +11426,7 @@ func (w *WasiStubs) procUname(m *Module, bufPtr uint64, bufLen int32, neededPtr 
 // getservbyname and getservbyport find. proto is the protocol ("tcp",
 // "udp", ...), or "" for a service of any protocol. A lookup that finds
 // nothing returns an error that is fs.ErrNotExist: the guest's call fails
-// with ENOENT. Any other error fails it with the errno hookErrno gives. Its
+// with ENOENT. Any other error fails it with the errno wasiErrnoOf gives. Its
 // methods are called without any lock of the WasiStubs held.
 type Services interface {
 	// ServiceByName returns the service called name, by its name or by an
@@ -11575,7 +11565,7 @@ func (w *WasiStubs) sockService(m *Module, namePtr uint64, nameLen, port, byPort
 		entry, err = services.ServiceByName(string(nameBytes), string(protoBytes))
 	}
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("sock_service", err)
 	}
 	rec := binary.LittleEndian.AppendUint32(nil, uint32(entry.Port))
 	rec = appendWasiString(rec, entry.Name)
@@ -11856,7 +11846,7 @@ func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, va
 		return err
 	})
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("fd_ioctl", err)
 	}
 	if arg.out {
 		arg.encode(mem)
@@ -11941,7 +11931,7 @@ func (w *WasiStubs) hostNumberAt(m *Module, family, index int32, namePtr uint64,
 
 // Syslogger is a system logger as a guest's syslog(3) uses it
 // (WASIConfig.Syslog). An error of its methods fails the guest's call with
-// the errno hookErrno gives.
+// the errno wasiErrnoOf gives.
 //
 // An instance and the instances forked from it share the Syslogger, each
 // calling it from its own goroutine, without any lock of the WasiStubs
@@ -12022,7 +12012,7 @@ func (w *WasiStubs) procSyslogOpen(m *Module, identPtr uint64, identLen, options
 		return -_wasiENOSYS
 	}
 	if err := w.cfg.Syslog.Open(string(ident), options, facility); err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_syslog_open", err)
 	}
 	return _wasiESUCCESS
 }
@@ -12064,7 +12054,7 @@ func (w *WasiStubs) procSyslog(m *Module, severity, facility, options int32, ide
 		Message:  string(text),
 	})
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_syslog", err)
 	}
 	return _wasiESUCCESS
 }
@@ -12077,7 +12067,7 @@ func (w *WasiStubs) Proc_syslog_close(m *Module) int32 {
 		return -_wasiENOSYS
 	}
 	if err := w.cfg.Syslog.Close(); err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("proc_syslog_close", err)
 	}
 	return _wasiESUCCESS
 }
@@ -12279,7 +12269,7 @@ func (w *WasiStubs) ipcGet(m *Module, kind, key int32, arg uint64, flags int32, 
 	}
 	id, err := ipc.Get(IPCKind(kind), key, arg, flags)
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("ipc_get", err)
 	}
 	binary.LittleEndian.PutUint32(out, uint32(id))
 	return _wasiESUCCESS
@@ -12320,7 +12310,7 @@ func (w *WasiStubs) ipcCtl(m *Module, kind, id, num, cmd int32, arg, bufPtr, res
 	}
 	r, err := ipc.Control(IPCKind(kind), id, num, cmd, arg, buf)
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("ipc_ctl", err)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(r))
 	return _wasiESUCCESS
@@ -12358,7 +12348,7 @@ func (w *WasiStubs) ipcSemop(m *Module, id int32, opsPtr, nops uint64) int32 {
 	err := ipc.Semop(id, ops)
 	w.endUnregistered()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("ipc_semop", err)
 	}
 	return _wasiESUCCESS
 }
@@ -12392,7 +12382,7 @@ func (w *WasiStubs) ipcMsgsnd(m *Module, id int32, msgPtr, size uint64, flags in
 	err := ipc.Msgsnd(id, msg, flags)
 	w.endUnregistered()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("ipc_msgsnd", err)
 	}
 	return _wasiESUCCESS
 }
@@ -12437,7 +12427,7 @@ func (w *WasiStubs) ipcMsgrcv(m *Module, id int32, msgPtr, size uint64, typ int6
 	n, err := ipc.Msgrcv(id, msg, typ, flags)
 	w.endUnregistered()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("ipc_msgrcv", err)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
@@ -12487,35 +12477,42 @@ func (w *WasiStubs) ipcShmat(m *Module, id int32, addr, size uint64, flags int32
 	// again itself for a caller other than the runtime.
 	st := make([]byte, ipcStructSize(IPCSharedMemory))
 	if _, err := ipc.Control(IPCSharedMemory, id, 0, ipcCmdStat, 0, st); err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("ipc_shmat", err)
 	}
 	pages, ok := ipcShmPages(binary.LittleEndian.Uint64(st[ipcShmSegsz:]), len(at))
 	if !ok {
 		return -_wasiEINVAL
 	}
 	at = at[:pages]
-	w.shmMu.Lock()
-	defer w.shmMu.Unlock()
-	if w.shmClosed {
-		return -_wasiEINVAL
-	}
-	for other, over := range w.shm {
-		if addr < other+uint64(len(over.at)) && other < addr+pages {
-			return -_wasiEINVAL
+	errno, err := func() (int32, error) {
+		w.shmMu.Lock()
+		defer w.shmMu.Unlock()
+		if w.shmClosed {
+			return _wasiEINVAL, nil
 		}
-	}
-	var err error
-	if !whileRuntimeMapped(mapping, func() { err = ipc.ShmAttach(id, at, flags) }) {
-		return -_wasiENOMEM
-	}
+		for other, over := range w.shm {
+			if addr < other+uint64(len(over.at)) && other < addr+pages {
+				return _wasiEINVAL, nil
+			}
+		}
+		var err error
+		if !whileRuntimeMapped(mapping, func() { err = ipc.ShmAttach(id, at, flags) }) {
+			return _wasiENOMEM, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		if w.shm == nil {
+			w.shm = map[uint64]shmAttachment{}
+		}
+		w.shm[addr] = shmAttachment{at: at, mapping: mapping}
+		return _wasiESUCCESS, nil
+	}()
 	if err != nil {
-		return -hookErrno(err)
+		// Errors is told without the lock held.
+		return -w.guestErrno("ipc_shmat", err)
 	}
-	if w.shm == nil {
-		w.shm = map[uint64]shmAttachment{}
-	}
-	w.shm[addr] = shmAttachment{at: at, mapping: mapping}
-	return _wasiESUCCESS
+	return -errno
 }
 
 // Ipc_shmdt is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -12538,17 +12535,24 @@ func (w *WasiStubs) ipcShmdt(addr uint64) int32 {
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
-	w.shmMu.Lock()
-	defer w.shmMu.Unlock()
-	attachment, ok := w.shm[addr]
-	if !ok {
-		return -_wasiEINVAL
+	errno, err := func() (int32, error) {
+		w.shmMu.Lock()
+		defer w.shmMu.Unlock()
+		attachment, ok := w.shm[addr]
+		if !ok {
+			return _wasiEINVAL, nil
+		}
+		if err := detachShm(ipc, attachment); err != nil {
+			return 0, err
+		}
+		delete(w.shm, addr)
+		return _wasiESUCCESS, nil
+	}()
+	if err != nil {
+		// Errors is told without the lock held.
+		return -w.guestErrno("ipc_shmdt", err)
 	}
-	if err := detachShm(ipc, attachment); err != nil {
-		return -hookErrno(err)
-	}
-	delete(w.shm, addr)
-	return _wasiESUCCESS
+	return -errno
 }
 
 // detachAllShm detaches every segment the guest has attached (CloseAll),
@@ -12632,13 +12636,13 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 	fsys := w.fs()
 	w.mu.Unlock()
 	if whole, isHost := fsys.(osFS); isHost {
-		if errno, asked := hostAccess(whole.join(name), uint32(amode), effective); asked {
-			return -errno
+		if asked, err := hostAccess(whole.join(name), uint32(amode), effective); asked {
+			return -w.guestErrno("path_access", err)
 		}
 	}
 	fi, err := fsys.Stat(name)
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("path_access", err)
 	}
 	if amode == 0 {
 		return _wasiESUCCESS
@@ -12650,7 +12654,7 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 	}
 	groups, err := w.guestGroups()
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("path_access", err)
 	}
 	if !modeAllows(fi, fileStatOf(fi), uint32(amode), uint32(uid), uint32(gid), groups) {
 		return -_wasiEACCES
@@ -12714,7 +12718,7 @@ func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) i
 		return -_wasiENOSYS
 	}
 	if err := w.create(fsys, unixFileMode(uint32(mode)).Perm(), func(perm os.FileMode) error { return maker.Mkfifo(name, perm) }); err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("path_mkfifo", err)
 	}
 	return _wasiESUCCESS
 }
@@ -12756,7 +12760,7 @@ func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMo
 	if w.awaitInterruptibly(call.done) {
 		err := call.take()
 		if err != nil {
-			return nil, mapOSError(err)
+			return nil, w.guestErrno("path_open", err)
 		}
 		return f, _wasiESUCCESS
 	}
@@ -12781,7 +12785,7 @@ func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMo
 		closeErr = errors.Join(closeErr, f.Close())
 	}
 	if closeErr != nil {
-		return nil, mapOSError(closeErr)
+		return nil, w.guestErrno("path_open", closeErr)
 	}
 	return nil, _wasiEINTR
 }
@@ -13022,7 +13026,7 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 		return -_wasiEINTR
 	}
 	if err != nil {
-		return -hookErrno(err)
+		return -w.guestErrno("fd_flock", err)
 	}
 	return _wasiESUCCESS
 }
@@ -13240,7 +13244,7 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 	}
 	if cmd == recordLockGet {
 		if err := hostRecordLock(f, recordLockGet, &lk); err != nil {
-			return -mapOSError(err)
+			return -w.guestErrno("fd_lock", err)
 		}
 		binary.LittleEndian.PutUint32(rec[0:], uint32(lk.typ))
 		binary.LittleEndian.PutUint32(rec[4:], uint32(lk.whence))
@@ -13252,7 +13256,7 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 	if cmd == recordLockWait && lk.typ != recordUnlock {
 		// The lock that is removed again after an interrupted wait is the
 		// range the wait asked for, where it was when it asked.
-		if errno := absoluteRecordLock(f, &lk); errno != _wasiESUCCESS {
+		if errno := w.absoluteRecordLock(f, &lk); errno != _wasiESUCCESS {
 			return -errno
 		}
 	}
@@ -13270,7 +13274,7 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 		return -_wasiEINTR
 	}
 	if err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("fd_lock", err)
 	}
 	return _wasiESUCCESS
 }
@@ -13278,19 +13282,19 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 // absoluteRecordLock makes the range of lk, a lock of the file f, one from
 // the start of the file (SEEK_SET): from the file's offset (SEEK_CUR) or its
 // size (SEEK_END) now. Returns a wasi errno.
-func absoluteRecordLock(f *os.File, lk *recordLock) int32 {
+func (w *WasiStubs) absoluteRecordLock(f *os.File, lk *recordLock) int32 {
 	var base int64
 	switch lk.whence {
 	case 1: // SEEK_CUR
 		offset, err := f.Seek(0, io.SeekCurrent)
 		if err != nil {
-			return mapOSError(err)
+			return w.guestErrno("fd_lock", err)
 		}
 		base = offset
 	case 2: // SEEK_END
 		fi, err := f.Stat()
 		if err != nil {
-			return mapOSError(err)
+			return w.guestErrno("fd_lock", err)
 		}
 		base = fi.Size()
 	}
@@ -13341,10 +13345,7 @@ func (w *WasiStubs) pathChown(m *Module, pathPtr uint64, pathLen, uid, gid, foll
 		return -_wasiENOSYS
 	}
 	if err := owner.Chown(path, int(uid), int(gid), follow != 0); err != nil {
-		if errors.Is(err, errors.ErrUnsupported) {
-			return -_wasiENOSYS
-		}
-		return -mapOSError(err)
+		return -w.guestErrno("path_chown", err)
 	}
 	return _wasiESUCCESS
 }
@@ -13364,7 +13365,7 @@ func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 		return -_wasiENOSYS
 	}
 	if err := file.Chown(int(uid), int(gid)); err != nil {
-		return -mapOSError(err)
+		return -w.guestErrno("fd_chown", err)
 	}
 	return _wasiESUCCESS
 }
@@ -14094,7 +14095,7 @@ func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, p
 	case errors.Is(err, ErrSyscallNotMade):
 		return sysSyscallNotMade
 	case err != nil:
-		return -hookErrno(err)
+		return -w.guestErrno("sys_syscall", err)
 	}
 	binary.LittleEndian.PutUint64(out, uint64(r))
 	return _wasiESUCCESS
@@ -15096,17 +15097,17 @@ func (w *WasiStubs) readStreamAs(call string, op *wasiOpen, src deadlineReader, 
 			// there is read all the same, as read(2) returns it to a
 			// process with a signal pending — whether the signal was
 			// posted before the call or while it was on its way.
-			if got, errno, refused := op.readAvailable(src, bufs); !refused && errno != _wasiEAGAIN {
+			if got, errno, refused := w.readAvailable(call, op, src, bufs); !refused && errno != _wasiEAGAIN {
 				w.keepInterrupt()
 				return got, errno
 			}
 		}
 		return n, errno
 	}
-	n, errno, refused := op.readAvailable(src, bufs)
+	n, errno, refused := w.readAvailable(call, op, src, bufs)
 	if refused {
 		// A stream whose read cannot be bounded: all there is is the read.
-		return readVec(src, bufs, false)
+		return w.readVec(call, src, bufs, false)
 	}
 	return n, errno
 }
@@ -15117,16 +15118,16 @@ func (w *WasiStubs) readStreamAs(call string, op *wasiOpen, src deadlineReader, 
 // the read: it waits just long enough for the read to be attempted and
 // keeps what arrives. refused is true when that cannot be told (the stream
 // takes no deadline): nothing was read.
-func (op *wasiOpen) readAvailable(src deadlineReader, bufs [][]byte) (n uint64, errno int32, refused bool) {
+func (w *WasiStubs) readAvailable(call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (n uint64, errno int32, refused bool) {
 	if op.inputPolled(src) {
-		n, errno = op.readStreamNow(src, bufs)
+		n, errno = w.readStreamNow(call, op, src, bufs)
 		return n, errno, false
 	}
 	ready, refused := op.probeRead(src, time.Now().Add(pollProbeGrace), nil)
 	if refused || !ready {
 		return 0, _wasiEAGAIN, refused
 	}
-	n, errno, _ = op.takeAhead(bufs)
+	n, errno, _ = w.takeAhead(call, op, bufs)
 	return n, errno, false
 }
 
@@ -15173,7 +15174,7 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 	}
 	defer op.passInputTurn()
 	// Whoever had the turn before may have left input behind.
-	if n, errno, served := op.takeAhead(bufs); served {
+	if n, errno, served := w.takeAhead(call, op, bufs); served {
 		return n, errno
 	}
 	// A signal ends the wait for input through a deadline the stream takes.
@@ -15186,26 +15187,28 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 	switch err := src.SetReadDeadline(time.Time{}); {
 	case err == nil:
 	case !errors.Is(err, os.ErrNoDeadline):
-		return 0, mapOSError(err)
+		return 0, w.guestErrno(call, err)
 	case op.inputPolled(src):
 		set := []hostWaitFD{{stream: src, want: hostWantInput, op: op}}
 		if err := waitHostReady(set, time.Now(), -1); err != nil {
-			return 0, mapOSError(err)
+			return 0, w.guestErrno(call, err)
 		}
 		for !set[0].ready {
 			// Woken without input: the entry was closed. A closed stream
 			// is ready, and the read reports it.
 			interrupted, err := w.waitHostInterruptibly(call, set, time.Time{})
 			if err != nil {
-				return 0, mapOSError(err)
+				return 0, w.guestErrno(call, err)
 			}
 			if interrupted {
 				return 0, _wasiEINTR
 			}
 		}
-		return readResult(readOnce(src, bufs))
+		n, err := readOnce(src, bufs)
+		return w.readResult(call, n, err)
 	default:
-		return readResult(readOnce(src, bufs))
+		n, err := readOnce(src, bufs)
+		return w.readResult(call, n, err)
 	}
 	var n int
 	var err error
@@ -15227,21 +15230,21 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 		case refused:
 			return 0, _wasiEINTR
 		case clearErr != nil && n == 0:
-			return 0, mapOSError(clearErr)
+			return 0, w.guestErrno(call, clearErr)
 		case n > 0 || !errors.Is(err, os.ErrDeadlineExceeded):
 			if interrupted {
 				// The read went through: the next call that waits reports
 				// the signal.
 				w.keepInterrupt()
 			}
-			return readResult(n, err)
+			return w.readResult(call, n, err)
 		case interrupted:
 			return 0, _wasiEINTR
 		case !woken:
 			// Only the holder of the turn sets a deadline, so this one is
 			// not the stream's any more: it was left behind.
 			if err := src.SetReadDeadline(time.Time{}); err != nil {
-				return 0, mapOSError(err)
+				return 0, w.guestErrno(call, err)
 			}
 		}
 		// Woken by a signal another blocking call reports: the read waits

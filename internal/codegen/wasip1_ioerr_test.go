@@ -557,41 +557,40 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 		t.Errorf("Sock_connect of a socket closed while it dials: rc=%d, want -EBADF", rc)
 	}
 
-	// A seek error without a number is EINVAL, a tell error without one
-	// EIO.
+	// A seek error without a number is EIO, of fd_seek and fd_tell alike,
+	// and is told Errors.
+	var told []string
+	w.cfg.Errors = func(op string, err error) { told = append(told, op) }
 	w.setSlotLocked(14, &wasiOpen{f: seekFailFile{}})
-	if rc := w.Fd_seek(m, 14, 0, 0, ioErrResult); rc != _wasiEINVAL {
-		t.Errorf("Fd_seek whose Seek fails: rc=%d, want EINVAL", rc)
+	if rc := w.Fd_seek(m, 14, 0, 0, ioErrResult); rc != _wasiEIO {
+		t.Errorf("Fd_seek whose Seek fails: rc=%d, want EIO", rc)
 	}
 	if rc := w.Fd_tell(m, 14, ioErrResult); rc != _wasiEIO {
 		t.Errorf("Fd_tell whose Seek fails: rc=%d, want EIO", rc)
 	}
+	if len(told) != 2 || told[0] != "fd_seek" || told[1] != "fd_tell" {
+		t.Errorf("Errors was told %q, want fd_seek and fd_tell", told)
+	}
 }
 
-// errnoOr gives the errno of an error with a number and the fallback for
-// one without or with a number that maps to no errno.
-func TestErrnoOr(t *testing.T) {
-	// ENOENT is a number every host maps (to fs.ErrNotExist at least).
-	missing := &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", syscall.ENOENT)}
-	if got := errnoOr(missing, _wasiECONNREFUSED); got != _wasiENOENT {
-		t.Errorf("errnoOr(ENOENT) = %d, want ENOENT", got)
+// A failed dial is the errno of its error: the host's number, and EIO, told
+// Errors, for an error without one.
+func TestDialInterruptiblyErrno(t *testing.T) {
+	w, _ := newTestStubs(t, t.TempDir())
+	var told []string
+	w.cfg.Errors = func(op string, err error) { told = append(told, op) }
+	if _, errno := w.dialInterruptibly("sock_connect", "unix", filepath.Join(t.TempDir(), "none")); errno != _wasiENOENT {
+		t.Errorf("dial of a missing socket file errno=%d, want ENOENT", errno)
 	}
-	if got := errnoOr(errors.New("no number"), _wasiECONNREFUSED); got != _wasiECONNREFUSED {
-		t.Errorf("errnoOr(an error without a number) = %d, want ECONNREFUSED", got)
+	if len(told) != 0 {
+		t.Errorf("Errors was told %q of an error with an errno", told)
 	}
-	// A number that maps to no errno is the fallback too; EIO itself is EIO.
-	if got := errnoOr(os.NewSyscallError("connect", syscall.Errno(9999)), _wasiECONNREFUSED); got != _wasiECONNREFUSED {
-		t.Errorf("errnoOr(an unknown number) = %d, want ECONNREFUSED", got)
+	// package net's error of a network it does not know has no number
+	if _, errno := w.dialInterruptibly("sock_connect", "none", "127.0.0.1:1"); errno != _wasiEIO {
+		t.Errorf("dial of an unknown network errno=%d, want EIO", errno)
 	}
-	if got := errnoOr(os.NewSyscallError("read", syscall.EIO), _wasiEINVAL); got != _wasiEIO {
-		t.Errorf("errnoOr(EIO) = %d, want EIO", got)
-	}
-	// os.File.Seek's own EISDIR of a directory it has read is no lseek errno.
-	if got := seekErrno(&os.PathError{Op: "seek", Path: "d", Err: syscall.EISDIR}, _wasiEINVAL); got != _wasiEINVAL {
-		t.Errorf("seekErrno(EISDIR) = %d, want EINVAL", got)
-	}
-	if got := seekErrno(&os.PathError{Op: "seek", Path: "f", Err: syscall.EIO}, _wasiEINVAL); got != _wasiEIO {
-		t.Errorf("seekErrno(EIO) = %d, want EIO", got)
+	if len(told) != 1 || told[0] != "sock_connect" {
+		t.Errorf("Errors was told %q, want sock_connect", told)
 	}
 }
 

@@ -194,14 +194,14 @@ func TestOSFSRenameIsTheSystemCall(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := fsys.Rename(path.Join(root, "file"), path.Join(root, "target")); mapOSError(err) != _wasiEISDIR {
-		t.Errorf("a file onto a directory: %v (errno %d), want EISDIR", err, mapOSError(err))
+	if err := fsys.Rename(path.Join(root, "file"), path.Join(root, "target")); errnoOfError(err) != _wasiEISDIR {
+		t.Errorf("a file onto a directory: %v (errno %d), want EISDIR", err, errnoOfError(err))
 	}
 	if err := fsys.Rename(path.Join(root, "moved"), path.Join(root, "empty")); err != nil {
 		t.Errorf("a directory onto an empty directory: %v", err)
 	}
-	if err := fsys.Rename(path.Join(root, "target"), path.Join(root, "full")); mapOSError(err) != 55 && mapOSError(err) != _wasiEEXIST {
-		t.Errorf("a directory onto a full one: %v (errno %d), want ENOTEMPTY", err, mapOSError(err))
+	if err := fsys.Rename(path.Join(root, "target"), path.Join(root, "full")); errnoOfError(err) != 55 && errnoOfError(err) != _wasiEEXIST {
+		t.Errorf("a directory onto a full one: %v (errno %d), want ENOTEMPTY", err, errnoOfError(err))
 	}
 	if err := fsys.Rename(path.Join(root, "file"), path.Join(root, "renamed")); err != nil {
 		t.Errorf("a file to a new name: %v", err)
@@ -275,8 +275,8 @@ func TestMemFSOpenDirectoryForWriting(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, flag := range []int{os.O_WRONLY, os.O_RDWR, os.O_RDWR | os.O_CREATE} {
-		if _, err := fsys.OpenFile("d", flag, 0); mapOSError(err) != _wasiEISDIR {
-			t.Errorf("OpenFile(d, %#x): %v (errno %d), want EISDIR", flag, err, mapOSError(err))
+		if _, err := fsys.OpenFile("d", flag, 0); errnoOfError(err) != _wasiEISDIR {
+			t.Errorf("OpenFile(d, %#x): %v (errno %d), want EISDIR", flag, err, errnoOfError(err))
 		}
 	}
 	f, err := fsys.OpenFile("d", os.O_RDONLY, 0)

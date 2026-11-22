@@ -879,12 +879,12 @@ func TestMemFS_RenameOntoAnExistingName(t *testing.T) {
 		{"file/", "new", _wasiENOTDIR},
 		{"file", "dir/", _wasiENOTDIR},
 	} {
-		if err := fsys.Rename(c.from, c.to); mapOSError(err) != c.want {
-			t.Errorf("rename %s onto %s: %v (errno %d), want errno %d", c.from, c.to, err, mapOSError(err), c.want)
+		if err := fsys.Rename(c.from, c.to); errnoOfError(err) != c.want {
+			t.Errorf("rename %s onto %s: %v (errno %d), want errno %d", c.from, c.to, err, errnoOfError(err), c.want)
 		}
 	}
-	if err := fsys.Remove("full"); mapOSError(err) != _wasiENOTEMPTY {
-		t.Errorf("remove full: %v (errno %d), want ENOTEMPTY", err, mapOSError(err))
+	if err := fsys.Remove("full"); errnoOfError(err) != _wasiENOTEMPTY {
+		t.Errorf("remove full: %v (errno %d), want ENOTEMPTY", err, errnoOfError(err))
 	}
 	for _, name := range []string{"file", "full/x", "dir/sub", "empty"} {
 		if _, err := fsys.Stat(name); err != nil {

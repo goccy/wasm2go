@@ -1370,8 +1370,8 @@ func TestWasi_MapOSError(t *testing.T) {
 		{io.EOF, _wasiEIO},
 	}
 	for _, c := range cases {
-		if got := mapOSError(c.err); got != c.want {
-			t.Errorf("mapOSError(%v) = %d, want %d", c.err, got, c.want)
+		if got := errnoOfError(c.err); got != c.want {
+			t.Errorf("errnoOfError(%v) = %d, want %d", c.err, got, c.want)
 		}
 	}
 }
@@ -1974,7 +1974,7 @@ func TestWasi_FdWriteToStdoutErr(t *testing.T) {
 
 func TestWasi_MapOSErrorMore(t *testing.T) {
 	// Cover the syscall.ENOTDIR / EISDIR / EBADF / EAGAIN / EPIPE
-	// branches in mapOSError.
+	// branches in errnoOfError.
 	tests := []struct {
 		err  error
 		want int32
@@ -1982,8 +1982,8 @@ func TestWasi_MapOSErrorMore(t *testing.T) {
 		{&os.PathError{Err: errors.New("nope")}, _wasiEIO},
 	}
 	for _, c := range tests {
-		if got := mapOSError(c.err); got != c.want {
-			t.Errorf("mapOSError generic=%d want %d", got, c.want)
+		if got := errnoOfError(c.err); got != c.want {
+			t.Errorf("errnoOfError generic=%d want %d", got, c.want)
 		}
 	}
 }

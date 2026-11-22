@@ -420,6 +420,19 @@ func TestUserAndGroupLookups(t *testing.T) {
 			t.Fatalf("lookup %d of failing Users rc=%d, want -EIO", i, rc)
 		}
 	}
+	// An error without an errno is told Errors under the lookup's import.
+	var told []string
+	w.cfg.Errors = func(op string, err error) { told = append(told, op) }
+	w.cfg.Users = fakeUsers{err: errors.New("no database")}
+	for i, rc := range lookups() {
+		if rc != -_wasiEIO {
+			t.Fatalf("lookup %d of Users failing without an errno rc=%d, want -EIO", i, rc)
+		}
+	}
+	want := []string{"proc_user_by_id", "proc_user_by_name", "proc_user_at", "proc_group_by_id", "proc_group_by_name", "proc_group_at"}
+	if !slices.Equal(told, want) {
+		t.Fatalf("Errors was told %q, want %q", told, want)
+	}
 }
 
 // HostUsers finds what os/user finds, and goes through /etc/passwd and
@@ -1271,7 +1284,7 @@ func TestPathMkfifoWithoutFIFOs(t *testing.T) {
 
 // The errno of an error of a configured value is that of the syscall.Errno
 // it carries; errors.ErrUnsupported without one is ENOSYS.
-func TestHookErrno(t *testing.T) {
+func TestConfiguredValueErrno(t *testing.T) {
 	for _, c := range []struct {
 		err  error
 		want int32
@@ -1282,8 +1295,8 @@ func TestHookErrno(t *testing.T) {
 		{&os.SyscallError{Syscall: "setuid", Err: syscall.EPERM}, _wasiEPERM},
 		{fs.ErrNotExist, _wasiENOENT},
 	} {
-		if got := hookErrno(c.err); got != c.want {
-			t.Errorf("hookErrno(%v) = %d, want %d", c.err, got, c.want)
+		if got := errnoOfError(c.err); got != c.want {
+			t.Errorf("errnoOfError(%v) = %d, want %d", c.err, got, c.want)
 		}
 	}
 }

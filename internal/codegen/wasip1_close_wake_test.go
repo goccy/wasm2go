@@ -256,7 +256,7 @@ func TestWasi_CloseLetsOtherCallsGoOn(t *testing.T) {
 		{"fd_closefrom", func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_closefrom(m, fd) }, _wasiESUCCESS},
 		{"fd_dup2", func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_dup2(m, 1, fd) }, _wasiESUCCESS},
 		{"fd_renumber", func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_renumber(m, 1, fd) }, _wasiESUCCESS},
-		{"CloseAll", func(w *WasiStubs, m *Module, fd int32) int32 { return mapOSError(w.CloseAll()) }, _wasiEBADF},
+		{"CloseAll", func(w *WasiStubs, m *Module, fd int32) int32 { return errnoOfError(w.CloseAll()) }, _wasiEBADF},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w, _ := newProcTestStubs(t)
