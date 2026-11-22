@@ -1178,6 +1178,23 @@ func TestFlockOfASharedDescriptorWaitedForTwice(t *testing.T) {
 	}
 }
 
+// A lock call forgets the locks earlier waits of the descriptor took by the
+// same import only (takeLock's lockHeld).
+func TestTakeLockForgetsHeldOfItsImport(t *testing.T) {
+	w, _ := newTestStubs(t, t.TempDir())
+	flock := lockKey{call: lockCallFlock, how: flockExclusive}
+	record := lockKey{call: lockCallRecord, typ: 1, len: 1}
+	op := &wasiOpen{lockHeld: map[lockKey]bool{flock: true, record: true}}
+	set := func(bool) error { return nil }
+	interrupted, err := w.takeLock("fd_lock", lockKey{call: lockCallRecord, typ: recordUnlock, len: 1}, op, true, false, set, nil)
+	if interrupted || err != nil {
+		t.Fatalf("takeLock: interrupted=%v err=%v", interrupted, err)
+	}
+	if len(op.lockHeld) != 1 || !op.lockHeld[flock] {
+		t.Errorf("lockHeld = %v, want fd_flock's lock only", op.lockHeld)
+	}
+}
+
 // A call the waiter took the result of is not undone; one the waiter left
 // is, by whichever of the two comes last.
 func TestDetachedCall(t *testing.T) {
