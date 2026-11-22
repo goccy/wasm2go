@@ -60,7 +60,7 @@ func writeImage(mem []byte, runs []pageRun, length int) (*memImage, error) {
 	if err != nil || !fits {
 		return nil, err
 	}
-	f, err := newImageFile()
+	f, err := makeImageFile(newImageFile)
 	if err != nil || f == nil {
 		return nil, err
 	}
@@ -124,7 +124,7 @@ func privatePages(mem []byte) (runs []pageRun, total uint64, ok bool, err error)
 	if len(mem) == 0 {
 		return nil, 0, true, nil
 	}
-	f, err := os.Open("/proc/self/pagemap")
+	f, err := makeImageFile(func() (*os.File, error) { return os.Open("/proc/self/pagemap") })
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, 0, false, nil
 	}

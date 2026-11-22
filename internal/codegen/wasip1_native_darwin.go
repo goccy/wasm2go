@@ -155,6 +155,19 @@ func hostWakePipe() (r, w int, err error) {
 	return p[0], p[1], nil
 }
 
+// hostDupTo makes descriptor to a close-on-exec duplicate of fd in one step
+// (dup2), closing what to was open on. darwin has no dup3: the mark is set
+// under syscall.ForkLock, before a command can be started with to open.
+func hostDupTo(fd, to int) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	if err := syscall.Dup2(fd, to); err != nil {
+		return os.NewSyscallError("dup2", err)
+	}
+	syscall.CloseOnExec(to)
+	return nil
+}
+
 // hostPollCall is poll(2): it waits no longer than timeout, and without
 // limit when timeout is negative.
 func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
@@ -299,8 +312,18 @@ func hostSocketPairFDs(typ int) ([2]int, error) {
 // syscall.ForkLock and in non-blocking mode, as Go's package net accepts
 // where accept(2) takes no such flags (accept).
 func hostAcceptFD(fd int) (int, error) {
-	syscall.ForkLock.RLock()
-	defer syscall.ForkLock.RUnlock()
+	// An accept on a description in blocking mode may wait in the host:
+	// it is not made under syscall.ForkLock, which every command start
+	// waits for, and a command started meanwhile may inherit the
+	// connection until socketFDMade marks it close-on-exec.
+	blocking, err := descriptorBlocks(fd)
+	if err != nil {
+		return -1, err
+	}
+	if !blocking {
+		syscall.ForkLock.RLock()
+		defer syscall.ForkLock.RUnlock()
+	}
 	conn, _, err := syscall.Accept(fd)
 	if err != nil {
 		return -1, os.NewSyscallError("accept", err)

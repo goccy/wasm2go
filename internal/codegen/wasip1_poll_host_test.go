@@ -130,7 +130,7 @@ func TestWasi_PollTakesNothingOffAHostPipe(t *testing.T) {
 	closeAtEnd(t, r)
 	closeAtEnd(t, wr)
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
+	fd := addTestFD(w, &wasiOpen{f: r, noWrite: true})
 	w.mu.Unlock()
 	hostRead := func() string {
 		t.Helper()
@@ -189,7 +189,7 @@ func udpPair(t *testing.T, w *WasiStubs) (fd int32, peer *net.UDPConn) {
 		t.Fatal(err)
 	}
 	w.mu.Lock()
-	fd = w.addFDLocked(&wasiOpen{conn: local})
+	fd = addTestFD(w, &wasiOpen{conn: local})
 	w.mu.Unlock()
 	return fd, peer
 }
@@ -277,7 +277,7 @@ func TestWasi_PollWaitsForAConnectionToAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{listener: ln})
+	fd := addTestFD(w, &wasiOpen{listener: ln})
 	w.mu.Unlock()
 	t.Cleanup(func() {
 		if rc := w.Fd_close(m, fd); rc != _wasiESUCCESS {
@@ -545,7 +545,7 @@ func TestWasi_SendOfBuffersIsOneDatagram(t *testing.T) {
 		})
 	}
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{conn: conn})
+	fd := addTestFD(w, &wasiOpen{conn: conn})
 	w.mu.Unlock()
 	copy(m.memory[hostBufOff:], "abcd")
 	makeIovec(m, hostIovOff, hostBufOff, 2)
@@ -702,7 +702,7 @@ func TestWasi_SendIsAWriteOfTheStream(t *testing.T) {
 	ignoreSIGPIPE(t, w, m)
 	local, remote := unixConnPair(t)
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{conn: local})
+	fd := addTestFD(w, &wasiOpen{conn: local})
 	w.mu.Unlock()
 	if rc := w.Fd_fdstat_set_flags(m, fd, wasiFdflagNonblock); rc != _wasiESUCCESS {
 		t.Fatalf("set O_NONBLOCK rc=%d", rc)
@@ -826,7 +826,7 @@ func TestWasi_PollWaitsForAHostPipeBesideAnotherStream(t *testing.T) {
 func addHostFile(w *WasiStubs, f *os.File) int32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{f: f, noWrite: true})
+	return addTestFD(w, &wasiOpen{f: f, noWrite: true})
 }
 
 // waiter is a blocking call of the guest's: wait makes it and returns its
@@ -1013,7 +1013,7 @@ func TestWasi_CloseOfAConnectionAPollWaitsFor(t *testing.T) {
 		}
 	}()
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{conn: conn})
+	fd := addTestFD(w, &wasiOpen{conn: conn})
 	w.mu.Unlock()
 	writeSubClock(m, pollSubsOff, 1, int64(2*time.Second))
 	writeSubFd(m, pollSubsOff+48, 2, 1, fd)
@@ -1164,7 +1164,7 @@ func TestWasi_WrapperConnectionIsReadThroughItsRead(t *testing.T) {
 		})
 	}
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{conn: upperConn{conn.(*net.TCPConn)}})
+	fd := addTestFD(w, &wasiOpen{conn: upperConn{conn.(*net.TCPConn)}})
 	w.mu.Unlock()
 	if _, err := peer.Write([]byte("abc")); err != nil {
 		t.Fatal(err)
@@ -1247,7 +1247,7 @@ func TestWasi_SendOfMoreBuffersThanOneCallTakes(t *testing.T) {
 		})
 	}
 	w.mu.Lock()
-	dgram, stream := w.addFDLocked(&wasiOpen{conn: conn}), w.addFDLocked(&wasiOpen{conn: local})
+	dgram, stream := addTestFD(w, &wasiOpen{conn: conn}), addTestFD(w, &wasiOpen{conn: local})
 	w.mu.Unlock()
 	if rc := w.Sock_send(m, dgram, iovOff, count, 0, hostCountOff); rc != _wasiEINVAL {
 		t.Fatalf("send of a datagram in %d buffers rc=%d, want EINVAL", count, rc)

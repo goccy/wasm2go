@@ -838,7 +838,7 @@ func TestSocket_Refusals(t *testing.T) {
 		}
 	})
 	w.mu.Lock()
-	conn := w.addFDLocked(&wasiOpen{conn: local})
+	conn := addTestFD(w, &wasiOpen{conn: local})
 	w.mu.Unlock()
 	if rc := w.Sock_name(m, conn, 0, sockAddr2Off); rc != -_wasiENOTSUP {
 		t.Errorf("Sock_name of a connection of package net's rc=%d, want -ENOTSUP", rc)
@@ -862,7 +862,7 @@ func TestSocket_LegacyDial(t *testing.T) {
 	w, m, _ := newSocketStubs(t)
 	_, port := newIPListener(t, w, m)
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{isSocket: true})
+	fd := addTestFD(w, &wasiOpen{isSocket: true})
 	w.mu.Unlock()
 	if rc := w.Sock_connect(m, fd, 0x0100007f, port); rc != _wasiESUCCESS {
 		t.Fatalf("Sock_connect rc=%d", rc)

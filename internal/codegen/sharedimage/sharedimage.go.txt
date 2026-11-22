@@ -139,7 +139,7 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 	if !mmapSupported {
 		return &SharedImage{err: errNoMappings}
 	}
-	f, err := os.CreateTemp("", "wasm2go-image-*")
+	f, err := makeImageFile(func() (*os.File, error) { return os.CreateTemp("", "wasm2go-image-*") })
 	if err != nil {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
@@ -250,7 +250,7 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 		globals = {{.SaveGlobals}}(m)
 	}
 
-	f, err := os.CreateTemp("", "wasm2go-image-*")
+	f, err := makeImageFile(func() (*os.File, error) { return os.CreateTemp("", "wasm2go-image-*") })
 	if err != nil {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
@@ -266,6 +266,14 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
 	return &SharedImage{img: &memImage{f: f, refs: 1}, size: size, dataEnd: dataEnd, globals: globals}
+}
+
+// makeImageFile returns the file make makes for the images (an image's
+// file, the page map), made as the runtime of the package makes its own
+// descriptors, where it has one: a guest whose descriptors are the host
+// process's gets none of them by number.
+func makeImageFile(make func() (*os.File, error)) (*os.File, error) {
+	{{if .RuntimeFile}}return {{.RuntimeFile}}(make){{else}}return make(){{end}}
 }
 
 // Err reports why the image is unavailable, or nil. A caller that gets an

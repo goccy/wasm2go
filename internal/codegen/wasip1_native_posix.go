@@ -596,8 +596,9 @@ func withDuplicateDescriptor(f syscall.Conn, use func(fd uintptr) error) error {
 	return errors.Join(use(uintptr(dup)), syscall.Close(dup))
 }
 
-// duplicateDescriptor returns a duplicate of the descriptor of f, made
-// close-on-exec while f's descriptor is borrowed (withHostDescriptor).
+// duplicateDescriptor returns a close-on-exec duplicate of the descriptor
+// of f, made while f's descriptor is borrowed (withHostDescriptor), at
+// runtimeFloor or above.
 func duplicateDescriptor(f syscall.Conn) (int, error) {
 	var dup int
 	err := withHostDescriptor(f, func(fd uintptr) error {
@@ -608,17 +609,11 @@ func duplicateDescriptor(f syscall.Conn) (int, error) {
 	return dup, err
 }
 
-// dupHostFD returns a duplicate of the descriptor fd, closed on exec: made
-// under syscall.ForkLock, so that no command started meanwhile has it.
+// dupHostFD returns a duplicate of the descriptor fd, closed on exec from
+// its making (F_DUPFD_CLOEXEC), so that no command started meanwhile has
+// it, at runtimeFloor or above.
 func dupHostFD(fd uintptr) (int, error) {
-	syscall.ForkLock.RLock()
-	defer syscall.ForkLock.RUnlock()
-	dup, err := syscall.Dup(int(fd))
-	if err != nil {
-		return -1, err
-	}
-	syscall.CloseOnExec(dup)
-	return dup, nil
+	return dupFrom(int(fd), runtimeFloor())
 }
 
 // withHostTerminal calls use with a duplicate of the descriptor of f
@@ -1086,11 +1081,33 @@ func hostListen(fd, backlog int) error {
 // connection that was aborted before it was accepted is none, as Go's
 // internal/poll has it.
 func hostAccept(fd int) (conn int, again bool, err error) {
+	// The connection is made as the runtime makes its own descriptors
+	// (makeRuntimeDescriptors). An accept on a description in blocking mode
+	// (one the guest was given or took in so) may wait in the host, and is
+	// not made under the lock, which guests that take descriptors in would
+	// wait for: its connection is moved once it is made, and is under a
+	// number of the guests' until then.
+	blocking, err := descriptorBlocks(fd)
+	if err != nil {
+		return -1, false, err
+	}
+	if !blocking {
+		hostTable.making.RLock()
+		defer hostTable.making.RUnlock()
+	}
 	for {
 		conn, err := hostAcceptFD(fd)
 		switch {
+		case err == nil && blocking:
+			err = makeRuntimeDescriptors(func() error {
+				var err error
+				conn, err = keepRuntimeFD(conn)
+				return err
+			})
+			return conn, false, err
 		case err == nil:
-			return conn, false, nil
+			conn, err = keepRuntimeFD(conn)
+			return conn, false, err
 		case errors.Is(err, syscall.EINTR), errors.Is(err, syscall.ECONNABORTED):
 			continue
 		case errors.Is(err, syscall.EAGAIN):
@@ -1412,29 +1429,30 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (in
 func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
 	report := func(err error) { w.reportError(op, err) }
 	var setup commandSetup
-	for i := range streams {
-		if i == 2 && sameDestination(&streams[1], &streams[2]) {
-			setup.conns[2] = setup.conns[1]
-			continue
-		}
-		if err := setup.add(i, &streams[i], share, report); err != nil {
-			return nil, errors.Join(err, setup.abandon())
-		}
-	}
 	var pid int
-	err := withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
-		var err error
-		pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: fds, Sys: hostJobAttr(job)})
-		return err
+	// The descriptors made for the command, and those package syscall makes
+	// to start it, are made as the runtime makes its own: no guest takes one
+	// in meanwhile (adoptHostLocked).
+	err := makeRuntimeDescriptors(func() error {
+		for i := range streams {
+			if i == 2 && sameDestination(&streams[1], &streams[2]) {
+				setup.conns[2] = setup.conns[1]
+				continue
+			}
+			if err := setup.add(i, &streams[i], share, report); err != nil {
+				return err
+			}
+		}
+		return withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
+			var err error
+			pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: fds, Sys: hostJobAttr(job)})
+			return err
+		})
 	})
 	if err != nil {
 		return nil, errors.Join(err, setup.abandon())
 	}
-	// FindProcess does not fail on a system of this file.
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return nil, errors.Join(err, setup.abandon())
-	}
+	p := &commandProcess{Pid: pid}
 	for _, f := range setup.owned {
 		report(f.Close())
 	}
@@ -1453,10 +1471,82 @@ func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string
 		}
 	}
 	return &hostCommand{process: p, finish: finish, wait: func() int32 {
-		st, err := p.Wait()
+		status, err := p.Wait()
 		finish()
-		return w.waitStatusOf(st, err)
+		if err != nil {
+			w.reportError("proc_spawn", err)
+			return 127 << 8
+		}
+		return encodeHostWaitStatus(status)
 	}}, nil
+}
+
+// commandProcess is a command of the host's the runtime started
+// (startCommand), known by its pid: package os's handle of a process holds
+// a descriptor of its own on Linux (a pidfd), which it makes at the lowest
+// number free, among the guests' (hostDescriptorFloor), and keeps until
+// the process is reaped.
+type commandProcess struct {
+	Pid int
+	// reaped is set once the command has been reaped, when its pid may be
+	// another process's: a signal holds mu for reading, the reap for
+	// writing.
+	mu     sync.RWMutex
+	reaped bool
+}
+
+// Signal sends sig to the command: os.ErrProcessDone once it has been
+// reaped, or when the host has no process under its pid (ESRCH), as
+// os.Process.Signal.
+func (p *commandProcess) Signal(sig os.Signal) error {
+	hostSig, ok := sig.(syscall.Signal)
+	if !ok {
+		return syscall.EINVAL
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.reaped {
+		return os.ErrProcessDone
+	}
+	err := syscall.Kill(p.Pid, hostSig)
+	if err == syscall.ESRCH {
+		return os.ErrProcessDone
+	}
+	return os.NewSyscallError("kill", err)
+}
+
+// Kill sends the command SIGKILL.
+func (p *commandProcess) Kill() error { return p.Signal(syscall.SIGKILL) }
+
+// Wait waits for the command to end and reaps it, returning its wait
+// status. It waits without reaping first (hostWaitExited), so that no
+// signal is sent to the pid once it is free for another process. A pid
+// that is no child of the process's (ECHILD), reaped elsewhere, is taken
+// for reaped as well.
+func (p *commandProcess) Wait() (syscall.WaitStatus, error) {
+	if _, err := hostWaitExited(p.Pid); err != nil {
+		if errors.Is(err, syscall.ECHILD) {
+			p.mu.Lock()
+			p.reaped = true
+			p.mu.Unlock()
+		}
+		return 0, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var status syscall.WaitStatus
+	for {
+		_, err := syscall.Wait4(p.Pid, &status, 0, nil)
+		if err == nil || err == syscall.ECHILD {
+			p.reaped = true
+		}
+		if err == nil {
+			return status, nil
+		}
+		if err != syscall.EINTR {
+			return 0, os.NewSyscallError("wait4", err)
+		}
+	}
 }
 
 // sameDestination reports whether a command's stdout a and stderr b go to
@@ -1540,8 +1630,26 @@ func (c *commandSetup) add(i int, s *commandStream, share *familyStreams, report
 	if err != nil {
 		return err
 	}
+	if null, err = keepRuntimeFile(null); err != nil {
+		return err
+	}
 	c.give(i, null)
 	return nil
+}
+
+// runtimePipe is os.Pipe, its ends at runtimeFloor or above
+// (keepRuntimeFile).
+func runtimePipe() (r, wr *os.File, err error) {
+	if r, wr, err = os.Pipe(); err != nil {
+		return nil, nil, err
+	}
+	if r, err = keepRuntimeFile(r); err != nil {
+		return nil, nil, errors.Join(err, wr.Close())
+	}
+	if wr, err = keepRuntimeFile(wr); err != nil {
+		return nil, nil, errors.Join(err, r.Close())
+	}
+	return r, wr, nil
 }
 
 // copyHost makes the command's stream i, s, a copy of the host descriptor
@@ -1581,7 +1689,7 @@ func (c *commandSetup) give(i int, f *os.File) {
 // read end the runtime copies to dst (outputCopy), under lock when it is
 // not nil; owned, when it is not nil, is closed once the copy ends.
 func (c *commandSetup) copyOutput(i int, dst io.Writer, owned io.Closer, s *commandStream, lock *sync.Mutex, report func(error)) error {
-	r, wr, err := os.Pipe()
+	r, wr, err := runtimePipe()
 	if err != nil {
 		return errors.Join(err, closeIfAny(owned))
 	}
@@ -1595,7 +1703,7 @@ func (c *commandSetup) copyOutput(i int, dst io.Writer, owned io.Closer, s *comm
 // read goes to back, when it is not nil; owned, when it is not nil, is
 // closed once the copy ends.
 func (c *commandSetup) copyInput(src io.Reader, owned io.Closer, s *commandStream, back func([]byte), report func(error)) (*inputCopy, error) {
-	r, wr, err := os.Pipe()
+	r, wr, err := runtimePipe()
 	if err != nil {
 		return nil, errors.Join(err, closeIfAny(owned))
 	}
@@ -1727,6 +1835,9 @@ func commandFile(f *os.File, nonblock bool) (child *os.File, copied bool, err er
 		return err
 	}); err != nil || reopened < 0 {
 		return nil, copied, err
+	}
+	if reopened, err = keepRuntimeFD(reopened); err != nil {
+		return nil, false, err
 	}
 	child = os.NewFile(uintptr(reopened), f.Name())
 	if err := setHostNonblock(child, nonblock); err != nil {

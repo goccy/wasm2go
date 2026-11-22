@@ -351,7 +351,7 @@ func TestProcForkEndsInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{f: hookedCloser{File: file, closed: func() { hook("close") }}})
+	fd := addTestFD(w, &wasiOpen{f: hookedCloser{File: file, closed: func() { hook("close") }}})
 	w.mu.Unlock()
 	if rc := w.Proc_fork(m, forkPidOff); rc != _wasiESUCCESS {
 		t.Fatalf("Proc_fork rc=%d", rc)

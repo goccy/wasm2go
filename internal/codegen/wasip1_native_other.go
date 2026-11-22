@@ -421,3 +421,82 @@ func hostProcessGroup() int                { return 0 }
 func hostForeground(fd int) (int, error)   { return 0, syscall.ENOTTY }
 func hostSetForeground(fd, pgid int) error { return syscall.ENOTTY }
 func dupHostFD(fd uintptr) (int, error)    { return -1, errors.ErrUnsupported }
+
+// commandProcess is a command of the host's the runtime started: package
+// os's process here.
+type commandProcess = os.Process
+
+// ---- descriptors of the host process ---------------------------------------
+
+// hostDescriptorsSupported says that no instance's descriptors are the host
+// process's here (WASIConfig.HostDescriptors has no effect).
+const hostDescriptorsSupported = false
+
+// startHostNumbers: there is nothing to record here.
+func startHostNumbers(files map[int32]*os.File) error { return nil }
+
+// hostIdentity: no descriptor is taken in from outside the guest here.
+type hostIdentity struct{}
+
+// makeRuntimeDescriptors runs make: no guest takes a descriptor in here.
+func makeRuntimeDescriptors(make func() error) error { return make() }
+
+// runtimeFile is make: the runtime's descriptors are where the host puts
+// them.
+func runtimeFile(make func() (*os.File, error)) (*os.File, error) { return make() }
+
+// runtimePipe is os.Pipe.
+func runtimePipe() (r, wr *os.File, err error) { return os.Pipe() }
+
+// keepRuntimeFile: the runtime's descriptors are where the host puts them.
+func keepRuntimeFile(f *os.File) (*os.File, error) { return f, nil }
+
+// keepRuntimeOpened: the runtime's descriptors are where the host puts them.
+func keepRuntimeOpened(f File) (File, error) { return f, nil }
+
+// currentLocked: every slot is what it was made for here.
+func (w *WasiStubs) currentLocked(fd int32) bool { return true }
+
+// keepRuntimeFD: the runtime's descriptors are where the host puts them.
+func keepRuntimeFD(fd int) (int, error) { return fd, nil }
+
+// hostSlotLocked: no instance's descriptors are the host's here.
+func (w *WasiStubs) hostSlotLocked(op *wasiOpen, min int32) (int32, error) {
+	return -1, errors.ErrUnsupported
+}
+
+// placeHostSlotLocked: no instance's descriptors are the host's here.
+func (w *WasiStubs) placeHostSlotLocked(to int32, src *wasiOpen) error {
+	return errors.ErrUnsupported
+}
+
+// placeFileLocked: no instance's descriptors are the host's here.
+func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
+	return errors.Join(errors.ErrUnsupported, f.Close())
+}
+
+// hostSlotHeld: no slot has a descriptor of the host's here.
+func (w *WasiStubs) hostSlotHeld(fd int32) bool { return false }
+
+// releaseHostSlotLocked: no slot has a descriptor of the host's here.
+func (w *WasiStubs) releaseHostSlotLocked(fd int32) error { return nil }
+
+// leaveStandardNumbersLocked: no slot has a descriptor of the host's here.
+func (w *WasiStubs) leaveStandardNumbersLocked() {}
+
+// adoptHostLocked: no instance's descriptors are the host's here.
+func (w *WasiStubs) adoptHostLocked(fd int32) *wasiOpen { return nil }
+
+// takeStandardLocked: no instance's descriptors are the host's here.
+func (w *WasiStubs) takeStandardLocked(fd int32) bool { return false }
+
+// fileEntry returns the entry of f, a file of the configuration's Files,
+// which it takes over: f itself, a directory or a regular file as its Stat
+// says. On failure f is closed.
+func fileEntry(f *os.File) (*wasiOpen, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return &wasiOpen{f: f, isDir: st.IsDir(), regular: st.Mode().IsRegular()}, nil
+}

@@ -177,7 +177,7 @@ func TestSpawn_ConnGetsTheCommandsOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.mu.Lock()
-	sock := w.addFDLocked(&wasiOpen{conn: conn})
+	sock := addTestFD(w, &wasiOpen{conn: conn})
 	w.mu.Unlock()
 	pid := spawnWithStreams(t, w, m, -1, sock, -1, spawnedSocketOutput...)
 	closeTestFd(t, w, m, sock)

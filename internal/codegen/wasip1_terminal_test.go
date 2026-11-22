@@ -137,7 +137,7 @@ func TestFdIoctlSetsTheSettingsFromLinuxNumbers(t *testing.T) {
 	_, slave := openTestPty(t)
 	w, m := newProcTestStubs(t)
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{f: slave})
+	fd := addTestFD(w, &wasiOpen{f: slave})
 	w.mu.Unlock()
 
 	for _, request := range []uint32{linuxTCSETS, linuxTCSETSW, linuxTCSETSF} {
@@ -378,7 +378,7 @@ func TestFdIoctlRefusals(t *testing.T) {
 	w.cfg.Stdin = slave
 	r, _ := blockingPipe(t)
 	w.mu.Lock()
-	pipe := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
+	pipe := addTestFD(w, &wasiOpen{f: r, noWrite: true})
 	w.mu.Unlock()
 	outside := int32(len(m.memory))
 
