@@ -240,6 +240,21 @@
   (import "wasip1_posix_extension" "proc_setenv"
     (func $proc_setenv (param i64 i32 i64 i32 i32) (result i32)))
 
+  (import "wasip1_posix_extension" "ipc_get"
+    (func $ipc_get (param i32 i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "ipc_ctl"
+    (func $ipc_ctl (param i32 i32 i32 i32 i64 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "ipc_semop"
+    (func $ipc_semop (param i32 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "ipc_msgsnd"
+    (func $ipc_msgsnd (param i32 i64 i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "ipc_msgrcv"
+    (func $ipc_msgrcv (param i32 i64 i64 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "ipc_shmat"
+    (func $ipc_shmat (param i32 i64 i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "ipc_shmdt"
+    (func $ipc_shmdt (param i64) (result i32)))
+
   (import "wasip1_posix_extension" "sys_syscall"
     (func $sys_syscall (param i64 i64 i32 i32 i64) (result i32)))
 
@@ -367,6 +382,13 @@
     (drop (call $proc_chdir (i64.const 0) (i32.const 0)))
     (drop (call $proc_setenv (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))
 
+    (drop (call $ipc_get (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_ctl (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $ipc_semop (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $ipc_msgsnd (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $ipc_msgrcv (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_shmat (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $ipc_shmdt (i64.const 0)))
 
     (drop (call $sys_syscall (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
 
