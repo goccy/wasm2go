@@ -98,6 +98,8 @@ var posixImports = map[string]bool{
 	"ipc_msgrcv": true,
 	"ipc_msgsnd": true,
 	"ipc_semop":  true,
+	"ipc_shmat":  true,
+	"ipc_shmdt":  true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

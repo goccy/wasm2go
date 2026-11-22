@@ -250,6 +250,10 @@
     (func $ipc_msgsnd (param i32 i64 i64 i32) (result i32)))
   (import "wasip1_posix_extension" "ipc_msgrcv"
     (func $ipc_msgrcv (param i32 i64 i64 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "ipc_shmat"
+    (func $ipc_shmat (param i32 i64 i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "ipc_shmdt"
+    (func $ipc_shmdt (param i64) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -377,5 +381,7 @@
     (drop (call $ipc_semop (i32.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $ipc_msgsnd (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
     (drop (call $ipc_msgrcv (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $ipc_shmat (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $ipc_shmdt (i64.const 0)))
   )
 )

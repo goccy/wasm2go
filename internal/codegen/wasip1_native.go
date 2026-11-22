@@ -88,6 +88,18 @@ type Module struct {
 // takes. The generated output has the real one; this one is not emitted.
 func accessMemory(m *Module, f func(mem []byte)) { f(m.memory) }
 
+// runtimeMapping, runtimeMappingOf and whileRuntimeMapped are the
+// in-package stand-ins for the shared-image runtime's of the same names: a
+// mapping the runtime made (SharedImage.Memory) and not released, the one
+// an instance's memory is, and f run while one is not released. The
+// generated output has the real ones; in this package no memory is one.
+// These are not emitted.
+type runtimeMapping struct{}
+
+func runtimeMappingOf(mem []byte) *runtimeMapping { return nil }
+
+func whileRuntimeMapped(m *runtimeMapping, f func()) bool { return false }
+
 // WasiExitError is the panic value of a guest that called Proc_exit(). A
 // bulk-dispatch function (Inv_<svc>_<mt>) recovers it and returns it wrapped
 // in its error, which errors.As reaches; an export method and the
@@ -2186,6 +2198,15 @@ type WasiStubs struct {
 	// which are made without mu held, so that they are made in the order of
 	// the changes they report.
 	dispositionsMu sync.Mutex
+
+	// shm holds the System V shared memory segments the guest has attached
+	// (Ipc_shmat), by the guest's address of the memory each is attached
+	// over; shmClosed is set by CloseAll, which detached them, and no
+	// segment is attached after it. shmMu guards both and makes the
+	// attachments and detachments one at a time; it is never held with mu.
+	shmMu     sync.Mutex
+	shm       map[uint64]shmAttachment
+	shmClosed bool
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
@@ -2427,7 +2448,8 @@ func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
 // The result is independent of w from then on (its own lock, its own fd
 // numbering) and is meant to back a second module instance running on
 // another goroutine. Release its descriptors with CloseAll when that instance
-// is done.
+// is done. It has none of the System V shared memory segments the guest of
+// w attached (Ipc_shmat): the copy's shmdt of one fails with EINVAL.
 func (w *WasiStubs) Fork() *WasiStubs {
 	ids := w.guestProcess().IDs()
 	start := w.forkedChanges(ids)
@@ -2481,16 +2503,17 @@ func (w *WasiStubs) Fork() *WasiStubs {
 // (dup, Fork) stays open until its last reference goes. It disposes of the
 // host state of a finished instance.
 // It also ends signal delivery to the instance — the interval timer is disarmed, and
-// PostSignal drops what it is given from here on — so the guest's memory
-// can be released afterwards. A call of IPC the guest is waiting in
-// (IPC.Semop, Msgsnd, Msgrcv) is not ended: it uses the guest's memory
-// until it returns.
+// PostSignal drops what it is given from here on — and detaches the System
+// V shared memory segments the guest has attached (Ipc_shmat), so the
+// guest's memory can be released afterwards. A call of IPC the guest is
+// waiting in (IPC.Semop, Msgsnd, Msgrcv) is not ended: it uses the guest's
+// memory until it returns.
 // Calling it again is a no-op: a call made while another one closes the
 // descriptors returns without waiting for those closes. The close errors
 // are joined.
 func (w *WasiStubs) CloseAll() error {
 	closing, err := w.takeAll()
-	return errors.Join(err, closeWasiOpens(closing))
+	return errors.Join(err, closeWasiOpens(closing), w.detachAllShm())
 }
 
 // takeAll is CloseAll up to the closing of the descriptors, which it takes
@@ -3664,6 +3687,7 @@ const (
 	_wasiELOOP        int32 = 32
 	_wasiEMFILE       int32 = 33
 	_wasiENOENT       int32 = 44
+	_wasiENOMEM       int32 = 48
 	_wasiENOSPC       int32 = 51
 	_wasiENOTCONN     int32 = 53
 	_wasiENOTDIR      int32 = 54
@@ -11649,21 +11673,25 @@ func (w *WasiStubs) Proc_syslog_close64(m *Module) int32 {
 // IPC gives the guest System V IPC (WASIConfig.IPC): message queues,
 // semaphore sets and shared memory segments. Numbers and structures are the
 // guest's: Linux's, the structures laid out as on a 64-bit architecture of
-// asm-generic. The runtime calls the methods without any lock of the
-// WasiStubs held. A call that waits (semop, msgsnd and msgrcv without
-// IPC_NOWAIT) waits until it is done: neither a signal posted to the guest
-// nor CloseAll ends it, and the guest takes a signal posted meanwhile once
-// the call has returned. An error that is errors.ErrUnsupported makes the
-// guest's call fail with ENOSYS; another one is its errno. A shared memory
-// segment is made and controlled through Get and Control; attaching one to
-// the guest's memory is not a call of IPC.
+// asm-generic. The runtime calls the methods without the lock of the
+// WasiStubs held. It calls ShmAttach and ShmDetach for an instance one at a
+// time, with the runtime's mappings locked: they must not block, nor call
+// SharedImage.Memory or UnmapMemory. A call that waits (semop, msgsnd and msgrcv without IPC_NOWAIT)
+// waits until it is done: neither a signal posted to the guest nor CloseAll
+// ends it, and the guest takes a signal posted meanwhile once the call has
+// returned. An error that is errors.ErrUnsupported makes the guest's call
+// fail with ENOSYS; another one is its errno.
+//
+// A shared memory segment is attached over a part of the guest's memory,
+// and only of a memory the runtime mapped itself, which does not move
+// (SharedImage.Memory): the guest's shmat fails with ENOMEM on any other.
 //
 // A wasm32 guest has msgget, semget, shmget and semop alone: its own
 // structures of the others (its msqid_ds, semid_ds and shmid_ds, the
 // message whose type is a 4-byte long) are not the ones of a 64-bit
 // architecture the runtime passes on, so its msgsnd and msgrcv fail with
 // ENOSYS, and so do its msgctl, semctl and shmctl of a command that passes
-// one (ipcCommandPassesNoStructure).
+// one (ipcCommandPassesNoStructure), and with them its shmat and shmdt.
 type IPC interface {
 	// Get is msgget, semget or shmget: the id of the object of the kind with
 	// the key. arg is the number of semaphores of a set, or the size of a
@@ -11687,6 +11715,25 @@ type IPC interface {
 	// Msgrcv is msgrcv: a message of the type is received into msg (its
 	// type, then room for its bytes), and the number of its bytes returned.
 	Msgrcv(id int32, msg []byte, typ int64, flags int32) (int, error)
+	// ShmAttach is shmat: the segment id is attached over at, the part of
+	// the guest's memory the guest gave, which starts at a page boundary of
+	// the host and is as long as the whole pages of the segment, whose size
+	// the runtime has read with Control (IPC_STAT); flags are shmat's
+	// (SHM_RDONLY). The guest then reads and writes the segment where at
+	// is.
+	ShmAttach(id int32, at []byte, flags int32) error
+	// ShmDetach is shmdt: the segment ShmAttach attached over at is
+	// detached, and at is the guest's memory again, all zero.
+	ShmDetach(at []byte) error
+}
+
+// shmAttachment is a System V shared memory segment the guest has attached
+// (Ipc_shmat): the memory it is attached over, and the runtime mapping that
+// memory is a part of. Nothing is done over the memory once the mapping is
+// released.
+type shmAttachment struct {
+	at      []byte
+	mapping *runtimeMapping
 }
 
 // IPCKind is the kind of a System V IPC object.
@@ -11705,7 +11752,12 @@ const (
 // the guest's; elsewhere every call fails with errors.ErrUnsupported. A
 // call that the host process is interrupted in (EINTR) is made again. The
 // operations made with SEM_UNDO are undone when the host process ends, not
-// when the instance does.
+// when the instance does. A store into a segment the guest attached
+// read-only (SHM_RDONLY), the guest's or the runtime's for the guest (the
+// bytes of an fd_read, say), faults the host process, as it faults a
+// process that attached the segment. Get refuses SHM_HUGETLB (EINVAL): the
+// mapping of a segment of huge pages is as long as its huge pages, not as
+// its size.
 func HostIPC() IPC { return hostIPC{} }
 
 // hostIPC is the IPC HostIPC returns. Its methods are the platform's.
@@ -11727,6 +11779,33 @@ const (
 	ipcCmdShmLock   = 11
 	ipcCmdShmUnlock = 12
 )
+
+// ipcStructSize is the size of the kernel's structure of the kind (struct
+// msqid64_ds, semid64_ds, shmid64_ds), the guest's.
+func ipcStructSize(kind IPCKind) int {
+	switch kind {
+	case IPCMessageQueue:
+		return 120
+	case IPCSemaphoreSet:
+		return 88
+	}
+	return 112
+}
+
+// Where the guest's shmid64_ds has the size of the segment (shm_segsz).
+const ipcShmSegsz = 48
+
+// ipcShmPages returns the length of the whole pages of the host that a
+// segment of segsz bytes is mapped in, and whether that is no more than
+// room.
+func ipcShmPages(segsz uint64, room int) (uint64, bool) {
+	if segsz > uint64(room) {
+		return 0, false
+	}
+	page := uint64(os.Getpagesize())
+	pages := segsz + (page-segsz%page)%page
+	return pages, pages <= uint64(room)
+}
 
 // ipcCommandPassesNoStructure reports whether the command cmd of msgctl,
 // semctl or shmctl, on an object of the kind, passes no structure: IPC_RMID,
@@ -11943,6 +12022,140 @@ func (w *WasiStubs) ipcMsgrcv(m *Module, id int32, msgPtr, size uint64, typ int6
 	}
 	binary.LittleEndian.PutUint64(out, uint64(n))
 	return _wasiESUCCESS
+}
+
+// Ipc_shmat is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_shmat") backing shmat (IPC.ShmAttach): the segment id is
+// attached over the size bytes of the guest's memory at addr, which the
+// guest has set aside for it, from its start as far as the segment's whole
+// pages go. Returns 0 or a negative errno: ENOMEM when the guest's memory
+// is not one a segment can be attached over (IPC), EINVAL for no memory,
+// memory outside the guest's, off a page boundary of the host, shorter
+// than the segment's pages, or a segment is attached over already, or
+// after CloseAll, and
+// the errno of the IPC_STAT of the segment (Control); ENOSYS for a wasm32
+// guest (IPC).
+func (w *WasiStubs) Ipc_shmat(m *Module, id, addr int32, size int64, flags int32) int32 {
+	return -_wasiENOSYS
+}
+
+// Ipc_shmat64 is Ipc_shmat for a memory64 guest.
+func (w *WasiStubs) Ipc_shmat64(m *Module, id int32, addr, size int64, flags int32) int32 {
+	return w.ipcShmat(m, id, uint64(addr), uint64(size), flags)
+}
+
+// ipcShmat is the body of Ipc_shmat and Ipc_shmat64.
+func (w *WasiStubs) ipcShmat(m *Module, id int32, addr, size uint64, flags int32) int32 {
+	w.endUnregistered()
+	ipc, errno := w.ipc(int32(IPCSharedMemory))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	at := w.memBytes(m, addr, size)
+	if size == 0 || at == nil {
+		return -_wasiEINVAL
+	}
+	mapping := runtimeMappingOf(w.guestMemory(m))
+	if mapping == nil {
+		return -_wasiENOMEM
+	}
+	// The mapping starts at a page boundary: the guest's address is where
+	// in a page the host's is.
+	if addr%uint64(os.Getpagesize()) != 0 {
+		return -_wasiEINVAL
+	}
+	// The runtime records the pages it hands ShmAttach, which checks them
+	// again itself for a caller other than the runtime.
+	st := make([]byte, ipcStructSize(IPCSharedMemory))
+	if _, err := ipc.Control(IPCSharedMemory, id, 0, ipcCmdStat, 0, st); err != nil {
+		return -hookErrno(err)
+	}
+	pages, ok := ipcShmPages(binary.LittleEndian.Uint64(st[ipcShmSegsz:]), len(at))
+	if !ok {
+		return -_wasiEINVAL
+	}
+	at = at[:pages]
+	w.shmMu.Lock()
+	defer w.shmMu.Unlock()
+	if w.shmClosed {
+		return -_wasiEINVAL
+	}
+	for other, over := range w.shm {
+		if addr < other+uint64(len(over.at)) && other < addr+pages {
+			return -_wasiEINVAL
+		}
+	}
+	var err error
+	if !whileRuntimeMapped(mapping, func() { err = ipc.ShmAttach(id, at, flags) }) {
+		return -_wasiENOMEM
+	}
+	if err != nil {
+		return -hookErrno(err)
+	}
+	if w.shm == nil {
+		w.shm = map[uint64]shmAttachment{}
+	}
+	w.shm[addr] = shmAttachment{at: at, mapping: mapping}
+	return _wasiESUCCESS
+}
+
+// Ipc_shmdt is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_shmdt") backing shmdt (IPC.ShmDetach): the segment Ipc_shmat
+// attached at addr is detached. Returns 0 or a negative errno: EINVAL when
+// no segment is attached at addr; ENOSYS for a wasm32 guest (IPC).
+func (w *WasiStubs) Ipc_shmdt(m *Module, addr int32) int32 {
+	return -_wasiENOSYS
+}
+
+// Ipc_shmdt64 is Ipc_shmdt for a memory64 guest.
+func (w *WasiStubs) Ipc_shmdt64(m *Module, addr int64) int32 {
+	return w.ipcShmdt(uint64(addr))
+}
+
+// ipcShmdt is the body of Ipc_shmdt and Ipc_shmdt64.
+func (w *WasiStubs) ipcShmdt(addr uint64) int32 {
+	w.endUnregistered()
+	ipc, errno := w.ipc(int32(IPCSharedMemory))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	w.shmMu.Lock()
+	defer w.shmMu.Unlock()
+	attachment, ok := w.shm[addr]
+	if !ok {
+		return -_wasiEINVAL
+	}
+	if err := detachShm(ipc, attachment); err != nil {
+		return -hookErrno(err)
+	}
+	delete(w.shm, addr)
+	return _wasiESUCCESS
+}
+
+// detachAllShm detaches every segment the guest has attached (CloseAll),
+// and joins the errors of the ones that stay attached.
+func (w *WasiStubs) detachAllShm() error {
+	w.shmMu.Lock()
+	defer w.shmMu.Unlock()
+	w.shmClosed = true
+	var err error
+	for addr, attachment := range w.shm {
+		if detachErr := detachShm(w.cfg.IPC, attachment); detachErr != nil {
+			err = errors.Join(err, detachErr)
+			continue
+		}
+		delete(w.shm, addr)
+	}
+	return err
+}
+
+// detachShm detaches the segment of the attachment while its mapping is
+// not released. A released mapping took the segment with it: nothing is
+// done over memory that is no longer the mapping.
+func detachShm(ipc IPC, attachment shmAttachment) error {
+	var err error
+	whileRuntimeMapped(attachment.mapping, func() { err = ipc.ShmDetach(attachment.at) })
+	return err
 }
 
 // ----- access, FIFOs and locks -------------------------------------------------
@@ -14364,9 +14577,10 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"linuxWinsize": true,
 			"terminalArg":  true,
 
-			"IPC":     true,
-			"IPCKind": true,
-			"hostIPC": true,
+			"IPC":           true,
+			"IPCKind":       true,
+			"hostIPC":       true,
+			"shmAttachment": true,
 		},
 		keepFuncNames: map[string]bool{
 			"NewWASI":                 true,
@@ -14520,7 +14734,10 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"zoneReading":             true,
 
 			"HostIPC":                     true,
+			"ipcStructSize":               true,
 			"ipcCommandPassesNoStructure": true,
+			"ipcShmPages":                 true,
+			"detachShm":                   true,
 		},
 		keepVarNames: map[string]bool{"idCallArgs": true, "creationThreadsRefused": true, "reportCreationThreadsRefused": true, "hostUmaskState": true},
 		keepConstAll: true,

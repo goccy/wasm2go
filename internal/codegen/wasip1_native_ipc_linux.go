@@ -4,7 +4,12 @@ package codegen
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -15,17 +20,15 @@ import (
 // The constraint names the other architectures: the gcasm capture and
 // bundle drop a file whose constraint names amd64 or arm64.
 
-// ipcStructSize is the size of the kernel's structure of the kind (struct
-// msqid64_ds, semid64_ds, shmid64_ds), the guest's.
-func ipcStructSize(kind IPCKind) int {
-	switch kind {
-	case IPCMessageQueue:
-		return 120
-	case IPCSemaphoreSet:
-		return 88
-	}
-	return 112
-}
+// shmat's flags, the guest's (Linux's): SHM_RDONLY, and SHM_REMAP, which
+// attaches over what is mapped there.
+const (
+	ipcShmRdonly = 0o10000
+	ipcShmRemap  = 0o40000
+)
+
+// shmget's SHM_HUGETLB, the guest's (Linux's).
+const ipcShmHugetlb = 0o4000
 
 // Where the guest's semid64_ds has the number of semaphores of the set
 // (sem_nsems), and the size of x86-64's semid64_ds and where it has
@@ -54,6 +57,9 @@ func ipcCall(call func() (r, r2 uintptr, errno syscall.Errno)) (uintptr, error) 
 }
 
 func (hostIPC) Get(kind IPCKind, key int32, arg uint64, flags int32) (int32, error) {
+	if kind == IPCSharedMemory && flags&ipcShmHugetlb != 0 {
+		return -1, syscall.EINVAL
+	}
 	r, err := ipcCall(func() (uintptr, uintptr, syscall.Errno) {
 		switch kind {
 		case IPCMessageQueue:
@@ -203,4 +209,87 @@ func (hostIPC) Msgrcv(id int32, msg []byte, typ int64, flags int32) (int, error)
 		return -1, err
 	}
 	return int(r), nil
+}
+
+// ShmAttach attaches the segment over at only when the segment's mapping
+// is as long as its pages: it attaches it where the kernel picks first and
+// reads the length of that mapping from /proc/self/maps. A segment of huge
+// pages (SHM_HUGETLB) is mapped as long as its huge pages, and the kernel
+// reports that nowhere else: IPC_STAT gives the size the segment was made
+// with, and its mode keeps no SHM_HUGETLB.
+func (hostIPC) ShmAttach(id int32, at []byte, flags int32) error {
+	if flags&^ipcShmRdonly != 0 {
+		return syscall.EINVAL
+	}
+	st, err := ipcStat(IPCSharedMemory, id)
+	if err != nil {
+		return err
+	}
+	// The segment is mapped in whole pages, which have to be at's; shmat
+	// itself refuses an address off a page boundary.
+	pages, ok := ipcShmPages(binary.LittleEndian.Uint64(st[ipcShmSegsz:]), len(at))
+	if !ok {
+		return syscall.EINVAL
+	}
+	probe, err := ipcCall(func() (uintptr, uintptr, syscall.Errno) {
+		return syscall.Syscall(syscall.SYS_SHMAT, uintptr(id), 0, uintptr(flags))
+	})
+	if err != nil {
+		return err
+	}
+	maps, readErr := os.ReadFile("/proc/self/maps")
+	_, detachErr := ipcCall(func() (uintptr, uintptr, syscall.Errno) {
+		return syscall.Syscall(syscall.SYS_SHMDT, probe, 0, 0)
+	})
+	if err := errors.Join(readErr, detachErr); err != nil {
+		return err
+	}
+	if err := validateShmMapping(maps, probe, pages); err != nil {
+		return err
+	}
+	_, err = ipcCall(func() (uintptr, uintptr, syscall.Errno) {
+		return syscall.Syscall(syscall.SYS_SHMAT, uintptr(id), uintptr(unsafe.Pointer(unsafe.SliceData(at))), uintptr(flags|ipcShmRemap))
+	})
+	return err
+}
+
+// validateShmMapping returns nil when the mapping that starts at addr in
+// maps (/proc/self/maps) is length bytes long, EINVAL when it is of another
+// length, and an error when maps has no mapping that starts there.
+func validateShmMapping(maps []byte, addr uintptr, length uint64) error {
+	for line := range strings.Lines(string(maps)) {
+		span, _, _ := strings.Cut(line, " ")
+		startText, endText, ok := strings.Cut(span, "-")
+		if !ok {
+			return fmt.Errorf("wasi: a line of /proc/self/maps without its range: %q", line)
+		}
+		start, err := strconv.ParseUint(startText, 16, 64)
+		if err != nil {
+			return err
+		}
+		if start != uint64(addr) {
+			continue
+		}
+		end, err := strconv.ParseUint(endText, 16, 64)
+		if err != nil {
+			return err
+		}
+		if end-start != length {
+			return syscall.EINVAL
+		}
+		return nil
+	}
+	return fmt.Errorf("wasi: no mapping at %#x in /proc/self/maps", addr)
+}
+
+// ShmDetach maps zero memory over at, which detaches the segment that is
+// there in the same call and leaves no moment at which at is not mapped.
+// (syscall.Mmap takes no address to map at.)
+func (hostIPC) ShmDetach(at []byte) error {
+	_, _, errno := syscall.Syscall6(syscall.SYS_MMAP, uintptr(unsafe.Pointer(unsafe.SliceData(at))), uintptr(len(at)),
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON|syscall.MAP_FIXED, ^uintptr(0), 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }

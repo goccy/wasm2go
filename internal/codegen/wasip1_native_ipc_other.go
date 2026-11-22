@@ -23,3 +23,7 @@ func (hostIPC) Msgsnd(id int32, msg []byte, flags int32) error { return errors.E
 func (hostIPC) Msgrcv(id int32, msg []byte, typ int64, flags int32) (int, error) {
 	return -1, errors.ErrUnsupported
 }
+
+func (hostIPC) ShmAttach(id int32, at []byte, flags int32) error { return errors.ErrUnsupported }
+
+func (hostIPC) ShmDetach(at []byte) error { return errors.ErrUnsupported }

@@ -26,7 +26,7 @@ type fakeIPC struct {
 func (f *fakeIPC) record(call string, buf []byte) {
 	f.calls = append(f.calls, call)
 	f.bufs = append(f.bufs, buf)
-	if f.wait != nil && call != "get" && call != "ctl" {
+	if f.wait != nil && (call == "semop" || call == "msgsnd" || call == "msgrcv") {
 		f.wait()
 	}
 }
@@ -54,6 +54,16 @@ func (f *fakeIPC) Msgsnd(id int32, msg []byte, flags int32) error {
 func (f *fakeIPC) Msgrcv(id int32, msg []byte, typ int64, flags int32) (int, error) {
 	f.record("msgrcv", msg)
 	return len(msg), f.err
+}
+
+func (f *fakeIPC) ShmAttach(id int32, at []byte, flags int32) error {
+	f.record("shmat", at)
+	return f.err
+}
+
+func (f *fakeIPC) ShmDetach(at []byte) error {
+	f.record("shmdt", at)
+	return f.err
 }
 
 // ipcCalls makes every call of the IPC imports once, as a memory64 guest
@@ -169,6 +179,8 @@ func TestIPC_Wasm32GuestHasNoCallsOfStructures(t *testing.T) {
 		"msgctl": w.Ipc_ctl(m, int32(IPCMessageQueue), 1, 0, 2, 0, ipcBufOff, ipcOutOff),
 		"msgsnd": w.Ipc_msgsnd(m, 1, ipcMsgOff, 16, 0),
 		"msgrcv": w.Ipc_msgrcv(m, 1, ipcMsgOff, 16, 0, 0, ipcOutOff),
+		"shmat":  w.Ipc_shmat(m, 1, 0, 1<<16, 0),
+		"shmdt":  w.Ipc_shmdt(m, 0),
 	} {
 		if rc != -_wasiENOSYS {
 			t.Errorf("%s of a wasm32 guest rc=%d, want -ENOSYS", name, rc)
@@ -247,5 +259,39 @@ func TestIPC_ASignalPostedWhileACallWaitsEndsTheGuestWhenItReturns(t *testing.T)
 				t.Fatalf("the call ended with %v, want a WasiSignalError for 15", r)
 			}
 		})
+	}
+}
+
+// A segment is attached only over a memory the runtime mapped itself, which
+// no memory of this package is: shmat fails with ENOMEM and asks the IPC
+// nothing. Memory that is not the guest's, or none, is refused before, as is
+// a shmdt of an address no segment is attached at.
+func TestIPC_ShmatOfAMemoryTheRuntimeDidNotMap(t *testing.T) {
+	ipc := &fakeIPC{}
+	w := NewWASI(WASIConfig{IPC: ipc})
+	m := newGuestModule(1 << 16)
+	for _, c := range []struct {
+		what string
+		rc   int32
+		want int32
+	}{
+		{"shmat", w.Ipc_shmat64(m, 1, 0, 1<<16, 0), -_wasiENOMEM},
+		{"shmat of no memory", w.Ipc_shmat64(m, 1, 0, 0, 0), -_wasiEINVAL},
+		{"shmat beyond the memory", w.Ipc_shmat64(m, 1, 0, 1<<16+1, 0), -_wasiEINVAL},
+		{"shmdt", w.Ipc_shmdt64(m, 0), -_wasiEINVAL},
+	} {
+		if c.rc != c.want {
+			t.Errorf("%s rc=%d, want %d", c.what, c.rc, c.want)
+		}
+	}
+	if len(ipc.calls) != 0 {
+		t.Fatalf("the IPC was asked %q", ipc.calls)
+	}
+	w = NewWASI(WASIConfig{})
+	if rc := w.Ipc_shmat64(m, 1, 0, 1<<16, 0); rc != -_wasiENOSYS {
+		t.Fatalf("shmat without an IPC rc=%d, want -ENOSYS", rc)
+	}
+	if rc := w.Ipc_shmdt64(m, 0); rc != -_wasiENOSYS {
+		t.Fatalf("shmdt without an IPC rc=%d, want -ENOSYS", rc)
 	}
 }

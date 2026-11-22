@@ -33,6 +33,7 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping the shared memory image: %w", err)
 	}
+	recordRuntimeMapping(mem)
 	return mem, nil
 }
 
@@ -53,6 +54,7 @@ func unmapMemory(mem []byte) {
 	if len(mem) == 0 {
 		return
 	}
+	forgetRuntimeMapping(mem)
 	_ = syscall.Munmap(mem)
 }
 

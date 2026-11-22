@@ -48,7 +48,7 @@ func TestHostIPC_WhereItHasNoObjects(t *testing.T) {
 	_, getErr := ipc.Get(IPCMessageQueue, guestIPCPrivate, 0, guestIPCCreat|0o600)
 	_, ctlErr := ipc.Control(IPCMessageQueue, 0, 0, 0, 0, nil)
 	_, rcvErr := ipc.Msgrcv(0, nil, 0, 0)
-	for i, err := range []error{getErr, ctlErr, ipc.Semop(0, nil), ipc.Msgsnd(0, nil, 0), rcvErr} {
+	for i, err := range []error{getErr, ctlErr, ipc.Semop(0, nil), ipc.Msgsnd(0, nil, 0), rcvErr, ipc.ShmAttach(0, nil, 0), ipc.ShmDetach(nil)} {
 		if !errors.Is(err, errors.ErrUnsupported) {
 			t.Errorf("call %d: %v, want errors.ErrUnsupported", i, err)
 		}

@@ -43,6 +43,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"unsafe"
 )
 
 // SharedImage is a process-wide initialized linear-memory template.
@@ -273,7 +274,9 @@ func (s *SharedImage) Globals() []uint64 { return s.globals }
 // and write nothing, while the initializers build this instance's own BSS.
 //
 // The mapping is NOT Go heap — the GC will not reclaim it. Pass it to
-// UnmapMemory when the instance is done.
+// UnmapMemory when the instance is done. A System V shared memory segment
+// may be attached over a part of the memory of an instance on it (see
+// IPC).
 func (s *SharedImage) Memory(ceiling int) ([]byte, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -286,5 +289,66 @@ func (s *SharedImage) Memory(ceiling int) ([]byte, error) {
 
 // UnmapMemory releases a mapping returned by SharedImage.Memory. Calling it on
 // a slice that did not come from there is a no-op on platforms without mmap
-// and undefined otherwise, so do not.
+// and undefined otherwise, so do not. Call the CloseAll of the instance's
+// WasiStubs first, which detaches the System V shared memory segments the
+// guest attached: a segment still attached is detached with the mapping,
+// and a later CloseAll leaves it alone.
 func UnmapMemory(mem []byte) { unmapMemory(mem) }
+
+// runtimeMapping is a mapping of an instance's memory the runtime made
+// (mmapImage) that unmapMemory has not released. It is the runtime's own
+// and does not move: an instance on it never grows past it. The wasi
+// runtime attaches System V shared memory segments over parts of an
+// instance's memory that is one (Ipc_shmat). The mapping an image is built
+// in place on (mmapShared) is not one: what a segment holds is not the
+// image's.
+type runtimeMapping struct {
+	start  *byte
+	length int
+}
+
+// runtimeMappings holds the runtimeMappings, by their first byte.
+var runtimeMappings = struct {
+	sync.Mutex
+	byStart map[*byte]*runtimeMapping
+}{byStart: map[*byte]*runtimeMapping{}}
+
+// recordRuntimeMapping records mem, a mapping the runtime has just made.
+func recordRuntimeMapping(mem []byte) {
+	runtimeMappings.Lock()
+	defer runtimeMappings.Unlock()
+	start := unsafe.SliceData(mem)
+	runtimeMappings.byStart[start] = &runtimeMapping{start: start, length: len(mem)}
+}
+
+// forgetRuntimeMapping removes mem, which is about to be unmapped, from
+// runtimeMappings. A whileRuntimeMapped on it that has begun ends first.
+func forgetRuntimeMapping(mem []byte) {
+	runtimeMappings.Lock()
+	defer runtimeMappings.Unlock()
+	delete(runtimeMappings.byStart, unsafe.SliceData(mem))
+}
+
+// runtimeMappingOf returns the runtimeMapping mem, an instance's memory,
+// is, or nil.
+func runtimeMappingOf(mem []byte) *runtimeMapping {
+	runtimeMappings.Lock()
+	defer runtimeMappings.Unlock()
+	m := runtimeMappings.byStart[unsafe.SliceData(mem)]
+	if m == nil || cap(mem) > m.length {
+		return nil
+	}
+	return m
+}
+
+// whileRuntimeMapped runs f while m has not been released, and reports
+// whether it ran f: m is not released before f returns.
+func whileRuntimeMapped(m *runtimeMapping, f func()) bool {
+	runtimeMappings.Lock()
+	defer runtimeMappings.Unlock()
+	if runtimeMappings.byStart[m.start] != m {
+		return false
+	}
+	f()
+	return true
+}
