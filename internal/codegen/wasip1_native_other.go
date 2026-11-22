@@ -5,8 +5,11 @@ package codegen
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -56,9 +59,9 @@ func readHostUmask() (os.FileMode, error) {
 	return 0, fmt.Errorf("the umask of the host process cannot be read without changing it: %w", errors.ErrUnsupported)
 }
 
-// clearHostNonblock would make the descriptor of f one that waits; no open
-// of this platform is given O_NONBLOCK (hostONonblock).
-func clearHostNonblock(f File) error { return nil }
+// setHostNonblock would set the O_NONBLOCK of f's descriptor; no open of
+// this platform is given O_NONBLOCK (hostONonblock).
+func setHostNonblock(f File, nonblock bool) error { return nil }
 
 // hostONonblock is the open flag of the host that opens a file without
 // waiting. This platform's opens wait as they will: the syscall package of
@@ -317,4 +320,49 @@ func setHostSocketTimeout(fd int, send bool, d time.Duration) error { return err
 // (HostSyscalls).
 func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
 	return 0, errors.ErrUnsupported
+}
+
+// startCommand starts the command path with argv and env in dir (the host
+// process's directory when it is empty), its standard streams those of
+// streams, with os/exec: a file or socket of the host is the command's as
+// it is, and os/exec copies any other stream, to the instance's stdout and
+// stderr under the family's output lock (familyStreams). Its wait waits for
+// the copies, as Cmd.Wait does.
+func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+	cmd := &exec.Cmd{Path: path, Args: argv, Env: env, Dir: dir}
+	if s := streams[0]; s.host != nil {
+		cmd.Stdin = s.host.(io.Reader)
+	} else if s.reader != nil {
+		cmd.Stdin = s.reader
+	}
+	out := [2]*io.Writer{&cmd.Stdout, &cmd.Stderr}
+	for i, s := range streams[1:] {
+		switch {
+		case s.host != nil:
+			*out[i] = s.host.(io.Writer)
+		case s.writer != nil && s.stdio >= 2:
+			*out[i] = lockedWriter{&share.output, s.writer}
+		case s.writer != nil:
+			*out[i] = s.writer
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &hostCommand{process: cmd.Process, wait: func() int32 {
+		err := cmd.Wait()
+		return waitStatusOf(cmd.ProcessState, err)
+	}}, nil
+}
+
+// lockedWriter writes to w under mu.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }

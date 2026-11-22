@@ -407,8 +407,8 @@ func TestOpenOfAFIFOWithoutWaiting(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := clearHostNonblock(&memFile{}); err != nil {
-		t.Fatalf("clearHostNonblock of a file not of the host: %v", err)
+	if err := setHostNonblock(&memFile{}, false); err != nil {
+		t.Fatalf("setHostNonblock of a file not of the host: %v", err)
 	}
 }
 

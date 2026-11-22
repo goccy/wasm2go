@@ -53,6 +53,25 @@ func chmodRefused(err error) bool {
 // host process: /dev/fd/N of this system is no link.
 func hostFDLink(fd uintptr) (string, bool, error) { return "", false, nil }
 
+// hostReopen would open descriptor fd again as a new open file
+// description, which this system has no way to (no /proc/self/fd).
+func hostReopen(fd uintptr, flags int) (int, error) { return -1, errors.ErrUnsupported }
+
+// hostReopensTerminal: no terminal is opened again here (hostReopen).
+func hostReopensTerminal(fd uintptr) (bool, error) { return false, nil }
+
+// hostFIONREAD is FIONREAD, _IOR('f', 127, int): package syscall names it
+// for no darwin architecture.
+const hostFIONREAD = 0x4004667f
+
+// hostReadable returns the number of bytes that can be read from fd, a
+// pipe, without waiting (FIONREAD).
+func hostReadable(fd uintptr) (int, error) {
+	var n int32
+	err := hostIoctl(fd, hostFIONREAD, unsafe.Pointer(&n))
+	return int(n), err
+}
+
 // readHostUmask returns the file mode creation mask of the host process,
 // which this system has no way to read without changing it:
 // errors.ErrUnsupported.
