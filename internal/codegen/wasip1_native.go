@@ -5196,6 +5196,25 @@ func (w *WasiStubs) guestLstat(name string) (dir bool, target string, link bool,
 	return false, target, true, _wasiESUCCESS
 }
 
+// entryRemover is an FS that removes a name of a file, or of a directory,
+// in one call, so that a name that was another kind of file when the guest
+// looked is refused, not removed: removeFile as unlink(2) does, removeDir
+// as rmdir(2) does. The whole host filesystem is one, and HostFS of a
+// directory where the host has calls relative to a directory descriptor.
+type entryRemover interface {
+	removeFile(name string) error
+	removeDir(name string) error
+}
+
+// noFollowOpener is an FS that opens a name without following a symbolic
+// link at its end in one call (O_NOFOLLOW: ELOOP for a link), where an FS
+// that is not one is asked first whether the name is a link. The whole host
+// filesystem is one, and HostFS of a directory where the host has calls
+// relative to a directory descriptor.
+type noFollowOpener interface {
+	openNoFollow(name string, flag int, perm os.FileMode) (File, error)
+}
+
 // rootRelative returns the guest path name cleaned as chroot(2) sees it,
 // lexically: relative to the root, which ".." of the root is, and "." for
 // the root itself. Only the target of a symbolic link, which names nothing
@@ -5951,10 +5970,16 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 		current = st
 	}
 	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, current)
-	// A file that sets its own times is changed through the descriptor,
-	// any other by its path.
+	// A file that sets its own times, and a host file where the host can
+	// (hostFutimens), is changed through the descriptor; any other by its
+	// path.
 	if f, ok := op.f.(ChtimesFile); ok {
 		return w.guestErrno("fd_filestat_set_times", f.Chtimes(atime, mtime))
+	}
+	if f, ok := op.f.(*os.File); ok {
+		if err := hostFutimens(f, atime, mtime); !errors.Is(err, errors.ErrUnsupported) {
+			return w.guestErrno("fd_filestat_set_times", err)
+		}
 	}
 	if err := fsys.Chtimes(name, atime, mtime); err != nil {
 		return w.guestErrno("fd_filestat_set_times", err)
@@ -8705,14 +8730,19 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		flag = os.O_RDONLY
 	}
 
-	// When the guest opted out of symlink-follow, refuse the open
-	// up-front if Lstat says the target is a symlink. There is a
-	// TOCTOU window between this check and OpenFile, but Go's
-	// stdlib does not expose a portable O_NOFOLLOW; this Lstat
-	// pre-check gives the right answer for the documented attack
-	// model (an existing symlink at the path) without dragging in
-	// platform-specific syscall constants.
+	// When the guest opted out of symlink-follow, an FS that opens a name
+	// so in one call does (noFollowOpener); of any other the open is
+	// refused up-front if Lstat says the name is a symbolic link, which
+	// leaves a window between the two for the name to change. What the
+	// name is (a FIFO) is told by Lstat then, so the open does not wait for
+	// the other end of a FIFO a link leads to.
+	stat := fsys.Stat
 	if noFollow {
+		stat = fsys.Lstat
+	}
+	if opener, ok := fsys.(noFollowOpener); ok && noFollow {
+		openFile = opener.openNoFollow
+	} else if noFollow {
 		if li, lerr := fsys.Lstat(rel); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
 			// open(2)'s errnos for a symbolic link: EEXIST with
 			// O_CREAT|O_EXCL, ELOOP with O_NOFOLLOW otherwise
@@ -8727,7 +8757,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	// A file the open creates gets the mode less the instance's umask
 	// (create).
 	isFIFO := false
-	fi, err := fsys.Stat(rel)
+	fi, err := stat(rel)
 	if err == nil {
 		isFIFO = fi.Mode()&os.ModeNamedPipe != 0
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -8844,6 +8874,9 @@ func (w *WasiStubs) pathUnlinkFile(m *Module, dirFd int32, pathPtr, pathLen uint
 	fsys := w.fs()
 	w.mu.Unlock()
 	rel := name
+	if remover, ok := fsys.(entryRemover); ok {
+		return w.guestErrno("path_unlink_file", remover.removeFile(rel))
+	}
 	st, err := fsys.Lstat(rel)
 	if err != nil {
 		return w.guestErrno("path_unlink_file", err)
@@ -8884,6 +8917,9 @@ func (w *WasiStubs) pathRemoveDirectory(m *Module, dirFd int32, pathPtr, pathLen
 	fsys := w.fs()
 	w.mu.Unlock()
 	rel := name
+	if remover, ok := fsys.(entryRemover); ok {
+		return w.guestErrno("path_remove_directory", remover.removeDir(rel))
+	}
 	st, err := fsys.Lstat(rel)
 	if err != nil {
 		return w.guestErrno("path_remove_directory", err)

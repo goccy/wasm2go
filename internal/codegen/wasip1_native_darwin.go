@@ -227,10 +227,17 @@ func hostAccess(path string, amode uint32, effective bool) (asked bool, err erro
 
 // rootAccess would be hostAccess for name in r; package syscall has no
 // call relative to a directory descriptor on this system, and a path of
-// the host is not looked up instead: errors.ErrUnsupported.
+// the host is not looked up instead: errors.ErrUnsupported. For the same
+// reason a rootFS here removes and opens names through os.Root alone (it
+// has no removeFile, removeDir or openNoFollow).
 func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
 	return errors.ErrUnsupported
 }
+
+// hostFutimens would set the times of the file open as f through its
+// descriptor; package syscall has no such call with times in nanoseconds
+// here: errors.ErrUnsupported, and the times are set by the file's name.
+func hostFutimens(f *os.File, atime, mtime time.Time) error { return errors.ErrUnsupported }
 
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,
 // recordLockSet and recordLockWait: fcntl's F_GETLK, F_SETLK and F_SETLKW,

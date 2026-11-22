@@ -273,6 +273,11 @@ func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
 	return errors.ErrUnsupported
 }
 
+// hostFutimens would set the times of the file open as f through its
+// descriptor, which the runtime cannot do on this platform:
+// errors.ErrUnsupported, and the times are set by the file's name.
+func hostFutimens(f *os.File, atime, mtime time.Time) error { return errors.ErrUnsupported }
+
 // flockOSFile would apply flock(2) to a file of the host process, which the
 // runtime cannot do on this platform.
 func flockOSFile(f *os.File, how int) error { return errors.ErrUnsupported }

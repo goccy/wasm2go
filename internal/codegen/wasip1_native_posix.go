@@ -953,6 +953,49 @@ func setHostNonblock(f File, nonblock bool) error {
 // waiting (a FIFO nobody writes to, or reads from).
 const hostONonblock = syscall.O_NONBLOCK
 
+// removeFile removes the name of a file that is not a directory, as
+// unlink(2) does, in one call: a name that is a directory is refused
+// (EISDIR), even one that became one since the guest looked. darwin's
+// unlink(2) refuses a directory with EPERM, which is told apart from a
+// refusal of the permission by what the name is.
+func (o osFS) removeFile(name string) error {
+	path := o.join(name)
+	err := syscall.Unlink(path)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.EPERM) {
+		fi, statErr := os.Lstat(path)
+		switch {
+		case statErr != nil:
+			return errors.Join(&fs.PathError{Op: "unlink", Path: path, Err: err}, statErr)
+		case fi.IsDir():
+			err = syscall.EISDIR
+		}
+	}
+	return &fs.PathError{Op: "unlink", Path: path, Err: err}
+}
+
+// removeDir removes an empty directory, as rmdir(2) does, in one call: a
+// name that is no directory is refused (ENOTDIR).
+func (o osFS) removeDir(name string) error {
+	path := o.join(name)
+	if err := syscall.Rmdir(path); err != nil {
+		return &fs.PathError{Op: "rmdir", Path: path, Err: err}
+	}
+	return nil
+}
+
+// openNoFollow opens name as OpenFile does, except that a symbolic link at
+// its end is not followed (ELOOP): O_NOFOLLOW.
+func (o osFS) openNoFollow(name string, flag int, perm os.FileMode) (File, error) {
+	f, err := os.OpenFile(o.join(name), flag|syscall.O_NOFOLLOW, perm)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 // ----- sockets ----------------------------------------------------------------
 
 // hostOpensSockets says that the runtime makes sockets of the host's.
