@@ -1067,10 +1067,9 @@ func TestFlockWaits(t *testing.T) {
 		t.Fatalf("waiting lock rc=%d, want -EINTR", rc)
 	}
 	takeSignals(t, w, m)
-	// The interrupted call still waits: a lock of the descriptor that may
-	// not wait is refused meanwhile.
+	// The interrupted call took nothing: the holder's lock is in the way.
 	if rc := w.Fd_flock(m, waiter, 1, 0); rc != -_wasiEAGAIN {
-		t.Fatalf("lock that may not wait beside the interrupted one rc=%d, want -EAGAIN", rc)
+		t.Fatalf("lock that may not wait beside the holder's rc=%d, want -EAGAIN", rc)
 	}
 	released := whenBlocked(w, func() { w.Fd_flock(newForkTestModule(), holder, 0, 0) })
 	if rc := w.Fd_flock(m, waiter, 2, 1); rc != _wasiESUCCESS {
@@ -1103,9 +1102,9 @@ func TestFlockWaits(t *testing.T) {
 	}
 }
 
-// A guest ended by SIGKILL while it waits for a lock leaves the lock the
-// call takes later to be removed: the descriptor's next lock does not meet
-// it.
+// A guest ended by SIGKILL while it waits for a lock of a MemFS file
+// leaves nothing behind: the wait ended with the guest's, and took
+// nothing.
 func TestFlockOfAGuestEndedWhileItWaits(t *testing.T) {
 	w, m, fsys := memTestStubs(t)
 	if err := fsys.WriteFile("lock", nil, 0o644); err != nil {
@@ -1130,17 +1129,16 @@ func TestFlockOfAGuestEndedWhileItWaits(t *testing.T) {
 	op := w.openLocked(waiter)
 	w.mu.Unlock()
 	op.mu.Lock()
-	released := op.lockPending
+	pending := op.lockPending
 	op.mu.Unlock()
-	if released == nil {
-		t.Fatal("no removal of the late lock is pending")
+	if pending != nil {
+		t.Fatal("the wait goes on after the guest ended")
 	}
 	if rc := w.Fd_flock(m, holder, 0, 0); rc != _wasiESUCCESS {
 		t.Fatalf("unlock rc=%d", rc)
 	}
-	<-released
-	if rc := w.Fd_flock(m, holder, 2, 0); rc != _wasiESUCCESS {
-		t.Fatalf("exclusive lock after the late one was removed rc=%d", rc)
+	if rc := w.Fd_flock(m, waiter, 2, 0); rc != _wasiESUCCESS {
+		t.Fatalf("exclusive lock of the waiter's descriptor after the unlock rc=%d", rc)
 	}
 }
 
@@ -1191,23 +1189,6 @@ func TestFlockOfASharedDescriptorWaitedForTwice(t *testing.T) {
 	}
 	if rc := w.Fd_flock(m, holder, 1, 0); rc != -_wasiEAGAIN {
 		t.Fatalf("lock beside the granted one rc=%d, want -EAGAIN: the late grant removed it", rc)
-	}
-}
-
-// A lock call forgets the locks earlier waits of the descriptor took by the
-// same import only (takeLock's lockHeld).
-func TestTakeLockForgetsHeldOfItsImport(t *testing.T) {
-	w, _ := newTestStubs(t, t.TempDir())
-	flock := lockKey{call: lockCallFlock, how: flockExclusive}
-	record := lockKey{call: lockCallRecord, typ: 1, len: 1}
-	op := &wasiOpen{lockHeld: map[lockKey]bool{flock: true, record: true}}
-	set := func(bool) error { return nil }
-	interrupted, err := w.takeLock("fd_lock", lockKey{call: lockCallRecord, typ: recordUnlock, len: 1}, op, true, false, set, nil)
-	if interrupted || err != nil {
-		t.Fatalf("takeLock: interrupted=%v err=%v", interrupted, err)
-	}
-	if len(op.lockHeld) != 1 || !op.lockHeld[flock] {
-		t.Errorf("lockHeld = %v, want fd_flock's lock only", op.lockHeld)
 	}
 }
 
