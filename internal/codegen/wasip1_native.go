@@ -9014,10 +9014,12 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	w.mu.Unlock()
 	// An open that does not wait is made as the runtime makes its own
 	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
-	// the other end (openFIFO) is moved up once it is made.
+	// the other end (openFIFO) is moved up once it is made. fsOpen is the FS's
+	// open, or its open that does not follow a link (noFollowOpener, below).
+	fsOpen := fsys.OpenFile
 	openFile := func(name string, flag int, perm os.FileMode) (f File, err error) {
 		err = makeRuntimeDescriptors(func() error {
-			if f, err = fsys.OpenFile(name, flag, perm); err != nil {
+			if f, err = fsOpen(name, flag, perm); err != nil {
 				return err
 			}
 			f, err = keepRuntimeOpened(f)
@@ -9084,7 +9086,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		stat = fsys.Lstat
 	}
 	if opener, ok := fsys.(noFollowOpener); ok && noFollow {
-		openFile = opener.openNoFollow
+		fsOpen = opener.openNoFollow
 	} else if noFollow {
 		if li, lerr := fsys.Lstat(rel); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
 			// open(2)'s errnos for a symbolic link: EEXIST with

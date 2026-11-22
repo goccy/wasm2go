@@ -350,6 +350,17 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// An open that does not follow a link, of the whole host filesystem as
+	// of a root, keeps the entry's own descriptor above the floor.
+	t.Run("NoFollowOpen", func(t *testing.T) {
+		w, _ := newHostNumberedStubs(t, nil, nil)
+		w.cfg.FS = newHostFS(t, "/")
+		fd := createTestFile(t, w, hostRelative(t, filepath.Join(t.TempDir(), "a.txt")))
+		if n := entryHostNumber(t, w, fd); n < hostDescriptorFloor {
+			t.Fatalf("the entry's own descriptor is at %d, below the floor", n)
+		}
+	})
+
 	t.Run("Dup2", func(t *testing.T) {
 		w, m := newHostNumberedStubs(t, nil, nil)
 		fd := createTestFile(t, w, "a.txt")
