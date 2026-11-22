@@ -54,9 +54,7 @@ func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 	}
 
 	w.sig.flagModule, w.sig.flagAddr = m, size
-	w.mu.Lock()
-	w.raiseSignalFlagLocked()
-	w.mu.Unlock()
+	w.raiseSignalFlag()
 	if !bytes.Equal(m.memory[size:size+4], make([]byte, 4)) {
 		t.Errorf("the flag word past memSize was written: % x", m.memory[size:size+4])
 	}
@@ -73,9 +71,7 @@ func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 	if s, ok := w.readCStr(m, size-4); !ok || s != "path" {
 		t.Errorf("readCStr after growth = %q, %v, want \"path\", true", s, ok)
 	}
-	w.mu.Lock()
-	w.raiseSignalFlagLocked()
-	w.mu.Unlock()
+	w.raiseSignalFlag()
 	if got := m.memory[size]; got != 1 {
 		t.Errorf("the flag word after growth = %d, want 1", got)
 	}

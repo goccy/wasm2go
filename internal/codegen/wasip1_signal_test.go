@@ -77,9 +77,9 @@ func whenBlocked(w *WasiStubs, f func()) <-chan struct{} {
 // awaitBlockedCalls returns once n blocking calls of the guest are waiting.
 func awaitBlockedCalls(w *WasiStubs, n int) {
 	for {
-		w.mu.Lock()
+		w.sig.mu.Lock()
 		blocked := len(w.sig.wakes)
-		w.mu.Unlock()
+		w.sig.mu.Unlock()
 		if blocked == n {
 			return
 		}
@@ -551,9 +551,9 @@ func TestSignal_TimerRepeatsAtItsInterval(t *testing.T) {
 // moving the moment it is due into the past.
 func TestSignal_TimerDueBeforeAWaitEndsIsPostedFirst(t *testing.T) {
 	overdue := func(w *WasiStubs) {
-		w.mu.Lock()
+		w.sig.mu.Lock()
 		w.sig.timerAt = time.Now().Add(-time.Millisecond)
-		w.mu.Unlock()
+		w.sig.mu.Unlock()
 	}
 
 	// The wait was in progress when the timer came due.
@@ -665,9 +665,9 @@ func TestSignal_CloseAllEndsDelivery(t *testing.T) {
 	// The guest's memory may be gone from here on.
 	m.memory = nil
 	w.PostSignal(wasiSIGALRM)
-	w.mu.Lock()
+	w.sig.mu.Lock()
 	timer := w.sig.timer
-	w.mu.Unlock()
+	w.sig.mu.Unlock()
 	if timer != nil {
 		t.Fatal("the timer survived CloseAll")
 	}
@@ -692,9 +692,9 @@ func TestSignal_SIGKILLIsAlwaysDelivered(t *testing.T) {
 // registered.
 func TestSignal_DueTimerInterruptsTheGuestsOwnWait(t *testing.T) {
 	overdue := func(w *WasiStubs) {
-		w.mu.Lock()
+		w.sig.mu.Lock()
 		w.sig.timerAt = time.Now().Add(-time.Millisecond)
-		w.mu.Unlock()
+		w.sig.mu.Unlock()
 	}
 	w, m := newSignalGuest(t, wasiSIGALRM)
 	outside := 0
@@ -751,9 +751,9 @@ func TestSignal_ExitStopsTheTimer(t *testing.T) {
 		if flag := signalFlag(m); flag != 0 {
 			t.Fatalf("after %s a posted signal raised the flag", end.name)
 		}
-		w.mu.Lock()
+		w.sig.mu.Lock()
 		timer := w.sig.timer
-		w.mu.Unlock()
+		w.sig.mu.Unlock()
 		if timer != nil {
 			t.Fatalf("the timer survived %s", end.name)
 		}
@@ -765,9 +765,9 @@ func TestSignal_ExitStopsTheTimer(t *testing.T) {
 func TestSignal_TimerOverdueWhenAskedFires(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGALRM)
 	setTimer(t, w, m, time.Hour, 0)
-	w.mu.Lock()
+	w.sig.mu.Lock()
 	w.sig.timerAt = time.Now().Add(-time.Millisecond)
-	w.mu.Unlock()
+	w.sig.mu.Unlock()
 	if left, every := setTimer(t, w, m, 0, 0); left != 0 || every != 0 {
 		t.Fatalf("an overdue one-shot timer reported %v left (every %v), want none", left, every)
 	}
@@ -890,9 +890,9 @@ func TestSignal_OwnPostsAreLeftForTheGuest(t *testing.T) {
 	takeSignals(t, w, m)
 
 	setTimer(t, w, m, time.Hour, 0)
-	w.mu.Lock()
+	w.sig.mu.Lock()
 	w.sig.timerAt = time.Now().Add(-time.Millisecond)
-	w.mu.Unlock()
+	w.sig.mu.Unlock()
 	timerState(t, w, m)
 	if rc := wait(); rc != -_wasiEINTR {
 		t.Fatalf("Proc_wait after the overdue timer fired rc=%d, want -EINTR", rc)
@@ -914,9 +914,9 @@ func TestSignal_DetachedForkedInstanceKeepsNothing(t *testing.T) {
 		t.Fatalf("CloseAll: %v", err)
 	}
 	child.PostSignal(wasiSIGTERM)
-	child.mu.Lock()
+	child.sig.mu.Lock()
 	pending := child.sig.pending
-	child.mu.Unlock()
+	child.sig.mu.Unlock()
 	if pending != 0 {
 		t.Fatalf("pending = %#x after CloseAll, want none", pending)
 	}
