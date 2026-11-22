@@ -6,11 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/constant"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -127,6 +133,69 @@ func TestWasi_ErrorsKeepTheirNumber(t *testing.T) {
 	}
 	if _, err := os.Open(filepath.Join(dir, strings.Repeat("n", 5000))); errnoOfError(err) != 37 {
 		t.Errorf("opening a name too long = %d, want ENAMETOOLONG (37)", errnoOfError(err))
+	}
+}
+
+// HostNumbering has the numbers the runtime uses, family by family, and
+// nothing past them.
+func TestHostNumberingIsTheRuntimes(t *testing.T) {
+	numbering := HostNumbering()
+	tables := hostNumberTables()
+	if len(tables[hostNumberFamilyErrno]) == 0 {
+		t.Fatal("the runtime has no error numbers")
+	}
+	for family, numbers := range tables {
+		for i, want := range numbers {
+			name, value, ok := numbering.NumberAt(family, int32(i))
+			if !ok || name != want.name || value != want.value {
+				t.Errorf("NumberAt(%d, %d) = %q %d %v, want %q %d", family, i, name, value, ok, want.name, want.value)
+			}
+		}
+		if _, _, ok := numbering.NumberAt(family, int32(len(numbers))); ok {
+			t.Errorf("NumberAt(%d, %d) past the last number is ok", family, len(numbers))
+		}
+		if _, _, ok := numbering.NumberAt(family, -1); ok {
+			t.Errorf("NumberAt(%d, -1) is ok", family)
+		}
+	}
+	if _, _, ok := numbering.NumberAt(0, 0); ok {
+		t.Error("NumberAt(0, 0) of a family the runtime has no numbers of is ok")
+	}
+}
+
+// The runtime has the families of numbers of its system, and a number of a
+// name package syscall has here is syscall's.
+func TestHostNumbersAreTheSystems(t *testing.T) {
+	want := []int32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
+	switch {
+	case runtime.GOOS == "darwin":
+		want = []int32{1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
+	case slices.Contains([]string{"mips", "mipsle", "mips64", "mips64le"}, runtime.GOARCH):
+		want = []int32{1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 20}
+	}
+	tables := hostNumberTables()
+	if got := slices.Sorted(maps.Keys(tables)); !slices.Equal(got, want) {
+		t.Fatalf("families %v, want %v", got, want)
+	}
+	pkg, err := importer.Default().Import("syscall")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range want {
+		t.Run(strconv.Itoa(int(family)), func(t *testing.T) {
+			if len(tables[family]) == 0 {
+				t.Fatal("no numbers")
+			}
+			for _, n := range tables[family] {
+				c, ok := pkg.Scope().Lookup(n.name).(*types.Const)
+				if !ok {
+					continue
+				}
+				if v, exact := constant.Int64Val(constant.ToInt(c.Val())); !exact || v != n.value {
+					t.Errorf("%s = %d, syscall's is %v", n.name, n.value, c.Val())
+				}
+			}
+		})
 	}
 }
 

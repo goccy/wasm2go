@@ -344,12 +344,6 @@ func descriptorFlags(fd int, get int) (int, error) {
 // and the two sides meet by that name. The tables are in the
 // wasip1_hostnumbers_* files, one family of numbers after another.
 
-// hostNumber is a number of the operating system under its name in C.
-type hostNumber struct {
-	name  string
-	value int64
-}
-
 // hostNumberFamilyErrno is the family of the error numbers.
 const hostNumberFamilyErrno int32 = 1
 
