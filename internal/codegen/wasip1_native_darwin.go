@@ -60,6 +60,13 @@ func hostReopen(fd uintptr, flags int) (int, error) { return -1, errors.ErrUnsup
 // hostReopensTerminal: no terminal is opened again here (hostReopen).
 func hostReopensTerminal(fd uintptr) (bool, error) { return false, nil }
 
+// openFIFOWatched reports that this system opens no FIFO by waiting for an
+// open of the other end, having no inotify: the caller opens it another
+// way.
+func (w *WasiStubs) openFIFOWatched(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, int32, bool) {
+	return nil, _wasiESUCCESS, false
+}
+
 // hostFIONREAD is FIONREAD, _IOR('f', 127, int): package syscall names it
 // for no darwin architecture.
 const hostFIONREAD = 0x4004667f

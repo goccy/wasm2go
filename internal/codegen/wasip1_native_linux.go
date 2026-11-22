@@ -127,7 +127,7 @@ func chmodRefused(err error) bool { return errors.Is(err, syscall.EPERM) }
 // the host process, /proc/self/fd/fd, and whether the host has one: a
 // system without /proc has none.
 func hostFDLink(fd uintptr) (string, bool, error) {
-	target, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(fd), 10))
+	target, err := os.Readlink(hostFDPath(fd))
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", false, nil
 	}
@@ -137,11 +137,15 @@ func hostFDLink(fd uintptr) (string, bool, error) {
 	return target, true, nil
 }
 
+// hostFDPath returns the name of descriptor fd of the host process in
+// /proc: /proc/self/fd/fd.
+func hostFDPath(fd uintptr) string { return "/proc/self/fd/" + strconv.FormatUint(uint64(fd), 10) }
+
 // hostReopen opens descriptor fd of the host process again with flags,
 // through /proc/self/fd/fd: a new open file description of the same file
 // (close-on-exec). A system without /proc gives fs.ErrNotExist.
 func hostReopen(fd uintptr, flags int) (int, error) {
-	path := "/proc/self/fd/" + strconv.FormatUint(uint64(fd), 10)
+	path := hostFDPath(fd)
 	reopened, err := syscall.Open(path, flags|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, &os.PathError{Op: "open", Path: path, Err: err}
@@ -420,4 +424,203 @@ func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, 
 		return 0, syscall.ENOSYS
 	}
 	return hostRawSyscall(n, args, ptrs, mem)
+}
+
+// openFIFOWatched opens the FIFO name, of a filesystem of the host's, for
+// reading with flag the way a blocking open(2) does (fs/pipe.c fifo_open),
+// and reports whether it did so here (watched): not where /proc or inotify
+// is missing, which is known before the FIFO is opened, and the caller
+// opens it another way. The open is made without waiting
+// (O_NONBLOCK), which makes it a reader at once, as a waiting reader is:
+// a writer's open that waits for one returns. The call then waits until
+// the FIFO has had a writer since (awaitFIFOWriter); a signal posted to
+// the guest meanwhile ends the wait with EINTR and closes the reader,
+// which a writer that came takes for a reader gone, as for an open(2)
+// that a signal interrupts. No other end of the FIFO is opened.
+func (w *WasiStubs) openFIFOWatched(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, int32, bool) {
+	// Known before the FIFO is opened: an open made and closed again would
+	// show.
+	if _, err := os.Stat("/proc/self/fd"); errors.Is(err, fs.ErrNotExist) {
+		return nil, _wasiESUCCESS, false
+	} else if err != nil {
+		return nil, w.guestErrno("path_open", err), true
+	}
+	fw, err := newFIFOWatch()
+	if err != nil {
+		// No inotify instance (the user's limit of them, a kernel without
+		// inotify): the open is made the way that needs none, which it can
+		// still be, as nothing of the FIFO's is opened yet. Errors is told
+		// why.
+		w.reportError("path_open", err)
+		return nil, _wasiESUCCESS, false
+	}
+	f, err := openFile(name, flag|syscall.O_NONBLOCK, perm)
+	if err != nil {
+		return nil, w.guestErrno("path_open", errors.Join(err, fw.Close())), true
+	}
+	ended := false
+	defer func() {
+		if !ended {
+			// Unwound by terminate: the guest is ending.
+			w.reportError("path_open", errors.Join(fw.Close(), f.Close()))
+		}
+	}()
+	opened, err := w.awaitFIFOWriter(fw, f)
+	ended = true
+	err = errors.Join(err, fw.Close())
+	if err == nil && opened {
+		return f, _wasiESUCCESS, true
+	}
+	if err = errors.Join(err, f.Close()); err != nil {
+		return nil, w.guestErrno("path_open", err), true
+	}
+	return nil, _wasiEINTR, true
+}
+
+// awaitFIFOWriter waits until f, the read end of a FIFO opened without
+// waiting, has had a writer since it was opened, as a blocking open of it
+// for reading waits (fs/pipe.c wait_for_partner), and reports whether it
+// has: not when a signal posted to the guest ended the wait first. A
+// writer that comes and goes ends the wait as well; a read then finds the
+// end of input. f that is no FIFO, another file the name was given to
+// after it was looked up, is what open(2) opens: there is nothing to wait
+// for.
+//
+// The wait is for an open of the FIFO (inotify IN_OPEN, on the inode
+// /proc/self/fd names, so no name is looked up again) and for f to be
+// readable, after which the call looks whether a writer has come
+// (fifoWatch.hasWriter). The events are read before each look, so that one
+// after it ends the next wait; a writer that came before the watch was set
+// is found by the first look, and one a look missed (another reader took
+// the input tee(2) was to find) by f's input or hang-up.
+func (w *WasiStubs) awaitFIFOWriter(fw *fifoWatch, f File) (bool, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if st.Mode()&os.ModeNamedPipe == 0 {
+		return true, nil
+	}
+	if err := fw.watch(f); err != nil {
+		return false, err
+	}
+	interrupted := false
+	for {
+		if err := fw.drain(); err != nil {
+			return false, err
+		}
+		found, err := fw.hasWriter(f)
+		switch {
+		case err != nil:
+			return false, err
+		case found:
+			if interrupted {
+				// The open is done after all: the next call that waits
+				// reports the signal.
+				w.keepInterrupt()
+			}
+			return true, nil
+		case interrupted:
+			return false, nil
+		}
+		set := []hostWaitFD{{stream: fw.events, want: hostWantInput}, {stream: f, want: hostWantInput}}
+		if interrupted, err = w.waitHostInterruptibly("path_open", set, time.Time{}); err != nil {
+			return false, err
+		}
+	}
+}
+
+// spliceFNonblock is SPLICE_F_NONBLOCK (include/uapi/linux/splice.h), which
+// package syscall does not name.
+const spliceFNonblock = 0x02
+
+// fifoWatch is what awaitFIFOWriter waits and looks with: an inotify
+// instance (events, whose descriptor is fd) that watches a FIFO for opens,
+// and a pipe of the runtime's (tee) that a look copies a byte of the FIFO
+// into.
+type fifoWatch struct {
+	events *os.File
+	fd     int
+	tee    [2]int
+}
+
+// newFIFOWatch makes a fifoWatch, which watches nothing yet.
+func newFIFOWatch() (*fifoWatch, error) {
+	fd, err := syscall.InotifyInit1(syscall.IN_NONBLOCK | syscall.IN_CLOEXEC)
+	if err != nil {
+		return nil, os.NewSyscallError("inotify_init1", err)
+	}
+	fw := &fifoWatch{events: os.NewFile(uintptr(fd), "inotify"), fd: fd}
+	if err := syscall.Pipe2(fw.tee[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+		return nil, errors.Join(os.NewSyscallError("pipe2", err), fw.events.Close())
+	}
+	return fw, nil
+}
+
+// Close closes what the watch is made of.
+func (fw *fifoWatch) Close() error {
+	return errors.Join(fw.events.Close(), hostCloseFD(fw.tee[0]), hostCloseFD(fw.tee[1]))
+}
+
+// watch watches the FIFO f, a file of the host's, for opens.
+func (fw *fifoWatch) watch(f File) error {
+	var err error
+	if !hostDescriptor(f, func(fd uintptr) { _, err = syscall.InotifyAddWatch(fw.fd, hostFDPath(fd), syscall.IN_OPEN) }) {
+		return fmt.Errorf("%s has no descriptor of the host's", f.Name())
+	}
+	return os.NewSyscallError("inotify_add_watch", err)
+}
+
+// drain reads the events of the watch that are there.
+func (fw *fifoWatch) drain() error {
+	// Room for one event at least, as inotify(7) asks of a read.
+	buf := make([]byte, syscall.SizeofInotifyEvent+syscall.NAME_MAX+1)
+	for {
+		_, err := syscall.Read(fw.fd, buf)
+		switch {
+		case err == nil, errors.Is(err, syscall.EINTR):
+			continue
+		case errors.Is(err, syscall.EAGAIN):
+			return nil
+		}
+		return os.NewSyscallError("read", err)
+	}
+}
+
+// hasWriter reports whether f, the read end of a FIFO the runtime opened
+// without waiting, has had a writer since it was opened: one is there now,
+// or came and went. tee(2) of a byte that does not wait tells of one that
+// is there (gVisor's nonblockingPipeHasWriter): EAGAIN is a FIFO that is
+// empty and has a writer, a byte one that has input, which a writer put
+// there; nothing is taken out of the FIFO. Of a FIFO that is empty and has
+// no writer, poll(2) tells of one that came and went: POLLHUP is set when
+// no writer is there and one has opened the FIFO since the read end was
+// opened, or was there then (fs/pipe.c pipe_poll compares the count of
+// writers' opens with the one fifo_open kept for a reader that does not
+// wait), and input when one has come since the tee. The input tee found is
+// not asked about again: another reader may take it before poll(2), while
+// the writer that put it there stays and opens nothing more.
+func (fw *fifoWatch) hasWriter(f File) (bool, error) {
+	var n int64
+	var err error
+	if !hostDescriptor(f, func(fd uintptr) {
+		for {
+			if n, err = syscall.Tee(int(fd), fw.tee[1], 1, spliceFNonblock); !errors.Is(err, syscall.EINTR) {
+				return
+			}
+		}
+	}) {
+		return false, fmt.Errorf("%s has no descriptor of the host's", f.Name())
+	}
+	switch {
+	case errors.Is(err, syscall.EAGAIN), err == nil && n > 0:
+		return true, nil
+	case err != nil:
+		return false, os.NewSyscallError("tee", err)
+	}
+	set := []hostWaitFD{{stream: f, want: hostWantInput}}
+	if err := waitHostReady(set, time.Now(), -1); err != nil {
+		return false, err
+	}
+	return set[0].ready, nil
 }

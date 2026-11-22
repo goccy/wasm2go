@@ -200,8 +200,8 @@ func TestOpenOfAFIFOWhoseNameMoved(t *testing.T) {
 	var told []string
 	w.cfg.Errors = func(op string, err error) { told = append(told, op) }
 	postWhenBlocked(w, wasiSIGUSR1)
-	if _, errno := w.openFIFO(w.fs().OpenFile, "queue", asked, os.O_RDONLY, 0); errno != _wasiEINTR {
-		t.Fatalf("open for reading errno=%d, want EINTR", errno)
+	if _, errno := w.openFIFO(w.fs(), "queue", asked, os.O_WRONLY, 0); errno != _wasiEINTR {
+		t.Fatalf("open for writing errno=%d, want EINTR", errno)
 	}
 	if len(told) != 1 || told[0] != "path_open" {
 		t.Fatalf("Errors was told %q, want the open of another file", told)
