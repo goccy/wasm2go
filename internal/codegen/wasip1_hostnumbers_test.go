@@ -177,6 +177,8 @@ func TestWasi_ProcRaise(t *testing.T) {
 	}
 	for _, sig := range terminating {
 		for _, r := range raises {
+			// An instance ends once: each raise ends one of its own.
+			w, m = newTestStubs(t, t.TempDir())
 			got := signalErrorOf(func() { r.raise(sig) })
 			if want := guestNumbers[sig]; got == nil || got.Signal != want {
 				t.Errorf("%s(%d) ended with %v, want a WasiSignalError for %d", r.name, sig, got, want)

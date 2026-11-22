@@ -376,6 +376,9 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// module has a memory so the API is uniformly available.
 	if len(m.Memories) > 0 {
 		t.helpers["accessMemory"] = true
+		// stopAgents ends the waits of the agents when the WASI host's
+		// instance ends.
+		t.helpers["stopAgents"] = true
 		// The Module struct's memMu field needs "sync" — register it
 		// HERE, not only in emitModuleStruct: the multi-package path
 		// snapshots base's import set after emitHelpers but BEFORE

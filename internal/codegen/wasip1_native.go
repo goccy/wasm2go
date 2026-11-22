@@ -93,6 +93,12 @@ type Module struct {
 // takes. The generated output has the real one; this one is not emitted.
 func accessMemory(m *Module, f func(mem []byte)) { f(m.memory) }
 
+// stopAgents is the in-package stand-in for the runtime helper of the same
+// name, which ends the waits of the module's agents on its memory with end:
+// this Module has no agents. The generated output has the real one; this one
+// is not emitted.
+func stopAgents(m *Module, end any) {}
+
 // runtimeMapping, runtimeMappingOf and whileRuntimeMapped are the
 // in-package stand-ins for the shared-image runtime's of the same names: a
 // mapping the runtime made (SharedImage.Memory) and not released, the one
@@ -126,6 +132,14 @@ type WasiSignalError struct{ Signal int32 }
 func (e *WasiSignalError) Error() string {
 	return "wasi: terminated by signal " + strconv.Itoa(int(e.Signal))
 }
+
+// endsInstance marks WasiExitError and WasiSignalError as the ends of the
+// whole instance: a thread of the guest that unwinds with one ends quietly
+// (threadLaunch), for the instance's other threads end with it
+// (WasiStubs.stop).
+func (e *WasiExitError) endsInstance() {}
+
+func (e *WasiSignalError) endsInstance() {}
 
 // FS is the read/write filesystem backend the WASI host opens files through.
 // It abstracts the default os-backed filesystem so an embedder can supply an
@@ -3250,13 +3264,6 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		return -_wasiEFAULT
 	}
 
-	w.sig.mu.Lock()
-	killed := w.sig.killPending()
-	w.sig.mu.Unlock()
-	if killed {
-		// A process that has been killed starts nothing more.
-		return -_wasiEINTR
-	}
 	w.mu.Lock()
 	hook := w.cfg.Exec
 	streams := [3]commandStream{
@@ -3291,6 +3298,9 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	var cmd *hostCommand
 	var startErr error
 	start := func() { cmd, startErr = w.startCommand(path, argv, env, dir, &streams, share) }
+	// A process that has been killed, while the Exec hook ran too, starts
+	// nothing more.
+	w.endIfStopped()
 	// The command inherits the umask of the thread that starts it: this
 	// one where the instance's mask is the host process's, the instance's
 	// creation thread otherwise.
@@ -8276,10 +8286,11 @@ func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes ui
 }
 
 func (w *WasiStubs) Proc_exit(m *Module, code int32) {
-	w.detachSignals()
 	// Panic instead of exiting the host process: the caller gets the
-	// *WasiExitError as WasiExitError's doc says.
-	panic(&WasiExitError{Code: code})
+	// *WasiExitError as WasiExitError's doc says. The other threads of the
+	// guest end with it (stop), and the instance is of no further use: each
+	// call that looks unwinds with the same end.
+	w.stop(m, &WasiExitError{Code: code})
 }
 
 // Proc_exit64 is Proc_exit for a memory64 guest.
@@ -8312,6 +8323,10 @@ func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
 // (postForGuestLocked), and a guest that has registered no flag word has the
 // signal's default action.
 func (w *WasiStubs) raiseOwn(sig int32) {
+	if sig == wasiSIGKILL {
+		// It ends the guest at once, every thread of it.
+		w.terminate(sig)
+	}
 	w.sig.mu.Lock()
 	registered := w.sig.flagModule != nil
 	if registered {
@@ -8439,9 +8454,18 @@ func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, 
 	defer cancel()
 	var conn net.Conn
 	var err error
+	ended := false
+	defer func() {
+		if !ended && conn != nil {
+			// The guest's thread is unwound (the instance ends): nobody
+			// takes the connection.
+			w.reportError(call, conn.Close())
+		}
+	}()
 	interrupted, _, refused := w.blockingAttempt(cancel, nil, func(<-chan struct{}) {
 		conn, err = (&net.Dialer{}).DialContext(ctx, network, address)
 	})
+	ended = true
 	switch {
 	case refused:
 		return nil, _wasiEINTR
@@ -14276,6 +14300,22 @@ type wasiSignals struct {
 	// detached records that delivery has ended (detachSignals): what is
 	// posted from then on is dropped, for a forked instance too.
 	detached bool
+	// stop is the end of the instance once it has been asked for
+	// (requestStopLocked): every thread of the guest unwinds with it
+	// (endIfStopped). It is set with mu held and read without.
+	stop atomic.Pointer[wasiStop]
+}
+
+// wasiStop is an end of the instance that its threads unwind with.
+type wasiStop struct {
+	end wasiEnd
+}
+
+// wasiEnd is the panic value of an end of the whole instance: Proc_exit's
+// *WasiExitError or the *WasiSignalError of an end by a signal.
+type wasiEnd interface {
+	error
+	endsInstance()
 }
 
 // wasiBlocking is a blocking call of the guest's in progress (beginBlocking).
@@ -14313,6 +14353,16 @@ type wasiSignalsDue struct {
 	outside *wasiOutside
 	// wakes are the blocking calls taken out to be woken.
 	wakes []*wasiBlocking
+	// stop records that the end of the instance was asked for
+	// (requestStopLocked): the flag word is raised, for a guest that
+	// computes to come to its safe point and end there; stopOutside, the
+	// registration in place then, whose call is counted already, is
+	// interrupted, for code outside the guest to return to it; and the
+	// waits of the guest's agents on its memory (stopAgents) of stopModule,
+	// a module of the guest when one is known, end.
+	stop        bool
+	stopOutside *wasiOutside
+	stopModule  *Module
 }
 
 // discards returns the signals that have no effect on the guest: the ones it
@@ -14321,24 +14371,13 @@ func (s *wasiSignals) discards() uint64 {
 	return s.ignored | wasiDefaultIgnoredSignals&^s.handled
 }
 
-// killPending reports whether SIGKILL has been posted and the guest has
-// not taken it yet: the guest is on its way to its end.
-func (s *wasiSignals) killPending() bool {
-	return s.pending&wasiSignalBit(wasiSIGKILL) != 0
-}
-
 // unregisteredEnd returns the signal that ends a guest that has not
 // registered for signals, or 0: such a guest takes no signal, so a pending
-// signal whose default action ends a process has that action, by the host.
-// SIGKILL ends any such guest; another signal only one that is not a
-// forked copy, which may yet register and handle it.
+// signal whose default action ends a process has that action, by the host,
+// for a guest that is not a forked copy, which may yet register and handle
+// it.
 func (s *wasiSignals) unregisteredEnd(forked bool) int32 {
-	switch {
-	case s.flagModule != nil:
-		return 0
-	case s.killPending():
-		return wasiSIGKILL
-	case forked:
+	if s.flagModule != nil || forked {
 		return 0
 	}
 	if ending := s.pending &^ wasiDefaultIgnoredSignals; ending != 0 {
@@ -14387,7 +14426,15 @@ const wasiDefaultIgnoredSignals = uint64(1)<<(wasiSIGCHLD-1) |
 // sig is the guest's number for it (Linux numbering). It may be called from
 // any goroutine, at any time.
 //
-// The signal is dropped when the guest ignores it (explicitly or because
+// SIGKILL is never the guest's: the host carries it out, whatever the guest
+// registered. Each thread of the guest ends at its next blocking call, at
+// the next of its calls that look (endUnregistered) or at its safe point
+// (its flag word is raised): a blocking call in progress ends at once, code
+// outside the guest is interrupted (SetOutsideInterrupt), and a wait of a
+// thread on the guest's memory ends. The instance is of no further use: each
+// call that looks unwinds with the same end.
+//
+// Another signal is dropped when the guest ignores it (explicitly or because
 // that is the signal's default action). Otherwise it is recorded for the
 // guest to take. Unless the guest has the signal blocked, its flag word is
 // raised, and the blocking call it is waiting in — or the next one it makes
@@ -14399,8 +14446,7 @@ const wasiDefaultIgnoredSignals = uint64(1)<<(wasiSIGCHLD-1) |
 // dropped. The host state of a forked instance (Fork) is the exception:
 // the guest it is for exists from the moment of the fork and registers as
 // soon as it runs, so a signal posted in between — a parent that kills its
-// child right after forking it — is kept for it, and only SIGKILL ends it
-// before it registers.
+// child right after forking it — is kept for it.
 //
 // Once delivery to the instance has ended (CloseAll, proc_exit,
 // proc_terminate), what is posted is dropped.
@@ -14424,6 +14470,10 @@ func (w *WasiStubs) postSignalLocked(sig int32) bool {
 	}
 	bit := wasiSignalBit(sig)
 	if bit == 0 {
+		return true
+	}
+	if sig == wasiSIGKILL {
+		w.requestStopLocked(nil, &WasiSignalError{Signal: wasiSIGKILL})
 		return true
 	}
 	if s.flagModule == nil {
@@ -14460,15 +14510,20 @@ func (w *WasiStubs) unlockSignals() {
 	due := s.due
 	s.due = wasiSignalsDue{}
 	s.mu.Unlock()
-	var outside *wasiOutside
-	if due.raise != 0 {
+	outside := due.stopOutside
+	if due.raise != 0 || due.stop {
 		w.raiseSignalFlag()
+	}
+	if due.stop && due.stopModule != nil {
+		stopAgents(due.stopModule, s.stop.Load().end)
+	}
+	if due.raise != 0 {
 		s.mu.Lock()
 		if !s.detached && s.pending&^s.blocked&due.raise != 0 {
 			s.interrupt = true
 			if due.wake && len(s.wakes) > 0 {
 				due.wakes = append(due.wakes, s.takeWakes()...)
-			} else if due.wake && due.outside != nil && due.outside == s.outside {
+			} else if outside == nil && due.wake && due.outside != nil && due.outside == s.outside {
 				// The guest is in code outside it: the signal interrupts
 				// that code where it stands — a system call it is waiting
 				// in ends with EINTR — and is noticed when the code has
@@ -14521,8 +14576,11 @@ func (s *wasiSignals) takeWakes() []*wasiBlocking {
 // nothing when it is in none). PostSignal calls it, from another goroutine
 // and without a lock of the instance held, for each signal it posts that the
 // guest neither blocks nor discards while no blocking call of the guest's own
-// is waiting. It may call PostSignal, but not SetOutsideInterrupt, which
-// waits for it. nil registers nothing.
+// is waiting. It is also called, once, when the end of the instance is asked
+// for — SIGKILL, or proc_exit or an end by a signal on any thread of the
+// guest, so from one of the guest's own goroutines too — for the code to
+// return to the guest, which ends. It may call PostSignal, but not
+// SetOutsideInterrupt, which waits for it. nil registers nothing.
 //
 // It returns what was registered before, for the caller to put back when
 // the code returns: such code can call back into the guest, which can run
@@ -14580,10 +14638,10 @@ func (w *WasiStubs) raiseSignalFlag() {
 // goroutine and without a lock of the instance held, to end the wait. Every
 // beginBlocking that returned true is followed by endBlocking with its b.
 //
-// SIGKILL is noticed by ending: until the guest has taken it, no call of
-// its blocks, however many it makes on the way to the point where it takes
-// its signals. A guest that has not registered for signals would never take
-// a signal: the call ends the guest instead (unregisteredEnd).
+// A call of an instance that is to stop (requestStopLocked) does not block:
+// it ends the guest's thread (endIfStopped). A guest that has not registered
+// for signals would never take a signal: the call ends the guest instead
+// (unregisteredEnd).
 func (w *WasiStubs) beginBlocking(wake func()) (b *wasiBlocking, ok bool) {
 	s := &w.sig
 	s.mu.Lock()
@@ -14592,8 +14650,12 @@ func (w *WasiStubs) beginBlocking(wake func()) (b *wasiBlocking, ok bool) {
 		w.unlockSignals()
 		w.terminate(sig)
 	}
+	if s.stop.Load() != nil {
+		w.unlockSignals()
+		w.endIfStopped()
+	}
 	defer w.unlockSignals()
-	if s.interrupt || s.killPending() {
+	if s.interrupt {
 		s.interrupt = false
 		return nil, false
 	}
@@ -14607,16 +14669,16 @@ func (w *WasiStubs) beginBlocking(wake func()) (b *wasiBlocking, ok bool) {
 
 // endBlocking ends what beginBlocking started as b and reports whether a
 // signal was posted in between that this call is to report: a signal ends
-// one of the blocking calls in progress with EINTR, and SIGKILL all of them.
-// The others resume their wait. It returns once a wake of b that was called
-// has returned.
+// one of the blocking calls in progress with EINTR. The others resume their
+// wait. It returns once a wake of b that was called has returned, and ends
+// the guest's thread instead when the instance is to stop.
 func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 	s := &w.sig
 	s.mu.Lock()
 	delete(s.wakes, b)
 	w.postDueTimerLocked()
 	sig := s.unregisteredEnd(w.forked)
-	interrupted = s.interrupt || s.killPending()
+	interrupted = s.interrupt
 	s.interrupt = false
 	woken := b.woken
 	w.unlockSignals()
@@ -14626,6 +14688,7 @@ func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 	if sig != 0 {
 		w.terminate(sig)
 	}
+	w.endIfStopped()
 	return interrupted
 }
 
@@ -14708,6 +14771,7 @@ func (w *WasiStubs) procSignalRegister(m *Module, flagPtr uint64) int32 {
 // dispositions are then reported to WASIConfig.Signals, with w as the target.
 // Returns 0.
 func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocked int64) int32 {
+	w.endIfStopped()
 	w.dispositionsMu.Lock()
 	defer w.dispositionsMu.Unlock()
 	s := &w.sig
@@ -14758,6 +14822,8 @@ func (w *WasiStubs) Proc_signal_take64(m *Module, maskPtr int64) int32 {
 
 // procSignalTake is the body of Proc_signal_take and Proc_signal_take64.
 func (w *WasiStubs) procSignalTake(m *Module, maskPtr uint64) int32 {
+	// The safe point of a guest whose instance is to stop is where it ends.
+	w.endIfStopped()
 	out := w.memBytes(m, maskPtr, 8)
 	if out == nil {
 		return -_wasiEFAULT
@@ -14915,25 +14981,71 @@ func (w *WasiStubs) stopTimerLocked() {
 // guest ends by signal sig, the default action of a signal it neither
 // handles nor ignores. It does not return; like Proc_exit it unwinds the
 // guest with a panic, whose value is a *WasiSignalError. Like Proc_exit it
-// ends signal delivery to the instance first.
+// ends signal delivery to the instance first, and the guest's other threads
+// with the same panic (stop).
 func (w *WasiStubs) Proc_terminate(m *Module, sig int32) {
-	w.terminate(sig)
+	w.stop(m, &WasiSignalError{Signal: sig})
 }
 
-// terminate ends the guest by signal sig: signal delivery to the instance
-// ends, and the guest is unwound with a panic whose value is a
-// *WasiSignalError. It does not return. Caller holds no lock of the
-// instance.
+// terminate ends the guest by signal sig (stop) with a *WasiSignalError. It
+// does not return. Caller holds no lock of the instance.
 func (w *WasiStubs) terminate(sig int32) {
-	w.detachSignals()
-	panic(&WasiSignalError{Signal: sig})
+	w.stop(nil, &WasiSignalError{Signal: sig})
 }
 
-// endUnregistered ends the guest by a pending signal it would never take,
-// not having registered for signals (unregisteredEnd). The host calls
-// fd_read, fd_write, poll_oneoff and the proc_ ones call it first; a
-// blocking call looks again when it begins and ends.
+// stop ends the instance with end, the panic value of an end by a signal or
+// of Proc_exit, unless an end was asked for before, which is then the one:
+// signal delivery to the instance ends, the calling thread of the guest is
+// unwound with the end at once, and the others at their next blocking call
+// or call that looks (endIfStopped). m is the calling thread's module, nil
+// when the caller has none. It does not return. Caller holds no lock of the
+// instance.
+func (w *WasiStubs) stop(m *Module, end wasiEnd) {
+	w.sig.mu.Lock()
+	w.requestStopLocked(m, end)
+	w.unlockSignals()
+	w.endIfStopped()
+}
+
+// requestStopLocked asks for the end of the instance with end, unless one
+// was asked for before: the blocking calls in progress end, code outside the
+// guest is interrupted, the flag word is raised, the waits of the guest's
+// agents end, and each thread of the guest unwinds with the end
+// (endIfStopped). m is a module of the guest, nil when the caller has none:
+// the registered one stands in for it then. Caller holds w.sig.mu.
+func (w *WasiStubs) requestStopLocked(m *Module, end wasiEnd) {
+	s := &w.sig
+	if s.stop.Load() == nil {
+		s.stop.Store(&wasiStop{end: end})
+	}
+	s.due.wakes = append(s.due.wakes, s.takeWakes()...)
+	s.due.stop = true
+	s.due.stopModule = cmp.Or(m, s.flagModule)
+	if s.outside != nil && s.due.stopOutside == nil {
+		s.outside.calls++
+		s.due.stopOutside = s.outside
+	}
+}
+
+// endIfStopped unwinds the calling thread of the guest when the end of the
+// instance has been asked for (requestStopLocked): signal delivery ends, and
+// the thread panics with the end. Caller holds no lock of the instance.
+func (w *WasiStubs) endIfStopped() {
+	st := w.sig.stop.Load()
+	if st == nil {
+		return
+	}
+	w.detachSignals()
+	panic(st.end)
+}
+
+// endUnregistered ends the guest's thread when the instance is to stop
+// (endIfStopped), and the guest by a pending signal it would never take, not
+// having registered for signals (unregisteredEnd). The host calls fd_read,
+// fd_write, poll_oneoff and the proc_ ones call it first; a blocking call
+// looks again when it begins and ends.
 func (w *WasiStubs) endUnregistered() {
+	w.endIfStopped()
 	w.sig.mu.Lock()
 	sig := w.sig.unregisteredEnd(w.forked)
 	w.sig.mu.Unlock()
@@ -15181,6 +15293,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		},
 		dropFuncs: map[string]bool{
 			"accessMemory":              true,
+			"stopAgents":                true, // the in-package stand-in of the helper
 			"runtimeMappingOf":          true,
 			"whileRuntimeMapped":        true,
 			"codegenStripForEmit":       true,
@@ -15220,7 +15333,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			fn := *dd
 			if multi {
 				// base/ exports the Module fields and the runtime helpers.
-				fn.Body = rewriteHelperBody(fn.Body, map[string]bool{"accessMemory": true})
+				fn.Body = rewriteHelperBody(fn.Body, map[string]bool{"accessMemory": true, "stopAgents": true})
 			}
 			decls = append(decls, &fn)
 		}

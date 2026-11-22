@@ -2043,6 +2043,10 @@ func atomicWait(m *Module, ea uint64, timeout int64, stillEqual func() bool) int
 		return 1
 	}
 	m.threads.parkMu.Lock()
+	if end := m.threads.end; end != nil {
+		m.threads.parkMu.Unlock()
+		panic(end)
+	}
 	if !stillEqual() {
 		m.threads.parkMu.Unlock()
 		return 1
@@ -2053,6 +2057,9 @@ func atomicWait(m *Module, ea uint64, timeout int64, stillEqual func() bool) int
 	}
 	m.threads.parked[ea] = append(m.threads.parked[ea], ch)
 	m.threads.parkMu.Unlock()
+	if hook := m.threads.parkedHook; hook != nil {
+		hook <- ea
+	}
 
 	unpark := func() {
 		m.threads.parkMu.Lock()
@@ -2077,6 +2084,7 @@ func atomicWait(m *Module, ea uint64, timeout int64, stillEqual func() bool) int
 			wasm_trap_atomic_wait_forever()
 		}
 		<-ch
+		m.threads.endIfStopped()
 		return 0
 	}
 	// +1ms: a guest measures its own wait with millisecond-granularity clocks
@@ -2087,6 +2095,7 @@ func atomicWait(m *Module, ea uint64, timeout int64, stillEqual func() bool) int
 	defer timer.Stop()
 	select {
 	case <-ch:
+		m.threads.endIfStopped()
 		return 0
 	case <-timer.C:
 		unpark()
@@ -2455,7 +2464,47 @@ type threadPool struct {
 
 	parkMu sync.Mutex
 	parked map[uint64][]chan struct{}
+	// end is what the instance ended with once it has (stop): the waits on
+	// its memory end with it. Guarded by parkMu.
+	end any
+	// parkedHook, when not nil, is told the address of each wait once it is
+	// parked: a test's notice that a waiter is there to be released.
+	parkedHook chan<- uint64
 }
+
+// stop ends the waits of the agents on the memory once the instance has
+// ended with end, the panic value its threads unwind with: every parked
+// waiter is released, and a wait that is released or begins from then on
+// panics with end. The first end is the one.
+func (p *threadPool) stop(end any) {
+	p.parkMu.Lock()
+	defer p.parkMu.Unlock()
+	if p.end != nil {
+		return
+	}
+	p.end = end
+	for _, waiters := range p.parked {
+		for _, ch := range waiters {
+			close(ch)
+		}
+	}
+	p.parked = nil
+}
+
+// endIfStopped panics with the end of the instance once it has ended (stop).
+func (p *threadPool) endIfStopped() {
+	p.parkMu.Lock()
+	end := p.end
+	p.parkMu.Unlock()
+	if end != nil {
+		panic(end)
+	}
+}
+
+// stopAgents ends the waits of m's agents on its memory with end, the end of
+// the instance (threadPool.stop). The WASI host calls it when the instance
+// ends.
+func stopAgents(m *Module, end any) { m.threads.stop(end) }
 
 // wake releases up to count waiters on ea and reports how many it woke.
 func (p *threadPool) wake(ea uint64, count int32) int32 {
@@ -2501,6 +2550,11 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 		// process down instead of silently unwinding the goroutine.
 		defer func() {
 			if r := recover(); r != nil {
+				if _, ended := r.(interface{ endsInstance() }); ended {
+					// The instance ended (proc_exit, an end by a
+					// signal), and its other threads end with it.
+					return
+				}
 				println("wasm2go: wasi thread", tid, "trapped:")
 				switch v := r.(type) {
 				case error:
