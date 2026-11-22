@@ -285,8 +285,8 @@ func TestFIFOOpenOfAnEndingGuest(t *testing.T) {
 			t.Fatalf("open for writing after the ended open for reading: %v, want ENXIO", err)
 		}
 		// The call's wake pipe went back to the pool; nothing else is open.
-		if n := openFDs(t); n != before+2 {
-			t.Fatalf("%d descriptors are open, %d before the open", n, before)
+		if n := newFDs(t, before); n != 2 {
+			t.Fatalf("%d descriptors are open that were not before the open, want the wake pipe's 2", n)
 		}
 	}
 }
