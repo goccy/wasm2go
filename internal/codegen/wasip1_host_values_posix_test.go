@@ -545,7 +545,7 @@ func TestHostPriorityOfEveryThread(t *testing.T) {
 	if nice >= 19 {
 		t.Skipf("the nice value is %d already", nice)
 	}
-	if err := p.SetPriority(0, 0, nice+1); err != nil {
+	if err := HostProcessChanges().SetPriority(0, 0, nice+1); err != nil {
 		t.Fatal(err)
 	}
 	tasks, err := os.ReadDir("/proc/self/task")

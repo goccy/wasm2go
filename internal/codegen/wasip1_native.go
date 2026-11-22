@@ -1984,6 +1984,14 @@ type WASIConfig struct {
 	// and group id 0, no CPU time and umask 022, none of them read from the
 	// host. HostProcess and HostProcessUmask give the host process's.
 	Process Process
+	// ProcessChanges makes the changes the guest of the fork family's root
+	// instance makes to its process — its ids, groups, priority and umask —
+	// where they are kept besides the instance (ProcessChanges). A forked
+	// instance's changes are its own and reach no ProcessChanges. nil
+	// changes nothing: the setuid family, setgroups and setpriority fail
+	// with ENOSYS, and the umask is the instance's alone.
+	// HostProcessChanges gives the host process's calls.
+	ProcessChanges ProcessChanges
 	// LocalZone is the time zone of a guest that names none (Clock_zone
 	// without TZ); nil is UTC.
 	LocalZone *time.Location
@@ -2090,8 +2098,24 @@ type WasiStubs struct {
 	// umask is the guest's file mode creation mask once it has set one
 	// (Proc_umask); nil means the Umask of the Process applies. It is
 	// per instance because every instance is a process of its own to the
-	// guest. Use it through createMode. Guarded by mu.
+	// guest. Use it through guestUmask. Guarded by mu.
 	umask *os.FileMode
+	// umaskCalls makes the guest's umask() calls one at a time
+	// (Proc_umask), so that the mask its creation thread and its
+	// ProcessChanges were given last is the instance's.
+	umaskCalls sync.Mutex
+	// creations is the thread the instance makes the files of the host's
+	// filesystem on, with its umask (creationThread), once it has needed
+	// one; creationsFailed records that none could be made, and
+	// creationsClosed that CloseAll ended it (the runtime then takes the
+	// mask out itself). Guarded by mu; made and set under umaskCalls.
+	creations       *creationThread
+	creationsFailed bool
+	creationsClosed bool
+	// changed holds the ids, groups and nice value the guest of a forked
+	// instance changed its own to (procChanges); nil before the first
+	// change. Guarded by mu.
+	changed *processChanged
 	// zoneTZ is the last TZ value the guest named and zone its zone,
 	// resolved (nil before the first); see zoneMoment. Guarded by mu.
 	zoneTZ string
@@ -2352,6 +2376,7 @@ func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
 // is done.
 func (w *WasiStubs) Fork() *WasiStubs {
 	ids := w.guestProcess().IDs()
+	start := w.forkedChanges(ids)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.forked {
@@ -2378,6 +2403,12 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		mask := *w.umask
 		child.umask = &mask
 	}
+	if start != nil {
+		if w.changed != nil {
+			start.overlay(*w.changed)
+		}
+		child.changed = start
+	}
 	if w.resolvedHosts != nil {
 		child.resolvedHosts = make(map[string]string, len(w.resolvedHosts))
 		for ip, host := range w.resolvedHosts {
@@ -2400,6 +2431,13 @@ func (w *WasiStubs) Fork() *WasiStubs {
 // can be released afterwards.
 // Calling it again is a no-op. The close errors are joined.
 func (w *WasiStubs) CloseAll() error {
+	w.mu.Lock()
+	creations := w.creations
+	w.creations, w.creationsClosed = nil, true
+	w.mu.Unlock()
+	if creations != nil {
+		creations.close()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.detachSignalsLocked()
@@ -2809,8 +2847,36 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	// fd straight to the child; capture works by the guest reading the pipe's
 	// other end via Fd_read.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = cin, cout, cerr
-	if err := cmd.Start(); err != nil {
-		return -mapExecError(err)
+	var startErr error
+	start := func() { startErr = cmd.Start() }
+	// The command inherits the umask of the thread that starts it: this
+	// one where the instance's mask is the host process's, the instance's
+	// creation thread otherwise.
+	switch {
+	case !hostThreadUmask:
+		start()
+	case withHostUmask(w.guestUmask(), start):
+	default:
+		t := w.creationThread()
+		if t != nil && !filepath.IsAbs(cmd.Dir) {
+			// The creation thread's working directory is the one of its
+			// unshare: the command is given the host process's, read here,
+			// off that thread, with a relative directory taken from it.
+			// When it cannot be read, the command is started here, in it,
+			// with the host process's umask.
+			if wd, err := os.Getwd(); err != nil {
+				w.reportError("proc_spawn", err)
+				t = nil
+			} else {
+				cmd.Dir = filepath.Join(wd, cmd.Dir)
+			}
+		}
+		if t == nil || t.run(start) != nil {
+			start()
+		}
+	}
+	if startErr != nil {
+		return -mapExecError(startErr)
 	}
 
 	proc := &wasiProc{cmd: cmd, done: make(chan struct{})}
@@ -5006,31 +5072,48 @@ func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
 }
 
 // Proc_umask is a NON-STANDARD host import (module wasip1_posix_extension,
-// name "proc_umask") backing umask(): it sets the
-// instance's file mode creation mask and returns the previous one. The
-// mask is taken out of the mode of every file and directory the instance
-// creates from then on (createMode), and a forked instance starts with its
-// parent's (see Fork). Until the guest sets one, the mask is the Umask of
-// the Process (WASIConfig.Process).
+// name "proc_umask") backing umask(): it sets the instance's file mode
+// creation mask and returns the previous one. Until the guest sets one, the
+// mask is the Umask of the Process (WASIConfig.Process), and a forked
+// instance starts with its parent's (see Fork).
 //
-// What a file then gets is its filesystem's to say. The host's filesystem
-// (the default) takes the host process's umask out of the mode as well, as
-// it does for every file the process creates: there the instance's mask
-// takes bits away and gives none back. MemFS creates with the mode it is
-// asked for.
+// The mask is the instance's own, taken out of the mode of every file,
+// directory and FIFO the instance creates (create). On Linux the instance
+// creates those of the host's filesystem on a thread of its own whose umask
+// is the mask (creationThread): the kernel takes it out, as for a process
+// of its own — a default ACL of the directory decides instead, as it does
+// (posix_acl_create) — and a command the instance starts (Proc_spawn) is
+// started there and inherits it. Elsewhere, and for any other filesystem,
+// the runtime takes the mask out of the mode it asks the filesystem for; on
+// another system than Linux the host's filesystem takes the host process's
+// umask out as well, and a command inherits the host process's umask.
 //
-// A command started by Proc_spawn does not get the instance's mask: it
-// starts with the host process's umask.
+// The mask the guest of the family's root instance sets is given to the
+// ProcessChanges as well (WASIConfig.ProcessChanges): HostProcessChanges
+// makes it the host process's umask (umask(2)), which every thread but the
+// instances' creation threads has. An error of its SetUmask other than
+// errors.ErrUnsupported is told WASIConfig.Errors (op "proc_umask").
 func (w *WasiStubs) Proc_umask(m *Module, mask int32) int32 {
 	w.endUnregistered()
 	next := os.FileMode(uint32(mask) & 0o777)
-	prev := w.guestProcess().Umask().Perm()
+	w.umaskCalls.Lock()
+	defer w.umaskCalls.Unlock()
+	prev := w.guestUmask()
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.umask != nil {
-		prev = *w.umask
-	}
 	w.umask = &next
+	creations := w.creations
+	w.mu.Unlock()
+	if creations != nil {
+		// A thread being closed (CloseAll) needs no mask any more.
+		if err := creations.run(func() { hostSetThreadUmask(next) }); err != nil && !errors.Is(err, fs.ErrClosed) {
+			w.reportError("proc_umask", err)
+		}
+	}
+	if changes := w.cfg.ProcessChanges; changes != nil && !w.forked {
+		if _, err := changes.SetUmask(next); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+			w.reportError("proc_umask", err)
+		}
+	}
 	return int32(prev)
 }
 
@@ -5040,16 +5123,274 @@ func (w *WasiStubs) Proc_umask64(m *Module, mask int32) int32 {
 }
 
 // createMode returns the mode the instance's filesystem is asked for when
-// the guest creates a file or directory with the requested mode: the
-// instance's umask taken out of it.
+// the guest creates a file or directory with the requested mode, where the
+// runtime takes the mask out (create): the instance's umask taken out of it.
 func (w *WasiStubs) createMode(requested os.FileMode) os.FileMode {
+	return requested &^ w.guestUmask()
+}
+
+// guestUmask returns the file mode creation mask of the instance.
+func (w *WasiStubs) guestUmask() os.FileMode {
 	w.mu.Lock()
 	umask := w.umask
 	w.mu.Unlock()
 	if umask != nil {
-		return requested &^ *umask
+		return *umask
 	}
-	return requested &^ w.guestProcess().Umask().Perm()
+	return w.guestProcess().Umask().Perm()
+}
+
+// create runs make, which creates a file, directory or FIFO in fsys with the
+// mode it is given, so that the instance's umask is taken out of the
+// requested mode: for a filesystem of the host's on Linux, where the
+// instance's mask is the host process's umask, on the calling goroutine,
+// and otherwise on the instance's creation thread, given the requested
+// mode, the kernel taking the mask out (creationThread); for another
+// filesystem, elsewhere and without a creation thread, given the mode less
+// the mask (createMode).
+func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode) error) error {
+	switch fsys.(type) {
+	case osFS, rootFS:
+	default:
+		return make(w.createMode(requested))
+	}
+	if !hostThreadUmask {
+		return make(w.createMode(requested))
+	}
+	// Where the instance's mask is the host process's, the kernel takes it
+	// out on any thread, or lets a default ACL decide: the creation is
+	// made here, given the requested mode.
+	var err error
+	if withHostUmask(w.guestUmask(), func() { err = make(requested) }) {
+		return err
+	}
+	if t := w.creationThread(); t != nil {
+		var err error
+		if rerr := t.run(func() { err = make(requested) }); rerr == nil {
+			return err
+		}
+		// The instance is being closed (CloseAll): the mask is taken out
+		// here.
+	}
+	return make(w.createMode(requested))
+}
+
+// creationThread returns the instance's creation thread, made with the
+// instance's umask under umaskCalls, as Proc_umask sets it: nil on a system
+// without one (hostThreadUmask), where the host process may make none
+// (creationThreadsRefused, told WASIConfig.Errors once a process, op
+// "creation_thread"), after CloseAll, and when the instance's could not be
+// made (told once an instance).
+func (w *WasiStubs) creationThread() *creationThread {
+	if !hostThreadUmask {
+		return nil
+	}
+	if err := creationThreadsRefused(); err != nil {
+		reportCreationThreadsRefused.Do(func() { w.reportError("creation_thread", err) })
+		return nil
+	}
+	w.umaskCalls.Lock()
+	defer w.umaskCalls.Unlock()
+	w.mu.Lock()
+	t, unmade := w.creations, w.creationsFailed || w.creationsClosed
+	w.mu.Unlock()
+	if t != nil || unmade {
+		return t
+	}
+	t, err := newCreationThread(w.guestUmask())
+	if err != nil {
+		w.mu.Lock()
+		w.creationsFailed = true
+		w.mu.Unlock()
+		w.reportError("creation_thread", err)
+		return nil
+	}
+	w.mu.Lock()
+	closed := w.creationsClosed
+	if !closed {
+		w.creations = t
+	}
+	w.mu.Unlock()
+	if closed {
+		t.close()
+		return nil
+	}
+	// An instance dropped without CloseAll lets its thread go when it is
+	// collected, as an os.File closes its descriptor.
+	runtime.AddCleanup(w, func(t *creationThread) { t.close() }, t)
+	return t
+}
+
+// hostUmaskState is the host process's umask as far as the runtime knows
+// it: read once (readHostUmask), then what the runtime itself set it to
+// (hostSetUmask). An embedder that changes the umask behind the runtime's
+// back is seen at the next hostSetUmask. Creations and command starts made
+// with it (withHostUmask) hold mu for reading; hostSetUmask holds it for
+// writing.
+var hostUmaskState struct {
+	mu    sync.RWMutex
+	read  sync.Once
+	known bool
+	mask  os.FileMode
+}
+
+// withHostUmask runs f and reports true when mask is the host process's
+// umask, which the kernel then takes out on any thread; it runs nothing
+// and reports false when it is not, or is not known.
+func withHostUmask(mask os.FileMode, f func()) bool {
+	s := &hostUmaskState
+	s.read.Do(func() {
+		umask, err := readHostUmask()
+		s.mu.Lock()
+		s.known, s.mask = err == nil, umask
+		s.mu.Unlock()
+	})
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.known || s.mask != mask.Perm() {
+		return false
+	}
+	f()
+	return true
+}
+
+// creationThreadsRefused is why the host process may make no creation
+// thread (unshare(2) refused, as Docker's default seccomp profile refuses
+// it), nil when it may: asked once a process, by making one.
+var creationThreadsRefused = sync.OnceValue(func() error {
+	t, err := newCreationThread(0)
+	if err != nil {
+		return err
+	}
+	t.close()
+	return nil
+})
+
+// reportCreationThreadsRefused tells WASIConfig.Errors of the first
+// instance that needs a creation thread why there is none.
+var reportCreationThreadsRefused sync.Once
+
+// creationThread is an OS thread whose file system attributes — umask,
+// working directory and root — are its own (unshare(CLONE_FS), Linux):
+// its umask is an instance's, and the instance makes the files of the
+// host's filesystem there (create), so that the kernel takes the mask out
+// exactly, or lets a default ACL decide, as for a process of its own. The
+// working directory stays what it was at the unshare; the host's
+// filesystems name what they make absolutely (osFS) or relative to a
+// directory descriptor (os.Root), which it does not affect, and a command
+// started there is given the host process's working directory
+// (Proc_spawn).
+//
+// The goroutine that holds the thread locks it and never unlocks it:
+// when the goroutine returns (close), the thread ends with it, as
+// runtime.LockOSThread does to a thread whose goroutine exits locked. The
+// main thread, which the runtime keeps when its goroutine so exits, is
+// never one (newCreationThread). The runtime starts no thread from a
+// locked one (runtime.newm hands the start to its template thread), so no
+// other thread gets its attributes; a process the thread starts (fork from
+// it) does, as the kernel copies the starting thread's (copy_fs). The
+// thread lasts until CloseAll, or, for an instance dropped without it,
+// until the garbage collector collects the instance (runtime.AddCleanup).
+type creationThread struct {
+	mu     sync.Mutex
+	closed bool
+	calls  chan func()
+	// quit is closed by close: the thread ends once the call it runs, if
+	// any, has returned.
+	quit chan struct{}
+}
+
+// newCreationThread starts a creation thread with umask mask. A goroutine
+// that locks the main thread (hostOnMainThread) starts another and lets
+// the main thread go once that one has locked a thread of its own, which
+// is then not the main thread, which the first holds.
+func newCreationThread(mask os.FileMode) (*creationThread, error) {
+	t := &creationThread{calls: make(chan func()), quit: make(chan struct{})}
+	started := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		if !hostOnMainThread() {
+			t.serve(mask, started, nil)
+			return
+		}
+		locked := make(chan struct{})
+		go func() {
+			runtime.LockOSThread()
+			t.serve(mask, started, locked)
+		}()
+		<-locked
+		runtime.UnlockOSThread()
+	}()
+	if err := <-started; err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// serve makes the locked thread it runs on a creation thread with umask
+// mask, tells started whether it did, and runs the calls given until close.
+// locked, when it is not nil, is closed once the thread is known not to be
+// the main thread. It returns with the thread locked, but for the main
+// thread.
+func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked chan<- struct{}) {
+	onMain := hostOnMainThread()
+	if locked != nil {
+		close(locked)
+	}
+	if onMain {
+		// Never so: the main thread is held by the goroutine that started
+		// this one. It is let go unchanged, which the main thread must be.
+		runtime.UnlockOSThread()
+		started <- errors.New("the creation thread is the main thread")
+		return
+	}
+	if err := hostUnshareFS(); err != nil {
+		started <- err
+		return
+	}
+	hostSetThreadUmask(mask)
+	started <- nil
+	for {
+		select {
+		case call := <-t.calls:
+			call()
+		case <-t.quit:
+			return
+		}
+	}
+}
+
+// run runs call on the thread and returns once it has returned; after close
+// it runs nothing and returns fs.ErrClosed.
+func (t *creationThread) run(call func()) error {
+	t.mu.Lock()
+	closed := t.closed
+	t.mu.Unlock()
+	if closed {
+		return fs.ErrClosed
+	}
+	ran := make(chan struct{})
+	select {
+	case t.calls <- func() {
+		defer close(ran)
+		call()
+	}:
+		<-ran
+		return nil
+	case <-t.quit:
+		return fs.ErrClosed
+	}
+}
+
+// close ends the thread without waiting for it: a call it runs returns
+// first, and no call is run after.
+func (t *creationThread) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.closed {
+		t.closed = true
+		close(t.quit)
+	}
 }
 
 // Path_open_mode is a NON-STANDARD host import (module
@@ -5115,9 +5456,7 @@ func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	// As for a file (pathOpenMode): the host's filesystem takes the host
-	// process's umask out of the mode as well, MemFS does not.
-	if err := fsys.Mkdir(name, w.createMode(mode)); err != nil {
+	if err := w.create(fsys, mode, func(perm os.FileMode) error { return fsys.Mkdir(name, perm) }); err != nil {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
@@ -6390,10 +6729,8 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	}
 	var f File
 	var err error
-	// The filesystem is asked for the mode less the instance's umask. The
-	// host's filesystem takes the host process's umask out as well, so
-	// there the instance's umask tightens a mode and does not loosen one;
-	// MemFS creates with the mode as asked.
+	// A file the open creates gets the mode less the instance's umask
+	// (create).
 	isFIFO := false
 	fi, err := fsys.Stat(rel)
 	if err == nil {
@@ -6424,8 +6761,16 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		if f, errno = w.openFIFO(openFile, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
+	case flag&os.O_CREATE != 0:
+		if err = w.create(fsys, mode, func(perm os.FileMode) error {
+			var err error
+			f, err = openFile(rel, flag, perm)
+			return err
+		}); err != nil {
+			return -1, mapOSError(err)
+		}
 	default:
-		if f, err = openFile(rel, flag, w.createMode(mode)); err != nil {
+		if f, err = openFile(rel, flag, mode); err != nil {
 			return -1, mapOSError(err)
 		}
 	}
@@ -7660,11 +8005,11 @@ func writeFilestat(out []byte, st os.FileInfo) {
 }
 
 // Process supplies the identity and the accounting of the guest process
-// (WASIConfig.Process). Its methods are called without any lock of the
-// WasiStubs held. An error of Groups, SetIDs, SetGroups, Priority or
-// SetPriority fails the guest's call with the errno hookErrno gives: the
-// errno of its name for a syscall.Errno, ENOSYS for errors.ErrUnsupported
-// without one.
+// (WASIConfig.Process): the values the guest reads. The changes are another
+// value's (ProcessChanges). Its methods are called without any lock of the
+// WasiStubs held. An error of Groups or Priority fails the guest's call
+// with the errno hookErrno gives: the errno of its name for a
+// syscall.Errno, ENOSYS for errors.ErrUnsupported without one.
 type Process interface {
 	// IDs returns the ids of the guest process.
 	IDs() ProcessIDs
@@ -7680,20 +8025,37 @@ type Process interface {
 	// Groups returns the supplementary group ids of the guest process
 	// (getgroups).
 	Groups() ([]int32, error)
+	// Priority returns the nice value of the processes which and who name
+	// (getpriority): which is PRIO_PROCESS (0), PRIO_PGRP (1) or PRIO_USER
+	// (2), who the id of the process, the group or the user, 0 for the
+	// caller's own. The guest's own pid is given as 0.
+	Priority(which, who int32) (int32, error)
+}
+
+// ProcessChanges makes the changes of the guest process
+// (WASIConfig.ProcessChanges) where they are kept besides the instance: the
+// host process's, for HostProcessChanges. Only the guest of the fork
+// family's root instance reaches it; a forked instance, which is a process
+// of its own to its guest but shares the host process, keeps its changes
+// (procChanges). Its methods are called without any lock of the WasiStubs
+// held, those of one instance one at a time. An error fails the guest's
+// call with the errno hookErrno gives, but for SetUmask, whose error is
+// told WASIConfig.Errors.
+type ProcessChanges interface {
 	// SetIDs makes a change of the guest's user or group ids, a call of the
 	// setuid or setgid family (proc_setids).
 	SetIDs(change IDChange) error
 	// SetGroups sets the supplementary group ids of the guest process
 	// (setgroups).
 	SetGroups(groups []int32) error
-	// Priority returns the nice value of the processes which and who name
-	// (getpriority): which is PRIO_PROCESS (0), PRIO_PGRP (1) or PRIO_USER
-	// (2), who the id of the process, the group or the user, 0 for the
-	// caller's own. The guest's own pid is given as 0.
-	Priority(which, who int32) (int32, error)
 	// SetPriority sets the nice value of the processes which and who name
-	// (setpriority), as Priority names them.
+	// (setpriority), as Process.Priority names them.
 	SetPriority(which, who, prio int32) error
+	// SetUmask sets the file mode creation mask (umask) to the permission
+	// bits of mask and returns the previous one. The runtime keeps the mask
+	// of each instance itself (Proc_umask); errors.ErrUnsupported is a
+	// ProcessChanges that keeps none.
+	SetUmask(mask os.FileMode) (os.FileMode, error)
 }
 
 // IDChange is a change of the user or group ids of the guest process: one
@@ -7747,26 +8109,22 @@ func (isolatedProcess) Times() (ProcessTimes, error) { return ProcessTimes{}, ni
 func (isolatedProcess) Umask() os.FileMode           { return 0o022 }
 
 // An isolated process is in no supplementary group and has the nice value
-// 0; it changes neither its ids, nor its groups, nor its priority (ENOSYS).
+// 0.
 func (isolatedProcess) Groups() ([]int32, error)                 { return nil, nil }
-func (isolatedProcess) SetIDs(IDChange) error                    { return errors.ErrUnsupported }
-func (isolatedProcess) SetGroups([]int32) error                  { return errors.ErrUnsupported }
 func (isolatedProcess) Priority(which, who int32) (int32, error) { return 0, nil }
-func (isolatedProcess) SetPriority(which, who, prio int32) error { return errors.ErrUnsupported }
 
 // HostProcess returns a Process with the identity and the accounting of the
 // host process, for WASIConfig.Process. IDs are os.Getpid, os.Getppid,
-// os.Getuid, os.Geteuid, os.Getgid and os.Getegid; Groups is os.Getgroups.
-// SetIDs, SetGroups, Priority and SetPriority are the host's calls of the
-// same name (package syscall's), on the host process: the ids of every
-// instance of a fork family change with it. Where the host has no such call
-// the error is errors.ErrUnsupported. Times are the host's
+// os.Getuid, os.Geteuid, os.Getgid and os.Getegid; Groups is os.Getgroups;
+// Priority is the host's getpriority. Where the host has no such call the
+// error is errors.ErrUnsupported. Times are the host's
 // resource usage of the whole host process, which every instance of a fork
 // family is part of, and of the children the host process has waited for;
 // on a system without one the error is errors.ErrUnsupported. Umask is the host
 // process's file mode creation mask when HostProcess is called, read without
-// changing it: on Linux from /proc/self/status, and an error reading it is
-// returned. Where it cannot be read without changing it (another system, or
+// changing it: on Linux from the status of the calling thread
+// (/proc/thread-self/status), which shares it with the process, and an
+// error reading it is returned. Where it cannot be read without changing it (another system, or
 // a Linux whose status has no umask) the error is errors.ErrUnsupported:
 // use HostProcessUmask, which takes the umask from the caller.
 func HostProcess() (Process, error) {
@@ -7809,9 +8167,25 @@ func (hostProcess) Groups() ([]int32, error) {
 	return out, nil
 }
 
-func (hostProcess) SetIDs(change IDChange) error { return setHostIDs(change) }
+func (hostProcess) Priority(which, who int32) (int32, error) {
+	nice, err := hostPriority(int(which), int(who))
+	return int32(nice), err
+}
 
-func (hostProcess) SetGroups(groups []int32) error {
+// HostProcessChanges returns the ProcessChanges of the host process, for
+// WASIConfig.ProcessChanges, which the guest of a fork family's root
+// instance makes the host process's: SetIDs, SetGroups and SetPriority are
+// the host's calls of the same name (package syscall's), and SetUmask is
+// umask(2). Where the host has no such call the error is
+// errors.ErrUnsupported.
+func HostProcessChanges() ProcessChanges { return hostProcessChanges{} }
+
+// hostProcessChanges is the ProcessChanges HostProcessChanges returns.
+type hostProcessChanges struct{}
+
+func (hostProcessChanges) SetIDs(change IDChange) error { return setHostIDs(change) }
+
+func (hostProcessChanges) SetGroups(groups []int32) error {
 	gids := make([]int, len(groups))
 	for i, gid := range groups {
 		gids[i] = int(gid)
@@ -7819,13 +8193,189 @@ func (hostProcess) SetGroups(groups []int32) error {
 	return setHostGroups(gids)
 }
 
-func (hostProcess) Priority(which, who int32) (int32, error) {
-	nice, err := hostPriority(int(which), int(who))
-	return int32(nice), err
+func (hostProcessChanges) SetPriority(which, who, prio int32) error {
+	return setHostPriority(int(which), int(who), int(prio))
 }
 
-func (hostProcess) SetPriority(which, who, prio int32) error {
-	return setHostPriority(int(which), int(who), int(prio))
+func (hostProcessChanges) SetUmask(mask os.FileMode) (os.FileMode, error) {
+	return hostSetUmask(mask)
+}
+
+// processChanged holds what the guest of a forked instance changed its
+// process's ids, groups and nice value to (procChanges): what it reads
+// afterwards in place of the Process's.
+type processChanged struct {
+	// ids are the real, effective and saved user ids, then group ids, once
+	// a change of them was made.
+	ids    *[6]int32
+	groups []int32
+	// grouped records that groups were set (an empty list included).
+	grouped bool
+	nice    *int32
+}
+
+// overlay puts what of c was changed over p, sharing nothing with c.
+func (p *processChanged) overlay(c processChanged) {
+	if c.ids != nil {
+		ids := *c.ids
+		p.ids = &ids
+	}
+	if c.grouped {
+		p.groups, p.grouped = slices.Clone(c.groups), true
+	}
+	if c.nice != nil {
+		nice := *c.nice
+		p.nice = &nice
+	}
+}
+
+// forkedChanges returns what a copy Fork makes starts with as its own
+// process's values, where the guests change them (WASIConfig.ProcessChanges):
+// the ids (ids, read by the caller), groups and nice value w's guest has
+// then, so that a later change of the root's, which reaches the host
+// process, is not the copy's. A value the Process cannot tell is left to
+// it, and its error told WASIConfig.Errors (op "fork") unless it is
+// errors.ErrUnsupported. nil without a ProcessChanges, where nothing
+// changes.
+func (w *WasiStubs) forkedChanges(ids ProcessIDs) *processChanged {
+	if w.cfg.ProcessChanges == nil {
+		return nil
+	}
+	start := &processChanged{ids: &[6]int32{ids.UID, ids.EUID, ids.EUID, ids.GID, ids.EGID, ids.EGID}}
+	groups, err := w.guestProcess().Groups()
+	switch {
+	case err == nil:
+		start.groups, start.grouped = groups, true
+	case !errors.Is(err, errors.ErrUnsupported):
+		w.reportError("fork", err)
+	}
+	nice, err := w.guestProcess().Priority(0, 0)
+	switch {
+	case err == nil:
+		start.nice = &nice
+	case !errors.Is(err, errors.ErrUnsupported):
+		w.reportError("fork", err)
+	}
+	return start
+}
+
+// guestIDs returns the ids of the instance's guest: the Process's, with
+// those the guest of a forked instance changed (procChanges).
+func (w *WasiStubs) guestIDs() ProcessIDs {
+	ids := w.guestProcess().IDs()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.changed != nil && w.changed.ids != nil {
+		c := w.changed.ids
+		ids.UID, ids.EUID, ids.GID, ids.EGID = c[0], c[1], c[3], c[4]
+	}
+	return ids
+}
+
+// guestGroups returns the supplementary groups of the instance's guest:
+// the Process's, or those the guest of a forked instance set.
+func (w *WasiStubs) guestGroups() ([]int32, error) {
+	w.mu.Lock()
+	if w.changed != nil && w.changed.grouped {
+		groups := slices.Clone(w.changed.groups)
+		w.mu.Unlock()
+		return groups, nil
+	}
+	w.mu.Unlock()
+	return w.guestProcess().Groups()
+}
+
+// hostCredentials reports whether changes are the host process's
+// (HostProcessChanges): the kernel then checks the credentials of the host
+// process for every instance of the family, which a forked instance, a
+// process of the guest's but not of the host's, cannot change alone — its
+// setuid family and setgroups fail with EPERM. A guest drops privileges in
+// the root instance before it forks.
+func hostCredentials(changes ProcessChanges) bool {
+	_, host := changes.(hostProcessChanges)
+	return host
+}
+
+// changedLocked returns the changes of the instance's guest, made when it
+// had none. Caller holds w.mu.
+func (w *WasiStubs) changedLocked() *processChanged {
+	if w.changed == nil {
+		w.changed = &processChanged{}
+	}
+	return w.changed
+}
+
+// changeIDs makes the change of a forked instance's guest to its own ids,
+// as Linux's calls make it (kernel/sys.c; gVisor's Task.SetUID and the
+// rest, pkg/sentry/kernel/task_identity.go): with the effective user id 0
+// any id may be given; otherwise only one of the real, effective and saved
+// ids, the real id of setreuid and setregid only the real or the effective
+// one, else EPERM. setuid and setgid of the superuser set all three; a
+// setreuid or setregid that sets the real id, or the effective one to
+// another than the real id, makes the saved id the new effective one.
+func (w *WasiStubs) changeIDs(change IDChange) error {
+	p := w.guestProcess().IDs()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	changed := w.changedLocked()
+	ids := [6]int32{p.UID, p.EUID, p.EUID, p.GID, p.EGID, p.EGID}
+	if changed.ids != nil {
+		ids = *changed.ids
+	}
+	privileged := ids[1] == 0
+	set := ids[0:3]
+	if change.Call >= IDSetgid {
+		set = ids[3:6]
+	}
+	among := func(id int32, of ...int32) bool {
+		return id == -1 || privileged || slices.Contains(of, id)
+	}
+	r, e, s := set[0], set[1], set[2]
+	a := change.IDs
+	switch change.Call {
+	case IDSetuid, IDSetgid:
+		switch {
+		case a[0] < 0:
+			return syscall.EINVAL
+		case privileged:
+			set[0], set[1], set[2] = a[0], a[0], a[0]
+		case a[0] == r || a[0] == s:
+			set[1] = a[0]
+		default:
+			return syscall.EPERM
+		}
+	case IDSeteuid, IDSetegid:
+		if !among(a[0], r, e, s) {
+			return syscall.EPERM
+		}
+		if a[0] != -1 {
+			set[1] = a[0]
+		}
+	case IDSetreuid, IDSetregid:
+		if !among(a[0], r, e) || !among(a[1], r, e, s) {
+			return syscall.EPERM
+		}
+		if a[0] != -1 {
+			set[0] = a[0]
+		}
+		if a[1] != -1 {
+			set[1] = a[1]
+		}
+		if a[0] != -1 || a[1] != -1 && a[1] != r {
+			set[2] = set[1]
+		}
+	case IDSetresuid, IDSetresgid:
+		if !among(a[0], r, e, s) || !among(a[1], r, e, s) || !among(a[2], r, e, s) {
+			return syscall.EPERM
+		}
+		for i, id := range a {
+			if id != -1 {
+				set[i] = id
+			}
+		}
+	}
+	changed.ids = &ids
+	return nil
 }
 
 // The guest's signal numbers are Linux's. A host has its own (SIGUSR1 is
@@ -7885,7 +8435,7 @@ func (w *WasiStubs) procIDs(m *Module, outPtr uint64) int32 {
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	ids := w.guestProcess().IDs()
+	ids := w.guestIDs()
 	for i, id := range [6]int32{ids.PID, ids.PPID, ids.UID, ids.EUID, ids.GID, ids.EGID} {
 		binary.LittleEndian.PutUint32(out[i*4:], uint32(id))
 	}
@@ -7963,7 +8513,7 @@ func (w *WasiStubs) procGroups(m *Module, bufPtr uint64, capacity int32, countPt
 	if countOut == nil {
 		return -_wasiEFAULT
 	}
-	groups, err := w.guestProcess().Groups()
+	groups, err := w.guestGroups()
 	if err != nil {
 		return -hookErrno(err)
 	}
@@ -7987,9 +8537,12 @@ func (w *WasiStubs) procGroups(m *Module, bufPtr uint64, capacity int32, countPt
 // Proc_setids is a NON-STANDARD host import (module wasip1_posix_extension,
 // name "proc_setids") backing the setuid and setgid families: request names
 // the call (the IDCall of its number) and a, b, c are its ids, -1 for an id
-// to leave alone. The SetIDs of the Process (WASIConfig.Process) makes the
-// change. Returns 0, or a negative errno: EINVAL for a request it does not
-// know, ENOSYS when the Process changes no ids.
+// to leave alone. The SetIDs of the ProcessChanges (WASIConfig.ProcessChanges)
+// makes the change of the family's root instance; a forked instance's guest
+// changes its own ids (changeIDs), but for the host's ProcessChanges, whose
+// credentials it cannot change alone (hostCredentials: EPERM). Returns 0,
+// or a negative errno: EINVAL for a request it does not know, ENOSYS
+// without a ProcessChanges.
 func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 	call := IDCall(request)
 	if call < IDSetuid || call > IDSetresgid {
@@ -7997,7 +8550,19 @@ func (w *WasiStubs) Proc_setids(m *Module, request, a, b, c int32) int32 {
 	}
 	change := IDChange{Call: call, IDs: [3]int32{-1, -1, -1}}
 	copy(change.IDs[:idCallArgs[call]], []int32{a, b, c})
-	if err := w.guestProcess().SetIDs(change); err != nil {
+	changes := w.cfg.ProcessChanges
+	var err error
+	switch {
+	case changes == nil:
+		return -_wasiENOSYS
+	case w.forked && hostCredentials(changes):
+		return -_wasiEPERM
+	case w.forked:
+		err = w.changeIDs(change)
+	default:
+		err = changes.SetIDs(change)
+	}
+	if err != nil {
 		return -hookErrno(err)
 	}
 	return _wasiESUCCESS
@@ -8010,10 +8575,13 @@ func (w *WasiStubs) Proc_setids64(m *Module, request, a, b, c int32) int32 {
 
 // Proc_setgroups is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "proc_setgroups") backing setgroups: the
-// count u32 group ids at listPtr are given to the SetGroups of the Process
-// (WASIConfig.Process). Returns 0, or a negative errno: EINVAL for a count
-// below 0 or above 65536 (NGROUPS_MAX), ENOSYS when the Process changes no
-// groups.
+// count u32 group ids at listPtr are given to the SetGroups of the
+// ProcessChanges (WASIConfig.ProcessChanges) by the family's root instance;
+// a forked instance's guest sets its own, which only a guest of the
+// effective user id 0 may (EPERM), and none for the host's ProcessChanges
+// (hostCredentials: EPERM). Returns 0, or a negative errno: EINVAL
+// for a count below 0 or above 65536 (NGROUPS_MAX), ENOSYS without a
+// ProcessChanges.
 func (w *WasiStubs) Proc_setgroups(m *Module, listPtr, count int32) int32 {
 	return w.procSetgroups(m, zext(listPtr), count)
 }
@@ -8036,8 +8604,24 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 	for i := range groups {
 		groups[i] = int32(binary.LittleEndian.Uint32(list[i*4:]))
 	}
-	if err := w.guestProcess().SetGroups(groups); err != nil {
-		return -hookErrno(err)
+	changes := w.cfg.ProcessChanges
+	switch {
+	case changes == nil:
+		return -_wasiENOSYS
+	case w.forked && hostCredentials(changes):
+		return -_wasiEPERM
+	case w.forked:
+		if w.guestIDs().EUID != 0 {
+			return -_wasiEPERM
+		}
+		w.mu.Lock()
+		changed := w.changedLocked()
+		changed.groups, changed.grouped = groups, true
+		w.mu.Unlock()
+	default:
+		if err := changes.SetGroups(groups); err != nil {
+			return -hookErrno(err)
+		}
 	}
 	return _wasiESUCCESS
 }
@@ -8048,11 +8632,15 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 // PRIO_USER (2) and who the id it applies to, 0 for the caller's own; the
 // guest's own pid is passed on as 0, and the pid token of another process
 // of the fork family or of a process the guest spawned is no process of
-// the host: ESRCH. With set non-zero the SetPriority of
-// the Process (WASIConfig.Process) makes value the nice value first. The
-// Priority of the Process, the nice value then in effect, is written at
-// outPtr (i32). Returns 0, or a negative errno: ENOSYS when the Process
-// changes no priority.
+// the host: ESRCH. With set non-zero value becomes the nice value first: by
+// the SetPriority of the ProcessChanges (WASIConfig.ProcessChanges) for the
+// family's root instance; a forked instance's guest sets its own nice value
+// alone (PRIO_PROCESS of itself; EPERM for another), and a lower one than it
+// has only with the effective user id 0 (EACCES), clamped to -20..19 as
+// setpriority clamps it. The nice value then in effect — the Priority of
+// the Process, or the forked instance's own — is written at outPtr (i32).
+// Returns 0, or a negative errno: ENOSYS for a change without a
+// ProcessChanges.
 func (w *WasiStubs) Proc_priority(m *Module, which, who, set, value, outPtr int32) int32 {
 	return w.procPriority(m, which, who, set, value, zext(outPtr))
 }
@@ -8083,9 +8671,33 @@ func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr
 			return -_wasiESRCH
 		}
 	}
+	own := which == 0 && who == 0
 	if set != 0 {
-		if err := proc.SetPriority(which, who, value); err != nil {
-			return -hookErrno(err)
+		changes := w.cfg.ProcessChanges
+		switch {
+		case changes == nil:
+			return -_wasiENOSYS
+		case w.forked:
+			if errno := w.setOwnNice(own, value); errno != _wasiESUCCESS {
+				return -errno
+			}
+		default:
+			if err := changes.SetPriority(which, who, value); err != nil {
+				return -hookErrno(err)
+			}
+		}
+	}
+	if own {
+		w.mu.Lock()
+		nice := w.changed != nil && w.changed.nice != nil
+		var value int32
+		if nice {
+			value = *w.changed.nice
+		}
+		w.mu.Unlock()
+		if nice {
+			binary.LittleEndian.PutUint32(out, uint32(value))
+			return _wasiESUCCESS
 		}
 	}
 	nice, err := proc.Priority(which, who)
@@ -8093,6 +8705,30 @@ func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr
 		return -hookErrno(err)
 	}
 	binary.LittleEndian.PutUint32(out, uint32(nice))
+	return _wasiESUCCESS
+}
+
+// setOwnNice sets the nice value of a forked instance's guest to value, for
+// a setpriority of itself (own), and returns a wasi errno.
+func (w *WasiStubs) setOwnNice(own bool, value int32) int32 {
+	if !own {
+		return _wasiEPERM
+	}
+	value = min(max(value, -20), 19)
+	euid := w.guestIDs().EUID
+	current, err := w.guestProcess().Priority(0, 0)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.changed != nil && w.changed.nice != nil {
+		current, err = *w.changed.nice, nil
+	}
+	if err != nil {
+		return hookErrno(err)
+	}
+	if value < current && euid != 0 {
+		return _wasiEACCES
+	}
+	w.changedLocked().nice = &value
 	return _wasiESUCCESS
 }
 
@@ -8998,13 +9634,12 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 	if amode == 0 {
 		return _wasiESUCCESS
 	}
-	proc := w.guestProcess()
-	ids := proc.IDs()
+	ids := w.guestIDs()
 	uid, gid := ids.UID, ids.GID
 	if effective {
 		uid, gid = ids.EUID, ids.EGID
 	}
-	groups, err := proc.Groups()
+	groups, err := w.guestGroups()
 	if err != nil {
 		return -hookErrno(err)
 	}
@@ -9069,7 +9704,7 @@ func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) i
 	if !can {
 		return -_wasiENOSYS
 	}
-	if err := maker.Mkfifo(name, w.createMode(unixFileMode(uint32(mode)).Perm())); err != nil {
+	if err := w.create(fsys, unixFileMode(uint32(mode)).Perm(), func(perm os.FileMode) error { return maker.Mkfifo(name, perm) }); err != nil {
 		return -hookErrno(err)
 	}
 	return _wasiESUCCESS
@@ -11174,6 +11809,11 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"posixZone":         true,
 			"posixZoneScanner":  true,
 			"wasiZone":          true,
+
+			"ProcessChanges":     true,
+			"hostProcessChanges": true,
+			"processChanged":     true,
+			"creationThread":     true,
 		},
 		keepFuncNames: map[string]bool{
 			"NewWASI":                 true,
@@ -11246,6 +11886,10 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"Clock_res_get":           true,
 			"Clock_time_get":          true,
 			"closeWasiOpen":           true,
+			"hostCredentials":         true,
+			"withHostUmask":           true,
+			"HostProcessChanges":      true,
+			"newCreationThread":       true,
 			"Fd_close":                true,
 			"Fd_fdstat_get":           true,
 			"Fd_fdstat_set_flags":     true,
@@ -11314,7 +11958,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"locationMoment":          true,
 			"zoneReading":             true,
 		},
-		keepVarNames: map[string]bool{"idCallArgs": true},
+		keepVarNames: map[string]bool{"idCallArgs": true, "creationThreadsRefused": true, "reportCreationThreadsRefused": true, "hostUmaskState": true},
 		keepConstAll: true,
 	})
 	if err != nil {
