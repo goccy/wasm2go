@@ -309,3 +309,26 @@ func setHostPriority(which, who, nice int) error {
 	}
 	return nil
 }
+
+// hostAbstractSockets says that Unix-domain sockets here have abstract
+// names (a leading NUL), which are no files.
+const hostAbstractSockets = true
+
+// hostSocketFD makes a socket of the host's, in non-blocking mode and
+// closed on exec at once, as Go's package net makes one (sysSocket).
+func hostSocketFD(domain, typ int) (int, error) {
+	return syscall.Socket(domain, typ|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+}
+
+// hostSocketPairFDs makes two connected Unix-domain sockets of the type, as
+// hostSocketFD makes a socket.
+func hostSocketPairFDs(typ int) ([2]int, error) {
+	return syscall.Socketpair(syscall.AF_UNIX, typ|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+}
+
+// hostAcceptFD accepts a connection on socket fd, in non-blocking mode and
+// closed on exec at once (accept4(2), as Go's package net accepts).
+func hostAcceptFD(fd int) (int, error) {
+	conn, _, err := syscall.Accept4(fd, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+	return conn, err
+}

@@ -73,7 +73,15 @@ var posixImports = map[string]bool{
 	"proc_user_by_name":          true,
 	"proc_wait":                  true,
 	"proc_wait_any":              true,
+	"sock_bind_addr":             true,
+	"sock_connect_addr":          true,
+	"sock_listen":                true,
+	"sock_name":                  true,
+	"sock_open":                  true,
+	"sock_recvfrom_addr":         true,
+	"sock_sendto_addr":           true,
 	"sock_service":               true,
+	"sock_socketpair":            true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

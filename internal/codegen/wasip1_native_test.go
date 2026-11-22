@@ -288,13 +288,13 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 		t.Fatalf("dial hook saw %v, want tcp/127.0.0.1/127.0.0.1:%d", dialed, port)
 	}
 
-	// Allow → connect succeeds and attaches the conn.
+	// Allow → connect succeeds: the socket has its peer.
 	w.cfg.Dial = func(network, host, ip string, p int) bool { return true }
 	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != _wasiESUCCESS {
 		t.Fatalf("allowed connect: want SUCCESS, got %d", rc)
 	}
-	if op := w.fdTable[fd]; op == nil || op.conn == nil {
-		t.Fatalf("connect did not attach a conn to fd %d", fd)
+	if rc := w.Sock_name(m, fd, 1, 700); rc != _wasiESUCCESS || readU32(m.memory, 704) != uint32(port) {
+		t.Fatalf("peer of the connected fd %d: rc=%d port %d, want %d", fd, rc, readU32(m.memory, 704), port)
 	}
 
 	// Connecting an already-connected socket → EISCONN.

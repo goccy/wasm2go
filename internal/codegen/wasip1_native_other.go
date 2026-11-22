@@ -236,3 +236,47 @@ func hostRecordLock(f *os.File, cmd int32, lk *recordLock) error { return errors
 // newHostSyslog would return the host's system logger, which package
 // log/syslog does not have on this platform.
 func newHostSyslog() (Syslogger, error) { return nil, errors.ErrUnsupported }
+
+// hostOpensSockets says that the runtime makes no sockets of the host's on
+// this platform: the socket imports are ENOTSUP, and the legacy ones serve
+// connections of package net's.
+const hostOpensSockets = false
+
+// hostAbstractSockets says that Unix-domain sockets have no abstract names
+// here.
+const hostAbstractSockets = false
+
+// The calls on a socket of the host's, which the runtime makes none of on
+// this platform.
+
+func openHostSocket(family int32, dgram bool) (*os.File, error) { return nil, errors.ErrUnsupported }
+
+func hostSocketPair(dgram bool) (a, b *os.File, err error) { return nil, nil, errors.ErrUnsupported }
+
+func hostBind(fd int, a wasiSockAddr, hostPath string) error { return errors.ErrUnsupported }
+
+func hostListen(fd, backlog int) error { return errors.ErrUnsupported }
+
+func hostAccept(fd int) (conn int, again bool, err error) { return -1, false, errors.ErrUnsupported }
+
+func hostConnect(fd int, a wasiSockAddr, hostPath string) error { return errors.ErrUnsupported }
+
+func hostConnectDone(fd int) (again bool, err error) { return false, errors.ErrUnsupported }
+
+func hostSocketName(fd int, peer bool) (wasiSockAddr, error) {
+	return wasiSockAddr{}, errors.ErrUnsupported
+}
+
+func hostReceive(fd int, bufs [][]byte, peek bool) (n int, truncated, again bool, err error) {
+	return 0, false, false, errors.ErrUnsupported
+}
+
+func hostReceiveFrom(fd int, buf []byte, peek bool) (n int, from wasiSockAddr, again bool, err error) {
+	return 0, wasiSockAddr{}, false, errors.ErrUnsupported
+}
+
+func hostSend(fd int, bufs [][]byte, to *wasiSockAddr, hostPath string) (n int, again bool, err error) {
+	return 0, false, errors.ErrUnsupported
+}
+
+func hostShutdown(fd int, how int32) error { return errors.ErrUnsupported }

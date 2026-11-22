@@ -1126,7 +1126,14 @@ type wasiOpen struct {
 	conn     net.Conn // guarded by mu; read it through netConn
 	listener net.Listener
 	isDir    bool
-	isSocket bool // created by Sock_socket, may not yet have a conn
+	isSocket bool // created by Sock_socket, Sock_open, Sock_socketpair or an accept; may not yet have a conn
+	// family (wasiSockFamily*) and dgram are what a socket of the host's
+	// (sock) is, from its making on.
+	family int32
+	dgram  bool
+	// sock is what a socket of the host's has of its own (wasiSocket);
+	// nil for an entry without one.
+	sock *wasiSocket
 	// shutClosed is set once Sock_shutdown closes conn, which has no half
 	// close, or listener: a transfer on conn that fails then fails as
 	// after shutdown(2) (see afterShutdown), an accept on listener with
@@ -1968,6 +1975,21 @@ type WASIConfig struct {
 	// literal IP), the dotted-quad IP and the port. Returning false denies
 	// the connection (EACCES). nil denies every one.
 	Dial func(network, host, ip string, port int) bool
+	// Listen is consulted before a socket takes a local address that others
+	// can reach it at: before a bind (Sock_bind_addr), of a datagram socket
+	// as well, before the listen (Sock_listen) of a socket that was not
+	// bound, which the host binds at a port it picks, before the first
+	// send to an address (Sock_sendto_addr) of a datagram socket that was
+	// not bound, which the host binds as well, and before a datagram
+	// socket dissolves its association (a connect with AF_UNSPEC), which on
+	// some hosts leaves the port it was given reachable. It is given the
+	// network ("tcp", "udp", "unix" or "unixgram") and the address:
+	// "ip:port" of an IP socket (an IPv6 one in brackets, with the zone of
+	// a link-local one; the unspecified address and port 0 for one the
+	// host picks), or a Unix-domain socket's path in the host filesystem
+	// ("@name" for an abstract name). Returning false denies it (EACCES).
+	// nil denies every one.
+	Listen func(network, address string) bool
 	// Resolve is consulted before a name lookup (Sock_getaddrinfo) with the
 	// requested host. Returning false denies the resolution (the guest sees
 	// a name-resolution error). nil denies every one. An empty host is the
@@ -2022,6 +2044,9 @@ func AllowAllNetAccess(op string) bool { return true }
 // AllowAllDial is a WASIConfig.Dial that allows every outbound connection.
 func AllowAllDial(network, host, ip string, port int) bool { return true }
 
+// AllowAllListen is a WASIConfig.Listen that allows every local address.
+func AllowAllListen(network, address string) bool { return true }
+
 // AllowAllResolve is a WASIConfig.Resolve that allows every name lookup.
 func AllowAllResolve(host string) bool { return true }
 
@@ -2044,6 +2069,7 @@ func HostWASIConfig() WASIConfig {
 		FS:        osFS{},
 		NetAccess: AllowAllNetAccess,
 		Dial:      AllowAllDial,
+		Listen:    AllowAllListen,
 		Resolve:   AllowAllResolve,
 		Exec:      AllowAllExec,
 		LocalZone: time.Local,
@@ -3530,7 +3556,9 @@ const (
 	_wasiEFAULT       int32 = 21
 	_wasiEFBIG        int32 = 22
 	_wasiEHOSTUNREACH int32 = 23
+	_wasiEINPROGRESS  int32 = 26
 	_wasiEINTR        int32 = 27
+	_wasiENAMETOOLONG int32 = 37
 	_wasiENETUNREACH  int32 = 40
 	_wasiEINVAL       int32 = 28
 	_wasiEIO          int32 = 29
@@ -3840,10 +3868,17 @@ func closeWasiOpen(op *wasiOpen) error {
 		return err
 	}
 	f, conn, listener := op.f, op.conn, op.listener
+	var host *os.File
+	if op.sock != nil {
+		host = op.sock.host
+	}
 	op.mu.Unlock()
 	var err error
 	if f != nil {
 		err = errors.Join(err, f.Close())
+	}
+	if host != nil {
+		err = errors.Join(err, host.Close())
 	}
 	if conn != nil && op.connClosed.CompareAndSwap(false, true) {
 		err = errors.Join(err, conn.Close())
@@ -3934,6 +3969,8 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 			ftype = 2 // a standard stream is a character device
 		} else if op.isDir {
 			ftype = 3
+		} else if op.dgram {
+			ftype = 5 // socket_dgram
 		} else if op.conn != nil || op.listener != nil || op.isSocket {
 			ftype = 6 // socket_stream
 		}
@@ -4073,10 +4110,13 @@ func (w *WasiStubs) filestatOf(fd int32, out []byte) int32 {
 		for i := range out {
 			out[i] = 0
 		}
-		// A socket is a stream socket (6). An embedder's stream is a
-		// pipe to the guest, which WASI has no file type for: it stays
-		// "unknown" (0) here, and Fd_filestat_ext names it.
-		if op.socket() {
+		// A socket is a datagram (5) or stream socket (6). An embedder's
+		// stream is a pipe to the guest, which WASI has no file type for:
+		// it stays "unknown" (0) here, and Fd_filestat_ext names it.
+		switch {
+		case op.socket() && op.dgram:
+			out[16] = 5
+		case op.socket():
 			out[16] = 6
 		}
 		return _wasiESUCCESS
@@ -4267,7 +4307,8 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	w.mu.Lock()
 	src, op := w.fdSrcLocked(fd)
 	w.mu.Unlock()
-	if src == nil {
+	host := op.hostSocket()
+	if src == nil && host == nil {
 		if op.socket() {
 			return _wasiENOTCONN
 		}
@@ -4278,6 +4319,12 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	nreadSlice := w.memBytes(m, nreadPtr, abi.wordSize())
 	if !ok || nreadSlice == nil {
 		return _wasiEFAULT
+	}
+	if host != nil {
+		// a socket of the host's, read as recv(2) reads it
+		n, _, errno := w.socketReceive("fd_read", op, host, bufs, 0)
+		abi.putWord(nreadSlice, n)
+		return errno
 	}
 	n, errno, served := op.takeAhead(bufs)
 	if !served {
@@ -4827,6 +4874,17 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	nwrittenSlice := w.memBytes(m, nwrittenPtr, abi.wordSize())
 	if !ok || nwrittenSlice == nil {
 		return _wasiEFAULT
+	}
+	if host := op.hostSocket(); host != nil {
+		// A socket of the host's, written as send(2) writes it: a write
+		// of nothing sends nothing.
+		var n uint64
+		errno := _wasiESUCCESS
+		if firstBuffer(bufs) != nil {
+			n, errno = w.socketSend("fd_write", op, host, bufs, 0, nil, "")
+		}
+		abi.putWord(nwrittenSlice, n)
+		return errno
 	}
 	if dst == nil {
 		abi.putWord(nwrittenSlice, 0)
@@ -7020,6 +7078,11 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	var hostSet []hostWaitFD
 	hostOf := map[probeKey]int{}
 	hostIndex := make([]int, len(fdEvents))
+	// slotClosed marks the subscriptions whose slot was closed while the
+	// call waited (closedSlots): the event of one carries EBADF, while
+	// another number of the same descriptor, which shares its entry of
+	// hostSet, waits on.
+	slotClosed := make([]bool, len(fdEvents))
 	addHost := func(i int, key probeKey, stream any, want int) {
 		if at, seen := hostOf[key]; seen {
 			hostIndex[i] = at
@@ -7044,6 +7107,15 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		if op == nil {
 			errnos[i] = _wasiEBADF
 			ready[i], anyReady = true, true
+			continue
+		}
+		if host := op.hostSocket(); host != nil {
+			// A socket of the host's is ready as poll(2) says.
+			want := hostWantInput
+			if !ev.isRead {
+				want = hostWantRoom
+			}
+			addHost(i, probeKey{op: op, write: !ev.isRead}, host, want)
 			continue
 		}
 		// A stream that is not open in the direction asked about never
@@ -7117,9 +7189,9 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	var hostErr error
 	markHost := func() {
 		for i := range fdEvents {
-			if at := hostIndex[i]; at >= 0 && (hostSet[at].ready || hostErr != nil) {
+			if at := hostIndex[i]; at >= 0 && (slotClosed[i] || hostSet[at].ready || hostErr != nil) {
 				ready[i], anyReady = true, true
-				if hostErr != nil {
+				if hostErr != nil && !slotClosed[i] {
 					errnos[i] = mapOSError(hostErr)
 				}
 			}
@@ -7156,14 +7228,15 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// call looked it up (their events carry EBADF), and reports whether a
 	// subscription is ready.
 	closedSlots := func() bool {
+		found := false
 		w.mu.Lock()
 		for i, ev := range fdEvents {
-			if at := hostIndex[i]; at >= 0 && w.openLocked(ev.fd) != ops[i] {
-				errnos[i], hostSet[at].ready = _wasiEBADF, true
+			if hostIndex[i] >= 0 && w.openLocked(ev.fd) != ops[i] {
+				errnos[i], slotClosed[i], found = _wasiEBADF, true, true
 			}
 		}
 		w.mu.Unlock()
-		return slices.ContainsFunc(hostSet, func(e hostWaitFD) bool { return e.ready })
+		return found || slices.ContainsFunc(hostSet, func(e hostWaitFD) bool { return e.ready })
 	}
 	// waitHostWoken waits for hostSet until until passes, stop is closed or
 	// the slot of a subscription is closed (its event carries EBADF), and
@@ -7502,9 +7575,18 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	// the host's).
 	_ = domain
 	_ = typ
+	if hostOpensSockets {
+		// a socket of the host's, as Sock_open makes it
+		return w.openSocketEntry(wasiSockFamilyIPv4, false)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.addFDLocked(&wasiOpen{isSocket: true})
+}
+
+// Sock_socket64 is Sock_socket for a memory64 guest.
+func (w *WasiStubs) Sock_socket64(m *Module, domain, typ int32) int32 {
+	return w.Sock_socket(m, domain, typ)
 }
 
 // Sock_connect is a NON-STANDARD host import (module wasi_snapshot_preview1,
@@ -7515,7 +7597,16 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 // attaches the resulting conn to the socket fd so the existing Sock_send /
 // Sock_recv / Fd_close paths drive it. Returns 0 or a negative errno.
 func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
+	w.endUnregistered()
 	u := uint32(ipBE)
+	if op, host, errno := w.socketOf(fd); errno != _wasiESUCCESS {
+		return -errno
+	} else if host != nil {
+		// A socket of the host's connects as sock_connect_addr connects
+		// it, to the IPv4 address.
+		a := wasiSockAddr{family: wasiSockFamilyIPv4, ip: net.IPv4(byte(u), byte(u>>8), byte(u>>16), byte(u>>24)).To4(), port: int(uint16(port))}
+		return -w.connectSocket("sock_connect", op, host, a, "")
+	}
 	ip := fmt.Sprintf("%d.%d.%d.%d", u&0xff, (u>>8)&0xff, (u>>16)&0xff, (u>>24)&0xff)
 	op, conn, errno := w.socketConn(fd)
 	switch {
@@ -7532,9 +7623,9 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	if hook == nil || !hook("tcp", host, ip, p) {
 		return -_wasiEACCES
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(p)), 30*time.Second)
-	if err != nil {
-		return -errnoOr(err, _wasiECONNREFUSED)
+	conn, errno = w.dialInterruptibly("sock_connect", "tcp", net.JoinHostPort(ip, strconv.Itoa(p)))
+	if conn == nil {
+		return -errno
 	}
 	w.mu.Lock()
 	// The fd may have been closed concurrently; re-check before attaching.
@@ -7552,17 +7643,69 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	return -_wasiEBADF
 }
 
+// Sock_connect64 is Sock_connect for a memory64 guest.
+func (w *WasiStubs) Sock_connect64(m *Module, fd, ipBE, port int32) int32 {
+	return w.Sock_connect(m, fd, ipBE, port)
+}
+
+// dialInterruptibly dials address on network as package net does, for a
+// host whose sockets the runtime does not make (Sock_connect): a signal
+// posted to the guest meanwhile cancels the dial (EINTR). It returns the
+// connection, or nil and an errno, ECONNREFUSED for a failure without the
+// host's error number. call is the import's name.
+func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, int32) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var conn net.Conn
+	var err error
+	interrupted, _, refused := w.blockingAttempt(cancel, nil, func(<-chan struct{}) {
+		conn, err = (&net.Dialer{}).DialContext(ctx, network, address)
+	})
+	switch {
+	case refused:
+		return nil, _wasiEINTR
+	case err != nil && interrupted:
+		return nil, _wasiEINTR
+	case err != nil:
+		return nil, errnoOr(err, _wasiECONNREFUSED)
+	case interrupted:
+		// The dial went through: the next call that waits reports the
+		// signal.
+		w.keepInterrupt()
+	}
+	return conn, _wasiESUCCESS
+}
+
 // Sock_accept accepts the next incoming TCP/Unix connection on the
 // listener associated with fd, registers it as a new wasiOpen with a
 // conn arm, and writes the new fd at fdOutPtr. Returns ENOTSOCK if fd
 // isn't a listener.
 func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
-	if !w.checkNet("accept") {
-		return _wasiEACCES
-	}
-	out := w.memSlice(m, fdOutPtr, 4)
+	return w.sockAccept(m, fd, flags, zext(fdOutPtr))
+}
+
+// Sock_accept64 is Sock_accept for a memory64 guest.
+func (w *WasiStubs) Sock_accept64(m *Module, fd, flags int32, fdOutPtr int64) int32 {
+	return w.sockAccept(m, fd, flags, uint64(fdOutPtr))
+}
+
+// sockAccept is the body of Sock_accept and Sock_accept64.
+func (w *WasiStubs) sockAccept(m *Module, fd, flags int32, fdOutPtr uint64) int32 {
+	w.endUnregistered()
+	out := w.memBytes(m, fdOutPtr, 4)
 	if out == nil {
 		return _wasiEFAULT
+	}
+	if op, host, errno := w.socketOf(fd); errno == _wasiESUCCESS && host != nil {
+		// a socket of the host's, which accept(2) takes a connection of
+		newFD, errno := w.acceptSocket(op, host, flags)
+		if errno == _wasiESUCCESS {
+			binary.LittleEndian.PutUint32(out, uint32(newFD))
+		}
+		return errno
+	}
+	if !w.checkNet("accept") {
+		return _wasiEACCES
 	}
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -7586,7 +7729,42 @@ func (w *WasiStubs) Sock_accept(m *Module, fd, flags, fdOutPtr int32) int32 {
 }
 
 func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataLenPtr, roFlagsPtr int32) int32 {
+	return w.sockRecv(m, wasiABI32, fd, zext(riData), zext(riDataLen), riFlags, zext(roDataLenPtr), zext(roFlagsPtr))
+}
+
+// Sock_recv64 is Sock_recv for a memory64 guest, whose ri_data_len and
+// ro_datalen are __wasi_size_t.
+func (w *WasiStubs) Sock_recv64(m *Module, fd int32, riData, riDataLen int64, riFlags int32, roDataLenPtr, roFlagsPtr int64) int32 {
+	return w.sockRecv(m, wasiABI64, fd, uint64(riData), uint64(riDataLen), riFlags, uint64(roDataLenPtr), uint64(roFlagsPtr))
+}
+
+// sockRecv is the body of Sock_recv and Sock_recv64.
+func (w *WasiStubs) sockRecv(m *Module, abi wasiABI, fd int32, riData, riDataLen uint64, riFlags int32, roDataLenPtr, roFlagsPtr uint64) int32 {
 	w.endUnregistered()
+	bufs, ok := w.iovecSlices(m, abi, riData, riDataLen)
+	lenOut := w.memBytes(m, roDataLenPtr, abi.wordSize())
+	// ro_flags is a __wasi_roflags_t — a 16-bit value. wasi-libc packs it
+	// immediately before ro_datalen (only 2 bytes apart), so writing 4 bytes
+	// here would clobber the low half of ro_datalen and make recv() report 0
+	// bytes received even when data arrived.
+	flagsOut := w.memBytes(m, roFlagsPtr, 2)
+	if op, host, errno := w.socketOf(fd); errno == _wasiESUCCESS && host != nil {
+		// a socket of the host's, received from as recv(2) receives
+		if !ok || lenOut == nil || flagsOut == nil {
+			return _wasiEFAULT
+		}
+		n, truncated, errno := w.socketReceive("sock_recv", op, host, bufs, riFlags)
+		if errno != _wasiESUCCESS {
+			return errno
+		}
+		var roFlags uint16
+		if truncated {
+			roFlags = wasiRecvDataTruncated
+		}
+		binary.LittleEndian.PutUint16(flagsOut, roFlags)
+		abi.putWord(lenOut, n)
+		return _wasiESUCCESS
+	}
 	if !w.checkNet("recv") {
 		return _wasiEACCES
 	}
@@ -7594,13 +7772,6 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 	if conn == nil {
 		return errno
 	}
-	bufs, ok := w.iovecSlices(m, wasiABI32, zext(riData), zext(riDataLen))
-	lenOut := w.memSlice(m, roDataLenPtr, 4)
-	// ro_flags is a __wasi_roflags_t — a 16-bit value. wasi-libc packs it
-	// immediately before ro_datalen (only 2 bytes apart), so writing 4 bytes
-	// here would clobber the low half of ro_datalen and make recv() report 0
-	// bytes received even when data arrived.
-	flagsOut := w.memSlice(m, roFlagsPtr, 2)
 	if !ok || lenOut == nil || flagsOut == nil {
 		return _wasiEFAULT
 	}
@@ -7612,12 +7783,38 @@ func (w *WasiStubs) Sock_recv(m *Module, fd, riData, riDataLen, riFlags, roDataL
 		return errno
 	}
 	binary.LittleEndian.PutUint16(flagsOut, 0)
-	binary.LittleEndian.PutUint32(lenOut, uint32(n))
+	abi.putWord(lenOut, n)
 	return _wasiESUCCESS
 }
 
 func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataLenPtr int32) int32 {
+	return w.sockSend(m, wasiABI32, fd, zext(siData), zext(siDataLen), siFlags, zext(soDataLenPtr))
+}
+
+// Sock_send64 is Sock_send for a memory64 guest, whose si_data_len and
+// so_datalen are __wasi_size_t.
+func (w *WasiStubs) Sock_send64(m *Module, fd int32, siData, siDataLen int64, siFlags int32, soDataLenPtr int64) int32 {
+	return w.sockSend(m, wasiABI64, fd, uint64(siData), uint64(siDataLen), siFlags, uint64(soDataLenPtr))
+}
+
+// sockSend is the body of Sock_send and Sock_send64.
+func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen uint64, siFlags int32, soDataLenPtr uint64) int32 {
 	w.endUnregistered()
+	bufs, ok := w.iovecSlices(m, abi, siData, siDataLen)
+	lenOut := w.memBytes(m, soDataLenPtr, abi.wordSize())
+	if op, host, errno := w.socketOf(fd); errno == _wasiESUCCESS && host != nil {
+		// a socket of the host's, sent on as send(2) sends: a send of
+		// nothing sends an empty datagram
+		if !ok || lenOut == nil {
+			return _wasiEFAULT
+		}
+		n, errno := w.socketSend("sock_send", op, host, bufs, siFlags, nil, "")
+		if errno != _wasiESUCCESS {
+			return errno
+		}
+		abi.putWord(lenOut, n)
+		return _wasiESUCCESS
+	}
 	if !w.checkNet("send") {
 		return _wasiEACCES
 	}
@@ -7629,8 +7826,6 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	if conn == nil {
 		return errno
 	}
-	bufs, ok := w.iovecSlices(m, wasiABI32, zext(siData), zext(siDataLen))
-	lenOut := w.memSlice(m, soDataLenPtr, 4)
 	if !ok || lenOut == nil {
 		return _wasiEFAULT
 	}
@@ -7639,7 +7834,7 @@ func (w *WasiStubs) Sock_send(m *Module, fd, siData, siDataLen, siFlags, soDataL
 	if errno = op.afterShutdown(errno, true); errno != _wasiESUCCESS {
 		return errno
 	}
-	binary.LittleEndian.PutUint32(lenOut, uint32(n))
+	abi.putWord(lenOut, n)
 	return _wasiESUCCESS
 }
 
@@ -7651,6 +7846,10 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 	if how == 0 || how&^0x3 != 0 {
 		// neither SHUT_RD nor SHUT_WR, or a bit that is neither
 		return _wasiEINVAL
+	}
+	if host := op.hostSocket(); host != nil {
+		// a socket of the host's, which the host shuts down as it says
+		return shutdownSocket(host, how)
 	}
 	if conn == nil {
 		if op.listener == nil {
@@ -7700,6 +7899,1004 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 		return mapOSError(shErr)
 	}
 	return _wasiESUCCESS
+}
+
+// ----- sockets of every family ------------------------------------------------
+//
+// The imports of this section back the socket calls of a guest's C library
+// for sockets of the IPv4, IPv6 and Unix domains, of stream and of datagram
+// type. A socket has one socket of the host's, made when the guest makes
+// the socket and closed when the guest closes its last slot, as gVisor's
+// hostinet and wasi-go have it. The host socket is in non-blocking mode
+// from its making on, as Go's package net and libuv keep theirs: no call
+// of the runtime on it waits in the host, and the guest's O_NONBLOCK
+// (fd_fdstat_set_flags) is the entry's alone (fdflags). A call of the
+// guest that is to wait — a blocking accept, receive, send, or a connect
+// that is not made at once — waits in poll(2) between attempts
+// (socketWait), and a signal posted to the guest meanwhile ends it with
+// EINTR. What the socket is — bound, listening, connecting, connected,
+// shut down, the peer of a datagram socket — is the host's to know and to
+// say: the runtime keeps only what the policies have allowed the socket
+// (wasiSocket.reachable) and the names of a Unix-domain socket as the
+// guest gave them.
+//
+// The imports name a socket address by a record in the guest's memory,
+// whatever its family. The record is wasiSockAddrSize bytes, little-endian:
+//
+//	offset  0  u32       family (wasiSockFamily*; 0 where there is no address)
+//	offset  4  u32       port, in host byte order (IP families)
+//	offset  8  [16]byte  address: 4 bytes for IPv4, 16 for IPv6
+//	offset 24  u32       scope id (IPv6)
+//	offset 28  u32       length of the name (Unix)
+//	offset 32  [108]byte name, as the guest gave it (Unix)
+//
+// The name of a Unix-domain socket is a path of the guest's, relative to its
+// working directory, which the host does not know: where an import takes an
+// address that may be one, it also takes the path as the filesystem imports
+// do, relative to the preopened root. A name that starts with a NUL is an
+// abstract name (Linux), which is no file.
+const (
+	wasiSockAddrSize    = 140
+	wasiSockAddrNameMax = 108
+)
+
+// The address families of a socket and of an address record, as the guest's
+// C library names them to the imports (a libc's AF_* numbers differ from
+// libc to libc).
+const (
+	wasiSockFamilyIPv4 int32 = 1
+	wasiSockFamilyUnix int32 = 2
+	wasiSockFamilyIPv6 int32 = 3
+)
+
+// The socket types of Sock_open and Sock_socketpair.
+const (
+	wasiSockTypeStream int32 = 1
+	wasiSockTypeDgram  int32 = 2
+)
+
+// wasiRecvDataTruncated is the ro_flags bit of a receive whose datagram was
+// cut to the buffer (__WASI_ROFLAGS_RECV_DATA_TRUNCATED).
+const wasiRecvDataTruncated uint16 = 1
+
+// wasiSocket is what a socket entry has of its own. Guarded by the entry's
+// mu.
+type wasiSocket struct {
+	// host is the socket of the host's, from the guest's socket() or
+	// accept() to the close of its last slot (closeWasiOpen).
+	host *os.File
+	// reachable is set once the Listen policy has allowed others to reach
+	// the socket at its local address: when it was bound, when it listened
+	// without having been bound, or when a datagram socket sent to an
+	// address without either (an implicit bind). It is never unset.
+	reachable bool
+	// unixLocal and unixPeer are the names of a Unix-domain socket and of
+	// its peer as the guest gave them (bind, connect), which getsockname
+	// and getpeername give back; empty for none given.
+	unixLocal, unixPeer string
+}
+
+// hostSocket returns the host socket of the entry op, or nil for an entry
+// without one: no socket, or a connection or listener of package net's.
+func (op *wasiOpen) hostSocket() *os.File {
+	if op == nil {
+		return nil
+	}
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.sock == nil {
+		return nil
+	}
+	return op.sock.host
+}
+
+// socketCall runs call on the descriptor of the host socket host. It
+// reports EBADF for a host socket that was closed meanwhile, which is the
+// one failure of Control.
+func socketCall(host *os.File, call func(fd int)) int32 {
+	rc, err := host.SyscallConn()
+	if err != nil {
+		return mapOSError(err)
+	}
+	if rc.Control(func(fd uintptr) { call(int(fd)) }) != nil {
+		return _wasiEBADF
+	}
+	return _wasiESUCCESS
+}
+
+// network is the name of the socket's network as the policies are given it:
+// "tcp", "udp", "unix" or "unixgram".
+func (op *wasiOpen) network() string {
+	switch {
+	case op.family == wasiSockFamilyUnix && op.dgram:
+		return "unixgram"
+	case op.family == wasiSockFamilyUnix:
+		return "unix"
+	case op.dgram:
+		return "udp"
+	}
+	return "tcp"
+}
+
+// socketOf returns the socket entry behind fd and its host socket, or the
+// errno of a descriptor that is not open (EBADF) or not a socket
+// (ENOTSOCK). host is nil for a socket entry of package net's.
+func (w *WasiStubs) socketOf(fd int32) (op *wasiOpen, host *os.File, errno int32) {
+	w.mu.Lock()
+	op = w.openLocked(fd)
+	w.mu.Unlock()
+	switch {
+	case op == nil && w.preopened(fd), op != nil && !op.socket():
+		return nil, nil, _wasiENOTSOCK
+	case op == nil:
+		return nil, nil, _wasiEBADF
+	}
+	return op, op.hostSocket(), _wasiESUCCESS
+}
+
+// rawSocketOf is socketOf for the imports of this section, which only a
+// socket of the host's takes: a connection or listener of package net's is
+// ENOTSUP.
+func (w *WasiStubs) rawSocketOf(fd int32) (*wasiOpen, *os.File, int32) {
+	op, host, errno := w.socketOf(fd)
+	if errno == _wasiESUCCESS && host == nil {
+		return nil, nil, _wasiENOTSUP
+	}
+	return op, host, errno
+}
+
+// wasiSockAddr is a socket address of the guest's, read from or written to
+// an address record.
+type wasiSockAddr struct {
+	family int32
+	ip     net.IP // 4 bytes for IPv4, 16 for IPv6
+	port   int
+	scope  uint32
+	name   string // of a Unix-domain socket, as the guest knows it
+}
+
+// readSockAddr reads the address record at ptr; one of family 0 is no
+// address (AF_UNSPEC). It reports an errno: EFAULT, EAFNOSUPPORT for a
+// family the host has no sockets of, EINVAL for a record that is not well
+// formed.
+func (w *WasiStubs) readSockAddr(m *Module, ptr uint64) (wasiSockAddr, int32) {
+	rec := w.memBytes(m, ptr, wasiSockAddrSize)
+	if rec == nil {
+		return wasiSockAddr{}, _wasiEFAULT
+	}
+	a := wasiSockAddr{
+		family: int32(binary.LittleEndian.Uint32(rec[0:])),
+		port:   int(uint16(binary.LittleEndian.Uint32(rec[4:]))),
+		scope:  binary.LittleEndian.Uint32(rec[24:]),
+	}
+	switch a.family {
+	case wasiSockFamilyIPv4:
+		a.ip = append(net.IP(nil), rec[8:12]...)
+	case wasiSockFamilyIPv6:
+		a.ip = append(net.IP(nil), rec[8:24]...)
+	case wasiSockFamilyUnix:
+		n := binary.LittleEndian.Uint32(rec[28:])
+		if n > wasiSockAddrNameMax {
+			return a, _wasiEINVAL
+		}
+		a.name = string(rec[32 : 32+n])
+	case 0:
+		// AF_UNSPEC: no address
+	default:
+		return a, _wasiEAFNOSUPPORT
+	}
+	return a, _wasiESUCCESS
+}
+
+// readSockPath reads the path that accompanies an address record (see the
+// head of this section); ok is false when it is not readable.
+func (w *WasiStubs) readSockPath(m *Module, ptr uint64, n int32) (path string, ok bool) {
+	b := w.memBytes(m, ptr, zext(n))
+	if b == nil && n != 0 {
+		return "", false
+	}
+	return string(b), true
+}
+
+// writeSockAddr writes a at ptr as an address record. Returns 0 or a
+// negative errno.
+func (w *WasiStubs) writeSockAddr(m *Module, ptr uint64, a wasiSockAddr) int32 {
+	rec := w.memBytes(m, ptr, wasiSockAddrSize)
+	if rec == nil {
+		return -_wasiEFAULT
+	}
+	clear(rec)
+	binary.LittleEndian.PutUint32(rec[0:], uint32(a.family))
+	switch a.family {
+	case wasiSockFamilyUnix:
+		if len(a.name) > wasiSockAddrNameMax {
+			return -_wasiENAMETOOLONG
+		}
+		binary.LittleEndian.PutUint32(rec[28:], uint32(len(a.name)))
+		copy(rec[32:], a.name)
+	case wasiSockFamilyIPv4:
+		binary.LittleEndian.PutUint32(rec[4:], uint32(a.port))
+		copy(rec[8:12], a.ip.To4())
+	case wasiSockFamilyIPv6:
+		binary.LittleEndian.PutUint32(rec[4:], uint32(a.port))
+		copy(rec[8:24], a.ip.To16())
+		binary.LittleEndian.PutUint32(rec[24:], a.scope)
+	}
+	return _wasiESUCCESS
+}
+
+// ipText renders the IP address, with the zone of a link-local IPv6 one as
+// the index of its interface, which package net takes: what the policies
+// are asked about, and what resolved host names are remembered under. An
+// IPv4-mapped or global address has no zone.
+func (a wasiSockAddr) ipText() string {
+	addr := net.IPAddr{IP: a.ip}
+	if a.ip.To4() == nil && (a.ip.IsLinkLocalUnicast() || a.ip.IsLinkLocalMulticast()) {
+		addr.Zone = a.ipZone()
+	}
+	return addr.String()
+}
+
+// ipZone is the zone of an IPv6 address as package net takes it: the index
+// of its interface, in text.
+func (a wasiSockAddr) ipZone() string {
+	if a.scope == 0 || a.family != wasiSockFamilyIPv6 {
+		return ""
+	}
+	return strconv.FormatUint(uint64(a.scope), 10)
+}
+
+// hostPort renders an IP address and port for package net.
+func (a wasiSockAddr) hostPort() string {
+	return net.JoinHostPort(a.ipText(), strconv.Itoa(a.port))
+}
+
+// unixHostPath returns the host's name for the Unix-domain address a, whose
+// name is path relative to the preopened root: the path of its file in the
+// whole host filesystem, after asking the filesystem policy about writing it
+// (binding creates the file, connecting or sending to it takes write access),
+// or an abstract name as package syscall writes it ("@name"). It reports an
+// errno: ENOTSUP when the instance's FS is not the whole host filesystem
+// (HostFS("/")), whose files alone the host can bind sockets in, and for an
+// abstract name on a host without them.
+func (w *WasiStubs) unixHostPath(a wasiSockAddr, path string) (string, int32) {
+	switch {
+	case a.name == "" || path == "" && a.name[0] != 0:
+		return "", _wasiEINVAL
+	case a.name[0] == 0:
+		if !hostAbstractSockets {
+			return "", _wasiENOTSUP
+		}
+		return "@" + a.name[1:], _wasiESUCCESS
+	}
+	w.mu.Lock()
+	_, whole := w.cfg.FS.(osFS)
+	w.mu.Unlock()
+	if !whole {
+		return "", _wasiENOTSUP
+	}
+	name, allowed := w.allowedPath(path, true)
+	if !allowed {
+		return "", _wasiEACCES
+	}
+	return osFS{}.join(name), _wasiESUCCESS
+}
+
+// unixGuestName returns the name the guest knows the Unix-domain address of
+// the host's path by: the path, which is the guest's own in the whole host
+// filesystem, or an abstract name with its leading NUL. An address without
+// a name has none (package syscall writes the one of Linux as "@").
+func unixGuestName(path string) string {
+	switch {
+	case path == "" || path == "@":
+		return ""
+	case hostAbstractSockets && path[0] == '@':
+		return "\x00" + path[1:]
+	}
+	return path
+}
+
+// listenAllowed asks the Listen policy whether the socket op may take the
+// local address (see WASIConfig.Listen).
+func (w *WasiStubs) listenAllowed(op *wasiOpen, address string) bool {
+	w.mu.Lock()
+	hook := w.cfg.Listen
+	w.mu.Unlock()
+	return hook != nil && hook(op.network(), address)
+}
+
+// allowReachable asks the Listen policy, once for the socket op, whether
+// others may reach it at its local address. binds says that the call about
+// to be made binds a socket that is not bound (the listen of a stream
+// socket, the first send to an address of a datagram socket); without, the
+// call leaves the socket reachable only where it is bound already (the
+// dissolving of a datagram socket's association, connect with AF_UNSPEC,
+// which leaves a port the host picked bound on some hosts). The address is
+// the socket's, or the unspecified one of its family with port 0 for one
+// the call binds. A Unix-domain socket that was not bound has no name to be
+// reached at. Returns 0, EACCES when the policy refuses, or the errno of
+// asking the host for the address.
+func (w *WasiStubs) allowReachable(op *wasiOpen, host *os.File, binds bool) int32 {
+	op.mu.Lock()
+	reachable := op.sock.reachable
+	op.mu.Unlock()
+	if reachable || op.family == wasiSockFamilyUnix {
+		return _wasiESUCCESS
+	}
+	var local wasiSockAddr
+	var failed error
+	if errno := socketCall(host, func(fd int) { local, failed = hostSocketName(fd, false) }); errno != _wasiESUCCESS {
+		return errno
+	}
+	if failed != nil {
+		return mapOSError(failed)
+	}
+	if local.port == 0 {
+		if !binds {
+			return _wasiESUCCESS
+		}
+		local = wasiSockAddr{family: op.family, ip: net.IPv4zero.To4()}
+		if op.family == wasiSockFamilyIPv6 {
+			local.ip = net.IPv6zero
+		}
+	}
+	if !w.listenAllowed(op, local.hostPort()) {
+		return _wasiEACCES
+	}
+	op.mu.Lock()
+	op.sock.reachable = true
+	op.mu.Unlock()
+	return _wasiESUCCESS
+}
+
+// destination asks the Dial policy about the address a the socket op is to
+// connect or send to, with the path of a Unix-domain one (see
+// unixHostPath), and returns the host's name of a Unix-domain address.
+// Returns an errno: EACCES when the policy refuses.
+func (w *WasiStubs) destination(op *wasiOpen, a wasiSockAddr, path string) (string, int32) {
+	w.mu.Lock()
+	hook := w.cfg.Dial
+	w.mu.Unlock()
+	network := op.network()
+	if a.family == wasiSockFamilyUnix {
+		hostPath, errno := w.unixHostPath(a, path)
+		if errno != _wasiESUCCESS {
+			return "", errno
+		}
+		if hook == nil || !hook(network, "", hostPath, 0) {
+			return "", _wasiEACCES
+		}
+		return hostPath, _wasiESUCCESS
+	}
+	ip := a.ipText()
+	w.mu.Lock()
+	host := w.resolvedHosts[ip] // "" for a literal-IP dial with no preceding lookup
+	w.mu.Unlock()
+	if hook == nil || !hook(network, host, ip, a.port) {
+		return "", _wasiEACCES
+	}
+	return "", _wasiESUCCESS
+}
+
+// socketWait makes attempt on the host socket host of op until it no
+// longer reports that it would have to wait (again), as gVisor's hostinet
+// and Go's internal/poll do: a call that does not wait (nonblocking) makes
+// it once and reports EAGAIN when it would. A blocking one waits in poll(2)
+// for what want names (hostWant...) between attempts, and a signal posted
+// to the guest meanwhile ends the wait with EINTR. A host socket closed
+// meanwhile is EBADF. Returns the errno of the attempt that did not have to
+// wait. call is the import's name.
+func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want int, nonblocking bool, attempt func(fd int) (again bool, err error)) int32 {
+	for {
+		var again bool
+		var failed error
+		if errno := socketCall(host, func(fd int) { again, failed = attempt(fd) }); errno != _wasiESUCCESS {
+			return errno
+		}
+		switch {
+		case !again:
+			return mapOSError(failed)
+		case nonblocking:
+			return _wasiEAGAIN
+		}
+		set := []hostWaitFD{{stream: host, want: want, op: op}}
+		interrupted, err := w.waitHostInterruptibly(call, set, time.Time{})
+		if err != nil {
+			return mapOSError(err)
+		}
+		if interrupted {
+			return _wasiEINTR
+		}
+	}
+}
+
+// The flags of a socket receive (Sock_recv's ri_flags, and the flags of
+// Sock_recvfrom_addr) besides wasiMsgDontWait, in WASI's numbering, which
+// the guest's C library maps MSG_* to.
+const (
+	wasiMsgPeek    int32 = 1 // what is received stays where it is
+	wasiMsgWaitAll int32 = 2 // wait until the buffer is full
+)
+
+// socketReceive receives into bufs from the socket op, whose host socket
+// is host, as recv(2) does: once, a datagram cut to the buffers
+// (truncated), or, for a stream socket with wasiMsgWaitAll, until the
+// buffers are full or the stream ends. One with wasiMsgPeek as well looks
+// at what has arrived once something has: poll(2) does not tell when more
+// has (what is there keeps the socket readable). flags are the receive's
+// (wasiMsg...). A receive that waits for more and is ended by a signal
+// after receiving something reports what it received. The NetAccess
+// policy is asked first ("recv"). call is the import's name.
+func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs [][]byte, flags int32) (n uint64, truncated bool, errno int32) {
+	if !w.checkNet("recv") {
+		return 0, false, _wasiEACCES
+	}
+	size := 0
+	for _, b := range bufs {
+		size += len(b)
+	}
+	peek := flags&wasiMsgPeek != 0
+	waitAll := flags&wasiMsgWaitAll != 0 && !op.dgram && !peek
+	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
+	got := 0
+	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, func(fd int) (bool, error) {
+		start := got
+		if peek {
+			start = 0
+		}
+		k, cut, again, err := hostReceive(fd, leadingFrom(bufs, start), peek)
+		if err != nil || again {
+			return again, err
+		}
+		if peek {
+			got = k
+		} else {
+			got += k
+		}
+		truncated = cut
+		// One that waits for all waits again while the stream goes on,
+		// for input that makes the socket readable again.
+		return waitAll && k > 0 && got < size, nil
+	})
+	if got > 0 && errno != _wasiESUCCESS {
+		if errno == _wasiEINTR {
+			w.keepInterrupt()
+		}
+		errno = _wasiESUCCESS
+	}
+	return uint64(got), truncated, errno
+}
+
+// socketSend sends bufs on the socket op, whose host socket is host, as
+// send(2) does: a datagram whole, and on a stream socket that waits, all
+// of it, waiting for room. to is the address of a datagram socket's send to
+// one (nil for its peer), with hostPath the host's name of a Unix-domain
+// one. A send that is ended by a signal after sending something reports
+// what it sent. The NetAccess policy is asked first
+// ("send"). call is the import's name.
+func (w *WasiStubs) socketSend(call string, op *wasiOpen, host *os.File, bufs [][]byte, flags int32, to *wasiSockAddr, hostPath string) (uint64, int32) {
+	if !w.checkNet("send") {
+		return 0, _wasiEACCES
+	}
+	size := 0
+	for _, b := range bufs {
+		size += len(b)
+	}
+	// No event tells that the receiver of a Unix-domain datagram sent to
+	// an address has room again: poll(2) reports room on the sender. Such
+	// a send does not wait, where Linux would.
+	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0 || op.family == wasiSockFamilyUnix && op.dgram && to != nil
+	sent := 0
+	errno := w.socketWait(call, op, host, hostWantRoom, nonblocking, func(fd int) (bool, error) {
+		k, again, err := hostSend(fd, leadingFrom(bufs, sent), to, hostPath)
+		if err != nil || again {
+			return again, err
+		}
+		sent += k
+		// A stream socket that waits sends the rest once there is room.
+		return !op.dgram && sent < size, nil
+	})
+	if sent > 0 && errno != _wasiESUCCESS {
+		if errno == _wasiEINTR {
+			w.keepInterrupt()
+		}
+		errno = _wasiESUCCESS
+	}
+	return uint64(sent), errno
+}
+
+// leadingFrom returns bufs past their first skip bytes.
+func leadingFrom(bufs [][]byte, skip int) [][]byte {
+	out := make([][]byte, 0, len(bufs))
+	for _, b := range bufs {
+		if skip >= len(b) {
+			skip -= len(b)
+			continue
+		}
+		out, skip = append(out, b[skip:]), 0
+	}
+	return out
+}
+
+// Sock_open is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_open") backing socket(): a socket of the family
+// (wasiSockFamily*) and type (wasiSockType*), with its socket of the host's.
+// Returns the new fd, or a negative errno: EAFNOSUPPORT for a family the
+// runtime has no sockets of, EINVAL for an unknown type, ENOTSUP on a host
+// whose sockets the runtime does not make, and the host's for a socket it
+// does not make.
+func (w *WasiStubs) Sock_open(m *Module, family, typ int32) int32 {
+	switch {
+	case family != wasiSockFamilyIPv4 && family != wasiSockFamilyIPv6 && family != wasiSockFamilyUnix:
+		return -_wasiEAFNOSUPPORT
+	case typ != wasiSockTypeStream && typ != wasiSockTypeDgram:
+		return -_wasiEINVAL
+	case !hostOpensSockets:
+		return -_wasiENOTSUP
+	}
+	return w.openSocketEntry(family, typ == wasiSockTypeDgram)
+}
+
+// Sock_open64 is Sock_open for a memory64 guest.
+func (w *WasiStubs) Sock_open64(m *Module, family, typ int32) int32 {
+	return w.Sock_open(m, family, typ)
+}
+
+// openSocketEntry makes a socket of the host's of the family and type and
+// gives the guest a slot for it. Returns the fd, or a negative errno.
+func (w *WasiStubs) openSocketEntry(family int32, dgram bool) int32 {
+	host, err := openHostSocket(family, dgram)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.addFDLocked(&wasiOpen{isSocket: true, family: family, dgram: dgram, sock: &wasiSocket{host: host}})
+}
+
+// Sock_bind_addr is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_bind_addr") backing bind(): the socket
+// takes the local address in the record at addrPtr, with the path at
+// (pathPtr, pathLen) for a Unix-domain one (see the head of this section).
+// The Listen policy is asked first, of a datagram socket too. Returns 0 or
+// a negative errno: EACCES when the policy refuses, and the host's.
+func (w *WasiStubs) Sock_bind_addr(m *Module, fd, addrPtr, pathPtr, pathLen int32) int32 {
+	return w.sockBindAddr(m, fd, zext(addrPtr), zext(pathPtr), pathLen)
+}
+
+// Sock_bind_addr64 is Sock_bind_addr for a memory64 guest.
+func (w *WasiStubs) Sock_bind_addr64(m *Module, fd int32, addrPtr, pathPtr int64, pathLen int32) int32 {
+	return w.sockBindAddr(m, fd, uint64(addrPtr), uint64(pathPtr), pathLen)
+}
+
+// sockBindAddr is the body of Sock_bind_addr and Sock_bind_addr64.
+func (w *WasiStubs) sockBindAddr(m *Module, fd int32, addrPtr, pathPtr uint64, pathLen int32) int32 {
+	a, errno := w.readSockAddr(m, addrPtr)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	path, ok := w.readSockPath(m, pathPtr, pathLen)
+	if !ok {
+		return -_wasiEFAULT
+	}
+	op, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	if a.family == 0 {
+		// no address to take, as Linux refuses one of AF_UNSPEC
+		return -_wasiEINVAL
+	}
+	address, hostPath := "", ""
+	if a.family == wasiSockFamilyUnix {
+		if hostPath, errno = w.unixHostPath(a, path); errno != _wasiESUCCESS {
+			return -errno
+		}
+		address = hostPath
+	} else {
+		address = a.hostPort()
+	}
+	if !w.listenAllowed(op, address) {
+		return -_wasiEACCES
+	}
+	var failed error
+	if errno := socketCall(host, func(fd int) { failed = hostBind(fd, a, hostPath) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if failed != nil {
+		return -mapOSError(failed)
+	}
+	op.mu.Lock()
+	op.sock.reachable = true
+	if a.family == wasiSockFamilyUnix {
+		op.sock.unixLocal = a.name
+	}
+	op.mu.Unlock()
+	return _wasiESUCCESS
+}
+
+// Sock_listen is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_listen") backing listen(): the socket takes connections, at
+// most backlog waiting. The host binds a socket of an IP family that was
+// not bound, which the Listen policy is asked about first (see
+// allowReachable). Returns 0 or a negative errno: EACCES when the policy
+// refuses, and the host's.
+func (w *WasiStubs) Sock_listen(m *Module, fd, backlog int32) int32 {
+	op, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	if errno := w.allowReachable(op, host, true); errno != _wasiESUCCESS {
+		return -errno
+	}
+	var failed error
+	if errno := socketCall(host, func(fd int) { failed = hostListen(fd, int(backlog)) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	return -mapOSError(failed)
+}
+
+// Sock_listen64 is Sock_listen for a memory64 guest.
+func (w *WasiStubs) Sock_listen64(m *Module, fd, backlog int32) int32 {
+	return w.Sock_listen(m, fd, backlog)
+}
+
+// acceptSocket accepts a connection on the socket op, whose host socket is
+// host, as accept(2) does, giving it a slot with fdflags: a non-blocking
+// socket takes one that is waiting and reports EAGAIN when there is none;
+// a blocking one waits in poll(2) for one (socketWait). accept(2) of a
+// socket that does not listen fails at once, with the host's errno. The NetAccess policy is asked first ("accept"). Returns
+// the new fd and an errno.
+func (w *WasiStubs) acceptSocket(op *wasiOpen, host *os.File, fdflags int32) (int32, int32) {
+	if !w.checkNet("accept") {
+		return 0, _wasiEACCES
+	}
+	conn := -1
+	errno := w.socketWait("sock_accept", op, host, hostWantInput, op.nonblocking(), func(fd int) (bool, error) {
+		var again bool
+		var err error
+		conn, again, err = hostAccept(fd)
+		return again, err
+	})
+	if errno != _wasiESUCCESS {
+		return 0, errno
+	}
+	return w.addAccepted(op, conn, fdflags)
+}
+
+// addAccepted gives conn, a connection accepted on the socket op, a slot
+// with fdflags. Returns the new fd and an errno.
+func (w *WasiStubs) addAccepted(op *wasiOpen, conn int, fdflags int32) (int32, int32) {
+	host := os.NewFile(uintptr(conn), "socket")
+	op.mu.Lock()
+	accepted := &wasiOpen{isSocket: true, family: op.family, dgram: op.dgram, fdflags: fdflags, sock: &wasiSocket{
+		host:      host,
+		unixLocal: op.sock.unixLocal,
+	}}
+	op.mu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.addFDLocked(accepted), _wasiESUCCESS
+}
+
+// Sock_connect_addr is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_connect_addr") backing connect() for a
+// socket of any family: it connects the socket to the address in the record
+// at addrPtr, with the path at (pathPtr, pathLen) for a Unix-domain one (see
+// the head of this section), after asking the Dial policy. A record of
+// family 0 (AF_UNSPEC) is given to the host as it is: it dissolves the
+// association of a datagram socket, after asking the Listen policy about
+// what the socket may be left reachable at (allowReachable), and of a
+// stream socket what the host says. A connection that is not made at once
+// is waited for, as Go's package net waits for one: until the socket is
+// writable, then SO_ERROR and the peer tell how it ended; a non-blocking
+// socket gets EINPROGRESS, and a signal ends the wait of a blocking one
+// with EINTR while the attempt goes on in the host, as a connect(2)
+// interrupted by a signal has it. Returns 0 or a negative errno: EACCES
+// when a policy refuses, and the host's.
+func (w *WasiStubs) Sock_connect_addr(m *Module, fd, addrPtr, pathPtr, pathLen int32) int32 {
+	return w.sockConnectAddr(m, fd, zext(addrPtr), zext(pathPtr), pathLen)
+}
+
+// Sock_connect_addr64 is Sock_connect_addr for a memory64 guest.
+func (w *WasiStubs) Sock_connect_addr64(m *Module, fd int32, addrPtr, pathPtr int64, pathLen int32) int32 {
+	return w.sockConnectAddr(m, fd, uint64(addrPtr), uint64(pathPtr), pathLen)
+}
+
+// sockConnectAddr is the body of Sock_connect_addr and Sock_connect_addr64.
+func (w *WasiStubs) sockConnectAddr(m *Module, fd int32, addrPtr, pathPtr uint64, pathLen int32) int32 {
+	a, errno := w.readSockAddr(m, addrPtr)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	path, ok := w.readSockPath(m, pathPtr, pathLen)
+	if !ok {
+		return -_wasiEFAULT
+	}
+	op, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	return -w.connectSocket("sock_connect_addr", op, host, a, path)
+}
+
+// connectSocket connects the socket op, whose host socket is host, to the
+// address a (see Sock_connect_addr). call is the import's name. It reports
+// an errno.
+func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wasiSockAddr, path string) int32 {
+	hostPath := ""
+	if a.family == 0 {
+		if op.dgram {
+			if errno := w.allowReachable(op, host, false); errno != _wasiESUCCESS {
+				return errno
+			}
+		}
+	} else {
+		var errno int32
+		if hostPath, errno = w.destination(op, a, path); errno != _wasiESUCCESS {
+			return errno
+		}
+	}
+	var started error
+	if errno := socketCall(host, func(fd int) { started = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
+		return errno
+	}
+	// One the host goes on with: not made at once (EINPROGRESS), or
+	// interrupted in the host (EINTR) or under way already (EALREADY).
+	underWay := errors.Is(started, syscall.EINPROGRESS) || errors.Is(started, syscall.EINTR) || errors.Is(started, syscall.EALREADY)
+	if (started == nil || underWay) && a.family == wasiSockFamilyUnix {
+		// getpeername asks the host first: the name is the peer's once
+		// the host has a peer.
+		op.mu.Lock()
+		op.sock.unixPeer = a.name
+		op.mu.Unlock()
+	}
+	if !underWay || op.nonblocking() {
+		return mapOSError(started)
+	}
+	if errno := w.socketWait(call, op, host, hostWantRoom, false, hostConnectDone); errno != _wasiESUCCESS {
+		return errno
+	}
+	// The host takes the socket for connected, and refuses a later connect
+	// of it (EISCONN), once a connect has reported the connection made, as
+	// a blocking connect(2) reports it: the connect that waited does so
+	// here, as gVisor's hostinet connects again (Linux reports the
+	// connection made with 0, darwin with EISCONN).
+	var made error
+	if errno := socketCall(host, func(fd int) { made = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
+		return errno
+	}
+	if errors.Is(made, syscall.EISCONN) {
+		return _wasiESUCCESS
+	}
+	return mapOSError(made)
+}
+
+// Sock_name is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_name") backing getsockname() (peer 0) and getpeername() (peer
+// 1): the host's name of the socket, or of its peer, written as an address
+// record at addrPtr. A Unix-domain socket's names are the ones the guest
+// gave where it gave them. Returns 0 or a negative errno: the host's, such
+// as ENOTCONN for the peer of a socket that has none.
+func (w *WasiStubs) Sock_name(m *Module, fd, peer, addrPtr int32) int32 {
+	return w.sockName(m, fd, peer, zext(addrPtr))
+}
+
+// Sock_name64 is Sock_name for a memory64 guest.
+func (w *WasiStubs) Sock_name64(m *Module, fd, peer int32, addrPtr int64) int32 {
+	return w.sockName(m, fd, peer, uint64(addrPtr))
+}
+
+// sockName is the body of Sock_name and Sock_name64.
+func (w *WasiStubs) sockName(m *Module, fd, peer int32, addrPtr uint64) int32 {
+	op, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var a wasiSockAddr
+	var failed error
+	if errno := socketCall(host, func(fd int) { a, failed = hostSocketName(fd, peer != 0) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if failed != nil {
+		return -mapOSError(failed)
+	}
+	if a.family == wasiSockFamilyUnix {
+		op.mu.Lock()
+		given := op.sock.unixLocal
+		if peer != 0 {
+			given = op.sock.unixPeer
+		}
+		op.mu.Unlock()
+		if given != "" {
+			a.name = given
+		}
+	}
+	return w.writeSockAddr(m, addrPtr, a)
+}
+
+// Sock_sendto_addr is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_sendto_addr") backing send() and
+// sendto(): it sends (bufPtr, bufLen) on the socket fd, to the address in
+// the record at addrPtr, with the path at (pathPtr, pathLen) for a
+// Unix-domain one, or, for addrPtr 0, to the socket's peer, and writes the
+// count sent (u32) at sentPtr. A datagram socket's send to an address asks
+// the Dial policy about it, and the Listen policy about the socket's own
+// address the first time it makes the host bind the socket (see
+// allowReachable). flags are the send's (wasiMsgDontWait). Returns 0 or a
+// negative errno: EACCES when a policy refuses, and the host's.
+func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, pathPtr, pathLen, sentPtr int32) int32 {
+	return w.sockSendtoAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(pathPtr), pathLen, zext(sentPtr))
+}
+
+// Sock_sendto_addr64 is Sock_sendto_addr for a memory64 guest.
+func (w *WasiStubs) Sock_sendto_addr64(m *Module, fd int32, bufPtr int64, bufLen, flags int32, addrPtr, pathPtr int64, pathLen int32, sentPtr int64) int32 {
+	return w.sockSendtoAddr(m, fd, uint64(bufPtr), bufLen, flags, uint64(addrPtr), uint64(pathPtr), pathLen, uint64(sentPtr))
+}
+
+// sockSendtoAddr is the body of Sock_sendto_addr and Sock_sendto_addr64.
+func (w *WasiStubs) sockSendtoAddr(m *Module, fd int32, bufPtr uint64, bufLen, flags int32, addrPtr, pathPtr uint64, pathLen int32, sentPtr uint64) int32 {
+	w.endUnregistered()
+	buf := w.memBytes(m, bufPtr, zext(bufLen))
+	out := w.memBytes(m, sentPtr, 4)
+	if (buf == nil && bufLen != 0) || out == nil {
+		return -_wasiEFAULT
+	}
+	op, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var to *wasiSockAddr
+	hostPath := ""
+	var a wasiSockAddr
+	if addrPtr != 0 {
+		if a, errno = w.readSockAddr(m, addrPtr); errno != _wasiESUCCESS {
+			return -errno
+		}
+	}
+	// A record of family 0 is no address: the send is to the peer.
+	if addrPtr != 0 && a.family != 0 {
+		path, ok := w.readSockPath(m, pathPtr, pathLen)
+		if !ok {
+			return -_wasiEFAULT
+		}
+		if op.dgram {
+			if hostPath, errno = w.destination(op, a, path); errno != _wasiESUCCESS {
+				return -errno
+			}
+			if errno := w.allowReachable(op, host, true); errno != _wasiESUCCESS {
+				return -errno
+			}
+		} else if a.family == wasiSockFamilyUnix {
+			// the host's to refuse (EISCONN, EOPNOTSUPP), which names no
+			// file of the guest's
+			hostPath = a.name
+		}
+		to = &a
+	}
+	n, errno := w.socketSend("sock_sendto_addr", op, host, [][]byte{buf}, flags&wasiMsgDontWait, to, hostPath)
+	binary.LittleEndian.PutUint32(out, uint32(n))
+	return -errno
+}
+
+// Sock_recvfrom_addr is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_recvfrom_addr") backing recv() and
+// recvfrom(): it receives into (bufPtr, bufLen) from the socket fd as
+// recv(2) does (see socketReceive), writes the count received (u32) at
+// receivedPtr and, unless addrPtr is 0 (NULL), the sender's address as a
+// record at addrPtr: of family 0 where the host gives none, as for a stream
+// socket. flags are the receive's (wasiMsgPeek, wasiMsgWaitAll,
+// wasiMsgDontWait). Returns 0 or a negative errno: EAGAIN when nothing is
+// there and the call does not wait, EINTR when a signal is posted to the
+// guest while it waits, and the host's.
+func (w *WasiStubs) Sock_recvfrom_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, receivedPtr int32) int32 {
+	return w.sockRecvfromAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(receivedPtr))
+}
+
+// Sock_recvfrom_addr64 is Sock_recvfrom_addr for a memory64 guest.
+func (w *WasiStubs) Sock_recvfrom_addr64(m *Module, fd int32, bufPtr int64, bufLen, flags int32, addrPtr, receivedPtr int64) int32 {
+	return w.sockRecvfromAddr(m, fd, uint64(bufPtr), bufLen, flags, uint64(addrPtr), uint64(receivedPtr))
+}
+
+// sockRecvfromAddr is the body of Sock_recvfrom_addr and
+// Sock_recvfrom_addr64.
+func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen, flags int32, addrPtr, receivedPtr uint64) int32 {
+	w.endUnregistered()
+	buf := w.memBytes(m, bufPtr, zext(bufLen))
+	out := w.memBytes(m, receivedPtr, 4)
+	if (buf == nil && bufLen != 0) || out == nil || (addrPtr != 0 && w.memBytes(m, addrPtr, wasiSockAddrSize) == nil) {
+		return -_wasiEFAULT
+	}
+	op, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	if addrPtr == 0 || !op.dgram {
+		// A stream socket's sender is its peer, which recvfrom(2) names
+		// not (family 0).
+		n, _, errno := w.socketReceive("sock_recvfrom_addr", op, host, [][]byte{buf}, flags)
+		if errno != _wasiESUCCESS {
+			return -errno
+		}
+		binary.LittleEndian.PutUint32(out, uint32(n))
+		if addrPtr == 0 {
+			return _wasiESUCCESS
+		}
+		return w.writeSockAddr(m, addrPtr, wasiSockAddr{})
+	}
+	if !w.checkNet("recv") {
+		return -_wasiEACCES
+	}
+	var from wasiSockAddr
+	n := 0
+	errno = w.socketWait("sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, func(fd int) (bool, error) {
+		var again bool
+		var err error
+		n, from, again, err = hostReceiveFrom(fd, buf, flags&wasiMsgPeek != 0)
+		return again, err
+	})
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	binary.LittleEndian.PutUint32(out, uint32(n))
+	return w.writeSockAddr(m, addrPtr, from)
+}
+
+// Sock_socketpair is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_socketpair") backing socketpair(): two
+// Unix-domain sockets of the type (wasiSockType*) connected to each other,
+// whose fds it writes (two u32) at fdsOutPtr. Returns 0 or a negative
+// errno: EAFNOSUPPORT for a family other than Unix, ENOTSUP on a host whose
+// sockets the runtime does not make, and the host's.
+func (w *WasiStubs) Sock_socketpair(m *Module, family, typ, fdsOutPtr int32) int32 {
+	return w.sockSocketpair(m, family, typ, zext(fdsOutPtr))
+}
+
+// Sock_socketpair64 is Sock_socketpair for a memory64 guest.
+func (w *WasiStubs) Sock_socketpair64(m *Module, family, typ int32, fdsOutPtr int64) int32 {
+	return w.sockSocketpair(m, family, typ, uint64(fdsOutPtr))
+}
+
+// sockSocketpair is the body of Sock_socketpair and Sock_socketpair64.
+func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint64) int32 {
+	out := w.memBytes(m, fdsOutPtr, 8)
+	switch {
+	case out == nil:
+		return -_wasiEFAULT
+	case family != wasiSockFamilyUnix:
+		return -_wasiEAFNOSUPPORT
+	case typ != wasiSockTypeStream && typ != wasiSockTypeDgram:
+		return -_wasiEINVAL
+	case !hostOpensSockets:
+		return -_wasiENOTSUP
+	}
+	dgram := typ == wasiSockTypeDgram
+	a, b, err := hostSocketPair(dgram)
+	if err != nil {
+		return -mapOSError(err)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i, host := range []*os.File{a, b} {
+		fd := w.addFDLocked(&wasiOpen{isSocket: true, family: wasiSockFamilyUnix, dgram: dgram, sock: &wasiSocket{host: host}})
+		binary.LittleEndian.PutUint32(out[4*i:], uint32(fd))
+	}
+	return _wasiESUCCESS
+}
+
+// shutdownSocket shuts the halves how (Sock_shutdown's: 1 reading, 2
+// writing) of the host socket host down. It reports an errno: the host's.
+func shutdownSocket(host *os.File, how int32) int32 {
+	var failed error
+	if errno := socketCall(host, func(fd int) { failed = hostShutdown(fd, how) }); errno != _wasiESUCCESS {
+		return errno
+	}
+	return mapOSError(failed)
+}
+
+// Sock_shutdown64 is Sock_shutdown for a memory64 guest.
+func (w *WasiStubs) Sock_shutdown64(m *Module, fd, how int32) int32 {
+	return w.Sock_shutdown(m, fd, how)
 }
 
 // writeFilestat populates the 64-byte WASI filestat structure from a
@@ -11202,6 +12399,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"pollProbe":         true,
 			"hostWaitFD":        true,
 			"wasiWake":          true,
+			"wasiSocket":        true,
+			"wasiSockAddr":      true,
 			"WasiStubs":         true,
 			"WASIConfig":        true,
 			"Process":           true,
@@ -11300,6 +12499,11 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"zext":                    true,
 			"readVec":                 true,
 			"hostDescriptor":          true,
+			"socketCall":              true,
+			"unixGuestName":           true,
+			"leadingFrom":             true,
+			"shutdownSocket":          true,
+			"AllowAllListen":          true,
 			"streamHungUp":            true,
 			"streamPolled":            true,
 			"waitHostReady":           true,

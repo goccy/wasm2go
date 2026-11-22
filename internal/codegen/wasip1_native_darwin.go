@@ -90,6 +90,7 @@ const hostPipeBuf = 512
 const (
 	hostSysRecvmsg = syscall.SYS_RECVMSG
 	hostSysSendmsg = syscall.SYS_SENDMSG
+	hostSysConnect = syscall.SYS_CONNECT
 )
 
 // hostWakePipe makes a pipe whose ends do not wait and are closed on exec:
@@ -198,3 +199,61 @@ var hostRecordLockCommands = [...]int{recordLockGet: syscall.F_GETLK, recordLock
 // hostRecordLockCommands are the process's, not the open file
 // description's.
 const hostRecordLocksOfDescription = false
+
+// hostAbstractSockets says that Unix-domain sockets here have no abstract
+// names.
+const hostAbstractSockets = false
+
+// hostSocketFD makes a socket of the host's, closed on exec under
+// syscall.ForkLock and in non-blocking mode, as Go's package net makes one
+// where socket(2) takes no such flags (sysSocket).
+func hostSocketFD(domain, typ int) (int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fd, err := syscall.Socket(domain, typ, 0)
+	if err != nil {
+		return -1, err
+	}
+	return fd, socketFDMade(fd)
+}
+
+// hostSocketPairFDs makes two connected Unix-domain sockets of the type, as
+// hostSocketFD makes a socket.
+func hostSocketPairFDs(typ int) ([2]int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, typ, 0)
+	if err != nil {
+		return fds, err
+	}
+	if err := socketFDMade(fds[0]); err != nil {
+		return fds, errors.Join(err, hostCloseFD(fds[1]))
+	}
+	if err := socketFDMade(fds[1]); err != nil {
+		return fds, errors.Join(err, hostCloseFD(fds[0]))
+	}
+	return fds, nil
+}
+
+// hostAcceptFD accepts a connection on socket fd, closed on exec under
+// syscall.ForkLock and in non-blocking mode, as Go's package net accepts
+// where accept(2) takes no such flags (accept).
+func hostAcceptFD(fd int) (int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	conn, _, err := syscall.Accept(fd)
+	if err != nil {
+		return -1, err
+	}
+	return conn, socketFDMade(conn)
+}
+
+// socketFDMade sets the socket fd, made by the caller, closed on exec and
+// in non-blocking mode; on a failure it closes fd.
+func socketFDMade(fd int) error {
+	syscall.CloseOnExec(fd)
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		return errors.Join(os.NewSyscallError("fcntl", err), hostCloseFD(fd))
+	}
+	return nil
+}
