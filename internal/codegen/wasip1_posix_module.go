@@ -85,6 +85,9 @@ var posixImports = map[string]bool{
 	"sock_sendto_addr":           true,
 	"sock_service":               true,
 	"sock_socketpair":            true,
+
+	"proc_chdir":  true,
+	"proc_setenv": true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

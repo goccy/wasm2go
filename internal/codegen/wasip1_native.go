@@ -2050,6 +2050,17 @@ type WASIConfig struct {
 	// Syslog is the system logger of openlog, syslog and closelog. nil is
 	// none: they fail with ENOSYS. HostSyslog gives the host's.
 	Syslog Syslogger
+
+	// Chdir is told each change of the guest's working directory, which the
+	// guest's C library keeps itself: dir is the directory the guest is in
+	// now, an absolute path of its filesystem. Setenv is told each change of
+	// the guest's environment: name is set to value, or removed when unset
+	// is true. Their error is the guest's call's errno. They are told the
+	// changes of an instance NewWASI made, not of a copy made by Fork or
+	// ForkProc, whose changes are its own as a child process's are. nil
+	// tells nobody.
+	Chdir  func(dir string) error
+	Setenv func(name, value string, unset bool) error
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -10297,6 +10308,71 @@ func (w *WasiStubs) setOwnNice(own bool, value int32) int32 {
 	}
 	w.changedLocked().nice = &value
 	return _wasiESUCCESS
+}
+
+// ----- the working directory and the environment ----------------------------
+
+// Proc_chdir is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_chdir"): the guest reports the working directory it has
+// changed to, an absolute path of pathLen bytes at pathPtr, which
+// WASIConfig.Chdir is told. Returns 0 or a negative errno: EINVAL for a
+// path that is not absolute.
+func (w *WasiStubs) Proc_chdir(m *Module, pathPtr, pathLen int32) int32 {
+	return w.procChdir(m, zext(pathPtr), pathLen)
+}
+
+// Proc_chdir64 is Proc_chdir for a memory64 guest.
+func (w *WasiStubs) Proc_chdir64(m *Module, pathPtr int64, pathLen int32) int32 {
+	return w.procChdir(m, uint64(pathPtr), pathLen)
+}
+
+// procChdir is the body of Proc_chdir and Proc_chdir64.
+func (w *WasiStubs) procChdir(m *Module, pathPtr uint64, pathLen int32) int32 {
+	w.endUnregistered()
+	path := w.memBytes(m, pathPtr, zext(pathLen))
+	if path == nil {
+		return -_wasiEFAULT
+	}
+	dir := string(path)
+	if !strings.HasPrefix(dir, "/") {
+		return -_wasiEINVAL
+	}
+	if w.forked || w.cfg.Chdir == nil {
+		return _wasiESUCCESS
+	}
+	return -hookErrno(w.cfg.Chdir(dir))
+}
+
+// Proc_setenv is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_setenv"): the guest reports each variable of its environment
+// it sets (hasValue non-zero) or removes, which WASIConfig.Setenv is told.
+// Returns 0 or a negative errno.
+func (w *WasiStubs) Proc_setenv(m *Module, namePtr, nameLen, valuePtr, valueLen, hasValue int32) int32 {
+	return w.procSetenv(m, zext(namePtr), nameLen, zext(valuePtr), valueLen, hasValue)
+}
+
+// Proc_setenv64 is Proc_setenv for a memory64 guest.
+func (w *WasiStubs) Proc_setenv64(m *Module, namePtr int64, nameLen int32, valuePtr int64, valueLen, hasValue int32) int32 {
+	return w.procSetenv(m, uint64(namePtr), nameLen, uint64(valuePtr), valueLen, hasValue)
+}
+
+// procSetenv is the body of Proc_setenv and Proc_setenv64.
+func (w *WasiStubs) procSetenv(m *Module, namePtr uint64, nameLen int32, valuePtr uint64, valueLen, hasValue int32) int32 {
+	w.endUnregistered()
+	name := w.memBytes(m, namePtr, zext(nameLen))
+	if name == nil {
+		return -_wasiEFAULT
+	}
+	var value []byte
+	if hasValue != 0 {
+		if value = w.memBytes(m, valuePtr, zext(valueLen)); value == nil {
+			return -_wasiEFAULT
+		}
+	}
+	if w.forked || w.cfg.Setenv == nil {
+		return _wasiESUCCESS
+	}
+	return -hookErrno(w.cfg.Setenv(string(name), string(value), hasValue == 0))
 }
 
 // ----- the user and group database ---------------------------------------------

@@ -227,6 +227,11 @@
   (import "wasip1_posix_extension" "sock_socketpair"
     (func $sock_socketpair (param i32 i32 i64) (result i32)))
 
+  (import "wasip1_posix_extension" "proc_chdir"
+    (func $proc_chdir (param i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "proc_setenv"
+    (func $proc_setenv (param i64 i32 i64 i32 i32) (result i32)))
+
   (memory (export "memory") i64 1)
 
   (func (export "touch")
@@ -340,5 +345,8 @@
     (drop (call $sock_sendto_addr (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_recvfrom_addr (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $sock_socketpair (i32.const 0) (i32.const 0) (i64.const 0)))
+
+    (drop (call $proc_chdir (i64.const 0) (i32.const 0)))
+    (drop (call $proc_setenv (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))
   )
 )
