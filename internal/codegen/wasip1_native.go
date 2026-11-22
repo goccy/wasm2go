@@ -2135,6 +2135,24 @@ type WASIConfig struct {
 	// no process but its own and the ones it made, and its dispositions are
 	// told nobody.
 	Signals Signals
+	// TakeSignal is offered a signal the runtime raises for a guest itself
+	// before the guest is given it: the SIGALRM of the interval timer, the
+	// SIGCHLD of a child's end once its status can be waited for, the
+	// signal of the guest's kill of its own pid and of its raise (never 0,
+	// SIGKILL or SIGSTOP), and the SIGPIPE of a write or send that fails
+	// with EPIPE; none once the guest has become a command (Proc_exec).
+	// target is the instance the signal is for; a forked instance has its
+	// parent's TakeSignal. When it reports the signal taken, it has dealt
+	// with the signal itself (a host process whose native code made a
+	// handler of its own the action of the signal raises it there), and the
+	// guest is given nothing. Its error is told Errors (op "take_signal"),
+	// and the guest is given the signal. It is called on the goroutine that
+	// raises the signal, with no lock of the instance's state or signals
+	// held; that goroutine may be in a write to one of the guest's streams
+	// (the SIGPIPE of the write's EPIPE, a timer that came due in it), so it
+	// must not wait for another thread's write to the guest's standard
+	// output or error. nil gives every such signal to the guest.
+	TakeSignal func(target SignalTarget, sig int32) (taken bool, err error)
 	// Users is the user and group database of getpwnam, getgrgid and the
 	// like. nil is an empty one: every lookup fails with ENOENT. HostUsers
 	// gives the host's.
@@ -3252,6 +3270,9 @@ func (w *WasiStubs) dropProcLocked(pid int32) {
 func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 	proc.status = status
 	close(proc.done)
+	// Offered once the status can be waited for, for whoever takes the
+	// signal to find it.
+	taken := w.takeSignal(wasiSIGCHLD)
 	// Proc_wait_any scans the table and picks up procFinished under one hold
 	// of w.mu, so a finish is either seen by its scan or closes the channel
 	// it then blocks on.
@@ -3286,7 +3307,9 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 	}
 	w.mu.Unlock()
 	// The parent is told, as the kernel tells a process whose child ended.
-	w.PostSignal(wasiSIGCHLD)
+	if !taken {
+		w.PostSignal(wasiSIGCHLD)
+	}
 }
 
 // reapFinishedLocked forgets every process of this instance that has ended:
@@ -4326,7 +4349,9 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	}
 	if pid == ids.PID {
 		// The guest's own pid is always the guest itself.
-		w.raiseOwn(m, sig, false)
+		if !w.takeSignal(sig) {
+			w.raiseOwn(m, sig, false)
+		}
 		return _wasiESUCCESS
 	}
 	proc, ours := pids.find(pid)
@@ -6081,7 +6106,7 @@ const (
 // the guest's own call raises it for the thread, as raise(3) does (Linux's
 // send_sig(SIGPIPE, current)).
 func (w *WasiStubs) signalBrokenPipe(m *Module, errno, flags int32) int32 {
-	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 {
+	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 && !w.takeSignal(wasiSIGPIPE) {
 		w.raiseOwn(m, wasiSIGPIPE, true)
 	}
 	return errno
@@ -9640,7 +9665,9 @@ func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
 	if sig < 0 || sig > 30 {
 		return _wasiEINVAL
 	}
-	w.raiseOwn(m, guestSignalOfWASI(sig), true)
+	if guest := guestSignalOfWASI(sig); !w.takeSignal(guest) {
+		w.raiseOwn(m, guest, true)
+	}
 	return _wasiESUCCESS
 }
 
@@ -9671,6 +9698,28 @@ func (w *WasiStubs) raiseOwn(m *Module, sig int32, thread bool) {
 		return
 	}
 	w.terminate(sig)
+}
+
+// takeSignal offers sig, a signal the runtime raises for the guest itself,
+// to WASIConfig.TakeSignal, and reports whether it was taken; see there.
+// Caller holds neither w.mu nor w.sig.mu; a stream's write lock may be
+// held.
+func (w *WasiStubs) takeSignal(sig int32) bool {
+	if w.cfg.TakeSignal == nil || sig == 0 || sig == wasiSIGKILL || sig == wasiSIGSTOP {
+		return false
+	}
+	w.sig.mu.Lock()
+	execed := w.sig.execed != nil
+	w.sig.mu.Unlock()
+	if execed {
+		return false
+	}
+	taken, err := w.cfg.TakeSignal(w, sig)
+	if err != nil {
+		w.reportError("take_signal", err)
+		return false
+	}
+	return taken
 }
 
 // guestSignalOfWASI returns the guest's number (Linux numbering) for a WASI
@@ -16577,6 +16626,12 @@ type wasiSignalsDue struct {
 	// alarm is the command the guest has become (Proc_exec), to be sent
 	// the interval timer's SIGALRM (fireDueTimerLocked).
 	alarm *os.Process
+	// alarmToOffer records a firing of the interval timer to offer
+	// WASIConfig.TakeSignal (fireDueTimerLocked); alarmFor, the thread whose
+	// own host call it came due in, to post it for if not taken
+	// (postForGuestLocked), nil for the host's timer.
+	alarmToOffer bool
+	alarmFor     *wasiSignalThread
 }
 
 // wasiRaise is a flag word to raise for the signals of bits, posted for
@@ -16932,6 +16987,9 @@ func (w *WasiStubs) unlockSignals() {
 	if due.alarm != nil {
 		w.reportError("proc_itimer", signalHostProc(due.alarm, wasiSIGALRM))
 	}
+	if due.alarmToOffer {
+		w.offerAlarm(due.alarmFor)
+	}
 	// The flags are raised first: a blocking call that a signal interrupts
 	// ends with its thread's flag up, for the guest to find the signal.
 	for _, r := range due.raises {
@@ -17170,7 +17228,7 @@ func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 // holds w.sig.mu, which it holds again on return.
 func (w *WasiStubs) postDueTimerLocked(t *wasiSignalThread) {
 	w.postForGuestLocked(t, w.fireDueTimerLocked)
-	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil {
+	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil || w.sig.due.alarmToOffer {
 		w.unlockSignals()
 		w.sig.mu.Lock()
 	}
@@ -17431,13 +17489,14 @@ func (w *WasiStubs) startTimerLocked(value, every time.Duration) {
 }
 
 // fireDueTimerLocked makes the firing of the interval timer whose time has
-// come: SIGALRM is posted, and the timer is set for its next firing or is
-// over. The host's own timer does this when it runs, which is some time
-// after the moment it was set for; a blocking call of the guest's does it
-// when it begins and when it ends, so that the guest sees the two in the
-// order of their times — a wait that ended by a timeout later than the
-// timer's time ends after the signal was posted, as it does when a kernel
-// keeps both (alarm(1); sleep(1) finds its handler run when sleep is over).
+// come: SIGALRM is posted (offered WASIConfig.TakeSignal first), and the
+// timer is set for its next firing or is over. The host's own timer does
+// this when it runs, which is some time after the moment it was set for; a
+// blocking call of the guest's does it when it begins and when it ends, so
+// that the guest sees the two in the order of their times — a wait that
+// ended by a timeout later than the timer's time ends after the signal was
+// posted, as it does when a kernel keeps both (alarm(1); sleep(1) finds its
+// handler run when sleep is over).
 // Caller holds w.sig.mu.
 func (w *WasiStubs) fireDueTimerLocked() {
 	s := &w.sig
@@ -17468,7 +17527,25 @@ func (w *WasiStubs) fireDueTimerLocked() {
 		}
 		return
 	}
+	if w.cfg.TakeSignal != nil {
+		// Offered once w.sig.mu is let go (unlockSignals).
+		s.due.alarmToOffer, s.due.alarmFor = true, s.quiet
+		return
+	}
 	w.postSignalLocked(wasiSIGALRM)
+}
+
+// offerAlarm offers SIGALRM, the firing of the interval timer, to
+// WASIConfig.TakeSignal, and posts it when it is not taken, from the host
+// call of the thread t (postForGuestLocked) when t is not nil. Caller holds
+// neither w.mu nor w.sig.mu; a stream's write lock may be held.
+func (w *WasiStubs) offerAlarm(t *wasiSignalThread) {
+	if w.takeSignal(wasiSIGALRM) {
+		return
+	}
+	w.sig.mu.Lock()
+	w.postForGuestLocked(t, func() { w.postSignalLocked(wasiSIGALRM) })
+	w.unlockSignals()
 }
 
 // postForGuestLocked runs post, which posts signals while the guest's own
