@@ -1284,10 +1284,11 @@ func TestReportErrorGoesToErrors(t *testing.T) {
 	}
 }
 
-// A forked instance's guest changes its own ids, groups and nice value, as
-// Linux's calls change a process's: the ProcessChanges is not reached, the
-// root's guest reads what it read, and an unprivileged copy gets EPERM where
-// Linux refuses.
+// A forked instance's guest changes its own nice value, as Linux's calls
+// change a process's, and keeps its ids and groups, whatever the
+// ProcessChanges is: a change of them that leaves them as they are
+// succeeds, any other gets EPERM. The ProcessChanges is not reached and the
+// root's guest reads what it read.
 func TestForkedInstanceChangesItsOwnProcess(t *testing.T) {
 	const out = 64
 	w, m := newProcTestStubs(t)
@@ -1358,8 +1359,9 @@ func TestForkedInstanceChangesItsOwnProcess(t *testing.T) {
 		t.Fatalf("the copy's copy's ids = %v, want the copy's %v", got, want)
 	}
 
-	// A privileged copy sets any id, and drops privilege for good.
+	// A privileged copy keeps its ids and groups too.
 	p.ids = ProcessIDs{PID: 7}
+	p.groups = []int32{100, 5}
 	w.cfg.Process = p
 	root := w.Fork()
 	t.Cleanup(func() {
@@ -1369,24 +1371,41 @@ func TestForkedInstanceChangesItsOwnProcess(t *testing.T) {
 	})
 	rm := newForkTestModule()
 	binary.LittleEndian.PutUint32(rm.memory[64:], 5)
-	if rc := root.Proc_setgroups(rm, 64, 1); rc != _wasiESUCCESS {
-		t.Fatalf("a privileged copy's setgroups rc=%d", rc)
+	if rc := root.Proc_setgroups(rm, 64, 1); rc != -_wasiEPERM {
+		t.Fatalf("a privileged copy's setgroups of other groups rc=%d, want -EPERM", rc)
 	}
-	if rc := root.Proc_setids(rm, int32(IDSetuid), 5, -1, -1); rc != _wasiESUCCESS {
-		t.Fatalf("a privileged copy's setuid(5) rc=%d", rc)
+	binary.LittleEndian.PutUint32(rm.memory[68:], 100)
+	if rc := root.Proc_setgroups(rm, 64, 2); rc != _wasiESUCCESS {
+		t.Fatalf("a privileged copy's setgroups of its groups rc=%d", rc)
 	}
-	if rc := root.Proc_setids(rm, int32(IDSetuid), 0, -1, -1); rc != -_wasiEPERM {
-		t.Fatalf("setuid(0) after dropping privilege rc=%d, want -EPERM", rc)
+	if rc := root.Proc_setids(rm, int32(IDSetuid), 5, -1, -1); rc != -_wasiEPERM {
+		t.Fatalf("a privileged copy's setuid(5) rc=%d, want -EPERM", rc)
 	}
-	if got := procIDs(t, root); got != [6]uint32{7, 0, 5, 5, 0, 0} {
-		t.Fatalf("the copy's ids = %v, want uid and euid 5", got)
+	if rc := root.Proc_setids(rm, int32(IDSetuid), 0, -1, -1); rc != _wasiESUCCESS {
+		t.Fatalf("a privileged copy's setuid(0) rc=%d", rc)
 	}
-	if got := procIDs(t, w); got != [6]uint32{7, 0, 0, 0, 0, 0} {
-		t.Fatalf("the root's ids = %v, want the Process's", got)
+	if got := procIDs(t, root); got != [6]uint32{7, 0, 0, 0, 0, 0} {
+		t.Fatalf("the copy's ids = %v, want the Process's", got)
 	}
-	if rc := root.Proc_groups(rm, 256, 4, 128); rc != _wasiESUCCESS || readU32(rm.memory, 128) != 1 || readU32(rm.memory, 256) != 5 {
-		t.Fatalf("the copy's groups rc=%d, want [5]", rc)
+	if rc := root.Proc_groups(rm, 256, 4, 128); rc != _wasiESUCCESS || readU32(rm.memory, 128) != 2 || readU32(rm.memory, 256) != 100 || readU32(rm.memory, 260) != 5 {
+		t.Fatalf("the copy's groups rc=%d, want the Process's [100 5]", rc)
 	}
+	if len(changes.changes)+len(changes.set)+len(changes.prios) != 0 {
+		t.Fatalf("the ProcessChanges was reached by a copy: %+v", changes)
+	}
+}
+
+// NewWASI refuses a ProcessChanges without a Process, which would read none
+// of its changes.
+func TestNewWASIRefusesProcessChangesWithoutProcess(t *testing.T) {
+	defer func() {
+		err, isErr := recover().(error)
+		if !isErr || !strings.Contains(err.Error(), "WASIConfig.ProcessChanges") || !strings.Contains(err.Error(), "WASIConfig.Process") {
+			t.Fatalf("NewWASI panicked with %v, want an error naming both fields", err)
+		}
+	}()
+	NewWASI(WASIConfig{ProcessChanges: &recordedChanges{}})
+	t.Fatal("NewWASI returned")
 }
 
 // HostProcessChanges's SetUmask is umask(2): set to the umask in effect, it
@@ -1472,8 +1491,8 @@ func TestForkedInstanceStartsWithTheParentsValues(t *testing.T) {
 }
 
 // With the host's ProcessChanges, whose credentials the kernel checks for
-// every instance of the family, a copy changes no ids or groups of its own:
-// EPERM.
+// every instance of the family, a copy keeps the host process's ids and
+// groups: EPERM for a change of them.
 func TestForkedInstanceChangesNoHostCredentials(t *testing.T) {
 	w, _ := newProcTestStubs(t)
 	w.cfg.Process = HostProcessUmask(0o022)
@@ -1486,10 +1505,23 @@ func TestForkedInstanceChangesNoHostCredentials(t *testing.T) {
 	})
 	cm := newForkTestModule()
 	uid := int32(os.Getuid())
-	if rc := child.Proc_setids(cm, int32(IDSetuid), uid, -1, -1); rc != -_wasiEPERM {
-		t.Fatalf("a copy's setuid to its own uid rc=%d, want -EPERM", rc)
+	if rc := child.Proc_setids(cm, int32(IDSetuid), uid, -1, -1); rc != _wasiESUCCESS {
+		t.Fatalf("a copy's setuid to its own uid rc=%d", rc)
 	}
-	if rc := child.Proc_setgroups(cm, 64, 0); rc != -_wasiEPERM {
-		t.Fatalf("a copy's setgroups rc=%d, want -EPERM", rc)
+	if rc := child.Proc_setids(cm, int32(IDSetuid), uid+1, -1, -1); rc != -_wasiEPERM {
+		t.Fatalf("a copy's setuid to another uid rc=%d, want -EPERM", rc)
+	}
+	// Windows has no groups (os.Getgroups fails): any group is another.
+	groups, err := os.Getgroups()
+	if err != nil && runtime.GOOS != "windows" {
+		t.Fatal(err)
+	}
+	other := int32(1)
+	for _, gid := range groups {
+		other = max(other, int32(gid)+1)
+	}
+	binary.LittleEndian.PutUint32(cm.memory[64:], uint32(other))
+	if rc := child.Proc_setgroups(cm, 64, 1); rc != -_wasiEPERM {
+		t.Fatalf("a copy's setgroups of a group it is not in rc=%d, want -EPERM", rc)
 	}
 }
