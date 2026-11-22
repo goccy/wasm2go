@@ -117,6 +117,22 @@ func guestSignalOf(hostSig syscall.Signal) int32 {
 	return 0
 }
 
+// hostSetUmask sets the umask of the host process to the permission bits of
+// mask (umask(2)) and returns the previous one.
+func hostSetUmask(mask os.FileMode) (os.FileMode, error) {
+	s := &hostUmaskState
+	s.read.Do(func() {})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev := os.FileMode(syscall.Umask(int(mask.Perm()))).Perm()
+	s.known, s.mask = true, mask.Perm()
+	return prev, nil
+}
+
+// hostSetThreadUmask sets the umask of a creation thread (umask(2) on it,
+// whose file system attributes are its own).
+func hostSetThreadUmask(mask os.FileMode) { syscall.Umask(int(mask.Perm())) }
+
 // hostProcessTimes returns the CPU time of the host process — user, then
 // system — and of the children it has waited for.
 func hostProcessTimes() (ProcessTimes, error) {

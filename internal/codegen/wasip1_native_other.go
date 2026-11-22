@@ -11,6 +11,21 @@ import (
 	"time"
 )
 
+// hostSetUmask: this platform has no umask(2) the runtime can set.
+func hostSetUmask(mask os.FileMode) (os.FileMode, error) { return 0, errors.ErrUnsupported }
+
+// hostThreadUmask says that no thread here has a umask of its own.
+const hostThreadUmask = false
+
+// hostOnMainThread: no creation thread is made here.
+func hostOnMainThread() bool { return false }
+
+// hostUnshareFS: no thread here has file system attributes of its own.
+func hostUnshareFS() error { return errors.ErrUnsupported }
+
+// hostSetThreadUmask: this platform has no umask.
+func hostSetThreadUmask(mask os.FileMode) {}
+
 // hostProcessTimes returns the CPU time of the host process and of its
 // children, which the runtime cannot read on this platform.
 func hostProcessTimes() (ProcessTimes, error) {

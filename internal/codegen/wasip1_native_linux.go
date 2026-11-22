@@ -98,6 +98,27 @@ func lstatAt(dir *os.File, name string) (os.FileInfo, error) {
 	return fi, nil
 }
 
+// hostThreadUmask says that a thread here can have a umask of its own
+// (creationThread).
+const hostThreadUmask = true
+
+// hostOnMainThread reports whether the calling thread is the main thread
+// of the process, whose thread id is the process id: the thread the
+// runtime cannot discard. In a program built with -buildmode=c-archive or
+// c-shared the main thread is the host program's, which the runtime
+// reaches only through a call the host program makes on it; it is the
+// thread checked all the same.
+func hostOnMainThread() bool { return syscall.Gettid() == syscall.Getpid() }
+
+// hostUnshareFS gives the calling thread file system attributes of its
+// own: unshare(2) with CLONE_FS.
+func hostUnshareFS() error {
+	if err := syscall.Unshare(syscall.CLONE_FS); err != nil {
+		return os.NewSyscallError("unshare", err)
+	}
+	return nil
+}
+
 // chmodRefused reports whether err is chmod(2)'s refusal of a mode bit to
 // this user, EPERM: a setgid bit of a group the user is not in.
 func chmodRefused(err error) bool { return errors.Is(err, syscall.EPERM) }
@@ -117,9 +138,16 @@ func hostFDLink(fd uintptr) (string, bool, error) {
 }
 
 // readHostUmask returns the file mode creation mask of the host process,
-// from /proc/self/status.
+// from /proc/thread-self/status.
 func readHostUmask() (os.FileMode, error) {
-	return statusUmask("/proc/self/status")
+	// The calling thread's, which no creation thread is: its goroutine
+	// runs on none. A kernel before 3.17 has no /proc/thread-self; the
+	// main thread's (/proc/self) is then read, which none is either.
+	mask, err := statusUmask("/proc/thread-self/status")
+	if errors.Is(err, fs.ErrNotExist) {
+		return statusUmask("/proc/self/status")
+	}
+	return mask, err
 }
 
 // statusUmask returns the umask the "Umask:" line of the process status file

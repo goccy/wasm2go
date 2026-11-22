@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1318,7 +1319,32 @@ func exerciseCreationModes(t *testing.T, w *WasiStubs, m *Module, host os.FileMo
 func TestWasi_CreationModeAppliesUmask(t *testing.T) {
 	skipWithoutPOSIXFiles(t)
 	w, m := newProcTestStubs(t)
-	exerciseCreationModes(t, w, m, hostUmask(t))
+	exerciseCreationModes(t, w, m, hostTakesOut(t))
+}
+
+// hostTakesOut returns the mask the host's filesystem takes out of a mode
+// besides the instance's umask: none where the instance's creation thread
+// has the umask (creationThreads), the host process's elsewhere.
+func hostTakesOut(t *testing.T) os.FileMode {
+	if creationThreads(t) {
+		return 0
+	}
+	return hostUmask(t)
+}
+
+// creationThreads reports whether an instance here gets a creation thread:
+// on a system with a umask for each thread (hostThreadUmask), one that does
+// not refuse unshare(2) (Docker's default seccomp profile does).
+func creationThreads(t *testing.T) bool {
+	t.Helper()
+	if !hostThreadUmask {
+		return false
+	}
+	if err := creationThreadsRefused(); err != nil {
+		t.Logf("no creation thread: %v", err)
+		return false
+	}
+	return true
 }
 
 func TestWasi_CreationModeAppliesUmaskOnMemFS(t *testing.T) {
@@ -1333,7 +1359,7 @@ func TestWasi_CreationModeKeepsSpecialBits(t *testing.T) {
 	skipWithoutPOSIXFiles(t)
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
-	less := uint32(hostUmask(t) | 0o022)
+	less := uint32(hostTakesOut(t) | 0o022)
 	w.Proc_umask(m, 0o022)
 	if got, want := mkdirWithMode(t, w, m, "sticky", 0o1777), 0o1777&^less; got != want {
 		t.Errorf("directory 01777 = %o, want %o", got, want)
@@ -1409,5 +1435,49 @@ func TestWasi_UmaskIsTheInstancesOwn(t *testing.T) {
 	}
 	if got := hostUmask(t); got != host {
 		t.Fatalf("host umask = %o after the guest set its own, want %o", got, host)
+	}
+}
+
+// The umask the root instance's guest sets goes to the ProcessChanges as
+// well; a forked instance's is its own. Each instance's files get its own
+// mask.
+func TestWasi_UmaskOfTheRootGoesToTheProcessChanges(t *testing.T) {
+	w, m, _ := memTestStubs(t)
+	changes := &recordedChanges{}
+	w.cfg.ProcessChanges = changes
+	child := w.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	cm := newForkTestModule()
+	if prev := w.Proc_umask(m, 0o077); prev != 0o022 {
+		t.Fatalf("umask returned %o, want the starting umask 022", prev)
+	}
+	if prev := child.Proc_umask(cm, 0o002); prev != 0o022 {
+		t.Fatalf("the copy's umask returned %o, want the starting umask 022", prev)
+	}
+	if !slices.Equal(changes.umasks, []os.FileMode{0o077}) {
+		t.Fatalf("the ProcessChanges was given %o, want the root's 077 alone", changes.umasks)
+	}
+	if got := createWithMode(t, w, m, "root", 0o666); got != 0o600 {
+		t.Errorf("file 0666 of the root under 077: %o, want 600", got)
+	}
+	if got := createWithMode(t, child, cm, "copy", 0o666); got != 0o664 {
+		t.Errorf("file 0666 of the copy under 002: %o, want 664", got)
+	}
+	changes.err = errors.New("refused")
+	var told []error
+	w.cfg.Errors = func(op string, err error) {
+		if op == "proc_umask" {
+			told = append(told, err)
+		}
+	}
+	if prev := w.Proc_umask(m, 0o027); prev != 0o077 {
+		t.Fatalf("umask returned %o, want 077", prev)
+	}
+	if len(told) != 1 || !errors.Is(told[0], changes.err) {
+		t.Fatalf("errors told: %v, want the ProcessChanges's", told)
 	}
 }

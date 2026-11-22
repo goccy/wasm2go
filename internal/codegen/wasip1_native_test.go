@@ -80,6 +80,17 @@ func newTestStubs(t *testing.T, dir string) (*WasiStubs, *Module) {
 		Exec:      AllowAllExec,
 	})
 	m := newGuestModule(1 << 16)
+	// The instance's creation thread, if it makes one, ends with the test
+	// (CloseAll ends it too, but some tests close descriptors behind the
+	// table's back, which CloseAll reports).
+	t.Cleanup(func() {
+		w.mu.Lock()
+		creations := w.creations
+		w.mu.Unlock()
+		if creations != nil {
+			creations.close()
+		}
+	})
 	return w, m
 }
 
