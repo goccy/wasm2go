@@ -1,6 +1,6 @@
 module github.com/goccy/wasm2go
 
-go 1.25.0
+go 1.25.12
 
 require github.com/tetratelabs/wazero v1.11.0
 
