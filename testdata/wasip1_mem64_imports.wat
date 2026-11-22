@@ -205,13 +205,13 @@
   (import "wasi_snapshot_preview1" "sock_connect"
     (func $sock_connect (param i32 i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "sock_accept"
-    (func $sock_accept (param i32 i32 i64) (result i32)))
+    (func $sock_accept (param i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_recv"
-    (func $sock_recv (param i32 i64 i64 i32 i64 i64) (result i32)))
+    (func $sock_recv (param i64 i64 i64 i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_send"
-    (func $sock_send (param i32 i64 i64 i32 i64) (result i32)))
+    (func $sock_send (param i64 i64 i64 i64 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_shutdown"
-    (func $sock_shutdown (param i32 i32) (result i32)))
+    (func $sock_shutdown (param i64 i64) (result i32)))
   (import "wasip1_posix_extension" "sock_open"
     (func $sock_open (param i32 i32) (result i32)))
   (import "wasip1_posix_extension" "sock_bind_addr"
@@ -363,10 +363,10 @@
     (drop (call $sock_host_by_name (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_socket (i32.const 0) (i32.const 0)))
     (drop (call $sock_connect (i32.const 0) (i32.const 0) (i32.const 0)))
-    (drop (call $sock_accept (i32.const 0) (i32.const 0) (i64.const 0)))
-    (drop (call $sock_recv (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
-    (drop (call $sock_send (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
-    (drop (call $sock_shutdown (i32.const 0) (i32.const 0)))
+    (drop (call $sock_accept (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_recv (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_send (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_shutdown (i64.const 0) (i64.const 0)))
     (drop (call $sock_open (i32.const 0) (i32.const 0)))
     (drop (call $sock_bind_addr (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
     (drop (call $sock_listen (i32.const 0) (i32.const 0)))
