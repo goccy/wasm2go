@@ -30,6 +30,18 @@ func newSignalGuest(t *testing.T, handled ...int32) (*WasiStubs, *Module) {
 	setDispositions(t, w, m, signalMask(handled...), 0, 0)
 	return w, m
 }
+
+// ignoreSIGPIPE has the guest of w register for signals and ignore SIGPIPE,
+// as a program that sets SIG_IGN for it: a write to a broken pipe or
+// connection is EPIPE alone.
+func ignoreSIGPIPE(t *testing.T, w *WasiStubs, m *Module) {
+	t.Helper()
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc < 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	setDispositions(t, w, m, 0, signalMask(wasiSIGPIPE), 0)
+}
+
 func signalMask(sigs ...int32) uint64 {
 	var mask uint64
 	for _, sig := range sigs {

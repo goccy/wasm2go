@@ -657,6 +657,7 @@ func TestWasi_PollReportsNoRoomInATerminalOpenForReading(t *testing.T) {
 func TestWasi_SendIsAWriteOfTheStream(t *testing.T) {
 	skipWithoutStreamWrites(t)
 	w, m := newProcTestStubs(t)
+	ignoreSIGPIPE(t, w, m)
 	local, remote := unixConnPair(t)
 	w.mu.Lock()
 	fd := w.addFDLocked(&wasiOpen{conn: local})

@@ -4966,7 +4966,20 @@ func (w *WasiStubs) writeFd(call string, op *wasiOpen, dst io.Writer, bufs [][]b
 // libc).
 const (
 	wasiMsgDontWait int32 = 4 // this call does not wait, whatever O_NONBLOCK says
+	wasiMsgNoSignal int32 = 8 // a broken pipe or connection is EPIPE without SIGPIPE
 )
+
+// signalBrokenPipe returns errno, the outcome of a write or send with flags
+// (wasiMsg...). A write to a pipe or socket nobody reads from any more is
+// EPIPE, and the kernel sends the writer SIGPIPE as well unless the send
+// asked for none (wasiMsgNoSignal): the guest's own call raises it, as
+// raise(3) does.
+func (w *WasiStubs) signalBrokenPipe(errno, flags int32) int32 {
+	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 {
+		w.raiseOwn(wasiSIGPIPE)
+	}
+	return errno
+}
 
 // writeStream writes bufs to a stream whose write can block, as the guest
 // asked for it. A non-blocking descriptor (O_NONBLOCK) takes what there is
@@ -5421,13 +5434,13 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 			n, errno = w.socketSend("fd_write", op, host, bufs, 0, nil, "")
 		}
 		abi.putWord(nwrittenSlice, n)
-		return errno
+		return w.signalBrokenPipe(errno, 0)
 	}
 	if dst == nil {
 		abi.putWord(nwrittenSlice, 0)
 		if op.socket() {
 			// a write of a socket without a connection, as on linux
-			return _wasiEPIPE
+			return w.signalBrokenPipe(_wasiEPIPE, 0)
 		}
 		return _wasiEBADF
 	}
@@ -5437,7 +5450,7 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	}
 	n, errno := w.writeFd("fd_write", op, dst, bufs, 0)
 	abi.putWord(nwrittenSlice, n)
-	return op.afterShutdown(errno, true)
+	return w.signalBrokenPipe(op.afterShutdown(errno, true), 0)
 }
 
 // socketConn returns the entry of the socket fd and its connection, or
@@ -8617,7 +8630,7 @@ func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen
 		}
 		n, errno := w.socketSend("sock_send", op, host, bufs, siFlags, nil, "")
 		if errno != _wasiESUCCESS {
-			return errno
+			return w.signalBrokenPipe(errno, siFlags)
 		}
 		abi.putWord(lenOut, n)
 		return _wasiESUCCESS
@@ -8628,7 +8641,7 @@ func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen
 	op, conn, errno := w.socketConn(fd)
 	if errno == _wasiENOTCONN {
 		// a send of a socket without a connection, as on linux
-		return _wasiEPIPE
+		return w.signalBrokenPipe(_wasiEPIPE, siFlags)
 	}
 	if conn == nil {
 		return errno
@@ -8639,7 +8652,7 @@ func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen
 	// The send writes the stream as fd_write does.
 	n, errno := w.writeFd("sock_send", op, conn, bufs, siFlags)
 	if errno = op.afterShutdown(errno, true); errno != _wasiESUCCESS {
-		return errno
+		return w.signalBrokenPipe(errno, siFlags)
 	}
 	abi.putWord(lenOut, n)
 	return _wasiESUCCESS
@@ -9560,8 +9573,9 @@ func (w *WasiStubs) sockName(m *Module, fd, peer int32, addrPtr uint64) int32 {
 // count sent (u32) at sentPtr. A datagram socket's send to an address asks
 // the Dial policy about it, and the Listen policy about the socket's own
 // address the first time it makes the host bind the socket (see
-// allowReachable). flags are the send's (wasiMsgDontWait). Returns 0 or a
-// negative errno: EACCES when a policy refuses, and the host's.
+// allowReachable). flags are the send's (wasiMsgDontWait, wasiMsgNoSignal).
+// Returns 0 or a negative errno: EACCES when a policy refuses, and the
+// host's.
 func (w *WasiStubs) Sock_sendto_addr(m *Module, fd, bufPtr, bufLen, flags, addrPtr, pathPtr, pathLen, sentPtr int32) int32 {
 	return w.sockSendtoAddr(m, fd, zext(bufPtr), bufLen, flags, zext(addrPtr), zext(pathPtr), pathLen, zext(sentPtr))
 }
@@ -9613,7 +9627,7 @@ func (w *WasiStubs) sockSendtoAddr(m *Module, fd int32, bufPtr uint64, bufLen, f
 	}
 	n, errno := w.socketSend("sock_sendto_addr", op, host, [][]byte{buf}, flags&wasiMsgDontWait, to, hostPath)
 	binary.LittleEndian.PutUint32(out, uint32(n))
-	return -errno
+	return -w.signalBrokenPipe(errno, flags)
 }
 
 // Sock_recvfrom_addr is a NON-STANDARD host import (module
