@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -1158,7 +1159,7 @@ func TestSignal_ForkChildKillsTheRoot(t *testing.T) {
 // they lie where the tokens are.
 func TestSignal_TokensAvoidTheRootsIDs(t *testing.T) {
 	root, _ := newProcTestStubs(t)
-	root.cfg.Process = testProcess{ids: ProcessIDs{PID: 1001, PPID: 1003}}
+	root.cfg.Process = testProcess{ids: ProcessIDs{PID: wasiFirstPID + 1, PPID: wasiFirstPID + 3}}
 	child, first, exited := root.ForkProc()
 	defer exited(0)
 	t.Cleanup(func() {
@@ -1170,8 +1171,31 @@ func TestSignal_TokensAvoidTheRootsIDs(t *testing.T) {
 	defer secondExited(0)
 	third, thirdExited := child.NewProc(nil)
 	defer thirdExited(0)
-	if first != 1000 || second != 1002 || third != 1004 {
-		t.Fatalf("tokens = %d, %d, %d; want 1000, 1002, 1004", first, second, third)
+	if first != wasiFirstPID || second != wasiFirstPID+2 || third != wasiFirstPID+4 {
+		t.Fatalf("tokens = %d, %d, %d; want the first token and 0, 2, 4", first, second, third)
+	}
+}
+
+// The tokens lie above every pid of the host's (Linux's PID_MAX_LIMIT), so
+// that a pid of the host's goes to the Signals whatever tokens the family
+// has handed out.
+func TestSignal_TokensAreNoHostPIDs(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	s := &recordingSignals{}
+	w.cfg.Signals = s
+	first, firstExited := w.NewProc(nil)
+	defer firstExited(0)
+	second, secondExited := w.NewProc(nil)
+	defer secondExited(0)
+	if first < 4194304 || second < 4194304 {
+		t.Fatalf("tokens = %d, %d, want 4194304 or above", first, second)
+	}
+	const hostPID = 1001
+	if rc := w.Proc_kill(m, hostPID, wasiSIGTERM); rc != _wasiESUCCESS {
+		t.Fatalf("kill of the host's pid %d rc=%d, want 0", hostPID, rc)
+	}
+	if want := [][2]int32{{hostPID, wasiSIGTERM}}; !slices.Equal(s.kills, want) {
+		t.Fatalf("the Signals was given %v, want %v", s.kills, want)
 	}
 }
 

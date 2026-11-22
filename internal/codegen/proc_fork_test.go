@@ -403,8 +403,8 @@ func TestWasi_NewProcWait(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	const statusOff int32 = 4004
 	pid, exited := w.NewProc(nil)
-	if pid != 1000 {
-		t.Errorf("first pid = %d, want 1000", pid)
+	if pid != wasiFirstPID {
+		t.Errorf("first pid = %d, want %d", pid, wasiFirstPID)
 	}
 	if rc := w.Proc_wait(m, pid, 1, statusOff); rc != -_wasiEAGAIN {
 		t.Fatalf("WNOHANG while running rc=%d, want -EAGAIN", rc)
@@ -632,8 +632,8 @@ func TestWasi_ForkFamilyPidsUnique(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	const statusOff int32 = 4004
 	first, _ := w.NewProc(nil)
-	if first != 1000 {
-		t.Errorf("first pid = %d, want 1000", first)
+	if first != wasiFirstPID {
+		t.Errorf("first pid = %d, want %d", first, wasiFirstPID)
 	}
 	child := w.Fork()
 	grandchild := child.Fork()
@@ -660,8 +660,8 @@ func TestWasi_ForkFamilyPidsUnique(t *testing.T) {
 	freshChild := fresh.Fork()
 	a, _ := freshChild.NewProc(nil)
 	b, _ := fresh.NewProc(nil)
-	if a != 1000 || b != 1001 {
-		t.Errorf("pids = %d, %d, want 1000, 1001", a, b)
+	if a != wasiFirstPID || b != wasiFirstPID+1 {
+		t.Errorf("pids = %d, %d, want the first token and the next", a, b)
 	}
 }
 
