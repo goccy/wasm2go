@@ -434,14 +434,56 @@ func TestWasi_LargeWriteToABlockingPipeIsOneCall(t *testing.T) {
 	}
 }
 
-// openFDs returns how many descriptors the process has open.
-func openFDs(t *testing.T) int {
+// fdIdentity is what a descriptor of the process refers to.
+type fdIdentity struct{ dev, ino uint64 }
+
+// openFDs returns the descriptors the process has open, each with what it
+// refers to, so that newFDs counts the ones opened since. A count of them
+// would not do: a file an earlier test left to its finalizer may be closed
+// in between.
+func openFDs(t *testing.T) map[int]fdIdentity {
 	t.Helper()
-	entries, err := os.ReadDir("/dev/fd")
+	// The names only: os.ReadDir also stats an entry whose type darwin does
+	// not report, which fails for a descriptor closed meanwhile.
+	dir, err := os.Open("/dev/fd")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(entries)
+	names, err := dir.Readdirnames(-1)
+	if err := errors.Join(err, dir.Close()); err != nil {
+		t.Fatal(err)
+	}
+	fds := make(map[int]fdIdentity, len(names))
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st syscall.Stat_t
+		if err := syscall.Fstat(fd, &st); err != nil {
+			if errors.Is(err, syscall.EBADF) {
+				// Closed since it was listed: the descriptor /dev/fd was read
+				// through, or a file an earlier test left to its finalizer.
+				continue
+			}
+			t.Fatal(err)
+		}
+		fds[fd] = fdIdentity{uint64(st.Dev), st.Ino}
+	}
+	return fds
+}
+
+// newFDs returns how many of the descriptors open now (openFDs) were not
+// open before, or refer to another file than they did.
+func newFDs(t *testing.T, before map[int]fdIdentity) int {
+	t.Helper()
+	n := 0
+	for fd, id := range openFDs(t) {
+		if was, ok := before[fd]; !ok || was != id {
+			n++
+		}
+	}
+	return n
 }
 
 // Polls waiting for many descriptors, one after another, open none of their
@@ -472,15 +514,15 @@ func TestWasi_PollOfManyPipesOpensNoDescriptors(t *testing.T) {
 		during := make(chan int, 1)
 		go func() {
 			time.Sleep(50 * time.Millisecond)
-			during <- openFDs(t)
+			during <- newFDs(t, before)
 		}()
 		poll(100 * time.Millisecond)
-		if n := <-during; n > before {
-			t.Fatalf("%d descriptors were open while the poll waited, %d before", n, before)
+		if n := <-during; n != 0 {
+			t.Fatalf("%d descriptors were opened while the poll waited", n)
 		}
 	}
-	if n := openFDs(t); n != before {
-		t.Fatalf("%d descriptors are open after the polls, %d before", n, before)
+	if n := newFDs(t, before); n != 0 {
+		t.Fatalf("%d descriptors are open after the polls that were not before", n)
 	}
 }
 
@@ -924,8 +966,8 @@ func TestSignal_EndsTheBlockingCallsOfAnUnregisteredGuest(t *testing.T) {
 			}
 			if tc.name == "poll" {
 				// The wake pipe went back to the pool.
-				if n := openFDs(t); n != before+2 {
-					t.Fatalf("%d descriptors are open, %d before the poll", n, before)
+				if n := newFDs(t, before); n != 2 {
+					t.Fatalf("%d descriptors are open that were not before the poll, want the wake pipe's 2", n)
 				}
 			}
 			if rc := fdWriteString(child, newForkTestModule(), writeFd, "x"); rc != _wasiESUCCESS {
