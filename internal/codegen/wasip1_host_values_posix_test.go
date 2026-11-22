@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -392,17 +393,26 @@ func TestOpenOfAFIFOWithoutWaiting(t *testing.T) {
 	if rc := w.Path_open(m, 3, 1, path, pathLen, 0, rightsWrite, 0, nonblock, fdOut); rc != _wasiESUCCESS {
 		t.Fatalf("open for writing without waiting, somebody reading: rc=%d", rc)
 	}
-	// The host's descriptor waits: the guest's NONBLOCK is its fdflags.
+	// The guest's NONBLOCK is its fdflags: the host's descriptor waits
+	// unless the Go runtime polls it.
 	w.mu.Lock()
 	op := w.openLocked(int32(readU32(m.memory, fdOut)))
 	w.mu.Unlock()
-	if err := withHostDescriptor(op.f.(*os.File), func(fd uintptr) error {
+	file := op.f.(*os.File)
+	polled := true
+	switch err := file.SetReadDeadline(time.Time{}); {
+	case errors.Is(err, os.ErrNoDeadline):
+		polled = false
+	case err != nil:
+		t.Fatal(err)
+	}
+	if err := withHostDescriptor(file, func(fd uintptr) error {
 		flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_GETFL, 0)
 		if errno != 0 {
 			return errno
 		}
-		if flags&syscall.O_NONBLOCK != 0 {
-			return errors.New("the host descriptor is O_NONBLOCK")
+		if (flags&syscall.O_NONBLOCK != 0) != polled {
+			return fmt.Errorf("the host descriptor's O_NONBLOCK is %v, the Go runtime polls it: %v", flags&syscall.O_NONBLOCK != 0, polled)
 		}
 		return nil
 	}); err != nil {

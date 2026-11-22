@@ -98,9 +98,14 @@ func guestSignalOf(hostSig syscall.Signal) int32 {
 	return 0
 }
 
-// descriptorWaits reports whether a call on the descriptor waits when there
-// is nothing for it, which the runtime cannot tell on this platform.
-func descriptorWaits(fd uintptr) bool { return true }
+// hostMayBlock reports whether a call on the descriptor can wait in the
+// kernel when there is nothing for it, which the runtime cannot tell on this
+// platform.
+func hostMayBlock(fd uintptr) bool { return true }
+
+// duplicateDescriptor would duplicate the descriptor of f, which the runtime
+// cannot do on this platform.
+func duplicateDescriptor(f syscall.Conn) (int, error) { return -1, errors.ErrUnsupported }
 
 // readvRaw would read with readv(2), which the runtime cannot do on this
 // platform.

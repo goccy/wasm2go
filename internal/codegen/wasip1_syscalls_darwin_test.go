@@ -8,6 +8,9 @@ import (
 	"testing"
 )
 
+// dupTo makes descriptor to a duplicate of from, closing what it was.
+func dupTo(from, to int) error { return syscall.Dup2(from, to) }
+
 // darwin makes getrandom by getentropy, 256 bytes a call, and refuses what
 // Linux refuses.
 func TestHostSyscalls_GetrandomOfDarwin(t *testing.T) {

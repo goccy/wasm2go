@@ -5,8 +5,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
+
+// dupTo makes descriptor to a duplicate of from, closing what it was
+// (dup2). (Package syscall has Dup2 on some Linux architectures only.)
+func dupTo(from, to int) error { return syscall.Dup3(from, to, 0) }
 
 // statusUmask reads the umask of a status file, and fails for one it cannot
 // read: ErrUnsupported for a status without a umask.

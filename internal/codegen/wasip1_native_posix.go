@@ -152,10 +152,11 @@ func hostProcessTimes() (ProcessTimes, error) {
 	}, nil
 }
 
-// descriptorWaits reports whether a call on the descriptor waits when there
-// is nothing for it: it is not in non-blocking mode, which the descriptors
-// the runtime polls are. Such a descriptor cannot be asked what is there.
-func descriptorWaits(fd uintptr) bool {
+// hostMayBlock reports whether a call on the descriptor can wait in the
+// kernel when there is nothing for it: its open file description is not in
+// non-blocking mode (O_NONBLOCK), or cannot be asked. The mode is the open
+// file description's, which whoever shares it can change at any time.
+func hostMayBlock(fd uintptr) bool {
 	flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
 	return err != nil || flags&syscall.O_NONBLOCK == 0
 }
@@ -1605,6 +1606,11 @@ func (c *commandSetup) add(i int, s *commandStream, share *familyStreams, report
 			c.give(i, child)
 			return nil
 		case !copied:
+			// The command shares the entry's open file description, whose
+			// mode it can change (netpolled).
+			if s.op != nil {
+				s.op.shared.Store(true)
+			}
 			c.conns[i] = f
 			return nil
 		}
@@ -1667,7 +1673,7 @@ func (c *commandSetup) copyHost(i int, conn syscall.Conn, name string, s *comman
 	if i > 0 {
 		return c.copyOutput(i, dup, dup, s, nil, report)
 	}
-	var back func([]byte)
+	var back func([]byte) error
 	if s.op != nil && !s.op.dgram {
 		back = s.op.giveAhead
 	}
@@ -1702,7 +1708,7 @@ func (c *commandSetup) copyOutput(i int, dst io.Writer, owned io.Closer, s *comm
 // copies src to (inputCopy), which it returns. What the command does not
 // read goes to back, when it is not nil; owned, when it is not nil, is
 // closed once the copy ends.
-func (c *commandSetup) copyInput(src io.Reader, owned io.Closer, s *commandStream, back func([]byte), report func(error)) (*inputCopy, error) {
+func (c *commandSetup) copyInput(src io.Reader, owned io.Closer, s *commandStream, back func([]byte) error, report func(error)) (*inputCopy, error) {
 	r, wr, err := runtimePipe()
 	if err != nil {
 		return nil, errors.Join(err, closeIfAny(owned))
@@ -1976,7 +1982,7 @@ type inputCopy struct {
 	dst     *os.File
 	keep    *os.File
 	owned   io.Closer
-	back    func([]byte)
+	back    func([]byte) error
 	report  func(error)
 	// reading records that the copy is in a read of src; stopping that
 	// finish asks it to stop; settled that finish has given back what the
@@ -2037,12 +2043,14 @@ func (c *inputCopy) giveBack(b []byte) {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.settled {
 		c.rest = append(c.rest, b...)
+		c.mu.Unlock()
 		return
 	}
-	c.back(slices.Clone(b))
+	err := c.back(slices.Clone(b))
+	c.mu.Unlock()
+	c.report(err)
 }
 
 // finish ends the copy for a command that has ended: a write deadline in
@@ -2078,20 +2086,28 @@ func (c *inputCopy) finish() {
 	left, err := readAvailable(c.keep)
 	c.report(errors.Join(err, c.keep.Close()))
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.settled = true
 	left = append(left, c.rest...)
 	c.rest = nil
+	var backErr error
 	if len(left) > 0 {
-		c.back(left)
+		backErr = c.back(left)
 	}
+	c.mu.Unlock()
+	c.report(backErr)
 }
 
 // giveAhead puts b, input a command was given of the descriptor and did not
 // read, after the input taken out of the stream before (ahead), for the
-// guest's next read of it.
-func (op *wasiOpen) giveAhead(b []byte) {
+// guest's next read of it, and wakes the waits for the descriptor's input,
+// which find it there: those in poll(2) (waitHostReady) and the one in the
+// Go runtime's poller (watchAhead).
+func (op *wasiOpen) giveAhead(b []byte) error {
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	op.ahead = append(op.ahead, b...)
+	if op.inputWake != nil {
+		op.inputWake()
+	}
+	return op.wakeWaitersLocked()
 }
