@@ -678,7 +678,7 @@ func hostSocketType(dgram bool) int {
 func openHostSocket(family int32, dgram bool) (*os.File, error) {
 	fd, err := hostSocketFD(hostDomain(family), hostSocketType(dgram))
 	if err != nil {
-		return nil, os.NewSyscallError("socket", err)
+		return nil, err
 	}
 	return os.NewFile(uintptr(fd), "socket"), nil
 }
@@ -688,7 +688,7 @@ func openHostSocket(family int32, dgram bool) (*os.File, error) {
 func hostSocketPair(dgram bool) (a, b *os.File, err error) {
 	fds, err := hostSocketPairFDs(hostSocketType(dgram))
 	if err != nil {
-		return nil, nil, os.NewSyscallError("socketpair", err)
+		return nil, nil, err
 	}
 	return os.NewFile(uintptr(fds[0]), "socket"), os.NewFile(uintptr(fds[1]), "socket"), nil
 }
@@ -748,7 +748,7 @@ func hostAccept(fd int) (conn int, again bool, err error) {
 		case errors.Is(err, syscall.EAGAIN):
 			return -1, true, nil
 		}
-		return -1, false, os.NewSyscallError("accept", err)
+		return -1, false, err
 	}
 }
 

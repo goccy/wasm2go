@@ -52,6 +52,7 @@ import (
 	"maps"
 	"math/bits"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
@@ -1990,10 +1991,13 @@ type WASIConfig struct {
 	// ("@name" for an abstract name). Returning false denies it (EACCES).
 	// nil denies every one.
 	Listen func(network, address string) bool
-	// Resolve is consulted before a name lookup (Sock_getaddrinfo) with the
-	// requested host. Returning false denies the resolution (the guest sees
-	// a name-resolution error). nil denies every one. An empty host is the
-	// exception: it resolves to INADDR_ANY without Resolve.
+	// Resolve is consulted before a name lookup (Sock_getaddrinfo,
+	// Sock_resolve, Sock_host_by_name) with the requested host, and before
+	// a reverse lookup (Sock_reverse_addr) with the IP address in text.
+	// Returning false denies the resolution (the guest sees a
+	// name-resolution error). nil denies every one. An address written in
+	// numbers is no lookup and is not asked about, nor is an empty host of
+	// Sock_getaddrinfo, which resolves to INADDR_ANY.
 	Resolve func(host string) bool
 	// Exec is consulted before every Proc_spawn, which runs a host binary,
 	// with the executable path and argv. Returning false denies the spawn
@@ -3432,20 +3436,34 @@ func mapExecError(err error) int32 {
 
 // Sock_getaddrinfo is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "sock_getaddrinfo") that a guest's getaddrinfo() can call. It reads the
-// host string at (nodePtr,nodeLen), consults the resolve whitelist, resolves it
-// to an IPv4 address via Go's resolver (numeric IPs pass through), and writes
-// the 4-byte network-order address at outPtr. Returns 0 on success or a negative
-// POSIX-ish errno (the caller maps it to an EAI_* code).
+// host string at (nodePtr,nodeLen), resolves it to its first IPv4 address as
+// Sock_resolve does (resolveHost), and writes the 4-byte network-order address
+// at outPtr. An empty host is INADDR_ANY. Returns 0 on success or a negative
+// POSIX-ish errno (the caller maps it to an EAI_* code): EACCES when the
+// Resolve policy refuses, ENOENT for a name without an IPv4 address,
+// EAFNOSUPPORT for an IPv6 address written in numbers, EAGAIN when the
+// lookup may succeed later, EINTR when a signal ends it.
 func (w *WasiStubs) Sock_getaddrinfo(m *Module, nodePtr, nodeLen, outPtr int32) int32 {
+	return w.sockGetaddrinfo(m, zext(nodePtr), nodeLen, zext(outPtr))
+}
+
+// Sock_getaddrinfo64 is Sock_getaddrinfo for a memory64 guest.
+func (w *WasiStubs) Sock_getaddrinfo64(m *Module, nodePtr int64, nodeLen int32, outPtr int64) int32 {
+	return w.sockGetaddrinfo(m, uint64(nodePtr), nodeLen, uint64(outPtr))
+}
+
+// sockGetaddrinfo is the body of Sock_getaddrinfo and Sock_getaddrinfo64.
+func (w *WasiStubs) sockGetaddrinfo(m *Module, nodePtr uint64, nodeLen int32, outPtr uint64) int32 {
+	w.endUnregistered()
 	host := ""
 	if nodeLen > 0 {
-		b := w.memSlice(m, nodePtr, nodeLen)
+		b := w.memBytes(m, nodePtr, zext(nodeLen))
 		if b == nil {
 			return -_wasiEFAULT
 		}
 		host = string(b)
 	}
-	out := w.memSlice(m, outPtr, 4)
+	out := w.memBytes(m, outPtr, 4)
 	if out == nil {
 		return -_wasiEFAULT
 	}
@@ -3453,38 +3471,28 @@ func (w *WasiStubs) Sock_getaddrinfo(m *Module, nodePtr, nodeLen, outPtr int32) 
 		binary.LittleEndian.PutUint32(out, 0) // INADDR_ANY
 		return _wasiESUCCESS
 	}
-	w.mu.Lock()
-	hook := w.cfg.Resolve
-	w.mu.Unlock()
-	if hook == nil || !hook(host) {
-		return -_wasiEACCES
-	}
-	// Numeric IPv4 fast path (avoids a resolver call and works offline).
-	if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			out[0], out[1], out[2], out[3] = v4[0], v4[1], v4[2], v4[3]
-			w.recordResolvedHost(v4, host)
-			return _wasiESUCCESS
-		}
+	if a, err := netip.ParseAddr(host); err == nil && !a.Unmap().Is4() {
 		return -_wasiEAFNOSUPPORT // IPv6 not supported by this import
 	}
-	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip4", host)
-	if err != nil || len(ips) == 0 {
+	found, errno := w.resolveHost(host, "ip4")
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	if len(found) == 0 {
 		return -_wasiENOENT
 	}
-	v4 := ips[0].To4()
-	if v4 == nil {
+	if !found[0].Is4() {
 		return -_wasiEAFNOSUPPORT
 	}
-	out[0], out[1], out[2], out[3] = v4[0], v4[1], v4[2], v4[3]
-	w.recordResolvedHost(v4, host)
+	v4 := found[0].As4()
+	copy(out, v4[:])
 	return _wasiESUCCESS
 }
 
-// recordResolvedHost remembers that host resolved to v4, so a later Sock_connect
-// to that IP can hand the dial hook the host name it was looked up under.
-func (w *WasiStubs) recordResolvedHost(v4 net.IP, host string) {
-	ip := fmt.Sprintf("%d.%d.%d.%d", v4[0], v4[1], v4[2], v4[3])
+// recordResolvedHost remembers that host resolved to ip, an address in
+// text (wasiSockAddr.ipText), so a later connect to it can hand the Dial
+// hook the host name it was looked up under.
+func (w *WasiStubs) recordResolvedHost(ip, host string) {
 	w.mu.Lock()
 	if w.resolvedHosts == nil {
 		w.resolvedHosts = make(map[string]string)
@@ -4083,8 +4091,9 @@ const wasiRootRights uint64 = 1<<9 | 1<<10 | 1<<11 | 1<<12 | 1<<13 | 1<<15 |
 // per-platform Fcntl wrapper. The flags are also cached on the wasiOpen
 // so a subsequent Fd_fdstat_get reflects what the guest set. Standard
 // streams store the requested flags but otherwise no-op; sockets/listeners take
-// only the cache update because Go's net layer manages blocking mode
-// internally.
+// only the cache update: a socket of the host's is in non-blocking mode from
+// its making on (see the head of the socket section), and Go's net layer
+// manages the blocking mode of its connections and listeners internally.
 func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -9246,6 +9255,286 @@ func shutdownSocket(host *os.File, how int32) int32 {
 	return mapOSError(failed)
 }
 
+// ----- name lookups -----------------------------------------------------------
+
+// lookupInterruptibly runs lookup, a lookup of the host's resolver given a
+// context, as a blocking call of the guest's: a signal posted to the guest
+// meanwhile cancels the context and ends the call with EINTR, as WASIX's
+// resolve does (glibc's getaddrinfo() goes on instead). It reports an
+// errno (lookupErrno).
+func (w *WasiStubs) lookupInterruptibly(lookup func(ctx context.Context) error) int32 {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var err error
+	interrupted, _, refused := w.blockingAttempt(cancel, nil, func(<-chan struct{}) { err = lookup(ctx) })
+	switch {
+	case refused, interrupted && err != nil:
+		return _wasiEINTR
+	case err != nil:
+		return lookupErrno(err)
+	case interrupted:
+		// The lookup went through: the next call that waits reports the
+		// signal.
+		w.keepInterrupt()
+	}
+	return _wasiESUCCESS
+}
+
+// lookupErrno is the errno of a failed lookup of the host's resolver: ENOENT
+// for a name or address it knows nothing of or a name with no address of the
+// network's family (package net's *AddrError), EAGAIN for a failure that may
+// pass (a time-out, a server that did not answer), and the error's own
+// otherwise.
+func lookupErrno(err error) int32 {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		switch {
+		case dnsErr.IsNotFound:
+			return _wasiENOENT
+		case dnsErr.IsTimeout, dnsErr.IsTemporary:
+			return _wasiEAGAIN
+		}
+	}
+	var addrErr *net.AddrError
+	if errors.As(err, &addrErr) {
+		return _wasiENOENT
+	}
+	return mapOSError(err)
+}
+
+// resolveHost returns the addresses of host on network ("ip", "ip4", "ip6"), as
+// the guest's getaddrinfo() asks for them. An address written in numbers
+// (with the zone of an IPv6 one) is converted: it is no lookup, and the
+// Resolve policy is not asked about it, as Go's net.Resolver looks up no
+// literal either. A name is looked up by the host's resolver
+// (lookupInterruptibly) once the policy allows it, and every address it
+// has is remembered under host, which the Dial policy is told of a connect
+// to it. It reports an errno: EACCES when the policy refuses, and the
+// lookup's.
+func (w *WasiStubs) resolveHost(host, network string) ([]netip.Addr, int32) {
+	if a, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{a.Unmap()}, _wasiESUCCESS
+	}
+	if !w.resolveAllowed(host) {
+		return nil, _wasiEACCES
+	}
+	var found []netip.Addr
+	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+		var err error
+		found, err = net.DefaultResolver.LookupNetIP(ctx, network, host)
+		return err
+	}); errno != _wasiESUCCESS {
+		return nil, errno
+	}
+	for i, a := range found {
+		found[i] = a.Unmap()
+		addr, err := sockAddrOf(found[i])
+		if err != nil {
+			return nil, mapOSError(err)
+		}
+		w.recordResolvedHost(addr.ipText(), host)
+	}
+	return found, _wasiESUCCESS
+}
+
+// sockAddrOf is the guest's address of the IP address a, its zone the
+// scope id (scopeOfZone).
+func sockAddrOf(a netip.Addr) (wasiSockAddr, error) {
+	if a.Is4() {
+		return wasiSockAddr{family: wasiSockFamilyIPv4, ip: a.AsSlice()}, nil
+	}
+	scope, err := scopeOfZone(a.Zone())
+	return wasiSockAddr{family: wasiSockFamilyIPv6, ip: a.AsSlice(), scope: scope}, err
+}
+
+// scopeOfZone returns the scope id of an IPv6 address whose zone package net
+// gives as zone: an interface's index, or its name.
+func scopeOfZone(zone string) (uint32, error) {
+	if zone == "" {
+		return 0, nil
+	}
+	if strings.Trim(zone, "0123456789") == "" {
+		// an interface's index
+		n, err := strconv.ParseUint(zone, 10, 32)
+		return uint32(n), err
+	}
+	ifc, err := net.InterfaceByName(zone)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(ifc.Index), nil
+}
+
+// resolveAllowed asks the Resolve policy whether host may be looked up.
+func (w *WasiStubs) resolveAllowed(host string) bool {
+	w.mu.Lock()
+	hook := w.cfg.Resolve
+	w.mu.Unlock()
+	return hook != nil && hook(host)
+}
+
+// Sock_resolve is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_resolve") backing getaddrinfo(): it resolves the host name at
+// (nodePtr, nodeLen) to its addresses (resolveHost) of family
+// (wasiSockFamilyIPv4, wasiSockFamilyIPv6, or 0 for both) and writes them
+// as address records at outPtr, at most limit of them, IPv4 addresses
+// first; their number goes to countPtr (u32). Returns 0, or a negative
+// errno: ENOENT when the name has no address of the family, EACCES when the
+// policy refuses, EAGAIN when the lookup may succeed later, EINTR when a
+// signal ends it.
+func (w *WasiStubs) Sock_resolve(m *Module, nodePtr, nodeLen, family, outPtr, limit, countPtr int32) int32 {
+	return w.sockResolve(m, zext(nodePtr), nodeLen, family, zext(outPtr), limit, zext(countPtr))
+}
+
+// Sock_resolve64 is Sock_resolve for a memory64 guest.
+func (w *WasiStubs) Sock_resolve64(m *Module, nodePtr int64, nodeLen, family int32, outPtr int64, limit int32, countPtr int64) int32 {
+	return w.sockResolve(m, uint64(nodePtr), nodeLen, family, uint64(outPtr), limit, uint64(countPtr))
+}
+
+// sockResolve is the body of Sock_resolve and Sock_resolve64.
+func (w *WasiStubs) sockResolve(m *Module, nodePtr uint64, nodeLen, family int32, outPtr uint64, limit int32, countPtr uint64) int32 {
+	w.endUnregistered()
+	node := w.memBytes(m, nodePtr, zext(nodeLen))
+	count := w.memBytes(m, countPtr, 4)
+	if (node == nil && nodeLen != 0) || count == nil || limit < 0 {
+		return -_wasiEFAULT
+	}
+	if family != 0 && family != wasiSockFamilyIPv4 && family != wasiSockFamilyIPv6 {
+		return -_wasiEAFNOSUPPORT
+	}
+	network := "ip"
+	switch family {
+	case wasiSockFamilyIPv4:
+		network = "ip4"
+	case wasiSockFamilyIPv6:
+		network = "ip6"
+	}
+	found, errno := w.resolveHost(string(node), network)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var n int32
+	for _, want := range []int32{wasiSockFamilyIPv4, wasiSockFamilyIPv6} {
+		if family != 0 && family != want {
+			continue
+		}
+		for _, a := range found {
+			if a.Is4() != (want == wasiSockFamilyIPv4) || n >= limit {
+				continue
+			}
+			addr, err := sockAddrOf(a)
+			if err != nil {
+				return -mapOSError(err)
+			}
+			if rc := w.writeSockAddr(m, outPtr+uint64(n)*wasiSockAddrSize, addr); rc != _wasiESUCCESS {
+				return rc
+			}
+			n++
+		}
+	}
+	if n == 0 {
+		return -_wasiENOENT
+	}
+	binary.LittleEndian.PutUint32(count, uint32(n))
+	return _wasiESUCCESS
+}
+
+// Sock_reverse_addr is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_reverse_addr") backing gethostbyaddr()
+// and getnameinfo(): the name of the host that has the IP address in the
+// address record at addrPtr, of either family, as the host's resolver knows
+// it, written as a record (writeWasiRecord): the name, without a length
+// prefix. The Resolve policy is asked about the address in text. Returns 0,
+// or a negative errno: ENOENT when the address has no name, EACCES when the
+// policy refuses, EAFNOSUPPORT for an address of no IP family, EAGAIN when
+// the lookup may succeed later, EINTR when a signal ends it, ERANGE when
+// the buffer is too small.
+func (w *WasiStubs) Sock_reverse_addr(m *Module, addrPtr, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.sockReverseAddr(m, zext(addrPtr), zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Sock_reverse_addr64 is Sock_reverse_addr for a memory64 guest.
+func (w *WasiStubs) Sock_reverse_addr64(m *Module, addrPtr, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.sockReverseAddr(m, uint64(addrPtr), uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// sockReverseAddr is the body of Sock_reverse_addr and Sock_reverse_addr64.
+func (w *WasiStubs) sockReverseAddr(m *Module, addrPtr, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	w.endUnregistered()
+	a, errno := w.readSockAddr(m, addrPtr)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	if a.family != wasiSockFamilyIPv4 && a.family != wasiSockFamilyIPv6 {
+		return -_wasiEAFNOSUPPORT
+	}
+	ip := a.ip.String()
+	if !w.resolveAllowed(ip) {
+		return -_wasiEACCES
+	}
+	var names []string
+	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+		var err error
+		names, err = net.DefaultResolver.LookupAddr(ctx, ip)
+		return err
+	}); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if len(names) == 0 {
+		return -_wasiENOENT
+	}
+	// The resolver answers with a fully qualified name, which ends in the
+	// root's dot; a host's name is written without it.
+	return w.writeWasiRecord(m, []byte(strings.TrimSuffix(names[0], ".")), bufPtr, bufLen, neededPtr)
+}
+
+// Sock_host_by_name is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "sock_host_by_name") backing gethostbyname():
+// the IPv4 addresses of the host named at (nodePtr, nodeLen) (resolveHost),
+// and its official name, which is the name asked about. The record
+// (writeWasiRecord) is the number of addresses (u32), the addresses (4
+// bytes each, as they sit in s_addr), then the official name. Returns 0, or
+// a negative errno: ENOENT when the name has no IPv4 address, EACCES when
+// the policy refuses, EAGAIN when the lookup may succeed later, EINTR when
+// a signal ends it, ERANGE when the buffer is too small.
+func (w *WasiStubs) Sock_host_by_name(m *Module, nodePtr, nodeLen, bufPtr, bufLen, neededPtr int32) int32 {
+	return w.sockHostByName(m, zext(nodePtr), nodeLen, zext(bufPtr), bufLen, zext(neededPtr))
+}
+
+// Sock_host_by_name64 is Sock_host_by_name for a memory64 guest.
+func (w *WasiStubs) Sock_host_by_name64(m *Module, nodePtr int64, nodeLen int32, bufPtr int64, bufLen int32, neededPtr int64) int32 {
+	return w.sockHostByName(m, uint64(nodePtr), nodeLen, uint64(bufPtr), bufLen, uint64(neededPtr))
+}
+
+// sockHostByName is the body of Sock_host_by_name and Sock_host_by_name64.
+func (w *WasiStubs) sockHostByName(m *Module, nodePtr uint64, nodeLen int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
+	w.endUnregistered()
+	node := w.memBytes(m, nodePtr, zext(nodeLen))
+	if node == nil && nodeLen != 0 {
+		return -_wasiEFAULT
+	}
+	name := string(node)
+	found, errno := w.resolveHost(name, "ip4")
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	rec := binary.LittleEndian.AppendUint32(nil, 0)
+	n := uint32(0)
+	for _, a := range found {
+		if a.Is4() {
+			v4 := a.As4()
+			rec = append(rec, v4[:]...)
+			n++
+		}
+	}
+	if n == 0 {
+		return -_wasiENOENT
+	}
+	binary.LittleEndian.PutUint32(rec, n)
+	rec = append(rec, name...)
+	return w.writeWasiRecord(m, rec, bufPtr, bufLen, neededPtr)
+}
+
 // Sock_shutdown64 is Sock_shutdown for a memory64 guest.
 func (w *WasiStubs) Sock_shutdown64(m *Module, fd, how int32) int32 {
 	return w.Sock_shutdown(m, fd, how)
@@ -13144,6 +13433,9 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"readVec":                 true,
 			"hostDescriptor":          true,
 			"socketCall":              true,
+			"lookupErrno":             true,
+			"sockAddrOf":              true,
+			"scopeOfZone":             true,
 			"unixGuestName":           true,
 			"leadingFrom":             true,
 			"shutdownSocket":          true,
@@ -13294,6 +13586,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"maps",
 		"math/bits",
 		"net",
+		"net/netip",
 		"os",
 		"os/exec",
 		"os/user",

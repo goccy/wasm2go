@@ -92,8 +92,12 @@ gates the accepts, receives and sends of sockets (`sock_accept`,
 a datagram to an address, `Listen` gates a socket's taking an address
 others reach it at (`sock_bind_addr`, the `sock_listen` of an unbound
 socket, and the first send to an address of an unbound datagram
-socket), `Resolve` gates `sock_getaddrinfo` (except an empty host,
-which resolves to `INADDR_ANY`), and `Exec` gates `proc_spawn`; a nil
+socket), `Resolve` gates the name lookups (`sock_getaddrinfo`,
+`sock_resolve`, `sock_host_by_name`, with the name) and
+`sock_reverse_addr` (with the address in text) — an address written
+in numbers, and the empty host of `sock_getaddrinfo` (`INADDR_ANY`),
+are no lookup and are not asked about; a signal ends a lookup with
+`EINTR` — and `Exec` gates `proc_spawn`; a nil
 one denies. A socket (`sock_open`, `sock_socketpair`, `sock_socket`)
 is one socket of the host's from its making to its close; a
 Unix-domain socket's path is a file of the host only with

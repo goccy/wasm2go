@@ -69,6 +69,17 @@ func TestWasip1Mem64ImportsCompile(t *testing.T) {
 			t.Errorf("the fixture does not import %s, which WasiStubs binds (%s)", imp, wide.Name)
 		}
 	}
+	// Every binding has its *64 twin: a method that takes the Module first,
+	// and is no twin itself, has one.
+	for i := 0; i < stubs.NumMethod(); i++ {
+		narrow := stubs.Method(i)
+		if strings.HasSuffix(narrow.Name, "64") || !takesModule(narrow) {
+			continue
+		}
+		if wide, ok := stubs.MethodByName(narrow.Name + "64"); !ok || !takesModule(wide) {
+			t.Errorf("%s has no *64 twin for a memory64 guest", narrow.Name)
+		}
+	}
 	if bindings < len(imported) {
 		t.Errorf("WasiStubs has %d bindings with a *64 twin, fewer than the %d imports of the fixture", bindings, len(imported))
 	}

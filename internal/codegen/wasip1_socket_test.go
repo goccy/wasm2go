@@ -3,11 +3,14 @@
 package codegen
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,6 +28,7 @@ const (
 	sockAddr2Off int32 = 14200
 	sockPathOff  int32 = 14400
 	sockFdsOff   int32 = 14600
+	sockManyOff  int32 = 15000
 )
 
 // sockRecord is an address record as the tests read it back.
@@ -32,6 +36,7 @@ type sockRecord struct {
 	family uint32
 	port   uint32
 	ip     string
+	scope  uint32
 	name   string
 }
 
@@ -43,6 +48,7 @@ func readSockRecord(m *Module, off int32) sockRecord {
 		r.ip = net.IP(rec[8:12]).String()
 	case wasiSockFamilyIPv6:
 		r.ip = net.IP(rec[8:24]).String()
+		r.scope = binary.LittleEndian.Uint32(rec[24:])
 	case wasiSockFamilyUnix:
 		r.name = string(rec[32 : 32+binary.LittleEndian.Uint32(rec[28:])])
 	}
@@ -928,5 +934,324 @@ func TestSocket_AcceptsThatShareAListener(t *testing.T) {
 	}
 	if !hostNonblocking(t, w, server) {
 		t.Fatal("the listener's host socket left non-blocking mode")
+	}
+}
+
+// Sock_resolve gives the addresses of a name of the family asked for, and
+// converts an address written in numbers without a lookup.
+func TestSocket_Resolve(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	var asked []string
+	w.cfg.Resolve = func(host string) bool {
+		asked = append(asked, host)
+		return host == "localhost"
+	}
+	resolve := func(node string, family, limit int32) ([]sockRecord, int32) {
+		copy(m.memory[sockBufOff:], node)
+		rc := w.Sock_resolve(m, sockBufOff, int32(len(node)), family, sockManyOff, limit, sockLenOff)
+		if rc != _wasiESUCCESS {
+			return nil, rc
+		}
+		var out []sockRecord
+		for i := range int32(readU32(m.memory, int(sockLenOff))) {
+			out = append(out, readSockRecord(m, sockManyOff+i*wasiSockAddrSize))
+		}
+		return out, rc
+	}
+	got, rc := resolve("127.0.0.1", 0, 8)
+	if rc != _wasiESUCCESS || len(got) != 1 || got[0].family != uint32(wasiSockFamilyIPv4) || got[0].ip != "127.0.0.1" {
+		t.Fatalf("resolve of an IPv4 address = %+v rc=%d", got, rc)
+	}
+	got, rc = resolve("fe80::1%7", wasiSockFamilyIPv6, 8)
+	if rc != _wasiESUCCESS || len(got) != 1 || got[0].ip != "fe80::1" || got[0].scope != 7 {
+		t.Fatalf("resolve of an IPv6 address with a zone = %+v rc=%d", got, rc)
+	}
+	if _, rc := resolve("::1", wasiSockFamilyIPv4, 8); rc != -_wasiENOENT {
+		t.Fatalf("an IPv6 address asked for as IPv4 rc=%d, want -ENOENT", rc)
+	}
+	if _, rc := resolve("::1", 0, 0); rc != -_wasiENOENT {
+		t.Fatalf("resolve with room for none rc=%d, want -ENOENT", rc)
+	}
+	if _, rc := resolve("fe80::1%no-such-interface", 0, 8); rc == _wasiESUCCESS {
+		t.Fatal("resolve of a zone that is no interface succeeded")
+	}
+	if len(asked) != 0 {
+		t.Fatalf("the lookup policy was asked %q about addresses written in numbers", asked)
+	}
+	got, rc = resolve("localhost", wasiSockFamilyIPv4, 8)
+	if rc != _wasiESUCCESS || len(got) == 0 || got[0].ip != "127.0.0.1" {
+		t.Fatalf("resolve of localhost = %+v rc=%d", got, rc)
+	}
+	if host := w.resolvedHosts["127.0.0.1"]; host != "localhost" {
+		t.Fatalf("127.0.0.1 is remembered as %q", host)
+	}
+	if _, rc := resolve("refused.example", 0, 8); rc != -_wasiEACCES {
+		t.Fatalf("resolve of a name the policy refuses rc=%d, want -EACCES", rc)
+	}
+	if _, rc := resolve("localhost", 9, 8); rc != -_wasiEAFNOSUPPORT {
+		t.Fatalf("resolve of an unknown family rc=%d, want -EAFNOSUPPORT", rc)
+	}
+	if rc := w.Sock_resolve(m, sockBufOff, 4, 0, sockManyOff, -1, sockLenOff); rc != -_wasiEFAULT {
+		t.Fatalf("resolve with a negative room rc=%d, want -EFAULT", rc)
+	}
+	if rc := w.Sock_resolve(m, sockBufOff, 9, 0, 1<<20, 8, sockLenOff); rc != -_wasiEFAULT {
+		t.Fatalf("resolve into memory that is not there rc=%d, want -EFAULT", rc)
+	}
+	copy(m.memory[sockBufOff:], "127.0.0.1")
+	if rc := w.Sock_resolve64(m, int64(sockBufOff), 9, 0, int64(sockManyOff), 1, int64(sockLenOff)); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_resolve64 rc=%d", rc)
+	}
+}
+
+func TestSocket_HostByName(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	var asked []string
+	w.cfg.Resolve = func(host string) bool {
+		asked = append(asked, host)
+		return host == "localhost"
+	}
+	lookup := func(name string, room int32) (addrs []string, official string, rc int32) {
+		copy(m.memory[sockBufOff:], name)
+		rc = w.Sock_host_by_name(m, sockBufOff, int32(len(name)), sockManyOff, room, sockLenOff)
+		if rc != _wasiESUCCESS {
+			return nil, "", rc
+		}
+		rec := m.memory[sockManyOff : sockManyOff+int32(readU32(m.memory, int(sockLenOff)))]
+		count := binary.LittleEndian.Uint32(rec)
+		for i := range count {
+			addrs = append(addrs, net.IP(rec[4+4*i:8+4*i]).String())
+		}
+		return addrs, string(rec[4+4*count:]), rc
+	}
+	if addrs, official, rc := lookup("127.0.0.1", 64); rc != _wasiESUCCESS || len(addrs) != 1 || addrs[0] != "127.0.0.1" || official != "127.0.0.1" {
+		t.Fatalf("lookup of an address = %q %q rc=%d", addrs, official, rc)
+	}
+	if _, _, rc := lookup("::1", 64); rc != -_wasiENOENT {
+		t.Fatalf("lookup of an IPv6 address rc=%d, want -ENOENT", rc)
+	}
+	if len(asked) != 0 {
+		t.Fatalf("the lookup policy was asked %q about addresses written in numbers", asked)
+	}
+	if addrs, official, rc := lookup("localhost", 64); rc != _wasiESUCCESS || len(addrs) == 0 || official != "localhost" {
+		t.Fatalf("lookup of localhost = %q %q rc=%d", addrs, official, rc)
+	}
+	if _, _, rc := lookup("localhost", 2); rc != -_wasiERANGE {
+		t.Fatalf("lookup into a buffer too small rc=%d, want -ERANGE", rc)
+	}
+	if _, _, rc := lookup("refused.example", 64); rc != -_wasiEACCES {
+		t.Fatalf("lookup the policy refuses rc=%d, want -EACCES", rc)
+	}
+	if rc := w.Sock_host_by_name(m, 1<<20, 4, sockManyOff, 64, sockLenOff); rc != -_wasiEFAULT {
+		t.Fatalf("lookup of a name outside memory rc=%d, want -EFAULT", rc)
+	}
+	copy(m.memory[sockBufOff:], "127.0.0.1")
+	if rc := w.Sock_host_by_name64(m, int64(sockBufOff), 9, int64(sockManyOff), 64, int64(sockLenOff)); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_host_by_name64 rc=%d", rc)
+	}
+}
+
+func TestSocket_ReverseAddr(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	var asked []string
+	w.cfg.Resolve = func(host string) bool {
+		asked = append(asked, host)
+		return false
+	}
+	putIPAddr(m, sockAddrOff, "127.0.0.1", 0)
+	if rc := w.Sock_reverse_addr(m, sockAddrOff, sockManyOff, 256, sockLenOff); rc != -_wasiEACCES {
+		t.Fatalf("reverse lookup the policy refuses rc=%d, want -EACCES", rc)
+	}
+	if len(asked) != 1 || asked[0] != "127.0.0.1" {
+		t.Fatalf("the lookup policy was asked %q", asked)
+	}
+	w.cfg.Resolve = AllowAllResolve
+	switch rc := w.Sock_reverse_addr64(m, int64(sockAddrOff), int64(sockManyOff), 256, int64(sockLenOff)); rc {
+	case _wasiESUCCESS:
+		if name := string(m.memory[sockManyOff : sockManyOff+int32(readU32(m.memory, int(sockLenOff)))]); name == "" || strings.HasSuffix(name, ".") {
+			t.Fatalf("reverse lookup of 127.0.0.1 = %q", name)
+		}
+	case -_wasiENOENT:
+		// this machine knows no name of it
+	default:
+		t.Fatalf("reverse lookup of 127.0.0.1 rc=%d", rc)
+	}
+	putUnixAddr(m, sockAddrOff, "/x")
+	if rc := w.Sock_reverse_addr(m, sockAddrOff, sockManyOff, 256, sockLenOff); rc != -_wasiEAFNOSUPPORT {
+		t.Fatalf("reverse lookup of a Unix-domain address rc=%d, want -EAFNOSUPPORT", rc)
+	}
+	if rc := w.Sock_reverse_addr(m, 1<<20, sockManyOff, 256, sockLenOff); rc != -_wasiEFAULT {
+		t.Fatalf("reverse lookup of a record outside memory rc=%d, want -EFAULT", rc)
+	}
+}
+
+// Sock_getaddrinfo looks a name up as Sock_resolve does: its first IPv4
+// address, remembered for the Dial policy.
+func TestSocket_GetaddrinfoLooksUp(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	w.cfg.Resolve = AllowAllResolve
+	copy(m.memory[sockBufOff:], "localhost")
+	if rc := w.Sock_getaddrinfo64(m, int64(sockBufOff), 9, int64(sockValueOff)); rc != _wasiESUCCESS {
+		t.Fatalf("getaddrinfo of localhost rc=%d", rc)
+	}
+	if got := net.IP(m.memory[sockValueOff : sockValueOff+4]).String(); got != "127.0.0.1" || w.resolvedHosts[got] != "localhost" {
+		t.Fatalf("getaddrinfo of localhost = %s, remembered as %q", got, w.resolvedHosts[got])
+	}
+	copy(m.memory[sockBufOff:], "::1")
+	if rc := w.Sock_getaddrinfo(m, sockBufOff, 3, sockValueOff); rc != -_wasiEAFNOSUPPORT {
+		t.Fatalf("getaddrinfo of an IPv6 address rc=%d, want -EAFNOSUPPORT", rc)
+	}
+	copy(m.memory[sockBufOff:], "::ffff:10.0.0.1")
+	if rc := w.Sock_getaddrinfo(m, sockBufOff, 15, sockValueOff); rc != _wasiESUCCESS || net.IP(m.memory[sockValueOff:sockValueOff+4]).String() != "10.0.0.1" {
+		t.Fatalf("getaddrinfo of an IPv4-mapped address rc=%d", rc)
+	}
+	if rc := w.Sock_getaddrinfo(m, sockBufOff, 15, 1<<20); rc != -_wasiEFAULT {
+		t.Fatalf("getaddrinfo into memory that is not there rc=%d, want -EFAULT", rc)
+	}
+	if rc := w.Sock_getaddrinfo(m, 1<<20, 15, sockValueOff); rc != -_wasiEFAULT {
+		t.Fatalf("getaddrinfo of a name outside memory rc=%d, want -EFAULT", rc)
+	}
+}
+
+// A signal ends a lookup with EINTR: one posted before it starts it, and
+// one posted while it waits for the resolver, which cancels it. A lookup
+// that ends well after all leaves the signal to the next call that waits.
+func TestSocket_LookupIsInterruptible(t *testing.T) {
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	w.cfg.Resolve = AllowAllResolve
+	w.PostSignal(wasiSIGUSR1)
+	copy(m.memory[sockBufOff:], "localhost")
+	if rc := w.Sock_resolve(m, sockBufOff, 9, 0, sockManyOff, 8, sockLenOff); rc != -_wasiEINTR {
+		t.Fatalf("resolve with a signal waiting rc=%d, want -EINTR", rc)
+	}
+	takeSignals(t, w, m)
+	postWhenBlocked(w, wasiSIGUSR1)
+	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}); errno != _wasiEINTR {
+		t.Fatalf("lookup cancelled by a signal errno=%d, want EINTR", errno)
+	}
+	takeSignals(t, w, m)
+	postWhenBlocked(w, wasiSIGUSR1)
+	if errno := w.lookupInterruptibly(func(ctx context.Context) error {
+		<-ctx.Done()
+		return nil
+	}); errno != _wasiESUCCESS {
+		t.Fatalf("lookup that went through errno=%d", errno)
+	}
+	notFound := func(context.Context) error { return &net.DNSError{IsNotFound: true} }
+	if errno := w.lookupInterruptibly(notFound); errno != _wasiEINTR {
+		t.Fatalf("lookup after one that went through a signal errno=%d, want EINTR", errno)
+	}
+	takeSignals(t, w, m)
+	if errno := w.lookupInterruptibly(notFound); errno != _wasiENOENT {
+		t.Fatalf("lookup of no name errno=%d, want ENOENT", errno)
+	}
+}
+
+func TestSocket_LookupErrno(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want int32
+	}{
+		{&net.DNSError{IsNotFound: true}, _wasiENOENT},
+		{&net.DNSError{IsTimeout: true}, _wasiEAGAIN},
+		{&net.DNSError{IsTemporary: true}, _wasiEAGAIN},
+		{&net.DNSError{}, _wasiEIO},
+		{&net.AddrError{Err: "no suitable address found", Addr: "h"}, _wasiENOENT},
+		{errors.ErrUnsupported, _wasiENOTSUP},
+	} {
+		if got := lookupErrno(c.err); got != c.want {
+			t.Errorf("lookupErrno(%v) = %d, want %d", c.err, got, c.want)
+		}
+	}
+}
+
+// A failure to make or accept a socket is an error of the system call that
+// failed, wrapped once.
+func TestSocket_MakingErrorsNameTheirCall(t *testing.T) {
+	skipWithoutRawSockets(t)
+	once := func(err error, calls ...string) {
+		t.Helper()
+		var se *os.SyscallError
+		if !errors.As(err, &se) || !slices.Contains(calls, se.Syscall) {
+			t.Fatalf("error %v: want an error of %v", err, calls)
+		}
+		if inner := (*os.SyscallError)(nil); errors.As(se.Err, &inner) {
+			t.Fatalf("error %v is wrapped twice", err)
+		}
+	}
+	_, err := hostSocketFD(-1, syscall.SOCK_STREAM)
+	once(err, "socket")
+	_, err = hostSocketPairFDs(-1)
+	once(err, "socketpair")
+	host, err := openHostSocket(wasiSockFamilyIPv4, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := host.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	if errno := socketCall(host, func(fd int) { _, _, err = hostAccept(fd) }); errno != _wasiESUCCESS {
+		t.Fatalf("socketCall errno=%d", errno)
+	}
+	once(err, "accept", "accept4")
+}
+
+// An address written in numbers is no lookup: it is not remembered as a
+// host name, and the name an earlier lookup gave the address stays the one
+// the Dial policy is told of a connect to it.
+func TestSocket_LiteralsAreNoHostNames(t *testing.T) {
+	w, m, _ := newSocketStubs(t)
+	w.cfg.Resolve = AllowAllResolve
+	_, port := newIPListener(t, w, m)
+	var hosts []string
+	w.cfg.Dial = func(network, host, ip string, p int) bool {
+		hosts = append(hosts, host)
+		return true
+	}
+	connect := func() {
+		t.Helper()
+		fd := openSocket(t, w, m, wasiSockFamilyIPv4, wasiSockTypeStream)
+		putIPAddr(m, sockAddrOff, "127.0.0.1", port)
+		if rc := w.Sock_connect_addr(m, fd, sockAddrOff, 0, 0); rc != _wasiESUCCESS {
+			t.Fatalf("connect rc=%d", rc)
+		}
+	}
+	copy(m.memory[sockBufOff:], "127.0.0.1")
+	if rc := w.Sock_getaddrinfo(m, sockBufOff, 9, sockValueOff); rc != _wasiESUCCESS {
+		t.Fatalf("getaddrinfo of an address rc=%d", rc)
+	}
+	if rc := w.Sock_resolve(m, sockBufOff, 9, 0, sockManyOff, 8, sockLenOff); rc != _wasiESUCCESS {
+		t.Fatalf("resolve of an address rc=%d", rc)
+	}
+	connect()
+	copy(m.memory[sockBufOff:], "localhost")
+	if rc := w.Sock_resolve(m, sockBufOff, 9, wasiSockFamilyIPv4, sockManyOff, 8, sockLenOff); rc != _wasiESUCCESS {
+		t.Fatalf("resolve of localhost rc=%d", rc)
+	}
+	copy(m.memory[sockBufOff:], "127.0.0.1")
+	if rc := w.Sock_host_by_name(m, sockBufOff, 9, sockManyOff, 64, sockLenOff); rc != _wasiESUCCESS {
+		t.Fatalf("host by name of an address rc=%d", rc)
+	}
+	connect()
+	if !slices.Equal(hosts, []string{"", "localhost"}) {
+		t.Fatalf("Dial was told of hosts %q, want none, then localhost", hosts)
+	}
+}
+
+// A zone of digits is an interface's index, and one too large for it is
+// an error; any other zone names an interface.
+func TestSocket_ScopeOfZone(t *testing.T) {
+	if scope, err := scopeOfZone("7"); err != nil || scope != 7 {
+		t.Fatalf("scopeOfZone(7) = %d, %v", scope, err)
+	}
+	if _, err := scopeOfZone("99999999999"); !errors.Is(err, strconv.ErrRange) {
+		t.Fatalf("scopeOfZone of an index too large: %v, want ErrRange", err)
+	}
+	if _, err := scopeOfZone("no-such-interface"); err == nil {
+		t.Fatal("scopeOfZone of no interface succeeded")
 	}
 }
