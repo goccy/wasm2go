@@ -2003,11 +2003,17 @@ type WASIConfig struct {
 	// with "accept", "recv" or "send". Returning false denies the operation
 	// (EACCES). nil denies every one.
 	NetAccess func(op string) bool
-	// Dial is consulted before an outbound connect (Sock_connect) with the
-	// network ("tcp"), the host the guest resolved to reach the address
-	// (from the preceding Sock_getaddrinfo, or "" when the guest dialed a
-	// literal IP), the dotted-quad IP and the port. Returning false denies
-	// the connection (EACCES). nil denies every one.
+	// Dial is consulted before an outbound connect (Sock_connect,
+	// Sock_connect_addr) and a datagram's send to an address
+	// (Sock_sendto_addr) with the network, a host name, the IP in text and
+	// the port (for a Unix-domain socket: "", its path in the host
+	// filesystem, 0). The host is each name a lookup of the guest's fork
+	// family gave the IP for (Sock_getaddrinfo, Sock_resolve,
+	// Sock_host_by_name), one call per name in sorted order until one
+	// allows, or "" in a single call when none did (the guest dialed a
+	// literal IP): a connect to an IP that several names share is allowed
+	// when any of its names is. Returning false denies the connection
+	// (EACCES). nil denies every one.
 	Dial func(network, host, ip string, port int) bool
 	// Listen is consulted before a socket takes a local address that others
 	// can reach it at: before a bind (Sock_bind_addr), of a datagram socket
@@ -2179,10 +2185,10 @@ type WasiStubs struct {
 	// which is how a WasiStubs built as a bare struct literal starts.
 	fdTable   map[int32]*wasiOpen
 	monoStart time.Time
-	// resolvedHosts maps a resolved dotted-quad IP back to the host name the
-	// guest looked it up under (populated by Sock_getaddrinfo, read by
-	// Sock_connect), so the dial hook can be given the host. Guarded by mu.
-	resolvedHosts map[string]string
+	// hosts is the names the family's lookups gave each address for, which
+	// the Dial policy is asked with (familyHosts). Like pids, it is created
+	// on first use (hostsLocked) and shared through Fork.
+	hosts *familyHosts
 	// procs tracks the processes this instance may wait for — host
 	// processes spawned via Proc_spawn and embedder-run processes
 	// registered via NewProc — keyed by the pid handed back to the guest.
@@ -2547,6 +2553,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		procs:     map[int32]*wasiProc{},
 		pids:      w.pidsLocked(),
 		streams:   w.streamsLocked(),
+		hosts:     w.hostsLocked(),
 		zoneTZ:    w.zoneTZ,
 		zone:      w.zone,
 		forked:    true,
@@ -2571,12 +2578,6 @@ func (w *WasiStubs) Fork() *WasiStubs {
 			start.overlay(*w.changed)
 		}
 		child.changed = start
-	}
-	if w.resolvedHosts != nil {
-		child.resolvedHosts = make(map[string]string, len(w.resolvedHosts))
-		for ip, host := range w.resolvedHosts {
-			child.resolvedHosts[ip] = host
-		}
 	}
 	return child
 }
@@ -3885,11 +3886,13 @@ func encodeHostWaitStatus(ws syscall.WaitStatus) int32 {
 	return int32(ws.ExitStatus()&0xff) << 8
 }
 
-// Sock_getaddrinfo is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "sock_getaddrinfo") that a guest's getaddrinfo() can call. It reads the
-// host string at (nodePtr,nodeLen), resolves it to its first IPv4 address as
-// Sock_resolve does (resolveHost), and writes the 4-byte network-order address
-// at outPtr. An empty host is INADDR_ANY. Returns 0 on success or a negative
+// Sock_getaddrinfo is a NON-STANDARD host import (module
+// wasip1_posix_extension, and wasi_snapshot_preview1 as well:
+// wasiReleasedPosixImports; name "sock_getaddrinfo") that a guest's
+// getaddrinfo() can call. It reads the host string at (nodePtr,nodeLen),
+// resolves it to its first IPv4 address as Sock_resolve does (resolveHost),
+// and writes the 4-byte network-order address at outPtr. An empty host is
+// INADDR_ANY. Returns 0 on success or a negative
 // POSIX-ish errno (the caller maps it to an EAI_* code): EACCES when the
 // Resolve policy refuses, ENOENT for a name without an IPv4 address,
 // EAFNOSUPPORT for an IPv6 address written in numbers, EAGAIN when the
@@ -3940,16 +3943,65 @@ func (w *WasiStubs) sockGetaddrinfo(m *Module, nodePtr uint64, nodeLen int32, ou
 	return _wasiESUCCESS
 }
 
-// recordResolvedHost remembers that host resolved to ip, an address in
-// text (wasiSockAddr.ipText), so a later connect to it can hand the Dial
-// hook the host name it was looked up under.
+// familyHosts is what the lookups of the instances of a fork family gave:
+// for each address in text (wasiSockAddr.ipText), the set of names it was
+// given for. A connect to an address asks the Dial policy with those names
+// (dialAllowed).
+type familyHosts struct {
+	mu    sync.Mutex
+	names map[string]map[string]bool
+}
+
+// hostsLocked returns the family's familyHosts, made on first use. Caller
+// holds w.mu.
+func (w *WasiStubs) hostsLocked() *familyHosts {
+	if w.hosts == nil {
+		w.hosts = &familyHosts{}
+	}
+	return w.hosts
+}
+
+// recordResolvedHost remembers that a lookup of host gave ip, an address
+// in text (wasiSockAddr.ipText), for the family's connects to it.
 func (w *WasiStubs) recordResolvedHost(ip, host string) {
 	w.mu.Lock()
-	if w.resolvedHosts == nil {
-		w.resolvedHosts = make(map[string]string)
-	}
-	w.resolvedHosts[ip] = host
+	hosts := w.hostsLocked()
 	w.mu.Unlock()
+	hosts.mu.Lock()
+	defer hosts.mu.Unlock()
+	if hosts.names == nil {
+		hosts.names = make(map[string]map[string]bool)
+	}
+	if hosts.names[ip] == nil {
+		hosts.names[ip] = make(map[string]bool)
+	}
+	hosts.names[ip][host] = true
+}
+
+// dialAllowed asks the Dial policy about a connect on network to the
+// address ip (in text) and port: once with each name the family's lookups
+// gave ip for, in sorted order, until one allows, or once with the host ""
+// when they gave it for none. nil denies.
+func (w *WasiStubs) dialAllowed(network, ip string, port int) bool {
+	w.mu.Lock()
+	hook := w.cfg.Dial
+	hosts := w.hostsLocked()
+	w.mu.Unlock()
+	if hook == nil {
+		return false
+	}
+	hosts.mu.Lock()
+	names := slices.Sorted(maps.Keys(hosts.names[ip]))
+	hosts.mu.Unlock()
+	if len(names) == 0 {
+		return hook(network, "", ip, port)
+	}
+	for _, host := range names {
+		if hook(network, host, ip, port) {
+			return true
+		}
+	}
+	return false
 }
 
 // allowedPath returns the name the FS is given for the guest path name and
@@ -6262,11 +6314,17 @@ func writeFilestatExt(out []byte, fi os.FileInfo) {
 // the guest merges the real mode in from here. The path is
 // preopen-relative; follow selects stat vs lstat semantics. Writes the
 // unix permission bits at modeOutPtr; returns 0 or a negative errno.
+//
+// It has no name under wasip1_posix_extension.
+//
+// Deprecated: use Path_filestat_ext, whose mode carries the same bits.
 func (w *WasiStubs) Path_filestat_mode(m *Module, pathPtr, pathLen, follow, modeOutPtr int32) int32 {
 	return w.pathFilestatMode(m, zext(pathPtr), pathLen, follow, zext(modeOutPtr))
 }
 
 // Path_filestat_mode64 is Path_filestat_mode for a memory64 guest.
+//
+// Deprecated: use Path_filestat_ext64, whose mode carries the same bits.
 func (w *WasiStubs) Path_filestat_mode64(m *Module, pathPtr int64, pathLen, follow int32, modeOutPtr int64) int32 {
 	return w.pathFilestatMode(m, uint64(pathPtr), pathLen, follow, uint64(modeOutPtr))
 }
@@ -8362,11 +8420,12 @@ func (w *WasiStubs) Proc_raise64(m *Module, sig int64) int32 {
 	return w.Proc_raise(m, int32(sig))
 }
 
-// Sock_socket is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "sock_socket") that a guest's socket() can call. WASI preview1 has no
-// way to create an outbound socket; this gives the guest a host-managed fd
-// whose connection is established later by Sock_connect. domain/type follow
-// the POSIX socket() args (AF_INET / SOCK_STREAM); only TCP over IPv4 is
+// Sock_socket is a NON-STANDARD host import (module wasip1_posix_extension,
+// and wasi_snapshot_preview1 as well: wasiReleasedPosixImports; name
+// "sock_socket") that a guest's socket() can call. WASI preview1 has no way
+// to create an outbound socket; this gives the guest a host-managed fd whose
+// connection is established later by Sock_connect. domain/type follow the
+// POSIX socket() args (AF_INET / SOCK_STREAM); only TCP over IPv4 is
 // supported. Returns the new fd, or a negative errno on failure.
 func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	// A guest calls this only for AF_INET / SOCK_STREAM: domain and typ
@@ -8388,9 +8447,10 @@ func (w *WasiStubs) Sock_socket64(m *Module, domain, typ int32) int32 {
 	return w.Sock_socket(m, domain, typ)
 }
 
-// Sock_connect is a NON-STANDARD host import (module wasi_snapshot_preview1,
-// name "sock_connect") that a guest's connect() can call. ipBE carries the
-// IPv4 address in network byte order exactly as it sat in
+// Sock_connect is a NON-STANDARD host import (module wasip1_posix_extension,
+// and wasi_snapshot_preview1 as well: wasiReleasedPosixImports; name
+// "sock_connect") that a guest's connect() can call. ipBE carries the IPv4
+// address in network byte order exactly as it sat in
 // sockaddr_in.sin_addr.s_addr (so the low byte is the first octet); port is
 // host byte order. It consults the dial whitelist, dials via Go's net, and
 // attaches the resulting conn to the socket fd so the existing Sock_send /
@@ -8414,12 +8474,8 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	case errno != _wasiENOTCONN:
 		return -errno
 	}
-	w.mu.Lock()
-	hook := w.cfg.Dial
-	host := w.resolvedHosts[ip] // "" for a literal-IP dial with no preceding lookup
-	w.mu.Unlock()
 	p := int(uint16(port))
-	if hook == nil || !hook("tcp", host, ip, p) {
+	if !w.dialAllowed("tcp", ip, p) {
 		return -_wasiEACCES
 	}
 	conn, errno = w.dialInterruptibly("sock_connect", "tcp", net.JoinHostPort(ip, strconv.Itoa(p)))
@@ -9070,11 +9126,7 @@ func (w *WasiStubs) destination(op *wasiOpen, a wasiSockAddr, path string) (stri
 		}
 		return hostPath, _wasiESUCCESS
 	}
-	ip := a.ipText()
-	w.mu.Lock()
-	host := w.resolvedHosts[ip] // "" for a literal-IP dial with no preceding lookup
-	w.mu.Unlock()
-	if hook == nil || !hook(network, host, ip, a.port) {
+	if !w.dialAllowed(network, a.ipText(), a.port) {
 		return "", _wasiEACCES
 	}
 	return "", _wasiESUCCESS

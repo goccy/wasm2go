@@ -91,8 +91,14 @@ func TestImportsAreServedUnderTheirModuleOnly(t *testing.T) {
 		{"wasi_snapshot_preview1", "pipe", true},
 		{"wasi_snapshot_preview1", "fd_dup2", true},
 		{"wasi_snapshot_preview1", "sock_socket", true},
+		{"wasi_snapshot_preview1", "sock_connect", true},
+		{"wasi_snapshot_preview1", "sock_getaddrinfo", true},
+		{"wasi_snapshot_preview1", "path_filestat_mode", true},
 		{"wasi_snapshot_preview1", "fd_write", true},
-		{"wasip1_posix_extension", "sock_socket", false},
+		{"wasip1_posix_extension", "sock_socket", true},
+		{"wasip1_posix_extension", "sock_connect", true},
+		{"wasip1_posix_extension", "sock_getaddrinfo", true},
+		{"wasip1_posix_extension", "path_filestat_mode", false},
 		{"wasip1_posix_extension", "fd_write", false},
 	} {
 		err := translateImport(c.mod, c.name)

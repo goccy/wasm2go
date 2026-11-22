@@ -1005,8 +1005,8 @@ func TestSocket_Resolve(t *testing.T) {
 	if rc != _wasiESUCCESS || len(got) == 0 || got[0].ip != "127.0.0.1" {
 		t.Fatalf("resolve of localhost = %+v rc=%d", got, rc)
 	}
-	if host := w.resolvedHosts["127.0.0.1"]; host != "localhost" {
-		t.Fatalf("127.0.0.1 is remembered as %q", host)
+	if !w.hosts.names["127.0.0.1"]["localhost"] {
+		t.Fatalf("127.0.0.1 is remembered as %v, want localhost", w.hosts.names["127.0.0.1"])
 	}
 	if _, rc := resolve("refused.example", 0, 8); rc != -_wasiEACCES {
 		t.Fatalf("resolve of a name the policy refuses rc=%d, want -EACCES", rc)
@@ -1116,8 +1116,8 @@ func TestSocket_GetaddrinfoLooksUp(t *testing.T) {
 	if rc := w.Sock_getaddrinfo64(m, int64(sockBufOff), 9, int64(sockValueOff)); rc != _wasiESUCCESS {
 		t.Fatalf("getaddrinfo of localhost rc=%d", rc)
 	}
-	if got := net.IP(m.memory[sockValueOff : sockValueOff+4]).String(); got != "127.0.0.1" || w.resolvedHosts[got] != "localhost" {
-		t.Fatalf("getaddrinfo of localhost = %s, remembered as %q", got, w.resolvedHosts[got])
+	if got := net.IP(m.memory[sockValueOff : sockValueOff+4]).String(); got != "127.0.0.1" || !w.hosts.names[got]["localhost"] {
+		t.Fatalf("getaddrinfo of localhost = %s, remembered as %v", got, w.hosts.names[got])
 	}
 	copy(m.memory[sockBufOff:], "::1")
 	if rc := w.Sock_getaddrinfo(m, sockBufOff, 3, sockValueOff); rc != -_wasiEAFNOSUPPORT {
@@ -1264,6 +1264,48 @@ func TestSocket_LiteralsAreNoHostNames(t *testing.T) {
 	connect()
 	if !slices.Equal(hosts, []string{"", "localhost"}) {
 		t.Fatalf("Dial was told of hosts %q, want none, then localhost", hosts)
+	}
+}
+
+// An address that lookups gave for several names is dialed when the Dial
+// policy allows any of them, whichever was looked up last: the policy is
+// asked with each name in sorted order until one allows.
+func TestSocket_DialAsksEveryNameOfAnAddress(t *testing.T) {
+	w, m, _ := newSocketStubs(t)
+	_, port := newIPListener(t, w, m)
+	w.recordResolvedHost("127.0.0.1", "c.example")
+	w.recordResolvedHost("127.0.0.1", "a.example")
+	w.recordResolvedHost("127.0.0.1", "b.example")
+	var hosts []string
+	allowed := "a.example"
+	w.cfg.Dial = func(network, host, ip string, p int) bool {
+		hosts = append(hosts, host)
+		return host == allowed
+	}
+	connect := func() int32 {
+		fd := openSocket(t, w, m, wasiSockFamilyIPv4, wasiSockTypeStream)
+		putIPAddr(m, sockAddrOff, "127.0.0.1", port)
+		return w.Sock_connect_addr(m, fd, sockAddrOff, 0, 0)
+	}
+	if rc := connect(); rc != _wasiESUCCESS {
+		t.Fatalf("connect to an address of an allowed name rc=%d", rc)
+	}
+	if !slices.Equal(hosts, []string{"a.example"}) {
+		t.Fatalf("Dial was told %q, want a.example alone", hosts)
+	}
+	hosts, allowed = nil, "b.example"
+	if rc := connect(); rc != _wasiESUCCESS {
+		t.Fatalf("connect to an address of an allowed name rc=%d", rc)
+	}
+	if !slices.Equal(hosts, []string{"a.example", "b.example"}) {
+		t.Fatalf("Dial was told %q, want a.example, then b.example", hosts)
+	}
+	hosts, allowed = nil, "other.example"
+	if rc := connect(); rc != -_wasiEACCES {
+		t.Fatalf("connect to an address of no allowed name rc=%d, want -EACCES", rc)
+	}
+	if !slices.Equal(hosts, []string{"a.example", "b.example", "c.example"}) {
+		t.Fatalf("Dial was told %q, want every name in order", hosts)
 	}
 }
 

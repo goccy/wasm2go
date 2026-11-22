@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -149,7 +150,7 @@ func TestWasi_ForkSharesDescriptors(t *testing.T) {
 func TestWasi_ForkConfiguration(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	w.cfg.FSAccess = func(string, bool) bool { return true }
-	w.resolvedHosts = map[string]string{"127.0.0.1": "localhost"}
+	w.recordResolvedHost("127.0.0.1", "localhost")
 	w.procs = map[int32]*wasiProc{1000: {done: make(chan struct{})}}
 	if rc := w.Fd_cloexec(m, 2, 1, 1, 5300); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_cloexec rc=%d", rc)
@@ -172,12 +173,20 @@ func TestWasi_ForkConfiguration(t *testing.T) {
 	if len(child.procs) != 0 {
 		t.Errorf("child inherited %d processes, want none", len(child.procs))
 	}
-	if child.resolvedHosts["127.0.0.1"] != "localhost" {
-		t.Error("resolved hosts not copied")
+	// The names lookups gave addresses for are the family's: the child's
+	// connects are asked about the parent's, and the parent's about the
+	// child's.
+	var told []string
+	dial := func(network, host, ip string, port int) bool {
+		told = append(told, host)
+		return false
 	}
-	child.resolvedHosts["10.0.0.1"] = "other"
-	if _, ok := w.resolvedHosts["10.0.0.1"]; ok {
-		t.Error("resolved hosts map is shared, want a copy")
+	w.cfg.Dial, child.cfg.Dial = dial, dial
+	child.recordResolvedHost("10.0.0.1", "other")
+	child.dialAllowed("tcp", "127.0.0.1", 80)
+	w.dialAllowed("tcp", "10.0.0.1", 80)
+	if !slices.Equal(told, []string{"localhost", "other"}) {
+		t.Errorf("Dial was told %q, want localhost for the parent's lookup, other for the child's", told)
 	}
 	// The close-on-exec marks are copied, and each side's are its own.
 	cm := newForkTestModule()

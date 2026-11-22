@@ -75,7 +75,9 @@ var posixImports = map[string]bool{
 	"proc_wait":                  true,
 	"proc_wait_any":              true,
 	"sock_bind_addr":             true,
+	"sock_connect":               true,
 	"sock_connect_addr":          true,
+	"sock_getaddrinfo":           true,
 	"sock_listen":                true,
 	"sock_name":                  true,
 	"sock_open":                  true,
@@ -87,6 +89,7 @@ var posixImports = map[string]bool{
 	"sock_service":               true,
 	"sock_getopt":                true,
 	"sock_setopt":                true,
+	"sock_socket":                true,
 	"sock_socketpair":            true,
 	"sock_timeout":               true,
 
@@ -107,15 +110,19 @@ var posixImports = map[string]bool{
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that
-// are served under wasi_snapshot_preview1 as well. Every other import of
-// wasip1_posix_extension is served under wasip1_posix_extension only.
+// are served under wasi_snapshot_preview1 as well, for the guests built
+// against that module. Every other import of wasip1_posix_extension is
+// served under wasip1_posix_extension only.
 var wasiReleasedPosixImports = map[string]bool{
-	"fd_dup":     true,
-	"fd_dup2":    true,
-	"path_chmod": true,
-	"pipe":       true,
-	"proc_spawn": true,
-	"proc_wait":  true,
+	"fd_dup":           true,
+	"fd_dup2":          true,
+	"path_chmod":       true,
+	"pipe":             true,
+	"proc_spawn":       true,
+	"proc_wait":        true,
+	"sock_connect":     true,
+	"sock_getaddrinfo": true,
+	"sock_socket":      true,
 }
 
 // servingModule returns the import module whose implementation answers an
