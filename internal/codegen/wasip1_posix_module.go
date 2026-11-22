@@ -92,6 +92,8 @@ var posixImports = map[string]bool{
 
 	"proc_chdir":  true,
 	"proc_setenv": true,
+
+	"proc_fork": true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

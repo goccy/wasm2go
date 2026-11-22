@@ -2,14 +2,18 @@
 ;; and exports __wasip1_posix_extension_fork_child, the entry of the child of
 ;; a fork. The child's result is made of what it sees: its argc (wasi), the
 ;; cell at 100 (memory), the global $g and env's base; it then changes the
-;; cell and $g.
+;; cell and $g. The passive data segments, the memory's maximum and the
+;; reference-typed global $r are the rest of the state a fork carries.
 (module
   (import "wasi_snapshot_preview1" "args_sizes_get"
     (func $args_sizes_get (param i32 i32) (result i32)))
   (import "env" "base" (func $base (result i32)))
 
-  (memory (export "memory") 1)
+  (memory (export "memory") 1 3)
   (global $g (mut i32) (i32.const 0))
+  (global $r (mut externref) (ref.null extern))
+  (data $p0 "abcd")
+  (data $p1 "efgh")
 
   (func (export "set") (param $v i32)
     (i32.store (i32.const 100) (local.get $v))
@@ -24,6 +28,17 @@
   ;; grows the memory by a page: the old size in pages, or -1
   (func (export "grow") (result i32)
     (memory.grow (i32.const 1)))
+
+  (func (export "drop")
+    (data.drop $p0))
+
+  ;; copies $p0 to 300, which traps once $p0 is dropped
+  (func (export "init0")
+    (memory.init $p0 (i32.const 300) (i32.const 0) (i32.const 4)))
+
+  ;; copies $p1 to 40000, where the data then ends
+  (func (export "init1")
+    (memory.init $p1 (i32.const 40000) (i32.const 0) (i32.const 4)))
 
   ;; argc + 10*cell + 100*g + 1000*base
   (func (export "__wasip1_posix_extension_fork_child") (result i32)
