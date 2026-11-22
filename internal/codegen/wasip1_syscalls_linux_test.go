@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux
 
 package codegen
 
@@ -31,11 +31,11 @@ func goSyscallNumbers(t *testing.T, goroot, arch string) map[string]uintptr {
 	return numbers
 }
 
-// The table moves each call of the Linux ABI to x86-64's call of the same
-// name: its keys are the numbers the ABI assigns below the shared ones, and
-// each call package syscall names on arm64 (whose numbers are the ABI's)
-// and on amd64 is moved to amd64's number of its name (the numbers the
-// table writes out are of calls package syscall does not name on amd64).
+// The table of amd64 moves each call of the Linux ABI to x86-64's call of
+// the same name: its keys are the numbers the ABI assigns below the shared
+// ones, and each call package syscall names on arm64 (whose numbers are the
+// ABI's) and on amd64 is moved to amd64's number of its name (the calls
+// package syscall does not name on amd64 are not checked).
 func TestHostSyscallNumbers_TheCallOfTheSameName(t *testing.T) {
 	out, err := exec.Command("go", "env", "GOROOT").Output()
 	if err != nil {
@@ -53,7 +53,7 @@ func TestHostSyscallNumbers_TheCallOfTheSameName(t *testing.T) {
 		t.Fatalf("read %d numbers of arm64 and %d of amd64", len(generic), len(x86))
 	}
 	for number := range int64(linuxSysPidfdSendSignal) {
-		got, ok := hostSyscallNumbers[number]
+		got, ok := hostSyscallNumbersAMD64[number]
 		if ok != linuxSyscallAssigned(number) {
 			t.Errorf("number %d in the table: %v, want %v", number, ok, !ok)
 			continue

@@ -14617,8 +14617,6 @@ var (
 	//go:embed wasip1_native_terminal_darwin.go
 	wasip1NativeTerminalDarwinRaw []byte
 
-	//go:embed wasip1_syscalls_linux_amd64.go
-	wasip1SyscallsLinuxAMD64Raw []byte
 	//go:embed wasip1_syscalls_linux.go
 	wasip1SyscallsLinuxRaw []byte
 )
@@ -14652,8 +14650,7 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
 		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
 
-		"wasip1_syscalls_linux_amd64.go": wasip1SyscallsLinuxAMD64Raw,
-		"wasip1_syscalls_linux.go":       wasip1SyscallsLinuxRaw,
+		"wasip1_syscalls_linux.go": wasip1SyscallsLinuxRaw,
 	} {
 		src, err := renamePackage(raw, pkg)
 		if err != nil {
