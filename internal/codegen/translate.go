@@ -379,6 +379,8 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 		// stopAgents ends the waits of the agents when the WASI host's
 		// instance ends.
 		t.helpers["stopAgents"] = true
+		// onAgentEnd tells the WASI host of each agent that ends.
+		t.helpers["onAgentEnd"] = true
 		// The Module struct's memMu field needs "sync" — register it
 		// HERE, not only in emitModuleStruct: the multi-package path
 		// snapshots base's import set after emitHelpers but BEFORE

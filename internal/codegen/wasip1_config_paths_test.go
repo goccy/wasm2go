@@ -200,7 +200,7 @@ func TestWasi_FdPathIsCanonical(t *testing.T) {
 	w, m := newTestStubs(t, pathWalkDir(t))
 	fdPath := func(name, want string) {
 		t.Helper()
-		fd, errno := w.pathOpen(name, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		fd, errno := w.pathOpen(m, name, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("pathOpen(%q) errno=%d", name, errno)
 		}

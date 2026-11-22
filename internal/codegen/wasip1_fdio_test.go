@@ -43,7 +43,7 @@ func TestWasi_FdDupfdTakesTheLowestNumberFromMin(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
-	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
+	fd, errno := w.pathOpen(m, "f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -126,7 +126,7 @@ func TestWasi_FdDupSharesOffsetAndDefersClose(t *testing.T) {
 	}
 	w, m := newTestStubs(t, dir)
 
-	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
+	fd, errno := w.pathOpen(m, "f.txt", 0, 0, 1<<1 /* FD_READ */, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -188,7 +188,7 @@ func TestWasi_FdDup2RedirectsAndRestoresStdio(t *testing.T) {
 	saved := int32(binary.LittleEndian.Uint32(m.memory[savedOff:]))
 
 	// Point fd 1 at a real file.
-	logFd, errno := w.pathOpen("log.txt", 0, 0x1 /* O_CREAT */, 1<<6 /* FD_WRITE */, 0)
+	logFd, errno := w.pathOpen(m, "log.txt", 0, 0x1 /* O_CREAT */, 1<<6 /* FD_WRITE */, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -280,7 +280,7 @@ func TestWasi_PollFdSubscriptionsPreemptTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
-	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1, 0)
+	fd, errno := w.pathOpen(m, "f.txt", 0, 0, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -332,7 +332,7 @@ func TestWasi_FdDupEdgeCases(t *testing.T) {
 	if rc := w.Fd_dup(m, 99, 100); rc != _wasiEBADF {
 		t.Fatalf("Fd_dup(bad) rc=%d, want EBADF", rc)
 	}
-	fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1, 0)
+	fd, errno := w.pathOpen(m, "f.txt", 0, 0, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -456,7 +456,7 @@ func TestWasi_OwnDescriptorNames(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
 	var out bytes.Buffer
 	w.cfg.Stdout = &out
-	fd, errno := w.pathOpen("dev/stdout", 1, 0, 1<<6 /* FD_WRITE */, 0)
+	fd, errno := w.pathOpen(m, "dev/stdout", 1, 0, 1<<6 /* FD_WRITE */, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open dev/stdout errno=%d", errno)
 	}
@@ -470,7 +470,7 @@ func TestWasi_OwnDescriptorNames(t *testing.T) {
 	if out.String() != "through the name\n" {
 		t.Fatalf("the guest's standard output got %q", out.String())
 	}
-	if _, errno := w.pathOpen("dev/fd/9", 0, 0, 1<<1, 0); errno != _wasiENOENT {
+	if _, errno := w.pathOpen(m, "dev/fd/9", 0, 0, 1<<1, 0); errno != _wasiENOENT {
 		t.Fatalf("open dev/fd/9 of a number that is not open: errno=%d, want ENOENT", errno)
 	}
 	// A number in a spelling no descriptor has does not reach the host,
@@ -479,7 +479,7 @@ func TestWasi_OwnDescriptorNames(t *testing.T) {
 		"dev/fd/01", "dev/fd/00", "dev/fd/07", "dev/fd/0099999999999", "dev/fd/99999999999",
 		"proc/self/fd/01", "proc/42/fd/002", "dev/fd/01/",
 	} {
-		if _, errno := w.pathOpen(name, 0, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiENOENT {
+		if _, errno := w.pathOpen(m, name, 0, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiENOENT {
 			t.Errorf("open %s errno=%d, want ENOENT", name, errno)
 		}
 	}
@@ -498,7 +498,7 @@ func TestWasi_OwnDescriptorListing(t *testing.T) {
 	}
 	pid := w.guestProcess().IDs().PID
 	for _, dir := range []string{"dev/fd", "/proc/self/fd/", "proc/" + strconv.Itoa(int(pid)) + "/fd"} {
-		fd, errno := w.pathOpen(dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		fd, errno := w.pathOpen(m, dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open %s errno=%d", dir, errno)
 		}
@@ -525,7 +525,7 @@ func TestWasi_OwnDescriptorListing(t *testing.T) {
 		}
 		closeTestFd(t, w, m, fd)
 	}
-	if _, errno := w.pathOpen("dev/fd", 0, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiEISDIR {
+	if _, errno := w.pathOpen(m, "dev/fd", 0, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiEISDIR {
 		t.Fatalf("open dev/fd for writing errno=%d, want EISDIR", errno)
 	}
 }
@@ -581,7 +581,7 @@ func TestWasi_OwnDescriptorNamesDescribed(t *testing.T) {
 	if target, rc := readlink(name); rc != _wasiESUCCESS || target != "/a.txt" {
 		t.Errorf("readlink %s = %q rc=%d, want /a.txt", name, target, rc)
 	}
-	dir, errno := w.pathOpen("proc/self/fd", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	dir, errno := w.pathOpen(m, "proc/self/fd", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open proc/self/fd errno=%d", errno)
 	}
@@ -642,18 +642,18 @@ func TestWasi_OwnDescriptorNamesAreLinks(t *testing.T) {
 	w.cfg.Stdin = stdin
 	w.cfg.Process = testProcess{ids: ProcessIDs{PID: 42, PPID: 1, EUID: 501, EGID: 20}}
 	const write = int64(1 << 6)
-	if _, errno := w.pathOpen("dev/stdout", 0, 0, write, 0); errno != _wasiELOOP {
+	if _, errno := w.pathOpen(m, "dev/stdout", 0, 0, write, 0); errno != _wasiELOOP {
 		t.Errorf("open dev/stdout without the follow flag errno=%d, want ELOOP", errno)
 	}
-	if _, errno := w.pathOpen("dev/stdout", 1, 0x1|0x4 /* O_CREAT|O_EXCL */, write, 0); errno != _wasiEEXIST {
+	if _, errno := w.pathOpen(m, "dev/stdout", 1, 0x1|0x4 /* O_CREAT|O_EXCL */, write, 0); errno != _wasiEEXIST {
 		t.Errorf("open dev/stdout O_CREAT|O_EXCL errno=%d, want EEXIST", errno)
 	}
-	if _, errno := w.pathOpen("dev/stdout/", 0, 0, write, 0); errno != _wasiENOTDIR {
+	if _, errno := w.pathOpen(m, "dev/stdout/", 0, 0, write, 0); errno != _wasiENOTDIR {
 		t.Errorf("open dev/stdout/ errno=%d, want ENOTDIR: a name that goes on follows the link", errno)
 	}
 
 	// The preopened root.
-	rootFd, errno := w.pathOpen("dev/fd/3", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	rootFd, errno := w.pathOpen(m, "dev/fd/3", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open dev/fd/3 errno=%d", errno)
 	}
@@ -698,16 +698,16 @@ func TestWasi_OwnDescriptorNamesAreLinks(t *testing.T) {
 		if st := lstat("dev/stdin"); st.filetype != 7 || st.size != uint64(len("/proc/self/fd/0")) {
 			t.Errorf("lstat dev/stdin = type %d size %d, want a link to /proc/self/fd/0", st.filetype, st.size)
 		}
-		if _, errno := w.pathOpen("dev/stdin", 0, 0, 1<<1, 0); errno != _wasiELOOP {
+		if _, errno := w.pathOpen(m, "dev/stdin", 0, 0, 1<<1, 0); errno != _wasiELOOP {
 			t.Errorf("open dev/stdin without the follow flag errno=%d, want ELOOP", errno)
 		}
-		fd, errno := w.pathOpen("dev/fd/0", 0, 0, 1<<1, 0)
+		fd, errno := w.pathOpen(m, "dev/fd/0", 0, 0, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Errorf("open dev/fd/0 without the follow flag errno=%d: it is no link", errno)
 		} else {
 			closeTestFd(t, w, m, fd)
 		}
-		listed, errno := w.pathOpen("dev/fd", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		listed, errno := w.pathOpen(m, "dev/fd", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open dev/fd errno=%d", errno)
 		}
@@ -735,7 +735,7 @@ func TestWasi_OwnDescriptorNamesAreLinks(t *testing.T) {
 		if target := string(m.memory[outOff : outOff+int32(readU32(m.memory, int(out2Off)))]); rc != _wasiESUCCESS || target != want {
 			t.Errorf("readlink dev/fd/0 on the whole host filesystem = %q rc=%d, want the host's %q", target, rc, want)
 		}
-		if _, errno := whole.pathOpen("dev/fd/0", 0, 0, 1<<1, 0); errno != _wasiELOOP {
+		if _, errno := whole.pathOpen(m, "dev/fd/0", 0, 0, 1<<1, 0); errno != _wasiELOOP {
 			t.Errorf("open dev/fd/0 without the follow flag errno=%d, want ELOOP", errno)
 		}
 	}
@@ -786,7 +786,7 @@ func TestWasi_OwnDescriptorNamesOfTheRootAndAClosedStream(t *testing.T) {
 			w.cfg.FS = osFS{}
 		}
 		w.cfg.FSAccess = func(string, bool) bool { return false }
-		fd, errno := w.pathOpen("dev/fd/3", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		fd, errno := w.pathOpen(m, "dev/fd/3", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open dev/fd/3 with FSAccess denying all errno=%d", errno)
 		}
@@ -808,7 +808,7 @@ func TestWasi_OwnDescriptorNamesOfTheRootAndAClosedStream(t *testing.T) {
 		if rc := w.Path_readlink(m, wasiPreopenFD, off, n, 1024, 256, 2048); rc != _wasiEBADF {
 			t.Errorf("whole=%v: readlink dev/fd/0 of a closed file rc=%d, want EBADF", whole, rc)
 		}
-		listed, errno := w.pathOpen("dev/fd", 1, 0x2, 1<<1, 0)
+		listed, errno := w.pathOpen(m, "dev/fd", 1, 0x2, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("whole=%v: open dev/fd errno=%d", whole, errno)
 		}
@@ -880,7 +880,7 @@ func TestWasi_OwnDescriptorNamesInAnySpelling(t *testing.T) {
 	var out bytes.Buffer
 	w.cfg.Stdout = &out
 	for _, name := range []string{"dev//fd/1", "dev/./stdout", "../proc/self/fd/1"} {
-		fd, errno := w.pathOpen(name, 1, 0, 1<<6 /* FD_WRITE */, 0)
+		fd, errno := w.pathOpen(m, name, 1, 0, 1<<6 /* FD_WRITE */, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open %s errno=%d", name, errno)
 		}
@@ -891,7 +891,7 @@ func TestWasi_OwnDescriptorNamesInAnySpelling(t *testing.T) {
 	if want := "dev//fd/1\ndev/./stdout\n../proc/self/fd/1\n"; out.String() != want {
 		t.Fatalf("the guest's standard output got %q, want %q", out.String(), want)
 	}
-	fd, errno := w.pathOpen("dev//fd/", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(m, "dev//fd/", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open dev//fd/ errno=%d", errno)
 	}
@@ -923,11 +923,11 @@ func TestWasi_OwnDescriptorNamesThatGoOn(t *testing.T) {
 	w, m := newTestStubs(t, dir)
 	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	const read, write = int64(1 << 1), int64(1 << 6)
-	file, errno := w.pathOpen("a.txt", 0, 0, read, 0)
+	file, errno := w.pathOpen(m, "a.txt", 0, 0, read, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open a.txt errno=%d", errno)
 	}
-	dirFd, errno := w.pathOpen("d", 0, 0x2 /* O_DIRECTORY */, read, 0)
+	dirFd, errno := w.pathOpen(m, "d", 0, 0x2 /* O_DIRECTORY */, read, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open d errno=%d", errno)
 	}
@@ -939,12 +939,12 @@ func TestWasi_OwnDescriptorNamesThatGoOn(t *testing.T) {
 		{"dev/stdout/", write}, {"dev/fd/1/.", write}, {"dev/fd/1/../2", write}, {"dev/stdin/..", read},
 		{fileName + "/", read}, {fileName + "/.", read}, {fileName + "/../0", read}, {"../proc/self/fd/" + strconv.Itoa(int(file)) + "/x", read},
 	} {
-		if _, errno := w.pathOpen(tc.name, 1, 0, tc.rights, 0); errno != _wasiENOTDIR {
+		if _, errno := w.pathOpen(m, tc.name, 1, 0, tc.rights, 0); errno != _wasiENOTDIR {
 			t.Errorf("open %s errno=%d, want ENOTDIR", tc.name, errno)
 		}
 	}
 	for _, name := range []string{dirName + "/", dirName + "/.", "dev//fd/" + strconv.Itoa(int(dirFd)) + "//./"} {
-		fd, errno := w.pathOpen(name, 0, 0, read, 0)
+		fd, errno := w.pathOpen(m, name, 0, 0, read, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open %s errno=%d", name, errno)
 		}
@@ -955,7 +955,7 @@ func TestWasi_OwnDescriptorNamesThatGoOn(t *testing.T) {
 	for _, name := range []string{
 		dirName + "/a.txt", dirName + "/../a.txt", dirName + "/../" + fileName, dirName + "/..", dirName + "/missing",
 	} {
-		if _, errno := w.pathOpen(name, 0, 0, read, 0); errno != _wasiENOTSUP {
+		if _, errno := w.pathOpen(m, name, 0, 0, read, 0); errno != _wasiENOTSUP {
 			t.Errorf("open %s errno=%d, want ENOTSUP", name, errno)
 		}
 	}
@@ -973,15 +973,15 @@ func TestWasi_OwnDescriptorNamesKeepTheAccessMode(t *testing.T) {
 	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 	const read, write = int64(1 << 1), int64(1 << 6)
 	writeOnly := createTestFile(t, w, "a.txt")
-	readOnly, errno := w.pathOpen("a.txt", 0, 0, read, 0)
+	readOnly, errno := w.pathOpen(nil, "a.txt", 0, 0, read, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open a.txt for reading errno=%d", errno)
 	}
-	both, errno := w.pathOpen("a.txt", 0, 0, read|write, 0)
+	both, errno := w.pathOpen(nil, "a.txt", 0, 0, read|write, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open a.txt errno=%d", errno)
 	}
-	dirFd, errno := w.pathOpen("d", 0, 0x2 /* O_DIRECTORY */, read, 0)
+	dirFd, errno := w.pathOpen(nil, "d", 0, 0x2 /* O_DIRECTORY */, read, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open d errno=%d", errno)
 	}
@@ -1013,7 +1013,7 @@ func TestWasi_OwnDescriptorNamesKeepTheAccessMode(t *testing.T) {
 		{name(dirFd), 0, read, _wasiESUCCESS},
 		{name(dirFd), 0, write, _wasiEACCES},
 	} {
-		if _, errno := w.pathOpen(tc.name, 1, tc.oflags, tc.rights, 0); errno != tc.want {
+		if _, errno := w.pathOpen(nil, tc.name, 1, tc.oflags, tc.rights, 0); errno != tc.want {
 			t.Errorf("open %s (oflags %#x, rights %#x) errno=%d, want %d", tc.name, tc.oflags, tc.rights, errno, tc.want)
 		}
 	}

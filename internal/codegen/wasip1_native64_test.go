@@ -551,7 +551,7 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 	}
 	w, m := newTestStubs(t, dir)
 	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
-	fd, errno := w.pathOpen("f", 0, 0, 1<<1|1<<6, 0)
+	fd, errno := w.pathOpen(m, "f", 0, 0, 1<<1|1<<6, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open: %d", errno)
 	}
@@ -646,7 +646,7 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 	prep := func(t *testing.T, w *WasiStubs, m *Module) int32 {
 		t.Helper()
 		w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
-		fd, errno := w.pathOpen("f.txt", 0, 0, 1<<1|1<<6, 0)
+		fd, errno := w.pathOpen(m, "f.txt", 0, 0, 1<<1|1<<6, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("open: %d", errno)
 		}

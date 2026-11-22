@@ -70,10 +70,11 @@ func TestWasip1Mem64ImportsCompile(t *testing.T) {
 		}
 	}
 	// Every binding has its *64 twin: a method that takes the Module first,
-	// and is no twin itself, has one.
+	// and is no twin itself, has one. BeginOutside takes the module of the
+	// calling thread for the embedder, and binds no import.
 	for i := 0; i < stubs.NumMethod(); i++ {
 		narrow := stubs.Method(i)
-		if strings.HasSuffix(narrow.Name, "64") || !takesModule(narrow) {
+		if strings.HasSuffix(narrow.Name, "64") || !takesModule(narrow) || narrow.Name == "BeginOutside" {
 			continue
 		}
 		if wide, ok := stubs.MethodByName(narrow.Name + "64"); !ok || !takesModule(wide) {

@@ -106,7 +106,7 @@ func fdFilestatExt(t *testing.T, w *WasiStubs, m *Module, fd int32) filestatExt 
 // the new fd: a separate open file description on every call.
 func openTestFile(t *testing.T, w *WasiStubs, name string) int32 {
 	t.Helper()
-	fd, errno := w.pathOpen(name, 0x1, 0, 1<<1|1<<6, 0)
+	fd, errno := w.pathOpen(nil, name, 0x1, 0, 1<<1|1<<6, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen(%s) errno=%d", name, errno)
 	}
@@ -487,7 +487,7 @@ func TestMemFS_FilesHaveTheirOwnInode(t *testing.T) {
 		t.Fatal(err)
 	}
 	opened := openTestFile(t, w, "d/a")
-	if _, errno := w.pathOpen("b", 0x1, 1<<0, 1<<1|1<<6, 0); errno != _wasiESUCCESS {
+	if _, errno := w.pathOpen(m, "b", 0x1, 1<<0, 1<<1|1<<6, 0); errno != _wasiESUCCESS {
 		t.Fatalf("create b errno=%d", errno)
 	}
 	root := pathFilestat(t, w, m, ".", true)
@@ -545,7 +545,7 @@ func TestMemFS_ReaddirInodesAreTheStatOnes(t *testing.T) {
 		"d":     {".": "d", "..": ".", "a": "d/a", "sub": "d/sub"},
 		"d/sub": {".": "d/sub", "..": "d", "b": "d/sub/b"},
 	} {
-		fd, errno := w.pathOpen(dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		fd, errno := w.pathOpen(m, dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("pathOpen(%s) errno=%d", dir, errno)
 		}
@@ -576,7 +576,7 @@ func TestMemFS_ReaddirDotsOfAMovedDirectory(t *testing.T) {
 		}
 	}
 	open := func(dir string) int32 {
-		fd, errno := w.pathOpen(dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		fd, errno := w.pathOpen(m, dir, 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("pathOpen(%s) errno=%d", dir, errno)
 		}
@@ -663,7 +663,7 @@ func TestReaddir_DirectoryWhoseStatFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.cfg.FS = statOnceFS{fsys}
-	fd, errno := w.pathOpen("d", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(nil, "d", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -892,7 +892,7 @@ func TestMemFS_RenameOntoAnExistingName(t *testing.T) {
 		}
 	}
 
-	held, errno := w.pathOpen("empty", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	held, errno := w.pathOpen(m, "empty", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen(empty) errno=%d", errno)
 	}
@@ -926,14 +926,14 @@ func TestWasi_FdPathNamesAnOpenDirectory(t *testing.T) {
 		return string(m.memory[metaPathOff : metaPathOff+int32(readU32(m.memory, int(metaOutOff)))]), 0
 	}
 	const oDirectory = 0x2
-	dir, errno := w.pathOpen("outer/inner", 0x1, oDirectory, 1<<1, 0)
+	dir, errno := w.pathOpen(m, "outer/inner", 0x1, oDirectory, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open the directory errno=%d", errno)
 	}
 	if got, rc := fdPath(dir, 256); rc != 0 || got != "/outer/inner" {
 		t.Fatalf("Fd_path(directory) = %q rc=%d, want /outer/inner", got, rc)
 	}
-	root, errno := w.pathOpen("", 0x1, oDirectory, 1<<1, 0)
+	root, errno := w.pathOpen(m, "", 0x1, oDirectory, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open the root errno=%d", errno)
 	}

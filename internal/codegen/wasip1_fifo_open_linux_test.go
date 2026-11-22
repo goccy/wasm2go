@@ -229,8 +229,8 @@ func TestFIFOOpenForReadingOfAnotherFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "plain"), []byte("p"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	w, _ := newSignalGuestIn(t, dir)
-	f, errno, watched := w.openFIFOWatched(w.fs().OpenFile, "plain", os.O_RDONLY, 0)
+	w, m := newSignalGuestIn(t, dir)
+	f, errno, watched := w.openFIFOWatched(m, w.fs().OpenFile, "plain", os.O_RDONLY, 0)
 	if !watched || errno != _wasiESUCCESS {
 		t.Fatalf("open errno=%d watched=%v", errno, watched)
 	}

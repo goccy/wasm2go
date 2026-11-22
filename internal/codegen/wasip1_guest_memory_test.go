@@ -53,8 +53,11 @@ func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 		t.Errorf("readCStr of a string unterminated within memSize = %q, ok", s)
 	}
 
-	w.sig.flagModule, w.sig.flagAddr = m, size
-	w.raiseSignalFlag()
+	w.sig.mu.Lock()
+	thread := w.sig.threadLocked(m)
+	thread.registered, thread.flagAddr = true, size
+	w.sig.mu.Unlock()
+	w.raiseSignalFlag(thread)
 	if !bytes.Equal(m.memory[size:size+4], make([]byte, 4)) {
 		t.Errorf("the flag word past memSize was written: % x", m.memory[size:size+4])
 	}
@@ -71,7 +74,7 @@ func TestWasiGuestMemoryBoundedByMemSize(t *testing.T) {
 	if s, ok := w.readCStr(m, size-4); !ok || s != "path" {
 		t.Errorf("readCStr after growth = %q, %v, want \"path\", true", s, ok)
 	}
-	w.raiseSignalFlag()
+	w.raiseSignalFlag(thread)
 	if got := m.memory[size]; got != 1 {
 		t.Errorf("the flag word after growth = %d, want 1", got)
 	}

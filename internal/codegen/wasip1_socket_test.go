@@ -1192,7 +1192,7 @@ func TestSocket_LookupIsInterruptible(t *testing.T) {
 	}
 	takeSignals(t, w, m)
 	postWhenBlocked(w, wasiSIGUSR1)
-	if errno := w.lookupInterruptibly("sock_resolve", func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly(m, "sock_resolve", func(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}); errno != _wasiEINTR {
@@ -1200,18 +1200,18 @@ func TestSocket_LookupIsInterruptible(t *testing.T) {
 	}
 	takeSignals(t, w, m)
 	postWhenBlocked(w, wasiSIGUSR1)
-	if errno := w.lookupInterruptibly("sock_resolve", func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly(m, "sock_resolve", func(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}); errno != _wasiESUCCESS {
 		t.Fatalf("lookup that went through errno=%d", errno)
 	}
 	notFound := func(context.Context) error { return &net.DNSError{IsNotFound: true} }
-	if errno := w.lookupInterruptibly("sock_resolve", notFound); errno != _wasiEINTR {
+	if errno := w.lookupInterruptibly(m, "sock_resolve", notFound); errno != _wasiEINTR {
 		t.Fatalf("lookup after one that went through a signal errno=%d, want EINTR", errno)
 	}
 	takeSignals(t, w, m)
-	if errno := w.lookupInterruptibly("sock_resolve", notFound); errno != _wasiENOENT {
+	if errno := w.lookupInterruptibly(m, "sock_resolve", notFound); errno != _wasiENOENT {
 		t.Fatalf("lookup of no name errno=%d, want ENOENT", errno)
 	}
 }

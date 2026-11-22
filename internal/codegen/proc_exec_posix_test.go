@@ -223,7 +223,7 @@ func TestExec_KillCommandsEndsTheCommand(t *testing.T) {
 // A SIGKILL that asked for the end of the instance while the command it
 // becomes started is the command's.
 func TestExec_KillDuringTheStartIsTheCommands(t *testing.T) {
-	w, _ := newProcTestStubs(t)
+	w, m := newProcTestStubs(t)
 	r, input, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +236,7 @@ func TestExec_KillDuringTheStartIsTheCommands(t *testing.T) {
 	w.sig.mu.Lock()
 	w.requestStopLocked(nil, &WasiSignalError{Signal: wasiSIGKILL})
 	w.unlockSignals()
-	w.becomeCommand(p)
+	w.becomeCommand(m, p)
 	// The command's input ends: a command that was not killed exits.
 	if err := input.Close(); err != nil {
 		t.Fatal(err)
@@ -278,7 +278,7 @@ func TestExec_IgnoredTimerIsNotTheCommands(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
-	w.becomeCommand(p)
+	w.becomeCommand(m, p)
 	w.sig.mu.Lock()
 	w.sig.timer = time.AfterFunc(time.Hour, func() {})
 	w.sig.timerAt = time.Now()
@@ -294,6 +294,46 @@ func TestExec_IgnoredTimerIsNotTheCommands(t *testing.T) {
 	}
 	if ws, _ := st.Sys().(syscall.WaitStatus); !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
 		t.Fatalf("the command ended with %v, want killed by SIGTERM: the ignored SIGALRM reached it", st)
+	}
+}
+
+// The command a thread of the guest becomes gets the signals pending for
+// the process and for that thread that the thread does not block, as
+// execve(2) keeps them; one the thread blocks, or raised for another
+// thread, it does not get.
+func TestExec_TheCommandGetsWhatWaitsForTheExecingThread(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		post func(w *WasiStubs, m, other *Module)
+		want syscall.Signal
+	}{
+		{"raised for the thread", func(w *WasiStubs, m, other *Module) { w.raiseOwn(m, wasiSIGUSR1, true) }, syscall.SIGUSR1},
+		{"blocked by the thread", func(w *WasiStubs, m, other *Module) { w.raiseOwn(m, wasiSIGUSR2, true) }, syscall.SIGTERM},
+		{"raised for another thread", func(w *WasiStubs, m, other *Module) { w.raiseOwn(other, wasiSIGUSR1, true) }, syscall.SIGTERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handled := signalMask(wasiSIGUSR1, wasiSIGUSR2)
+			w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGUSR2)
+			setDispositions(t, w, m, handled, 0, signalMask(wasiSIGUSR2))
+			other := newSignalThread(t, w, m, sigFlag2Off, handled, 0)
+			tc.post(w, m, other)
+			p, err := os.StartProcess("/bin/sleep", []string{"/bin/sleep", "1000"}, &os.ProcAttr{})
+			if err != nil {
+				t.Skip(err)
+			}
+			w.becomeCommand(m, p)
+			// What becomeCommand sent, it sent before it returned.
+			if err := p.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			st, err := p.Wait()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ws, _ := st.Sys().(syscall.WaitStatus); !ws.Signaled() || ws.Signal() != tc.want {
+				t.Fatalf("the command ended with %v, want killed by %v", st, tc.want)
+			}
+		})
 	}
 }
 

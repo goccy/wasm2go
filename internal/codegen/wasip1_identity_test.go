@@ -166,13 +166,13 @@ func TestPathOpenAsksForThePIDOnlyUnderProc(t *testing.T) {
 	calls := 0
 	w.cfg.Process = countingProcess{testProcess{ids: ProcessIDs{PID: 7}}, &calls}
 	closeTestFd(t, w, m, createTestFile(t, w, "a.txt"))
-	if _, errno := w.pathOpen("dev/fd/1", 1, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiESUCCESS {
+	if _, errno := w.pathOpen(m, "dev/fd/1", 1, 0, 1<<6 /* FD_WRITE */, 0); errno != _wasiESUCCESS {
 		t.Fatalf("open dev/fd/1 errno=%d", errno)
 	}
 	if calls != 0 {
 		t.Fatalf("IDs called %d times for names outside proc/N/fd", calls)
 	}
-	fd, errno := w.pathOpen("proc/7/fd/1", 1, 0, 1<<6, 0)
+	fd, errno := w.pathOpen(m, "proc/7/fd/1", 1, 0, 1<<6, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open proc/7/fd/1 errno=%d", errno)
 	}
@@ -194,12 +194,12 @@ func TestConfigProcess(t *testing.T) {
 	if got := procIDs(t, w); got != want {
 		t.Fatalf("ids = %v, want %v", got, want)
 	}
-	fd, errno := w.pathOpen("proc/7/fd", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(m, "proc/7/fd", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open proc/7/fd errno=%d", errno)
 	}
 	closeTestFd(t, w, m, fd)
-	if _, errno := w.pathOpen("proc/42/fd", 0, 0x2, 1<<1, 0); errno != _wasiENOENT {
+	if _, errno := w.pathOpen(m, "proc/42/fd", 0, 0x2, 1<<1, 0); errno != _wasiENOENT {
 		t.Fatalf("open proc/42/fd of another pid errno=%d, want ENOENT", errno)
 	}
 	if got := createWithMode(t, w, m, "f", 0o666); got != 0o600 {

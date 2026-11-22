@@ -187,7 +187,7 @@ func TestWasi_PollRegularFileBesideIdlePipe(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
-	fileFd, errno := w.pathOpen("f.txt", 0, 0, 1<<1, 0)
+	fileFd, errno := w.pathOpen(m, "f.txt", 0, 0, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}

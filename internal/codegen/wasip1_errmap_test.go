@@ -158,17 +158,17 @@ func TestGuestErrnoReportsWithoutLocks(t *testing.T) {
 // EEXIST, as with O_CREAT|O_EXCL, a link to nothing included.
 func TestPathOpenNoFollowLoop(t *testing.T) {
 	dir := t.TempDir()
-	w, _ := newTestStubs(t, dir)
+	w, m := newTestStubs(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "target"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
 		t.Fatal(err)
 	}
-	if _, errno := w.pathOpen("link", 0, 0, 1<<1, 0); errno != _wasiELOOP {
+	if _, errno := w.pathOpen(m, "link", 0, 0, 1<<1, 0); errno != _wasiELOOP {
 		t.Errorf("open of a link without following it errno=%d, want ELOOP", errno)
 	}
-	if _, errno := w.pathOpen("link", 1, 0, 1<<1, 0); errno != _wasiESUCCESS {
+	if _, errno := w.pathOpen(m, "link", 1, 0, 1<<1, 0); errno != _wasiESUCCESS {
 		t.Errorf("open of a link following it errno=%d", errno)
 	}
 	if err := os.Symlink("none", filepath.Join(dir, "dangling")); err != nil {
@@ -176,7 +176,7 @@ func TestPathOpenNoFollowLoop(t *testing.T) {
 	}
 	for _, name := range []string{"link", "dangling"} {
 		// O_CREAT|O_EXCL, FD_WRITE
-		if _, errno := w.pathOpen(name, 0, 0x5, 1<<6, 0); errno != _wasiEEXIST {
+		if _, errno := w.pathOpen(m, name, 0, 0x5, 1<<6, 0); errno != _wasiEEXIST {
 			t.Errorf("exclusive create of %s errno=%d, want EEXIST", name, errno)
 		}
 	}
@@ -196,7 +196,7 @@ func (unsupportedFS) Chown(string, int, int, bool) error { return syscall.ENOTSU
 func TestFSUnsupportedErrno(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
 	w.cfg.FS = unsupportedFS{NewMemFS()}
-	if _, errno := w.pathOpen("f", 1, 0, 1<<1, 0); errno != _wasiENOSYS {
+	if _, errno := w.pathOpen(m, "f", 1, 0, 1<<1, 0); errno != _wasiENOSYS {
 		t.Errorf("open errno=%d, want ENOSYS", errno)
 	}
 	path, pathLen := putPath(m, 1000, "f")

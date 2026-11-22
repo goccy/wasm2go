@@ -240,6 +240,19 @@ func TestSignal_WriteToAClosedPipeRaisesSIGPIPE(t *testing.T) {
 		t.Fatalf("pending signals %#x, want SIGPIPE", got)
 	}
 
+	// The signal is the writing thread's: another thread does not take it.
+	writer := newSignalThread(t, w, m, sigFlag2Off, signalMask(wasiSIGPIPE), 0)
+	fd = closedPipe(w, m)
+	if rc, _ := ioWriteCalls[0].run(w, writer, fd, 1); rc != _wasiEPIPE {
+		t.Fatalf("write of the second thread rc=%d, want EPIPE", rc)
+	}
+	if got := takeSignals(t, w, m); got != 0 {
+		t.Fatalf("the thread that did not write took %#x, want nothing", got)
+	}
+	if got := takeSignals(t, w, writer); got != signalMask(wasiSIGPIPE) {
+		t.Fatalf("the writing thread took %#x, want SIGPIPE", got)
+	}
+
 	w, m = newSignalGuest(t)
 	setDispositions(t, w, m, 0, signalMask(wasiSIGPIPE), 0)
 	fd = closedPipe(w, m)
