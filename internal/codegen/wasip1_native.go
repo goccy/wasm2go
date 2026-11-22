@@ -77,10 +77,15 @@ import (
 // embedded-source path strips the package + import header at emit time
 // and lets the generated Module shadow this one. It has the generated
 // Module's fields the stubs read: the memory slice and memSize, the size
-// the guest sees (see guestMemory).
+// the guest sees (see guestMemory), memShared, and what a fork runs
+// (Proc_fork): forkChild, the module's fork child export, and forkModule,
+// which builds the instance a copy of the module's memory is the memory of.
 type Module struct {
-	memory  []byte
-	memSize *atomic.Uint64
+	memory     []byte
+	memSize    *atomic.Uint64
+	memShared  bool
+	forkChild  func(m *Module) int32
+	forkModule func(m *Module, wasi *WasiStubs, memory []byte, memSize uint64) *Module
 }
 
 // accessMemory is the in-package stand-in for the runtime helper of the same
@@ -2049,6 +2054,11 @@ type WASIConfig struct {
 	// tells nobody.
 	Chdir  func(dir string) error
 	Setenv func(name, value string, unset bool) error
+
+	// Fork makes the instance the child of a guest's fork runs in
+	// (Proc_fork). nil denies every fork: it fails with ENOSYS.
+	// CopyForker makes a copy of the forking instance.
+	Fork Forker
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -2664,12 +2674,18 @@ func (w *WasiStubs) pidsLocked() *wasiPIDs {
 // ids of the Process. The family does not know it yet: see
 // enterProcLocked. Caller holds w.mu.
 func (w *WasiStubs) addProcLocked(proc *wasiProc, ids ProcessIDs) int32 {
+	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
+	w.putProcLocked(pid, proc)
+	return pid
+}
+
+// putProcLocked registers proc under pid, a token alloc handed out, as a
+// process this instance waits for. Caller holds w.mu.
+func (w *WasiStubs) putProcLocked(pid int32, proc *wasiProc) {
 	if w.procs == nil {
 		w.procs = map[int32]*wasiProc{}
 	}
-	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
 	w.procs[pid] = proc
-	return pid
 }
 
 // enterProcLocked makes the process registered under pid known to the whole
@@ -2771,12 +2787,32 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 // shares w's identity (see Fork), so when w is such a copy the ppid is the
 // root's pid, and the copy's kill of it reaches the root, not w.
 func (w *WasiStubs) ForkProc() (child *WasiStubs, pid int32, exited func(status int32)) {
+	child, pid, proc := w.forkProc()
+	w.enterChild(pid, proc)
+	return child, pid, w.procExitFunc(proc)
+}
+
+// forkProc is ForkProc up to the copy's becoming w's child (enterChild):
+// it returns the copy, its pid token and its process, which nobody can wait
+// for or signal yet.
+func (w *WasiStubs) forkProc() (*WasiStubs, int32, *wasiProc) {
 	parent := w.guestProcess()
-	ppid := parent.IDs().PID
-	child = w.Fork()
-	pid, exited = w.newProc(&wasiProc{done: make(chan struct{}), instance: child})
-	child.cfg.Process = forkedProcess{Process: parent, pid: pid, ppid: ppid}
-	return child, pid, exited
+	ids := parent.IDs()
+	child := w.Fork()
+	w.mu.Lock()
+	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
+	w.mu.Unlock()
+	child.cfg.Process = forkedProcess{Process: parent, pid: pid, ppid: ids.PID}
+	return child, pid, &wasiProc{done: make(chan struct{}), instance: child}
+}
+
+// enterChild makes proc, the process of a copy forkProc made under pid, a
+// child of w that w waits for and the fork family can signal.
+func (w *WasiStubs) enterChild(pid int32, proc *wasiProc) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.putProcLocked(pid, proc)
+	w.enterProcLocked(pid)
 }
 
 // forkedProcess is the Process of a copy made by ForkProc: its pid is its
@@ -2809,6 +2845,176 @@ func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
 	return func(status int32) {
 		once.Do(func() { w.finishProc(proc, status) })
 	}
+}
+
+// Forker makes the instance the child of a guest's fork runs in
+// (WASIConfig.Fork, Proc_fork).
+type Forker interface {
+	// Fork returns a new instance of parent's module that is a copy of
+	// parent as it stands: its memory and globals, the memory's ceiling,
+	// its dropped data segments and the end of its data (dataEnd). Its
+	// wasi import is child, the host state of the copy (ForkProc), whose
+	// pid token is pid. It does not run the instance: Proc_fork runs the
+	// child in it, through the module's fork child export.
+	//
+	// It is called on the goroutine of the guest that forks, inside its
+	// proc_fork call, so that thread of the guest is stopped; the guest's
+	// other threads are not, and the child has none of them: as in a POSIX
+	// fork, a lock another thread held stays held in the child. The function
+	// it returns, done, is nil or is called by Proc_fork once with the
+	// child's wait status when the child has ended: on the child's
+	// goroutine, before child is closed (CloseAll) and before the status
+	// is published, so that nobody who waits for pid goes on before done
+	// has returned. The threads the child started itself may still run
+	// then. A panic of done is told WASIConfig.Errors, which must not
+	// panic itself. done may close child itself before it releases what
+	// the instance holds. An error leaves nothing made: Proc_fork closes
+	// child and the fork fails, and it closes child as well when Fork
+	// panics.
+	//
+	// The children of the child fork through the same Forker (a forked
+	// instance has its parent's WASIConfig), so done is called for every
+	// process of the fork family.
+	Fork(parent *Module, child *WasiStubs, pid int32) (*Module, func(status int32), error)
+}
+
+// CopyForker is the Forker that makes the child's instance from a copy of
+// the parent's memory in the Go heap, made while the parent's memory cannot
+// grow; the child's other imports than the wasi one are the parent's. The
+// copy of a shared memory is as long as the parent's, its ceiling, and any
+// other is as long as the guest's memory. A guest thread other than the
+// forking one that writes the memory meanwhile may leave the copy with a
+// part of its write. It returns no done.
+var CopyForker Forker = copyForker{}
+
+// copyForker is CopyForker.
+type copyForker struct{}
+
+func (copyForker) Fork(m *Module, child *WasiStubs, pid int32) (*Module, func(status int32), error) {
+	var (
+		memory []byte
+		size   uint64
+	)
+	accessMemory(m, func(mem []byte) {
+		size = m.memSize.Load()
+		length := size
+		if m.memShared {
+			// Its threads hold its address: it never moves, so it spans
+			// its ceiling from the start (see memoryGrow).
+			length = uint64(len(mem))
+		}
+		memory = make([]byte, length)
+		copy(memory, mem[:size])
+	})
+	return m.forkModule(m, child, memory, size), nil, nil
+}
+
+// Proc_fork is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_fork") backing fork(): the guest's process is copied into a
+// child process, a new instance that runs on a goroutine of its own. The
+// child's host state is a copy of the guest's with a pid token of its own
+// (ForkProc); WASIConfig.Fork makes its instance. On success the token is
+// written at pidOutPtr, which the copy does not have, and the child runs
+// the module's fork child export (__wasip1_posix_extension_fork_child)
+// once. It ends when the export returns r, as exit(r) does (wait status
+// (r&0xff)<<8), with Proc_exit (the same of its code), or by a signal (the
+// signal's number). A trap or another panic of the child is told
+// WASIConfig.Errors (op "proc_fork") and ends it as SIGABRT does. When the
+// child has ended, the Forker's done is called, its host state is closed
+// (CloseAll) and its wait status published, in that order: the guest
+// waits for it (Proc_wait, Proc_wait_any), signals it (Proc_kill) and is
+// sent SIGCHLD when it ends, as for any child.
+//
+// Returns 0, or a negative errno: ENOSYS when WASIConfig.Fork is nil or
+// the module has no fork child export, EFAULT for a pidOutPtr outside the
+// memory, EAGAIN when the Forker failed, whose error is told
+// WASIConfig.Errors (op "proc_fork").
+func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
+	return w.procFork(m, zext(pidOutPtr))
+}
+
+// Proc_fork64 is Proc_fork for a memory64 guest.
+func (w *WasiStubs) Proc_fork64(m *Module, pidOutPtr int64) int32 {
+	return w.procFork(m, uint64(pidOutPtr))
+}
+
+// procFork is the body of Proc_fork and Proc_fork64.
+func (w *WasiStubs) procFork(m *Module, pidOutPtr uint64) int32 {
+	w.endUnregistered()
+	if w.cfg.Fork == nil || m.forkChild == nil {
+		return -_wasiENOSYS
+	}
+	if w.memBytes(m, pidOutPtr, 4) == nil {
+		return -_wasiEFAULT
+	}
+	child, pid, proc := w.forkProc()
+	made := false
+	defer func() {
+		// A Forker that failed, or panicked, made no child.
+		if !made {
+			w.reportError("proc_fork", child.CloseAll())
+		}
+	}()
+	childModule, done, err := w.cfg.Fork.Fork(m, child, pid)
+	if err != nil {
+		w.reportError("proc_fork", err)
+		return -_wasiEAGAIN
+	}
+	made = true
+	w.enterChild(pid, proc)
+	exited := w.procExitFunc(proc)
+	// The memory has not shrunk since it was checked above.
+	binary.LittleEndian.PutUint32(w.memBytes(m, pidOutPtr, 4), uint32(pid))
+	go func() {
+		status := child.runForkChild(childModule, done)
+		child.reportError("proc_fork", child.CloseAll())
+		exited(status)
+	}()
+	return _wasiESUCCESS
+}
+
+// runForkChild runs the child of a fork in m, the instance whose host state
+// w is, through the module's fork child export, then done (when non-nil),
+// and returns the wait status the child ended with (see Proc_fork). A panic
+// of done is told WASIConfig.Errors.
+func (w *WasiStubs) runForkChild(m *Module, done func(status int32)) (status int32) {
+	status = w.forkChildStatus(m)
+	if done != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				w.reportError("proc_fork", panicError("the done of a fork", r))
+			}
+		}()
+		done(status)
+	}
+	return status
+}
+
+// forkChildStatus runs the fork child export in m and returns the wait
+// status the child ended with.
+func (w *WasiStubs) forkChildStatus(m *Module) (status int32) {
+	defer func() {
+		switch r := recover().(type) {
+		case nil:
+		case *WasiExitError:
+			status = (r.Code & 0xff) << 8
+		case *WasiSignalError:
+			status = r.Signal & 0x7f
+		default:
+			w.reportError("proc_fork", panicError("a fork child", r))
+			status = wasiSIGABRT
+		}
+	}()
+	return (m.forkChild(m) & 0xff) << 8
+}
+
+// panicError is the error of a panic of what with the value r: r itself,
+// wrapped, when it is an error.
+func panicError(what string, r any) error {
+	if err, ok := r.(error); ok {
+		return fmt.Errorf("%s panicked: %w", what, err)
+	}
+	return fmt.Errorf("%s panicked: %v", what, r)
 }
 
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
@@ -14054,6 +14260,9 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"linuxTermios": true,
 			"linuxWinsize": true,
 			"terminalArg":  true,
+
+			"Forker":     true,
+			"copyForker": true,
 		},
 		keepFuncNames: map[string]bool{
 			"NewWASI":                 true,
@@ -14205,8 +14414,13 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"parsePosixZone":          true,
 			"locationMoment":          true,
 			"zoneReading":             true,
+
+			"panicError": true,
 		},
-		keepVarNames: map[string]bool{"idCallArgs": true, "creationThreadsRefused": true, "reportCreationThreadsRefused": true, "hostUmaskState": true},
+		keepVarNames: map[string]bool{"idCallArgs": true, "creationThreadsRefused": true, "reportCreationThreadsRefused": true, "hostUmaskState": true,
+
+			"CopyForker": true,
+		},
 		keepConstAll: true,
 	})
 	if err != nil {

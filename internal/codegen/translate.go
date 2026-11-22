@@ -2059,19 +2059,49 @@ func (t *translator) funcExport(name string) (funcIdx uint32, ok bool) {
 // wasi runtime cannot name from the base package of multi-package output.
 func (t *translator) emitForkModule() ast.Decl {
 	args := t.importArgs(newID("wasi"), func(mod string) ast.Expr { return t.fieldRef(MangleModuleField(mod)) })
-	args = append(args, newID("memory"), newID("memSize"), newID("globals"))
+	args = append(args, newID("memory"), newID("memSize"),
+		&ast.CallExpr{Fun: t.helperRef("saveGlobals"), Args: []ast.Expr{newID("m")}})
+	field := func(x, name string) ast.Expr {
+		return &ast.SelectorExpr{X: newID(x), Sel: newID(t.fieldName(name))}
+	}
+	carry := func(name string) ast.Stmt {
+		return &ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{field("c", name)}, Rhs: []ast.Expr{field("m", name)}}
+	}
+	body := []ast.Stmt{
+		&ast.AssignStmt{Tok: token.DEFINE, Lhs: []ast.Expr{newID("c")}, Rhs: []ast.Expr{
+			&ast.CallExpr{Fun: newID("NewFromSnapshot"), Args: args},
+		}},
+		carry("maxMem"),
+		carry("dataEnd"),
+	}
+	if t.hasPassiveData() {
+		t.use("slices")
+		body = append(body, &ast.AssignStmt{Tok: token.ASSIGN, Lhs: []ast.Expr{field("c", "dataSegs")}, Rhs: []ast.Expr{
+			&ast.CallExpr{Fun: &ast.SelectorExpr{X: newID("slices"), Sel: newID("Clone")}, Args: []ast.Expr{field("m", "dataSegs")}},
+		}})
+	}
+	// The mutable globals saveGlobals leaves out (see emitGlobalsSnapshot).
+	for i, g := range t.mod.Globals {
+		switch g.Type.Type {
+		case wasm.ValI32, wasm.ValI64, wasm.ValF32, wasm.ValF64:
+			continue
+		}
+		if g.Type.Mutable {
+			body = append(body, carry(fmt.Sprintf("g%d", int(t.mod.NumImportedGlobals)+i)))
+		}
+	}
+	body = append(body, &ast.ReturnStmt{Results: []ast.Expr{newID("c")}})
 	return &ast.FuncDecl{
 		Doc: &ast.CommentGroup{List: []*ast.Comment{{
-			Text: "// forkModule builds an instance from a copy of m's memory and globals\n" +
-				"// (NewFromSnapshot): its wasi import is wasi and its other imports are\n" +
-				"// m's. len(memory) is the instance's memory ceiling, as it is for\n" +
-				"// NewFromSnapshot: memory is as long as the instance's memory may grow.",
+			Text: "// forkModule builds an instance from memory, a copy of m's memory of\n" +
+				"// memSize bytes, and the rest of m's state (NewFromSnapshot): its\n" +
+				"// globals, the memory's ceiling, its dropped data segments and dataEnd.\n" +
+				"// Its wasi import is wasi and its other imports are m's. A shared\n" +
+				"// memory is as long as m's: the memory's ceiling.",
 		}}},
 		Name: newID("forkModule"),
 		Type: t.forkModuleType(),
-		Body: &ast.BlockStmt{List: []ast.Stmt{&ast.ReturnStmt{Results: []ast.Expr{
-			&ast.CallExpr{Fun: newID("NewFromSnapshot"), Args: args},
-		}}}},
+		Body: &ast.BlockStmt{List: body},
 	}
 }
 
@@ -2087,7 +2117,6 @@ func (t *translator) forkModuleType() *ast.FuncType {
 			param("wasi", &ast.StarExpr{X: t.baseRef("WasiStubs")}),
 			param("memory", &ast.ArrayType{Elt: newID("byte")}),
 			param("memSize", newID("uint64")),
-			param("globals", &ast.ArrayType{Elt: newID("uint64")}),
 		}},
 		Results: &ast.FieldList{List: []*ast.Field{{Type: t.moduleType()}}},
 	}
