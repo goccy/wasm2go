@@ -86,18 +86,26 @@ discard what is written, no filesystem (nothing is preopened: every
 call on fd 3 fails with `EBADF`, fd 3 is an ordinary free number, and
 the guest's C library fails every path with `ENOENT`), no process
 spawn, and none of the socket operations the hooks gate: `NetAccess`
-gates `sock_accept`, `sock_recv` and `sock_send`, `Dial` gates
-`sock_connect`, `Resolve` gates `sock_getaddrinfo` (except an empty
-host, which resolves to `INADDR_ANY`), and `Exec` gates `proc_spawn`;
-a nil one denies. `sock_socket`, `sock_shutdown` and `pipe` consult no
-hook. `FSAccess` is consulted on every path operation with the path
+gates the accepts, receives and sends of sockets (`sock_accept`,
+`sock_recv`, `sock_send`, and `fd_read` and `fd_write` of a socket),
+`Dial` gates `sock_connect` and `sock_connect_addr` and every send of
+a datagram to an address, `Listen` gates a socket's taking an address
+others reach it at (`sock_bind_addr`, the `sock_listen` of an unbound
+socket, and the first send to an address of an unbound datagram
+socket), `Resolve` gates `sock_getaddrinfo` (except an empty host,
+which resolves to `INADDR_ANY`), and `Exec` gates `proc_spawn`; a nil
+one denies. A socket (`sock_open`, `sock_socketpair`, `sock_socket`)
+is one socket of the host's from its making to its close; a
+Unix-domain socket's path is a file of the host only with
+`HostFS("/")`, and `ENOTSUP` with any other `FS`. `sock_shutdown` and
+`pipe` consult no hook. `FSAccess` is consulted on every path operation with the path
 cleaned as `chroot(2)` sees it (`..` of the root is the root; a
 symbolic link's target too) and the `FS` is given that approved path
 (`FSAccess` is a policy on path names); a nil one allows every access
 to the configured `FS`, which is then given the path as the guest wrote
 it. `Errors` is told the errors the guest cannot be given (nil drops them). Host
 access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
-`AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
+`AllowAllListen`, `AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
 host process has (its args, environment, stdio, the whole host
 filesystem and its local time zone, with every hook allowing).
 `HostFS` of a directory other than `/` is built on `os.Root`, which
