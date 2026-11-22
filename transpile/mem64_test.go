@@ -203,6 +203,28 @@ func TestMem64Wasip1Hello(t *testing.T) {
 	}
 }
 
+// The multi-package output with WASI builds for every system the native
+// WASI has files of, whatever the host is: each of those files reaches the
+// output.
+func TestMem64Wasip1MultiPackageBuildsForEachSystem(t *testing.T) {
+	defer transpile.SetMultiPackageThreshold(0)()
+	dir := writeMem64Wasip1(t, "../testdata/wasip1_mem64_hello.wasm", "pkg.Start(pkg.NewWithWASI(base.NewWASI(base.HostWASIConfig())))", "m64wasi/pkg/base")
+	for _, target := range [][]string{
+		{"GOOS=linux", "GOARCH=amd64"},
+		{"GOOS=linux", "GOARCH=arm64"},
+		{"GOOS=linux", "GOARCH=386"},
+		{"GOOS=darwin", "GOARCH=arm64"},
+		{"GOOS=windows", "GOARCH=amd64"},
+	} {
+		cmd := exec.Command("go", "build", "-o", os.DevNull, ".")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), append(target, "CGO_ENABLED=0")...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%v go build: %v\n%s", target, err, out)
+		}
+	}
+}
+
 // TestMem64Wasip1CppException runs C++ compiled for wasm64-wasip1 with
 // -fwasm-exceptions against the wasm64 libc++/libc++abi/libunwind
 // runtimes: typed catches (std::runtime_error, a user struct), a
@@ -269,6 +291,13 @@ func TestMem64Wasip1CppException(t *testing.T) {
 // imports are the packages main.go imports besides m64wasi/pkg.
 func runMem64Wasip1(t *testing.T, fixture, mainBody string, imports ...string) string {
 	t.Helper()
+	return runMem64(t, writeMem64Wasip1(t, fixture, mainBody, imports...))
+}
+
+// writeMem64Wasip1 writes the program runMem64Wasip1 runs into a new
+// directory and returns it.
+func writeMem64Wasip1(t *testing.T, fixture, mainBody string, imports ...string) string {
+	t.Helper()
 	bin, err := os.ReadFile(fixture)
 	if err != nil {
 		t.Fatal(err)
@@ -309,5 +338,5 @@ func runMem64Wasip1(t *testing.T, fixture, mainBody string, imports ...string) s
 		importLines += "\t\"" + p + "\"\n"
 	}
 	w("main.go", []byte("package main\n\nimport (\n"+importLines+")\n\nfunc main() {\n\t"+mainBody+"\n}\n"))
-	return runMem64(t, dir)
+	return dir
 }

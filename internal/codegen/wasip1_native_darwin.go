@@ -299,3 +299,61 @@ func socketFDMade(fd int) error {
 	}
 	return nil
 }
+
+// hostSyscall makes the guest's system call of the number (HostSyscalls),
+// of the two whose arguments darwin's calls take as the Linux ABI gives
+// them: gettimeofday(2), whose third argument of darwin's (where to store
+// mach_absolute_time) is null, and getrandom(2), made by getentropy(2)
+// (hostGetrandom). Every other call fails with ENOSYS.
+func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	switch number {
+	case linuxSysGettimeofday:
+		return hostRawSyscall(syscall.SYS_GETTIMEOFDAY, [6]uint64{args[0], args[1]}, ptrs&0b11, mem)
+	case linuxSysGetrandom:
+		return hostGetrandom(args, ptrs, mem)
+	}
+	return 0, syscall.ENOSYS
+}
+
+// The flags of getrandom(2), Linux's (include/uapi/linux/random.h), which
+// darwin has no constants of.
+const (
+	linuxGrndNonblock = 0x1
+	linuxGrndRandom   = 0x2
+	linuxGrndInsecure = 0x4
+)
+
+// darwin's getentropy(2) (bsd/kern/syscalls.master), and the most bytes it
+// gives a call (its manual page), which package syscall has no constants
+// of.
+const (
+	hostSysGetentropy = 500
+	hostGetentropyMax = 256
+)
+
+// hostGetrandom makes Linux's getrandom(buf, buflen, flags) by darwin's
+// getentropy(2), which does not block once the system has booted, so every
+// flag Linux takes asks for what it gives. As Linux does, it fails with
+// EINVAL for any other flag and for GRND_RANDOM with GRND_INSECURE, and
+// returns buflen; EFAULT for a buffer not all in the guest's memory.
+func hostGetrandom(args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	buf, n, flags := args[0], args[1], args[2]
+	if flags&^(linuxGrndNonblock|linuxGrndRandom|linuxGrndInsecure) != 0 ||
+		flags&(linuxGrndRandom|linuxGrndInsecure) == linuxGrndRandom|linuxGrndInsecure {
+		return 0, syscall.EINVAL
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if ptrs&1 == 0 || buf > uint64(len(mem)) || n > uint64(len(mem))-buf {
+		return 0, syscall.EFAULT
+	}
+	for done := uint64(0); done < n; {
+		chunk := min(n-done, hostGetentropyMax)
+		if _, err := hostRawSyscall(hostSysGetentropy, [6]uint64{buf + done, chunk}, 0b1, mem); err != nil {
+			return 0, err
+		}
+		done += chunk
+	}
+	return int64(n), nil
+}

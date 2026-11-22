@@ -316,6 +316,12 @@ func hostSocketTimeout(fd int, send bool) (time.Duration, error) { return 0, err
 
 func setHostSocketTimeout(fd int, send bool, d time.Duration) error { return errors.ErrUnsupported }
 
+// hostSyscall: this platform has no system calls of the Linux ABI
+// (HostSyscalls).
+func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	return 0, errors.ErrUnsupported
+}
+
 // startCommand starts the command path with argv and env in dir (the host
 // process's directory when it is empty), its standard streams those of
 // streams, with os/exec: a file or socket of the host is the command's as

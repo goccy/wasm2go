@@ -2065,6 +2065,12 @@ type WASIConfig struct {
 	Chdir  func(dir string) error
 	Setenv func(name, value string, unset bool) error
 
+	// Syscalls makes the guest's syscall(2). nil makes none: syscall fails
+	// with ENOSYS. HostSyscalls makes the host's, which gives the guest the
+	// host process's memory and descriptors outside every other field of
+	// the configuration.
+	Syscalls Syscalls
+
 	// Fork makes the instance the child of a guest's fork runs in
 	// (Proc_fork). nil denies every fork: it fails with ENOSYS.
 	// CopyForker makes a copy of the forking instance.
@@ -13363,6 +13369,293 @@ func (w *WasiStubs) clockZone(m *Module, tzPtr uint64, tzLen, hasTZ int32, t int
 	return _wasiESUCCESS
 }
 
+// ----- syscall(2) ----------------------------------------------------------------
+
+// Syscalls makes the guest's syscall(2) (WASIConfig.Syscalls). The runtime
+// calls it without any lock of the WasiStubs held. Its error is the errno of
+// the guest's call: errors.ErrUnsupported is ENOSYS, and ErrSyscallNotMade
+// says that the call was not made for a copy made by Fork, which the guest
+// is told apart from every errno.
+type Syscalls interface {
+	Syscall(call Syscall) (int64, error)
+}
+
+// Syscall is a system call the guest makes: its number and its arguments,
+// as the guest gave them. The number is the Linux ABI's on every host: that
+// of Linux's scripts/syscall.tbl for the "common" and "64" calls, the
+// numbers of asm-generic (arm64's and riscv64's).
+type Syscall struct {
+	Number int64
+	Args   [6]uint64
+	// Pointers has bit i set for an argument that is an address of the
+	// guest's memory, whose bytes are the call's to read and write: the
+	// implementation makes it an address the call can be given.
+	Pointers uint32
+	// Memory is the guest's memory, up to its current size.
+	Memory []byte
+	// Forked reports that the guest is a copy made by Fork, which shares
+	// the host process with the guest it was forked from.
+	Forked bool
+}
+
+// ErrSyscallNotMade is the error a Syscalls returns for a call it does not
+// make for a copy made by Fork.
+var ErrSyscallNotMade = errors.New("system call not made for a forked process")
+
+// HostSyscalls returns a Syscalls that gives the guest the host's kernel,
+// for WASIConfig.Syscalls of a guest that is trusted with it. The number is
+// moved by the table of the host to the host's call of the same name, as
+// QEMU's linux-user moves the numbers of its target; a number the table does
+// not have fails with ENOSYS. The tables are:
+//
+//   - Linux on arm64, riscv64 and loong64, whose numbers are the Linux
+//     ABI's: every number the ABI assigns, as it is;
+//   - Linux on amd64: every call the ABI assigns, each of which x86-64 has;
+//   - darwin: gettimeofday, whose third argument of darwin's is made null,
+//     and getrandom, made by getentropy(2) 256 bytes at a time; darwin's
+//     other calls do not take their arguments as the Linux ABI gives them;
+//   - every other host: none. A 32-bit Linux takes a 64-bit argument in two
+//     registers and has its calls of 64-bit times under other names, which
+//     a table of numbers cannot move a call to.
+//
+// HostSyscalls gives the guest of the root instance everything the host
+// process can do: it can read and write any memory of the host process and
+// use any descriptor of it, and FSAccess, NetAccess, Dial, Listen, Resolve
+// and Exec do not apply to its calls.
+//
+// The call is made with the arguments as they are, in the order the host's
+// call takes them (clone's on amd64 is not arm64's), but for one whose bit
+// is set in Pointers, which is given as the address the host process has
+// the guest's byte at (EFAULT for an address past the end of the guest's
+// memory). That is all it translates and bounds: flags and structures are
+// the host kernel's (x86-64's struct stat is not arm64's), and a length the
+// call is given, and a pointer inside a structure the call reads, are the
+// guest's numbers, which the kernel takes for the host process's — a
+// length past the guest's memory reaches the host process's memory beyond
+// it, and a pointer in a structure any address of the host process. The
+// call acts on the host process — its descriptors, identity, working
+// directory, memory — which is what the guest knows as its own only when
+// the configuration gives it the host process's. HostWASIConfig has no
+// Syscalls.
+//
+// For a copy made by Fork, which shares the host process with the guest it
+// was forked from (execve would replace them all, getpid names the first
+// one, chdir moves every one), it makes only the calls of its table
+// (forkedSyscallMade), which depend on no state of the host process, and
+// returns ErrSyscallNotMade for the others. The table says which arguments
+// of those calls are pointers and how many bytes the call reads or writes
+// there: a call whose Pointers differ (an argument of a pointer's place may
+// be 0 instead, the null pointer) is refused with EINVAL, and one whose
+// bytes are not all in the guest's memory with EFAULT.
+func HostSyscalls() Syscalls { return hostSyscalls{} }
+
+// hostSyscalls is the Syscalls HostSyscalls returns.
+type hostSyscalls struct{}
+
+func (hostSyscalls) Syscall(call Syscall) (int64, error) {
+	if !linuxSyscallAssigned(call.Number) {
+		return 0, syscall.ENOSYS
+	}
+	if call.Forked {
+		c, made := forkedSyscallMade(call.Number, &call.Args)
+		if !made {
+			return 0, ErrSyscallNotMade
+		}
+		if err := c.validateArgs(call); err != nil {
+			return 0, err
+		}
+	}
+	for i, v := range call.Args {
+		if call.Pointers&(1<<i) != 0 && v > uint64(len(call.Memory)) {
+			return 0, syscall.EFAULT
+		}
+	}
+	return hostSyscall(call.Number, call.Args, call.Pointers, call.Memory)
+}
+
+// The numbers of the Linux ABI of the guest's system calls (Syscall) that
+// the runtime names, from Linux 7.2's scripts/syscall.tbl. A host whose own
+// numbers are other has no constants of them.
+const (
+	linuxSysClockGettime    = 113
+	linuxSysClockGetres     = 114
+	linuxSysSchedYield      = 124
+	linuxSysUname           = 160
+	linuxSysGetcpu          = 168
+	linuxSysGettimeofday    = 169
+	linuxSysRecvmmsg        = 243 // the last before the architecture's own (244-259)
+	linuxSysWait4           = 260
+	linuxSysGetrandom       = 278
+	linuxSysKexecFileLoad   = 294 // the last before 295-423, which no 64-bit architecture has
+	linuxSysPidfdSendSignal = 424 // the first of the numbers every architecture shares
+	linuxSysRseqSliceYield  = 471
+)
+
+// linuxSyscallAssigned reports whether the Linux ABI of Syscall assigns the
+// number to a call shared by the 64-bit architectures: the architecture's
+// own range, and the numbers of 32-bit architectures only, are not the
+// guest's.
+func linuxSyscallAssigned(number int64) bool {
+	return 0 <= number && number <= linuxSysRecvmmsg ||
+		linuxSysWait4 <= number && number <= linuxSysKexecFileLoad ||
+		linuxSysPidfdSendSignal <= number && number <= linuxSysRseqSliceYield
+}
+
+// sysSyscallNotMade is what sys_syscall returns for a call the Syscalls did
+// not make for a copy made by Fork (ErrSyscallNotMade): no errno, as the
+// call was not made at all.
+const sysSyscallNotMade = 1
+
+// Sys_syscall is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sys_syscall") backing syscall(2) through WASIConfig.Syscalls: the
+// system call of the number (the Linux ABI's; see Syscall), with the nargs
+// (at most six) u64 arguments at argsPtr; an argument whose bit is set in
+// ptrs is an address of the guest's memory. Its result is written at
+// resultPtr (i64). Returns 0, or a negative errno: ENOSYS without a
+// Syscalls; or sysSyscallNotMade.
+func (w *WasiStubs) Sys_syscall(m *Module, number int64, argsPtr, nargs, ptrs, resultPtr int32) int32 {
+	return w.sysSyscall(m, number, zext(argsPtr), nargs, ptrs, zext(resultPtr))
+}
+
+// Sys_syscall64 is Sys_syscall for a memory64 guest.
+func (w *WasiStubs) Sys_syscall64(m *Module, number int64, argsPtr int64, nargs, ptrs int32, resultPtr int64) int32 {
+	return w.sysSyscall(m, number, uint64(argsPtr), nargs, ptrs, uint64(resultPtr))
+}
+
+// sysSyscall is the body of Sys_syscall and Sys_syscall64.
+func (w *WasiStubs) sysSyscall(m *Module, number int64, argsPtr uint64, nargs, ptrs int32, resultPtr uint64) int32 {
+	w.endUnregistered()
+	if w.cfg.Syscalls == nil {
+		return -_wasiENOSYS
+	}
+	if nargs < 0 || nargs > 6 {
+		return -_wasiEINVAL
+	}
+	raw := w.memBytes(m, argsPtr, uint64(nargs)*8)
+	out := w.memBytes(m, resultPtr, 8)
+	if raw == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	call := Syscall{Number: number, Pointers: uint32(ptrs) & (1<<nargs - 1), Memory: w.guestMemory(m), Forked: w.forked}
+	for i := range nargs {
+		call.Args[i] = binary.LittleEndian.Uint64(raw[i*8:])
+	}
+	r, err := w.cfg.Syscalls.Syscall(call)
+	switch {
+	case errors.Is(err, ErrSyscallNotMade):
+		return sysSyscallNotMade
+	case err != nil:
+		return -hookErrno(err)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(r))
+	return _wasiESUCCESS
+}
+
+// forkedSyscall is a system call that HostSyscalls makes for a copy made by
+// Fork (forkedSyscallMade).
+type forkedSyscall struct {
+	number int64
+	// clock: the first argument is a clock id, and the call is made for
+	// every clock but a CPU-time one (cpuTimeClock)
+	clock bool
+	// pointers are the arguments of the call that are pointers; every
+	// other argument is a number.
+	pointers []syscallPointer
+}
+
+// syscallPointer is an argument of a system call that is a pointer: the call
+// reads or writes size bytes there, or as many as the argument length says
+// when that is not negative.
+type syscallPointer struct {
+	arg, size, length int
+}
+
+// validateArgs refuses a call of c whose arguments are not what c takes
+// (HostSyscalls): EINVAL for a pointer declared where c has a number, or a
+// number other than 0 where c has a pointer; EFAULT for a pointer whose
+// bytes are not all in the guest's memory.
+func (c forkedSyscall) validateArgs(call Syscall) error {
+	var pointers uint32
+	for _, p := range c.pointers {
+		pointers |= 1 << p.arg
+		v := call.Args[p.arg]
+		if call.Pointers&(1<<p.arg) == 0 {
+			if v != 0 {
+				return syscall.EINVAL
+			}
+			continue
+		}
+		n := uint64(p.size)
+		if p.length >= 0 {
+			n = call.Args[p.length]
+		}
+		if v > uint64(len(call.Memory)) || n > uint64(len(call.Memory))-v {
+			return syscall.EFAULT
+		}
+	}
+	if call.Pointers&^pointers != 0 {
+		return syscall.EINVAL
+	}
+	return nil
+}
+
+// forkedSyscallMade reports whether HostSyscalls makes the system call of
+// the number, with args, for a copy made by Fork. Such a copy shares the
+// host process with the guest it was forked from, so a call is made only
+// when what the kernel does for it depends on no state of that process (its
+// identity, descriptors, working directory, signals, memory maps,
+// credentials and limits, exec and exit): the call then gives the copy what
+// it would give a process of its own. These are the calls, each depending
+// on no such state for this reason:
+//
+//   - getrandom: bytes of the kernel's random pool, which is the system's;
+//   - clock_gettime, clock_getres: the time and the resolution of a clock of
+//     the system, for every clock but a CPU-time one (cpuTimeClock), which
+//     counts the time of the host process or of a thread;
+//   - gettimeofday: the time of the system;
+//   - uname: the name and the version of the system;
+//   - sched_yield: gives the calling thread's CPU to another thread;
+//   - getcpu: the CPU the calling thread runs on.
+//
+// It returns the entry of the call, and whether the call is made.
+func forkedSyscallMade(number int64, args *[6]uint64) (forkedSyscall, bool) {
+	// The pointers of the calls, by the structures the kernel writes there:
+	// struct new_utsname (6 fields of 65 bytes), struct timeval and
+	// timezone, struct timespec, the two unsigned ints of getcpu (its third
+	// argument is unused), and the buffer of getrandom, whose length is its
+	// second argument.
+	var (
+		utsname   = []syscallPointer{{0, 390, -1}}
+		timeOfDay = []syscallPointer{{0, 16, -1}, {1, 8, -1}}
+		clockOut  = []syscallPointer{{1, 16, -1}}
+		cpuOut    = []syscallPointer{{0, 4, -1}, {1, 4, -1}, {2, 0, -1}}
+		randomOut = []syscallPointer{{0, 0, 1}}
+	)
+	for _, c := range []forkedSyscall{
+		{linuxSysClockGettime, true, clockOut},
+		{linuxSysClockGetres, true, clockOut},
+		{linuxSysSchedYield, false, nil},
+		{linuxSysUname, false, utsname},
+		{linuxSysGetcpu, false, cpuOut},
+		{linuxSysGettimeofday, false, timeOfDay},
+		{linuxSysGetrandom, false, randomOut},
+	} {
+		if c.number == number {
+			return c, !c.clock || !cpuTimeClock(int32(args[0]))
+		}
+	}
+	return forkedSyscall{}, false
+}
+
+// cpuTimeClock reports whether a clock id of the Linux ABI names a CPU-time
+// clock: CLOCK_PROCESS_CPUTIME_ID (2), CLOCK_THREAD_CPUTIME_ID (3), or a
+// negative id, the CPU-time clock of a given process or thread
+// (clock_getcpuclockid, pthread_getcpuclockid). Package syscall has no
+// constants of the ids.
+func cpuTimeClock(id int32) bool {
+	return id < 0 || id == 2 || id == 3
+}
+
 // ----- signals ----------------------------------------------------------------
 //
 // A guest cannot be interrupted: it is ordinary code on a goroutine. A
@@ -14472,6 +14765,9 @@ var (
 	wasip1NativeTerminalLinuxRaw []byte
 	//go:embed wasip1_native_terminal_darwin.go
 	wasip1NativeTerminalDarwinRaw []byte
+
+	//go:embed wasip1_syscalls_linux.go
+	wasip1SyscallsLinuxRaw []byte
 )
 
 // emitWasip1Platform returns the per-platform companions of the native wasi
@@ -14502,6 +14798,8 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 
 		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
 		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
+
+		"wasip1_syscalls_linux.go": wasip1SyscallsLinuxRaw,
 	} {
 		src, err := renamePackage(raw, pkg)
 		if err != nil {
