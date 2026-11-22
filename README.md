@@ -131,8 +131,10 @@ error where its umask cannot be read without changing it;
 `HostWASIConfig()` leaves `Process` nil.
 
 `Process` only reads; `ProcessChanges` makes the changes: the
-`setuid` family, `setgroups`, `setpriority` and `umask` of the guest
-of the fork family's root instance. `Process` reads what they change,
+`setuid` family, `setgroups`, `setpriority`, `umask`, `setpgid` and
+`setsid` of the guest of the fork family's root instance, and tells
+the process group the family starts in and that of a process outside
+the family (`Pgid`). `Process` reads what they change,
 so a `ProcessChanges` needs a `Process` (`NewWASI` panics without one).
 A forked instance's guest changes its nice value and umask alone, and
 keeps the ids and groups of the process the `ProcessChanges` changes:
@@ -163,8 +165,8 @@ instance dropped without it.
 `Signals` connects the guest's signals with what is outside it: its
 `Kill` is given the guest's `kill` of a process that is not the
 guest's own (not the guest, not a child or fork it made) or of a
-process group that is not the guest's (the guest and its forks are one
-group; `kill(-1)` reaches them but the guest), and its
+process group that is none of the family's (`kill(-1)` reaches the
+family but the guest), and its
 `Dispositions` is told the signals the guest handles, ignores and
 blocks whenever they change, with the reporting instance as the
 `SignalTarget` to post that guest's signals to (a forked instance shares
@@ -193,6 +195,23 @@ lock another thread held stays held in the child. A trap ends it as
 it and gets `SIGCHLD` as for any child. An embedder that wraps a
 `Forker` is called back with each child's status when it ends (every
 process of the fork family forks through the same `Forker`).
+
+The fork family keeps its process groups and sessions (`getpgid`,
+`setpgid`, `setsid`): a process starts in its parent's group and
+session, and the root instance in the group its `ProcessChanges`
+tells (its own pid without one) and in the host process's session.
+The root's guest changes its own group and session through its
+`ProcessChanges`, every other process through the family. A command
+the guest starts is put in a group of the host's for its group: the
+host process's for the group the host process is in, and otherwise a
+group of the host's that the group's first command leads and the
+later ones join; a command of a session that is not the host
+process's leads a session of the host's of its own. A `kill` of a
+group reaches the family's processes in it and, through the host's
+group, the processes the commands started in it. The first command of
+a group stays unreaped while the group has other members, so that the
+group's number stays its own. Where the host has no process groups
+(Windows), every command is in the host process's.
 
 `Process` also answers `getgroups` and makes the guest's `setuid`
 family, `setgroups` and `setpriority` changes; an isolated process is

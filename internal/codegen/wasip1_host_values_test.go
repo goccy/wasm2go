@@ -91,6 +91,9 @@ func (c *recordedChanges) SetUmask(mask os.FileMode) (os.FileMode, error) {
 	c.umasks = append(c.umasks, mask)
 	return 0, c.err
 }
+func (c *recordedChanges) Pgid(pid int32) (int32, error) { return 0, errors.ErrUnsupported }
+func (c *recordedChanges) Setpgid(pid, pgid int32) error { return errors.ErrUnsupported }
+func (c *recordedChanges) Setsid() (int32, error)        { return 0, errors.ErrUnsupported }
 
 func TestProcGroupsOfTheProcess(t *testing.T) {
 	const bufPtr, countPtr = 256, 64

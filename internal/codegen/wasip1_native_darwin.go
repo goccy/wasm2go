@@ -294,6 +294,13 @@ func hostAcceptFD(fd int) (int, error) {
 	return conn, socketFDMade(conn)
 }
 
+// hostSiginfo is Darwin's siginfo_t (waitid(2)): si_signo, si_errno,
+// si_code, si_pid, si_uid and si_status, within its 104 bytes.
+type hostSiginfo struct {
+	signo, errno, code, pid, uid, status int32
+	_                                    [104 - 24]byte
+}
+
 // socketFDMade sets the socket fd, made by the caller, closed on exec and
 // in non-blocking mode; on a failure it closes fd.
 func socketFDMade(fd int) error {
