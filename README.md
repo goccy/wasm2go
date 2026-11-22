@@ -173,7 +173,12 @@ blocks whenever they change, with the reporting instance as the
 its parent's `Signals`). Signal numbers are the guest's (Linux
 numbering); a raise of a WASI signal is turned into it. A nil one is an
 isolated guest: such a `kill` fails with `ESRCH`. Signals reach the
-guest through `PostSignal`. `ForkProc` forks an instance that its
+guest through `PostSignal`, which delivers them as `kill` does to the
+guest's process (the command the guest has become after `exec`), or
+through `DeliverSignal` with a `SignalReach`: `ReachProcess` as
+`PostSignal`, `ReachGuest` to the guest alone, dropped once it has
+become a command, for a signal the command gets where the host process
+got it too (a terminal's interrupt). `ForkProc` forks an instance that its
 parent waits for, under a pid token the fork knows as its own. The
 pid tokens of the forks and the commands a guest starts are numbers
 from 4194304 up, above every pid Linux and darwin hand out, so a token

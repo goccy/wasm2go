@@ -15259,9 +15259,49 @@ type Signals interface {
 }
 
 // SignalTarget is what a signal is posted to: the WasiStubs of a guest
-// (PostSignal).
+// (PostSignal, DeliverSignal).
 type SignalTarget interface {
 	PostSignal(sig int32)
+	DeliverSignal(sig int32, reach SignalReach)
+}
+
+// SignalReach is how far DeliverSignal delivers a signal. The one relaying
+// the signals of the host process to a guest chooses it for each signal,
+// as tini, dumb-init and docker's --sig-proxy choose where the signals
+// they relay go.
+type SignalReach int32
+
+const (
+	// ReachProcess delivers the signal to the guest's process, as kill(2)
+	// does: to the guest, or to the command the guest has become
+	// (Proc_exec), as PostSignal does. For a signal sent to the host
+	// process alone, which the command would not get otherwise (kill of
+	// the host process's pid).
+	ReachProcess SignalReach = iota
+	// ReachGuest delivers the signal to the guest only: once the guest has
+	// become a command, it is dropped. For a signal the command gets where
+	// the host process got it as well (a terminal's interrupt, which is
+	// sent to the whole foreground group).
+	ReachGuest
+)
+
+// DeliverSignal delivers sig, the guest's number for a signal, as far as
+// reach says: as PostSignal does with ReachProcess, to the guest alone
+// with ReachGuest. Another reach delivers nothing. It may be called from
+// any goroutine, at any time.
+func (w *WasiStubs) DeliverSignal(sig int32, reach SignalReach) {
+	switch reach {
+	case ReachProcess:
+		w.PostSignal(sig)
+	case ReachGuest:
+		w.sig.mu.Lock()
+		if w.sig.execed != nil {
+			w.sig.mu.Unlock()
+			return
+		}
+		w.postSignalLocked(sig)
+		w.unlockSignals()
+	}
 }
 
 // wasiSignals is the signal state of one instance. It is guarded by mu, apart
