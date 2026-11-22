@@ -818,9 +818,9 @@ func emitCmp64ARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 //     pure-Go path is `uint32(base + int32(off))`). MOVWU / ADDW
 //     zero-extend the low 32 bits into R3.
 //   - memory64: address = base + off in full 64-bit, bounded like the
-//     pure-Go path (see codegen's memPtr64): R3 = base + off, and the
-//     access branches to plan.boundsTrap on a carry out of that sum or
-//     unless R3 + size <= m.memSize. R1 carries the offset and the
+//     pure-Go path (see codegen's memBoundsTrapStmt): R3 = base + off,
+//     and the access branches to plan.boundsTrap on a carry out of that
+//     sum or unless R3 + size <= m.memSize. R1 carries the offset and the
 //     bound.
 func emitMemAddrARM64(b *strings.Builder, v *ssa.Value, size int, plan *funcPlan, frame argFrame) {
 	baseArg, aux := v.Args[0], v.AuxInt

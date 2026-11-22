@@ -39,6 +39,10 @@ import (
 // asmgen translates those into plan9 asm symbols ("base·Fn42(SB)")
 // inside goAsmSymbol — callers don't need to construct .vs·.
 // themselves.
+//
+// The Driver does not carry the Module layout, so MemSizeOffset stays
+// unset: for a memory64 module the caller must set it, or every
+// function with a load or store fails emission.
 func FuncOptionsFromDriver(d emit.Driver, modulePkgRef string) FuncOptions {
 	prefix := ""
 	if d.MultiPackage() {
@@ -52,7 +56,6 @@ func FuncOptionsFromDriver(d emit.Driver, modulePkgRef string) FuncOptions {
 			return d.FuncRefName(idx)
 		},
 		// Helper CALLs are spelled package-locally (see goCallSymbol).
-		// A memory64 module's caller also sets MemSizeOffset.
 		BoundsTrapSymbol: "·wasm_trap_memory_oob",
 	}
 }

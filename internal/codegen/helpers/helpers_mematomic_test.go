@@ -220,7 +220,7 @@ func TestWasmTrapHelpersPanic(t *testing.T) {
 	mustTrapOOB(t, wasm_trap_meminit_oob)
 	mustTrapOOB(t, wasm_trap_atomic_oob)
 	mustTrapOOB(t, wasm_trap_memory_oob)
-	if got := (memoryOutOfBounds{}).Error(); got != "wasm: out of bounds memory access" {
+	if got := (memoryOutOfBounds{}).Error(); got != "wasm: memory access out of bounds" {
 		t.Errorf("trap message = %q", got)
 	}
 	mustPanic(t, "wasm: unaligned atomic access", wasm_trap_atomic_unaligned)

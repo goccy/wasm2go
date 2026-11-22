@@ -994,9 +994,9 @@ func emitCmp64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame,
 //     the zero-extension the wrap rule wants); negative offsets keep
 //     the explicit ADDL.
 //   - memory64: address = base + off in full 64-bit, bounded like the
-//     pure-Go path (see codegen's memPtr64): SI = base + off, and the
-//     access branches to plan.boundsTrap on a carry out of that sum or
-//     unless SI + size <= m.memSize. AX carries the offset and the
+//     pure-Go path (see codegen's memBoundsTrapStmt): SI = base + off,
+//     and the access branches to plan.boundsTrap on a carry out of that
+//     sum or unless SI + size <= m.memSize. AX carries the offset and the
 //     bound — safe as a temp here because address formation completes
 //     before AX carries the access value. The offset goes through AX
 //     and the bound through a load so that no peephole folds an add

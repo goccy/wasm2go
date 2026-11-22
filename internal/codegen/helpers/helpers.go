@@ -155,11 +155,13 @@ func wasm_trap_meminit_oob() { panic(memoryOutOfBounds{}) }
 // memoryOutOfBounds is the trap value of every out-of-bounds linear-memory
 // access: a wasm32 access faulting in its guard reservation, a memory64
 // access past its memory, and the range checks of the bulk, atomic and SIMD
-// helpers. All its values are equal, so a recovered trap compares with == or
-// errors.Is.
+// helpers. It is an error: Inv_* entry points wrap it (%w) into the error
+// they return, and direct exports and constructors panic with it. The type
+// is unexported, so only code inside the generated package can name it;
+// there all its values are equal and compare with == or errors.Is.
 type memoryOutOfBounds struct{}
 
-func (memoryOutOfBounds) Error() string { return "wasm: out of bounds memory access" }
+func (memoryOutOfBounds) Error() string { return "wasm: memory access out of bounds" }
 
 // wasm_trap_memory_oob panics with memoryOutOfBounds: the target of the
 // memory64 access checks, in generated code and in asm (directly, or
