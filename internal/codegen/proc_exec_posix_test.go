@@ -296,3 +296,30 @@ func TestExec_IgnoredTimerIsNotTheCommands(t *testing.T) {
 		t.Fatalf("the command ended with %v, want killed by SIGTERM: the ignored SIGALRM reached it", st)
 	}
 }
+
+// Once the guest has become a command, the Signals is told that the process
+// handles every signal but the ones of no effect and the ones the guest
+// ignores, which stay ignored: a relay of the host process's signals sends
+// them on to the command.
+func TestExec_DispositionsAreTheCommands(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	s := &recordingSignals{}
+	root.cfg.Signals = s
+	child, cm, _, input, statusFd, exited := execingChild(t, root, m)
+	defer exited(0)
+	ignored := signalMask(wasiSIGPIPE)
+	setDispositions(t, child, cm, signalMask(wasiSIGUSR1), ignored, signalMask(wasiSIGHUP))
+	ended := execIn(t, child, cm, "/bin/sh", "-c", "read x; exit 0")
+	awaitExeced(t, root, m, statusFd)
+	closeFd(t, root, m, input)
+	var exit *WasiExitError
+	if end, _ := (<-ended).(error); !errors.As(end, &exit) || exit.Code != 0 {
+		t.Fatalf("the guest ended with %v, want an exit of 0", end)
+	}
+	uncatchable := signalMask(wasiSIGKILL, wasiSIGSTOP)
+	want := [3]uint64{^uint64(0) &^ wasiDefaultIgnoredSignals &^ ignored &^ uncatchable, ignored, 0}
+	last := len(s.reports) - 1
+	if last < 0 || s.reports[last] != want || s.targets[last] != child {
+		t.Fatalf("reports = %#x, want the last %#x for the child", s.reports, want)
+	}
+}

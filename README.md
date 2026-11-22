@@ -235,7 +235,10 @@ descriptors are closed, and the guest waits for the command and ends
 as it ended (`WasiExitError` or `WasiSignalError`, as an exit or a
 kill of its own). A signal for the process from then on is the
 command's, and so is a signal pending for the guest that it does not
-block; `KillCommands` kills it as well.
+block; `KillCommands` kills it as well. The `Signals` is told then that
+the process handles every signal but the ones of no effect and the ones
+the guest ignored, which stay ignored across the exec, so that a relay
+of the host process's signals sends them on to the command.
 
 `Process` also answers `getgroups` and makes the guest's `setuid`
 family, `setgroups` and `setpriority` changes; an isolated process is

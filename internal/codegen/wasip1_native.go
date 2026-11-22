@@ -3759,6 +3759,7 @@ func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, 
 	}); rc != _wasiESUCCESS {
 		return rc
 	}
+	w.reportExecDispositions()
 	w.reportError("proc_exec", w.closeFrom(0))
 	if self != nil && self.leads {
 		if status, reap := w.awaitLeader(pids, self, cmd); reap != nil {
@@ -3790,6 +3791,27 @@ func (w *WasiStubs) becomeCommand(process *os.Process) *execedCommand {
 		w.reportError("proc_exec", signalHostProc(process, int32(bits.TrailingZeros64(pending))+1))
 	}
 	return execed
+}
+
+// reportExecDispositions tells WASIConfig.Signals the dispositions of the
+// process once the guest has become a command (Proc_exec), as the guest
+// tells its own (Proc_signal_dispositions): a signal that reaches the
+// process now goes to the command (signalProcess), so every signal is
+// handled, for one who relays the host process's signals to send it on,
+// but those whose default action is to do nothing and those the guest
+// ignores, which stay ignored across execve(2). No signal is blocked.
+func (w *WasiStubs) reportExecDispositions() {
+	if w.cfg.Signals == nil {
+		return
+	}
+	w.dispositionsMu.Lock()
+	defer w.dispositionsMu.Unlock()
+	w.sig.mu.Lock()
+	ignored := w.sig.ignored
+	w.sig.mu.Unlock()
+	uncatchable := wasiSignalBit(wasiSIGKILL) | wasiSignalBit(wasiSIGSTOP)
+	handled := ^uint64(0) &^ wasiDefaultIgnoredSignals &^ ignored &^ uncatchable
+	w.cfg.Signals.Dispositions(w, handled, ignored, 0)
 }
 
 // endAs ends the guest, which has become the command execed (Proc_exec),
