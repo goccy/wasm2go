@@ -184,7 +184,12 @@ guest's process (the command the guest has become after `exec`), or
 through `DeliverSignal` with a `SignalReach`: `ReachProcess` as
 `PostSignal`, `ReachGuest` to the guest alone, dropped once it has
 become a command, for a signal the command gets where the host process
-got it too (a terminal's interrupt). `ForkProc` forks an instance that its
+got it too (a terminal's interrupt). `TakeSignal` is offered the
+signals the runtime raises for a guest itself (the interval timer's
+`SIGALRM`, a child's `SIGCHLD` once its status can be waited for, a
+`kill` of its own pid, a raise, the `SIGPIPE` of a write that fails
+with `EPIPE`) before the guest is given them; one it takes is not the
+guest's. `ForkProc` forks an instance that its
 parent waits for, under a pid token the fork knows as its own. The
 pid tokens of the forks and the commands a guest starts are numbers
 from 4194304 up, above every pid Linux and darwin hand out, so a token
