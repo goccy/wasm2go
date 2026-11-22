@@ -673,8 +673,10 @@ func TestSignal_CloseAllEndsDelivery(t *testing.T) {
 	}
 }
 
-// SIGKILL can be neither caught nor ignored nor blocked: a guest that says
-// it does all three to every signal still has SIGKILL delivered.
+// SIGKILL can be neither caught nor ignored nor blocked, and the host
+// carries it out: a guest that says it does all three to every signal finds
+// its flag word up, and is ended at its safe point — taking its signals,
+// reporting its dispositions — or at its next call that looks.
 func TestSignal_SIGKILLIsAlwaysDelivered(t *testing.T) {
 	w, m := newSignalGuest(t)
 	setDispositions(t, w, m, ^uint64(0), ^uint64(0), ^uint64(0))
@@ -682,8 +684,14 @@ func TestSignal_SIGKILLIsAlwaysDelivered(t *testing.T) {
 	if flag := signalFlag(m); flag != 1 {
 		t.Fatalf("flag = %d after SIGKILL, want 1", flag)
 	}
-	if got, want := takeSignals(t, w, m), signalMask(wasiSIGKILL); got != want {
-		t.Fatalf("taken = %#x, want SIGKILL (%#x)", got, want)
+	for name, call := range map[string]func(){
+		"proc_signal_take":         func() { w.Proc_signal_take(m, sigMaskOff) },
+		"proc_signal_dispositions": func() { w.Proc_signal_dispositions(m, 0, 0, 0) },
+		"fd_write":                 func() { fdWriteString(w, m, 1, "x") },
+	} {
+		if sig := killEnd(call); sig != wasiSIGKILL {
+			t.Errorf("%s ended the guest by %d, want SIGKILL", name, sig)
+		}
 	}
 }
 
@@ -747,6 +755,8 @@ func TestSignal_ExitStopsTheTimer(t *testing.T) {
 			}()
 			end.call(w, m)
 		}()
+		// The end raised the flag, for the guest's other threads.
+		signalFlag(m)
 		w.PostSignal(wasiSIGALRM)
 		if flag := signalFlag(m); flag != 0 {
 			t.Fatalf("after %s a posted signal raised the flag", end.name)
@@ -863,6 +873,8 @@ func TestSignal_RaiseWithoutAFlagWordHasTheDefaultAction(t *testing.T) {
 					t.Fatalf("raise(%d) recovered %v, want a WasiSignalError for %d", sig, err, want)
 				}
 			}()
+			// An instance ends once: each raise ends one of its own.
+			w, m := newProcTestStubs(t)
 			w.Proc_raise(m, sig)
 		}()
 	}

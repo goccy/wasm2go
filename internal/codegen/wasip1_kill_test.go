@@ -3,15 +3,15 @@
 package codegen
 
 import (
+	"reflect"
 	"runtime"
 	"syscall"
 	"testing"
-	"time"
 )
 
-// An instance that has been sent SIGKILL is on its way to its end: until
-// its guest has taken the signal none of its calls blocks, however many it
-// makes, and it starts no command.
+// SIGKILL is the host's to carry out, whatever the guest registered: the
+// guest's next call that looks ends it, a call that would block and a spawn
+// among them.
 
 // killedInstance forks an instance of w with a registered guest and posts
 // SIGKILL to it.
@@ -22,46 +22,30 @@ func killedInstance(t *testing.T, w *WasiStubs) (*WasiStubs, *Module) {
 	return instances[0], modules[0]
 }
 
-func TestKill_NoCallBlocksWhileSIGKILLIsPending(t *testing.T) {
+func TestKill_SIGKILLEndsARegisteredGuest(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	readFd, _ := newTestPipe(t, w, m)
 	child, cm := killedInstance(t, w)
-	// More than one call: the first one is interrupted by any signal.
+	// A read with no input, again and again as a loop retrying EINTR does.
 	for round := 0; round < 3; round++ {
-		result := make(chan int32, 1)
-		go func() {
-			_, rc := fdReadString(child, cm, readFd, 16)
-			result <- rc
-		}()
-		select {
-		case rc := <-result:
-			if rc != _wasiEINTR {
-				t.Fatalf("read %d of a killed process rc=%d, want EINTR", round, rc)
-			}
-		case <-time.After(waitLimit):
-			t.Fatalf("read %d of a killed process blocks", round)
+		if sig := killEnd(func() { fdReadString(child, cm, readFd, 16) }); sig != wasiSIGKILL {
+			t.Fatalf("read %d ended the guest by %d, want SIGKILL", round, sig)
 		}
 	}
-	// Once the guest has the signal the host holds nothing back.
-	takeSignals(t, child, cm)
-	result := make(chan int32, 1)
-	go func() {
-		_, rc := fdReadString(child, cm, readFd, 16)
-		result <- rc
-	}()
-	select {
-	case rc := <-result:
-		t.Fatalf("a read with no input returned %d after the signal was taken", rc)
-	case <-time.After(100 * time.Millisecond):
+	if sig := killEnd(func() { fdWriteString(child, cm, 1, "x") }); sig != wasiSIGKILL {
+		t.Fatalf("fd_write ended the guest by %d, want SIGKILL", sig)
 	}
-	child.PostSignal(wasiSIGTERM)
-	select {
-	case rc := <-result:
-		if rc != _wasiEINTR {
-			t.Fatalf("the read rc=%d after SIGTERM, want EINTR", rc)
-		}
-	case <-time.After(waitLimit):
-		t.Fatal("the read did not take SIGTERM")
+}
+
+// SIGKILL ends the blocking call a registered guest waits in, and the guest.
+func TestKill_SIGKILLEndsTheWaitOfARegisteredGuest(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	readFd, _ := newTestPipe(t, w, m)
+	instances, modules := sharedWaiters(t, w, 1)
+	child, cm := instances[0], modules[0]
+	whenBlocked(child, func() { child.PostSignal(wasiSIGKILL) })
+	if sig := killEnd(func() { fdReadString(child, cm, readFd, 16) }); sig != wasiSIGKILL {
+		t.Fatalf("the read ended the guest by %d, want SIGKILL", sig)
 	}
 }
 
@@ -70,8 +54,31 @@ func TestKill_AKilledProcessStartsNoCommand(t *testing.T) {
 	child, cm := killedInstance(t, w)
 	pathOff := writeCStr(cm, 1000, "/bin/sh")
 	argvOff := writeArgv(cm, 2000, 3000, []string{"/bin/sh", "-c", "exit 0"})
-	if rc := child.Proc_spawn(cm, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiEINTR {
-		t.Fatalf("Proc_spawn of a killed process rc=%d, want -EINTR", rc)
+	if sig := killEnd(func() { child.Proc_spawn(cm, pathOff, argvOff, 0, -1, -1, -1, 0, 4000) }); sig != wasiSIGKILL {
+		t.Fatalf("Proc_spawn of a killed process ended it by %d, want SIGKILL", sig)
+	}
+}
+
+// A spawn that a SIGKILL reaches while the Exec hook runs starts nothing.
+func TestKill_ASpawnKilledInTheExecHookStartsNothing(t *testing.T) {
+	w, m := newSignalGuest(t)
+	hooked := 0
+	w.cfg.Exec = func(string, []string) bool {
+		hooked++
+		w.PostSignal(wasiSIGKILL)
+		return true
+	}
+	path := writeCStr(m, 1000, "/bin/sh")
+	argv := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "exit 0"})
+	want := &WasiSignalError{Signal: wasiSIGKILL}
+	if got := endOf(func() { w.Proc_spawn(m, path, argv, 0, -1, -1, -1, 0, 4000) }); !reflect.DeepEqual(got, want) || hooked != 1 {
+		t.Fatalf("the spawn ended with %v after %d hook calls, want %v after 1", got, hooked, want)
+	}
+	w.mu.Lock()
+	started := len(w.procs)
+	w.mu.Unlock()
+	if started != 0 {
+		t.Fatalf("%d processes started", started)
 	}
 }
 
