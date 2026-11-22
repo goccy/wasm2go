@@ -156,7 +156,7 @@ func TestFdLockRanges(t *testing.T) {
 			t.Fatalf("F_SETLK [%d, +%d) rc=%d, want -%d", c.start, c.length, rc, c.errno)
 		}
 	}
-	readOnly, errno := w.pathOpen("f", 0x1, 0, 1<<1, 0)
+	readOnly, errno := w.pathOpen(m, "f", 0x1, 0, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open for reading errno=%d", errno)
 	}
@@ -232,7 +232,7 @@ func TestFdLockConcurrentInstances(t *testing.T) {
 			wg.Go(func() {
 				m := newForkTestModule()
 				for k := range 50 {
-					fd, errno := w.pathOpen("f", 0x1, 0, 1<<1|1<<6, 0)
+					fd, errno := w.pathOpen(m, "f", 0x1, 0, 1<<1|1<<6, 0)
 					if errno != _wasiESUCCESS {
 						t.Errorf("pathOpen errno=%d", errno)
 						return

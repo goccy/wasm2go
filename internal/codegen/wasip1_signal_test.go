@@ -42,6 +42,13 @@ func ignoreSIGPIPE(t *testing.T, w *WasiStubs, m *Module) {
 	setDispositions(t, w, m, 0, signalMask(wasiSIGPIPE), 0)
 }
 
+// newThreadModule returns the module of another thread of m's guest: a copy
+// of m on the same memory, as wasi-threads runs each thread.
+func newThreadModule(m *Module) *Module {
+	thread := *m
+	return &thread
+}
+
 func signalMask(sigs ...int32) uint64 {
 	var mask uint64
 	for _, sig := range sigs {
@@ -91,13 +98,23 @@ func whenBlocked(w *WasiStubs, f func()) <-chan struct{} {
 func awaitBlockedCalls(w *WasiStubs, n int) {
 	for {
 		w.sig.mu.Lock()
-		blocked := len(w.sig.wakes)
+		blocked := blockedCallsLocked(w)
 		w.sig.mu.Unlock()
 		if blocked == n {
 			return
 		}
 		runtime.Gosched()
 	}
+}
+
+// blockedCallsLocked counts the blocking calls of the guest's threads in
+// progress. Caller holds w.sig.mu.
+func blockedCallsLocked(w *WasiStubs) int {
+	n := 0
+	for _, t := range w.sig.threads {
+		n += len(t.wakes)
+	}
+	return n
 }
 
 // postWhenBlocked posts sig once a blocking call of the guest is waiting.
@@ -245,21 +262,26 @@ func TestSignal_PendingSignalEndsTheNextBlockingCallAtOnce(t *testing.T) {
 }
 
 // While the guest runs code outside it (a native library it called), a
-// signal posted for it interrupts that code through what its runner
-// registered, once per signal; the guest's own blocking calls that follow
-// are not interrupted by it, and it is noticed as any signal is. A signal
-// the guest blocks or discards does nothing to the code; a blocking call of
-// the guest's own made from inside the code (a callback) is ended as
-// always. Registrations nest.
+// signal posted for it interrupts that code through what its runner gave,
+// once per signal; the guest's own blocking calls that follow are not
+// interrupted by it, and it is noticed as any signal is. A signal the guest
+// blocks or discards does nothing to the code; a blocking call of the guest's
+// own made from inside the code (a callback) is ended as always. Calls nest,
+// and the one the thread began last and has not ended is interrupted.
+// Pending tells whether a signal waits for the thread.
 func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGUSR2)
 	var outer, inner int
-	if prev := w.SetOutsideInterrupt(func() { outer++ }); prev != nil {
-		t.Fatal("something was registered before the first registration")
+	outerCall := w.BeginOutside(m, func() { outer++ })
+	if outerCall.Pending() {
+		t.Fatal("Pending with no signal posted")
 	}
 	w.PostSignal(wasiSIGUSR1)
 	if outer != 1 {
 		t.Fatalf("interrupt called %d times for one signal, want 1", outer)
+	}
+	if !outerCall.Pending() {
+		t.Fatal("Pending is false with a signal waiting")
 	}
 	if flag := signalFlag(m); flag != 1 {
 		t.Fatalf("flag = %d, want 1", flag)
@@ -274,6 +296,9 @@ func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1); got != want {
 		t.Fatalf("taken = %#x, want %#x", got, want)
 	}
+	if outerCall.Pending() {
+		t.Fatal("Pending once the signal was taken")
+	}
 
 	// Blocked, and discarded by default.
 	setDispositions(t, w, m, signalMask(wasiSIGUSR1, wasiSIGUSR2), 0, signalMask(wasiSIGUSR2))
@@ -281,6 +306,9 @@ func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	w.PostSignal(wasiSIGCHLD)
 	if outer != 1 {
 		t.Fatalf("interrupt called for a blocked or discarded signal (%d calls)", outer)
+	}
+	if outerCall.Pending() {
+		t.Fatal("Pending for a blocked signal")
 	}
 	setDispositions(t, w, m, signalMask(wasiSIGUSR1, wasiSIGUSR2), 0, 0)
 	takeSignals(t, w, m)
@@ -297,23 +325,27 @@ func TestSignal_InterruptsCodeOutsideTheGuest(t *testing.T) {
 	takeSignals(t, w, m)
 
 	// Nesting.
-	if prev := w.SetOutsideInterrupt(func() { inner++ }); prev == nil {
-		t.Fatal("the outer registration was not returned")
-	} else {
-		w.PostSignal(wasiSIGUSR1)
-		if inner != 1 || outer != 1 {
-			t.Fatalf("calls inner=%d outer=%d, want 1 1", inner, outer)
-		}
-		w.SetOutsideInterrupt(prev)
+	innerCall := w.BeginOutside(m, func() { inner++ })
+	w.PostSignal(wasiSIGUSR1)
+	if inner != 1 || outer != 1 {
+		t.Fatalf("calls inner=%d outer=%d, want 1 1", inner, outer)
 	}
+	innerCall.End()
 	w.PostSignal(wasiSIGUSR1)
 	if inner != 1 || outer != 2 {
 		t.Fatalf("after the inner code returned: calls inner=%d outer=%d, want 1 2", inner, outer)
 	}
-	w.SetOutsideInterrupt(nil)
+	// Ended out of order: the call begun last is still the one.
+	innerCall = w.BeginOutside(m, func() { inner++ })
+	outerCall.End()
 	w.PostSignal(wasiSIGUSR1)
-	if outer != 2 {
-		t.Fatalf("interrupt called after the code returned (%d calls)", outer)
+	if inner != 2 || outer != 2 {
+		t.Fatalf("after the outer call ended first: calls inner=%d outer=%d, want 2 2", inner, outer)
+	}
+	innerCall.End()
+	w.PostSignal(wasiSIGUSR1)
+	if inner != 2 || outer != 2 {
+		t.Fatalf("interrupt called after the code returned (calls inner=%d outer=%d)", inner, outer)
 	}
 	// With nothing outside, the signal is left for the next blocking call.
 	if rc := sleepPoll(t, w, m, 30*time.Second); rc != _wasiEINTR {
@@ -572,7 +604,7 @@ func TestSignal_TimerDueBeforeAWaitEndsIsPostedFirst(t *testing.T) {
 	// The wait was in progress when the timer came due.
 	w, m := newSignalGuest(t, wasiSIGALRM)
 	setTimer(t, w, m, time.Hour, 0)
-	key, ok := w.beginBlocking(func() {})
+	key, ok := w.beginBlocking(m, func() {})
 	if !ok {
 		t.Fatal("a wait before the timer is due did not begin")
 	}
@@ -626,8 +658,8 @@ func TestSignal_ForkedStateStartsWithoutSignals(t *testing.T) {
 		}
 	})
 	cm := newForkTestModule()
-	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
-		t.Fatalf("the forked guest's registration rc=%d, want 0 (new)", rc)
+	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 1 {
+		t.Fatalf("the forked guest's registration rc=%d, want 1 (inherited)", rc)
 	}
 	if got := takeSignals(t, child, cm); got != 0 {
 		t.Fatalf("the forked guest inherited pending signals: %#x", got)
@@ -641,9 +673,10 @@ func TestSignal_ForkedStateStartsWithoutSignals(t *testing.T) {
 	}
 }
 
-// A signal sent to a forked guest before it has run — and so before it has
-// registered — is not lost: it is there when the guest reports its
-// dispositions, unless those say the signal is ignored.
+// A signal sent to a forked guest before it has run is not lost: the guest
+// has the registration of the thread that forked, and its flag word is
+// raised once the thread is known; a signal the inherited dispositions
+// discard is dropped.
 func TestSignal_PostedToAForkedGuestBeforeItRegisters(t *testing.T) {
 	w, _ := newSignalGuest(t)
 	child := w.Fork()
@@ -656,10 +689,9 @@ func TestSignal_PostedToAForkedGuestBeforeItRegisters(t *testing.T) {
 	child.PostSignal(wasiSIGCHLD)
 
 	cm := newForkTestModule()
-	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
-		t.Fatalf("Proc_signal_register rc=%d", rc)
+	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 1 {
+		t.Fatalf("Proc_signal_register rc=%d, want 1 (inherited)", rc)
 	}
-	setDispositions(t, child, cm, 0, wasiDefaultIgnoredSignals, 0)
 	if flag := signalFlag(cm); flag != 1 {
 		t.Fatalf("flag = %d once the forked guest is ready, want 1", flag)
 	}
@@ -719,7 +751,8 @@ func TestSignal_DueTimerInterruptsTheGuestsOwnWait(t *testing.T) {
 	}
 	w, m := newSignalGuest(t, wasiSIGALRM)
 	outside := 0
-	w.SetOutsideInterrupt(func() { outside++ })
+	c := w.BeginOutside(m, func() { outside++ })
+	defer c.End()
 	pid, exited := w.NewProc(nil)
 	defer exited(0)
 
@@ -733,7 +766,7 @@ func TestSignal_DueTimerInterruptsTheGuestsOwnWait(t *testing.T) {
 	}
 
 	setTimer(t, w, m, time.Hour, 0)
-	key, ok := w.beginBlocking(func() {})
+	key, ok := w.beginBlocking(m, func() {})
 	if !ok {
 		t.Fatal("a wait before the timer is due did not begin")
 	}
@@ -899,7 +932,8 @@ func TestSignal_RaiseWithoutAFlagWordHasTheDefaultAction(t *testing.T) {
 func TestSignal_OwnPostsAreLeftForTheGuest(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGALRM)
 	outside := 0
-	w.SetOutsideInterrupt(func() { outside++ })
+	c := w.BeginOutside(m, func() { outside++ })
+	defer c.End()
 	pid, exited := w.NewProc(nil)
 	defer exited(0)
 	wait := func() int32 {
@@ -1050,10 +1084,11 @@ func TestSignal_ForkKeepsTheSignals(t *testing.T) {
 		t.Fatalf("Proc_kill from the forked guest rc=%d", rc)
 	}
 	setDispositions(t, child, cm, signalMask(wasiSIGTERM), 0, 0)
-	if len(s.kills) != 1 || len(s.reports) != 1 || s.reports[0][0] != signalMask(wasiSIGTERM) {
+	// The dispositions the copy inherited are reported when it is made.
+	if len(s.kills) != 1 || len(s.reports) != 2 || s.reports[0] != [3]uint64{} || s.reports[1][0] != signalMask(wasiSIGTERM) {
 		t.Fatalf("kills = %v, reports = %#x", s.kills, s.reports)
 	}
-	if s.targets[0] != child {
+	if s.targets[0] != child || s.targets[1] != child {
 		t.Fatal("the forked instance reported with another target")
 	}
 }
@@ -1110,8 +1145,9 @@ func TestSignal_KillOfTheGuestAndItsGroup(t *testing.T) {
 	}
 }
 
-// registeredFork registers the guest of a forked instance for signals and
-// has it handle sigs.
+// registeredFork registers the guest of a forked instance for signals — the
+// registration it inherited from a registered guest, or a new one — and has
+// it handle sigs.
 func registeredFork(t *testing.T, child *WasiStubs, sigs ...int32) *Module {
 	t.Helper()
 	t.Cleanup(func() {
@@ -1119,9 +1155,15 @@ func registeredFork(t *testing.T, child *WasiStubs, sigs ...int32) *Module {
 			t.Error(err)
 		}
 	})
+	child.sig.mu.Lock()
+	want := int32(0)
+	if child.sig.registeredLocked() {
+		want = 1
+	}
+	child.sig.mu.Unlock()
 	cm := newForkTestModule()
-	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
-		t.Fatalf("Proc_signal_register rc=%d", rc)
+	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != want {
+		t.Fatalf("Proc_signal_register rc=%d, want %d", rc, want)
 	}
 	setDispositions(t, child, cm, signalMask(sigs...), 0, 0)
 	return cm
@@ -1262,15 +1304,21 @@ func TestSignal_ForkProcOfAForkCopyReachesTheRoot(t *testing.T) {
 	}
 }
 
-// Two blocking calls in progress (threads of the guest share the instance)
-// are both woken by a signal: one ends with EINTR, the other waits on.
+// Of two threads of the guest that wait, a signal goes to one: its wait ends
+// with EINTR, the other waits on.
 func TestSignal_OneOfTwoWaitsEndsByASignal(t *testing.T) {
-	w, _ := newSignalGuest(t, wasiSIGUSR1)
+	handled := signalMask(wasiSIGUSR1)
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	setDispositions(t, w, m, handled, 0, handled)
+	threads := []*Module{
+		newSignalThread(t, w, m, sigFlag2Off, handled, 0),
+		newSignalThread(t, w, m, sigFlag3Off, handled, 0),
+	}
 	first, firstExited := w.NewProc(nil)
 	second, secondExited := w.NewProc(nil)
 	results := make(chan int32, 2)
-	for _, pid := range []int32{first, second} {
-		go func() { results <- w.Proc_wait(newForkTestModule(), pid, 0, sigValueOff) }()
+	for i, pid := range []int32{first, second} {
+		go func() { results <- w.Proc_wait(threads[i], pid, 0, sigValueOff) }()
 	}
 	awaitBlockedCalls(w, 2)
 	w.PostSignal(wasiSIGUSR1)
@@ -1425,8 +1473,8 @@ func TestSignal_ForkProcChildKnowsItsToken(t *testing.T) {
 		}
 	})
 	cm := newForkTestModule()
-	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 0 {
-		t.Fatalf("Proc_signal_register rc=%d", rc)
+	if rc := child.Proc_signal_register(cm, sigFlagOff); rc != 1 {
+		t.Fatalf("Proc_signal_register rc=%d, want 1 (inherited)", rc)
 	}
 	setDispositions(t, child, cm, signalMask(wasiSIGUSR1, wasiSIGUSR2), 0, 0)
 

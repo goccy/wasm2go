@@ -52,8 +52,9 @@ func TestStop_AnEndEndsTheOtherThreads(t *testing.T) {
 }
 
 // The end of the instance interrupts the code outside the guest that a
-// thread runs (SetOutsideInterrupt), for it to come back to the guest, which
-// ends at its next call that looks: SIGKILL, and another thread's end.
+// thread runs (BeginOutside), for it to come back to the guest, which ends at
+// its next call that looks: SIGKILL, and another thread's end. The call's
+// Pending says so.
 func TestStop_AnEndInterruptsCodeOutsideTheGuest(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -65,9 +66,13 @@ func TestStop_AnEndInterruptsCodeOutsideTheGuest(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w, m := newSignalGuest(t)
 			calls := 0
-			w.SetOutsideInterrupt(func() { calls++ })
+			c := w.BeginOutside(newThreadModule(m), func() { calls++ })
 			tc.end(w, m)
-			w.SetOutsideInterrupt(nil)
+			pending := c.Pending()
+			c.End()
+			if !pending {
+				t.Error("Pending is false once the end was asked for")
+			}
 			if calls != 1 {
 				t.Fatalf("the interrupt was called %d times, want once", calls)
 			}
@@ -89,8 +94,8 @@ func TestStop_TheFirstEndIsTheInstances(t *testing.T) {
 // A blocking call that the end wakes ends the thread, and so does one that
 // begins once the end has been asked for, which no wake reaches.
 func TestStop_ABlockingCallAfterTheEndEndsTheThread(t *testing.T) {
-	w, _ := newSignalGuest(t)
-	b, ok := w.beginBlocking(func() {})
+	w, m := newSignalGuest(t)
+	b, ok := w.beginBlocking(m, func() {})
 	if !ok {
 		t.Fatal("beginBlocking refused with no signal posted")
 	}
@@ -99,7 +104,7 @@ func TestStop_ABlockingCallAfterTheEndEndsTheThread(t *testing.T) {
 	if got := endOf(func() { w.endBlocking(b) }); !reflect.DeepEqual(got, want) {
 		t.Fatalf("endBlocking of the call SIGKILL woke ended with %v, want %v", got, want)
 	}
-	if got := endOf(func() { w.beginBlocking(func() {}) }); !reflect.DeepEqual(got, want) {
+	if got := endOf(func() { w.beginBlocking(m, func() {}) }); !reflect.DeepEqual(got, want) {
 		t.Fatalf("beginBlocking after SIGKILL ended with %v, want %v", got, want)
 	}
 }

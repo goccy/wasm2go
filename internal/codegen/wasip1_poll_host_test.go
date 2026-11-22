@@ -582,7 +582,7 @@ func TestWasi_PollSeesTheEndOfAFIFO(t *testing.T) {
 		}
 		writer <- f
 	}()
-	fd, errno := w.pathOpen("fifo", 0, 0, 1<<1, 0)
+	fd, errno := w.pathOpen(m, "fifo", 0, 0, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -836,19 +836,22 @@ type waiter struct {
 	feed func()
 }
 
-// readWaiter is a read of fd, which w feeds by writing to wr.
+// readWaiter is a read of fd by a thread of its own (signalWaiter), which
+// feed feeds.
 func readWaiter(t *testing.T, w *WasiStubs, fd int32, feed func()) waiter {
+	m := signalWaiter(t, w)
 	return waiter{
 		wait: func() int32 {
-			_, rc := fdReadString(w, newForkTestModule(), fd, 16)
+			_, rc := fdReadString(w, m, fd, 16)
 			return rc
 		},
 		feed: feed,
 	}
 }
 
-// A signal ends one of the waits in progress, each with a wake of its own:
-// the other call of the instance's goes on waiting, whatever it waits in.
+// A signal ends one of the waits in progress of the threads that take it,
+// each with a wake of its own: the other call of the instance's goes on
+// waiting, whatever it waits in.
 func TestSignal_EndsOneOfTheWaits(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -886,7 +889,7 @@ func TestSignal_EndsOneOfTheWaits(t *testing.T) {
 					}
 				}
 			}
-			pm := newForkTestModule()
+			pm := signalWaiter(t, w)
 			writeSubFd(pm, pollSubsOff, 7, 1, aR)
 			return []waiter{
 				{wait: func() int32 { return w.Poll_oneoff(pm, pollSubsOff, pollEvOff, 1, pollNevOff) }, feed: feed(aW)},
@@ -895,7 +898,10 @@ func TestSignal_EndsOneOfTheWaits(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w, _ := newSignalGuest(t, wasiSIGUSR1)
+			w, m := newSignalGuest(t, wasiSIGUSR1)
+			// The thread that registered first blocks the signal: it
+			// goes to a thread that waits.
+			setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, signalMask(wasiSIGUSR1))
 			waiters := tc.waiters(t, w)
 			results := make([]chan int32, len(waiters))
 			for i, wt := range waiters {

@@ -623,17 +623,17 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 // A failed dial is the errno of its error: the host's number, and EIO, told
 // Errors, for an error without one.
 func TestDialInterruptiblyErrno(t *testing.T) {
-	w, _ := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, t.TempDir())
 	var told []string
 	w.cfg.Errors = func(op string, err error) { told = append(told, op) }
-	if _, errno := w.dialInterruptibly("sock_connect", "unix", filepath.Join(t.TempDir(), "none")); errno != _wasiENOENT {
+	if _, errno := w.dialInterruptibly(m, "sock_connect", "unix", filepath.Join(t.TempDir(), "none")); errno != _wasiENOENT {
 		t.Errorf("dial of a missing socket file errno=%d, want ENOENT", errno)
 	}
 	if len(told) != 0 {
 		t.Errorf("Errors was told %q of an error with an errno", told)
 	}
 	// package net's error of a network it does not know has no number
-	if _, errno := w.dialInterruptibly("sock_connect", "none", "127.0.0.1:1"); errno != _wasiEIO {
+	if _, errno := w.dialInterruptibly(m, "sock_connect", "none", "127.0.0.1:1"); errno != _wasiEIO {
 		t.Errorf("dial of an unknown network errno=%d, want EIO", errno)
 	}
 	if len(told) != 1 || told[0] != "sock_connect" {

@@ -2467,6 +2467,9 @@ type threadPool struct {
 	// end is what the instance ended with once it has (stop): the waits on
 	// its memory end with it. Guarded by parkMu.
 	end any
+	// ended is told of each agent whose goroutine has returned
+	// (onAgentEnd). Guarded by parkMu.
+	ended func(agent *Module)
 	// parkedHook, when not nil, is told the address of each wait once it is
 	// parked: a test's notice that a waiter is there to be released.
 	parkedHook chan<- uint64
@@ -2505,6 +2508,26 @@ func (p *threadPool) endIfStopped() {
 // the instance (threadPool.stop). The WASI host calls it when the instance
 // ends.
 func stopAgents(m *Module, end any) { m.threads.stop(end) }
+
+// onAgentEnd has ended told of each agent of m's instance whose goroutine has
+// returned, with the agent's module, once it has: the WASI host forgets the
+// thread then. The last call's ended is the one.
+func onAgentEnd(m *Module, ended func(agent *Module)) {
+	m.threads.parkMu.Lock()
+	defer m.threads.parkMu.Unlock()
+	m.threads.ended = ended
+}
+
+// agentEnded tells the ended of onAgentEnd, if any, of agent, whose goroutine
+// is returning.
+func (p *threadPool) agentEnded(agent *Module) {
+	p.parkMu.Lock()
+	ended := p.ended
+	p.parkMu.Unlock()
+	if ended != nil {
+		ended(agent)
+	}
+}
 
 // wake releases up to count waiters on ea and reports how many it woke.
 func (p *threadPool) wake(ea uint64, count int32) int32 {
@@ -2545,6 +2568,7 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 	go func() {
 		defer m.threads.wg.Done()
 		defer spinAgentsAdd(-1)
+		defer m.threads.agentEnded(child)
 		// A trap on any wasm thread traps the whole instance (wasi-threads
 		// semantics): surface WHERE it happened, then let it take the
 		// process down instead of silently unwinding the goroutine.

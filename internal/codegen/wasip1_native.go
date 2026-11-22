@@ -112,6 +112,12 @@ func runtimeMappingOf(mem []byte) *runtimeMapping { return nil }
 
 func whileRuntimeMapped(m *runtimeMapping, f func()) bool { return false }
 
+// onAgentEnd is the in-package stand-in for the runtime helper of the same
+// name, which has ended told of each agent of the module whose goroutine has
+// returned: this Module has no agents. The generated output has the real
+// one; this one is not emitted.
+func onAgentEnd(m *Module, ended func(agent *Module)) {}
+
 // WasiExitError is the panic value of a guest that called Proc_exit(). A
 // bulk-dispatch function (Inv_<svc>_<mt>) recovers it and returns it wrapped
 // in its error, which errors.As reaches; an export method and the
@@ -1641,7 +1647,7 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake int) error {
 // interrupted reports that the call is to report one, or when an entry of
 // set is closed (its last slot is cleared). The call takes a wake pipe of
 // the instance's for the wait.
-func (w *WasiStubs) waitHostInterruptibly(call string, set []hostWaitFD, until time.Time) (interrupted bool, err error) {
+func (w *WasiStubs) waitHostInterruptibly(m *Module, call string, set []hostWaitFD, until time.Time) (interrupted bool, err error) {
 	wk, err := w.takeWake()
 	if err != nil {
 		return false, err
@@ -1654,7 +1660,7 @@ func (w *WasiStubs) waitHostInterruptibly(call string, set []hostWaitFD, until t
 	given := false
 	defer w.giveWakeOnUnwind(call, &given, wk, set)
 	var wakeErr error
-	interrupted, _, refused := w.blockingAttempt(func() { wakeErr = hostWakeWrite(wk.w) }, nil,
+	interrupted, _, refused := w.blockingAttempt(m, func() { wakeErr = hostWakeWrite(wk.w) }, nil,
 		func(<-chan struct{}) { err = waitHostReady(set, until, wk.r) })
 	given = true
 	return interrupted || refused, errors.Join(err, wakeErr, w.giveWake(wk, set))
@@ -1684,9 +1690,9 @@ func (w *WasiStubs) reportError(op string, err error) {
 // is to report a signal (endBlocking), and woken that wake ran, whichever
 // call reports the signal; the caller then undoes what wake did. A call that
 // terminate unwinds after wake ran has unwound (nil for none) undo it.
-func (w *WasiStubs) blockingAttempt(wake func(), unwound func(), attempt func(stop <-chan struct{})) (interrupted, woken, refused bool) {
+func (w *WasiStubs) blockingAttempt(m *Module, wake func(), unwound func(), attempt func(stop <-chan struct{})) (interrupted, woken, refused bool) {
 	stop := make(chan struct{})
-	key, ok := w.beginBlocking(func() {
+	key, ok := w.beginBlocking(m, func() {
 		close(stop)
 		wake()
 	})
@@ -2831,9 +2837,14 @@ func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
 //     the family, is known to the family by the pid of its Process from its
 //     first fork on (Proc_kill), and neither that pid nor its ppid is a token
 //     from then on;
-//   - no signal is pending and no interval timer is set, and the guest has not
-//     registered for signals: the copy of the guest that runs on the result
-//     registers and reports its dispositions (the ones it inherited) itself.
+//   - the dispositions are w's, and so are the registration for signals and
+//     the mask of the guest's thread that forks, the one thread of the copy
+//     (POSIX fork): its first call of the host is that thread's. Fork does
+//     not know the thread that forks, and takes the first thread of w's
+//     guest that registered for signals; Proc_fork takes its own. The
+//     dispositions are reported to WASIConfig.Signals with the result as the
+//     target. A copy of a guest that has not registered has not either. No
+//     signal is pending and no interval timer is set.
 //
 // The copy shares the identity of w: the same Process, so its getpid and
 // getppid are w's. From the root on, every copy made by Fork has the root's
@@ -2848,6 +2859,20 @@ func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
 // is done. It has none of the System V shared memory segments the guest of
 // w attached (Ipc_shmat): the copy's shmdt of one fails with EINVAL.
 func (w *WasiStubs) Fork() *WasiStubs {
+	return w.fork(nil)
+}
+
+// fork is Fork for the thread of the guest whose module from is, the one
+// that forks (nil: the first one that registered for signals).
+func (w *WasiStubs) fork(from *Module) *WasiStubs {
+	child := w.forkHost()
+	w.sig.forkInto(&child.sig, from)
+	child.reportDispositions()
+	return child
+}
+
+// forkHost is Fork but for the signal state.
+func (w *WasiStubs) forkHost() *WasiStubs {
 	ids := w.guestProcess().IDs()
 	start := w.forkedChanges(ids)
 	w.enterRoot()
@@ -3307,18 +3332,18 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 // shares w's identity (see Fork), so when w is such a copy the ppid is the
 // root's pid, and the copy's kill of it reaches the root, not w.
 func (w *WasiStubs) ForkProc() (child *WasiStubs, pid int32, exited func(status int32)) {
-	child, pid, proc := w.forkProc()
+	child, pid, proc := w.forkProc(nil)
 	w.enterChild(pid, proc)
 	return child, pid, w.procExitFunc(proc)
 }
 
 // forkProc is ForkProc up to the copy's becoming w's child (enterChild):
 // it returns the copy, its pid token and its process, which nobody can wait
-// for or signal yet.
-func (w *WasiStubs) forkProc() (*WasiStubs, int32, *wasiProc) {
+// for or signal yet. from is the module of the thread that forks (see fork).
+func (w *WasiStubs) forkProc(from *Module) (*WasiStubs, int32, *wasiProc) {
 	parent := w.guestProcess()
 	ids := parent.IDs()
-	child := w.Fork()
+	child := w.fork(from)
 	w.mu.Lock()
 	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
 	pgid, sid := w.pidsLocked().jobOf(ids.PID)
@@ -3470,7 +3495,7 @@ func (w *WasiStubs) procFork(m *Module, pidOutPtr uint64) int32 {
 	if w.memBytes(m, pidOutPtr, 4) == nil {
 		return -_wasiEFAULT
 	}
-	child, pid, proc := w.forkProc()
+	child, pid, proc := w.forkProc(m)
 	made := false
 	defer func() {
 		// A Forker that failed, or panicked, made no child.
@@ -3775,8 +3800,9 @@ func (w *WasiStubs) awaitLeader(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand
 // cannot be replaced, so the exec is emulated, as Cygwin's spawn.cc does
 // for _P_OVERLAY: once the command has started, the process keeps its pid
 // and is the command's — a signal for it (PostSignal, Proc_kill), one
-// pending for the guest the guest does not block, and a SIGKILL that
-// arrived while the command started, are the command's — the
+// pending for the process or the exec'ing thread that this thread does not
+// block, and a SIGKILL that arrived while the command started, are the
+// command's — the
 // guest's descriptors are closed, and the call waits for the command and
 // what the runtime copies from it, and ends the guest the way the command
 // ended, as Proc_exit or Proc_terminate end it. The command is put where
@@ -3813,7 +3839,7 @@ func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, 
 	if rc := w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{0, 1, 2}, true, func(c *hostCommand, job commandJob, p *wasiPIDs, _ ProcessIDs) {
 		cmd, self, pids = c, job.self, p
 		w.reportError("proc_exec", pids.started(job, self, cmd.process.Pid))
-		execed = w.becomeCommand(cmd.process)
+		execed = w.becomeCommand(m, cmd.process)
 	}); rc != _wasiESUCCESS {
 		return rc
 	}
@@ -3830,21 +3856,25 @@ func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, 
 }
 
 // becomeCommand makes the process of the instance the command process,
-// which the guest has become (Proc_exec): signals for the process are the
-// command's from now on (signalProcess), and so are the signals pending
-// for the guest that it does not block, and SIGKILL when the end of the
-// instance has been asked for (requestStopLocked) while the command
-// started. A failure to send one is told WASIConfig.Errors.
-func (w *WasiStubs) becomeCommand(process *os.Process) *execedCommand {
+// which the guest's thread whose module m is has become (Proc_exec):
+// signals for the process are the command's from now on (signalProcess),
+// and so are the signals pending for the process or for that thread that
+// the thread does not block, and SIGKILL when the end of the instance has
+// been asked for (requestStopLocked) while the command started. The command
+// is given no mask: the pending signals the thread blocks are dropped. A
+// failure to send one is told WASIConfig.Errors.
+func (w *WasiStubs) becomeCommand(m *Module, process *os.Process) *execedCommand {
 	execed := &execedCommand{process: process, done: make(chan struct{})}
-	w.sig.mu.Lock()
-	w.sig.execed = execed
-	pending := w.sig.pending &^ w.sig.blocked
-	w.sig.pending &^= pending
-	if w.sig.stop.Load() != nil {
+	s := &w.sig
+	t := w.lockSignalThread(m)
+	s.execed = execed
+	pending := s.deliverable(t)
+	s.pending &^= pending
+	t.pending &^= pending
+	if s.stop.Load() != nil {
 		pending |= wasiSignalBit(wasiSIGKILL)
 	}
-	w.sig.mu.Unlock()
+	w.unlockSignals()
 	for ; pending != 0; pending &= pending - 1 {
 		w.reportError("proc_exec", signalHostProc(process, int32(bits.TrailingZeros64(pending))+1))
 	}
@@ -4088,7 +4118,7 @@ func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64)
 			// Child still running; non-blocking caller gets EAGAIN.
 			return -_wasiEAGAIN
 		}
-	} else if !w.awaitInterruptibly(proc.done) {
+	} else if !w.awaitInterruptibly(m, proc.done) {
 		return -_wasiEINTR
 	}
 	w.mu.Lock()
@@ -4177,7 +4207,7 @@ func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPt
 		}
 		finished := w.procFinished
 		w.mu.Unlock()
-		if !w.awaitInterruptibly(finished) {
+		if !w.awaitInterruptibly(m, finished) {
 			return -_wasiEINTR
 		}
 	}
@@ -4188,7 +4218,7 @@ func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPt
 // returns EINTR. An event that has already happened is never reported as
 // interrupted. A wait that a signal ended for another blocking call of the
 // guest (endBlocking) goes on.
-func (w *WasiStubs) awaitInterruptibly(done <-chan struct{}) bool {
+func (w *WasiStubs) awaitInterruptibly(m *Module, done <-chan struct{}) bool {
 	for {
 		select {
 		case <-done:
@@ -4196,7 +4226,7 @@ func (w *WasiStubs) awaitInterruptibly(done <-chan struct{}) bool {
 		default:
 		}
 		posted := make(chan struct{})
-		key, ok := w.beginBlocking(func() { close(posted) })
+		key, ok := w.beginBlocking(m, func() { close(posted) })
 		if !ok {
 			select {
 			case <-done:
@@ -4279,14 +4309,14 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	// -1 first: it is no process group, even where the group's id is 1.
 	switch pid {
 	case -1:
-		rc, _ := w.killGroup(sig, 0, false)
+		rc, _ := w.killGroup(m, sig, 0, false)
 		return rc
 	case 0:
-		rc, _ := w.killGroup(sig, own, true)
+		rc, _ := w.killGroup(m, sig, own, true)
 		return rc
 	}
 	if pid < -1 {
-		if rc, found := w.killGroup(sig, -pid, -pid == own); found {
+		if rc, found := w.killGroup(m, sig, -pid, -pid == own); found {
 			return rc
 		}
 		if _, ours := pids.find(-pid); ours {
@@ -4296,7 +4326,7 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 	}
 	if pid == ids.PID {
 		// The guest's own pid is always the guest itself.
-		w.raiseOwn(sig)
+		w.raiseOwn(m, sig, false)
 		return _wasiESUCCESS
 	}
 	proc, ours := pids.find(pid)
@@ -4315,10 +4345,11 @@ func (w *WasiStubs) Proc_kill(m *Module, pid, sig int32) int32 {
 
 // killGroup signals the processes of the family's process group pgid, or,
 // for pgid 0, every process of the fork family, but the guest itself, and
-// with self the guest too, last (groupMembers). It returns 0 when one was
-// signalled, and otherwise the error of the last one, ESRCH when there is
-// none, and whether the group has a process.
-func (w *WasiStubs) killGroup(sig, pgid int32, self bool) (int32, bool) {
+// with self the guest too, last, from its thread whose module m is
+// (groupMembers). It returns 0 when one was signalled, and otherwise the
+// error of the last one, ESRCH when there is none, and whether the group has
+// a process.
+func (w *WasiStubs) killGroup(m *Module, sig, pgid int32, self bool) (int32, bool) {
 	w.mu.Lock()
 	pids := w.pidsLocked()
 	w.mu.Unlock()
@@ -4336,7 +4367,7 @@ func (w *WasiStubs) killGroup(sig, pgid int32, self bool) (int32, bool) {
 		}
 	}
 	if self {
-		w.raiseOwn(sig)
+		w.raiseOwn(m, sig, false)
 		return _wasiESUCCESS, true
 	}
 	return rc, found
@@ -4787,7 +4818,7 @@ func (w *WasiStubs) sockGetaddrinfo(m *Module, nodePtr uint64, nodeLen int32, ou
 	if a, err := netip.ParseAddr(host); err == nil && !a.Unmap().Is4() {
 		return -_wasiEAFNOSUPPORT // IPv6 not supported by this import
 	}
-	found, errno := w.resolveHost(host, "ip4")
+	found, errno := w.resolveHost(m, host, "ip4")
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
@@ -5934,14 +5965,14 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	}
 	if host != nil {
 		// a socket of the host's, read as recv(2) reads it
-		n, _, errno := w.socketReceive("fd_read", op, host, bufs, 0)
+		n, _, errno := w.socketReceive(m, "fd_read", op, host, bufs, 0)
 		abi.putWord(nreadSlice, n)
 		return errno
 	}
 	n, errno, served := w.takeAhead("fd_read", op, bufs)
 	if !served {
 		if stream, blocks := op.readBlocks(src); blocks {
-			n, errno = w.readStream("fd_read", op, stream, bufs)
+			n, errno = w.readStream(m, "fd_read", op, stream, bufs)
 		} else {
 			n, errno = w.readVec("fd_read", src, bufs, op.regular)
 		}
@@ -6028,9 +6059,9 @@ func (w *WasiStubs) writeVec(call string, dst io.Writer, bufs [][]byte) (uint64,
 // why; one that transferred something reports the count, and the failure
 // meets the guest's next write. flags are those of the write to a stream
 // (wasiMsg...).
-func (w *WasiStubs) writeFd(call string, op *wasiOpen, dst io.Writer, bufs [][]byte, flags int32) (uint64, int32) {
+func (w *WasiStubs) writeFd(m *Module, call string, op *wasiOpen, dst io.Writer, bufs [][]byte, flags int32) (uint64, int32) {
 	if stream, blocks := op.writeBlocks(dst); blocks {
-		return w.writeStream(call, op, stream, bufs, flags)
+		return w.writeStream(m, call, op, stream, bufs, flags)
 	}
 	return w.writeVec(call, dst, bufs)
 }
@@ -6044,13 +6075,14 @@ const (
 )
 
 // signalBrokenPipe returns errno, the outcome of a write or send with flags
-// (wasiMsg...). A write to a pipe or socket nobody reads from any more is
-// EPIPE, and the kernel sends the writer SIGPIPE as well unless the send
-// asked for none (wasiMsgNoSignal): the guest's own call raises it, as
-// raise(3) does.
-func (w *WasiStubs) signalBrokenPipe(errno, flags int32) int32 {
+// (wasiMsg...) by the thread whose module m is. A write to a pipe or socket
+// nobody reads from any more is EPIPE, and the kernel sends the writing
+// thread SIGPIPE as well unless the send asked for none (wasiMsgNoSignal):
+// the guest's own call raises it for the thread, as raise(3) does (Linux's
+// send_sig(SIGPIPE, current)).
+func (w *WasiStubs) signalBrokenPipe(m *Module, errno, flags int32) int32 {
 	if errno == _wasiEPIPE && flags&wasiMsgNoSignal == 0 {
-		w.raiseOwn(wasiSIGPIPE)
+		w.raiseOwn(m, wasiSIGPIPE, true)
 	}
 	return errno
 }
@@ -6062,15 +6094,15 @@ func (w *WasiStubs) signalBrokenPipe(errno, flags int32) int32 {
 // ends the wait, with EINTR when nothing was written yet and the count
 // otherwise. flags are those of the write (wasiMsg...): one that does not
 // wait is non-blocking whatever the descriptor says.
-func (w *WasiStubs) writeStream(call string, op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
-	n, errno := w.writeStreamOnce(call, op, dst, bufs, flags)
+func (w *WasiStubs) writeStream(m *Module, call string, op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
+	n, errno := w.writeStreamOnce(m, call, op, dst, bufs, flags)
 	if errno == _wasiEINTR {
 		// A signal interrupts a write that has to wait. What there is room
 		// for is written all the same, as write(2) takes it from a process
 		// with a signal pending — whether the signal was posted before the
 		// call or while it was on its way.
-		if n, errno := w.writeStreamOnce(call, op, dst, bufs, flags|wasiMsgDontWait); errno != _wasiEAGAIN {
-			w.keepInterrupt()
+		if n, errno := w.writeStreamOnce(m, call, op, dst, bufs, flags|wasiMsgDontWait); errno != _wasiEAGAIN {
+			w.keepInterrupt(m)
 			return n, errno
 		}
 	}
@@ -6079,7 +6111,7 @@ func (w *WasiStubs) writeStream(call string, op *wasiOpen, dst streamWriter, buf
 
 // writeStreamOnce is writeStream without the second look of an interrupted
 // write.
-func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
+func (w *WasiStubs) writeStreamOnce(m *Module, call string, op *wasiOpen, dst streamWriter, bufs [][]byte, flags int32) (uint64, int32) {
 	rc, err := dst.SyscallConn()
 	if err != nil {
 		return 0, w.guestErrno(call, err)
@@ -6095,7 +6127,7 @@ func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter,
 		default:
 			return 0, _wasiEAGAIN
 		}
-	} else if !w.awaitOutputTurn(op) {
+	} else if !w.awaitOutputTurn(m, op) {
 		return 0, _wasiEINTR
 	}
 	defer op.passOutputTurn()
@@ -6174,7 +6206,7 @@ func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter,
 			var wakeErr error
 			clearDeadline := func() error { return errors.Join(wakeErr, dst.SetWriteDeadline(time.Time{})) }
 			var refused bool
-			interrupted, woken, refused = w.blockingAttempt(
+			interrupted, woken, refused = w.blockingAttempt(m,
 				func() { wakeErr = dst.SetWriteDeadline(time.Now()) },
 				func() { w.reportError(call, clearDeadline()) }, write)
 			if refused {
@@ -6207,7 +6239,7 @@ func (w *WasiStubs) writeStreamOnce(call string, op *wasiOpen, dst streamWriter,
 		if interrupted {
 			// The write went through: the next call that waits reports
 			// the signal.
-			w.keepInterrupt()
+			w.keepInterrupt(m)
 		}
 		if waitErr != nil && failure == nil {
 			failure = waitErr
@@ -6505,16 +6537,16 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 		var n uint64
 		errno := _wasiESUCCESS
 		if firstBuffer(bufs) != nil {
-			n, errno = w.socketSend("fd_write", op, host, bufs, 0, nil, "")
+			n, errno = w.socketSend(m, "fd_write", op, host, bufs, 0, nil, "")
 		}
 		abi.putWord(nwrittenSlice, n)
-		return w.signalBrokenPipe(errno, 0)
+		return w.signalBrokenPipe(m, errno, 0)
 	}
 	if dst == nil {
 		abi.putWord(nwrittenSlice, 0)
 		if op.socket() {
 			// a write of a socket without a connection, as on linux
-			return w.signalBrokenPipe(_wasiEPIPE, 0)
+			return w.signalBrokenPipe(m, _wasiEPIPE, 0)
 		}
 		return _wasiEBADF
 	}
@@ -6522,9 +6554,9 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 		output.Lock()
 		defer output.Unlock()
 	}
-	n, errno := w.writeFd("fd_write", op, dst, bufs, 0)
+	n, errno := w.writeFd(m, "fd_write", op, dst, bufs, 0)
 	abi.putWord(nwrittenSlice, n)
-	return w.signalBrokenPipe(op.afterShutdown(errno, true), 0)
+	return w.signalBrokenPipe(m, op.afterShutdown(errno, true), 0)
 }
 
 // socketConn returns the entry of the socket fd and its connection, or
@@ -7057,7 +7089,7 @@ func (w *WasiStubs) openGuestPathMode(m *Module, dirflags int32, pathPtr uint64,
 	if pathSlice == nil || outSlice == nil {
 		return -_wasiEFAULT
 	}
-	fd, errno := w.pathOpenMode(string(pathSlice), dirflags, oflags, fsRightsBase, fdflags, unixFileMode(uint32(mode)))
+	fd, errno := w.pathOpenMode(m, string(pathSlice), dirflags, oflags, fsRightsBase, fdflags, unixFileMode(uint32(mode)))
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
@@ -7785,7 +7817,7 @@ func (w *WasiStubs) openGuestPath(m *Module, dirFd, dirflags int32, pathPtr, pat
 	if pathSlice == nil || outSlice == nil {
 		return _wasiEFAULT
 	}
-	fd, errno := w.pathOpen(string(pathSlice), dirflags, oflags, fsRightsBase, fdflags)
+	fd, errno := w.pathOpen(m, string(pathSlice), dirflags, oflags, fsRightsBase, fdflags)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
@@ -7805,8 +7837,8 @@ const (
 // pathOpen is the layout-independent body of path_open: it resolves and
 // opens rel, registers the fd, and returns it. Callers own reading the
 // path and writing the opened fd at their ABI's pointer width.
-func (w *WasiStubs) pathOpen(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32) (int32, int32) {
-	return w.pathOpenMode(rel, dirflags, oflags, fsRightsBase, fdflags, wasiDefaultFileMode)
+func (w *WasiStubs) pathOpen(m *Module, rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32) (int32, int32) {
+	return w.pathOpenMode(m, rel, dirflags, oflags, fsRightsBase, fdflags, wasiDefaultFileMode)
 }
 
 // ownDescriptorPath tells what rel, a name guestName gave, names of the
@@ -8471,7 +8503,7 @@ func (w *WasiStubs) ownDescriptorsLocked() []int32 {
 
 // pathOpenMode is pathOpen with the mode of open(2): a file the call
 // creates gets mode, less the instance's umask.
-func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
+func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
 	// Decode rights into access mode. WASI rights bits: 0=FD_DATASYNC,
 	// 1=FD_READ, 6=FD_WRITE. We treat absent rights as the closest fit:
 	// without FD_WRITE the open is one for reading.
@@ -8590,7 +8622,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	case isFIFO && flag&os.O_RDWR == 0:
 		// An open of one end waits for the other.
 		var errno int32
-		if f, errno = w.openFIFO(fsys, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
+		if f, errno = w.openFIFO(m, fsys, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
 	case flag&os.O_CREATE != 0:
@@ -9417,7 +9449,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		wait(nil)
 	}
 	for waits {
-		interrupted, woken, refused := w.blockingAttempt(func() {
+		interrupted, woken, refused := w.blockingAttempt(m, func() {
 			if wk != nil {
 				wakeErr = errors.Join(wakeErr, hostWakeWrite(wk.w))
 			}
@@ -9593,9 +9625,11 @@ func (w *WasiStubs) Proc_exit64(m *Module, code int64) {
 // Proc_raise backs raise() for the guest itself; no signal reaches the host
 // process. sig is a WASI signal (__wasi_signal_t, 0..30), which is turned
 // into the guest's number for it (Linux numbering, see guestSignalOfWASI),
-// the numbering of every other signal call. The signal is posted to the
-// guest, which takes it at its next safe point; signal 0 does nothing. A
-// guest that has registered no flag word (Proc_signal_register) cannot take
+// the numbering of every other signal call. The signal is raised for the
+// calling thread of the guest, which takes it at its next safe point (a
+// thread that has not registered gets it as a signal of the process); signal
+// 0 does nothing. A guest that has registered no flag word
+// (Proc_signal_register) cannot take
 // a signal: the signal has its default action, which is to do nothing for
 // the signals of wasiDefaultIgnoredSignals (the ones ignored by default and
 // the ones that stop a process, which cannot stop an instance) and to end
@@ -9606,23 +9640,31 @@ func (w *WasiStubs) Proc_raise(m *Module, sig int32) int32 {
 	if sig < 0 || sig > 30 {
 		return _wasiEINVAL
 	}
-	w.raiseOwn(guestSignalOfWASI(sig))
+	w.raiseOwn(m, guestSignalOfWASI(sig), true)
 	return _wasiESUCCESS
 }
 
 // raiseOwn posts sig, the guest's number for a signal, to the guest itself
-// as Proc_raise does: what the guest's own code posts is left for the guest
+// from its thread whose module m is: raised for that thread as Proc_raise
+// does when thread is true, posted to the process as kill(2) of its own pid
+// does otherwise. What the guest's own code posts is left for the guest
 // (postForGuestLocked), and a guest that has registered no flag word has the
 // signal's default action.
-func (w *WasiStubs) raiseOwn(sig int32) {
+func (w *WasiStubs) raiseOwn(m *Module, sig int32, thread bool) {
 	if sig == wasiSIGKILL {
 		// It ends the guest at once, every thread of it.
 		w.terminate(sig)
 	}
-	w.sig.mu.Lock()
-	registered := w.sig.flagModule != nil
+	t := w.lockSignalThread(m)
+	registered := w.sig.registeredLocked()
 	if registered {
-		w.postForGuestLocked(func() { w.postSignalLocked(sig) })
+		w.postForGuestLocked(t, func() {
+			if thread {
+				w.raiseLocked(t, sig)
+			} else {
+				w.postSignalLocked(sig)
+			}
+		})
 	}
 	w.unlockSignals()
 	if registered || sig == 0 || wasiSignalBit(sig)&wasiDefaultIgnoredSignals != 0 {
@@ -9695,7 +9737,7 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 		// A socket of the host's connects as sock_connect_addr connects
 		// it, to the IPv4 address.
 		a := wasiSockAddr{family: wasiSockFamilyIPv4, ip: net.IPv4(byte(u), byte(u>>8), byte(u>>16), byte(u>>24)).To4(), port: int(uint16(port))}
-		return -w.connectSocket("sock_connect", op, host, a, "")
+		return -w.connectSocket(m, "sock_connect", op, host, a, "")
 	}
 	ip := fmt.Sprintf("%d.%d.%d.%d", u&0xff, (u>>8)&0xff, (u>>16)&0xff, (u>>24)&0xff)
 	op, conn, errno := w.socketConn(fd)
@@ -9709,7 +9751,7 @@ func (w *WasiStubs) Sock_connect(m *Module, fd, ipBE, port int32) int32 {
 	if !w.dialAllowed("tcp", ip, p) {
 		return -_wasiEACCES
 	}
-	conn, errno = w.dialInterruptibly("sock_connect", "tcp", net.JoinHostPort(ip, strconv.Itoa(p)))
+	conn, errno = w.dialInterruptibly(m, "sock_connect", "tcp", net.JoinHostPort(ip, strconv.Itoa(p)))
 	if conn == nil {
 		return -errno
 	}
@@ -9738,7 +9780,7 @@ func (w *WasiStubs) Sock_connect64(m *Module, fd, ipBE, port int32) int32 {
 // host whose sockets the runtime does not make (Sock_connect): a signal
 // posted to the guest meanwhile cancels the dial (EINTR). It returns the
 // connection, or nil and an errno. call is the import's name.
-func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, int32) {
+func (w *WasiStubs) dialInterruptibly(m *Module, call, network, address string) (net.Conn, int32) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var conn net.Conn
@@ -9751,7 +9793,7 @@ func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, 
 			w.reportError(call, conn.Close())
 		}
 	}()
-	interrupted, _, refused := w.blockingAttempt(cancel, nil, func(<-chan struct{}) {
+	interrupted, _, refused := w.blockingAttempt(m, cancel, nil, func(<-chan struct{}) {
 		conn, err = (&net.Dialer{}).DialContext(ctx, network, address)
 	})
 	ended = true
@@ -9765,7 +9807,7 @@ func (w *WasiStubs) dialInterruptibly(call, network, address string) (net.Conn, 
 	case interrupted:
 		// The dial went through: the next call that waits reports the
 		// signal.
-		w.keepInterrupt()
+		w.keepInterrupt(m)
 	}
 	return conn, _wasiESUCCESS
 }
@@ -9792,7 +9834,7 @@ func (w *WasiStubs) sockAccept(m *Module, fd, flags int32, fdOutPtr uint64) int3
 	}
 	if op, host, errno := w.socketOf(fd); errno == _wasiESUCCESS && host != nil {
 		// a socket of the host's, which accept(2) takes a connection of
-		newFD, errno := w.acceptSocket(op, host, flags)
+		newFD, errno := w.acceptSocket(m, op, host, flags)
 		if errno == _wasiESUCCESS {
 			binary.LittleEndian.PutUint32(out, uint32(newFD))
 		}
@@ -9847,7 +9889,7 @@ func (w *WasiStubs) sockRecv(m *Module, abi wasiABI, fd int32, riData, riDataLen
 		if !ok || lenOut == nil || flagsOut == nil {
 			return _wasiEFAULT
 		}
-		n, truncated, errno := w.socketReceive("sock_recv", op, host, bufs, riFlags)
+		n, truncated, errno := w.socketReceive(m, "sock_recv", op, host, bufs, riFlags)
 		if errno != _wasiESUCCESS {
 			return errno
 		}
@@ -9871,7 +9913,7 @@ func (w *WasiStubs) sockRecv(m *Module, abi wasiABI, fd int32, riData, riDataLen
 	}
 	n, errno, served := w.takeAhead("sock_recv", op, bufs)
 	if !served {
-		n, errno = w.readStream("sock_recv", op, conn, bufs)
+		n, errno = w.readStream(m, "sock_recv", op, conn, bufs)
 	}
 	if errno = op.afterShutdown(errno, false); errno != _wasiESUCCESS {
 		return errno
@@ -9902,9 +9944,9 @@ func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen
 		if !ok || lenOut == nil {
 			return _wasiEFAULT
 		}
-		n, errno := w.socketSend("sock_send", op, host, bufs, siFlags, nil, "")
+		n, errno := w.socketSend(m, "sock_send", op, host, bufs, siFlags, nil, "")
 		if errno != _wasiESUCCESS {
-			return w.signalBrokenPipe(errno, siFlags)
+			return w.signalBrokenPipe(m, errno, siFlags)
 		}
 		abi.putWord(lenOut, n)
 		return _wasiESUCCESS
@@ -9915,7 +9957,7 @@ func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen
 	op, conn, errno := w.socketConn(fd)
 	if errno == _wasiENOTCONN {
 		// a send of a socket without a connection, as on linux
-		return w.signalBrokenPipe(_wasiEPIPE, siFlags)
+		return w.signalBrokenPipe(m, _wasiEPIPE, siFlags)
 	}
 	if conn == nil {
 		return errno
@@ -9924,9 +9966,9 @@ func (w *WasiStubs) sockSend(m *Module, abi wasiABI, fd int32, siData, siDataLen
 		return _wasiEFAULT
 	}
 	// The send writes the stream as fd_write does.
-	n, errno := w.writeFd("sock_send", op, conn, bufs, siFlags)
+	n, errno := w.writeFd(m, "sock_send", op, conn, bufs, siFlags)
 	if errno = op.afterShutdown(errno, true); errno != _wasiESUCCESS {
-		return w.signalBrokenPipe(errno, siFlags)
+		return w.signalBrokenPipe(m, errno, siFlags)
 	}
 	abi.putWord(lenOut, n)
 	return _wasiESUCCESS
@@ -10375,7 +10417,7 @@ func (w *WasiStubs) destination(op *wasiOpen, a wasiSockAddr, path string) (stri
 // it reports expired. A host socket closed meanwhile is EBADF. Returns the
 // errno of the attempt that did not have to wait. call is the import's
 // name.
-func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want int, nonblocking bool, expired int32, attempt func(fd int) (again bool, err error)) int32 {
+func (w *WasiStubs) socketWait(m *Module, call string, op *wasiOpen, host *os.File, want int, nonblocking bool, expired int32, attempt func(fd int) (again bool, err error)) int32 {
 	waited := false
 	var until time.Time
 	for {
@@ -10405,7 +10447,7 @@ func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want in
 			waited = true
 		}
 		set := []hostWaitFD{{stream: host, want: want, op: op}}
-		interrupted, err := w.waitHostInterruptibly(call, set, until)
+		interrupted, err := w.waitHostInterruptibly(m, call, set, until)
 		if err != nil {
 			return w.guestErrno(call, err)
 		}
@@ -10442,7 +10484,7 @@ func (op *wasiOpen) receiveAhead(bufs [][]byte, peek bool) uint64 {
 // (wasiMsg...). A receive that waits for more and is ended by a signal
 // after receiving something reports what it received. The NetAccess
 // policy is asked first ("recv"). call is the import's name.
-func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs [][]byte, flags int32) (n uint64, truncated bool, errno int32) {
+func (w *WasiStubs) socketReceive(m *Module, call string, op *wasiOpen, host *os.File, bufs [][]byte, flags int32) (n uint64, truncated bool, errno int32) {
 	if !w.checkNet("recv") {
 		return 0, false, _wasiEACCES
 	}
@@ -10459,7 +10501,7 @@ func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs
 		return uint64(got), false, _wasiESUCCESS
 	}
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
-	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
+	errno = w.socketWait(m, call, op, host, hostWantInput, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		start := got
 		if peek {
 			start = 0
@@ -10480,7 +10522,7 @@ func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs
 	})
 	if got > 0 && errno != _wasiESUCCESS {
 		if errno == _wasiEINTR {
-			w.keepInterrupt()
+			w.keepInterrupt(m)
 		}
 		errno = _wasiESUCCESS
 	}
@@ -10494,7 +10536,7 @@ func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs
 // one. A send that is ended by a signal after sending something reports
 // what it sent. The NetAccess policy is asked first
 // ("send"). call is the import's name.
-func (w *WasiStubs) socketSend(call string, op *wasiOpen, host *os.File, bufs [][]byte, flags int32, to *wasiSockAddr, hostPath string) (uint64, int32) {
+func (w *WasiStubs) socketSend(m *Module, call string, op *wasiOpen, host *os.File, bufs [][]byte, flags int32, to *wasiSockAddr, hostPath string) (uint64, int32) {
 	if !w.checkNet("send") {
 		return 0, _wasiEACCES
 	}
@@ -10507,7 +10549,7 @@ func (w *WasiStubs) socketSend(call string, op *wasiOpen, host *os.File, bufs []
 	// a send does not wait, where Linux would.
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0 || op.family == wasiSockFamilyUnix && op.dgram && to != nil
 	sent := 0
-	errno := w.socketWait(call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
+	errno := w.socketWait(m, call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		k, again, err := hostSend(fd, leadingFrom(bufs, sent), to, hostPath)
 		if err != nil || again {
 			return again, err
@@ -10518,7 +10560,7 @@ func (w *WasiStubs) socketSend(call string, op *wasiOpen, host *os.File, bufs []
 	})
 	if sent > 0 && errno != _wasiESUCCESS {
 		if errno == _wasiEINTR {
-			w.keepInterrupt()
+			w.keepInterrupt(m)
 		}
 		errno = _wasiESUCCESS
 	}
@@ -10667,12 +10709,12 @@ func (w *WasiStubs) Sock_listen64(m *Module, fd, backlog int32) int32 {
 // a blocking one waits in poll(2) for one (socketWait). accept(2) of a
 // socket that does not listen fails at once, with the host's errno. The NetAccess policy is asked first ("accept"). Returns
 // the new fd and an errno.
-func (w *WasiStubs) acceptSocket(op *wasiOpen, host *os.File, fdflags int32) (int32, int32) {
+func (w *WasiStubs) acceptSocket(m *Module, op *wasiOpen, host *os.File, fdflags int32) (int32, int32) {
 	if !w.checkNet("accept") {
 		return 0, _wasiEACCES
 	}
 	conn := -1
-	errno := w.socketWait("sock_accept", op, host, hostWantInput, op.nonblocking(), _wasiEAGAIN, func(fd int) (bool, error) {
+	errno := w.socketWait(m, "sock_accept", op, host, hostWantInput, op.nonblocking(), _wasiEAGAIN, func(fd int) (bool, error) {
 		var again bool
 		var err error
 		conn, again, err = hostAccept(fd)
@@ -10737,13 +10779,13 @@ func (w *WasiStubs) sockConnectAddr(m *Module, fd int32, addrPtr, pathPtr uint64
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
-	return -w.connectSocket("sock_connect_addr", op, host, a, path)
+	return -w.connectSocket(m, "sock_connect_addr", op, host, a, path)
 }
 
 // connectSocket connects the socket op, whose host socket is host, to the
 // address a (see Sock_connect_addr). call is the import's name. It reports
 // an errno.
-func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wasiSockAddr, path string) int32 {
+func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os.File, a wasiSockAddr, path string) int32 {
 	hostPath := ""
 	if a.family == 0 {
 		if op.dgram {
@@ -10774,7 +10816,7 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 	if !underWay || op.nonblocking() {
 		return w.guestErrno(call, started)
 	}
-	if errno := w.socketWait(call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
+	if errno := w.socketWait(m, call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
 		return errno
 	}
 	// The host takes the socket for connected, and refuses a later connect
@@ -10895,9 +10937,9 @@ func (w *WasiStubs) sockSendtoAddr(m *Module, fd int32, bufPtr uint64, bufLen, f
 		}
 		to = &a
 	}
-	n, errno := w.socketSend("sock_sendto_addr", op, host, [][]byte{buf}, flags&wasiMsgDontWait, to, hostPath)
+	n, errno := w.socketSend(m, "sock_sendto_addr", op, host, [][]byte{buf}, flags&wasiMsgDontWait, to, hostPath)
 	binary.LittleEndian.PutUint32(out, uint32(n))
-	return -w.signalBrokenPipe(errno, flags)
+	return -w.signalBrokenPipe(m, errno, flags)
 }
 
 // Sock_recvfrom_addr is a NON-STANDARD host import (module
@@ -10935,7 +10977,7 @@ func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen,
 	if addrPtr == 0 || !op.dgram {
 		// A stream socket's sender is its peer, which recvfrom(2) names
 		// not (family 0).
-		n, _, errno := w.socketReceive("sock_recvfrom_addr", op, host, [][]byte{buf}, flags)
+		n, _, errno := w.socketReceive(m, "sock_recvfrom_addr", op, host, [][]byte{buf}, flags)
 		if errno != _wasiESUCCESS {
 			return -errno
 		}
@@ -10950,7 +10992,7 @@ func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen,
 	}
 	var from wasiSockAddr
 	n := 0
-	errno = w.socketWait("sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, _wasiEAGAIN, func(fd int) (bool, error) {
+	errno = w.socketWait(m, "sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, _wasiEAGAIN, func(fd int) (bool, error) {
 		var again bool
 		var err error
 		n, from, again, err = hostReceiveFrom(fd, buf, flags&wasiMsgPeek != 0)
@@ -11160,11 +11202,11 @@ func (w *WasiStubs) shutdownSocket(host *os.File, how int32) int32 {
 // meanwhile cancels the context and ends the call with EINTR, as WASIX's
 // resolve does (glibc's getaddrinfo() goes on instead). It reports an
 // errno (lookupErrno); call is the import's name.
-func (w *WasiStubs) lookupInterruptibly(call string, lookup func(ctx context.Context) error) int32 {
+func (w *WasiStubs) lookupInterruptibly(m *Module, call string, lookup func(ctx context.Context) error) int32 {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var err error
-	interrupted, _, refused := w.blockingAttempt(cancel, nil, func(<-chan struct{}) { err = lookup(ctx) })
+	interrupted, _, refused := w.blockingAttempt(m, cancel, nil, func(<-chan struct{}) { err = lookup(ctx) })
 	switch {
 	case refused, interrupted && err != nil:
 		return _wasiEINTR
@@ -11173,7 +11215,7 @@ func (w *WasiStubs) lookupInterruptibly(call string, lookup func(ctx context.Con
 	case interrupted:
 		// The lookup went through: the next call that waits reports the
 		// signal.
-		w.keepInterrupt()
+		w.keepInterrupt(m)
 	}
 	return _wasiESUCCESS
 }
@@ -11209,7 +11251,7 @@ func (w *WasiStubs) lookupErrno(call string, err error) int32 {
 // has is remembered under host, which the Dial policy is told of a connect
 // to it. It reports an errno: EACCES when the policy refuses, and the
 // lookup's.
-func (w *WasiStubs) resolveHost(host, network string) ([]netip.Addr, int32) {
+func (w *WasiStubs) resolveHost(m *Module, host, network string) ([]netip.Addr, int32) {
 	if a, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{a.Unmap()}, _wasiESUCCESS
 	}
@@ -11217,7 +11259,7 @@ func (w *WasiStubs) resolveHost(host, network string) ([]netip.Addr, int32) {
 		return nil, _wasiEACCES
 	}
 	var found []netip.Addr
-	if errno := w.lookupInterruptibly("sock_resolve", func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly(m, "sock_resolve", func(ctx context.Context) error {
 		var err error
 		found, err = net.DefaultResolver.LookupNetIP(ctx, network, host)
 		return err
@@ -11305,7 +11347,7 @@ func (w *WasiStubs) sockResolve(m *Module, nodePtr uint64, nodeLen, family int32
 	case wasiSockFamilyIPv6:
 		network = "ip6"
 	}
-	found, errno := w.resolveHost(string(node), network)
+	found, errno := w.resolveHost(m, string(node), network)
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
@@ -11369,7 +11411,7 @@ func (w *WasiStubs) sockReverseAddr(m *Module, addrPtr, bufPtr uint64, bufLen in
 		return -_wasiEACCES
 	}
 	var names []string
-	if errno := w.lookupInterruptibly("sock_reverse_addr", func(ctx context.Context) error {
+	if errno := w.lookupInterruptibly(m, "sock_reverse_addr", func(ctx context.Context) error {
 		var err error
 		names, err = net.DefaultResolver.LookupAddr(ctx, ip)
 		return err
@@ -11410,7 +11452,7 @@ func (w *WasiStubs) sockHostByName(m *Module, nodePtr uint64, nodeLen int32, buf
 		return -_wasiEFAULT
 	}
 	name := string(node)
-	found, errno := w.resolveHost(name, "ip4")
+	found, errno := w.resolveHost(m, name, "ip4")
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
@@ -14184,12 +14226,12 @@ func (o osFS) Mkfifo(name string, perm os.FileMode) error {
 // An open for reading of a FIFO of a filesystem of the host's is made
 // without opening the other end where the host can tell of the opens of
 // the FIFO (openFIFOWatched).
-func (w *WasiStubs) openFIFO(fsys FS, name string, fi os.FileInfo, flag int, perm os.FileMode) (File, int32) {
+func (w *WasiStubs) openFIFO(m *Module, fsys FS, name string, fi os.FileInfo, flag int, perm os.FileMode) (File, int32) {
 	openFile := fsys.OpenFile
 	switch fsys.(type) {
 	case osFS, rootFS:
 		if flag&os.O_WRONLY == 0 {
-			if f, errno, watched := w.openFIFOWatched(openFile, name, flag, perm); watched {
+			if f, errno, watched := w.openFIFOWatched(m, openFile, name, flag, perm); watched {
 				return f, errno
 			}
 		}
@@ -14216,7 +14258,7 @@ func (w *WasiStubs) openFIFO(fsys FS, name string, fi os.FileInfo, flag int, per
 			w.reportError("path_open", errors.Join(unblockErr, closeErr))
 		}
 	}()
-	opened := w.awaitInterruptibly(call.done)
+	opened := w.awaitInterruptibly(m, call.done)
 	awaited = true
 	if opened {
 		err := call.take()
@@ -14527,7 +14569,7 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 		}
 		return flock(how, stop)
 	}
-	interrupted, err := w.takeLock(how, op, wait != 0, stoppable, set, func() error { return flock(flockUnlock, nil) })
+	interrupted, err := w.takeLock(m, how, op, wait != 0, stoppable, set, func() error { return flock(flockUnlock, nil) })
 	if interrupted {
 		return -_wasiEINTR
 	}
@@ -14561,7 +14603,7 @@ func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
 // late grant is removed only when no other wait of the descriptor for that
 // lock is in progress and none has taken it: a lock a wait took counts as
 // held until the descriptor's next lock call (lockHeld).
-func (w *WasiStubs) takeLock(how int, op *wasiOpen, wait, stoppable bool, set func(wait bool, stop <-chan struct{}) error, unlock func() error) (interrupted bool, err error) {
+func (w *WasiStubs) takeLock(m *Module, how int, op *wasiOpen, wait, stoppable bool, set func(wait bool, stop <-chan struct{}) error, unlock func() error) (interrupted bool, err error) {
 	unlocks := how == flockUnlock
 	op.mu.Lock()
 	pending := op.lockPending
@@ -14570,7 +14612,7 @@ func (w *WasiStubs) takeLock(how int, op *wasiOpen, wait, stoppable bool, set fu
 		if !wait {
 			return false, syscall.EAGAIN
 		}
-		if !w.awaitInterruptibly(pending) {
+		if !w.awaitInterruptibly(m, pending) {
 			return true, nil
 		}
 	}
@@ -14625,7 +14667,7 @@ func (w *WasiStubs) takeLock(how int, op *wasiOpen, wait, stoppable bool, set fu
 		}
 	}()
 	go func() { call.finish(set(true, call.stop)) }()
-	if w.awaitInterruptibly(call.done) {
+	if w.awaitInterruptibly(m, call.done) {
 		taken = true
 		err := call.take()
 		if err == nil {
@@ -14797,7 +14839,7 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 	if cmd == recordLockGet {
 		return w.getRecordLock(rec, f, file, want)
 	}
-	return w.setRecordLock(fd, op, f, file, want, lk.typ == recordUnlock, cmd == recordLockWait)
+	return w.setRecordLock(m, fd, op, f, file, want, lk.typ == recordUnlock, cmd == recordLockWait)
 }
 
 // getRecordLock is fdLock's F_GETLK of want, a lock of the file of f whose
@@ -14839,7 +14881,7 @@ func (w *WasiStubs) getRecordLock(rec []byte, f *os.File, file *lockedFile, want
 // the host (waitHostRecordLock). The descriptor is looked at before each
 // try and after the lock is in the table (keepRecordLock), so that a lock
 // call that meets its close takes nothing (Linux's fcntl_setlk).
-func (w *WasiStubs) setRecordLock(fd int32, op *wasiOpen, f *os.File, file *lockedFile, want lockRow, unlocks, wait bool) int32 {
+func (w *WasiStubs) setRecordLock(m *Module, fd int32, op *wasiOpen, f *os.File, file *lockedFile, want lockRow, unlocks, wait bool) int32 {
 	// The failure of an open the call went on past (prepareHostLocked),
 	// reported once file.mu is let go: every return comes after.
 	var passed error
@@ -14873,7 +14915,7 @@ func (w *WasiStubs) setRecordLock(fd int32, op *wasiOpen, f *os.File, file *lock
 			}
 			changed := file.changedLocked()
 			file.mu.Unlock()
-			if !w.awaitInterruptibly(changed) {
+			if !w.awaitInterruptibly(m, changed) {
 				return -_wasiEINTR
 			}
 			continue
@@ -14903,7 +14945,7 @@ func (w *WasiStubs) setRecordLock(fd int32, op *wasiOpen, f *os.File, file *lock
 			file.mu.Unlock()
 			return -_wasiENOLCK
 		}
-		return w.waitHostRecordLock(fd, op, f, file, want)
+		return w.waitHostRecordLock(m, fd, op, f, file, want)
 	}
 }
 
@@ -14936,7 +14978,7 @@ func (w *WasiStubs) keepRecordLock(fd int32, op *wasiOpen, f *os.File, file *loc
 // the locks where there is one. The wait is in the table (waits) until
 // what it took is in the table or brought back to it. Caller holds
 // file.mu, which it lets go.
-func (w *WasiStubs) waitHostRecordLock(fd int32, op *wasiOpen, f *os.File, file *lockedFile, want lockRow) int32 {
+func (w *WasiStubs) waitHostRecordLock(m *Module, fd int32, op *wasiOpen, f *os.File, file *lockedFile, want lockRow) int32 {
 	waitFD, err := file.waitDescriptorLocked()
 	if err != nil {
 		file.mu.Unlock()
@@ -14955,7 +14997,7 @@ func (w *WasiStubs) waitHostRecordLock(fd int32, op *wasiOpen, f *os.File, file 
 	}()
 	lk := want.hostLock()
 	go func() { call.finish(hostWaitRecordLock(waitFD, f, &lk)) }()
-	if !w.awaitInterruptibly(call.done) {
+	if !w.awaitInterruptibly(m, call.done) {
 		return -_wasiEINTR
 	}
 	taken = true
@@ -16282,10 +16324,11 @@ func cpuTimeClock(id int32) bool {
 // A guest cannot be interrupted: it is ordinary code on a goroutine. A
 // signal is therefore delivered the way an interpreter with deferred signal
 // handling takes one from its own C-level handler: the host records the
-// signal and raises a flag word in the guest's memory, the guest notices the
-// flag at its next safe point and takes the recorded signals
-// (Proc_signal_take), and a blocking host call the guest is waiting in ends
-// early with EINTR so that the safe point comes.
+// signal and raises a flag word in the guest's memory — the one the thread
+// the signal is delivered to registered — the thread notices the flag at its
+// next safe point and takes the recorded signals (Proc_signal_take), and a
+// blocking host call the thread is waiting in ends early with EINTR so that
+// the safe point comes.
 //
 // What a signal does — run a handler, be ignored, end the process — is the
 // guest's business: it owns the dispositions and tells the host about them
@@ -16309,7 +16352,8 @@ type Signals interface {
 	Kill(pid, sig int32) error
 	// Dispositions is told the guest's dispositions whenever they change:
 	// the signals it handles, the ones it ignores explicitly and the ones
-	// it blocks (signal n is bit n-1). target is the instance whose guest
+	// it blocks — every thread of it that registered for signals blocks
+	// them (signal n is bit n-1). target is the instance whose guest
 	// reported them, the one a signal for that guest is posted to: a
 	// forked instance has the same Signals as its parent (Fork). The
 	// reports of an instance are made one at a time, in the order of the
@@ -16363,47 +16407,44 @@ func (w *WasiStubs) DeliverSignal(sig int32, reach SignalReach) {
 	}
 }
 
-// wasiSignals is the signal state of one instance. It is guarded by mu, apart
-// from what is said otherwise. Nothing that runs code of others — the wakes of
-// blocking calls, the interrupt of code outside the guest — nor a write to the
-// guest's memory is done with mu held: what a change under mu leaves to do is
-// kept in due and done once mu is let go (unlockSignals).
+// wasiSignals is the signal state of one instance: the process's, and each
+// thread's of the guest (wasiSignalThread), as POSIX divides them — the
+// dispositions are the process's, the mask is a thread's. A signal posted to
+// the process waits for it until a thread takes it, and is delivered to one
+// of the threads that have registered and do not block it (targetLocked);
+// while every thread blocks it, it waits until one unblocks it. A signal the
+// guest raises is its calling thread's.
+//
+// It is guarded by mu, apart from what is said otherwise. Nothing that runs
+// code of others — the wakes of blocking calls, the interrupts of code
+// outside the guest — nor a write to the guest's memory is done with mu
+// held: what a change under mu leaves to do is kept in due and done once mu
+// is let go (unlockSignals).
 type wasiSignals struct {
 	mu sync.Mutex
-	// flagMu is held while the flag word is written (raiseSignalFlag), so
-	// that once the registration is gone (detachSignals) nothing writes to
-	// the guest's memory any more.
+	// flagMu is held while a flag word is written (raiseSignalFlag), so
+	// that once delivery has ended (detachSignals) nothing writes to the
+	// guest's memory any more.
 	flagMu sync.Mutex
-	// flagModule and flagAddr locate the guest's flag word, once the guest
-	// has registered it (Proc_signal_register). Until then there is no one
-	// to deliver a signal to, and PostSignal drops what it is given. The
-	// address is a guest address at full width, which a memory64 guest's
-	// may need; the flag word itself is a 32-bit int, which the host stores
-	// atomically. They are written with flagMu and mu held, and read with
-	// either.
-	flagModule *Module
-	flagAddr   uint64
-	// handled, ignored and blocked are the dispositions the guest reported:
-	// the signals it has a handler for, the ones it ignores explicitly
-	// (SIG_IGN), and its signal mask. A signal in neither of the first two
-	// has its default action; see discards.
-	handled, ignored, blocked uint64
-	// pending holds the posted signals the guest has not taken yet.
+	// handled and ignored are the dispositions the guest reported: the
+	// signals it has a handler for and the ones it ignores explicitly
+	// (SIG_IGN). A signal in neither has its default action; see discards.
+	handled, ignored uint64
+	// pending holds the signals posted to the process that no thread has
+	// taken yet.
 	pending uint64
-	// interrupt records that a signal was posted and no blocking call has
-	// reported it yet: the next one (or the one in progress) ends with
-	// EINTR, once — as a system call does for one delivered signal.
-	interrupt bool
-	// wakes are the blocking calls in progress, whose wakes end them early:
-	// the threads of the guest share the instance and may each be waiting.
-	// beginBlocking adds one, endBlocking removes its own, and PostSignal
-	// removes them all and calls their wakes (takeWakes).
-	wakes map[*wasiBlocking]bool
-	// outside interrupts the code outside the guest that the guest is
-	// running at the moment, if any (SetOutsideInterrupt): the host learns
-	// of such code only from the one who runs it, and only that one knows
-	// how to interrupt it.
-	outside *wasiOutside
+	// threads are the threads of the guest the host has seen, in the order
+	// it saw them, and byModule finds one by its module: wasi-threads runs
+	// each thread on a module instance of its own, so the module of a host
+	// call names the thread that made it (threadLocked).
+	threads  []*wasiSignalThread
+	byModule map[*Module]*wasiSignalThread
+	// agentEnds has the runtime tell agentEnded of each thread of the guest
+	// that ends (lockSignalThread).
+	agentEnds sync.Once
+	// quiet is the thread whose own host call posts what is posted at the
+	// moment (postForGuestLocked): it runs no code outside the guest then.
+	quiet *wasiSignalThread
 	// due is what the changes made under mu leave to do once it is let go.
 	due wasiSignalsDue
 	// timer is the running real-time interval timer (setitimer's
@@ -16425,6 +16466,38 @@ type wasiSignals struct {
 	execed *execedCommand
 }
 
+// wasiSignalThread is the signal state of one thread of the guest.
+type wasiSignalThread struct {
+	// module is the thread's module. It is nil for the registration a
+	// forked instance inherited (forkInto) until the first thread of its
+	// guest calls the host (threadLocked).
+	module *Module
+	// registered records that the thread has registered its flag word, at
+	// flagAddr (Proc_signal_register). The address is a guest address at
+	// full width, which a memory64 guest's may need; the flag word itself is
+	// a 32-bit int, which the host stores atomically.
+	registered bool
+	flagAddr   uint64
+	// blocked is the thread's signal mask, and pending holds the signals
+	// raised for the thread that it has not taken yet.
+	blocked, pending uint64
+	// interrupt records that a signal is waiting for the thread and no
+	// blocking call of its has reported it yet: the next one (or the one in
+	// progress) ends with EINTR, once — as a system call does for one
+	// delivered signal.
+	interrupt bool
+	// wakes are the thread's blocking calls in progress, whose wakes end
+	// them early. beginBlocking adds one, endBlocking removes its own, and a
+	// signal for the thread removes them all and calls their wakes
+	// (takeWakes).
+	wakes map[*wasiBlocking]bool
+	// outside are the calls of code outside the guest that the thread is in
+	// (BeginOutside), the one it runs at the moment last: the host learns of
+	// such code only from the one who runs it, and only that one knows how
+	// to interrupt it.
+	outside []*OutsideCall
+}
+
 // wasiStop is an end of the instance that its threads unwind with.
 type wasiStop struct {
 	end wasiEnd
@@ -16439,6 +16512,8 @@ type wasiEnd interface {
 
 // wasiBlocking is a blocking call of the guest's in progress (beginBlocking).
 type wasiBlocking struct {
+	// thread is the thread that makes the call.
+	thread *wasiSignalThread
 	// wake ends the call's wait.
 	wake func()
 	// woken is made when a post takes the call out of the signal state to
@@ -16448,43 +16523,39 @@ type wasiBlocking struct {
 	woken chan struct{}
 }
 
-// wasiOutside is one registration of SetOutsideInterrupt.
-type wasiOutside struct {
-	interrupt func()
-	// calls counts the calls of interrupt in progress, and idle is made by
-	// the SetOutsideInterrupt that replaced the registration while there
-	// were some, to be closed by the last of them. Guarded by the signal
-	// state's mu.
-	calls int
-	idle  chan struct{}
-}
-
 // wasiSignalsDue is what changes of the signal state leave to do once its
 // lock is let go (unlockSignals).
 type wasiSignalsDue struct {
-	// raise holds the signals for which the flag word is to be raised; once
-	// it is, the ones of them still pending and not blocked interrupt the
-	// guest's blocking calls (wasiSignals.interrupt) — and, with wake, end
-	// the ones in progress, or else interrupt outside, when it is still the
-	// registration.
-	raise   uint64
-	wake    bool
-	outside *wasiOutside
+	// raises are the flag words to raise for signals posted for a thread.
+	raises []wasiRaise
 	// wakes are the blocking calls taken out to be woken.
 	wakes []*wasiBlocking
 	// stop records that the end of the instance was asked for
-	// (requestStopLocked): the flag word is raised, for a guest that
-	// computes to come to its safe point and end there; stopOutside, the
-	// registration in place then, whose call is counted already, is
-	// interrupted, for code outside the guest to return to it; and the
-	// waits of the guest's agents on its memory (stopAgents) of stopModule,
-	// a module of the guest when one is known, end.
+	// (requestStopLocked): the flag words of stopFlags are raised, for a
+	// guest that computes to come to its safe point and end there; the
+	// calls of code outside the guest of stopOutside, the ones the threads
+	// ran then, whose interrupts are counted already, are interrupted, for
+	// that code to return to the guest; and the waits of the guest's agents
+	// on its memory (stopAgents) of stopModule, a module of the guest when
+	// one is known, end.
 	stop        bool
-	stopOutside *wasiOutside
+	stopFlags   []*wasiSignalThread
+	stopOutside []*OutsideCall
 	stopModule  *Module
 	// alarm is the command the guest has become (Proc_exec), to be sent
 	// the interval timer's SIGALRM (fireDueTimerLocked).
 	alarm *os.Process
+}
+
+// wasiRaise is a flag word to raise for the signals of bits, posted for
+// thread. Once it is raised, the ones of them still waiting for the thread
+// interrupt it (wasiSignalThread.interrupt) and end its blocking calls in
+// progress, or else interrupt outside, its call of code outside the guest,
+// when the thread still runs it.
+type wasiRaise struct {
+	thread  *wasiSignalThread
+	bits    uint64
+	outside *OutsideCall
 }
 
 // discards returns the signals that have no effect on the guest: the ones it
@@ -16495,17 +16566,200 @@ func (s *wasiSignals) discards() uint64 {
 
 // unregisteredEnd returns the signal that ends a guest that has not
 // registered for signals, or 0: such a guest takes no signal, so a pending
-// signal whose default action ends a process has that action, by the host,
-// for a guest that is not a forked copy, which may yet register and handle
-// it.
-func (s *wasiSignals) unregisteredEnd(forked bool) int32 {
-	if s.flagModule != nil || forked {
+// signal whose default action ends a process has that action, by the host.
+// Caller holds s.mu.
+func (s *wasiSignals) unregisteredEnd() int32 {
+	if s.registeredLocked() {
 		return 0
 	}
 	if ending := s.pending &^ wasiDefaultIgnoredSignals; ending != 0 {
 		return int32(bits.TrailingZeros64(ending)) + 1
 	}
 	return 0
+}
+
+// registeredLocked reports whether a thread of the guest has registered for
+// signals, or a forked instance inherited a registration (forkInto). Caller
+// holds s.mu.
+func (s *wasiSignals) registeredLocked() bool {
+	return slices.ContainsFunc(s.threads, (*wasiSignalThread).isRegistered)
+}
+
+func (t *wasiSignalThread) isRegistered() bool { return t.registered }
+
+// deliverable returns the signals waiting for t that it does not block: the
+// ones raised for it and the ones posted to the process. Caller holds s.mu.
+func (s *wasiSignals) deliverable(t *wasiSignalThread) uint64 {
+	return (s.pending | t.pending) &^ t.blocked
+}
+
+// threadLocked returns the signal state of the thread whose module m is. A
+// thread the host has not seen before is the copy of the thread that forked,
+// when the instance inherited a registration not bound to a thread yet
+// (forkInto): a forked instance starts with that thread alone, so its first
+// call of the host is that thread's. Otherwise the thread is new. Caller
+// holds s.mu.
+func (s *wasiSignals) threadLocked(m *Module) *wasiSignalThread {
+	if t := s.byModule[m]; t != nil {
+		return t
+	}
+	if s.byModule == nil {
+		s.byModule = map[*Module]*wasiSignalThread{}
+	}
+	if i := slices.IndexFunc(s.threads, func(t *wasiSignalThread) bool { return t.module == nil }); i >= 0 {
+		t := s.threads[i]
+		t.module = m
+		s.byModule[m] = t
+		if bits := s.deliverable(t); bits != 0 {
+			// Posted before the thread was known: its flag word is
+			// raised now.
+			s.announceLocked(t, bits)
+		}
+		return t
+	}
+	t := &wasiSignalThread{module: m}
+	s.threads = append(s.threads, t)
+	s.byModule[m] = t
+	return t
+}
+
+// lockSignalThread takes w.sig.mu and returns the signal state of the thread
+// whose module m is (threadLocked). The first time, it has the runtime tell
+// agentEnded of each thread of the guest that ends. The caller lets go of
+// w.sig.mu with unlockSignals.
+func (w *WasiStubs) lockSignalThread(m *Module) *wasiSignalThread {
+	w.sig.agentEnds.Do(func() { onAgentEnd(m, w.agentEnded) })
+	w.sig.mu.Lock()
+	return w.sig.threadLocked(m)
+}
+
+// agentEnded forgets the thread of the guest whose module m is, which has
+// ended: the signals raised for it go with it, and the ones posted to the
+// process that it would have taken go to another thread (retargetLocked),
+// as they do for a thread that exits in Linux (exit_signals). Its flag word
+// is not written from then on: a raise of it in progress is over first
+// (flagMu).
+func (w *WasiStubs) agentEnded(m *Module) {
+	s := &w.sig
+	s.flagMu.Lock()
+	s.mu.Lock()
+	if t := s.byModule[m]; t != nil {
+		delete(s.byModule, m)
+		s.threads = slices.DeleteFunc(s.threads, func(u *wasiSignalThread) bool { return u == t })
+		t.registered, t.module = false, nil
+		s.retargetLocked(s.pending &^ t.blocked)
+	}
+	s.flagMu.Unlock()
+	w.unlockSignals()
+}
+
+// forkInto gives child, the signal state of a copy that Fork makes, what a
+// forked process inherits (POSIX fork): the dispositions, and the
+// registration and mask of the thread whose module from is — the one that
+// forks, of which the copy's one thread is a copy — or, for a nil from or a
+// thread that has not registered, of the first thread that registered. The
+// copy's thread is not known yet (threadLocked). Nothing is pending for it.
+// Caller holds no lock of s; child is nobody else's yet.
+func (s *wasiSignals) forkInto(child *wasiSignals, from *Module) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	child.handled, child.ignored = s.handled, s.ignored
+	t := s.byModule[from]
+	if t == nil || !t.registered {
+		i := slices.IndexFunc(s.threads, (*wasiSignalThread).isRegistered)
+		if i < 0 {
+			return
+		}
+		t = s.threads[i]
+	}
+	child.threads = []*wasiSignalThread{{registered: true, flagAddr: t.flagAddr, blocked: t.blocked}}
+}
+
+// reportDispositions tells WASIConfig.Signals the dispositions of a forked
+// instance that inherited a registration (forkInto), with w as the target:
+// its guest has them without reporting them. Caller holds no lock of w.
+func (w *WasiStubs) reportDispositions() {
+	s := &w.sig
+	s.mu.Lock()
+	registered := s.registeredLocked()
+	handled, ignored := s.handled, s.ignored
+	var blocked uint64
+	if registered {
+		blocked = s.blockedByAllLocked(nil)
+	}
+	s.mu.Unlock()
+	if registered && w.cfg.Signals != nil {
+		w.cfg.Signals.Dispositions(w, handled, ignored, blocked)
+	}
+}
+
+// targetLocked returns the thread a signal of the process (its mask bit) is
+// delivered to: one that has registered and does not block it, prefer when
+// it is such a thread, else the first such thread in the order the host saw
+// them (Linux's complete_signal tries the suggested thread first as well).
+// nil is none: the signal waits for the process. Caller holds s.mu.
+func (s *wasiSignals) targetLocked(bit uint64, prefer *wasiSignalThread) *wasiSignalThread {
+	takes := func(t *wasiSignalThread) bool { return t.registered && t.blocked&bit == 0 }
+	if prefer != nil && takes(prefer) {
+		return prefer
+	}
+	if i := slices.IndexFunc(s.threads, takes); i >= 0 {
+		return s.threads[i]
+	}
+	return nil
+}
+
+// retargetLocked delivers the signals of bits that wait for the process to
+// the threads that take them, as Linux's retarget_shared_pending does when
+// the thread they were delivered to can take them no longer: it has blocked
+// them, or has ended. Caller holds s.mu.
+func (s *wasiSignals) retargetLocked(bits uint64) {
+	for bits != 0 {
+		bit := bits & -bits
+		bits &^= bit
+		if t := s.targetLocked(bit, nil); t != nil {
+			s.announceLocked(t, bit)
+		}
+	}
+}
+
+// announceLocked has the flag word of t raised for the signals of bits once
+// s.mu is let go, and t interrupted for the ones still waiting for it then:
+// its blocking calls end, or else its call of code outside the guest is
+// interrupted — unless the post is made by t's own host call
+// (postForGuestLocked). Caller holds s.mu.
+func (s *wasiSignals) announceLocked(t *wasiSignalThread, bits uint64) {
+	r := wasiRaise{thread: t, bits: bits}
+	if t != s.quiet {
+		r.outside = t.current()
+	}
+	s.due.raises = append(s.due.raises, r)
+}
+
+// current returns the call of code outside the guest that t runs at the
+// moment, or nil. Caller holds the signal state's mu.
+func (t *wasiSignalThread) current() *OutsideCall {
+	if n := len(t.outside); n > 0 {
+		return t.outside[n-1]
+	}
+	return nil
+}
+
+// blockedByAllLocked returns the signals that every thread that has
+// registered blocks: the ones the guest takes none of while they are blocked.
+// A guest with no registered thread has the mask of its thread t. Caller
+// holds s.mu.
+func (s *wasiSignals) blockedByAllLocked(t *wasiSignalThread) uint64 {
+	if !s.registeredLocked() {
+		return t.blocked
+	}
+	blocked := ^uint64(0)
+	for _, u := range s.threads {
+		if u.registered {
+			blocked &= u.blocked
+		}
+	}
+	return blocked
 }
 
 // reapsChildren reports whether the guest ignores SIGCHLD explicitly. As
@@ -16552,23 +16806,23 @@ const wasiDefaultIgnoredSignals = uint64(1)<<(wasiSIGCHLD-1) |
 // registered. Each thread of the guest ends at its next blocking call, at
 // the next of its calls that look (endUnregistered) or at its safe point
 // (its flag word is raised): a blocking call in progress ends at once, code
-// outside the guest is interrupted (SetOutsideInterrupt), and a wait of a
-// thread on the guest's memory ends. The instance is of no further use: each
-// call that looks unwinds with the same end.
+// outside the guest is interrupted (BeginOutside), and a wait of a thread on
+// the guest's memory ends. The instance is of no further use: each call that
+// looks unwinds with the same end.
 //
 // Another signal is dropped when the guest ignores it (explicitly or because
 // that is the signal's default action). Otherwise it is recorded for the
-// guest to take. Unless the guest has the signal blocked, its flag word is
-// raised, and the blocking call it is waiting in — or the next one it makes
-// before taking the signal — ends with EINTR.
+// guest to take, and delivered to one of the guest's threads that have
+// registered and do not block it: that thread's flag word is raised, and the
+// blocking call it is waiting in — or the next one it makes before taking
+// the signal — ends with EINTR. While every such thread blocks the signal,
+// it waits for one to unblock it.
 //
 // A guest that has not registered for signals takes none: a signal whose
 // default action ends a process ends it, at its next blocking call or at
 // the next of its calls that look (endUnregistered), and any other is
-// dropped. The host state of a forked instance (Fork) is the exception:
-// the guest it is for exists from the moment of the fork and registers as
-// soon as it runs, so a signal posted in between — a parent that kills its
-// child right after forking it — is kept for it.
+// dropped. A forked instance has registered when the instance it was forked
+// from had (Fork).
 //
 // Once delivery to the instance has ended (CloseAll, proc_exit,
 // proc_terminate), what is posted is dropped. Once the guest has become a
@@ -16596,13 +16850,11 @@ func (w *WasiStubs) postSignalLocked(sig int32) bool {
 		w.requestStopLocked(nil, &WasiSignalError{Signal: wasiSIGKILL})
 		return true
 	}
-	if s.flagModule == nil {
-		if w.forked || bit&wasiDefaultIgnoredSignals == 0 {
+	if !s.registeredLocked() {
+		if bit&wasiDefaultIgnoredSignals == 0 {
 			s.pending |= bit
-			if s.unregisteredEnd(w.forked) != 0 {
-				// The blocking calls end, and end the guest.
-				s.due.wakes = append(s.due.wakes, s.takeWakes()...)
-			}
+			// The blocking calls end, and end the guest.
+			s.due.wakes = append(s.due.wakes, s.takeAllWakes()...)
 		}
 		return true
 	}
@@ -16610,21 +16862,36 @@ func (w *WasiStubs) postSignalLocked(sig int32) bool {
 		return true
 	}
 	s.pending |= bit
-	if s.blocked&bit != 0 {
-		return true
+	if t := s.targetLocked(bit, s.quiet); t != nil {
+		s.announceLocked(t, bit)
 	}
-	// The flag is raised first: a blocking call that the signal interrupts
-	// ends with the flag up, for the guest to find the signal.
-	s.due.raise |= bit
-	s.due.wake = true
-	s.due.outside = s.outside
 	return true
 }
 
+// raiseLocked raises sig for the thread t, as raise(3) does (Proc_raise):
+// it waits for t alone, which is interrupted for it unless t blocks it. A
+// thread that has not registered takes no signal of its own: sig is posted
+// to the process then. Caller holds w.sig.mu.
+func (w *WasiStubs) raiseLocked(t *wasiSignalThread, sig int32) {
+	s := &w.sig
+	bit := wasiSignalBit(sig)
+	if !t.registered || bit == 0 || sig == wasiSIGKILL || s.detached {
+		w.postSignalLocked(sig)
+		return
+	}
+	if s.discards()&bit != 0 {
+		return
+	}
+	t.pending |= bit
+	if t.blocked&bit == 0 {
+		s.announceLocked(t, bit)
+	}
+}
+
 // unlockSignals lets go of w.sig.mu and does what the changes made under it
-// left to do (wasiSignalsDue): it raises the flag word, then interrupts the
-// guest for the signals still waiting for it, and calls the wakes of the
-// blocking calls taken out, or the interrupt of the code outside the guest.
+// left to do (wasiSignalsDue): it raises the flag words, then interrupts the
+// threads for the signals still waiting for them, and calls the wakes of the
+// blocking calls taken out, or the interrupts of the code outside the guest.
 func (w *WasiStubs) unlockSignals() {
 	s := &w.sig
 	due := s.due
@@ -16633,30 +16900,39 @@ func (w *WasiStubs) unlockSignals() {
 	if due.alarm != nil {
 		w.reportError("proc_itimer", signalHostProc(due.alarm, wasiSIGALRM))
 	}
-	outside := due.stopOutside
-	if due.raise != 0 || due.stop {
-		w.raiseSignalFlag()
+	// The flags are raised first: a blocking call that a signal interrupts
+	// ends with its thread's flag up, for the guest to find the signal.
+	for _, r := range due.raises {
+		w.raiseSignalFlag(r.thread)
+	}
+	for _, t := range due.stopFlags {
+		w.raiseSignalFlag(t)
 	}
 	if due.stop && due.stopModule != nil {
 		stopAgents(due.stopModule, s.stop.Load().end)
 	}
-	if due.raise != 0 {
+	outside := due.stopOutside
+	if len(due.raises) > 0 {
 		s.mu.Lock()
-		if !s.detached && s.pending&^s.blocked&due.raise != 0 {
-			s.interrupt = true
-			if due.wake && len(s.wakes) > 0 {
-				due.wakes = append(due.wakes, s.takeWakes()...)
-			} else if outside == nil && due.wake && due.outside != nil && due.outside == s.outside {
-				// The guest is in code outside it: the signal interrupts
-				// that code where it stands — a system call it is waiting
-				// in ends with EINTR — and is noticed when the code has
-				// returned, as a signal delivered while a process runs a
-				// library's code is. It has interrupted the call in
-				// progress: the guest's own blocking calls that follow do
+		for _, r := range due.raises {
+			t := r.thread
+			if s.detached || s.deliverable(t)&r.bits == 0 {
+				continue
+			}
+			t.interrupt = true
+			if len(t.wakes) > 0 {
+				due.wakes = append(due.wakes, t.takeWakes()...)
+			} else if c := r.outside; c != nil && c == t.current() && !slices.Contains(outside, c) {
+				// The thread is in code outside the guest: the signal
+				// interrupts that code where it stands — a system call it
+				// is waiting in ends with EINTR — and is noticed when the
+				// code has returned, as a signal delivered while a process
+				// runs a library's code is. It has interrupted the call in
+				// progress: the thread's own blocking calls that follow do
 				// not end by it.
-				s.interrupt = false
-				outside = due.outside
-				outside.calls++
+				t.interrupt = false
+				c.calls++
+				outside = append(outside, c)
 			}
 		}
 		s.mu.Unlock()
@@ -16665,111 +16941,149 @@ func (w *WasiStubs) unlockSignals() {
 		b.wake()
 		close(b.woken)
 	}
-	if outside == nil {
-		return
+	for _, c := range outside {
+		c.interrupt()
+		s.mu.Lock()
+		c.calls--
+		if c.calls == 0 && c.idle != nil {
+			close(c.idle)
+		}
+		s.mu.Unlock()
 	}
-	outside.interrupt()
-	s.mu.Lock()
-	outside.calls--
-	if outside.calls == 0 && outside.idle != nil {
-		close(outside.idle)
-	}
-	s.mu.Unlock()
 }
 
-// takeWakes removes the blocking calls in progress from the signal state and
-// returns them, for their wakes to be called once s.mu is let go. Caller
-// holds s.mu.
-func (s *wasiSignals) takeWakes() []*wasiBlocking {
-	taken := slices.Collect(maps.Keys(s.wakes))
-	clear(s.wakes)
+// takeWakes removes the blocking calls of t in progress from the signal state
+// and returns them, for their wakes to be called once the signal state's mu
+// is let go. Caller holds that mu.
+func (t *wasiSignalThread) takeWakes() []*wasiBlocking {
+	taken := slices.Collect(maps.Keys(t.wakes))
+	clear(t.wakes)
 	for _, b := range taken {
 		b.woken = make(chan struct{})
 	}
 	return taken
 }
 
-// SetOutsideInterrupt registers interrupt as what a signal posted for the
-// guest does while the guest runs code outside it: code the host runs for
-// the guest on its goroutine that has not returned yet — a native library
-// the guest called, say, which may be waiting in a system call. A signal
-// interrupts a process's system call wherever the process is; the guest's
-// own blocking calls are ended by the host, code outside the guest by
-// interrupt, which ends a system call that code is waiting in (or does
-// nothing when it is in none). PostSignal calls it, from another goroutine
-// and without a lock of the instance held, for each signal it posts that the
-// guest neither blocks nor discards while no blocking call of the guest's own
-// is waiting. It is also called, once, when the end of the instance is asked
-// for — SIGKILL, or proc_exit or an end by a signal on any thread of the
-// guest, so from one of the guest's own goroutines too — for the code to
-// return to the guest, which ends. It may call PostSignal, but not
-// SetOutsideInterrupt, which waits for it. nil registers nothing.
+// takeAllWakes is takeWakes of every thread. Caller holds s.mu.
+func (s *wasiSignals) takeAllWakes() []*wasiBlocking {
+	var taken []*wasiBlocking
+	for _, t := range s.threads {
+		taken = append(taken, t.takeWakes()...)
+	}
+	return taken
+}
+
+// OutsideCall is a call of code outside the guest that a thread of the guest
+// runs (BeginOutside).
+type OutsideCall struct {
+	w         *WasiStubs
+	thread    *wasiSignalThread
+	interrupt func()
+	// calls counts the calls of interrupt in progress, and idle is made by
+	// End while there are some, to be closed by the last of them. Guarded
+	// by the signal state's mu.
+	calls int
+	idle  chan struct{}
+}
+
+// BeginOutside is called by what runs code outside the guest for the thread
+// of the guest whose module m is, on that thread's goroutine, before the
+// code runs: a native library the guest called, say, which may wait in a
+// system call. A signal interrupts a process's system call wherever the
+// process is; the guest's own blocking calls are ended by the host, code
+// outside the guest by interrupt, which ends a system call that code is
+// waiting in (or does nothing when it is in none). interrupt is not nil.
 //
-// It returns what was registered before, for the caller to put back when
-// the code returns: such code can call back into the guest, which can run
-// code outside it again. Once SetOutsideInterrupt has returned, an
-// interrupt that was replaced is not called any more, and none of its calls
-// is still running.
-func (w *WasiStubs) SetOutsideInterrupt(interrupt func()) (previous func()) {
-	s := &w.sig
+// interrupt is called once for each signal delivered to the thread while it
+// runs the call and has no blocking call of the guest's own waiting: from
+// another goroutine, without a lock of the instance held. It may call
+// PostSignal and Pending, but not End, which waits for it. The signal is
+// noticed when the code has returned to the guest, and the thread's own
+// blocking calls that follow do not end by it. Calls nest — the code can call
+// back into the guest, which can run code outside it again — and it is the
+// thread's last call begun and not ended that is interrupted. The end of the
+// instance (PostSignal of SIGKILL, Proc_exit) interrupts the call too.
+//
+// Pending tells the code whether to wait at all: code that makes the wait
+// that interrupt ends first, then asks Pending, and then waits, loses no
+// signal in between, as pselect(2) loses none.
+func (w *WasiStubs) BeginOutside(m *Module, interrupt func()) *OutsideCall {
+	t := w.lockSignalThread(m)
+	defer w.unlockSignals()
+	c := &OutsideCall{w: w, thread: t, interrupt: interrupt}
+	t.outside = append(t.outside, c)
+	return c
+}
+
+// Pending reports whether a signal is waiting for the call's thread that the
+// thread does not block, or the end of the instance was asked for: the code
+// outside the guest is then to return to the guest instead of waiting. It
+// reports the state as it is when it is asked.
+func (c *OutsideCall) Pending() bool {
+	s := &c.w.sig
 	s.mu.Lock()
-	replaced := s.outside
-	s.outside = nil
-	if interrupt != nil {
-		s.outside = &wasiOutside{interrupt: interrupt}
-	}
-	if replaced == nil {
-		s.mu.Unlock()
-		return nil
-	}
+	defer s.mu.Unlock()
+	return s.deliverable(c.thread) != 0 || s.stop.Load() != nil
+}
+
+// End ends the call. Once it has returned, interrupt is not called any more,
+// and none of its calls is still running.
+func (c *OutsideCall) End() {
+	s := &c.w.sig
+	s.mu.Lock()
+	t := c.thread
+	t.outside = slices.DeleteFunc(t.outside, func(o *OutsideCall) bool { return o == c })
 	var idle chan struct{}
-	if replaced.calls > 0 {
+	if c.calls > 0 {
 		idle = make(chan struct{})
-		replaced.idle = idle
+		c.idle = idle
 	}
 	s.mu.Unlock()
 	if idle != nil {
 		<-idle
 	}
-	return replaced.interrupt
 }
 
-// raiseSignalFlag stores 1 in the guest's flag word, atomically: the guest
-// runs on another goroutine. It may be growing its memory, hence
-// accessMemory: the word is looked up in the guest's memory (memBytes) under
-// the lock growth takes. Nothing is stored once the registration is gone.
-// Caller does not hold w.sig.mu.
-func (w *WasiStubs) raiseSignalFlag() {
+// raiseSignalFlag stores 1 in the flag word of t, atomically: the guest runs
+// on another goroutine. It may be growing its memory, hence accessMemory:
+// the word is looked up in the guest's memory (memBytes) under the lock
+// growth takes. Nothing is stored for a thread that has not registered or
+// is not known yet, nor once delivery has ended. Caller does not hold
+// w.sig.mu.
+func (w *WasiStubs) raiseSignalFlag(t *wasiSignalThread) {
 	s := &w.sig
 	s.flagMu.Lock()
 	defer s.flagMu.Unlock()
-	flagModule, addr := s.flagModule, s.flagAddr
-	if flagModule == nil {
+	s.mu.Lock()
+	m, addr, raise := t.module, t.flagAddr, t.registered && t.module != nil && !s.detached
+	s.mu.Unlock()
+	if !raise {
 		return
 	}
-	accessMemory(flagModule, func([]byte) {
-		if b := w.memBytes(flagModule, addr, 4); b != nil {
+	accessMemory(m, func([]byte) {
+		if b := w.memBytes(m, addr, 4); b != nil {
 			atomic.StoreUint32((*uint32)(unsafe.Pointer(&b[0])), 1)
 		}
 	})
 }
 
-// beginBlocking is called by a host call that is about to block the guest.
-// It reports false when the call must not block at all because a posted
-// signal is waiting to be noticed: the call then returns EINTR. Otherwise
-// wake is registered for the call b: PostSignal calls it, once, from another
-// goroutine and without a lock of the instance held, to end the wait. Every
-// beginBlocking that returned true is followed by endBlocking with its b.
+// beginBlocking is called by a host call of the thread whose module m is that
+// is about to block the guest's thread. It reports false when the call must
+// not block at all because a signal is waiting for the thread to notice it:
+// the call then returns EINTR. Otherwise wake is registered for the call b: a
+// signal delivered to the thread calls it, once, from another goroutine and
+// without a lock of the instance held, to end the wait. Every beginBlocking
+// that returned true is followed by endBlocking with its b.
 //
 // A call of an instance that is to stop (requestStopLocked) does not block:
 // it ends the guest's thread (endIfStopped). A guest that has not registered
 // for signals would never take a signal: the call ends the guest instead
 // (unregisteredEnd).
-func (w *WasiStubs) beginBlocking(wake func()) (b *wasiBlocking, ok bool) {
+func (w *WasiStubs) beginBlocking(m *Module, wake func()) (b *wasiBlocking, ok bool) {
 	s := &w.sig
-	s.mu.Lock()
-	w.postDueTimerLocked()
-	if sig := s.unregisteredEnd(w.forked); sig != 0 {
+	t := w.lockSignalThread(m)
+	w.postDueTimerLocked(t)
+	if sig := s.unregisteredEnd(); sig != 0 {
 		w.unlockSignals()
 		w.terminate(sig)
 	}
@@ -16778,31 +17092,33 @@ func (w *WasiStubs) beginBlocking(wake func()) (b *wasiBlocking, ok bool) {
 		w.endIfStopped()
 	}
 	defer w.unlockSignals()
-	if s.interrupt {
-		s.interrupt = false
+	if t.interrupt {
+		t.interrupt = false
 		return nil, false
 	}
-	if s.wakes == nil {
-		s.wakes = map[*wasiBlocking]bool{}
+	if t.wakes == nil {
+		t.wakes = map[*wasiBlocking]bool{}
 	}
-	b = &wasiBlocking{wake: wake}
-	s.wakes[b] = true
+	b = &wasiBlocking{thread: t, wake: wake}
+	t.wakes[b] = true
 	return b, true
 }
 
 // endBlocking ends what beginBlocking started as b and reports whether a
-// signal was posted in between that this call is to report: a signal ends
-// one of the blocking calls in progress with EINTR. The others resume their
-// wait. It returns once a wake of b that was called has returned, and ends
-// the guest's thread instead when the instance is to stop.
+// signal was delivered to the thread in between that this call is to report:
+// a signal ends one of the thread's blocking calls in progress with EINTR.
+// The others resume their wait. It returns once a wake of b that was called
+// has returned, and ends the guest's thread instead when the instance is to
+// stop.
 func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 	s := &w.sig
 	s.mu.Lock()
-	delete(s.wakes, b)
-	w.postDueTimerLocked()
-	sig := s.unregisteredEnd(w.forked)
-	interrupted = s.interrupt
-	s.interrupt = false
+	t := b.thread
+	delete(t.wakes, b)
+	w.postDueTimerLocked(t)
+	sig := s.unregisteredEnd()
+	interrupted = t.interrupt
+	t.interrupt = false
 	woken := b.woken
 	w.unlockSignals()
 	if woken != nil {
@@ -16816,38 +17132,47 @@ func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 }
 
 // postDueTimerLocked posts the firing of the interval timer whose time has
-// come for the guest (postForGuestLocked), as a blocking call does when it
-// begins and when it ends, and has the guest interrupted by it before the
-// call goes on. Caller holds w.sig.mu, which it holds again on return.
-func (w *WasiStubs) postDueTimerLocked() {
-	w.postForGuestLocked(w.fireDueTimerLocked)
-	if w.sig.due.raise != 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil {
+// come for the guest, from the host call of the thread t
+// (postForGuestLocked), as a blocking call does when it begins and when it
+// ends, and has the guest interrupted by it before the call goes on. Caller
+// holds w.sig.mu, which it holds again on return.
+func (w *WasiStubs) postDueTimerLocked(t *wasiSignalThread) {
+	w.postForGuestLocked(t, w.fireDueTimerLocked)
+	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil {
 		w.unlockSignals()
 		w.sig.mu.Lock()
 	}
 }
 
-// keepInterrupt is called when a call that a signal had interrupted was
-// carried out after all, because it did not have to wait. The guest has not
-// noticed the signal yet, and nothing has told it: the next call that has
-// to wait is interrupted, as the one that was let through would have been.
-func (w *WasiStubs) keepInterrupt() {
-	w.sig.mu.Lock()
-	defer w.sig.mu.Unlock()
-	if w.sig.pending&^w.sig.blocked != 0 {
-		w.sig.interrupt = true
+// keepInterrupt is called when a call of the thread whose module m is that a
+// signal had interrupted was carried out after all, because it did not have
+// to wait. The thread has not noticed the signal yet, and nothing has told
+// it: its next call that has to wait is interrupted, as the one that was let
+// through would have been.
+func (w *WasiStubs) keepInterrupt(m *Module) {
+	t := w.lockSignalThread(m)
+	defer w.unlockSignals()
+	if w.sig.deliverable(t) != 0 {
+		t.interrupt = true
 	}
 }
 
 // Proc_signal_register is a NON-STANDARD host import (module
-// wasip1_posix_extension, name "proc_signal_register"). The guest names the
-// 32-bit word in its memory that the host sets to 1 whenever a signal is
-// waiting to be taken, with an atomic store: the word is aligned to 4 bytes,
-// and the guest reads it with an atomic load. A guest calls it whenever it
+// wasip1_posix_extension, name "proc_signal_register"). The calling thread of
+// the guest names the 32-bit word in its memory that the host sets to 1
+// whenever a signal is waiting for that thread to take it, with an atomic
+// store: the word is aligned to 4 bytes, and the guest reads it with an
+// atomic load (i32.atomic.load) and clears it with an atomic store
+// (i32.atomic.store) — a C program built with the atomics feature, whose C
+// atomics are plain loads and stores without it. Each thread registers a
+// word of its own, or the same word as others; the host stores into it until
+// the thread ends, so the word is to stay the thread's for as long as the
+// thread runs. A thread calls it whenever it
 // may be running in a module instance the host has not seen yet (a snapshot
 // or fork copy of the one that registered), so it is cheap: it returns 1
-// when this module and address are already registered, and 0 when the
-// registration is new — the guest then reports its dispositions, which the
+// when this module and address are already registered — a forked instance
+// has the registration of the thread that forked (Fork) — and 0 when the
+// registration is new: the guest then reports its dispositions, which the
 // host does not know either. A negative errno is EFAULT for a word outside
 // the guest's memory and EINVAL for one that is not aligned.
 func (w *WasiStubs) Proc_signal_register(m *Module, flagPtr int32) int32 {
@@ -16872,47 +17197,69 @@ func (w *WasiStubs) procSignalRegister(m *Module, flagPtr uint64) int32 {
 		return -_wasiEINVAL
 	}
 	s := &w.sig
+	// A raise of the word registered before that is in progress is over
+	// first (flagMu): none is made at the old address once this returns.
 	s.flagMu.Lock()
-	defer s.flagMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.flagModule == m && s.flagAddr == flagPtr {
+	t := w.lockSignalThread(m)
+	known := t.registered && t.flagAddr == flagPtr
+	if !known {
+		t.registered, t.flagAddr = true, flagPtr
+		if bits := s.deliverable(t); bits != 0 {
+			// Waiting for the process while no thread took it, or raised
+			// for this thread: the new word is raised for it.
+			w.postForGuestLocked(t, func() { s.announceLocked(t, bits) })
+		}
+	}
+	s.flagMu.Unlock()
+	w.unlockSignals()
+	if known {
 		return 1
 	}
-	s.flagModule, s.flagAddr = m, flagPtr
 	return 0
 }
 
 // Proc_signal_dispositions is a NON-STANDARD host import (name
 // "proc_signal_dispositions"). The guest reports, as signal masks, the
 // signals it has a handler for, the signals it ignores explicitly (SIG_IGN)
-// and the signals it has blocked, every time one of the three changes. A
-// pending signal that now has no effect is discarded, as sigaction(2) does.
+// and the signals the calling thread has blocked, every time one of the
+// three changes: the first two are the process's, the mask is the thread's.
+// A pending signal that now has no effect is discarded, as sigaction(2)
+// does; a pending one the thread no longer blocks is delivered to it, and
+// one it now blocks is delivered to another thread that takes it, if any.
 // SIGKILL and SIGSTOP are left out of all three: they can be neither caught
 // nor ignored nor blocked. Ignoring SIGCHLD also gives up the children that
 // have ended and were not waited for (see wasiSignals.reapsChildren). The
-// dispositions are then reported to WASIConfig.Signals, with w as the target.
-// Returns 0.
+// dispositions are then reported to WASIConfig.Signals, with w as the
+// target. Returns 0.
 func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocked int64) int32 {
 	w.endIfStopped()
 	w.dispositionsMu.Lock()
 	defer w.dispositionsMu.Unlock()
 	s := &w.sig
-	s.mu.Lock()
+	t := w.lockSignalThread(m)
 	uncatchable := wasiSignalBit(wasiSIGKILL) | wasiSignalBit(wasiSIGSTOP)
 	s.handled = uint64(handled) &^ uncatchable
 	s.ignored = uint64(ignored) &^ uncatchable
-	s.blocked = uint64(blocked) &^ uncatchable
-	s.pending &^= s.discards()
-	if s.flagModule != nil && s.pending&^s.blocked != 0 {
-		// Deliverable now: unblocked while pending, or posted to a forked
-		// guest before it had registered.
-		s.due.raise |= s.pending &^ s.blocked
-	} else {
-		// Nothing deliverable is pending: no blocking call ends for it.
-		s.interrupt = false
+	newlyBlocked := uint64(blocked) &^ uncatchable &^ t.blocked
+	t.blocked = uint64(blocked) &^ uncatchable
+	discards := s.discards()
+	s.pending &^= discards
+	for _, u := range s.threads {
+		u.pending &^= discards
 	}
-	handledNow, ignoredNow, blockedNow := s.handled, s.ignored, s.blocked
+	w.postForGuestLocked(t, func() {
+		if bits := s.deliverable(t); t.registered && bits != 0 {
+			// Deliverable now: unblocked while pending, or posted to a
+			// forked guest before its thread was known.
+			s.announceLocked(t, bits)
+		} else {
+			// Nothing deliverable is waiting for the thread: no blocking
+			// call of its ends for it.
+			t.interrupt = false
+		}
+		s.retargetLocked(s.pending & newlyBlocked)
+	})
+	handledNow, ignoredNow, blockedNow := s.handled, s.ignored, s.blockedByAllLocked(t)
 	w.unlockSignals()
 	if s.reapsChildren() {
 		w.mu.Lock()
@@ -16931,9 +17278,12 @@ func (w *WasiStubs) Proc_signal_dispositions64(m *Module, handled, ignored, bloc
 }
 
 // Proc_signal_take is a NON-STANDARD host import (name "proc_signal_take").
-// It writes the mask of posted signals (u64) at maskPtr and forgets them:
-// from here on they are the guest's to deliver, or to hold while blocked.
-// Returns 0 or a negative errno.
+// It writes at maskPtr the mask (u64) of the signals waiting for the calling
+// thread — posted to the process and raised for the thread — and takes the
+// ones the thread does not block: from here on they are the thread's to
+// deliver. The ones it blocks stay with the host, for the thread or another
+// one to take once it unblocks them; the guest has them in the mask as
+// pending (sigpending). Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_signal_take(m *Module, maskPtr int32) int32 {
 	return w.procSignalTake(m, zext(maskPtr))
 }
@@ -16951,14 +17301,17 @@ func (w *WasiStubs) procSignalTake(m *Module, maskPtr uint64) int32 {
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	w.sig.mu.Lock()
-	taken := w.sig.pending
-	w.sig.pending = 0
-	// The guest is at a safe point and has the signals: there is nothing
-	// left to interrupt a blocking call for.
-	w.sig.interrupt = false
-	w.sig.mu.Unlock()
-	binary.LittleEndian.PutUint64(out, taken)
+	s := &w.sig
+	t := w.lockSignalThread(m)
+	waiting := s.pending | t.pending
+	taken := waiting &^ t.blocked
+	s.pending &^= taken
+	t.pending &^= taken
+	// The thread is at a safe point and has the signals it takes: there is
+	// nothing left to interrupt a blocking call of its for.
+	t.interrupt = false
+	w.unlockSignals()
+	binary.LittleEndian.PutUint64(out, waiting)
 	return _wasiESUCCESS
 }
 
@@ -16994,8 +17347,8 @@ func (w *WasiStubs) procItimer(m *Module, set int32, value, interval int64, oldP
 	if set != 0 && (value < 0 || interval < 0) {
 		return -_wasiEINVAL
 	}
-	w.sig.mu.Lock()
-	w.postForGuestLocked(w.fireDueTimerLocked)
+	t := w.lockSignalThread(m)
+	w.postForGuestLocked(t, w.fireDueTimerLocked)
 	left, every := w.timerStateLocked()
 	if set != 0 {
 		w.stopTimerLocked()
@@ -17087,15 +17440,16 @@ func (w *WasiStubs) fireDueTimerLocked() {
 }
 
 // postForGuestLocked runs post, which posts signals while the guest's own
-// code is running — a host call it made, a blocking call of its that begins
-// or ends: what post posts is left for the guest and its next blocking call,
-// not delivered to code outside the guest (SetOutsideInterrupt). Caller
-// holds w.sig.mu.
-func (w *WasiStubs) postForGuestLocked(post func()) {
-	outside := w.sig.outside
-	w.sig.outside = nil
+// code is running on the thread t — a host call it made, a blocking call of
+// its that begins or ends: what post posts for t is left for t and its next
+// blocking call, not delivered to code outside the guest (BeginOutside),
+// which t does not run then; and a signal of the process goes to t when t
+// takes it. Caller holds w.sig.mu.
+func (w *WasiStubs) postForGuestLocked(t *wasiSignalThread, post func()) {
+	quiet := w.sig.quiet
+	w.sig.quiet = t
 	post()
-	w.sig.outside = outside
+	w.sig.quiet = quiet
 }
 
 // stopTimerLocked disarms the interval timer, if one is set. Caller holds
@@ -17140,22 +17494,29 @@ func (w *WasiStubs) stop(m *Module, end wasiEnd) {
 }
 
 // requestStopLocked asks for the end of the instance with end, unless one
-// was asked for before: the blocking calls in progress end, code outside the
-// guest is interrupted, the flag word is raised, the waits of the guest's
-// agents end, and each thread of the guest unwinds with the end
-// (endIfStopped). m is a module of the guest, nil when the caller has none:
-// the registered one stands in for it then. Caller holds w.sig.mu.
+// was asked for before: the blocking calls in progress end, the calls of code
+// outside the guest the threads run are interrupted, the flag words are
+// raised, the waits of the guest's agents end, and each thread of the guest
+// unwinds with the end (endIfStopped). m is a module of the guest, nil when
+// the caller has none: the module of a thread the host knows stands in for
+// it then. Caller holds w.sig.mu.
 func (w *WasiStubs) requestStopLocked(m *Module, end wasiEnd) {
 	s := &w.sig
 	if s.stop.Load() == nil {
 		s.stop.Store(&wasiStop{end: end})
 	}
-	s.due.wakes = append(s.due.wakes, s.takeWakes()...)
+	s.due.wakes = append(s.due.wakes, s.takeAllWakes()...)
 	s.due.stop = true
-	s.due.stopModule = cmp.Or(m, s.flagModule)
-	if s.outside != nil && s.due.stopOutside == nil {
-		s.outside.calls++
-		s.due.stopOutside = s.outside
+	s.due.stopModule = m
+	for _, t := range s.threads {
+		s.due.stopModule = cmp.Or(s.due.stopModule, t.module)
+		if t.registered {
+			s.due.stopFlags = append(s.due.stopFlags, t)
+		}
+		if c := t.current(); c != nil && !slices.Contains(s.due.stopOutside, c) {
+			c.calls++
+			s.due.stopOutside = append(s.due.stopOutside, c)
+		}
 	}
 }
 
@@ -17179,7 +17540,7 @@ func (w *WasiStubs) endIfStopped() {
 func (w *WasiStubs) endUnregistered() {
 	w.endIfStopped()
 	w.sig.mu.Lock()
-	sig := w.sig.unregisteredEnd(w.forked)
+	sig := w.sig.unregisteredEnd()
 	w.sig.mu.Unlock()
 	if sig != 0 {
 		w.terminate(sig)
@@ -17201,9 +17562,11 @@ func (w *WasiStubs) detachSignals() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	w.stopTimerLocked()
-	s.flagModule, s.flagAddr = nil, 0
-	s.handled, s.ignored, s.blocked, s.pending = 0, 0, 0, 0
-	s.interrupt = false
+	for _, t := range s.threads {
+		t.registered, t.flagAddr = false, 0
+		t.blocked, t.pending, t.interrupt = 0, 0, false
+	}
+	s.handled, s.ignored, s.pending = 0, 0, 0
 	s.detached = true
 }
 
@@ -17211,21 +17574,21 @@ func (w *WasiStubs) detachSignals() {
 // for it: a non-blocking descriptor (O_NONBLOCK) reports EAGAIN when no
 // input is there, a blocking one waits and reports EINTR when a signal is
 // posted to the guest meanwhile.
-func (w *WasiStubs) readStream(call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
-	return w.readStreamAs(call, op, src, bufs, op.nonblocking())
+func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
+	return w.readStreamAs(m, call, op, src, bufs, op.nonblocking())
 }
 
 // readStreamAs is readStream with the blocking mode given by the caller.
-func (w *WasiStubs) readStreamAs(call string, op *wasiOpen, src deadlineReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
+func (w *WasiStubs) readStreamAs(m *Module, call string, op *wasiOpen, src deadlineReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
 	if !nonblocking {
-		n, errno := w.readInterruptibly(call, op, src, bufs)
+		n, errno := w.readInterruptibly(m, call, op, src, bufs)
 		if errno == _wasiEINTR {
 			// A signal interrupts a read that has to wait. Input that is
 			// there is read all the same, as read(2) returns it to a
 			// process with a signal pending — whether the signal was
 			// posted before the call or while it was on its way.
 			if got, errno, refused := w.readAvailable(call, op, src, bufs); !refused && errno != _wasiEAGAIN {
-				w.keepInterrupt()
+				w.keepInterrupt(m)
 				return got, errno
 			}
 		}
@@ -17260,18 +17623,22 @@ func (w *WasiStubs) readAvailable(call string, op *wasiOpen, src deadlineReader,
 
 // awaitOutputTurn takes the turn at op's output for a blocking write of the
 // guest's (awaitTurn).
-func (w *WasiStubs) awaitOutputTurn(op *wasiOpen) bool { return w.awaitTurn(op.outputTurn()) }
+func (w *WasiStubs) awaitOutputTurn(m *Module, op *wasiOpen) bool {
+	return w.awaitTurn(m, op.outputTurn())
+}
 
 // awaitInputTurn takes the turn at op's input for a blocking call of the
 // guest's (awaitTurn).
-func (w *WasiStubs) awaitInputTurn(op *wasiOpen) bool { return w.awaitTurn(op.inputTurn()) }
+func (w *WasiStubs) awaitInputTurn(m *Module, op *wasiOpen) bool {
+	return w.awaitTurn(m, op.inputTurn())
+}
 
 // awaitTurn takes turn for a blocking call of the guest's. It reports false
 // when the call is to report a signal posted to the guest meanwhile: the
 // call is then to be reported as EINTR, and the turn is not held. A signal
 // another blocking call reports leaves the wait on. A call that terminate
 // unwinds does not keep the turn.
-func (w *WasiStubs) awaitTurn(turn chan struct{}) bool {
+func (w *WasiStubs) awaitTurn(m *Module, turn chan struct{}) bool {
 	held, kept := false, false
 	defer func() {
 		if held && !kept {
@@ -17279,7 +17646,7 @@ func (w *WasiStubs) awaitTurn(turn chan struct{}) bool {
 		}
 	}()
 	for {
-		interrupted, _, refused := w.blockingAttempt(func() {}, nil,
+		interrupted, _, refused := w.blockingAttempt(m, func() {}, nil,
 			func(stop <-chan struct{}) { held = takeTurn(turn, time.Time{}, stop) })
 		if refused || interrupted {
 			return false
@@ -17295,8 +17662,8 @@ func (w *WasiStubs) awaitTurn(turn chan struct{}) bool {
 // socket, a terminal): a signal posted while the read waits — for its turn
 // at the stream, or for input — ends it, with EINTR when that happened
 // before any byte arrived. The read is one, as readv(2)'s.
-func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
-	if !w.awaitInputTurn(op) {
+func (w *WasiStubs) readInterruptibly(m *Module, call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
+	if !w.awaitInputTurn(m, op) {
 		return 0, _wasiEINTR
 	}
 	defer op.passInputTurn()
@@ -17323,7 +17690,7 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 		for !set[0].ready {
 			// Woken without input: the entry was closed. A closed stream
 			// is ready, and the read reports it.
-			interrupted, err := w.waitHostInterruptibly(call, set, time.Time{})
+			interrupted, err := w.waitHostInterruptibly(m, call, set, time.Time{})
 			if err != nil {
 				return 0, w.guestErrno(call, err)
 			}
@@ -17345,7 +17712,7 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 		// closing is what the read failed of.
 		var wakeErr error
 		clearDeadline := func() error { return errors.Join(wakeErr, src.SetReadDeadline(time.Time{})) }
-		interrupted, woken, refused := w.blockingAttempt(
+		interrupted, woken, refused := w.blockingAttempt(m,
 			func() { wakeErr = src.SetReadDeadline(time.Now()) },
 			func() { w.reportError(call, clearDeadline()) },
 			func(<-chan struct{}) { n, err = readOnce(src, bufs) })
@@ -17362,7 +17729,7 @@ func (w *WasiStubs) readInterruptibly(call string, op *wasiOpen, src deadlineRea
 			if interrupted {
 				// The read went through: the next call that waits reports
 				// the signal.
-				w.keepInterrupt()
+				w.keepInterrupt(m)
 			}
 			return w.readResult(call, n, err)
 		case interrupted:
@@ -17430,6 +17797,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"stopAgents":                true, // the in-package stand-in of the helper
 			"runtimeMappingOf":          true,
 			"whileRuntimeMapped":        true,
+			"onAgentEnd":                true, // likewise
 			"codegenStripForEmit":       true,
 			"printAST":                  true,
 			"receiverTypeName":          true,
@@ -17467,7 +17835,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			fn := *dd
 			if multi {
 				// base/ exports the Module fields and the runtime helpers.
-				fn.Body = rewriteHelperBody(fn.Body, map[string]bool{"accessMemory": true, "stopAgents": true})
+				fn.Body = rewriteHelperBody(fn.Body, map[string]bool{"accessMemory": true, "stopAgents": true, "onAgentEnd": true})
 			}
 			decls = append(decls, &fn)
 		}

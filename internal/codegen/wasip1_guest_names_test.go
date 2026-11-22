@@ -158,7 +158,7 @@ func TestWasi_OwnDescriptorNamesOfEveryPathOperation(t *testing.T) {
 	w, m := newTestStubs(t, dir)
 	ids := ProcessIDs{PID: 42, PPID: 1, UID: int32(os.Getuid()), EUID: int32(os.Geteuid()), GID: int32(os.Getgid()), EGID: int32(os.Getegid())}
 	w.cfg.Process = testProcess{ids: ids, umask: 0o022}
-	fd, errno := w.pathOpen("f", 0, 0, 1<<1|1<<6, 0)
+	fd, errno := w.pathOpen(m, "f", 0, 0, 1<<1|1<<6, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("open f errno=%d", errno)
 	}

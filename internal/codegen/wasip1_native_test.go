@@ -863,7 +863,7 @@ func TestWasi_PollOneoffAbsoluteClock(t *testing.T) {
 	// CLOCK_PROCESS_CPUTIME_ID, at a time of the realtime clock soon: the
 	// call does not wait for it.
 	clockSub(0, 2, clock(0)+uint64(20*time.Millisecond))
-	fd, errno := w.pathOpen("f", 0, 0x1 /* O_CREAT */, 1<<1, 0)
+	fd, errno := w.pathOpen(m, "f", 0, 0x1 /* O_CREAT */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}

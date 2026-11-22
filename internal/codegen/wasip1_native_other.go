@@ -54,7 +54,7 @@ func hostFDLink(fd uintptr) (string, bool, error) { return "", false, nil }
 
 // openFIFOWatched reports that this platform opens no FIFO by waiting for
 // an open of the other end: the caller opens it another way.
-func (w *WasiStubs) openFIFOWatched(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, int32, bool) {
+func (w *WasiStubs) openFIFOWatched(m *Module, openFile func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, int32, bool) {
 	return nil, _wasiESUCCESS, false
 }
 

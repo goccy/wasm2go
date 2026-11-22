@@ -18,7 +18,7 @@ func loadSignalFlag(m *Module) uint32 {
 func TestSignal_AWakeRunsWithoutALockOfTheInstance(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGUSR2)
 	entered, release := make(chan struct{}), make(chan struct{})
-	b, ok := w.beginBlocking(func() {
+	b, ok := w.beginBlocking(m, func() {
 		close(entered)
 		<-release
 	})
@@ -50,10 +50,10 @@ func TestSignal_AWakeRunsWithoutALockOfTheInstance(t *testing.T) {
 // A blocking call whose wake was called ends once the wake has returned, so
 // that the wake does nothing to what the caller does next.
 func TestSignal_ABlockingCallEndsAfterItsWake(t *testing.T) {
-	w, _ := newSignalGuest(t, wasiSIGUSR1)
+	w, m := newSignalGuest(t, wasiSIGUSR1)
 	entered, release := make(chan struct{}), make(chan struct{})
 	woke := 0
-	b, ok := w.beginBlocking(func() {
+	b, ok := w.beginBlocking(m, func() {
 		close(entered)
 		<-release
 		woke++
@@ -73,35 +73,61 @@ func TestSignal_ABlockingCallEndsAfterItsWake(t *testing.T) {
 }
 
 // The interrupt of the code outside the guest runs without a lock of the
-// instance held, so it may post a signal itself; and a registration that is
-// replaced has no call left running once SetOutsideInterrupt has returned.
+// instance held, so it may post a signal itself; and a call that has ended
+// has no interrupt left running once End has returned.
 func TestSignal_OutsideInterruptRunsWithoutALockOfTheInstance(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGUSR1, wasiSIGUSR2)
 	again := false
-	w.SetOutsideInterrupt(func() {
+	var c *OutsideCall
+	c = w.BeginOutside(m, func() {
 		if !again {
 			again = true
 			w.PostSignal(wasiSIGUSR2)
+			if !c.Pending() {
+				t.Error("Pending is false in the interrupt of a signal")
+			}
 		}
 	})
 	returnsWithin(t, "PostSignal of an interrupt that posts", func() { w.PostSignal(wasiSIGUSR1) })
+	c.End()
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGUSR1, wasiSIGUSR2); got != want {
 		t.Fatalf("taken = %#x, want %#x", got, want)
 	}
 
 	entered, release := make(chan struct{}), make(chan struct{})
 	calls := 0
-	w.SetOutsideInterrupt(func() {
+	c = w.BeginOutside(m, func() {
 		close(entered)
 		<-release
 		calls++
 	})
 	go w.PostSignal(wasiSIGUSR1)
 	<-entered
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		c.End()
+	}()
+	// End waits for the interrupt: it has not returned while the
+	// interrupt is held, which the test lets go of once End has begun.
+	awaitEnding(w, c)
 	close(release)
-	w.SetOutsideInterrupt(nil)
+	<-ended
 	if calls != 1 {
-		t.Fatalf("SetOutsideInterrupt returned before the call of the interrupt it replaced (%d returns)", calls)
+		t.Fatalf("End returned before the call of the interrupt (%d returns)", calls)
+	}
+}
+
+// awaitEnding returns once End of c has begun to wait for its interrupt.
+func awaitEnding(w *WasiStubs, c *OutsideCall) {
+	for {
+		w.sig.mu.Lock()
+		waiting := c.idle != nil
+		w.sig.mu.Unlock()
+		if waiting {
+			return
+		}
+		runtime.Gosched()
 	}
 }
 
@@ -152,7 +178,7 @@ func TestSignal_AnInterruptedCallEndsWithTheFlagUp(t *testing.T) {
 	}()
 	for {
 		w.sig.mu.Lock()
-		blocked := len(w.sig.wakes)
+		blocked := blockedCallsLocked(w)
 		w.sig.mu.Unlock()
 		if blocked == 1 {
 			break

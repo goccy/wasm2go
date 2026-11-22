@@ -37,7 +37,7 @@ func systemOrder(t *testing.T, dir string) []string {
 // listed is what readDirCached lists for the root of w's file system.
 func listed(t *testing.T, w *WasiStubs) []string {
 	t.Helper()
-	fd, errno := w.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(nil, "", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -71,7 +71,7 @@ func TestReaddir_HostInodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, _ := newTestStubs(t, dir)
-	fd, errno := w.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(nil, "", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -203,7 +203,7 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 	entriesOf := func(root string) map[string]os.DirEntry {
 		t.Helper()
 		w, _ := newTestStubs(t, root)
-		fd, errno := w.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+		fd, errno := w.pathOpen(nil, "", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
 			t.Fatalf("pathOpen(%s) errno=%d", root, errno)
 		}
@@ -268,7 +268,7 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 		t.Errorf("an entry whose file is gone: type %v, IsDir() = %v; want %v and false", got, gone.IsDir(), os.ModeIrregular)
 	}
 	unknown, _ := newTestStubs(t, dir)
-	unknownFd, errno := unknown.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	unknownFd, errno := unknown.pathOpen(nil, "", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -293,7 +293,7 @@ func TestReaddir_HostEntryTypes(t *testing.T) {
 
 	// A directory whose file is closed lists nothing.
 	w, _ := newTestStubs(t, dir)
-	fd, errno := w.pathOpen("", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(nil, "", 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}
@@ -333,7 +333,7 @@ func TestReaddir_DirectoryWithoutSearchPermission(t *testing.T) {
 	// On the whole host filesystem: a HostFS of dir itself cannot be made
 	// (os.Root searches its root).
 	w := NewWASI(WASIConfig{FS: newHostFS(t, "/")})
-	fd, errno := w.pathOpen(hostRelative(t, dir), 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
+	fd, errno := w.pathOpen(nil, hostRelative(t, dir), 0, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen errno=%d", errno)
 	}

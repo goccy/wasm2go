@@ -24,7 +24,7 @@ func dupTestFd(t *testing.T, w *WasiStubs, m *Module, fd int32) int32 {
 // returns the new fd.
 func createTestFile(t *testing.T, w *WasiStubs, name string) int32 {
 	t.Helper()
-	fd, errno := w.pathOpen(name, 0, 0x1 /* O_CREAT */, 1<<6 /* FD_WRITE */, 0)
+	fd, errno := w.pathOpen(nil, name, 0, 0x1 /* O_CREAT */, 1<<6 /* FD_WRITE */, 0)
 	if errno != _wasiESUCCESS {
 		t.Fatalf("pathOpen(%s) errno=%d", name, errno)
 	}

@@ -437,7 +437,7 @@ func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, 
 // the guest meanwhile ends the wait with EINTR and closes the reader,
 // which a writer that came takes for a reader gone, as for an open(2)
 // that a signal interrupts. No other end of the FIFO is opened.
-func (w *WasiStubs) openFIFOWatched(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, int32, bool) {
+func (w *WasiStubs) openFIFOWatched(m *Module, openFile func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, int32, bool) {
 	// Known before the FIFO is opened: an open made and closed again would
 	// show.
 	if _, err := os.Stat("/proc/self/fd"); errors.Is(err, fs.ErrNotExist) {
@@ -465,7 +465,7 @@ func (w *WasiStubs) openFIFOWatched(openFile func(name string, flag int, perm os
 			w.reportError("path_open", errors.Join(fw.Close(), f.Close()))
 		}
 	}()
-	opened, err := w.awaitFIFOWriter(fw, f)
+	opened, err := w.awaitFIFOWriter(m, fw, f)
 	ended = true
 	err = errors.Join(err, fw.Close())
 	if err == nil && opened {
@@ -493,7 +493,7 @@ func (w *WasiStubs) openFIFOWatched(openFile func(name string, flag int, perm os
 // after it ends the next wait; a writer that came before the watch was set
 // is found by the first look, and one a look missed (another reader took
 // the input tee(2) was to find) by f's input or hang-up.
-func (w *WasiStubs) awaitFIFOWriter(fw *fifoWatch, f File) (bool, error) {
+func (w *WasiStubs) awaitFIFOWriter(m *Module, fw *fifoWatch, f File) (bool, error) {
 	st, err := f.Stat()
 	if err != nil {
 		return false, err
@@ -517,14 +517,14 @@ func (w *WasiStubs) awaitFIFOWriter(fw *fifoWatch, f File) (bool, error) {
 			if interrupted {
 				// The open is done after all: the next call that waits
 				// reports the signal.
-				w.keepInterrupt()
+				w.keepInterrupt(m)
 			}
 			return true, nil
 		case interrupted:
 			return false, nil
 		}
 		set := []hostWaitFD{{stream: fw.events, want: hostWantInput}, {stream: f, want: hostWantInput}}
-		if interrupted, err = w.waitHostInterruptibly("path_open", set, time.Time{}); err != nil {
+		if interrupted, err = w.waitHostInterruptibly(m, "path_open", set, time.Time{}); err != nil {
 			return false, err
 		}
 	}

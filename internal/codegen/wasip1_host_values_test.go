@@ -1150,7 +1150,9 @@ func TestFlockOfASharedDescriptorWaitedForTwice(t *testing.T) {
 	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
 		t.Fatalf("Proc_signal_register rc=%d", rc)
 	}
-	setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, 0)
+	// The thread that registered first blocks the signal: it goes to a
+	// thread that waits.
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, signalMask(wasiSIGUSR1))
 	if err := fsys.WriteFile("lock", nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1165,7 +1167,8 @@ func TestFlockOfASharedDescriptorWaitedForTwice(t *testing.T) {
 	}
 	results := make(chan int32, 2)
 	for _, fd := range []int32{waiter, sharer} {
-		go func() { results <- w.Fd_flock(newForkTestModule(), fd, 2, 1) }()
+		thread := signalWaiter(t, w)
+		go func() { results <- w.Fd_flock(thread, fd, 2, 1) }()
 	}
 	awaitBlockedCalls(w, 2)
 	w.PostSignal(wasiSIGUSR1)
