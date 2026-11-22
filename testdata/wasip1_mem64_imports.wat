@@ -240,6 +240,9 @@
   (import "wasip1_posix_extension" "proc_setenv"
     (func $proc_setenv (param i64 i32 i64 i32 i32) (result i32)))
 
+  (import "wasip1_posix_extension" "sys_syscall"
+    (func $sys_syscall (param i64 i64 i32 i32 i64) (result i32)))
+
   (memory (export "memory") i64 1)
 
   (func (export "touch")
@@ -360,5 +363,8 @@
 
     (drop (call $proc_chdir (i64.const 0) (i32.const 0)))
     (drop (call $proc_setenv (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))
+
+
+    (drop (call $sys_syscall (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
   )
 )

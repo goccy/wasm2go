@@ -92,6 +92,8 @@ var posixImports = map[string]bool{
 
 	"proc_chdir":  true,
 	"proc_setenv": true,
+
+	"sys_syscall": true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

@@ -312,3 +312,9 @@ func getHostSockOpt(fd int, option int32) (int32, error) { return 0, errors.ErrU
 func hostSocketTimeout(fd int, send bool) (time.Duration, error) { return 0, errors.ErrUnsupported }
 
 func setHostSocketTimeout(fd int, send bool, d time.Duration) error { return errors.ErrUnsupported }
+
+// hostSyscall: this platform has no system calls of the Linux ABI
+// (HostSyscalls).
+func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	return 0, errors.ErrUnsupported
+}
