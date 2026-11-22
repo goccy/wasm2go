@@ -209,10 +209,10 @@ func TestWasi_FdDup2RedirectsAndRestoresStdio(t *testing.T) {
 
 	// While redirected, a spawned child's stdout resolves to the file too.
 	w.mu.Lock()
-	cw := w.childWriterLocked(1, w.cfg.Stdout)
+	cw := commandStreamValue(w.commandStreamLocked(1, 2))
 	w.mu.Unlock()
 	if _, isBuf := cw.(*bytes.Buffer); isBuf {
-		t.Fatal("childWriterLocked(1) ignored the redirection")
+		t.Fatal("commandStreamLocked(1, 2) ignored the redirection")
 	}
 
 	// Restore and close the saved alias; the stream must still work.
@@ -348,7 +348,7 @@ func TestWasi_FdDupEdgeCases(t *testing.T) {
 	}
 
 	// Reads through a descriptor dup2'd onto fd 0 come from the file,
-	// and childReaderLocked follows the same redirection.
+	// and commandStreamLocked follows the same redirection.
 	if rc := w.Fd_dup2(m, fd, 0); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_dup2 onto 0 rc=%d", rc)
 	}
@@ -362,14 +362,14 @@ func TestWasi_FdDupEdgeCases(t *testing.T) {
 		t.Fatalf("read via redirected fd 0 = %q", got)
 	}
 	w.mu.Lock()
-	cr := w.childReaderLocked(0)
-	crDefault := w.childReaderLocked(-1)
+	cr := commandStreamValue(w.commandStreamLocked(0, 1))
+	crDefault := commandStreamValue(w.commandStreamLocked(-1, 1))
 	w.mu.Unlock()
 	if cr == w.cfg.Stdin {
-		t.Fatal("childReaderLocked(0) ignored the redirection")
+		t.Fatal("commandStreamLocked(0, 1) ignored the redirection")
 	}
 	if crDefault != w.cfg.Stdin {
-		t.Fatal("childReaderLocked(-1) should be the interpreter stdin")
+		t.Fatal("commandStreamLocked(-1, 1) should be the interpreter stdin")
 	}
 
 	// An alias of stderr placed on another fd writes to the stream.

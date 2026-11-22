@@ -77,10 +77,15 @@ import (
 // embedded-source path strips the package + import header at emit time
 // and lets the generated Module shadow this one. It has the generated
 // Module's fields the stubs read: the memory slice and memSize, the size
-// the guest sees (see guestMemory).
+// the guest sees (see guestMemory), memShared, and what a fork runs
+// (Proc_fork): forkChild, the module's fork child export, and forkModule,
+// which builds the instance a copy of the module's memory is the memory of.
 type Module struct {
-	memory  []byte
-	memSize *atomic.Uint64
+	memory     []byte
+	memSize    *atomic.Uint64
+	memShared  bool
+	forkChild  func(m *Module) int32
+	forkModule func(m *Module, wasi *WasiStubs, memory []byte, memSize uint64) *Module
 }
 
 // accessMemory is the in-package stand-in for the runtime helper of the same
@@ -1231,16 +1236,26 @@ func (op *wasiOpen) takeAhead(bufs [][]byte) (n uint64, errno int32, ok bool) {
 		}
 		return 0, mapOSError(end), true
 	}
+	return op.copyAheadLocked(bufs, false), _wasiESUCCESS, true
+}
+
+// copyAheadLocked copies the input ahead into bufs in order, and takes out
+// what it copied unless peek. Caller holds op.mu.
+func (op *wasiOpen) copyAheadLocked(bufs [][]byte, peek bool) uint64 {
+	n := 0
 	for _, buf := range bufs {
-		c := copy(buf, op.ahead)
-		op.ahead = op.ahead[c:]
-		n += uint64(c)
-		if len(op.ahead) == 0 {
-			op.ahead = nil
+		n += copy(buf, op.ahead[n:])
+		if n == len(op.ahead) {
 			break
 		}
 	}
-	return n, _wasiESUCCESS, true
+	if !peek {
+		op.ahead = op.ahead[n:]
+		if len(op.ahead) == 0 {
+			op.ahead = nil
+		}
+	}
+	return uint64(n)
 }
 
 // aheadReady reports whether a read would return without blocking because
@@ -2049,6 +2064,11 @@ type WASIConfig struct {
 	// tells nobody.
 	Chdir  func(dir string) error
 	Setenv func(name, value string, unset bool) error
+
+	// Fork makes the instance the child of a guest's fork runs in
+	// (Proc_fork). nil denies every fork: it fails with ENOSYS.
+	// CopyForker makes a copy of the forking instance.
+	Fork Forker
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -2129,6 +2149,10 @@ type WasiStubs struct {
 	// shared with every instance derived through Fork, so a token is unique
 	// across a whole fork family.
 	pids *wasiPIDs
+	// streams is what the family shares of the instance's standard streams
+	// for the commands it starts (familyStreams). Like pids, it is created
+	// on first use (streamsLocked) and shared through Fork.
+	streams *familyStreams
 	// procFinished is closed, and dropped so the next waiter makes a fresh
 	// one, whenever a process in procs finishes. Proc_wait_any blocks on it
 	// instead of polling. Guarded by mu.
@@ -2177,13 +2201,13 @@ type WasiStubs struct {
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
-// Proc_spawn (cmd != nil), or a process the embedder runs itself (NewProc)
-// (cmd == nil). Whoever runs the process publishes the encoded POSIX status
+// Proc_spawn (host != nil), or a process the embedder runs itself (NewProc)
+// (host == nil). Whoever runs the process publishes the encoded POSIX status
 // and closes done, so Proc_wait can support both the blocking (options 0)
 // and non-blocking (WNOHANG) forms without holding the WasiStubs lock across
 // the child's lifetime.
 type wasiProc struct {
-	cmd    *exec.Cmd
+	host   *os.Process
 	done   chan struct{}
 	status int32 // POSIX wait status, valid once done is closed
 	// kill delivers a signal to an embedder-run process (Proc_kill). nil
@@ -2351,6 +2375,41 @@ func (w *WasiStubs) stdin() io.Reader {
 	return w.cfg.Stdin
 }
 
+// familyStreams is what the instances of a fork family share of their
+// standard streams (WASIConfig.Stdin, Stdout, Stderr) for the commands they
+// start, whose streams the runtime copies when they are not files of the
+// host. output makes the writes to the instance's stdout and stderr one at
+// a time: the guests' and those of the runtime's copies of command output.
+// The streams are the configuration's, which every instance of the family
+// shares.
+type familyStreams struct {
+	output sync.Mutex
+}
+
+// streamsLocked returns the family's familyStreams, made on first use.
+// Caller holds w.mu.
+func (w *WasiStubs) streamsLocked() *familyStreams {
+	if w.streams == nil {
+		w.streams = &familyStreams{}
+	}
+	return w.streams
+}
+
+// outputLockLocked returns the lock a write of the guest's to dst, the
+// destination of the entry op, is made under: the family's output lock for
+// the instance's stdout or stderr that is not a file of the host, which
+// the runtime's copies of command output write to as well (familyStreams);
+// nil for any other. Caller holds w.mu.
+func (w *WasiStubs) outputLockLocked(op *wasiOpen, dst io.Writer) *sync.Mutex {
+	if op == nil || op.stdio < 2 {
+		return nil
+	}
+	if _, isFile := dst.(*os.File); isFile {
+		return nil
+	}
+	return &w.streamsLocked().output
+}
+
 // stdout returns the standard output of the instance: io.Discard when the
 // configuration names none.
 func (w *WasiStubs) stdout() io.Writer {
@@ -2430,6 +2489,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 		monoStart: w.monoStart,
 		procs:     map[int32]*wasiProc{},
 		pids:      w.pidsLocked(),
+		streams:   w.streamsLocked(),
 		zoneTZ:    w.zoneTZ,
 		zone:      w.zone,
 		forked:    true,
@@ -2522,13 +2582,72 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 // 0, or a positive errno for the first close that failed (every fd in range
 // is closed regardless).
 func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
-	w.mu.Lock()
-	closing := w.clearSlotsFromLocked(lowFd)
-	w.mu.Unlock()
-	if err := closeWasiOpens(closing); err != nil {
+	if err := w.closeFrom(lowFd); err != nil {
 		return mapOSError(err)
 	}
 	return _wasiESUCCESS
+}
+
+// closeFrom closes every fd numbered lowFd or higher, each as fd_close
+// would, and joins the close errors.
+func (w *WasiStubs) closeFrom(lowFd int32) error {
+	w.mu.Lock()
+	closing := w.clearSlotsFromLocked(lowFd)
+	w.mu.Unlock()
+	return closeWasiOpens(closing)
+}
+
+// CloseDescriptors closes every descriptor of this instance in its table,
+// each as fd_close would, and nothing else: the preopened directories stay
+// (the root's numbers, wasiPreopenFD and wasiRootFD), and the instance
+// stays what it is to the processes of its family and keeps receiving
+// signals. It is for an embedder that ends an instance whose guest may
+// still be running on another goroutine: the guest finds every descriptor
+// it opened, and its standard ones, closed. CloseAll is still to be called
+// once the guest no longer runs. The close errors are joined.
+func (w *WasiStubs) CloseDescriptors() error {
+	return w.closeFrom(0)
+}
+
+// KillCommands ends the commands this instance started (Proc_spawn) and
+// has not waited for: each one still running is killed, as by SIGKILL,
+// and the call returns once every one killed, or found ended, has ended
+// and what the runtime copied of its output is delivered (startCommand),
+// as os/exec's Cmd.Wait without a WaitDelay: a destination that does not
+// take the output holds the call. A read of an embedder's stdin a copy is
+// in is not waited for, as the runtime cannot end it, except on a system
+// where commands are started by os/exec (not darwin or linux), whose wait
+// waits for that copy too. A command the kill fails for (EPERM) is not
+// waited for: its error is returned. The commands are those in the table
+// when the call takes it: one started afterwards is not killed. They stay
+// in the instance's process table, with the status they end with. The
+// errors of the kills are joined.
+//
+// It is for an embedder that ends an instance without letting it run on,
+// and may be called while the guest is running on another goroutine.
+func (w *WasiStubs) KillCommands() error {
+	w.mu.Lock()
+	var commands []*wasiProc
+	for _, proc := range w.procs {
+		if proc.host != nil {
+			commands = append(commands, proc)
+		}
+	}
+	w.mu.Unlock()
+	var err error
+	var ending []*wasiProc
+	for _, proc := range commands {
+		// A command that has ended already is not killed, and ends.
+		if kerr := proc.host.Kill(); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
+			err = errors.Join(err, kerr)
+			continue
+		}
+		ending = append(ending, proc)
+	}
+	for _, proc := range ending {
+		<-proc.done
+	}
+	return err
 }
 
 // Fd_closefrom64 is Fd_closefrom for a memory64 guest.
@@ -2664,12 +2783,18 @@ func (w *WasiStubs) pidsLocked() *wasiPIDs {
 // ids of the Process. The family does not know it yet: see
 // enterProcLocked. Caller holds w.mu.
 func (w *WasiStubs) addProcLocked(proc *wasiProc, ids ProcessIDs) int32 {
+	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
+	w.putProcLocked(pid, proc)
+	return pid
+}
+
+// putProcLocked registers proc under pid, a token alloc handed out, as a
+// process this instance waits for. Caller holds w.mu.
+func (w *WasiStubs) putProcLocked(pid int32, proc *wasiProc) {
 	if w.procs == nil {
 		w.procs = map[int32]*wasiProc{}
 	}
-	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
 	w.procs[pid] = proc
-	return pid
 }
 
 // enterProcLocked makes the process registered under pid known to the whole
@@ -2771,12 +2896,32 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 // shares w's identity (see Fork), so when w is such a copy the ppid is the
 // root's pid, and the copy's kill of it reaches the root, not w.
 func (w *WasiStubs) ForkProc() (child *WasiStubs, pid int32, exited func(status int32)) {
+	child, pid, proc := w.forkProc()
+	w.enterChild(pid, proc)
+	return child, pid, w.procExitFunc(proc)
+}
+
+// forkProc is ForkProc up to the copy's becoming w's child (enterChild):
+// it returns the copy, its pid token and its process, which nobody can wait
+// for or signal yet.
+func (w *WasiStubs) forkProc() (*WasiStubs, int32, *wasiProc) {
 	parent := w.guestProcess()
-	ppid := parent.IDs().PID
-	child = w.Fork()
-	pid, exited = w.newProc(&wasiProc{done: make(chan struct{}), instance: child})
-	child.cfg.Process = forkedProcess{Process: parent, pid: pid, ppid: ppid}
-	return child, pid, exited
+	ids := parent.IDs()
+	child := w.Fork()
+	w.mu.Lock()
+	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
+	w.mu.Unlock()
+	child.cfg.Process = forkedProcess{Process: parent, pid: pid, ppid: ids.PID}
+	return child, pid, &wasiProc{done: make(chan struct{}), instance: child}
+}
+
+// enterChild makes proc, the process of a copy forkProc made under pid, a
+// child of w that w waits for and the fork family can signal.
+func (w *WasiStubs) enterChild(pid int32, proc *wasiProc) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.putProcLocked(pid, proc)
+	w.enterProcLocked(pid)
 }
 
 // forkedProcess is the Process of a copy made by ForkProc: its pid is its
@@ -2809,6 +2954,176 @@ func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
 	return func(status int32) {
 		once.Do(func() { w.finishProc(proc, status) })
 	}
+}
+
+// Forker makes the instance the child of a guest's fork runs in
+// (WASIConfig.Fork, Proc_fork).
+type Forker interface {
+	// Fork returns a new instance of parent's module that is a copy of
+	// parent as it stands: its memory and globals, the memory's ceiling,
+	// its dropped data segments and the end of its data (dataEnd). Its
+	// wasi import is child, the host state of the copy (ForkProc), whose
+	// pid token is pid. It does not run the instance: Proc_fork runs the
+	// child in it, through the module's fork child export.
+	//
+	// It is called on the goroutine of the guest that forks, inside its
+	// proc_fork call, so that thread of the guest is stopped; the guest's
+	// other threads are not, and the child has none of them: as in a POSIX
+	// fork, a lock another thread held stays held in the child. The function
+	// it returns, done, is nil or is called by Proc_fork once with the
+	// child's wait status when the child has ended: on the child's
+	// goroutine, before child is closed (CloseAll) and before the status
+	// is published, so that nobody who waits for pid goes on before done
+	// has returned. The threads the child started itself may still run
+	// then. A panic of done is told WASIConfig.Errors, which must not
+	// panic itself. done may close child itself before it releases what
+	// the instance holds. An error leaves nothing made: Proc_fork closes
+	// child and the fork fails, and it closes child as well when Fork
+	// panics.
+	//
+	// The children of the child fork through the same Forker (a forked
+	// instance has its parent's WASIConfig), so done is called for every
+	// process of the fork family.
+	Fork(parent *Module, child *WasiStubs, pid int32) (*Module, func(status int32), error)
+}
+
+// CopyForker is the Forker that makes the child's instance from a copy of
+// the parent's memory in the Go heap, made while the parent's memory cannot
+// grow; the child's other imports than the wasi one are the parent's. The
+// copy of a shared memory is as long as the parent's, its ceiling, and any
+// other is as long as the guest's memory. A guest thread other than the
+// forking one that writes the memory meanwhile may leave the copy with a
+// part of its write. It returns no done.
+var CopyForker Forker = copyForker{}
+
+// copyForker is CopyForker.
+type copyForker struct{}
+
+func (copyForker) Fork(m *Module, child *WasiStubs, pid int32) (*Module, func(status int32), error) {
+	var (
+		memory []byte
+		size   uint64
+	)
+	accessMemory(m, func(mem []byte) {
+		size = m.memSize.Load()
+		length := size
+		if m.memShared {
+			// Its threads hold its address: it never moves, so it spans
+			// its ceiling from the start (see memoryGrow).
+			length = uint64(len(mem))
+		}
+		memory = make([]byte, length)
+		copy(memory, mem[:size])
+	})
+	return m.forkModule(m, child, memory, size), nil, nil
+}
+
+// Proc_fork is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_fork") backing fork(): the guest's process is copied into a
+// child process, a new instance that runs on a goroutine of its own. The
+// child's host state is a copy of the guest's with a pid token of its own
+// (ForkProc); WASIConfig.Fork makes its instance. On success the token is
+// written at pidOutPtr, which the copy does not have, and the child runs
+// the module's fork child export (__wasip1_posix_extension_fork_child)
+// once. It ends when the export returns r, as exit(r) does (wait status
+// (r&0xff)<<8), with Proc_exit (the same of its code), or by a signal (the
+// signal's number). A trap or another panic of the child is told
+// WASIConfig.Errors (op "proc_fork") and ends it as SIGABRT does. When the
+// child has ended, the Forker's done is called, its host state is closed
+// (CloseAll) and its wait status published, in that order: the guest
+// waits for it (Proc_wait, Proc_wait_any), signals it (Proc_kill) and is
+// sent SIGCHLD when it ends, as for any child.
+//
+// Returns 0, or a negative errno: ENOSYS when WASIConfig.Fork is nil or
+// the module has no fork child export, EFAULT for a pidOutPtr outside the
+// memory, EAGAIN when the Forker failed, whose error is told
+// WASIConfig.Errors (op "proc_fork").
+func (w *WasiStubs) Proc_fork(m *Module, pidOutPtr int32) int32 {
+	return w.procFork(m, zext(pidOutPtr))
+}
+
+// Proc_fork64 is Proc_fork for a memory64 guest.
+func (w *WasiStubs) Proc_fork64(m *Module, pidOutPtr int64) int32 {
+	return w.procFork(m, uint64(pidOutPtr))
+}
+
+// procFork is the body of Proc_fork and Proc_fork64.
+func (w *WasiStubs) procFork(m *Module, pidOutPtr uint64) int32 {
+	w.endUnregistered()
+	if w.cfg.Fork == nil || m.forkChild == nil {
+		return -_wasiENOSYS
+	}
+	if w.memBytes(m, pidOutPtr, 4) == nil {
+		return -_wasiEFAULT
+	}
+	child, pid, proc := w.forkProc()
+	made := false
+	defer func() {
+		// A Forker that failed, or panicked, made no child.
+		if !made {
+			w.reportError("proc_fork", child.CloseAll())
+		}
+	}()
+	childModule, done, err := w.cfg.Fork.Fork(m, child, pid)
+	if err != nil {
+		w.reportError("proc_fork", err)
+		return -_wasiEAGAIN
+	}
+	made = true
+	w.enterChild(pid, proc)
+	exited := w.procExitFunc(proc)
+	// The memory has not shrunk since it was checked above.
+	binary.LittleEndian.PutUint32(w.memBytes(m, pidOutPtr, 4), uint32(pid))
+	go func() {
+		status := child.runForkChild(childModule, done)
+		child.reportError("proc_fork", child.CloseAll())
+		exited(status)
+	}()
+	return _wasiESUCCESS
+}
+
+// runForkChild runs the child of a fork in m, the instance whose host state
+// w is, through the module's fork child export, then done (when non-nil),
+// and returns the wait status the child ended with (see Proc_fork). A panic
+// of done is told WASIConfig.Errors.
+func (w *WasiStubs) runForkChild(m *Module, done func(status int32)) (status int32) {
+	status = w.forkChildStatus(m)
+	if done != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				w.reportError("proc_fork", panicError("the done of a fork", r))
+			}
+		}()
+		done(status)
+	}
+	return status
+}
+
+// forkChildStatus runs the fork child export in m and returns the wait
+// status the child ended with.
+func (w *WasiStubs) forkChildStatus(m *Module) (status int32) {
+	defer func() {
+		switch r := recover().(type) {
+		case nil:
+		case *WasiExitError:
+			status = (r.Code & 0xff) << 8
+		case *WasiSignalError:
+			status = r.Signal & 0x7f
+		default:
+			w.reportError("proc_fork", panicError("a fork child", r))
+			status = wasiSIGABRT
+		}
+	}()
+	return (m.forkChild(m) & 0xff) << 8
+}
+
+// panicError is the error of a panic of what with the value r: r itself,
+// wrapped, when it is an error.
+func panicError(what string, r any) error {
+	if err, ok := r.(error); ok {
+		return fmt.Errorf("%s panicked: %w", what, err)
+	}
+	return fmt.Errorf("%s panicked: %v", what, r)
 }
 
 // readCStr reads a NUL-terminated C string at ptr from linear memory. A nil
@@ -2859,13 +3174,10 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // Proc_spawn is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "proc_spawn") that a guest's posix_spawn() can call. It spawns a
 // HOST process: path is the executable, argv/envp are NUL-terminated char**
-// in linear memory. The child inherits the guest program's
-// stdin/stdout/stderr. The new pid token is written at pidOutPtr. Returns 0
-// or a negative errno.
-//
-// Only stdio inheritance is supported today (no fd remapping / pipes), which
-// covers running a child with the default streams; capturing its output via
-// host pipes is a follow-up.
+// in linear memory. stdinFd, stdoutFd and stderrFd are the guest's
+// descriptors the child gets as its standard streams, -1 for the
+// instance's own (commandStreamLocked, startCommand). The new pid token is
+// written at pidOutPtr. Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
 }
@@ -2911,36 +3223,38 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	}
 	w.mu.Lock()
 	hook := w.cfg.Exec
-	cin := w.childReaderLocked(stdinFd)
-	cout := w.childWriterLocked(stdoutFd, w.stdout())
-	cerr := w.childWriterLocked(stderrFd, w.stderr())
+	streams := [3]commandStream{
+		w.commandStreamLocked(stdinFd, 1),
+		w.commandStreamLocked(stdoutFd, 2),
+		w.commandStreamLocked(stderrFd, 3),
+	}
+	share := w.streamsLocked()
 	w.mu.Unlock()
 	if hook == nil || !hook(path, argv) {
 		return -_wasiEACCES
 	}
 
-	cmd := exec.Command(path)
-	if len(argv) > 0 {
-		cmd.Args = argv
-	} else {
-		cmd.Args = []string{path}
+	if len(argv) == 0 {
+		argv = []string{path}
 	}
-	if cwd != "" {
-		cmd.Dir = cwd
+	if filepath.Base(path) == path {
+		// A name without a directory is looked up in the host's PATH, as
+		// exec.Command does.
+		found, err := exec.LookPath(path)
+		if err != nil {
+			return -mapExecError(err)
+		}
+		path = found
 	}
 	// Sandbox: the child sees ONLY the guest-provided environment; a nil
 	// (NULL envp) must NOT fall through to the host process environment.
-	cmd.Env = env
-	if cmd.Env == nil {
-		cmd.Env = []string{}
+	if env == nil {
+		env = []string{}
 	}
-	// stdin/stdout/stderr are the guest program's streams (inherited) or a guest
-	// pipe end. A pipe end's dynamic type is *os.File, so Go's exec passes the
-	// fd straight to the child; capture works by the guest reading the pipe's
-	// other end via Fd_read.
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = cin, cout, cerr
+	dir := cwd
+	var cmd *hostCommand
 	var startErr error
-	start := func() { startErr = cmd.Start() }
+	start := func() { cmd, startErr = w.startCommand(path, argv, env, dir, &streams, share) }
 	// The command inherits the umask of the thread that starts it: this
 	// one where the instance's mask is the host process's, the instance's
 	// creation thread otherwise.
@@ -2950,7 +3264,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	case withHostUmask(w.guestUmask(), start):
 	default:
 		t := w.creationThread()
-		if t != nil && !filepath.IsAbs(cmd.Dir) {
+		if t != nil && !filepath.IsAbs(dir) {
 			// The creation thread's working directory is the one of its
 			// unshare: the command is given the host process's, read here,
 			// off that thread, with a relative directory taken from it.
@@ -2960,7 +3274,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 				w.reportError("proc_spawn", err)
 				t = nil
 			} else {
-				cmd.Dir = filepath.Join(wd, cmd.Dir)
+				dir = filepath.Join(wd, dir)
 			}
 		}
 		if t == nil || t.run(start) != nil {
@@ -2971,24 +3285,13 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		return -mapExecError(startErr)
 	}
 
-	proc := &wasiProc{cmd: cmd, done: make(chan struct{})}
+	proc := &wasiProc{host: cmd.process, done: make(chan struct{})}
 	ids := w.guestProcess().IDs()
 	w.mu.Lock()
 	pid := w.addProcLocked(proc, ids)
 	w.enterProcLocked(pid)
 	w.mu.Unlock()
-	go func() {
-		werr := cmd.Wait()
-		status := encodeWaitStatus(cmd.ProcessState)
-		// A non-zero exit or signal surfaces as *exec.ExitError and is the
-		// normal path (status already encoded from ProcessState above). Any
-		// OTHER error means the wait itself failed; report a 127 exit.
-		var exitErr *exec.ExitError
-		if werr != nil && !errors.As(werr, &exitErr) {
-			status = int32(127) << 8
-		}
-		w.finishProc(proc, status)
-	}()
+	go func() { w.finishProc(proc, cmd.wait()) }()
 
 	binary.LittleEndian.PutUint32(out, uint32(pid))
 	return _wasiESUCCESS
@@ -3039,34 +3342,73 @@ func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) in
 	return _wasiESUCCESS
 }
 
-// childReaderLocked resolves the stdin of a spawned process. A negative fd
-// asks for the instance's stdin. Any other fd is resolved through the fd
-// table like a read of it: the standard stream, file or pipe end it refers
-// to, and nil — no stream, which os/exec turns into the null device — when
-// the fd is closed or cannot be read. The fd of a socket asks for the
-// instance's stdin too. Caller holds w.mu.
-func (w *WasiStubs) childReaderLocked(fd int32) io.Reader {
-	if fd < 0 {
-		return w.stdin()
-	}
-	src, op := w.fdSrcLocked(fd)
-	if op.socket() {
-		return w.stdin()
-	}
-	return src
+// commandStream is a standard stream of a command Proc_spawn starts, as the
+// guest's descriptor for it resolves (commandStreamLocked): a descriptor
+// of the host (host), which the command is given its own open file
+// description of or shares (startCommand); a stream the runtime copies to
+// or from (reader for the stdin, writer for the stdout and stderr); or
+// none of them, the null device.
+type commandStream struct {
+	host   syscall.Conn
+	reader io.Reader
+	writer io.Writer
+	// socket marks a host descriptor that is a socket, which the runtime
+	// copies to or from: its open file description stays in the
+	// non-blocking mode the runtime uses it in.
+	socket bool
+	// nonblock is the guest's O_NONBLOCK of the descriptor, which an open
+	// file description of the command's own gets.
+	nonblock bool
+	// op is the guest's entry of the stream, nil for the instance's stream
+	// the guest names with -1.
+	op *wasiOpen
+	// stdio is the instance's standard stream (1/2/3, as wasiOpen.stdio)
+	// the stream is, 0 for none.
+	stdio int8
 }
 
-// childWriterLocked is the stdout/stderr counterpart of childReaderLocked;
-// inherited is the instance stream a negative fd asks for.
-func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
-	if fd < 0 {
-		return inherited
+// commandStreamLocked resolves the descriptor fd the guest gives a command
+// as its standard stream slot (1 for the stdin, 2 for the stdout, 3 for
+// the stderr). A negative fd asks for the instance's stream. Any other fd
+// is resolved through the fd table like a read (slot 1) or a write of it:
+// the standard stream, file, pipe end or socket it refers to, and none —
+// the null device — when the fd is closed or not open that way. A socket
+// is the host's socket (wasiSocket), or the connection of package net's
+// that has a descriptor of the host; any other socket stands for the
+// instance's stream. Caller holds w.mu.
+func (w *WasiStubs) commandStreamLocked(fd int32, slot int8) commandStream {
+	var stream any
+	var op *wasiOpen
+	switch {
+	case fd < 0:
+	case slot == 1:
+		stream, op = w.fdSrcLocked(fd)
+	default:
+		stream, op = w.fdDstLocked(fd)
 	}
-	dst, op := w.fdDstLocked(fd)
-	if op.socket() {
-		return inherited
+	if host := op.hostSocket(); host != nil {
+		return commandStream{host: host, socket: true, op: op}
 	}
-	return dst
+	if host, isHost := stream.(syscall.Conn); isHost && op.socket() {
+		return commandStream{host: host, socket: true, op: op}
+	}
+	if fd < 0 || op.socket() {
+		stream, op = [...]any{w.stdin(), w.stdout(), w.stderr()}[slot-1], nil
+	}
+	s := commandStream{op: op, stdio: slot}
+	if op != nil {
+		s.nonblock, s.stdio = op.nonblocking(), op.stdio
+	}
+	switch file, isFile := stream.(*os.File); {
+	case isFile:
+		s.host = file
+	case stream == nil:
+	case slot == 1:
+		s.reader = stream.(io.Reader)
+	default:
+		s.writer = stream.(io.Writer)
+	}
+	return s
 }
 
 // Pipe is a NON-STANDARD host import (module wasi_snapshot_preview1, name
@@ -3399,8 +3741,8 @@ func killFamilyProc(proc *wasiProc, sig int32) int32 {
 		return _wasiESUCCESS
 	case sig == 0:
 		return _wasiESUCCESS
-	case proc.cmd != nil:
-		return killHostProc(proc.cmd.Process, sig)
+	case proc.host != nil:
+		return killHostProc(proc.host, sig)
 	case proc.kill == nil:
 		return -_wasiEPERM
 	}
@@ -3431,6 +3773,25 @@ func killHostProc(p *os.Process, sig int32) int32 {
 // Proc_kill64 is Proc_kill for a memory64 guest.
 func (w *WasiStubs) Proc_kill64(m *Module, pid, sig int32) int32 {
 	return w.Proc_kill(m, pid, sig)
+}
+
+// hostCommand is a command startCommand started on the host: process is
+// its process, and wait waits for it to end and for what the runtime copies
+// from it to be delivered, and returns its wait status (waitStatusOf).
+type hostCommand struct {
+	process *os.Process
+	wait    func() int32
+}
+
+// waitStatusOf returns the wait status of a command whose wait returned st
+// and err: that of st (encodeWaitStatus), or a 127 exit when the wait
+// itself failed. A command that exits with a status other than 0, or is
+// killed, is no failure of the wait (exec.ExitError).
+func waitStatusOf(st *os.ProcessState, err error) int32 {
+	if exitErr := (*exec.ExitError)(nil); err != nil && !errors.As(err, &exitErr) {
+		return 127 << 8
+	}
+	return encodeWaitStatus(st)
 }
 
 // encodeWaitStatus turns a Go ProcessState into a POSIX wait status int (the
@@ -4977,6 +5338,7 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	w.endUnregistered()
 	w.mu.Lock()
 	dst, op := w.fdDstLocked(fd)
+	output := w.outputLockLocked(op, dst)
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nwritten is a __wasi_size_t.
@@ -5002,6 +5364,10 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 			return _wasiEPIPE
 		}
 		return _wasiEBADF
+	}
+	if output != nil {
+		output.Lock()
+		defer output.Unlock()
 	}
 	n, errno := w.writeFd("fd_write", op, dst, bufs, 0)
 	abi.putWord(nwrittenSlice, n)
@@ -6899,7 +7265,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		}
 		// The descriptor waits as any other does: the guest's NONBLOCK is
 		// its fdflags.
-		if err := clearHostNonblock(f); err != nil {
+		if err := setHostNonblock(f, false); err != nil {
 			return -1, mapOSError(errors.Join(err, f.Close()))
 		}
 	case isFIFO && flag&os.O_RDWR == 0:
@@ -7483,7 +7849,12 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			continue
 		}
 		if host := op.hostSocket(); host != nil {
-			// A socket of the host's is ready as poll(2) says.
+			// A socket of the host's is ready as poll(2) says, and for
+			// reading with input a command left of it (receiveAhead).
+			if pending, _ := op.aheadReady(); pending && ev.isRead {
+				ready[i], anyReady = true, true
+				continue
+			}
 			want := hostWantInput
 			if !ev.isRead {
 				want = hostWantRoom
@@ -8706,6 +9077,16 @@ const (
 	wasiMsgWaitAll int32 = 2 // wait until the buffer is full
 )
 
+// receiveAhead receives into bufs, for the socket op, the input a command
+// was given of it and did not read (giveAhead), which comes before what the
+// socket has, and returns how much: none when there is none. A receive with
+// peek leaves it there.
+func (op *wasiOpen) receiveAhead(bufs [][]byte, peek bool) uint64 {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	return op.copyAheadLocked(bufs, peek)
+}
+
 // socketReceive receives into bufs from the socket op, whose host socket
 // is host, as recv(2) does: once, a datagram cut to the buffers
 // (truncated), or, for a stream socket with wasiMsgWaitAll, until the
@@ -8725,8 +9106,13 @@ func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs
 	}
 	peek := flags&wasiMsgPeek != 0
 	waitAll := flags&wasiMsgWaitAll != 0 && !op.dgram && !peek
+	// Input a command left of the socket comes first; one that waits for
+	// all goes on to the socket for the rest.
+	got := int(op.receiveAhead(bufs, peek))
+	if got > 0 && (!waitAll || got == size) {
+		return uint64(got), false, _wasiESUCCESS
+	}
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
-	got := 0
 	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		start := got
 		if peek {

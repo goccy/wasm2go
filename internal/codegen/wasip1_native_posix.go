@@ -5,6 +5,7 @@ package codegen
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/syslog"
 	"math"
@@ -454,10 +455,11 @@ func makeHostFIFO(path string, perm os.FileMode) error {
 	return syscall.Mkfifo(path, uint32(perm.Perm()))
 }
 
-// withHostDescriptor calls use with the descriptor of f. The descriptor is
-// borrowed through SyscallConn rather than taken with Fd, which would
-// switch a pipe or terminal to blocking mode for good.
-func withHostDescriptor(f *os.File, use func(fd uintptr) error) error {
+// withHostDescriptor calls use with the descriptor of f, a file or socket
+// of the host. The descriptor is borrowed through SyscallConn rather than
+// taken with Fd, which would switch a pipe or terminal to blocking mode for
+// good.
+func withHostDescriptor(f syscall.Conn, use func(fd uintptr) error) error {
 	conn, err := f.SyscallConn()
 	if err != nil {
 		return err
@@ -475,9 +477,19 @@ func withHostDescriptor(f *os.File, use func(fd uintptr) error) error {
 // f, made close-on-exec while f's descriptor is borrowed and closed when
 // use returns: a call of use that waits holds no reference to f, whose
 // Close would wait for it.
-func withDuplicateDescriptor(f *os.File, use func(fd uintptr) error) error {
+func withDuplicateDescriptor(f syscall.Conn, use func(fd uintptr) error) error {
+	dup, err := duplicateDescriptor(f)
+	if err != nil {
+		return err
+	}
+	return errors.Join(use(uintptr(dup)), syscall.Close(dup))
+}
+
+// duplicateDescriptor returns a duplicate of the descriptor of f, made
+// close-on-exec while f's descriptor is borrowed (withHostDescriptor).
+func duplicateDescriptor(f syscall.Conn) (int, error) {
 	var dup int
-	if err := withHostDescriptor(f, func(fd uintptr) error {
+	err := withHostDescriptor(f, func(fd uintptr) error {
 		syscall.ForkLock.RLock()
 		defer syscall.ForkLock.RUnlock()
 		var err error
@@ -486,10 +498,8 @@ func withDuplicateDescriptor(f *os.File, use func(fd uintptr) error) error {
 		}
 		syscall.CloseOnExec(dup)
 		return nil
-	}); err != nil {
-		return err
-	}
-	return errors.Join(use(uintptr(dup)), syscall.Close(dup))
+	})
+	return dup, err
 }
 
 // withHostTerminal calls use with a duplicate of the descriptor of f
@@ -675,15 +685,17 @@ func (l *hostSyslogger) Close() error {
 	return err
 }
 
-// clearHostNonblock makes the descriptor of f, a file of the host, one
-// that waits (clears O_NONBLOCK). A File of another backend is left as it
-// is.
-func clearHostNonblock(f File) error {
+// setHostNonblock sets the O_NONBLOCK of the open file description of f, a
+// file of the host: with nonblock false, the descriptor waits. A File of
+// another backend is left as it is.
+func setHostNonblock(f File, nonblock bool) error {
 	file, isHost := f.(*os.File)
 	if !isHost {
 		return nil
 	}
-	return withHostDescriptor(file, func(fd uintptr) error { return syscall.SetNonblock(int(fd), false) })
+	return withHostDescriptor(file, func(fd uintptr) error {
+		return os.NewSyscallError("fcntl", syscall.SetNonblock(int(fd), nonblock))
+	})
 }
 
 // hostONonblock is the open flag of the host that opens a file without
@@ -1057,4 +1069,606 @@ func hostShutdown(fd int, how int32) error {
 		halves = syscall.SHUT_WR
 	}
 	return os.NewSyscallError("shutdown", syscall.Shutdown(fd, halves))
+}
+
+// ---- commands ----------------------------------------------------------
+
+// startCommand starts the command path with argv and env in dir (the host
+// process's directory when it is empty), its standard streams those of
+// streams, with syscall.StartProcess: os.StartProcess and os/exec take the
+// descriptor of each file with Fd, which turns a pipe or terminal the
+// runtime polls to blocking mode for good. Each host descriptor is borrowed
+// (withHostDescriptors) until the command has started. For a stream, the
+// command gets (commandSetup.add):
+//   - for a socket, the end of a pipe of the runtime's that it copies the
+//     socket to or from, whose open file description stays in the
+//     non-blocking mode the runtime uses it in;
+//   - the descriptor of a file whose O_NONBLOCK is the guest's
+//     (commandStream.nonblock), or of a regular file, directory or device
+//     that is no terminal, sharing its open file description as fork(2)
+//     does;
+//   - for a pipe, FIFO or terminal whose O_NONBLOCK is not the guest's, an
+//     open file description of its own with the guest's (commandFile); where
+//     the host gives none, the end of a pipe of the runtime's that it copies
+//     a pipe or FIFO to or from, and the terminal itself;
+//   - for a stream that is no file of the host, the end of a pipe of the
+//     runtime's that it copies the stream to or from (outputCopy, inputCopy);
+//   - the null device for none.
+//
+// A stdout and a stderr with one destination (sameDestination) are one
+// stream given twice, as os/exec gives one when Stdout is Stderr: what the
+// command writes to either keeps its order. The command's wait delivers
+// what it wrote before it returns, and gives the input the runtime took for
+// it and it did not read back.
+func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+	report := func(err error) { w.reportError("proc_spawn", err) }
+	var setup commandSetup
+	for i := range streams {
+		if i == 2 && sameDestination(&streams[1], &streams[2]) {
+			setup.conns[2] = setup.conns[1]
+			continue
+		}
+		if err := setup.add(i, &streams[i], share, report); err != nil {
+			return nil, errors.Join(err, setup.abandon())
+		}
+	}
+	var pid int
+	err := withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
+		var err error
+		pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: fds})
+		return err
+	})
+	if err != nil {
+		return nil, errors.Join(err, setup.abandon())
+	}
+	// FindProcess does not fail on a system of this file.
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return nil, errors.Join(err, setup.abandon())
+	}
+	for _, f := range setup.owned {
+		report(f.Close())
+	}
+	for _, c := range setup.outputs {
+		go c.run()
+	}
+	if setup.input != nil {
+		go setup.input.run()
+	}
+	return &hostCommand{process: p, wait: func() int32 {
+		st, err := p.Wait()
+		for _, c := range setup.outputs {
+			c.finish()
+		}
+		if setup.input != nil {
+			setup.input.finish()
+		}
+		return waitStatusOf(st, err)
+	}}, nil
+}
+
+// sameDestination reports whether a command's stdout a and stderr b go to
+// one destination: one entry of the guest's, one host descriptor or one
+// writer.
+func sameDestination(a, b *commandStream) bool {
+	switch {
+	case a.op != nil && a.op == b.op:
+		return true
+	case a.host != nil || b.host != nil:
+		return interfaceEqual(a.host, b.host)
+	case a.writer != nil:
+		return interfaceEqual(a.writer, b.writer)
+	}
+	return false
+}
+
+// interfaceEqual is a == b, and false where a and b hold values of one
+// type that is not comparable, whose comparison panics: as os/exec's
+// interfaceEqual, which decides that Stdout is Stderr so.
+func interfaceEqual(a, b any) (equal bool) {
+	defer func() {
+		// The panic of the comparison says only that the values cannot be
+		// compared: they are taken for different ones.
+		if recover() != nil {
+			equal = false
+		}
+	}()
+	return a == b
+}
+
+// commandSetup is what startCommand prepares for a command: conns are the
+// host descriptors it gets, by stream; owned the files opened for it, which
+// are closed once it has started; outputs and input the copies to make
+// while it runs, which a command that does not start leaves undone.
+type commandSetup struct {
+	conns   [3]syscall.Conn
+	owned   []*os.File
+	outputs []*outputCopy
+	input   *inputCopy
+}
+
+// add prepares stream i (0 the stdin, 1 the stdout, 2 the stderr), s, of
+// the command; see startCommand.
+func (c *commandSetup) add(i int, s *commandStream, share *familyStreams, report func(error)) error {
+	switch {
+	case s.socket:
+		return c.copyHost(i, s.host, "socket", s, report)
+	case s.host != nil:
+		f := s.host.(*os.File)
+		child, copied, err := commandFile(f, s.nonblock)
+		switch {
+		case err != nil:
+			return err
+		case child != nil:
+			c.give(i, child)
+			return nil
+		case !copied:
+			c.conns[i] = f
+			return nil
+		}
+		// A pipe or FIFO the host gives no description of its own of.
+		return c.copyHost(i, f, f.Name(), s, report)
+	case s.reader != nil:
+		// A stream of the embedder's or of a filesystem of its own: what
+		// the command does not read of it is lost, as with os/exec.
+		_, err := c.copyInput(s.reader, nil, s, nil, report)
+		return err
+	case s.writer != nil:
+		var lock *sync.Mutex
+		if s.stdio >= 2 {
+			lock = &share.output
+		}
+		return c.copyOutput(i, s.writer, nil, s, lock, report)
+	}
+	flag := os.O_WRONLY
+	if i == 0 {
+		flag = os.O_RDONLY
+	}
+	null, err := os.OpenFile(os.DevNull, flag, 0)
+	if err != nil {
+		return err
+	}
+	c.give(i, null)
+	return nil
+}
+
+// copyHost makes the command's stream i, s, a copy of the host descriptor
+// conn (named name): the runtime copies a duplicate of it, which the
+// guest's close leaves open, as the command's would be, and which the
+// copy's end closes. What the command leaves of its input goes back to the
+// guest's descriptor; the instance's stdin that is a file of the host
+// takes none, nor does a datagram socket, whose datagrams the copy has run
+// together.
+func (c *commandSetup) copyHost(i int, conn syscall.Conn, name string, s *commandStream, report func(error)) error {
+	dup, err := duplicateFile(conn, name)
+	if err != nil {
+		return err
+	}
+	if i > 0 {
+		return c.copyOutput(i, dup, dup, s, nil, report)
+	}
+	var back func([]byte)
+	if s.op != nil && !s.op.dgram {
+		back = s.op.giveAhead
+	}
+	in, err := c.copyInput(dup, dup, s, back, report)
+	if err != nil {
+		return err
+	}
+	in.srcFile = dup
+	return nil
+}
+
+// give makes f, opened for the command, its stream i.
+func (c *commandSetup) give(i int, f *os.File) {
+	c.conns[i] = f
+	c.owned = append(c.owned, f)
+}
+
+// copyOutput makes the command's stream i the write end of a pipe whose
+// read end the runtime copies to dst (outputCopy), under lock when it is
+// not nil; owned, when it is not nil, is closed once the copy ends.
+func (c *commandSetup) copyOutput(i int, dst io.Writer, owned io.Closer, s *commandStream, lock *sync.Mutex, report func(error)) error {
+	r, wr, err := os.Pipe()
+	if err != nil {
+		return errors.Join(err, closeIfAny(owned))
+	}
+	c.give(i, wr)
+	c.outputs = append(c.outputs, &outputCopy{src: r, dst: dst, owned: owned, lock: lock, report: report, done: make(chan struct{})})
+	return setHostNonblock(wr, s.nonblock)
+}
+
+// copyInput makes the command's stdin the read end of a pipe the runtime
+// copies src to (inputCopy), which it returns. What the command does not
+// read goes to back, when it is not nil; owned, when it is not nil, is
+// closed once the copy ends.
+func (c *commandSetup) copyInput(src io.Reader, owned io.Closer, s *commandStream, back func([]byte), report func(error)) (*inputCopy, error) {
+	r, wr, err := os.Pipe()
+	if err != nil {
+		return nil, errors.Join(err, closeIfAny(owned))
+	}
+	in := &inputCopy{src: src, dst: wr, owned: owned, back: back, report: report, done: make(chan struct{})}
+	c.input = in
+	// For back, the runtime keeps a read end of the pipe to take back what
+	// the command left (inputCopy.finish): the pipe's own when the command
+	// reads a description of its own (commandFile), a duplicate of it
+	// otherwise.
+	child, _, err := commandFile(r, s.nonblock)
+	switch {
+	case err != nil:
+		c.owned = append(c.owned, r)
+		return nil, err
+	case child != nil && back != nil:
+		c.give(0, child)
+		in.keep = r
+		return in, nil
+	case child != nil:
+		c.give(0, child)
+		c.owned = append(c.owned, r)
+		return in, nil
+	}
+	c.give(0, r)
+	if back != nil {
+		if in.keep, err = duplicateFile(r, r.Name()); err != nil {
+			return nil, err
+		}
+	}
+	return in, setHostNonblock(r, s.nonblock)
+}
+
+// abandon undoes what was prepared for a command that does not start.
+func (c *commandSetup) abandon() error {
+	var err error
+	for _, f := range c.owned {
+		err = errors.Join(err, f.Close())
+	}
+	for _, o := range c.outputs {
+		err = errors.Join(err, o.src.Close(), closeIfAny(o.owned))
+	}
+	if in := c.input; in != nil {
+		err = errors.Join(err, in.dst.Close(), closeIfAny(in.owned))
+		if in.keep != nil {
+			err = errors.Join(err, in.keep.Close())
+		}
+	}
+	return err
+}
+
+// closeIfAny closes c when there is one.
+func closeIfAny(c io.Closer) error {
+	if c == nil {
+		return nil
+	}
+	return c.Close()
+}
+
+// withHostDescriptors calls use with the descriptors of conns, each
+// borrowed as withHostDescriptor borrows it, all at once.
+func withHostDescriptors(conns []syscall.Conn, use func(fds []uintptr) error) error {
+	fds := make([]uintptr, 0, len(conns))
+	var from func(i int) error
+	from = func(i int) error {
+		if i == len(conns) {
+			return use(fds)
+		}
+		return withHostDescriptor(conns[i], func(fd uintptr) error {
+			fds = append(fds, fd)
+			return from(i + 1)
+		})
+	}
+	return from(0)
+}
+
+// duplicateFile returns a file named name of a duplicate of f's
+// descriptor (duplicateDescriptor), which shares its open file
+// description.
+func duplicateFile(f syscall.Conn, name string) (*os.File, error) {
+	dup, err := duplicateDescriptor(f)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(dup), name), nil
+}
+
+// commandFile returns what a command gets for f, a file of the host, whose
+// O_NONBLOCK the guest has as nonblock: nil for f itself, which shares f's
+// open file description, when f's O_NONBLOCK is the guest's or f is no
+// pipe, FIFO or terminal; otherwise a file of an open file description of
+// its own with the guest's O_NONBLOCK (hostReopen), as Linux gives a reopen
+// of /proc/self/fd (fs/pipe.c fifo_open, which opens either end of a pipe
+// without waiting when O_NONBLOCK asks it to). The write end of a pipe
+// nobody reads cannot be opened so (ENXIO): it is f itself, whose writes
+// fail without a reader whatever the mode. Where the host opens no such
+// description, copied reports that a pipe or FIFO is to be copied by the
+// runtime instead, and a terminal is f itself.
+func commandFile(f *os.File, nonblock bool) (child *os.File, copied bool, err error) {
+	reopened := -1
+	if err := withHostDescriptor(f, func(fd uintptr) error {
+		flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
+		if err != nil {
+			return os.NewSyscallError("fcntl", err)
+		}
+		if (flags&syscall.O_NONBLOCK != 0) == nonblock {
+			return nil
+		}
+		var st syscall.Stat_t
+		if err := syscall.Fstat(int(fd), &st); err != nil {
+			return os.NewSyscallError("fstat", err)
+		}
+		fifo := st.Mode&syscall.S_IFMT == syscall.S_IFIFO
+		if !fifo {
+			if st.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+				return nil
+			}
+			if reopens, err := hostReopensTerminal(fd); err != nil || !reopens {
+				return err
+			}
+		}
+		reopened, err = hostReopen(fd, flags&syscall.O_ACCMODE|syscall.O_NONBLOCK|syscall.O_NOCTTY)
+		switch {
+		case err == nil, fifo && errors.Is(err, syscall.ENXIO):
+			return nil
+		case errors.Is(err, errors.ErrUnsupported), errors.Is(err, fs.ErrNotExist):
+			copied = fifo
+			return nil
+		}
+		return err
+	}); err != nil || reopened < 0 {
+		return nil, copied, err
+	}
+	child = os.NewFile(uintptr(reopened), f.Name())
+	if err := setHostNonblock(child, nonblock); err != nil {
+		return nil, false, errors.Join(err, child.Close())
+	}
+	return child, false, nil
+}
+
+// hostIoctl makes the ioctl(2) req of fd with arg.
+func hostIoctl(fd, req uintptr, arg unsafe.Pointer) error {
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, req, uintptr(arg)); errno != 0 {
+		return os.NewSyscallError("ioctl", errno)
+	}
+	return nil
+}
+
+// outputCopy copies what a command writes to a pipe of the runtime's, read
+// from src, to dst, under lock when it is not nil (familyStreams.output),
+// until the pipe ends or finish asks it to stop. Its wait is the command's:
+// once the command has ended, what is in the pipe is delivered without
+// waiting for the writers it left behind (Go's os/exec waits for them, up
+// to Cmd.WaitDelay).
+type outputCopy struct {
+	src    *os.File
+	dst    io.Writer
+	owned  io.Closer
+	lock   *sync.Mutex
+	report func(error)
+	// ended records that the copy has stopped reading src. Guarded by mu.
+	mu    sync.Mutex
+	ended bool
+	done  chan struct{}
+}
+
+func (c *outputCopy) run() {
+	defer close(c.done)
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := c.src.Read(buf)
+		if n > 0 && !c.deliver(buf[:n]) {
+			break
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			c.drain()
+			break
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				c.report(err)
+			}
+			break
+		}
+	}
+	c.mu.Lock()
+	c.ended = true
+	c.mu.Unlock()
+	c.report(errors.Join(c.src.Close(), closeIfAny(c.owned)))
+}
+
+// deliver writes b to dst, and reports whether it was written.
+func (c *outputCopy) deliver(b []byte) bool {
+	if len(b) == 0 {
+		return true
+	}
+	if c.lock != nil {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+	}
+	if _, err := c.dst.Write(b); err != nil {
+		c.report(err)
+		return false
+	}
+	return true
+}
+
+// drain delivers what is in the pipe now (readAvailable).
+func (c *outputCopy) drain() {
+	data, err := readAvailable(c.src)
+	c.report(err)
+	c.deliver(data)
+}
+
+// readAvailable reads what is in the pipe whose read end f is now: as much
+// as FIONREAD counts (hostReadable), which a writer still writing cannot
+// make longer, and which a read in either mode returns without waiting.
+func readAvailable(f *os.File) ([]byte, error) {
+	var data []byte
+	err := withHostDescriptor(f, func(fd uintptr) error {
+		n, err := hostReadable(fd)
+		if err != nil {
+			return err
+		}
+		data = make([]byte, n)
+		got := 0
+		for got < n {
+			k, again, err := readvRaw(fd, [][]byte{data[got:]})
+			if err != nil {
+				return os.NewSyscallError("readv", err)
+			}
+			if again || k == 0 {
+				break
+			}
+			got += k
+		}
+		data = data[:got]
+		return nil
+	})
+	return data, err
+}
+
+// finish ends the copy of a command that has ended: a read deadline in the
+// past makes the read that waits return, and the copy drains the pipe.
+func (c *outputCopy) finish() {
+	c.mu.Lock()
+	if !c.ended {
+		if err := c.src.SetReadDeadline(time.Unix(0, 1)); err != nil {
+			c.report(err)
+		}
+	}
+	c.mu.Unlock()
+	<-c.done
+}
+
+// inputCopy copies src to a pipe of the runtime's, written to dst, whose
+// other end is a command's stdin, until src ends or the command does
+// (finish). What the copy took from src and the command did not read goes
+// to back, when it is not nil: what is left in the pipe, read through keep,
+// a read end of the runtime's, then what the copy could not write, and what
+// a read of src in progress returns. That read is ended when src is a
+// descriptor's duplicate in non-blocking mode (srcFile), at a read deadline
+// in the past; otherwise the runtime cannot end it, and finish does not
+// wait for it.
+type inputCopy struct {
+	src     io.Reader
+	srcFile *os.File
+	dst     *os.File
+	keep    *os.File
+	owned   io.Closer
+	back    func([]byte)
+	report  func(error)
+	// reading records that the copy is in a read of src; stopping that
+	// finish asks it to stop; settled that finish has given back what the
+	// command left, after which the copy gives back what it has itself;
+	// rest is what it had before. Guarded by mu.
+	mu                         sync.Mutex
+	reading, stopping, settled bool
+	rest                       []byte
+	done                       chan struct{}
+}
+
+func (c *inputCopy) run() {
+	defer close(c.done)
+	buf := make([]byte, 32<<10)
+	for {
+		c.mu.Lock()
+		if c.stopping {
+			c.mu.Unlock()
+			break
+		}
+		c.reading = true
+		c.mu.Unlock()
+		n, rerr := c.src.Read(buf)
+		c.mu.Lock()
+		c.reading = false
+		stopping := c.stopping
+		c.mu.Unlock()
+		if stopping {
+			c.giveBack(buf[:n])
+			if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, os.ErrDeadlineExceeded) {
+				c.report(rerr)
+			}
+			break
+		}
+		if k, err := c.dst.Write(buf[:n]); err != nil {
+			// The command has ended (finish's deadline) or closed its
+			// stdin (EPIPE): it did not get the rest.
+			c.giveBack(buf[k:n])
+			if !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, syscall.EPIPE) {
+				c.report(err)
+			}
+			break
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				c.report(rerr)
+			}
+			break
+		}
+	}
+	c.report(errors.Join(c.dst.Close(), closeIfAny(c.owned)))
+}
+
+// giveBack gives b back, or keeps it for finish to give back after what the
+// command left.
+func (c *inputCopy) giveBack(b []byte) {
+	if len(b) == 0 || c.back == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.settled {
+		c.rest = append(c.rest, b...)
+		return
+	}
+	c.back(slices.Clone(b))
+}
+
+// finish ends the copy for a command that has ended: a write deadline in
+// the past ends a write the command no longer reads, a read deadline in the
+// past a read of a descriptor's duplicate, and what the command left is
+// given back. A read the runtime cannot end is not waited for: one of a
+// stream of the embedder's, and one of a duplicate in blocking mode, which
+// takes no deadline (os.ErrNoDeadline).
+func (c *inputCopy) finish() {
+	c.mu.Lock()
+	c.stopping = true
+	reading := c.reading
+	c.mu.Unlock()
+	// A copy that has ended has closed dst and srcFile already: ErrClosed
+	// says there is nothing left to end.
+	if err := c.dst.SetWriteDeadline(time.Unix(0, 1)); err != nil && !errors.Is(err, os.ErrClosed) {
+		c.report(err)
+	}
+	if c.srcFile != nil {
+		switch err := c.srcFile.SetReadDeadline(time.Unix(0, 1)); {
+		case err == nil:
+			reading = false
+		case !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrNoDeadline):
+			c.report(err)
+		}
+	}
+	if !reading {
+		<-c.done
+	}
+	if c.keep == nil {
+		return
+	}
+	left, err := readAvailable(c.keep)
+	c.report(errors.Join(err, c.keep.Close()))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.settled = true
+	left = append(left, c.rest...)
+	c.rest = nil
+	if len(left) > 0 {
+		c.back(left)
+	}
+}
+
+// giveAhead puts b, input a command was given of the descriptor and did not
+// read, after the input taken out of the stream before (ahead), for the
+// guest's next read of it.
+func (op *wasiOpen) giveAhead(b []byte) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	op.ahead = append(op.ahead, b...)
 }

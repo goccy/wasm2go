@@ -174,6 +174,23 @@ isolated guest: such a `kill` fails with `ESRCH`. Signals reach the
 guest through `PostSignal`. `ForkProc` forks an instance that its
 parent waits for, under a pid token the fork knows as its own.
 
+`Fork` makes the instance the child of the guest's `fork`
+(`proc_fork`) runs in; a nil one fails it with `ENOSYS`. `CopyForker`
+copies the forking instance: its memory (into the Go heap, the whole
+memory at each fork), its globals, its memory's ceiling, its dropped
+data segments and the end of its data, with the parent's other
+imports. The child is
+a pseudo-process: its host state comes from `ForkProc` (the
+descriptors share their open file descriptions with the parent's), it
+runs on a goroutine of its own through the module's export
+`__wasip1_posix_extension_fork_child`, whose result is its exit
+status, and it has only the forking thread: as in a POSIX fork, a
+lock another thread held stays held in the child. A trap ends it as
+`SIGABRT` does and is told `Errors`. The parent waits for it, signals
+it and gets `SIGCHLD` as for any child. An embedder that wraps a
+`Forker` is called back with each child's status when it ends (every
+process of the fork family forks through the same `Forker`).
+
 `Process` also answers `getgroups` and makes the guest's `setuid`
 family, `setgroups` and `setpriority` changes; an isolated process is
 in no supplementary group, has the nice value 0 and changes nothing
