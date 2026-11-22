@@ -212,7 +212,7 @@ func TestWasi_ReadOnDirectoryIsEISDIR(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			w.fdsLocked()[9] = &wasiOpen{f: f}
+			w.setSlotLocked(9, &wasiOpen{f: f})
 			for _, c := range ioReadCalls {
 				if rc, n := c.run(w, m, 9, 1); rc != _wasiEISDIR || n != 0 {
 					t.Errorf("%s: rc=%d n=%d, want EISDIR 0", c.name, rc, n)
@@ -228,15 +228,15 @@ func TestWasi_IOErrorAfterTransferIsShortCount(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			w, m := newTestStubs(t, t.TempDir())
 			// a regular file, which a read fills every buffer of
-			w.fdsLocked()[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{4, nil}, {0, failure}}}, regular: true}
+			w.setSlotLocked(9, &wasiOpen{f: &scriptFile{steps: []ioStep{{4, nil}, {0, failure}}}, regular: true})
 			if rc, n := c.run(w, m, 9, 2); rc != _wasiESUCCESS || n != 4 {
 				t.Fatalf("error after a full buffer: rc=%d n=%d, want ESUCCESS 4", rc, n)
 			}
-			w.fdsLocked()[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{3, failure}}}}
+			w.setSlotLocked(9, &wasiOpen{f: &scriptFile{steps: []ioStep{{3, failure}}}})
 			if rc, n := c.run(w, m, 9, 2); rc != _wasiESUCCESS || n != 3 {
 				t.Fatalf("error with a short count: rc=%d n=%d, want ESUCCESS 3", rc, n)
 			}
-			w.fdsLocked()[9] = &wasiOpen{f: &scriptFile{steps: []ioStep{{0, failure}}}}
+			w.setSlotLocked(9, &wasiOpen{f: &scriptFile{steps: []ioStep{{0, failure}}}})
 			if rc, n := c.run(w, m, 9, 2); rc != _wasiEIO || n != 0 {
 				t.Fatalf("error with nothing transferred: rc=%d n=%d, want EIO 0", rc, n)
 			}
@@ -286,7 +286,7 @@ func TestWasi_SockIOErrorIsErrnoOnlyWhenNothingMoved(t *testing.T) {
 				{[]ioStep{{0, syscall.EPIPE}}, _wasiEPIPE, 0},
 			} {
 				binary.LittleEndian.PutUint32(m.memory[ioErrResult:], 0)
-				w.fdsLocked()[9] = &wasiOpen{conn: &scriptConn{script: scriptFile{steps: s.steps}}}
+				w.setSlotLocked(9, &wasiOpen{conn: &scriptConn{script: scriptFile{steps: s.steps}}})
 				if rc, n := c.call(w, m), readU32(m.memory, ioErrResult); rc != s.rc || n != s.n {
 					t.Errorf("%v: rc=%d n=%d, want %d %d", s.steps, rc, n, s.rc, s.n)
 				}
@@ -297,7 +297,7 @@ func TestWasi_SockIOErrorIsErrnoOnlyWhenNothingMoved(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
 	makeIovec(m, ioErrIov, ioErrBuf, 4)
 	binary.LittleEndian.PutUint32(m.memory[ioErrResult:], 7)
-	w.fdsLocked()[9] = &wasiOpen{conn: &scriptConn{script: scriptFile{steps: []ioStep{{0, io.EOF}}}}}
+	w.setSlotLocked(9, &wasiOpen{conn: &scriptConn{script: scriptFile{steps: []ioStep{{0, io.EOF}}}}})
 	if rc, n := w.Sock_recv(m, 9, ioErrIov, 1, 0, ioErrResult, ioErrResult+8), readU32(m.memory, ioErrResult); rc != _wasiESUCCESS || n != 0 {
 		t.Fatalf("EOF: rc=%d n=%d, want ESUCCESS 0", rc, n)
 	}
@@ -321,7 +321,7 @@ func TestWasi_SeekErrorIsTheHostError(t *testing.T) {
 			}
 		})
 	}
-	w.fdsLocked()[9] = &wasiOpen{f: r}
+	w.setSlotLocked(9, &wasiOpen{f: r})
 	if rc := w.Fd_seek(m, 9, 0, 0, ioErrResult); rc != _wasiESPIPE {
 		t.Errorf("Fd_seek on a pipe: rc=%d, want ESPIPE", rc)
 	}
@@ -330,7 +330,7 @@ func TestWasi_SeekErrorIsTheHostError(t *testing.T) {
 	}
 	// A socket cannot seek either; a descriptor that is not there is
 	// EBADF.
-	w.fdsLocked()[10] = &wasiOpen{isSocket: true}
+	w.setSlotLocked(10, &wasiOpen{isSocket: true})
 	for fd, want := range map[int32]int32{10: _wasiESPIPE, 11: _wasiEBADF} {
 		if rc := w.Fd_seek(m, fd, 0, 0, ioErrResult); rc != want {
 			t.Errorf("Fd_seek(%d): rc=%d, want %d", fd, rc, want)
@@ -386,7 +386,7 @@ func TestWasi_StreamReadReturnsWhatHasArrived(t *testing.T) {
 					case "conn":
 						c1, c2 := net.Pipe()
 						peer, own = c1, c2
-						w.fdsLocked()[fd] = &wasiOpen{conn: c2}
+						w.setSlotLocked(fd, &wasiOpen{conn: c2})
 					default:
 						r, pw, err := os.Pipe()
 						if err != nil {
@@ -396,7 +396,7 @@ func TestWasi_StreamReadReturnsWhatHasArrived(t *testing.T) {
 						if src == "stdin" {
 							w.cfg.Stdin, fd = r, 0
 						} else {
-							w.fdsLocked()[fd] = &wasiOpen{f: r}
+							w.setSlotLocked(fd, &wasiOpen{f: r})
 						}
 					}
 					t.Cleanup(func() {
@@ -468,10 +468,10 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 		}
 	})
 	accepted := newShutConn(t, false)
-	w.fdsLocked()[9] = &wasiOpen{isSocket: true}
-	w.fdsLocked()[10] = &wasiOpen{f: &scriptFile{}}
-	w.fdsLocked()[12] = &wasiOpen{conn: accepted}
-	w.fdsLocked()[13] = &wasiOpen{isSocket: true, listener: l}
+	w.setSlotLocked(9, &wasiOpen{isSocket: true})
+	w.setSlotLocked(10, &wasiOpen{f: &scriptFile{}})
+	w.setSlotLocked(12, &wasiOpen{conn: accepted})
+	w.setSlotLocked(13, &wasiOpen{isSocket: true, listener: l})
 	makeIovec(m, ioErrIov, ioErrBuf, 4)
 	for _, c := range []struct{ fd, recv, send int32 }{
 		{9, _wasiENOTCONN, _wasiEPIPE},
@@ -525,7 +525,7 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.fdsLocked()[15] = &wasiOpen{isSocket: true, listener: l2}
+	w.setSlotLocked(15, &wasiOpen{isSocket: true, listener: l2})
 	accept := make(chan int32, 1)
 	go func() { accept <- w.Sock_accept(m, 15, 0, ioErrResult) }()
 	// Give the accept time to wait.
@@ -559,7 +559,7 @@ func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 
 	// A seek error without a number is EINVAL, a tell error without one
 	// EIO.
-	w.fdsLocked()[14] = &wasiOpen{f: seekFailFile{}}
+	w.setSlotLocked(14, &wasiOpen{f: seekFailFile{}})
 	if rc := w.Fd_seek(m, 14, 0, 0, ioErrResult); rc != _wasiEINVAL {
 		t.Errorf("Fd_seek whose Seek fails: rc=%d, want EINVAL", rc)
 	}
@@ -685,7 +685,7 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 				if waiting {
 					conn = &readEndsConn{Conn: c2, finished: finished}
 				}
-				w.fdsLocked()[9] = &wasiOpen{conn: conn}
+				w.setSlotLocked(9, &wasiOpen{conn: conn})
 				shutdown := func() {
 					if rc := w.Sock_shutdown(m, 9, 0x1); rc != _wasiESUCCESS {
 						t.Errorf("Sock_shutdown rc=%d", rc)
@@ -728,7 +728,7 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 	} {
 		conn := newShutConn(t, false)
 		w, m := newTestStubs(t, t.TempDir())
-		w.fdsLocked()[9] = &wasiOpen{conn: conn}
+		w.setSlotLocked(9, &wasiOpen{conn: conn})
 		var wg sync.WaitGroup
 		for range 2 {
 			wg.Add(1)
@@ -760,7 +760,7 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 
 	conn := newShutConn(t, false)
 	w, m := newTestStubs(t, t.TempDir())
-	w.fdsLocked()[9] = &wasiOpen{conn: conn}
+	w.setSlotLocked(9, &wasiOpen{conn: conn})
 	for _, how := range []int32{0, 0x4, 0x7} {
 		if rc := w.Sock_shutdown(m, 9, how); rc != _wasiEINVAL {
 			t.Errorf("Sock_shutdown how %#x: rc=%d, want EINVAL", how, rc)
@@ -776,7 +776,7 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 			conn.release = make(chan struct{})
 		}
 		w, m := newTestStubs(t, t.TempDir())
-		w.fdsLocked()[9] = &wasiOpen{conn: conn}
+		w.setSlotLocked(9, &wasiOpen{conn: conn})
 		shut := make(chan int32, 1)
 		go func() { shut <- w.Sock_shutdown(m, 9, 0x3) }()
 		if during {
@@ -812,8 +812,8 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 
 	// Only a connected socket can be shut down.
 	w, m = newTestStubs(t, t.TempDir())
-	w.fdsLocked()[9] = &wasiOpen{isSocket: true}
-	w.fdsLocked()[10] = &wasiOpen{f: &scriptFile{}}
+	w.setSlotLocked(9, &wasiOpen{isSocket: true})
+	w.setSlotLocked(10, &wasiOpen{f: &scriptFile{}})
 	for fd, want := range map[int32]int32{9: _wasiENOTCONN, 10: _wasiENOTSOCK, 11: _wasiEBADF} {
 		if rc := w.Sock_shutdown(m, fd, 0x3); rc != want {
 			t.Errorf("Sock_shutdown(%d): rc=%d, want %d", fd, rc, want)

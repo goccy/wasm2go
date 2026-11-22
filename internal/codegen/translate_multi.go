@@ -84,6 +84,8 @@ func scanStdlibRefs(decls []ast.Decl) []string {
 		// &atomic.Uint64{}) in whichever package hosts the constructor.
 		"sync":   "sync",
 		"atomic": "sync/atomic",
+		// forkModule clones the dropped data segments (slices.Clone).
+		"slices": "slices",
 	}
 	used := map[string]bool{}
 	for _, d := range decls {

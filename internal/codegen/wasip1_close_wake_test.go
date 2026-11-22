@@ -94,9 +94,11 @@ func TestWasi_CloseWakesWaitsOnceClosed(t *testing.T) {
 	}
 }
 
-// A renumbering wakes the waits in poll(2) for the number it takes the
-// descriptor from, which leaves the table.
-func TestWasi_RenumberWakesWaitsOfTheOldNumber(t *testing.T) {
+// Only the clearing of a descriptor's last slot wakes the waits in poll(2)
+// for it: a renumbering, a close of a duplicate, and a forked instance's
+// closing of the slots it inherited leave the descriptor open, and its
+// waits waiting.
+func TestWasi_OnlyTheLastSlotWakesWaits(t *testing.T) {
 	if !hostPolls {
 		t.Skip("the host has no poll(2)")
 	}
@@ -117,14 +119,70 @@ func TestWasi_RenumberWakesWaitsOfTheOldNumber(t *testing.T) {
 		t.Fatal(err)
 	}
 	op.addWaiter(wk)
+	if rc := w.Fd_dup(m, fd, 900); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_dup rc=%d", rc)
+	}
+	dup := int32(readU32(m.memory, 900))
 	if rc := w.Fd_renumber(m, fd, 40); rc != _wasiESUCCESS {
 		t.Fatalf("Fd_renumber rc=%d", rc)
 	}
+	if woken(t, wk) {
+		t.Fatal("a renumbering woke the wait")
+	}
+	child := w.Fork()
+	if rc := child.Fd_closefrom(newForkTestModule(), 0); rc != _wasiESUCCESS {
+		t.Fatalf("the child's Fd_closefrom rc=%d", rc)
+	}
+	if err := child.CloseAll(); err != nil {
+		t.Fatalf("the child's CloseAll: %v", err)
+	}
+	if woken(t, wk) {
+		t.Fatal("the child's closing of its slots woke the parent's wait")
+	}
+	if rc := w.Fd_close(m, 40); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_close rc=%d", rc)
+	}
+	if woken(t, wk) {
+		t.Fatal("the close of a duplicate woke the wait")
+	}
+	if rc := w.Fd_close(m, dup); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_close of the last slot rc=%d", rc)
+	}
 	if !woken(t, wk) {
-		t.Fatal("the wait for the old number was not woken")
+		t.Fatal("the close of the last slot did not wake the wait")
 	}
 	if err := w.giveWake(wk, []hostWaitFD{{op: op}}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Clearing a slot clears its close-on-exec mark, whichever call clears it.
+func TestWasi_ClearedSlotsAreNotCloseOnExec(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		clear func(w *WasiStubs, m *Module, fd int32) int32
+	}{
+		{"fd_close", func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_close(m, fd) }},
+		{"fd_closefrom", func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_closefrom(m, fd) }},
+		{"fd_renumber", func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_renumber(m, fd, fd+1) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w, m := newTestStubs(t, t.TempDir())
+			closeAllAtCleanup(t, w)
+			fd := pipeSlot(t, w, false)
+			if rc := w.Fd_cloexec(m, fd, 1, 1, 900); rc != _wasiESUCCESS {
+				t.Fatalf("Fd_cloexec rc=%d", rc)
+			}
+			if rc := c.clear(w, m, fd); rc != _wasiESUCCESS {
+				t.Fatalf("%s rc=%d", c.name, rc)
+			}
+			w.mu.Lock()
+			marked := w.cloexec[fd]
+			w.mu.Unlock()
+			if marked {
+				t.Errorf("%s left fd %d close-on-exec", c.name, fd)
+			}
+		})
 	}
 }
 

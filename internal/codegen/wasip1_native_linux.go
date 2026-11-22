@@ -137,6 +137,52 @@ func hostFDLink(fd uintptr) (string, bool, error) {
 	return target, true, nil
 }
 
+// hostReopen opens descriptor fd of the host process again with flags,
+// through /proc/self/fd/fd: a new open file description of the same file
+// (close-on-exec). A system without /proc gives fs.ErrNotExist.
+func hostReopen(fd uintptr, flags int) (int, error) {
+	path := "/proc/self/fd/" + strconv.FormatUint(uint64(fd), 10)
+	reopened, err := syscall.Open(path, flags|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	return reopened, nil
+}
+
+// hostReopensTerminal reports whether fd is a terminal a command is given
+// an open file description of its own of (commandFile): one that is not
+// the master of a pseudo-terminal, whose open makes a new pseudo-terminal
+// (TIOCGPTN answers only on a master). An ioctl that fails otherwise than
+// for a descriptor of another kind returns its error.
+func hostReopensTerminal(fd uintptr) (bool, error) {
+	var termios syscall.Termios
+	if err := hostIoctl(fd, syscall.TCGETS, unsafe.Pointer(&termios)); err != nil {
+		return false, unlessOtherKind(err)
+	}
+	var n uint32
+	if err := hostIoctl(fd, syscall.TIOCGPTN, unsafe.Pointer(&n)); err != nil {
+		return true, unlessOtherKind(err)
+	}
+	return false, nil
+}
+
+// unlessOtherKind returns err of an ioctl, but nil for its refusal by a
+// descriptor of another kind than the request is for (ENOTTY, EINVAL).
+func unlessOtherKind(err error) error {
+	if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
+		return nil
+	}
+	return err
+}
+
+// hostReadable returns the number of bytes that can be read from fd, a
+// pipe, without waiting (FIONREAD).
+func hostReadable(fd uintptr) (int, error) {
+	var n int32
+	err := hostIoctl(fd, syscall.TIOCINQ, unsafe.Pointer(&n))
+	return int(n), err
+}
+
 // readHostUmask returns the file mode creation mask of the host process,
 // from /proc/thread-self/status.
 func readHostUmask() (os.FileMode, error) {
@@ -367,4 +413,14 @@ func hostSocketPairFDs(typ int) ([2]int, error) {
 func hostAcceptFD(fd int) (int, error) {
 	conn, _, err := syscall.Accept4(fd, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
 	return conn, os.NewSyscallError("accept4", err)
+}
+
+// hostSyscall makes the guest's system call of the number (HostSyscalls) as
+// the host's call of its name (hostSyscallNumber).
+func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	n, ok := hostSyscallNumber(number)
+	if !ok {
+		return 0, syscall.ENOSYS
+	}
+	return hostRawSyscall(n, args, ptrs, mem)
 }

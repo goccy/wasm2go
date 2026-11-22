@@ -255,6 +255,12 @@
   (import "wasip1_posix_extension" "ipc_shmdt"
     (func $ipc_shmdt (param i64) (result i32)))
 
+  (import "wasip1_posix_extension" "sys_syscall"
+    (func $sys_syscall (param i64 i64 i32 i32 i64) (result i32)))
+
+  (import "wasip1_posix_extension" "proc_fork"
+    (func $proc_fork (param i64) (result i32)))
+
   (memory (export "memory") i64 1)
 
   (func (export "touch")
@@ -383,5 +389,9 @@
     (drop (call $ipc_msgrcv (i32.const 0) (i64.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $ipc_shmat (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
     (drop (call $ipc_shmdt (i64.const 0)))
+
+    (drop (call $sys_syscall (i64.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
+
+    (drop (call $proc_fork (i64.const 0)))
   )
 )

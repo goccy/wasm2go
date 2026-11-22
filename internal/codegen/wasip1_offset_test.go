@@ -58,7 +58,7 @@ func openDataFile(t *testing.T, w *WasiStubs, fsys FS) File {
 		t.Fatal(err)
 	}
 	w.cfg.FS = fsys
-	w.fdsLocked()[9] = &wasiOpen{f: f}
+	w.setSlotLocked(9, &wasiOpen{f: f})
 	return f
 }
 
@@ -282,7 +282,7 @@ func TestWasi_MemFSFileLargerThanLimit(t *testing.T) {
 				}
 			})
 			w.cfg.FS = fsys
-			w.fdsLocked()[9] = &wasiOpen{f: f}
+			w.setSlotLocked(9, &wasiOpen{f: f})
 			for _, c := range []struct {
 				offset int64
 				whence int32

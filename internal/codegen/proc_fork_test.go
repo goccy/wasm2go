@@ -52,9 +52,9 @@ func newTestPipe(t *testing.T, w *WasiStubs, m *Module) (readFd, writeFd int32) 
 	return int32(readU32(m.memory, int(out))), int32(readU32(m.memory, int(out)+4))
 }
 
-// extraRefs returns the number of extra table slots referring to the entry
-// behind fd.
-func extraRefs(t *testing.T, w *WasiStubs, fd int32) int32 {
+// slotRefs returns the number of table slots, of every instance, that hold
+// the entry behind fd.
+func slotRefs(t *testing.T, w *WasiStubs, fd int32) int32 {
 	t.Helper()
 	w.mu.Lock()
 	op := w.fdTable[fd]
@@ -201,8 +201,8 @@ func TestWasi_ForkDupSlotsCloseLast(t *testing.T) {
 
 	child := w.Fork()
 	cm := newForkTestModule()
-	if got := extraRefs(t, w, writeFd); got != 3 {
-		t.Fatalf("extra references = %d, want 3 (four slots)", got)
+	if got := slotRefs(t, w, writeFd); got != 4 {
+		t.Fatalf("slots = %d, want 4", got)
 	}
 
 	closes := []struct {
@@ -281,8 +281,8 @@ func TestWasi_CloseAll(t *testing.T) {
 	if len(child.fdTable) != 0 {
 		t.Errorf("child still has %d fds", len(child.fdTable))
 	}
-	if got := extraRefs(t, w, readFd) + extraRefs(t, w, writeFd); got != 0 {
-		t.Errorf("extra references left = %d, want 0", got)
+	if got := slotRefs(t, w, readFd) + slotRefs(t, w, writeFd); got != 2 {
+		t.Errorf("slots left = %d, want 2, the parent's", got)
 	}
 	if rc := fdWriteString(w, m, writeFd, "ok"); rc != _wasiESUCCESS {
 		t.Fatalf("parent write rc=%d", rc)

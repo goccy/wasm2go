@@ -100,6 +100,10 @@ var posixImports = map[string]bool{
 	"ipc_semop":  true,
 	"ipc_shmat":  true,
 	"ipc_shmdt":  true,
+
+	"sys_syscall": true,
+
+	"proc_fork": true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that

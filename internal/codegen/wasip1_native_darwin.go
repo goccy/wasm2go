@@ -53,6 +53,25 @@ func chmodRefused(err error) bool {
 // host process: /dev/fd/N of this system is no link.
 func hostFDLink(fd uintptr) (string, bool, error) { return "", false, nil }
 
+// hostReopen would open descriptor fd again as a new open file
+// description, which this system has no way to (no /proc/self/fd).
+func hostReopen(fd uintptr, flags int) (int, error) { return -1, errors.ErrUnsupported }
+
+// hostReopensTerminal: no terminal is opened again here (hostReopen).
+func hostReopensTerminal(fd uintptr) (bool, error) { return false, nil }
+
+// hostFIONREAD is FIONREAD, _IOR('f', 127, int): package syscall names it
+// for no darwin architecture.
+const hostFIONREAD = 0x4004667f
+
+// hostReadable returns the number of bytes that can be read from fd, a
+// pipe, without waiting (FIONREAD).
+func hostReadable(fd uintptr) (int, error) {
+	var n int32
+	err := hostIoctl(fd, hostFIONREAD, unsafe.Pointer(&n))
+	return int(n), err
+}
+
 // readHostUmask returns the file mode creation mask of the host process,
 // which this system has no way to read without changing it:
 // errors.ErrUnsupported.
@@ -279,4 +298,62 @@ func socketFDMade(fd int) error {
 		return errors.Join(os.NewSyscallError("fcntl", err), hostCloseFD(fd))
 	}
 	return nil
+}
+
+// hostSyscall makes the guest's system call of the number (HostSyscalls),
+// of the two whose arguments darwin's calls take as the Linux ABI gives
+// them: gettimeofday(2), whose third argument of darwin's (where to store
+// mach_absolute_time) is null, and getrandom(2), made by getentropy(2)
+// (hostGetrandom). Every other call fails with ENOSYS.
+func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	switch number {
+	case linuxSysGettimeofday:
+		return hostRawSyscall(syscall.SYS_GETTIMEOFDAY, [6]uint64{args[0], args[1]}, ptrs&0b11, mem)
+	case linuxSysGetrandom:
+		return hostGetrandom(args, ptrs, mem)
+	}
+	return 0, syscall.ENOSYS
+}
+
+// The flags of getrandom(2), Linux's (include/uapi/linux/random.h), which
+// darwin has no constants of.
+const (
+	linuxGrndNonblock = 0x1
+	linuxGrndRandom   = 0x2
+	linuxGrndInsecure = 0x4
+)
+
+// darwin's getentropy(2) (bsd/kern/syscalls.master), and the most bytes it
+// gives a call (its manual page), which package syscall has no constants
+// of.
+const (
+	hostSysGetentropy = 500
+	hostGetentropyMax = 256
+)
+
+// hostGetrandom makes Linux's getrandom(buf, buflen, flags) by darwin's
+// getentropy(2), which does not block once the system has booted, so every
+// flag Linux takes asks for what it gives. As Linux does, it fails with
+// EINVAL for any other flag and for GRND_RANDOM with GRND_INSECURE, and
+// returns buflen; EFAULT for a buffer not all in the guest's memory.
+func hostGetrandom(args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	buf, n, flags := args[0], args[1], args[2]
+	if flags&^(linuxGrndNonblock|linuxGrndRandom|linuxGrndInsecure) != 0 ||
+		flags&(linuxGrndRandom|linuxGrndInsecure) == linuxGrndRandom|linuxGrndInsecure {
+		return 0, syscall.EINVAL
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if ptrs&1 == 0 || buf > uint64(len(mem)) || n > uint64(len(mem))-buf {
+		return 0, syscall.EFAULT
+	}
+	for done := uint64(0); done < n; {
+		chunk := min(n-done, hostGetentropyMax)
+		if _, err := hostRawSyscall(hostSysGetentropy, [6]uint64{buf + done, chunk}, 0b1, mem); err != nil {
+			return 0, err
+		}
+		done += chunk
+	}
+	return int64(n), nil
 }
