@@ -185,6 +185,7 @@ func TestWasi_BlockingWriteWaitsForRoomAndIsEndedByASignal(t *testing.T) {
 func TestWasi_WriteToAClosedPipeIsEPIPE(t *testing.T) {
 	skipWithoutStreamWrites(t)
 	w, m := newProcTestStubs(t)
+	ignoreSIGPIPE(t, w, m)
 	readFd, writeFd := newTestPipe(t, w, m)
 	if rc := w.Fd_close(m, readFd); rc != _wasiESUCCESS {
 		t.Fatalf("close the read end rc=%d", rc)
@@ -205,6 +206,48 @@ func TestWasi_WriteToAClosedPipeIsEPIPE(t *testing.T) {
 	wantUserdata(t, pollUserdata(t, w, m, 1), 7)
 	if errno := binary.LittleEndian.Uint16(m.memory[pollEvOff+8:]); errno != uint16(_wasiEPIPE) {
 		t.Fatalf("the event for reading the write end has errno %d, want EPIPE", errno)
+	}
+}
+
+// A write to a pipe whose reader is gone raises SIGPIPE, as the kernel
+// sends it with EPIPE: a guest that has not registered for signals ends of
+// it at the write, one that handles it gets EPIPE and the signal, one that
+// ignores it gets EPIPE alone.
+func TestSignal_WriteToAClosedPipeRaisesSIGPIPE(t *testing.T) {
+	skipWithoutStreamWrites(t)
+	closedPipe := func(w *WasiStubs, m *Module) int32 {
+		readFd, writeFd := newTestPipe(t, w, m)
+		if rc := w.Fd_close(m, readFd); rc != _wasiESUCCESS {
+			t.Fatalf("close the read end rc=%d", rc)
+		}
+		return writeFd
+	}
+	w, m := newProcTestStubs(t)
+	fd := closedPipe(w, m)
+	if sig := killEnd(func() { ioWriteCalls[0].run(w, m, fd, 1) }); sig != wasiSIGPIPE {
+		t.Fatalf("the write ended the guest by %d, want SIGPIPE", sig)
+	}
+
+	w, m = newSignalGuest(t, wasiSIGPIPE)
+	fd = closedPipe(w, m)
+	if rc, n := ioWriteCalls[0].run(w, m, fd, 1); rc != _wasiEPIPE || n != 0 {
+		t.Fatalf("write of a guest that handles SIGPIPE: rc=%d n=%d, want EPIPE 0", rc, n)
+	}
+	if signalFlag(m) == 0 {
+		t.Fatal("the flag word was not raised")
+	}
+	if got := takeSignals(t, w, m); got != signalMask(wasiSIGPIPE) {
+		t.Fatalf("pending signals %#x, want SIGPIPE", got)
+	}
+
+	w, m = newSignalGuest(t)
+	setDispositions(t, w, m, 0, signalMask(wasiSIGPIPE), 0)
+	fd = closedPipe(w, m)
+	if rc, _ := ioWriteCalls[0].run(w, m, fd, 1); rc != _wasiEPIPE {
+		t.Fatalf("write of a guest that ignores SIGPIPE: rc=%d, want EPIPE", rc)
+	}
+	if got := takeSignals(t, w, m); got != 0 {
+		t.Fatalf("pending signals %#x, want none", got)
 	}
 }
 

@@ -523,6 +523,50 @@ func TestSocket_Pairs(t *testing.T) {
 	}
 }
 
+// A write or send on a socket of the host's whose peer is gone raises
+// SIGPIPE with EPIPE, as the kernel does; a send with MSG_NOSIGNAL
+// (wasiMsgNoSignal) gets EPIPE alone.
+func TestSocket_BrokenConnectionRaisesSIGPIPE(t *testing.T) {
+	w, m, _ := newSocketStubs(t)
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	setDispositions(t, w, m, signalMask(wasiSIGPIPE), 0, 0)
+	if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, sockFdsOff); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_socketpair rc=%d", rc)
+	}
+	a, b := int32(readU32(m.memory, int(sockFdsOff))), int32(readU32(m.memory, int(sockFdsOff)+4))
+	if rc := w.Fd_close(m, b); rc != _wasiESUCCESS {
+		t.Fatalf("close of the peer rc=%d", rc)
+	}
+	copy(m.memory[sockBufOff:], "x")
+	makeIovec(m, sockIovOff, sockBufOff, 1)
+	for _, c := range []struct {
+		name   string
+		signal bool
+		call   func() int32
+	}{
+		{"Fd_write", true, func() int32 { return w.Fd_write(m, a, sockIovOff, 1, sockLenOff) }},
+		{"Sock_send", true, func() int32 { return w.Sock_send(m, a, sockIovOff, 1, 0, sockLenOff) }},
+		{"Sock_send with MSG_NOSIGNAL", false, func() int32 { return w.Sock_send(m, a, sockIovOff, 1, wasiMsgNoSignal, sockLenOff) }},
+		{"Sock_sendto_addr", true, func() int32 { return -w.Sock_sendto_addr(m, a, sockBufOff, 1, 0, 0, 0, 0, sockLenOff) }},
+		{"Sock_sendto_addr with MSG_NOSIGNAL", false, func() int32 {
+			return -w.Sock_sendto_addr(m, a, sockBufOff, 1, wasiMsgNoSignal, 0, 0, 0, sockLenOff)
+		}},
+	} {
+		if rc := c.call(); rc != _wasiEPIPE {
+			t.Fatalf("%s: rc=%d, want EPIPE", c.name, rc)
+		}
+		want := uint64(0)
+		if c.signal {
+			want = signalMask(wasiSIGPIPE)
+		}
+		if got := takeSignals(t, w, m); got != want {
+			t.Fatalf("%s: pending signals %#x, want %#x", c.name, got, want)
+		}
+	}
+}
+
 // A socket is ready in poll_oneoff as poll(2) says.
 func TestSocket_Poll(t *testing.T) {
 	w, m, _ := newSocketStubs(t)

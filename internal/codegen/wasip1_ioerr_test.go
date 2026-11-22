@@ -272,6 +272,7 @@ func TestWasi_SockIOErrorIsErrnoOnlyWhenNothingMoved(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w, m := newTestStubs(t, t.TempDir())
+			ignoreSIGPIPE(t, w, m)
 			for i := int32(0); i < 2; i++ {
 				makeIovec(m, ioErrIov+i*8, ioErrBuf+i*4, 4)
 			}
@@ -448,6 +449,51 @@ type seekFailFile struct{ File }
 
 func (seekFailFile) Seek(int64, int) (int64, error) { return 0, errors.New("cannot seek") }
 
+// A write or send that fails with EPIPE raises SIGPIPE, of a socket without
+// a connection as of one whose peer is gone; a send with MSG_NOSIGNAL
+// (wasiMsgNoSignal) gets EPIPE alone.
+func TestSignal_BrokenConnectionRaisesSIGPIPE(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		call func(w *WasiStubs, m *Module) int32
+	}{
+		{"Fd_write", func(w *WasiStubs, m *Module) int32 {
+			rc, _ := ioWriteCalls[0].run(w, m, 9, 1)
+			return rc
+		}},
+		{"Sock_send", func(w *WasiStubs, m *Module) int32 {
+			return w.Sock_send(m, 9, ioErrIov, 1, 0, ioErrResult)
+		}},
+	} {
+		for _, entry := range []func() *wasiOpen{
+			func() *wasiOpen { return &wasiOpen{isSocket: true} },
+			func() *wasiOpen {
+				return &wasiOpen{conn: &scriptConn{script: scriptFile{steps: []ioStep{{0, syscall.EPIPE}}}}}
+			},
+		} {
+			w, m := newSignalGuest(t, wasiSIGPIPE)
+			makeIovec(m, ioErrIov, ioErrBuf, 4)
+			w.setSlotLocked(9, entry())
+			if rc := c.call(w, m); rc != _wasiEPIPE {
+				t.Fatalf("%s: rc=%d, want EPIPE", c.name, rc)
+			}
+			if got := takeSignals(t, w, m); got != signalMask(wasiSIGPIPE) {
+				t.Fatalf("%s: pending signals %#x, want SIGPIPE", c.name, got)
+			}
+			if c.name != "Sock_send" {
+				continue
+			}
+			w.setSlotLocked(9, entry())
+			if rc := w.Sock_send(m, 9, ioErrIov, 1, wasiMsgNoSignal, ioErrResult); rc != _wasiEPIPE {
+				t.Fatalf("Sock_send with MSG_NOSIGNAL: rc=%d, want EPIPE", rc)
+			}
+			if got := takeSignals(t, w, m); got != 0 {
+				t.Fatalf("Sock_send with MSG_NOSIGNAL: pending signals %#x, want none", got)
+			}
+		}
+	}
+}
+
 // A socket call on a descriptor that is not open is EBADF, on one that is
 // not a socket (a preopened directory included) ENOTSOCK; on a socket
 // without a connection a receive or read is ENOTCONN and a send or write
@@ -458,6 +504,7 @@ func (seekFailFile) Seek(int64, int) (int64, error) { return 0, errors.New("cann
 // waits with EINVAL.
 func TestWasi_SocketCallsOnDescriptorsWithoutAConnection(t *testing.T) {
 	w, m := newTestStubs(t, t.TempDir())
+	ignoreSIGPIPE(t, w, m)
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -727,6 +774,7 @@ func TestWasi_TransferAfterShutdown(t *testing.T) {
 	} {
 		conn := newShutConn(t, false)
 		w, m := newTestStubs(t, t.TempDir())
+		ignoreSIGPIPE(t, w, m)
 		w.setSlotLocked(9, &wasiOpen{conn: conn})
 		var wg sync.WaitGroup
 		for range 2 {
