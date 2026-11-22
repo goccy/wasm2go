@@ -1,0 +1,160 @@
+//go:build linux && !386 && !arm && !mips && !mipsle && !mips64 && !mips64le && !ppc64 && !ppc64le && !s390x
+
+package {{.Pkg}}
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"runtime"
+	"strings"
+	"syscall"
+	"unsafe"
+)
+
+// Copy-on-write forks of linear memory, on the architectures of Linux whose
+// mmap takes its arguments in registers and whose memfd_create is
+// asm-generic's or x86-64's. The constraint names the other architectures:
+// the gcasm capture and bundle drop a file whose constraint names amd64 or
+// arm64.
+
+// cowSupported reports that the platform tells which pages of a private
+// mapping the process has written (privatePages), makes files in memory
+// (writeImage), and maps a file at the address of a mapping (remapImage).
+const cowSupported = true
+
+// memfdCreate is the number of memfd_create, which package syscall names
+// for the asm-generic architectures but not for amd64.
+func memfdCreate() uintptr {
+	if runtime.GOARCH == "amd64" {
+		return 319
+	}
+	return 279
+}
+
+// newImageFile returns an empty file that has no name and lives in memory
+// only (memfd_create, close-on-exec), so that an image is never written to
+// a disk. It returns a nil file without an error when the kernel has no
+// such file (ENOSYS).
+func newImageFile() (*os.File, error) {
+	name := []byte("wasm2go-image\x00")
+	const mfdCloexec = 1
+	fd, _, errno := syscall.Syscall(memfdCreate(), uintptr(unsafe.Pointer(&name[0])), mfdCloexec, 0)
+	if errno == syscall.ENOSYS {
+		return nil, nil
+	}
+	if errno != 0 {
+		return nil, fmt.Errorf("wasm2go: memory image: memfd_create: %w", errno)
+	}
+	return os.NewFile(fd, "wasm2go-image"), nil
+}
+
+// writeImage returns a new image, a file in memory length bytes long, that
+// holds the runs of mem, a memory, and zeros elsewhere. It returns nil
+// without an error when the kernel has no such file or the process may not
+// make one length bytes long.
+func writeImage(mem []byte, runs []pageRun, length int) (*memImage, error) {
+	fits, err := imageFits(length)
+	if err != nil || !fits {
+		return nil, err
+	}
+	f, err := newImageFile()
+	if err != nil || f == nil {
+		return nil, err
+	}
+	if err := f.Truncate(int64(length)); err != nil {
+		return nil, errors.Join(fmt.Errorf("wasm2go: sizing a memory image: %w", err), f.Close())
+	}
+	for _, r := range runs {
+		if _, err := f.WriteAt(mem[r.from:r.to], int64(r.from)); err != nil {
+			return nil, errors.Join(fmt.Errorf("wasm2go: memory image: %w", err), f.Close())
+		}
+	}
+	return &memImage{f: f}, nil
+}
+
+// remapImage replaces mem, a mapping that holds what f holds where the
+// memory is, by a private mapping of f at the same address.
+func remapImage(f *os.File, mem []byte) error {
+	addr := uintptr(unsafe.Pointer(unsafe.SliceData(mem)))
+	_, _, errno := syscall.Syscall6(syscall.SYS_MMAP, addr, uintptr(len(mem)),
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_FIXED|mapNoReserve, f.Fd(), 0)
+	if errno != 0 {
+		return fmt.Errorf("wasm2go: mapping a memory image in place: %w", errno)
+	}
+	return nil
+}
+
+// remapUncharged reports whether a memory may be mapped anew at its address
+// (remapImage) without the new mapping being charged against the commit
+// limit: not under the strict policy (vm.overcommit_memory=2), which
+// charges a private writable mapping's whole length, ignoring
+// mapNoReserve, and which a kernel may check after it has unmapped what
+// the new mapping replaces. A kernel that does not tell its policy is taken
+// for one with the strict policy.
+func remapUncharged() (bool, error) {
+	policy, err := os.ReadFile("/proc/sys/vm/overcommit_memory")
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("wasm2go: the overcommit policy: %w", err)
+	}
+	return strings.TrimSpace(string(policy)) != "2", nil
+}
+
+// The bits of an entry of /proc/self/pagemap that privatePages reads
+// (Documentation/admin-guide/mm/pagemap.rst). An entry is a 64-bit word in
+// the host's byte order.
+const (
+	pagemapPresent = 1 << 63
+	pagemapSwapped = 1 << 62
+	pagemapFile    = 1 << 61 // a page of a file or of shared memory, not a private copy
+)
+
+// privatePages finds the pages of mem, the head of a private mapping, that
+// the process has made its own: present or swapped out, and no page of the
+// mapped file (written pages of a private mapping of a file, the pages of
+// anonymous memory that were touched). It returns them as runs of byte
+// offsets into mem and their total length. ok is false when the kernel has
+// no page map.
+func privatePages(mem []byte) (runs []pageRun, total uint64, ok bool, err error) {
+	if len(mem) == 0 {
+		return nil, 0, true, nil
+	}
+	f, err := os.Open("/proc/self/pagemap")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("wasm2go: the page map: %w", err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			runs, total, ok, err = nil, 0, false, errors.Join(err, fmt.Errorf("wasm2go: the page map: %w", closeErr))
+		}
+	}()
+	page := uint64(os.Getpagesize())
+	start := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(mem))))
+	pages := (uint64(len(mem)) + page - 1) / page
+	entries := make([]byte, 8*pages)
+	if _, err := f.ReadAt(entries, int64(start/page*8)); err != nil {
+		return nil, 0, false, fmt.Errorf("wasm2go: reading the page map: %w", err)
+	}
+	for i := range pages {
+		e := binary.NativeEndian.Uint64(entries[8*i:])
+		if e&(pagemapPresent|pagemapSwapped) == 0 || e&pagemapFile != 0 {
+			continue
+		}
+		from, to := i*page, min((i+1)*page, uint64(len(mem)))
+		total += to - from
+		if n := len(runs); n > 0 && runs[n-1].to == from {
+			runs[n-1].to = to
+		} else {
+			runs = append(runs, pageRun{from: from, to: to})
+		}
+	}
+	return runs, total, true, nil
+}

@@ -26,27 +26,47 @@ var mmapTmpl string
 //go:embed sharedimage_nommap.go.txt
 var nommapTmpl string
 
+//go:embed sharedimage_cow_linux.go.txt
+var cowLinuxTmpl string
+
+//go:embed sharedimage_cow_other.go.txt
+var cowOtherTmpl string
+
+//go:embed sharedimage_noreserve_linux.go.txt
+var noReserveLinuxTmpl string
+
+//go:embed sharedimage_noreserve_other.go.txt
+var noReserveOtherTmpl string
+
 // Names are the identifiers the emitting package supplies.
 type Names struct {
-	Pkg     string // package clause of the generated files
-	Module  string // the Module type's name (always "Module" today)
-	Memory  string // Module's linear-memory field
-	MemSize string // Module's *atomic.Uint64 current-size field
-	DataEnd string // Module's data-segment-extent field
+	Pkg       string // package clause of the generated files
+	Module    string // the Module type's name (always "Module" today)
+	Memory    string // Module's linear-memory field
+	MemSize   string // Module's *atomic.Uint64 current-size field
+	MemMu     string // Module's *sync.Mutex that memory.grow takes
+	MemShared string // Module's shared-memory flag
+	DataEnd   string // Module's data-segment-extent field
 
 	// SaveGlobals is the generated globals-snapshot function (see
 	// emitGlobalsSnapshot); multi-package output exports it.
 	SaveGlobals string
 }
 
-// Files renders the runtime: output filename → formatted Go source. The three
-// files split by platform (mmap / no mmap) and must be emitted together.
+// Files renders the runtime: output filename → formatted Go source. The
+// files split by platform (mmap / no mmap, copy-on-write forks / copies,
+// Linux's MAP_NORESERVE / none) and must be emitted together.
 func Files(n Names) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	for name, src := range map[string]string{
-		"sharedimage.go":        coreTmpl,
-		"sharedimage_mmap.go":   mmapTmpl,
-		"sharedimage_nommap.go": nommapTmpl,
+		"sharedimage.go":           coreTmpl,
+		"sharedimage_mmap.go":      mmapTmpl,
+		"sharedimage_nommap.go":    nommapTmpl,
+		"sharedimage_cow_linux.go": cowLinuxTmpl,
+		"sharedimage_cow_other.go": cowOtherTmpl,
+
+		"sharedimage_noreserve_linux.go": noReserveLinuxTmpl,
+		"sharedimage_noreserve_other.go": noReserveOtherTmpl,
 	} {
 		t, err := template.New(name).Parse(src)
 		if err != nil {

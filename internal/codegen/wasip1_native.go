@@ -100,17 +100,28 @@ func accessMemory(m *Module, f func(mem []byte)) { f(m.memory) }
 // is not emitted.
 func stopAgents(m *Module, end any) {}
 
-// runtimeMapping, runtimeMappingOf and whileRuntimeMapped are the
-// in-package stand-ins for the shared-image runtime's of the same names: a
-// mapping the runtime made (SharedImage.Memory) and not released, the one
-// an instance's memory is, and f run while one is not released. The
-// generated output has the real ones; in this package no memory is one.
-// These are not emitted.
+// runtimeMapping, runtimeMappingOf, whileRuntimeMapped, noteSegment,
+// forkRuntimeMapping and unmapMemory are the in-package stand-ins for the
+// shared-image runtime's of the same names: a mapping the runtime made
+// (SharedImage.Memory, MapMemory, ForkMemory) and not released, the one an
+// instance's memory is, f run while one is not released, the record of a
+// segment attached over one or detached from it, the duplicate a fork of an
+// instance on one gets (nil for memory that is none), and the release of
+// one. The generated output has the real ones; in this package no memory
+// is one. These are not emitted.
 type runtimeMapping struct{}
 
 func runtimeMappingOf(mem []byte) *runtimeMapping { return nil }
 
 func whileRuntimeMapped(m *runtimeMapping, f func()) bool { return false }
+
+func noteSegment(m *runtimeMapping, at []byte, attached bool) {}
+
+func forkRuntimeMapping(m *Module) (memory []byte, memSize uint64, err error) {
+	return nil, m.memSize.Load(), nil
+}
+
+func unmapMemory(mem []byte) error { return nil }
 
 // onAgentEnd is the in-package stand-in for the runtime helper of the same
 // name, which has ended told of each agent of the module whose goroutine has
@@ -3450,18 +3461,34 @@ type Forker interface {
 }
 
 // CopyForker is the Forker that makes the child's instance from a copy of
-// the parent's memory in the Go heap, made while the parent's memory cannot
-// grow; the child's other imports than the wasi one are the parent's. The
-// copy of a shared memory is as long as the parent's, its ceiling, and any
-// other is as long as the guest's memory. A guest thread other than the
-// forking one that writes the memory meanwhile may leave the copy with a
-// part of its write. It returns no done.
+// the parent's memory, made while the parent's memory cannot grow; the
+// child's other imports than the wasi one are the parent's. The copy of a
+// memory that is not shared and is a mapping of the runtime's (MapMemory,
+// SharedImage.Memory, ForkMemory) is the duplicate ForkMemory makes, and
+// done releases it once it has closed the child. Any other copy is in the
+// Go heap: the copy of a shared memory is as long as the parent's, its
+// ceiling, and any other is as long as the guest's memory, and it returns
+// no done. A guest thread other than the forking one that writes the
+// memory meanwhile may leave the copy with a part of its write.
 var CopyForker Forker = copyForker{}
 
 // copyForker is CopyForker.
 type copyForker struct{}
 
 func (copyForker) Fork(m *Module, child *WasiStubs, pid int32) (*Module, func(status int32), error) {
+	if !m.memShared {
+		memory, size, err := forkRuntimeMapping(m)
+		if err != nil {
+			return nil, nil, err
+		}
+		if memory != nil {
+			return m.forkModule(m, child, memory, size), func(int32) {
+				// The child's segments are detached before its memory goes
+				// (UnmapMemory).
+				child.reportError("proc_fork", errors.Join(child.CloseAll(), unmapMemory(memory)))
+			}, nil
+		}
+	}
 	var (
 		memory []byte
 		size   uint64
@@ -14034,7 +14061,12 @@ func (w *WasiStubs) ipcShmat(m *Module, id int32, addr, size uint64, flags int32
 			}
 		}
 		var err error
-		if !whileRuntimeMapped(mapping, func() { err = ipc.ShmAttach(id, at, flags) }) {
+		attach := func() {
+			if err = ipc.ShmAttach(id, at, flags); err == nil {
+				noteSegment(mapping, at, true)
+			}
+		}
+		if !whileRuntimeMapped(mapping, attach) {
 			return _wasiENOMEM, nil
 		}
 		if err != nil {
@@ -14115,7 +14147,11 @@ func (w *WasiStubs) detachAllShm() error {
 // done over memory that is no longer the mapping.
 func detachShm(ipc IPC, attachment shmAttachment) error {
 	var err error
-	whileRuntimeMapped(attachment.mapping, func() { err = ipc.ShmDetach(attachment.at) })
+	whileRuntimeMapped(attachment.mapping, func() {
+		if err = ipc.ShmDetach(attachment.at); err == nil {
+			noteSegment(attachment.mapping, attachment.at, false)
+		}
+	})
 	return err
 }
 
@@ -17906,6 +17942,9 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"stopAgents":                true, // the in-package stand-in of the helper
 			"runtimeMappingOf":          true,
 			"whileRuntimeMapped":        true,
+			"noteSegment":               true,
+			"forkRuntimeMapping":        true,
+			"unmapMemory":               true,
 			"onAgentEnd":                true, // likewise
 			"codegenStripForEmit":       true,
 			"printAST":                  true,

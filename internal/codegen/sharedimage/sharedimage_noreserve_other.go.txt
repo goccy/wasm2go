@@ -1,0 +1,8 @@
+//go:build !linux
+
+package {{.Pkg}}
+
+// mapNoReserve is the flag that keeps a mapping from being charged against
+// a commit limit when it is made (see sharedimage_noreserve_linux.go); the
+// other platforms charge pages as they are written.
+const mapNoReserve = 0
