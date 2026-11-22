@@ -222,7 +222,7 @@ func hostSocketFD(domain, typ int) (int, error) {
 	defer syscall.ForkLock.RUnlock()
 	fd, err := syscall.Socket(domain, typ, 0)
 	if err != nil {
-		return -1, err
+		return -1, os.NewSyscallError("socket", err)
 	}
 	return fd, socketFDMade(fd)
 }
@@ -234,7 +234,7 @@ func hostSocketPairFDs(typ int) ([2]int, error) {
 	defer syscall.ForkLock.RUnlock()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, typ, 0)
 	if err != nil {
-		return fds, err
+		return fds, os.NewSyscallError("socketpair", err)
 	}
 	if err := socketFDMade(fds[0]); err != nil {
 		return fds, errors.Join(err, hostCloseFD(fds[1]))
@@ -253,7 +253,7 @@ func hostAcceptFD(fd int) (int, error) {
 	defer syscall.ForkLock.RUnlock()
 	conn, _, err := syscall.Accept(fd)
 	if err != nil {
-		return -1, err
+		return -1, os.NewSyscallError("accept", err)
 	}
 	return conn, socketFDMade(conn)
 }

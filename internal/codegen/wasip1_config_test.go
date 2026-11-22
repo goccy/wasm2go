@@ -79,8 +79,8 @@ func testZeroConfigDenies(t *testing.T, w *WasiStubs) {
 		}
 	}
 
-	ipOff, ipLen := putPath(m, 512, "127.0.0.1")
-	if rc := w.Sock_getaddrinfo(m, ipOff, ipLen, 600); rc != -_wasiEACCES {
+	nameOff, nameLen := putPath(m, 512, "localhost")
+	if rc := w.Sock_getaddrinfo(m, nameOff, nameLen, 600); rc != -_wasiEACCES {
 		t.Errorf("Sock_getaddrinfo rc=%d, want -EACCES", rc)
 	}
 	// fd 3 is a free number: the first new descriptor gets it.

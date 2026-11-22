@@ -190,6 +190,14 @@
     (func $proc_syslog (param i32 i32 i32 i64 i32 i64 i32) (result i32)))
   (import "wasip1_posix_extension" "proc_syslog_close"
     (func $proc_syslog_close (result i32)))
+  (import "wasi_snapshot_preview1" "sock_getaddrinfo"
+    (func $sock_getaddrinfo (param i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_resolve"
+    (func $sock_resolve (param i64 i32 i32 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_reverse_addr"
+    (func $sock_reverse_addr (param i64 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_host_by_name"
+    (func $sock_host_by_name (param i64 i32 i64 i32 i64) (result i32)))
   (import "wasi_snapshot_preview1" "sock_socket"
     (func $sock_socket (param i32 i32) (result i32)))
   (import "wasi_snapshot_preview1" "sock_connect"
@@ -314,6 +322,10 @@
     (drop (call $proc_syslog_open (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $proc_syslog (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0)))
     (drop (call $proc_syslog_close))
+    (drop (call $sock_getaddrinfo (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_resolve (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_reverse_addr (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_host_by_name (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_socket (i32.const 0) (i32.const 0)))
     (drop (call $sock_connect (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $sock_accept (i32.const 0) (i32.const 0) (i64.const 0)))

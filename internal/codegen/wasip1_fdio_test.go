@@ -416,9 +416,15 @@ func TestWasi_SockGetaddrinfoNumericAndHook(t *testing.T) {
 		t.Fatalf("empty-host getaddrinfo rc=%d", rc)
 	}
 
-	w.cfg.Resolve = func(host string) bool { return false }
-	if rc := w.Sock_getaddrinfo(m, hostOff, 7, outOff); rc != -_wasiEACCES {
-		t.Fatalf("denied getaddrinfo rc=%d, want -EACCES", rc)
+	// An address written in numbers is no lookup: the policy is not asked.
+	var asked []string
+	w.cfg.Resolve = func(host string) bool { asked = append(asked, host); return false }
+	if rc := w.Sock_getaddrinfo(m, hostOff, 7, outOff); rc != _wasiESUCCESS || len(asked) != 0 {
+		t.Fatalf("numeric getaddrinfo under a refusing policy rc=%d, asked %q", rc, asked)
+	}
+	nameOff := writeCStr(m, 1000, "blocked.invalid")
+	if rc := w.Sock_getaddrinfo(m, nameOff, 15, outOff); rc != -_wasiEACCES || !slices.Equal(asked, []string{"blocked.invalid"}) {
+		t.Fatalf("denied getaddrinfo rc=%d, asked %q; want -EACCES", rc, asked)
 	}
 }
 

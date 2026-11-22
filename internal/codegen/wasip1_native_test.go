@@ -282,7 +282,7 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 
 	// Resolve the loopback host first so Sock_connect can hand the dial hook the
 	// host name that was looked up for this IP (host+port matched jointly).
-	hoff, hln := putPath(m, 512, "127.0.0.1")
+	hoff, hln := putPath(m, 512, "localhost")
 	if rc := w.Sock_getaddrinfo(m, hoff, hln, 600); rc != _wasiESUCCESS {
 		t.Fatalf("getaddrinfo for dial-hook host: rc=%d", rc)
 	}
@@ -295,8 +295,8 @@ func TestWasi_SockSocketConnect(t *testing.T) {
 	if rc := w.Sock_connect(m, fd, loopbackBE, int32(port)); rc != -_wasiEACCES {
 		t.Fatalf("denied connect: want -EACCES, got %d", rc)
 	}
-	if len(dialed) != 1 || dialed[0] != fmt.Sprintf("tcp/127.0.0.1/127.0.0.1:%d", port) {
-		t.Fatalf("dial hook saw %v, want tcp/127.0.0.1/127.0.0.1:%d", dialed, port)
+	if len(dialed) != 1 || dialed[0] != fmt.Sprintf("tcp/localhost/127.0.0.1:%d", port) {
+		t.Fatalf("dial hook saw %v, want tcp/localhost/127.0.0.1:%d", dialed, port)
 	}
 
 	// Allow → connect succeeds: the socket has its peer.
