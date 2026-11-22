@@ -220,20 +220,20 @@ func TestConfigProcess(t *testing.T) {
 // A pid token is never the pid or the ppid the Process reports.
 func TestPIDTokensAvoidTheProcessIDs(t *testing.T) {
 	w, _ := newProcTestStubs(t)
-	w.cfg.Process = testProcess{ids: ProcessIDs{PID: 1000, PPID: 1001}}
+	w.cfg.Process = testProcess{ids: ProcessIDs{PID: wasiFirstPID, PPID: wasiFirstPID + 1}}
 	first, _ := w.NewProc(nil)
 	second, _ := w.NewProc(nil)
-	if first != 1002 || second != 1003 {
-		t.Fatalf("pid tokens = %d, %d, want 1002, 1003", first, second)
+	if first != wasiFirstPID+2 || second != wasiFirstPID+3 {
+		t.Fatalf("pid tokens = %d, %d, want the first token and 2, 3", first, second)
 	}
-	w.cfg.Process = testProcess{ids: ProcessIDs{PID: 1005, PPID: 1}}
+	w.cfg.Process = testProcess{ids: ProcessIDs{PID: wasiFirstPID + 5, PPID: 1}}
 	got := []int32{}
 	for range 2 {
 		pid, _ := w.NewProc(nil)
 		got = append(got, pid)
 	}
-	if got[0] != 1004 || got[1] != 1006 {
-		t.Fatalf("pid tokens = %v, want [1004 1006]", got)
+	if got[0] != wasiFirstPID+4 || got[1] != wasiFirstPID+6 {
+		t.Fatalf("pid tokens = %v, want the first token and 4, 6", got)
 	}
 }
 

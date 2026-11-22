@@ -172,7 +172,10 @@ its parent's `Signals`). Signal numbers are the guest's (Linux
 numbering); a raise of a WASI signal is turned into it. A nil one is an
 isolated guest: such a `kill` fails with `ESRCH`. Signals reach the
 guest through `PostSignal`. `ForkProc` forks an instance that its
-parent waits for, under a pid token the fork knows as its own.
+parent waits for, under a pid token the fork knows as its own. The
+pid tokens of the forks and the commands a guest starts are numbers
+from 4194304 up, above every pid Linux and darwin hand out, so a token
+passed outside the guest names no process of the host.
 
 `Fork` makes the instance the child of the guest's `fork`
 (`proc_fork`) runs in; a nil one fails it with `ENOSYS`. `CopyForker`

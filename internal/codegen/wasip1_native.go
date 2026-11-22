@@ -2348,8 +2348,12 @@ func (p *wasiPIDs) alloc(reserved ...int32) int32 {
 	return pid
 }
 
-// wasiFirstPID is the first pid token a fresh instance hands out.
-const wasiFirstPID int32 = 1000
+// wasiFirstPID is the first pid token a fresh instance hands out:
+// PID_MAX_LIMIT of 64-bit Linux, above every pid Linux hands out (below
+// pid_max, at most PID_MAX_LIMIT: kernel/pid.c, include/linux/threads.h)
+// and darwin's (below PID_MAX, 99999: bsd/kern/kern_fork.c), so that a
+// token names no process of the host.
+const wasiFirstPID int32 = 1 << 22
 
 // NewWASI returns a WasiStubs whose guest has what cfg gives it (see
 // WASIConfig). It panics when cfg has a ProcessChanges without a Process,
