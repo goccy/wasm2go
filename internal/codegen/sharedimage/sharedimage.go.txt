@@ -107,10 +107,11 @@ var (
 )
 
 // InPlaceImageBuilder brings up one throwaway instance ON the caller-provided
-// memory — a MAP_SHARED mapping of the image file being built. Construct the
-// module with the generated NewWithMemory (passing InitialMemoryBytes for a
-// fresh, all-zero mapping) and initialize it exactly as the corresponding
-// ImageBuilder would.
+// memory — a MAP_SHARED mapping of the image file being built, fresh and all
+// zero. Install the module's active data segments in it with the generated
+// InstallDataSegments, construct the module with the generated NewWithMemory
+// (passing InitialMemoryBytes), and initialize it exactly as the
+// corresponding ImageBuilder would.
 type InPlaceImageBuilder func(mem []byte) (m *{{.Module}}, err error)
 
 // NewSharedImageInPlace is NewSharedImage with the copy elided: the builder
