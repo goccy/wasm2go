@@ -226,6 +226,12 @@
     (func $sock_recvfrom_addr (param i32 i64 i32 i32 i64 i64) (result i32)))
   (import "wasip1_posix_extension" "sock_socketpair"
     (func $sock_socketpair (param i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_setopt"
+    (func $sock_setopt (param i32 i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "sock_getopt"
+    (func $sock_getopt (param i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_timeout"
+    (func $sock_timeout (param i32 i32 i32 i64 i64) (result i32)))
 
   (import "wasip1_posix_extension" "proc_chdir"
     (func $proc_chdir (param i64 i32) (result i32)))
@@ -345,6 +351,9 @@
     (drop (call $sock_sendto_addr (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $sock_recvfrom_addr (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $sock_socketpair (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_setopt (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $sock_getopt (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_timeout (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
 
     (drop (call $proc_chdir (i64.const 0) (i32.const 0)))
     (drop (call $proc_setenv (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0)))

@@ -84,7 +84,10 @@ var posixImports = map[string]bool{
 	"sock_reverse_addr":          true,
 	"sock_sendto_addr":           true,
 	"sock_service":               true,
+	"sock_getopt":                true,
+	"sock_setopt":                true,
 	"sock_socketpair":            true,
+	"sock_timeout":               true,
 
 	"proc_chdir":  true,
 	"proc_setenv": true,

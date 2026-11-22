@@ -116,7 +116,7 @@ func (e *WasiSignalError) Error() string {
 // routed to it. It is a write-capable superset of io/fs.FS.
 //
 // Names are GUEST paths relative to the preopen root: slash-separated, with no
-// leading slash (e.g. "encodings/__init__.py", or "" for the root). Methods
+// leading slash (e.g. "etc/app.conf", or "" for the root). Methods
 // should return the standard fs errors (fs.ErrNotExist, fs.ErrExist,
 // fs.ErrPermission) so the host maps them to the right wasi errno.
 type FS interface {
@@ -517,8 +517,8 @@ func (noFS) Readlink(string) (string, error)                 { return "", fs.Err
 func (noFS) Link(string, string) error                       { return fs.ErrNotExist }
 
 // MemFS is an in-memory read/write FS. Each value is an independent tree, so
-// two interpreters given separate MemFS values cannot observe each other's
-// files (full per-interpreter filesystem isolation, no disk). Build one with
+// two guest programs given separate MemFS values cannot observe each other's
+// files (full per-program filesystem isolation, no disk). Build one with
 // NewMemFS. Safe for concurrent use.
 type MemFS struct {
 	mu   sync.Mutex
@@ -570,25 +570,15 @@ type memNode struct {
 	locks map[*memFile]int
 }
 
+// memSplit returns the elements of the path name, with ".." resolved
+// lexically (a MemFS has no symbolic links) and ".." of the root the root;
+// none for the root itself.
 func memSplit(name string) []string {
-	name = strings.Trim(name, "/")
-	if name == "" {
+	name = path.Clean("/" + name)
+	if name == "/" {
 		return nil
 	}
-	raw := strings.Split(name, "/")
-	out := make([]string, 0, len(raw))
-	for _, p := range raw {
-		switch p {
-		case "", ".":
-		case "..":
-			if len(out) > 0 {
-				out = out[:len(out)-1]
-			}
-		default:
-			out = append(out, p)
-		}
-	}
-	return out
+	return strings.Split(name[1:], "/")
 }
 
 // lookup resolves name to a node. Caller holds fsys.mu.
@@ -644,6 +634,9 @@ func (fsys *MemFS) OpenFile(name string, flag int, perm os.FileMode) (File, erro
 	} else {
 		if flag&os.O_EXCL != 0 && flag&os.O_CREATE != 0 {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrExist}
+		}
+		if node.dir && flag&(os.O_WRONLY|os.O_RDWR) != 0 {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EISDIR}
 		}
 		if flag&os.O_TRUNC != 0 && !node.dir {
 			node.data = node.data[:0]
@@ -793,7 +786,8 @@ func (fsys *MemFS) Chtimes(name string, _ time.Time, mtime time.Time) error {
 }
 
 // MkdirAll creates name and any missing parents. Exposed so embedders can
-// populate the FS (e.g. unpack a stdlib bundle) before handing it to a module.
+// populate the FS (e.g. unpack the guest program's files) before handing it
+// to a module.
 func (fsys *MemFS) MkdirAll(name string, perm os.FileMode) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
@@ -1202,8 +1196,8 @@ type wasiOpen struct {
 	// lockWaits counts, by lock (takeLock's key), the waits for a lock of
 	// the descriptor in progress; lockHeld holds the locks a wait of it
 	// took and no later lock call of it has changed. Guarded by mu.
-	lockWaits map[string]int
-	lockHeld  map[string]bool
+	lockWaits map[lockKey]int
+	lockHeld  map[lockKey]bool
 }
 
 // deadlineReader is a stream whose blocking read can be bounded: a pipe, a
@@ -2828,13 +2822,13 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // Proc_spawn is a NON-STANDARD host import (module wasi_snapshot_preview1,
 // name "proc_spawn") that a guest's posix_spawn() can call. It spawns a
 // HOST process: path is the executable, argv/envp are NUL-terminated char**
-// in linear memory. The child inherits the interpreter's
+// in linear memory. The child inherits the guest program's
 // stdin/stdout/stderr. The new pid token is written at pidOutPtr. Returns 0
 // or a negative errno.
 //
 // Only stdio inheritance is supported today (no fd remapping / pipes), which
-// covers subprocess.run/call with default streams; capture_output via host
-// pipes is a follow-up.
+// covers running a child with the default streams; capturing its output via
+// host pipes is a follow-up.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
 }
@@ -2901,7 +2895,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	if cmd.Env == nil {
 		cmd.Env = []string{}
 	}
-	// stdin/stdout/stderr are the interpreter streams (inherited) or a guest
+	// stdin/stdout/stderr are the guest program's streams (inherited) or a guest
 	// pipe end. A pipe end's dynamic type is *os.File, so Go's exec passes the
 	// fd straight to the child; capture works by the guest reading the pipe's
 	// other end via Fd_read.
@@ -3040,8 +3034,8 @@ func (w *WasiStubs) childWriterLocked(fd int32, inherited io.Writer) io.Writer {
 // "pipe") that a guest's pipe()/pipe2() can call. It creates a host OS pipe
 // and registers both ends as guest fds, writing [readFd, writeFd] (two i32)
 // at fdsOutPtr. The guest reads the read end via Fd_read; the write end is
-// given to a child as its stdout/stderr via Proc_spawn, so subprocess.run can
-// capture output. Returns 0 or a negative errno.
+// given to a child as its stdout/stderr via Proc_spawn, so the guest can
+// capture the child's output. Returns 0 or a negative errno.
 func (w *WasiStubs) Pipe(m *Module, fdsOutPtr int32) int32 {
 	return w.pipe(m, zext(fdsOutPtr))
 }
@@ -7348,11 +7342,12 @@ func (w *WasiStubs) Sched_yield64(m *Module) int32 {
 //
 // For clock subscriptions, payload at offset 16 is: u32 clock_id, u64
 // timeout, u64 precision, u16 sub_clock_flags (bit0=ABSTIME). We sleep
-// for `timeout` ns (relative timer) or the diff to `timeout` (absolute
-// timer); a signal posted to the guest ends the sleep, and the call returns
-// EINTR (awaitInterruptibly). For fd_read / fd_write subscriptions, payload
-// at offset 16 is a u32 fd; we call into the platform Poll helper to wait for
-// readiness.
+// for `timeout` ns (relative timer) or until clock_id reads `timeout`
+// (absolute timer; at once, with an event carrying EINVAL, for a clock_id
+// clock_time_get refuses); a signal posted to the guest ends the sleep, and
+// the call returns EINTR (awaitInterruptibly). For fd_read / fd_write
+// subscriptions, payload at offset 16 is a u32 fd; we call into the
+// platform Poll helper to wait for readiness.
 //
 // Each emitted event is 32 bytes: u64 userdata, u16 errno, u16
 // eventtype, u64 fd_readwrite_nbytes (filled for fd events), u16
@@ -7388,6 +7383,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		etype    byte
 		fd       int32
 		isRead   bool
+		errno    int32
 	}
 	var minClockNs int64 = -1
 	var clockEvents []pollItem
@@ -7398,23 +7394,26 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		etype := subs[base+8]
 		switch etype {
 		case 0: // clock
+			clockID := int32(binary.LittleEndian.Uint32(subs[base+16:]))
 			timeout := int64(binary.LittleEndian.Uint64(subs[base+24:]))
 			flags := binary.LittleEndian.Uint16(subs[base+40:])
 			ns := timeout
+			var errno int32
 			if flags&0x1 != 0 {
-				// Absolute timeout in nanoseconds since the clock epoch.
-				// We approximate by treating it as relative — the guest
-				// program's wall time will see the right elapsed
-				// duration even if the absolute value is past.
-				ns = timeout - time.Now().UnixNano()
-				if ns < 0 {
-					ns = 0
+				// Absolute timeout in nanoseconds of the subscription's
+				// clock: the time left until it. A clock there is none of
+				// has its event at once, carrying the error.
+				var now uint64
+				now, errno = w.clockNanos(clockID)
+				ns = 0
+				if at := uint64(timeout); errno == _wasiESUCCESS && at > now {
+					ns = int64(min(at-now, 1<<63-1))
 				}
 			}
 			if minClockNs < 0 || ns < minClockNs {
 				minClockNs = ns
 			}
-			clockEvents = append(clockEvents, pollItem{userdata: userdata, etype: 0})
+			clockEvents = append(clockEvents, pollItem{userdata: userdata, etype: 0, errno: errno})
 		case 1, 2: // fd_read / fd_write
 			fd := int32(binary.LittleEndian.Uint32(subs[base+16:]))
 			fdEvents = append(fdEvents, pollItem{userdata: userdata, etype: etype, fd: fd, isRead: etype == 1})
@@ -7737,10 +7736,10 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	for _, ev := range clockEvents {
 		// A poll returns its ready fds without also claiming that the
 		// timeout expired.
-		if ev.etype == 0 && anyReady {
+		if ev.etype == 0 && ev.errno == _wasiESUCCESS && anyReady {
 			continue
 		}
-		writeEvent(events[written:written+32], ev.userdata, ev.etype, 0, 0, 0)
+		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(ev.errno), 0, 0)
 		written += 32
 	}
 	for i, ev := range fdEvents {
@@ -8285,10 +8284,11 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 // (fd_fdstat_set_flags) is the entry's alone (fdflags). A call of the
 // guest that is to wait — a blocking accept, receive, send, or a connect
 // that is not made at once — waits in poll(2) between attempts
-// (socketWait), and a signal posted to the guest meanwhile ends it with
-// EINTR. What the socket is — bound, listening, connecting, connected,
-// shut down, the peer of a datagram socket — is the host's to know and to
-// say: the runtime keeps only what the policies have allowed the socket
+// (socketWait), no longer than the socket's timeout, and a signal posted
+// to the guest meanwhile ends it with EINTR. What the socket is — bound,
+// listening, connecting, connected, shut down, the peer of a datagram
+// socket, its options and timeouts — is the host's to know and to say:
+// the runtime keeps only what the policies have allowed the socket
 // (wasiSocket.reachable) and the names of a Unix-domain socket as the
 // guest gave them.
 //
@@ -8655,10 +8655,16 @@ func (w *WasiStubs) destination(op *wasiOpen, a wasiSockAddr, path string) (stri
 // and Go's internal/poll do: a call that does not wait (nonblocking) makes
 // it once and reports EAGAIN when it would. A blocking one waits in poll(2)
 // for what want names (hostWant...) between attempts, and a signal posted
-// to the guest meanwhile ends the wait with EINTR. A host socket closed
-// meanwhile is EBADF. Returns the errno of the attempt that did not have to
-// wait. call is the import's name.
-func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want int, nonblocking bool, attempt func(fd int) (again bool, err error)) int32 {
+// to the guest meanwhile ends the wait with EINTR. It waits no longer than
+// the socket's timeout, which it reads at its first wait, as gVisor fixes
+// a call's deadline once: the receive timeout (SO_RCVTIMEO) for input or a
+// connection, the send timeout (SO_SNDTIMEO) for room; once that has passed
+// it reports expired. A host socket closed meanwhile is EBADF. Returns the
+// errno of the attempt that did not have to wait. call is the import's
+// name.
+func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want int, nonblocking bool, expired int32, attempt func(fd int) (again bool, err error)) int32 {
+	waited := false
+	var until time.Time
 	for {
 		var again bool
 		var failed error
@@ -8670,9 +8676,23 @@ func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want in
 			return mapOSError(failed)
 		case nonblocking:
 			return _wasiEAGAIN
+		case waited && !until.IsZero() && !time.Now().Before(until):
+			return expired
+		case !waited:
+			var timeout time.Duration
+			if errno := socketCall(host, func(fd int) { timeout, failed = hostSocketTimeout(fd, want == hostWantRoom) }); errno != _wasiESUCCESS {
+				return errno
+			}
+			if failed != nil {
+				return mapOSError(failed)
+			}
+			if timeout > 0 {
+				until = time.Now().Add(timeout)
+			}
+			waited = true
 		}
 		set := []hostWaitFD{{stream: host, want: want, op: op}}
-		interrupted, err := w.waitHostInterruptibly(call, set, time.Time{})
+		interrupted, err := w.waitHostInterruptibly(call, set, until)
 		if err != nil {
 			return mapOSError(err)
 		}
@@ -8711,7 +8731,7 @@ func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs
 	waitAll := flags&wasiMsgWaitAll != 0 && !op.dgram && !peek
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
 	got := 0
-	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, func(fd int) (bool, error) {
+	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		start := got
 		if peek {
 			start = 0
@@ -8759,7 +8779,7 @@ func (w *WasiStubs) socketSend(call string, op *wasiOpen, host *os.File, bufs []
 	// a send does not wait, where Linux would.
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0 || op.family == wasiSockFamilyUnix && op.dgram && to != nil
 	sent := 0
-	errno := w.socketWait(call, op, host, hostWantRoom, nonblocking, func(fd int) (bool, error) {
+	errno := w.socketWait(call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		k, again, err := hostSend(fd, leadingFrom(bufs, sent), to, hostPath)
 		if err != nil || again {
 			return again, err
@@ -8924,7 +8944,7 @@ func (w *WasiStubs) acceptSocket(op *wasiOpen, host *os.File, fdflags int32) (in
 		return 0, _wasiEACCES
 	}
 	conn := -1
-	errno := w.socketWait("sock_accept", op, host, hostWantInput, op.nonblocking(), func(fd int) (bool, error) {
+	errno := w.socketWait("sock_accept", op, host, hostWantInput, op.nonblocking(), _wasiEAGAIN, func(fd int) (bool, error) {
 		var again bool
 		var err error
 		conn, again, err = hostAccept(fd)
@@ -9026,7 +9046,7 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 	if !underWay || op.nonblocking() {
 		return mapOSError(started)
 	}
-	if errno := w.socketWait(call, op, host, hostWantRoom, false, hostConnectDone); errno != _wasiESUCCESS {
+	if errno := w.socketWait(call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
 		return errno
 	}
 	// The host takes the socket for connected, and refuses a later connect
@@ -9201,7 +9221,7 @@ func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen,
 	}
 	var from wasiSockAddr
 	n := 0
-	errno = w.socketWait("sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, func(fd int) (bool, error) {
+	errno = w.socketWait("sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, _wasiEAGAIN, func(fd int) (bool, error) {
 		var again bool
 		var err error
 		n, from, again, err = hostReceiveFrom(fd, buf, flags&wasiMsgPeek != 0)
@@ -9253,6 +9273,140 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 		fd := w.addFDLocked(&wasiOpen{isSocket: true, family: wasiSockFamilyUnix, dgram: dgram, sock: &wasiSocket{host: host}})
 		binary.LittleEndian.PutUint32(out[4*i:], uint32(fd))
 	}
+	return _wasiESUCCESS
+}
+
+// The socket options of Sock_setopt and Sock_getopt, as the guest's C
+// library names them to the imports (a libc's option numbers differ from
+// libc to libc).
+const (
+	wasiSockOptReuseAddr int32 = 1  // SO_REUSEADDR
+	wasiSockOptReusePort int32 = 2  // SO_REUSEPORT
+	wasiSockOptKeepAlive int32 = 3  // SO_KEEPALIVE
+	wasiSockOptNoDelay   int32 = 4  // TCP_NODELAY
+	wasiSockOptRcvBuf    int32 = 5  // SO_RCVBUF
+	wasiSockOptSndBuf    int32 = 6  // SO_SNDBUF
+	wasiSockOptLinger    int32 = 7  // SO_LINGER: seconds, or -1 for off
+	wasiSockOptError     int32 = 8  // SO_ERROR (read only): the guest's errno
+	wasiSockOptType      int32 = 9  // SO_TYPE (read only): a wasiSockType
+	wasiSockOptAccepting int32 = 10 // SO_ACCEPTCONN (read only)
+	wasiSockOptV6Only    int32 = 11 // IPV6_V6ONLY
+	wasiSockOptBroadcast int32 = 12 // SO_BROADCAST
+	wasiSockOptDefer     int32 = 13 // TCP_DEFER_ACCEPT: seconds
+)
+
+// The two timeouts of a socket, as Sock_timeout names them.
+const (
+	wasiSockTimeoutReceive int32 = 1 // SO_RCVTIMEO
+	wasiSockTimeoutSend    int32 = 2 // SO_SNDTIMEO
+)
+
+// Sock_setopt is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_setopt") backing setsockopt() for the options above: it sets
+// the option of the socket fd's host socket to value, as setsockopt(2)
+// does. Returns 0, or a negative errno: ENOPROTOOPT for an option that is
+// unknown, or that the host has not, and the host's, such as ENOPROTOOPT
+// for an option it only reads.
+func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
+	_, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var failed error
+	if errno := socketCall(host, func(fd int) { failed = setHostSockOpt(fd, option, value) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	return -mapOSError(failed)
+}
+
+// Sock_setopt64 is Sock_setopt for a memory64 guest.
+func (w *WasiStubs) Sock_setopt64(m *Module, fd, option, value int32) int32 {
+	return w.Sock_setopt(m, fd, option, value)
+}
+
+// Sock_getopt is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_getopt") backing getsockopt() for the options above: it
+// writes the value of the option of the socket fd's host socket (i32) at
+// valuePtr, as getsockopt(2) gives it (getHostSockOpt). Returns 0, or a
+// negative errno as Sock_setopt does.
+func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
+	return w.sockGetopt(m, fd, option, zext(valuePtr))
+}
+
+// Sock_getopt64 is Sock_getopt for a memory64 guest.
+func (w *WasiStubs) Sock_getopt64(m *Module, fd, option int32, valuePtr int64) int32 {
+	return w.sockGetopt(m, fd, option, uint64(valuePtr))
+}
+
+// sockGetopt is the body of Sock_getopt and Sock_getopt64.
+func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int32 {
+	out := w.memBytes(m, valuePtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	_, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var value int32
+	var failed error
+	if errno := socketCall(host, func(fd int) { value, failed = getHostSockOpt(fd, option) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if failed != nil {
+		return -mapOSError(failed)
+	}
+	binary.LittleEndian.PutUint32(out, uint32(value))
+	return _wasiESUCCESS
+}
+
+// Sock_timeout is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_timeout") backing SO_RCVTIMEO and SO_SNDTIMEO: which names the
+// timeout (wasiSockTimeout...), which is the host socket's. The timeout
+// before the call is written at oldPtr in nanoseconds (i64; 0 is no limit);
+// when set is non-zero it is then replaced by nanos, in microseconds
+// rounded up. A blocking receive or accept that has waited the receive
+// timeout gives up with EAGAIN, as a blocking send does that has waited
+// the send timeout, and a blocking connect with EINPROGRESS (socketWait).
+// A connection accepted on the socket has its timeouts, as the host gives
+// them. Returns 0, or a negative errno: EINVAL for another which or a
+// negative time, and the host's.
+func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, oldPtr int32) int32 {
+	return w.sockTimeout(m, fd, which, set, nanos, zext(oldPtr))
+}
+
+// Sock_timeout64 is Sock_timeout for a memory64 guest.
+func (w *WasiStubs) Sock_timeout64(m *Module, fd, which, set int32, nanos, oldPtr int64) int32 {
+	return w.sockTimeout(m, fd, which, set, nanos, uint64(oldPtr))
+}
+
+// sockTimeout is the body of Sock_timeout and Sock_timeout64.
+func (w *WasiStubs) sockTimeout(m *Module, fd, which, set int32, nanos int64, oldPtr uint64) int32 {
+	out := w.memBytes(m, oldPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	_, host, errno := w.rawSocketOf(fd)
+	switch {
+	case errno != _wasiESUCCESS:
+		return -errno
+	case which != wasiSockTimeoutReceive && which != wasiSockTimeoutSend, set != 0 && nanos < 0:
+		return -_wasiEINVAL
+	}
+	send := which == wasiSockTimeoutSend
+	var old time.Duration
+	var failed error
+	if errno := socketCall(host, func(fd int) {
+		if old, failed = hostSocketTimeout(fd, send); failed == nil && set != 0 {
+			failed = setHostSocketTimeout(fd, send, time.Duration(nanos))
+		}
+	}); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if failed != nil {
+		return -mapOSError(failed)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(old))
 	return _wasiESUCCESS
 }
 
@@ -11651,7 +11805,7 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 		}
 		return flock(how)
 	}
-	interrupted, err := w.takeLock("fd_flock", fmt.Sprintf("fd_flock %d", how), op, how == flockUnlock, wait != 0, set, func() error { return flock(flockUnlock) })
+	interrupted, err := w.takeLock("fd_flock", lockKey{call: lockCallFlock, how: how}, op, how == flockUnlock, wait != 0, set, func() error { return flock(flockUnlock) })
 	if interrupted {
 		return -_wasiEINTR
 	}
@@ -11664,6 +11818,23 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 // Fd_flock64 is Fd_flock for a memory64 guest.
 func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
 	return w.Fd_flock(m, fd, lock, wait)
+}
+
+// lockCall is the import a lock call of takeLock is made by.
+type lockCall int
+
+const (
+	lockCallFlock  lockCall = iota // fd_flock
+	lockCallRecord                 // fd_lock
+)
+
+// lockKey is the lock a call of takeLock asks for: the import that asks
+// (call), and the lock — how of fd_flock, the type and range of fd_lock.
+type lockKey struct {
+	call        lockCall
+	how         int
+	typ, whence int32
+	start, len  int64
 }
 
 // takeLock takes or removes (unlocks) a lock of the descriptor op with
@@ -11679,12 +11850,12 @@ func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
 // unlock is told WASIConfig.Errors under name, the name of the import.
 //
 // The descriptor may be shared, and several of its sharers may wait for
-// the same lock (key: the import's name and the lock asked for) at once;
+// the same lock (key) at once;
 // their calls all get it when it is granted. So a late grant is removed
 // only when no other wait of the descriptor for that lock is in progress
 // and none has taken it: a lock a wait took counts as held until the
 // descriptor's next lock call by this import (lockHeld).
-func (w *WasiStubs) takeLock(name, key string, op *wasiOpen, unlocks, wait bool, set func(wait bool) error, unlock func() error) (interrupted bool, err error) {
+func (w *WasiStubs) takeLock(name string, key lockKey, op *wasiOpen, unlocks, wait bool, set func(wait bool) error, unlock func() error) (interrupted bool, err error) {
 	op.mu.Lock()
 	pending := op.lockPending
 	op.mu.Unlock()
@@ -11697,11 +11868,7 @@ func (w *WasiStubs) takeLock(name, key string, op *wasiOpen, unlocks, wait bool,
 		}
 	}
 	op.mu.Lock()
-	for held := range op.lockHeld {
-		if strings.HasPrefix(held, name+" ") {
-			delete(op.lockHeld, held)
-		}
-	}
+	maps.DeleteFunc(op.lockHeld, func(held lockKey, _ bool) bool { return held.call == key.call })
 	op.mu.Unlock()
 	if unlocks || !wait {
 		return false, set(false)
@@ -11729,7 +11896,7 @@ func (w *WasiStubs) takeLock(name, key string, op *wasiOpen, unlocks, wait bool,
 	})
 	op.mu.Lock()
 	if op.lockWaits == nil {
-		op.lockWaits = map[string]int{}
+		op.lockWaits = map[lockKey]int{}
 	}
 	op.lockWaits[key]++
 	op.mu.Unlock()
@@ -11754,7 +11921,7 @@ func (w *WasiStubs) takeLock(name, key string, op *wasiOpen, unlocks, wait bool,
 		if err == nil {
 			op.mu.Lock()
 			if op.lockHeld == nil {
-				op.lockHeld = map[string]bool{}
+				op.lockHeld = map[lockKey]bool{}
 			}
 			op.lockHeld[key] = true
 			op.mu.Unlock()
@@ -11885,7 +12052,7 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 		}
 		return hostRecordLock(f, recordLockSet, &lk)
 	}
-	interrupted, err := w.takeLock("fd_lock", fmt.Sprintf("fd_lock %d %d %d %d", lk.typ, lk.whence, lk.start, lk.len), op, lk.typ == recordUnlock, cmd == recordLockWait, set,
+	interrupted, err := w.takeLock("fd_lock", lockKey{call: lockCallRecord, typ: lk.typ, whence: lk.whence, start: lk.start, len: lk.len}, op, lk.typ == recordUnlock, cmd == recordLockWait, set,
 		func() error { return hostRecordLock(f, recordLockSet, &unlock) })
 	if interrupted {
 		return -_wasiEINTR
@@ -13434,6 +13601,8 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"SyslogMessage":     true,
 			"LockFS":            true,
 			"recordLock":        true,
+			"lockCall":          true,
+			"lockKey":           true,
 			"detachedCall":      true,
 			"wasiABI":           true,
 			"dotDirEntry":       true,
@@ -13699,6 +13868,10 @@ var (
 	wasip1NativeLinuxMsgRaw []byte
 	//go:embed wasip1_native_linux_386.go
 	wasip1NativeLinux386Raw []byte
+	//go:embed wasip1_native_linux_reuseport.go
+	wasip1NativeLinuxReusePortRaw []byte
+	//go:embed wasip1_native_linux_mipsreuseport.go
+	wasip1NativeLinuxMIPSReusePortRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_darwin.go
@@ -13724,6 +13897,9 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 
 		"wasip1_native_linux_msg.go": wasip1NativeLinuxMsgRaw,
 		"wasip1_native_linux_386.go": wasip1NativeLinux386Raw,
+
+		"wasip1_native_linux_reuseport.go":     wasip1NativeLinuxReusePortRaw,
+		"wasip1_native_linux_mipsreuseport.go": wasip1NativeLinuxMIPSReusePortRaw,
 
 		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,

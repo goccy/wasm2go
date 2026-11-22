@@ -101,8 +101,9 @@ are no lookup and are not asked about; a signal ends a lookup with
 one denies. A socket (`sock_open`, `sock_socketpair`, `sock_socket`)
 is one socket of the host's from its making to its close; a
 Unix-domain socket's path is a file of the host only with
-`HostFS("/")`, and `ENOTSUP` with any other `FS`. `sock_shutdown` and
-`pipe` consult no hook. `FSAccess` is consulted on every path operation with the path
+`HostFS("/")`, and `ENOTSUP` with any other `FS`. `sock_shutdown`, the
+socket options and timeouts (`sock_setopt`, `sock_getopt`,
+`sock_timeout`) and `pipe` consult no hook. `FSAccess` is consulted on every path operation with the path
 cleaned as `chroot(2)` sees it (`..` of the root is the root; a
 symbolic link's target too) and the `FS` is given that approved path
 (`FSAccess` is a policy on path names); a nil one allows every access
