@@ -305,6 +305,14 @@ type osFS struct{}
 // Everything, the root itself included, goes through the directory os.Root
 // holds, so the root must be a directory that may be searched: HostFS
 // returns the error of looking at it otherwise.
+//
+// A guest's open of a FIFO waits for the other end, as open(2) does. When
+// the wait of an open for writing, or of any open of a FIFO where the host
+// does not tell of the opens of a FIFO (darwin, a Linux without /proc or
+// inotify), ends before the other end comes — a signal interrupts it, or
+// the guest ends — the open is made to return by opening the FIFO for
+// reading and writing, and both ends are closed again: a process that opens
+// the FIFO meanwhile finds that end, which goes away at once.
 func HostFS(root string) (FS, error) {
 	if root == "" || filepath.Clean(root) == "/" {
 		return osFS{}, nil
@@ -7392,7 +7400,7 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 	case isFIFO && flag&os.O_RDWR == 0:
 		// An open of one end waits for the other.
 		var errno int32
-		if f, errno = w.openFIFO(openFile, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
+		if f, errno = w.openFIFO(fsys, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
 	case flag&os.O_CREATE != 0:
@@ -12805,9 +12813,23 @@ func (o osFS) Mkfifo(name string, perm os.FileMode) error {
 // take for a peer. When that open fails, or opens another file than fi
 // (the name was given to another file meanwhile), its error is told
 // WASIConfig.Errors, and the first open is left to return when someone
-// else opens the FIFO: the goroutine closes what it opened then. So it
-// does too when the wait ends because the guest is ended.
-func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, fi os.FileInfo, flag int, perm os.FileMode) (File, int32) {
+// else opens the FIFO: the goroutine closes what it opened then. When the
+// wait ends because the guest is ended (terminate unwinds the call), the
+// open is made to return as well, and what fails is told Errors.
+//
+// An open for reading of a FIFO of a filesystem of the host's is made
+// without opening the other end where the host can tell of the opens of
+// the FIFO (openFIFOWatched).
+func (w *WasiStubs) openFIFO(fsys FS, name string, fi os.FileInfo, flag int, perm os.FileMode) (File, int32) {
+	openFile := fsys.OpenFile
+	switch fsys.(type) {
+	case osFS, rootFS:
+		if flag&os.O_WRONLY == 0 {
+			if f, errno, watched := w.openFIFOWatched(openFile, name, flag, perm); watched {
+				return f, errno
+			}
+		}
+	}
 	var f File
 	call := newDetachedCall(func(err error) {
 		if err != nil {
@@ -12823,37 +12845,59 @@ func (w *WasiStubs) openFIFO(openFile func(name string, flag int, perm os.FileMo
 		f, err = openFile(name, flag, perm)
 		call.finish(err)
 	}()
-	if w.awaitInterruptibly(call.done) {
+	awaited := false
+	defer func() {
+		if !awaited {
+			unblockErr, closeErr := unblockFIFOOpen(openFile, name, fi, call, &f)
+			w.reportError("path_open", errors.Join(unblockErr, closeErr))
+		}
+	}()
+	opened := w.awaitInterruptibly(call.done)
+	awaited = true
+	if opened {
 		err := call.take()
 		if err != nil {
 			return nil, w.guestErrno("path_open", err)
 		}
 		return f, _wasiESUCCESS
 	}
-	end, err := openFile(name, os.O_RDWR, 0)
-	if err != nil {
+	unblockErr, closeErr := unblockFIFOOpen(openFile, name, fi, call, &f)
+	if unblockErr != nil {
 		// The guest is told EINTR: no call of its is left to fail with
 		// this.
-		w.reportError("path_open", err)
+		w.reportError("path_open", unblockErr)
 		return nil, _wasiEINTR
+	}
+	if closeErr != nil {
+		return nil, w.guestErrno("path_open", closeErr)
+	}
+	return nil, _wasiEINTR
+}
+
+// unblockFIFOOpen makes the open of the FIFO name, which fi describes, that
+// call makes return, by opening the FIFO for reading and writing, the other
+// end of either open, which does not wait; once it has returned, what it
+// opened (*f) and that end are closed. unblockErr is why the open could not
+// be made to return: it is left to return when someone else opens the
+// FIFO, and call closes what it opens then. closeErr is the closes'.
+func unblockFIFOOpen(openFile func(name string, flag int, perm os.FileMode) (File, error), name string, fi os.FileInfo, call *detachedCall, f *File) (unblockErr, closeErr error) {
+	end, err := openFile(name, os.O_RDWR, 0)
+	if err != nil {
+		return err, nil
 	}
 	endInfo, err := end.Stat()
 	if err == nil && !os.SameFile(fi, endInfo) {
 		err = fmt.Errorf("%s is another file than the FIFO whose open waits", name)
 	}
 	if err != nil {
-		w.reportError("path_open", errors.Join(err, end.Close()))
-		return nil, _wasiEINTR
+		return errors.Join(err, end.Close()), nil
 	}
 	<-call.done
-	closeErr := end.Close()
+	closeErr = end.Close()
 	if openErr := call.take(); openErr == nil {
-		closeErr = errors.Join(closeErr, f.Close())
+		closeErr = errors.Join(closeErr, (*f).Close())
 	}
-	if closeErr != nil {
-		return nil, w.guestErrno("path_open", closeErr)
-	}
-	return nil, _wasiEINTR
+	return nil, closeErr
 }
 
 // detachedCall is a call made on a goroutine of its own that the guest
