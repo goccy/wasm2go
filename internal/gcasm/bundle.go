@@ -1197,12 +1197,14 @@ func buildPkg(
 		decl.WriteString("\t\"sync/atomic\"\n")
 	}
 	decl.WriteString("\t\"unsafe\"\n")
-	if rel != "" && rel != "base" {
+	// Multi-package output keeps the Module and the helpers in base.
+	_, multi := pkgSigs["base"]
+	if multi && rel != "base" {
 		fmt.Fprintf(&decl, "\n\tbase %q\n", importPath+"/base")
 	}
 	decl.WriteString(")\n\n")
 	decl.WriteString("var _ = unsafe.Pointer(nil)\n\n")
-	if rel != "" && rel != "base" {
+	if multi && rel != "base" {
 		decl.WriteString("var _ = base.Module{}\n\n")
 	}
 	decl.WriteString(declFns.String())
@@ -1261,9 +1263,19 @@ func buildPkg(
 		}
 		decl.WriteString("\n")
 	}
-	// Never-returning trap targets. Self-contained per package: the
-	// wasm_trap_* helpers live in base only under the multi-package
-	// layout. Messages match the pure trap helpers.
+	// Never-returning trap targets, one set per package. Messages match
+	// the pure trap helpers. gcasmTrapMemoryOOB, the direct-asm memory64
+	// access trap, panics with the helpers' out-of-bounds trap value
+	// itself, through wasm_trap_memory_oob (base's Wasm_trap_memory_oob
+	// in multi-package output).
+	trapOOB := "wasm_trap_memory_oob"
+	switch {
+	case rel == "base":
+		trapOOB = "Wasm_trap_memory_oob"
+	case multi:
+		trapOOB = "base.Wasm_trap_memory_oob"
+	}
+	fmt.Fprintf(&decl, "//go:noinline\nfunc gcasmTrapMemoryOOB() { %s() }\n\n", trapOOB)
 	decl.WriteString(`//go:noinline
 func gcasmTrapBounds() { panic("wasm: out of bounds access") }
 
@@ -1280,6 +1292,7 @@ func gcasmTrapOverflow() { panic("wasm: integer overflow") }
 func gcasmTrapUnreachable() { panic("wasm: unreachable") }
 
 var (
+	_ = gcasmTrapMemoryOOB
 	_ = gcasmTrapBounds
 	_ = gcasmTrapIndirectSig
 	_ = gcasmTrapDivZero

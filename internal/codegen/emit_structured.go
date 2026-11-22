@@ -579,7 +579,7 @@ func (se *structEmitter) blockValues(blk *ssa.Block) ([]ast.Stmt, error) {
 		if v.Op == ssa.OpPhi {
 			continue
 		}
-		if pre, err := se.em.callPrelude(v, se.emitExpr); err != nil {
+		if pre, err := se.em.valuePrelude(v, se.emitExpr); err != nil {
 			return nil, err
 		} else if len(pre) > 0 {
 			out = append(out, pre...)

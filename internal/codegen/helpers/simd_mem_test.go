@@ -11,7 +11,6 @@ package helpers
 
 import (
 	"encoding/binary"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -52,8 +51,8 @@ func mustTrap(t *testing.T, name string, f func()) {
 		if r == nil {
 			t.Fatalf("%s: expected an out-of-bounds trap", name)
 		}
-		if msg, ok := r.(string); !ok || !strings.Contains(msg, "out of bounds") {
-			t.Fatalf("%s: trapped with %v, want the v128 out-of-bounds message", name, r)
+		if r != (memoryOutOfBounds{}) {
+			t.Fatalf("%s: trapped with %v, want the out-of-bounds trap", name, r)
 		}
 	}()
 	f()
@@ -321,8 +320,8 @@ func TestSimdPairMemWrappers(t *testing.T) {
 // captured assembly.
 func TestGcasmMemProbe(t *testing.T) {
 	m := memTestModule(t, 64)
-	p, sz := gcasmMemProbe(m)
-	if p != m.M || sz != m.memSize {
-		t.Fatal("gcasmMemProbe must return m.M and m.memSize, in that order")
+	p, sz, n := gcasmMemProbe(m)
+	if p != m.M || sz != m.memSize || n != len(m.memory) {
+		t.Fatal("gcasmMemProbe must return m.M, m.memSize and len(m.memory), in that order")
 	}
 }

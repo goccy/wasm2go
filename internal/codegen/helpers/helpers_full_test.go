@@ -84,6 +84,17 @@ func mustPanic(t *testing.T, want string, f func()) {
 	f()
 }
 
+// mustTrapOOB calls f and asserts it panics with the out-of-bounds trap value.
+func mustTrapOOB(t *testing.T, f func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != (memoryOutOfBounds{}) {
+			t.Errorf("panic value: got %v, want the out-of-bounds trap", r)
+		}
+	}()
+	f()
+}
+
 // ---- Opaque identity helpers ------------------------------------------------
 
 func TestIdentityHelpers(t *testing.T) {

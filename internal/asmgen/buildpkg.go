@@ -391,6 +391,12 @@ type BuildPackageOptions struct {
 	// block so `*base.Module` resolves.
 	BasePkgImport string
 
+	// MemSizeOffset is the byte offset of the Module's memSize field,
+	// which a memory64 module's loads and stores check against (see
+	// FuncOptions.MemSizeOffset). A memory64 module needs it: without
+	// it, every function with a load or store is stubbed.
+	MemSizeOffset int
+
 	// SkipWrappers, when true, omits the wrappers.go entry from
 	// the returned file map. In multi-package mode the caller
 	// emits wrappers separately into base via BuildWrappers; each
@@ -537,6 +543,12 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 		// in hand.
 		for _, blk := range fn.Blocks {
 			for _, v := range blk.Values {
+				// A memory64 access's bounds check CALLs
+				// ·wasm_trap_memory_oob (see BoundsTrapSymbol), which
+				// needs a per-chunk trampoline like the div/rem traps.
+				if mod.Memory64() && isScalarMemOp(v.Op) {
+					helpersUsed["wasm_trap_memory_oob"] = true
+				}
 				switch v.Op {
 				case ssa.OpCallIndirect:
 					indirectTypes[uint32(v.AuxInt)] = true
@@ -579,12 +591,14 @@ func BuildPackageFiles(mod *wasm.Module, opts BuildPackageOptions) (map[string]s
 
 		for _, t := range targets {
 			asm, decl, err := t.emit(localName, sig, fn, FuncOptions{
-				ModulePkgRef:  modulePkgRef,
-				HelperPrefix:  helperPrefix,
-				Module:        mod,
-				FuncSymbol:    funcSymbol,
-				GlobalOffsets: globalOffsets,
-				Exc:           excOffsets,
+				ModulePkgRef:     modulePkgRef,
+				HelperPrefix:     helperPrefix,
+				Module:           mod,
+				FuncSymbol:       funcSymbol,
+				GlobalOffsets:    globalOffsets,
+				Exc:              excOffsets,
+				BoundsTrapSymbol: "·wasm_trap_memory_oob",
+				MemSizeOffset:    opts.MemSizeOffset,
 			})
 			if err != nil {
 				// Surface emit failures behind an env-var gate so a

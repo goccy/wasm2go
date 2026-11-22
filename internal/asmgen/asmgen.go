@@ -39,6 +39,10 @@ import (
 // asmgen translates those into plan9 asm symbols ("base·Fn42(SB)")
 // inside goAsmSymbol — callers don't need to construct .vs·.
 // themselves.
+//
+// The Driver does not carry the Module layout, so MemSizeOffset stays
+// unset: for a memory64 module the caller must set it, or every
+// function with a load or store fails emission.
 func FuncOptionsFromDriver(d emit.Driver, modulePkgRef string) FuncOptions {
 	prefix := ""
 	if d.MultiPackage() {
@@ -51,6 +55,8 @@ func FuncOptionsFromDriver(d emit.Driver, modulePkgRef string) FuncOptions {
 		FuncSymbol: func(idx uint32) string {
 			return d.FuncRefName(idx)
 		},
+		// Helper CALLs are spelled package-locally (see goCallSymbol).
+		BoundsTrapSymbol: "·wasm_trap_memory_oob",
 	}
 }
 
@@ -126,6 +132,14 @@ type FuncOptions struct {
 	// variants) to a CALLable symbol operand (same shape as
 	// CalleeSymbol: no "(SB)" suffix, emitted verbatim).
 	MemHelperSymbol func(name string) (string, bool)
+	// BoundsTrapSymbol is the CALL target, without "(SB)", that a
+	// memory64 load or store branches to when its access does not fit
+	// the memory: a never-returning, argument-less function.
+	// MemSizeOffset is the byte offset of the Module's memSize field
+	// (*atomic.Uint64), the bound of that check. A memory64 load or
+	// store fails emission without both.
+	BoundsTrapSymbol string
+	MemSizeOffset    int
 	// PackedParams, when non-nil, marks the packed outlined-boundary
 	// form: the Go-side signature carries only the module pointer and
 	// the parameter VALUES ride the Module's outline-pack scratch
@@ -2018,6 +2032,11 @@ type funcPlan struct {
 	trapDivZero  string
 	trapIntOvf   string
 	divRemInline bool
+	// boundsTrap / memSizeOffset are FuncOptions.BoundsTrapSymbol and
+	// MemSizeOffset: the CALL target and the bound of the memory64
+	// access checks.
+	boundsTrap    string
+	memSizeOffset int
 	// spliceHoist is the splicer's module-state staging text (m.M /
 	// memSize pointer into splice-safe registers), emitted at entry
 	// and re-issued after every value that actually emitted a CALL.
@@ -2262,6 +2281,7 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 	}
 	p.mem64 = opts.Module != nil && opts.Module.Memory64()
 	p.trapDivZero, p.trapIntOvf = "·wasm_trap_div_zero", "·wasm_trap_int_overflow"
+	p.boundsTrap, p.memSizeOffset = opts.BoundsTrapSymbol, opts.MemSizeOffset
 	p.divRemInline = true
 	p.packed = opts.PackedParams != nil
 	p.packedParams = opts.PackedParams
@@ -2274,15 +2294,20 @@ func planFunc(f *ssa.Func, opts FuncOptions, sig wasm.FuncType, callArgBias int,
 	maxCallee := 0
 	for _, blk := range f.Blocks {
 		for _, v := range blk.Values {
-			switch v.Op {
-			case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpLoad16U, ssa.OpLoad16S,
-				ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoad64,
-				ssa.OpLoadF32, ssa.OpLoadF64,
-				ssa.OpStore8, ssa.OpStore16, ssa.OpStore32, ssa.OpStore64,
-				ssa.OpStoreF32, ssa.OpStoreF64,
+			switch {
+			case isScalarMemOp(v.Op):
+				p.hasMem = true
+				if p.mem64 {
+					// The bounds check CALLs the trap (see
+					// emitMemAddrAMD64 / emitMemAddrARM64).
+					if p.boundsTrap == "" || p.memSizeOffset == 0 {
+						return nil, fmt.Errorf("%v v%d: a memory64 access needs FuncOptions.BoundsTrapSymbol and MemSizeOffset", v.Op, v.ID)
+					}
+					p.hasCall = true
+				}
+			case v.Op == ssa.OpSimdMemCall:
 				// SIMD memory helpers take m; staging it per call
 				// benefits from the m-cache exactly like inline memops.
-				ssa.OpSimdMemCall:
 				p.hasMem = true
 			}
 			switch v.Op {

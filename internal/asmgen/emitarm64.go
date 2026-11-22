@@ -817,16 +817,35 @@ func emitCmp64ARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 //     negative int32 base wraps the way wasm semantics require (the
 //     pure-Go path is `uint32(base + int32(off))`). MOVWU / ADDW
 //     zero-extend the low 32 bits into R3.
-//   - memory64: address = base + off in full 64-bit, no wrap (the
-//     pure-Go path is `uint64(base) + offset`). The Go assembler
-//     materialises out-of-range ADD immediates via REGTMP, so the
-//     shape stays a single ADD regardless of offset size.
-func emitMemAddrARM64(b *strings.Builder, baseArg *ssa.Value, aux int64, plan *funcPlan, frame argFrame) {
+//   - memory64: address = base + off in full 64-bit, bounded like the
+//     pure-Go path (see codegen's memBoundsTrapStmt): R3 = base + off,
+//     and the access branches to plan.boundsTrap on a carry out of that
+//     sum or unless R3 + size <= m.memSize. R1 carries the offset and the
+//     bound.
+func emitMemAddrARM64(b *strings.Builder, v *ssa.Value, size int, plan *funcPlan, frame argFrame) {
+	baseArg, aux := v.Args[0], v.AuxInt
 	if plan.mem64 {
+		trapLbl, okLbl := fmt.Sprintf("MEMOOB_%d", v.ID), fmt.Sprintf("MEMOK_%d", v.ID)
 		fmt.Fprintf(b, "\tMOVD %s, R3\n", operandSrc64ARM64(baseArg, plan, frame))
 		if aux != 0 {
-			fmt.Fprintf(b, "\tADD $%d, R3, R3\n", aux)
+			fmt.Fprintf(b, "\tMOVD $%d, R1\n", aux)
+			b.WriteString("\tADDS R1, R3, R3\n")
+			fmt.Fprintf(b, "\tBCS %s\n", trapLbl)
 		}
+		if plan.mCacheReg != "" {
+			fmt.Fprintf(b, "\tMOVD %d(%s), R1\n", plan.memSizeOffset, plan.mCacheReg)
+		} else {
+			b.WriteString("\tMOVD m+0(FP), R1\n")
+			fmt.Fprintf(b, "\tMOVD %d(R1), R1\n", plan.memSizeOffset)
+		}
+		b.WriteString("\tMOVD (R1), R1\n")
+		fmt.Fprintf(b, "\tSUBS $%d, R1, R1\n", size)
+		fmt.Fprintf(b, "\tBLO %s\n", trapLbl)
+		b.WriteString("\tCMP R1, R3\n")
+		fmt.Fprintf(b, "\tBLS %s\n", okLbl)
+		fmt.Fprintf(b, "%s:\n", trapLbl)
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.boundsTrap)
+		fmt.Fprintf(b, "%s:\n", okLbl)
 		fmt.Fprintf(b, "\tADD R3, R2, R2\n")
 		return
 	}
@@ -853,7 +872,7 @@ func emitLoadARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFr
 		fmt.Fprintf(b, "\tMOVD m+0(FP), R2\n")
 		fmt.Fprintf(b, "\tMOVD %d(R2), R2\n", moduleMOffset)
 	}
-	emitMemAddrARM64(b, v.Args[0], v.AuxInt, plan, frame)
+	emitMemAddrARM64(b, v, memAccessSize(v.Op), plan, frame)
 	is64 := v.Type == ssa.TypeI64
 	// Load directly into the destination register when the value
 	// has a regHome. Saves the final `MOVx R0, dst(RSP)` slot
@@ -963,7 +982,7 @@ func emitStoreARM64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argF
 		fmt.Fprintf(b, "\tMOVD m+0(FP), R2\n")
 		fmt.Fprintf(b, "\tMOVD %d(R2), R2\n", moduleMOffset)
 	}
-	emitMemAddrARM64(b, v.Args[0], v.AuxInt, plan, frame)
+	emitMemAddrARM64(b, v, memAccessSize(v.Op), plan, frame)
 	valIs64 := v.Args[1].Type == ssa.TypeI64
 	val32 := operandSrc32ARM64(v.Args[1], plan, frame)
 	val64 := operandSrc64ARM64(v.Args[1], plan, frame)

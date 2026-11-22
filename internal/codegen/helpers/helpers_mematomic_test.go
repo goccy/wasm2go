@@ -51,15 +51,15 @@ func TestMemoryInitAndDataDrop(t *testing.T) {
 	}
 
 	// Out of bounds on the source and on the destination both trap.
-	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit(m, 0, 0, 0, 100) })
-	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit(m, 0, 60, 0, 10) })
+	mustTrapOOB(t, func() { memoryInit(m, 0, 0, 0, 100) })
+	mustTrapOOB(t, func() { memoryInit(m, 0, 60, 0, 10) })
 
 	// After data.drop the segment is nil; naming it in memory.init traps.
 	dataDrop(m, 0)
 	if m.dataSegs[0] != nil {
 		t.Error("dataDrop did not nil the segment")
 	}
-	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit(m, 0, 0, 0, 1) })
+	mustTrapOOB(t, func() { memoryInit(m, 0, 0, 0, 1) })
 }
 
 // TestMemoryInit64DataEnd pins the memory64 variant's shared-image
@@ -101,10 +101,10 @@ func TestMemoryInit64DataEnd(t *testing.T) {
 	}
 
 	// Bounds checks trap like the 32-bit variant.
-	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit64(m, 0, 0, 0, 100) })
-	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit64(m, 0, 60, 0, 10) })
+	mustTrapOOB(t, func() { memoryInit64(m, 0, 0, 0, 100) })
+	mustTrapOOB(t, func() { memoryInit64(m, 0, 60, 0, 10) })
 	dataDrop(m, 0)
-	mustPanic(t, "wasm: memory.init out of bounds", func() { memoryInit64(m, 0, 0, 0, 1) })
+	mustTrapOOB(t, func() { memoryInit64(m, 0, 0, 0, 1) })
 }
 
 func TestAtomicMemoryOps(t *testing.T) {
@@ -178,7 +178,7 @@ func TestAtomicMemoryOps(t *testing.T) {
 
 	// atomicEA's bounds and alignment checks (reached through the ops above).
 	mustPanic(t, "wasm: unaligned atomic access", func() { atomicLoad32(m, 1, 0) })
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicLoad32(m, 60, 8) })
+	mustTrapOOB(t, func() { atomicLoad32(m, 60, 8) })
 }
 
 func TestThreadSpawnRunsThreadStart(t *testing.T) {
@@ -217,8 +217,12 @@ func TestThreadSpawnRunsThreadStart(t *testing.T) {
 }
 
 func TestWasmTrapHelpersPanic(t *testing.T) {
-	mustPanic(t, "wasm: memory.init out of bounds", wasm_trap_meminit_oob)
-	mustPanic(t, "wasm: atomic access out of bounds", wasm_trap_atomic_oob)
+	mustTrapOOB(t, wasm_trap_meminit_oob)
+	mustTrapOOB(t, wasm_trap_atomic_oob)
+	mustTrapOOB(t, wasm_trap_memory_oob)
+	if got := (memoryOutOfBounds{}).Error(); got != "wasm: memory access out of bounds" {
+		t.Errorf("trap message = %q", got)
+	}
 	mustPanic(t, "wasm: unaligned atomic access", wasm_trap_atomic_unaligned)
 	mustPanic(t, "wasm: blocking atomic wait with no other agents (wasi-threads not enabled)",
 		wasm_trap_atomic_wait_forever)

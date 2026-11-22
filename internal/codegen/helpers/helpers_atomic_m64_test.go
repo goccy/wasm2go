@@ -33,17 +33,17 @@ func TestAtomicEA64(t *testing.T) {
 		t.Errorf("atomicEA64(end-4) = %d", got)
 	}
 	// One past the end traps.
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicEA64(m, (5<<30)-3, 0, 4) })
+	mustTrapOOB(t, func() { atomicEA64(m, (5<<30)-3, 0, 4) })
 	// Negative address / negative offset trap as out of bounds.
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicEA64(m, -8, 0, 4) })
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicEA64(m, 0, -8, 4) })
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicEA64(m, -4, 8, 4) })
+	mustTrapOOB(t, func() { atomicEA64(m, -8, 0, 4) })
+	mustTrapOOB(t, func() { atomicEA64(m, 0, -8, 4) })
+	mustTrapOOB(t, func() { atomicEA64(m, -4, 8, 4) })
 	// addr+offset wrapping u64 traps rather than aliasing a low address.
-	mustPanic(t, "wasm: atomic access out of bounds", func() {
+	mustTrapOOB(t, func() {
 		atomicEA64(m, math.MaxInt64, math.MaxInt64, 4)
 	})
 	// ea+size wrapping u64 traps (ea itself did not wrap).
-	mustPanic(t, "wasm: atomic access out of bounds", func() {
+	mustTrapOOB(t, func() {
 		atomicEA64(m, 0, -1, 8)
 	})
 	// Misalignment traps AFTER the bounds check, like atomicEA.
@@ -124,8 +124,8 @@ func TestAtomicM64FullWidth(t *testing.T) {
 	}
 
 	// Out-of-bounds and misaligned addresses trap through atomicEA64.
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicLoad32_m64(m, 64, 0) })
-	mustPanic(t, "wasm: atomic access out of bounds", func() { atomicStore64_m64(m, -8, 0, 1) })
+	mustTrapOOB(t, func() { atomicLoad32_m64(m, 64, 0) })
+	mustTrapOOB(t, func() { atomicStore64_m64(m, -8, 0, 1) })
 	mustPanic(t, "wasm: unaligned atomic access", func() { atomicRmwAdd32_m64(m, 2, 0, 1) })
 }
 

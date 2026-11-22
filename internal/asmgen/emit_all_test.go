@@ -53,7 +53,7 @@ func TestEmitSweepBothArches(t *testing.T) {
 					continue
 				}
 				sig := mod.FuncTypeOf(funcIdx)
-				opts := FuncOptions{ModulePkgRef: "*Module", Module: mod, FuncSymbol: funcSymbol}
+				opts := FuncOptions{ModulePkgRef: "*Module", Module: mod, FuncSymbol: funcSymbol, BoundsTrapSymbol: "·wasm_trap_memory_oob", MemSizeOffset: driverMemSizeOffset}
 				if asm, decl, err := EmitFuncAMD64(name, sig, fn, opts); err == nil {
 					if asm == "" || decl == "" {
 						t.Fatalf("amd64 %s: empty asm/decl", name)

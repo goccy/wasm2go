@@ -229,6 +229,7 @@ func (t *translator) appendDirectAsmLayoutFile(files map[string][]byte) {
 		asserted++
 	}
 	if len(t.mod.Memories) > 0 {
+		assert(t.fieldName("memory"), 0)
 		assert("M", 32)
 	}
 	if t.opts.OutlineMinValues > 0 {

@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/bits"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,6 +72,10 @@ type Module struct {
 	threadStart64 func(m *Module, tid int32, arg int64)
 	// threads tracks agents spawned through wasi_thread_spawn.
 	threads *threadPool
+	// memReserve is the guarded reservation backing memory when the
+	// constructor allocated it (see initLinearMemory); nil for a heap
+	// allocation or a caller-supplied memory.
+	memReserve []byte
 }
 
 // ----- Opaque identity helpers ---------------------------------------------
@@ -139,13 +144,34 @@ func wasm_trap_invalid_conv() { panic("wasm: invalid conversion to integer") }
 func wasm_trap_unreachable() { panic("wasm: unreachable") }
 
 //go:noinline
-func wasm_trap_memfill_oob() { panic("wasm: memory.fill out of bounds") }
+func wasm_trap_memfill_oob() { panic(memoryOutOfBounds{}) }
 
 //go:noinline
-func wasm_trap_memcopy_oob() { panic("wasm: memory.copy out of bounds") }
+func wasm_trap_memcopy_oob() { panic(memoryOutOfBounds{}) }
 
 //go:noinline
-func wasm_trap_meminit_oob() { panic("wasm: memory.init out of bounds") }
+func wasm_trap_meminit_oob() { panic(memoryOutOfBounds{}) }
+
+// memoryOutOfBounds is the trap value of every out-of-bounds linear-memory
+// access: a wasm32 access faulting in its guard reservation, a memory64
+// access past its memory, and the range checks of the bulk, atomic and SIMD
+// helpers. It is an error: Inv_* entry points wrap it (%w) into the error
+// they return, and direct exports and constructors panic with it. The type
+// is unexported, so only code inside the generated package can name it;
+// there all its values are equal and compare with == or errors.Is.
+type memoryOutOfBounds struct{}
+
+func (memoryOutOfBounds) Error() string { return "wasm: memory access out of bounds" }
+
+// wasm_trap_memory_oob panics with memoryOutOfBounds: the target of the
+// memory64 access checks, in generated code and in asm (directly, or
+// through the asm bundle's gcasmTrapMemoryOOB).
+//
+//go:noinline
+func wasm_trap_memory_oob() { panic(memoryOutOfBounds{}) }
+
+// wasm_trap_memory_oob is only called from generated code and asm.
+var _ = wasm_trap_memory_oob
 
 // ----- Exception handling (EH proposal / setjmp-longjmp) --------------------
 //
@@ -819,6 +845,56 @@ func memorySize(m *Module) int32 {
 // with codegen's wasmMemHardCapBytes).
 func wasmMemHardCap() uint64 { return (1 << 32) - (1 << 17) }
 
+// initLinearMemory returns m's wasm32 linear memory, minBytes long (see
+// adoptLinearMemory). It panics when the host refuses the reservation:
+// running without one would leave guest accesses unconfined.
+func initLinearMemory(m *Module, minBytes, capBytes uint64) []byte {
+	mem, err := adoptLinearMemory(m, minBytes, capBytes)
+	if err != nil {
+		panic("wasm2go: " + err.Error())
+	}
+	return mem
+}
+
+// adoptLinearMemory allocates a linear memory for m: in a guarded reservation
+// where the host supports one (see newLinearMemory), recorded in m.memReserve,
+// and otherwise on the heap with capBytes capacity. The reservation is not Go
+// heap. Its release is tied to m.threads, which m and every wasi-threads agent
+// copy of it share (and which, holding pointers, is never a tiny allocation
+// whose cleanup could be held back by its neighbours), so it is released once
+// none of them is reachable — and a slice of it is valid only while one is.
+func adoptLinearMemory(m *Module, minBytes, capBytes uint64) ([]byte, error) {
+	mem, reserve, err := newLinearMemory(minBytes, capBytes)
+	if err != nil {
+		return nil, err
+	}
+	if reserve != nil {
+		m.memReserve = reserve
+		runtime.AddCleanup(m.threads, releaseLinearMemory, reserve)
+	}
+	return mem, nil
+}
+
+// memoryAccessTrap maps a value recovered at an export entry point: a memory
+// fault inside m's guarded linear-memory reservation is a guest out-of-bounds
+// access and becomes the wasm trap, any other fault is a host bug and is
+// re-raised, and every other value passes through unchanged.
+func memoryAccessTrap(m *Module, r any) any {
+	f, ok := r.(interface{ Addr() uintptr })
+	if !ok {
+		return r
+	}
+	if guardedLinearMemory && uint64(f.Addr()-uintptr(m.M)) < linearMemoryReserve {
+		return memoryOutOfBounds{}
+	}
+	panic(r)
+}
+
+// setPanicOnFault is debug.SetPanicOnFault for the generated entry points,
+// which call it without importing runtime/debug next to parameters named
+// after the module's imports.
+func setPanicOnFault(enabled bool) bool { return debug.SetPanicOnFault(enabled) }
+
 // memoryGrow grows m.memory by n wasm pages (64 KiB each). Returns the
 // previous page count, or -1 if the new size would exceed maxMem or
 // wasmMemHardCap. n may be 0, which simply returns the current size.
@@ -861,6 +937,21 @@ func memoryGrow(m *Module, n int32) int32 {
 		m.memSize.Store(want)
 		return prev
 	}
+	if m.memReserve != nil {
+		// A reserved memory never moves and is writable exactly up to its
+		// size: commit the new pages in place, and m.M stays valid.
+		if err := commitLinearMemory(m.memReserve, cur, want); err != nil {
+			// memory.grow reports a host that cannot supply the pages
+			// the same way as reaching maxMem: -1, which the guest's
+			// allocator turns into its own out-of-memory result. The
+			// host's reason goes to stderr, as nothing else sees it.
+			println("wasm2go: memory.grow:", err.Error())
+			return -1
+		}
+		m.memory = m.memReserve[:want:want]
+		m.memSize.Store(want)
+		return prev
+	}
 	if want <= uint64(cap(m.memory)) {
 		// Spare capacity already covers the new size. The bytes in
 		// [len, want) were zero-filled when the backing array was
@@ -882,7 +973,14 @@ func memoryGrow(m *Module, n int32) int32 {
 	if newCap > wasmMemHardCap() {
 		newCap = wasmMemHardCap()
 	}
-	grown := make([]byte, want, newCap)
+	// The new backing array is a guarded reservation where the host has
+	// them, so a caller-supplied memory that outgrows itself stays confined.
+	grown, err := adoptLinearMemory(m, want, newCap)
+	if err != nil {
+		// Reported to the guest as -1, like the reserved path above.
+		println("wasm2go: memory.grow:", err.Error())
+		return -1
+	}
 	copy(grown, m.memory)
 	m.memory = grown
 	m.memSize.Store(want)
@@ -1241,7 +1339,7 @@ func memoryCopy(m *Module, dst int32, src int32, n int32) {
 // which is every architecture wasm2go targets.
 
 //go:noinline
-func wasm_trap_atomic_oob() { panic("wasm: atomic access out of bounds") }
+func wasm_trap_atomic_oob() { panic(memoryOutOfBounds{}) }
 
 //go:noinline
 func wasm_trap_atomic_unaligned() { panic("wasm: unaligned atomic access") }
@@ -2496,11 +2594,15 @@ func threadLaunch(m *Module, body func(child *Module, tid int32)) int32 {
 	go func() {
 		defer m.threads.wg.Done()
 		defer spinAgentsAdd(-1)
+		// A guest access outside the linear memory faults in its guard
+		// reservation; make that a panic the recover below reports.
+		debug.SetPanicOnFault(true)
 		// A trap on any wasm thread traps the whole instance (wasi-threads
 		// semantics): surface WHERE it happened, then let it take the
 		// process down instead of silently unwinding the goroutine.
 		defer func() {
 			if r := recover(); r != nil {
+				r = memoryAccessTrap(child, r)
 				println("wasm2go: wasi thread", tid, "trapped:")
 				switch v := r.(type) {
 				case error:
@@ -2559,20 +2661,21 @@ func ThreadsWait(m *Module) { m.threads.wg.Wait() }
 // instead of inlined bodies.
 
 //go:noinline
-func wasm_trap_simd_oob() { panic("wasm: v128 memory access out of bounds") }
+func wasm_trap_simd_oob() { panic(memoryOutOfBounds{}) }
 
 // gcasmMemProbe anchors the Module field offsets the gcasm memory-op
 // splices hardcode. The splices read m.M and m.memSize straight off the
 // receiver in generated assembly, and the offsets of those fields
 // depend on the module (the import-interface fields between them vary).
-// Rather than re-deriving Go's struct layout, gcasm extracts the two
-// offsets from THIS function's captured assembly — two loads off R0/AX,
-// M first — so they always come from the same compile that produced the
-// code being spliced. Never called at run time.
+// Rather than re-deriving Go's struct layout, gcasm extracts the
+// offsets from THIS function's captured assembly — three loads off
+// R0/AX: M, memSize, then len(memory), which pins the memory slice at
+// offset 0 — so they always come from the same compile that produced
+// the code being spliced. Never called at run time.
 //
 //go:noinline
-func gcasmMemProbe(m *Module) (unsafe.Pointer, *atomic.Uint64) {
-	return m.M, m.memSize
+func gcasmMemProbe(m *Module) (unsafe.Pointer, *atomic.Uint64, int) {
+	return m.M, m.memSize, len(m.memory)
 }
 
 func simdEA(m *Module, addr int32, offset int32, size uint64) uint64 {
@@ -3145,7 +3248,7 @@ func simd_p_v128_store64_lane(m *Module, addr int32, offset int32, lane int32, v
 // page counts are u64/i64; effective-address arithmetic is u64 with
 // explicit overflow traps (there is no benign wrap at 2^64). Plain
 // scalar loads/stores never come through here — the emitter derefs
-// them inline with a uint64 cast, exactly like the uint32 form.
+// them inline behind a bounds check (see codegen's memBoundsTrapStmt).
 
 // mem64HardCap bounds a memory64's linear memory. Far above any real
 // host, it exists so effective-address arithmetic in the checked

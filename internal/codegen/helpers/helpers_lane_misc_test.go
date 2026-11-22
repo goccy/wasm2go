@@ -129,7 +129,7 @@ func TestTrapAndExceptionEntryPoints(t *testing.T) {
 		f()
 	}
 	trap("unreachable", wasm_trap_unreachable, "unreachable")
-	trap("memcopy", wasm_trap_memcopy_oob, "out of bounds")
+	mustTrapOOB(t, wasm_trap_memcopy_oob)
 	// throw/catch round-trip.
 	func() {
 		defer func() {

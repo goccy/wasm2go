@@ -37,6 +37,10 @@ type Names struct {
 	// SaveGlobals is the generated globals-snapshot function (see
 	// emitGlobalsSnapshot); multi-package output exports it.
 	SaveGlobals string
+
+	// GuardMemory maps the image inside a guarded reservation (a wasm32
+	// memory; see mapLinearMemory).
+	GuardMemory bool
 }
 
 // Files renders the runtime: output filename → formatted Go source. The three

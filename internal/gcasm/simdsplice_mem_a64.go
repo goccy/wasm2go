@@ -98,13 +98,14 @@ var (
 )
 
 // FindModuleOffsets extracts the Module field offsets from the probe's
-// captured body: two loads off the receiver, m.M first, then m.memSize
-// (the probe returns them in that order and gc does not reorder two
-// independent loads feeding results). The M offset is additionally
-// pinned by construction — memory/maxMem/M lead the struct precisely so
-// generated assembly can hardcode them — which the extraction verifies;
-// a probe that does not look like that yields nil, and memory ops stay
-// on the call path.
+// captured body: three loads off the receiver, m.M first, then m.memSize,
+// then len(m.memory) (the probe returns them in that order and gc does
+// not reorder independent loads feeding results). The M offset and the
+// memory slice's are additionally pinned by construction —
+// memory/maxMem/M lead the struct precisely so generated assembly can
+// hardcode them — which the extraction verifies (M at 32, the slice's
+// length word at 8); a probe that does not look like that yields nil,
+// and memory ops stay on the call path.
 func FindModuleOffsets(fns []*Fn, arch string) *ModuleOffsets {
 	re := a64ProbeLoadRe
 	if arch == "amd64" {
@@ -125,7 +126,7 @@ func FindModuleOffsets(fns []*Fn, arch string) *ModuleOffsets {
 				offs = append(offs, n)
 			}
 		}
-		if len(offs) != 2 || offs[0] != 32 {
+		if len(offs) != 3 || offs[0] != 32 || offs[2] != 8 {
 			return nil
 		}
 		return &ModuleOffsets{M: offs[0], MemSize: offs[1]}
