@@ -203,7 +203,7 @@ func TestWasi_ClosedStandardOutputIsReusedByOpen(t *testing.T) {
 		t.Fatalf("offset = %d, want %d", pos, len("to-file"))
 	}
 	w.mu.Lock()
-	cw := w.childWriterLocked(1, w.cfg.Stdout)
+	cw := commandStreamValue(w.commandStreamLocked(1, 2))
 	w.mu.Unlock()
 	if _, isFile := cw.(File); !isFile {
 		t.Fatalf("spawned child's stdout = %T, want the file", cw)
@@ -282,10 +282,10 @@ func TestWasi_ClosedStandardDescriptorsAreBad(t *testing.T) {
 	// A spawned process gets no stream for a closed descriptor, and the
 	// instance's own stream when the guest asks for it with -1.
 	w.mu.Lock()
-	cin := w.childReaderLocked(0)
-	cout := w.childWriterLocked(1, w.cfg.Stdout)
-	cerr := w.childWriterLocked(2, w.cfg.Stderr)
-	inherited := w.childWriterLocked(-1, w.cfg.Stdout)
+	cin := commandStreamValue(w.commandStreamLocked(0, 1))
+	cout := commandStreamValue(w.commandStreamLocked(1, 2))
+	cerr := commandStreamValue(w.commandStreamLocked(2, 3))
+	inherited := commandStreamValue(w.commandStreamLocked(-1, 2))
 	w.mu.Unlock()
 	if cin != nil || cout != nil || cerr != nil {
 		t.Errorf("child streams for closed fds = %v, %v, %v; want none", cin, cout, cerr)
@@ -293,6 +293,20 @@ func TestWasi_ClosedStandardDescriptorsAreBad(t *testing.T) {
 	if inherited != w.cfg.Stdout {
 		t.Errorf("child stream for fd -1 = %v, want the instance's stdout", inherited)
 	}
+}
+
+// commandStreamValue returns the stream a command gets for s: its host
+// descriptor, reader or writer; nil for the null device.
+func commandStreamValue(s commandStream) any {
+	switch {
+	case s.host != nil:
+		return s.host
+	case s.reader != nil:
+		return s.reader
+	case s.writer != nil:
+		return s.writer
+	}
+	return nil
 }
 
 func TestWasi_SpawnWithClosedStandardOutput(t *testing.T) {
