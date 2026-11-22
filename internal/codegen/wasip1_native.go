@@ -13970,244 +13970,22 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		return nil, nil, nil
 	}
 	src, err := codegenStripForEmit(wasip1NativeRaw, codegenStripOpts{
-		// Only the names listed here survive into emitted output.
-		// Anything else (codegen-only helpers, the in-package Module
-		// stand-in, the embed vars, this very function, etc.) is
-		// stripped.
-		keepTypeNames: map[string]bool{
-			"WasiExitError":     true,
-			"WasiSignalError":   true,
-			"Signals":           true,
-			"SignalTarget":      true,
-			"wasiSignals":       true,
-			"wasiOpen":          true,
-			"wasiProc":          true,
-			"wasiPIDs":          true,
-			"deadlineReader":    true,
-			"streamWriter":      true,
-			"pollProbe":         true,
-			"hostWaitFD":        true,
-			"wasiWake":          true,
-			"wasiSocket":        true,
-			"wasiSockAddr":      true,
-			"WasiStubs":         true,
-			"WASIConfig":        true,
-			"Process":           true,
-			"ProcessIDs":        true,
-			"ProcessTimes":      true,
-			"isolatedProcess":   true,
-			"ownNameInfo":       true,
-			"ownNameEntry":      true,
-			"hostProcess":       true,
-			"forkedProcess":     true,
-			"IDChange":          true,
-			"IDCall":            true,
-			"Users":             true,
-			"User":              true,
-			"Group":             true,
-			"noUsers":           true,
-			"hostUsers":         true,
-			"hostDBEntry":       true,
-			"System":            true,
-			"Uname":             true,
-			"hostSystem":        true,
-			"Services":          true,
-			"Service":           true,
-			"hostServices":      true,
-			"Numbering":         true,
-			"Syslogger":         true,
-			"SyslogMessage":     true,
-			"LockFS":            true,
-			"recordLock":        true,
-			"lockCall":          true,
-			"lockKey":           true,
-			"detachedCall":      true,
-			"wasiABI":           true,
-			"dotDirEntry":       true,
-			"descriptorListing": true,
-			"FS":                true,
-			"File":              true,
-			"osFS":              true,
-			"rootFS":            true,
-			"noFS":              true,
-			"fileStat":          true,
-			"MemFS":             true,
-			"memFile":           true,
-			"memNode":           true,
-			"memFileInfo":       true,
-			"memDirEntry":       true,
-			"wasiZoneMoment":    true,
-			"posixZoneRule":     true,
-			"posixZone":         true,
-			"posixZoneScanner":  true,
-			"wasiZone":          true,
-
-			"ProcessChanges":     true,
-			"hostProcessChanges": true,
-			"processChanged":     true,
-			"creationThread":     true,
-
-			"wasiBlocking":   true,
-			"wasiOutside":    true,
-			"wasiSignalsDue": true,
-
-			"linuxTermios": true,
-			"linuxWinsize": true,
-			"terminalArg":  true,
+		// The codegen package's own declarations; everything else is the
+		// runtime and is emitted.
+		dropTypes: map[string]bool{
+			"Module":           true, // the in-package stand-in of the module
+			"codegenStripOpts": true,
+			"codegenWriter":    true,
+			"translator":       true, // the receiver of emitWasip1Native and the like
 		},
-		keepFuncNames: map[string]bool{
-			"NewWASI":                 true,
-			"HostWASIConfig":          true,
-			"HostFS":                  true,
-			"AllowAllNetAccess":       true,
-			"AllowAllDial":            true,
-			"AllowAllResolve":         true,
-			"AllowAllExec":            true,
-			"HostProcess":             true,
-			"HostProcessUmask":        true,
-			"hookErrno":               true,
-			"HostUsers":               true,
-			"hostUser":                true,
-			"hostGroup":               true,
-			"hostLookupError":         true,
-			"hostDatabaseEntry":       true,
-			"parseHostDBEntry":        true,
-			"parseHostID":             true,
-			"parseHostService":        true,
-			"newDetachedCall":         true,
-			"appendWasiString":        true,
-			"HostSystem":              true,
-			"HostServices":            true,
-			"findHostService":         true,
-			"HostSyslog":              true,
-			"modeAllows":              true,
-			"absoluteRecordLock":      true,
-			"NewMemFS":                true,
-			"fileStatOf":              true,
-			"unixFileMode":            true,
-			"unixModeBits":            true,
-			"unixTypeBits":            true,
-			"filetimesNeedCurrent":    true,
-			"writeFilestatExt":        true,
-			"rootRelative":            true,
-			"rootEscapeOf":            true,
-			"memSplit":                true,
-			"memSlice":                true,
-			"mapOSError":              true,
-			"errnoOr":                 true,
-			"seekErrno":               true,
-			"mapExecError":            true,
-			"encodeWaitStatus":        true,
-			"encodeHostWaitStatus":    true,
-			"totalBytesPlusNul":       true,
-			"zext":                    true,
-			"readVec":                 true,
-			"hostDescriptor":          true,
-			"socketCall":              true,
-			"lookupErrno":             true,
-			"sockAddrOf":              true,
-			"scopeOfZone":             true,
-			"unixGuestName":           true,
-			"leadingFrom":             true,
-			"shutdownSocket":          true,
-			"AllowAllListen":          true,
-			"streamHungUp":            true,
-			"streamPolled":            true,
-			"waitHostReady":           true,
-			"firstBuffer":             true,
-			"leadingBytes":            true,
-			"readOnce":                true,
-			"readResult":              true,
-			"hostRaw":                 true,
-			"wasiSignalBit":           true,
-			"isWasiSignalNumber":      true,
-			"guestSignalOfWASI":       true,
-			"killFamilyProc":          true,
-			"killHostProc":            true,
-			"pollReady":               true,
-			"takeTurn":                true,
-			"writeVec":                true,
-			"Args_get":                true,
-			"Args_sizes_get":          true,
-			"Environ_get":             true,
-			"Environ_sizes_get":       true,
-			"Clock_res_get":           true,
-			"Clock_time_get":          true,
-			"closeWasiOpen":           true,
-			"closeWasiOpens":          true,
-			"withHostUmask":           true,
-			"HostProcessChanges":      true,
-			"newCreationThread":       true,
-			"Fd_close":                true,
-			"Fd_fdstat_get":           true,
-			"Fd_fdstat_set_flags":     true,
-			"Fd_fdstat_set_rights":    true,
-			"Fd_filestat_get":         true,
-			"Fd_filestat_set_size":    true,
-			"Fd_filestat_set_times":   true,
-			"combine64":               true,
-			"resolveFiletimes":        true,
-			"Fd_prestat_get":          true,
-			"Fd_prestat_dir_name":     true,
-			"Fd_read":                 true,
-			"fdSrcLocked":             true,
-			"fdDstLocked":             true,
-			"Fd_pread":                true,
-			"Fd_pwrite":               true,
-			"Fd_seek":                 true,
-			"Fd_tell":                 true,
-			"Fd_write":                true,
-			"Fd_sync":                 true,
-			"Fd_datasync":             true,
-			"Fd_advise":               true,
-			"Fd_allocate":             true,
-			"Fd_renumber":             true,
-			"readDirCached":           true,
-			"dotEntry":                true,
-			"Name":                    true,
-			"IsDir":                   true,
-			"Type":                    true,
-			"Info":                    true,
-			"Fd_readdir":              true,
-			"Path_open":               true,
-			"ownDescriptorPath":       true,
-			"ownDescriptorNumber":     true,
-			"ownProcessDir":           true,
-			"rootElements":            true,
-			"ownAccess":               true,
-			"hostStreamLink":          true,
-			"streamAlias":             true,
-			"refuseDirectory":         true,
-			"guestPath":               true,
-			"setSpecialBits":          true,
-			"Path_create_directory":   true,
-			"Path_unlink_file":        true,
-			"Path_remove_directory":   true,
-			"Path_rename":             true,
-			"Path_filestat_get":       true,
-			"Path_filestat_set_times": true,
-			"osLstatOrStat":           true,
-			"Path_link":               true,
-			"Path_symlink":            true,
-			"Path_readlink":           true,
-			"Random_get":              true,
-			"Sched_yield":             true,
-			"Poll_oneoff":             true,
-			"writeEvent":              true,
-			"Proc_exit":               true,
-			"Proc_raise":              true,
-			"Sock_accept":             true,
-			"Sock_recv":               true,
-			"Sock_send":               true,
-			"Sock_shutdown":           true,
-			"writeFilestat":           true,
-			"Error":                   true,
-			"parsePosixZone":          true,
-			"locationMoment":          true,
-			"zoneReading":             true,
+		dropFuncs: map[string]bool{
+			"accessMemory":              true,
+			"codegenStripForEmit":       true,
+			"printAST":                  true,
+			"receiverTypeName":          true,
+			"renamePackage":             true,
+			"rewriteValueSpecsSelfRefs": true,
 		},
-		keepVarNames: map[string]bool{"idCallArgs": true, "creationThreadsRefused": true, "reportCreationThreadsRefused": true, "hostUmaskState": true},
-		keepConstAll: true,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("strip wasi template: %w", err)
@@ -14360,22 +14138,22 @@ func renamePackage(src []byte, pkg string) ([]byte, error) {
 	return nil, errors.New("no package clause of package codegen")
 }
 
-// codegenStripOpts is the allow-list flavour of strip: any top-level
-// decl whose name isn't listed is removed from the embedded source
-// before it is spliced into the generated output. Const blocks survive
-// wholesale (the wasi errno constants are all part of the runtime
-// surface).
+// codegenStripOpts names the top-level declarations of the embedded source
+// that are the codegen package's own, which strip removes before the rest
+// is spliced into the generated output: types with their methods
+// (dropTypes, which names the receiver types of the codegen package's
+// methods too) and functions (dropFuncs). The vars the codegen package
+// embeds its sources into, the ones with a //go:embed directive, go as
+// well. Everything else stays, constants included.
 type codegenStripOpts struct {
-	keepTypeNames map[string]bool
-	keepFuncNames map[string]bool
-	keepVarNames  map[string]bool
-	keepConstAll  bool
+	dropTypes map[string]bool
+	dropFuncs map[string]bool
 }
 
-// codegenStripForEmit returns the embedded source with codegen-only
-// types/funcs/vars removed (only entries listed in opts survive). It
-// also rewrites the package declaration to wasip1native so downstream
-// parser-level operations don't see the codegen package name.
+// codegenStripForEmit returns the embedded source with the codegen
+// package's own declarations removed (codegenStripOpts). It also rewrites
+// the package declaration to wasip1native so downstream parser-level
+// operations don't see the codegen package name.
 func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "src.go", raw, parser.ParseComments)
@@ -14383,6 +14161,14 @@ func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 		return nil, err
 	}
 	f.Name = &ast.Ident{Name: "wasip1native"}
+	// embeds reports whether doc holds a //go:embed directive: the line
+	// comment "//go:embed" followed by a space or a tab and the patterns.
+	embeds := func(doc *ast.CommentGroup) bool {
+		return doc != nil && slices.ContainsFunc(doc.List, func(c *ast.Comment) bool {
+			rest, found := strings.CutPrefix(c.Text, "//go:embed")
+			return found && rest != "" && (rest[0] == ' ' || rest[0] == '\t')
+		})
+	}
 	kept := f.Decls[:0]
 	for _, d := range f.Decls {
 		switch dd := d.(type) {
@@ -14391,9 +14177,7 @@ func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 			case "import":
 				continue
 			case "const":
-				if opts.keepConstAll {
-					kept = append(kept, dd)
-				}
+				kept = append(kept, dd)
 			case "type":
 				specs := dd.Specs[:0]
 				for _, sp := range dd.Specs {
@@ -14402,7 +14186,7 @@ func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 						specs = append(specs, sp)
 						continue
 					}
-					if opts.keepTypeNames[ts.Name.Name] {
+					if !opts.dropTypes[ts.Name.Name] {
 						specs = append(specs, sp)
 					}
 				}
@@ -14412,21 +14196,15 @@ func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 				dd.Specs = specs
 				kept = append(kept, dd)
 			case "var":
+				// The directive of a declaration without parentheses is
+				// the declaration's doc.
+				if !dd.Lparen.IsValid() && embeds(dd.Doc) {
+					continue
+				}
 				specs := dd.Specs[:0]
 				for _, sp := range dd.Specs {
 					vs, ok := sp.(*ast.ValueSpec)
-					if !ok {
-						specs = append(specs, sp)
-						continue
-					}
-					keep := false
-					for _, n := range vs.Names {
-						if opts.keepVarNames[n.Name] {
-							keep = true
-							break
-						}
-					}
-					if keep {
+					if !ok || !embeds(vs.Doc) {
 						specs = append(specs, sp)
 					}
 				}
@@ -14438,21 +14216,16 @@ func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 				kept = append(kept, dd)
 			}
 		case *ast.FuncDecl:
-			// Functions are kept iff their name is in the allow-list,
-			// OR they are a method whose receiver type is in the
-			// allow-list (which catches all methods on the kept
-			// WasiStubs / wasiOpen / dotDirEntry).
-			recvType := ""
+			// A method goes with its type, wherever the type is declared
+			// (another platform file); a function when it is named.
 			if dd.Recv != nil && len(dd.Recv.List) > 0 {
-				recvType = receiverTypeName(dd.Recv.List[0].Type)
-			}
-			if opts.keepFuncNames[dd.Name.Name] {
-				kept = append(kept, dd)
+				if !opts.dropTypes[receiverTypeName(dd.Recv.List[0].Type)] {
+					kept = append(kept, dd)
+				}
 				continue
 			}
-			if recvType != "" && opts.keepTypeNames[recvType] {
+			if !opts.dropFuncs[dd.Name.Name] {
 				kept = append(kept, dd)
-				continue
 			}
 		}
 	}
@@ -14469,12 +14242,15 @@ func codegenStripForEmit(raw []byte, opts codegenStripOpts) ([]byte, error) {
 }
 
 // receiverTypeName returns the underlying type identifier of a method
-// receiver expression. For "*Foo" it returns "Foo"; for "Foo" it
-// returns "Foo". Used by the strip logic to drop entire receiver
-// families (e.g. every method on *translator) by name.
+// receiver expression. For "*Foo", "Foo" and "Foo[T]" it returns "Foo".
+// Used by the strip logic to keep or drop the methods of a type with it.
 func receiverTypeName(expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.StarExpr:
+		return receiverTypeName(e.X)
+	case *ast.IndexExpr:
+		return receiverTypeName(e.X)
+	case *ast.IndexListExpr:
 		return receiverTypeName(e.X)
 	case *ast.Ident:
 		return e.Name

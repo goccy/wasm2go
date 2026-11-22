@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1503,6 +1504,140 @@ func TestWasip1EmitKeepsEndErrors(t *testing.T) {
 	for _, name := range []string{"WasiExitError", "WasiSignalError"} {
 		if !types[name] || !errorMethods[name] {
 			t.Errorf("emitted runtime: type %s kept=%v, its Error method kept=%v", name, types[name], errorMethods[name])
+		}
+	}
+}
+
+// Strip removes what it is told is the codegen package's, and the vars
+// with a //go:embed directive, and keeps the rest unlisted: a method goes
+// with its type only, whatever its name, and stays with a type declared in
+// another file. No import is left.
+func TestCodegenStripForEmitDropsWhatItNames(t *testing.T) {
+	src := `package codegen
+
+import (
+	_ "embed"
+	"fmt"
+)
+
+const c = 1
+
+type kept struct{}
+type dropped struct{}
+type generic[T any] struct{ v T }
+type pair[K comparable, V any] map[K]V
+
+func (kept) Name() string            { return fmt.Sprint(c) }
+func (*dropped) Name() string        { return "" }
+func (g *generic[T]) Get() T         { return g.v }
+func (p pair[K, V]) Get(k K) V       { return p[k] }
+func (*elsewhere) Close() error      { return nil }
+func (*translator) emit()            {}
+func helper()                        {}
+func codegenOnly()                   {}
+
+var v = 1
+
+//go:embed out.go
+var raw []byte
+
+var (
+	w = 2
+	//go:embed out_linux.go
+	rawLinux []byte
+	//go:embedded is no directive
+	x = 3
+)
+`
+	out, err := codegenStripForEmit([]byte(src), codegenStripOpts{
+		dropTypes: map[string]bool{"dropped": true, "translator": true},
+		dropFuncs: map[string]bool{"codegenOnly": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), "out.go", out, 0)
+	if err != nil {
+		t.Fatalf("parse the stripped source: %v\n%s", err, out)
+	}
+	if len(f.Imports) != 0 {
+		t.Errorf("imports left: %d", len(f.Imports))
+	}
+	var got []string
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.GenDecl:
+			for _, sp := range d.Specs {
+				switch sp := sp.(type) {
+				case *ast.TypeSpec:
+					got = append(got, "type "+sp.Name.Name)
+				case *ast.ValueSpec:
+					got = append(got, d.Tok.String()+" "+sp.Names[0].Name)
+				}
+			}
+		case *ast.FuncDecl:
+			name := d.Name.Name
+			if d.Recv != nil {
+				name = receiverTypeName(d.Recv.List[0].Type) + "." + name
+			}
+			got = append(got, "func "+name)
+		}
+	}
+	want := []string{
+		"const c", "type kept", "type generic", "type pair",
+		"func kept.Name", "func generic.Get", "func pair.Get", "func elsewhere.Close", "func helper",
+		"var v", "var w", "var x",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("stripped declarations = %v, want %v", got, want)
+	}
+}
+
+// The emitted runtime has none of the vars the codegen package embeds its
+// sources into.
+func TestWasip1EmitHasNoEmbedVars(t *testing.T) {
+	src, err := parser.ParseFile(token.NewFileSet(), "wasip1_native.go", wasip1NativeRaw, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	embedded := map[string]bool{}
+	for _, d := range src.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
+			continue
+		}
+		for _, sp := range gd.Specs {
+			vs := sp.(*ast.ValueSpec)
+			for _, doc := range []*ast.CommentGroup{gd.Doc, vs.Doc} {
+				if doc != nil && slices.ContainsFunc(doc.List, func(c *ast.Comment) bool { return strings.HasPrefix(c.Text, "//go:embed ") }) {
+					embedded[vs.Names[0].Name] = true
+				}
+			}
+		}
+	}
+	if len(embedded) == 0 {
+		t.Fatal("wasip1_native.go embeds nothing: the test finds no directive")
+	}
+	tr := &translator{
+		opts:            Options{Package: "x", OutputImportPath: "ex/x"},
+		importedModules: []string{"wasi_snapshot_preview1"},
+		fset:            token.NewFileSet(),
+	}
+	decls, _, err := tr.emitWasip1Native()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
+			continue
+		}
+		for _, sp := range gd.Specs {
+			for _, n := range sp.(*ast.ValueSpec).Names {
+				if embedded[n.Name] {
+					t.Errorf("emitted runtime has the embed var %s", n.Name)
+				}
+			}
 		}
 	}
 }
