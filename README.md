@@ -260,15 +260,18 @@ the guest keeps its own numbers. `HostUsers()`, `HostSystem()`,
 `HostServices()` and `HostSyslog()` give the host's. The guest's
 `flock` locks a file of an `FS` that is a `LockFS` (what `HostFS` and
 `NewMemFS` return); `fcntl`'s record locks and `mkfifo` are the host's.
-On Linux a record lock is the open file description's (`F_OFD_SETLK`),
-so instances of one host process exclude each other; elsewhere it is the
-host process's, shared by all its instances and released by closing any
-descriptor of the file. A lock or an open of a FIFO that waits ends with
-`EINTR` when a signal is posted to the guest; an open of a FIFO with
-`O_NONBLOCK` does not wait. A blocked `F_SETLKW` cannot be called off:
-when it is granted after the guest was told `EINTR`, the range it asked
-for is unlocked again, which also removes a lock the guest held in that
-range before it waited.
+A record lock is the instance's, as a process's: a forked copy does not
+inherit it, the instances of a generated package exclude each other, and
+the instance's close of any descriptor of the file releases it. The
+host's locks exclude the other processes: on Linux those of one open
+file description of the file the runtime opens again, elsewhere the host
+process's, which a close of any descriptor of the file in the host
+process releases (see `Fd_lock`). A lock or an open of a FIFO that waits
+ends with `EINTR` when a signal is posted to the guest; an open of a FIFO
+with `O_NONBLOCK` does not wait. A blocked `F_SETLKW` for another
+process's lock cannot be called off: when it is granted after the guest
+was told `EINTR`, the host's locks of its range are brought back to the
+instances' locks.
 
 ```go
 fsys, err := mymodule.HostFS("/srv/data")

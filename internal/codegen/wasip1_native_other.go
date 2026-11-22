@@ -268,9 +268,21 @@ func hostAccess(path string, amode uint32, effective bool) (asked bool, err erro
 // runtime cannot do on this platform.
 func flockOSFile(f *os.File, how int) error { return errors.ErrUnsupported }
 
-// hostRecordLock would take a record lock of a file of the host process,
-// which the runtime cannot do on this platform.
-func hostRecordLock(f *os.File, cmd int32, lk *recordLock) error { return errors.ErrUnsupported }
+// hostRecordLocks says that the system has no record locks of the host:
+// fd_lock fails with ENOTSUP.
+const hostRecordLocks = false
+
+// The host's side of the record lock table, which fd_lock does not use on
+// this platform (hostRecordLocks).
+func (file *lockedFile) hostLockLocked(via *os.File, cmd int32, lk *recordLock) error {
+	return errors.ErrUnsupported
+}
+func (file *lockedFile) prepareHostLocked(f *os.File, regular, read, write, forWrite bool) (passed, err error) {
+	return nil, errors.ErrUnsupported
+}
+func (file *lockedFile) closeHostLocked() error                         { return nil }
+func (file *lockedFile) waitDescriptorLocked() (int, error)             { return -1, errors.ErrUnsupported }
+func hostWaitRecordLock(waitFD int, via *os.File, lk *recordLock) error { return errors.ErrUnsupported }
 
 // newHostSyslog would return the host's system logger, which package
 // log/syslog does not have on this platform.

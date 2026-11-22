@@ -50,6 +50,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"math/bits"
 	"net"
 	"net/netip"
@@ -574,7 +575,9 @@ func (noFS) Link(string, string) error                       { return fs.ErrNotE
 // MemFS is an in-memory read/write FS. Each value is an independent tree, so
 // two guest programs given separate MemFS values cannot observe each other's
 // files (full per-program filesystem isolation, no disk). Build one with
-// NewMemFS. Safe for concurrent use.
+// NewMemFS. Safe for concurrent use. A guest's flock (fd_flock) that waits
+// for a lock of a file of it is called off when the guest stops waiting
+// (see LockFS): nothing of it is left to run.
 type MemFS struct {
 	mu   sync.Mutex
 	root *memNode
@@ -583,9 +586,10 @@ type MemFS struct {
 	maxFileSize int64
 	// lastIno is the inode number of the node made last.
 	lastIno uint64
-	// lockReleased is broadcast whenever a lock of a node is removed
-	// (Flock); made on first use.
-	lockReleased *sync.Cond
+	// lockReleased is closed, and dropped for the next waiter to make a
+	// fresh one, whenever a lock of a node is removed (Flock); nil while
+	// nobody waits.
+	lockReleased chan struct{}
 }
 
 // NewMemFS returns an empty in-memory filesystem with a root directory.
@@ -1258,11 +1262,20 @@ type wasiOpen struct {
 	// has returned and what it took is removed again; nil when there is
 	// none (see takeLock). Guarded by mu.
 	lockPending chan struct{}
-	// lockWaits counts, by lock (takeLock's key), the waits for a lock of
+	// lockWaits counts, by lock (takeLock's how), the waits for a lock of
 	// the descriptor in progress; lockHeld holds the locks a wait of it
 	// took and no later lock call of it has changed. Guarded by mu.
-	lockWaits map[lockKey]int
-	lockHeld  map[lockKey]bool
+	lockWaits map[int]int
+	lockHeld  map[int]bool
+	// fileKey is the device and inode of the file of the host Path_open
+	// opened, which hasFileKey says there is: the file of its record locks
+	// (fd_lock). Immutable.
+	fileKey    fileKey
+	hasFileKey bool
+	// lockedFile is the record lock table's entry of the file, from the
+	// descriptor's first fd_lock on (useLockedFile); closeWasiOpen lets it
+	// go. Guarded by mu.
+	lockedFile *lockedFile
 }
 
 // deadlineReader is a stream whose blocking read can be bounded: a pipe, a
@@ -2285,6 +2298,14 @@ type WasiStubs struct {
 	// preopenReplaced is set once a descriptor has been put at
 	// wasiPreopenFD, which then no longer names the root (preopened).
 	preopenReplaced atomic.Bool
+	// recordLockUses counts the files this instance holds record locks of
+	// (fd_lock) and its fd_lock calls in progress: while it is 0, a close
+	// has no lock of the instance to remove (releaseRecordLocksLocked).
+	recordLockUses atomic.Int32
+	// lockResyncs are the files whose host locks a close of this instance
+	// has left to be brought down to the record lock table, once mu is let
+	// go (resyncReleased). Guarded by mu.
+	lockResyncs []lockResync
 	// sig is the signal state; see wasiSignals, which has its own locks.
 	sig wasiSignals
 	// rootEntry enters the root instance in its family's table, once
@@ -2883,7 +2904,7 @@ func (w *WasiStubs) Fork() *WasiStubs {
 // are joined.
 func (w *WasiStubs) CloseAll() error {
 	closing, err := w.takeAll()
-	return errors.Join(err, closeWasiOpens(closing), w.detachAllShm())
+	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm())
 }
 
 // takeAll is CloseAll up to the closing of the descriptors, which it takes
@@ -2942,7 +2963,7 @@ func (w *WasiStubs) closeFrom(lowFd int32) error {
 	w.mu.Lock()
 	closing := w.clearSlotsFromLocked(lowFd)
 	w.mu.Unlock()
-	return closeWasiOpens(closing)
+	return errors.Join(w.resyncReleased(), closeWasiOpens(closing))
 }
 
 // CloseDescriptors closes every descriptor of this instance in its table,
@@ -3062,7 +3083,8 @@ func (w *WasiStubs) setSlotLocked(fd int32, op *wasiOpen) {
 	}
 }
 
-// clearSlotLocked takes fd out of the table, close-on-exec mark and all.
+// clearSlotLocked takes fd out of the table, close-on-exec mark and all,
+// with the instance's record locks of its file (releaseRecordLocksLocked).
 // It returns the entry fd held when that was its last slot, of any
 // instance, for the caller to close once w.mu is let go (closeWasiOpen);
 // nil otherwise, and for an fd that holds nothing. Caller holds w.mu.
@@ -3073,6 +3095,7 @@ func (w *WasiStubs) clearSlotLocked(fd int32) (closing *wasiOpen) {
 	}
 	delete(w.fdsLocked(), fd)
 	delete(w.cloexec, fd)
+	w.releaseRecordLocksLocked(op)
 	op.mu.Lock()
 	op.refs--
 	last := op.refs == 0
@@ -5135,6 +5158,7 @@ const (
 	_wasiELOOP        int32 = 32
 	_wasiEMFILE       int32 = 33
 	_wasiENOENT       int32 = 44
+	_wasiENOLCK       int32 = 46
 	_wasiENOMEM       int32 = 48
 	_wasiENOSPC       int32 = 51
 	_wasiENOTCONN     int32 = 53
@@ -5145,6 +5169,7 @@ const (
 	_wasiENOTTY       int32 = 59
 	_wasiENOSYS       int32 = 52
 	_wasiENXIO        int32 = 60
+	_wasiEOVERFLOW    int32 = 61
 	_wasiEPERM        int32 = 63
 	_wasiEPIPE        int32 = 64
 	_wasiERANGE       int32 = 68
@@ -5450,6 +5475,8 @@ func closeWasiOpen(op *wasiOpen) error {
 	if op.sock != nil {
 		host = op.sock.host
 	}
+	locked := op.lockedFile
+	op.lockedFile = nil
 	op.mu.Unlock()
 	var err error
 	if f != nil {
@@ -5463,6 +5490,9 @@ func closeWasiOpen(op *wasiOpen) error {
 	}
 	if listener != nil && op.connClosed.CompareAndSwap(false, true) {
 		err = errors.Join(err, listener.Close())
+	}
+	if locked != nil {
+		err = errors.Join(err, releaseLockedFile(locked, true))
 	}
 	// The waits in poll(2) for the descriptor are woken once it is closed:
 	// one woken before could wait again on the open descriptor, and
@@ -5492,10 +5522,12 @@ func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 	}
 	closing := w.clearSlotLocked(fd)
 	w.mu.Unlock()
+	err := w.resyncReleased()
 	if closing != nil {
-		if closeErr := closeWasiOpen(closing); closeErr != nil {
-			return w.guestErrno("fd_close", closeErr)
-		}
+		err = errors.Join(err, closeWasiOpen(closing))
+	}
+	if err != nil {
+		return w.guestErrno("fd_close", err)
 	}
 	return _wasiESUCCESS
 }
@@ -7499,9 +7531,11 @@ func (w *WasiStubs) Fd_renumber(m *Module, from, to int32) int32 {
 // was asked once the slot holds the other descriptor: a failure of the
 // close goes to WASIConfig.Errors.
 func (w *WasiStubs) closeReplaced(call string, op *wasiOpen) {
+	err := w.resyncReleased()
 	if op != nil {
-		w.reportError(call, closeWasiOpen(op))
+		err = errors.Join(err, closeWasiOpen(op))
 	}
+	w.reportError(call, err)
 }
 
 // takeRenumber is Fd_renumber up to the closing of what to held, which it
@@ -8588,6 +8622,11 @@ func (w *WasiStubs) pathOpenMode(rel string, dirflags, oflags int32, fsRightsBas
 		hostPath: whole,
 		noRead:   flag&os.O_WRONLY != 0,
 		noWrite:  flag&(os.O_WRONLY|os.O_RDWR) == 0,
+	}
+	if _, isHost := f.(*os.File); isHost {
+		if hs, ok := osFileStat(st.Sys()); ok {
+			op.fileKey, op.hasFileKey = fileKey{dev: hs.dev, ino: hs.ino}, true
+		}
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -14233,6 +14272,9 @@ func unblockFIFOOpen(openFile func(name string, flag int, perm os.FileMode) (Fil
 type detachedCall struct {
 	// done is closed once the call has returned (finish).
 	done chan struct{}
+	// stop is closed when the waiter leaves without the result (leave):
+	// a call that can be ended then returns.
+	stop chan struct{}
 	// undo undoes what a call that returned err did.
 	undo func(err error)
 
@@ -14246,7 +14288,7 @@ type detachedCall struct {
 
 // newDetachedCall returns a detachedCall whose call is undone by undo.
 func newDetachedCall(undo func(err error)) *detachedCall {
-	return &detachedCall{done: make(chan struct{}), undo: undo}
+	return &detachedCall{done: make(chan struct{}), stop: make(chan struct{}), undo: undo}
 }
 
 // finish is called by the goroutine with the call's error, once.
@@ -14281,6 +14323,7 @@ func (c *detachedCall) leave() {
 	c.left = true
 	returned, err := c.returned, c.err
 	c.mu.Unlock()
+	close(c.stop)
 	if returned {
 		c.undo(err)
 	}
@@ -14336,7 +14379,20 @@ func (rootFS) Flock(f File, how int) error {
 }
 
 // Flock implements LockFS.Flock for the files of this MemFS.
-func (fsys *MemFS) Flock(f File, how int) error {
+func (fsys *MemFS) Flock(f File, how int) error { return fsys.flockUntil(f, how, nil) }
+
+// stoppableLockFS is a LockFS whose Flock that waits can be ended, as
+// MemFS's: flockUntil is Flock, whose wait for a lock held elsewhere ends
+// with errLockWaitLeft once stop is closed (a nil stop never is).
+type stoppableLockFS interface {
+	flockUntil(f File, how int, stop <-chan struct{}) error
+}
+
+// errLockWaitLeft is what flockUntil returns when its waiter has left.
+var errLockWaitLeft = errors.New("the wait for the lock was left")
+
+// flockUntil implements stoppableLockFS for the files of this MemFS.
+func (fsys *MemFS) flockUntil(f File, how int, stop <-chan struct{}) error {
 	mf, ok := f.(*memFile)
 	if !ok || mf.fsys != fsys {
 		return syscall.EBADF
@@ -14367,9 +14423,17 @@ func (fsys *MemFS) Flock(f File, how int) error {
 			return syscall.EAGAIN
 		}
 		if fsys.lockReleased == nil {
-			fsys.lockReleased = sync.NewCond(&fsys.mu)
+			fsys.lockReleased = make(chan struct{})
 		}
-		fsys.lockReleased.Wait()
+		released := fsys.lockReleased
+		fsys.mu.Unlock()
+		select {
+		case <-released:
+		case <-stop:
+			fsys.mu.Lock()
+			return errLockWaitLeft
+		}
+		fsys.mu.Lock()
 	}
 	if node.locks == nil {
 		node.locks = map[*memFile]int{}
@@ -14398,7 +14462,8 @@ func (f *memFile) unlockLocked() {
 	}
 	delete(f.node.locks, f)
 	if f.fsys.lockReleased != nil {
-		f.fsys.lockReleased.Broadcast()
+		close(f.fsys.lockReleased)
+		f.fsys.lockReleased = nil
 	}
 }
 
@@ -14433,30 +14498,36 @@ func (w *WasiStubs) Fd_flock(m *Module, fd, lock, wait int32) int32 {
 	if op == nil {
 		return -_wasiEBADF
 	}
-	var flock func(how int) error
+	// flock takes a lock; one that waits ends once stop is closed when
+	// stoppable says so.
+	var flock func(how int, stop <-chan struct{}) error
+	stoppable := false
 	switch {
 	case op.f != nil:
 		locks, can := fsys.(LockFS)
 		if !can {
 			return -_wasiENOSYS
 		}
-		flock = func(how int) error { return locks.Flock(op.f, how) }
+		flock = func(how int, _ <-chan struct{}) error { return locks.Flock(op.f, how) }
+		if until, can := fsys.(stoppableLockFS); can {
+			flock, stoppable = func(how int, stop <-chan struct{}) error { return until.flockUntil(op.f, how, stop) }, true
+		}
 	case op.stdio != 0:
 		stream, isHost := [...]any{w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr}[op.stdio-1].(*os.File)
 		if !isHost {
 			return _wasiESUCCESS
 		}
-		flock = func(how int) error { return flockOSFile(stream, how) }
+		flock = func(how int, _ <-chan struct{}) error { return flockOSFile(stream, how) }
 	default:
 		return -_wasiEINVAL
 	}
-	set := func(wait bool) error {
+	set := func(wait bool, stop <-chan struct{}) error {
 		if !wait && how != flockUnlock {
-			return flock(how | flockNonblock)
+			return flock(how|flockNonblock, nil)
 		}
-		return flock(how)
+		return flock(how, stop)
 	}
-	interrupted, err := w.takeLock("fd_flock", lockKey{call: lockCallFlock, how: how}, op, how == flockUnlock, wait != 0, set, func() error { return flock(flockUnlock) })
+	interrupted, err := w.takeLock(how, op, wait != 0, stoppable, set, func() error { return flock(flockUnlock, nil) })
 	if interrupted {
 		return -_wasiEINTR
 	}
@@ -14471,42 +14542,27 @@ func (w *WasiStubs) Fd_flock64(m *Module, fd, lock, wait int32) int32 {
 	return w.Fd_flock(m, fd, lock, wait)
 }
 
-// lockCall is the import a lock call of takeLock is made by.
-type lockCall int
-
-const (
-	lockCallFlock  lockCall = iota // fd_flock
-	lockCallRecord                 // fd_lock
-)
-
-// lockKey is the lock a call of takeLock asks for: the import that asks
-// (call), and the lock — how of fd_flock, the type and range of fd_lock.
-type lockKey struct {
-	call        lockCall
-	how         int
-	typ, whence int32
-	start, len  int64
-}
-
-// takeLock takes or removes (unlocks) a lock of the descriptor op with
-// set, which may wait for a lock held elsewhere when wait is true and
-// must not otherwise. A call that may wait is made once, on a goroutine of
-// its own (detachedCall), and the guest waits for it until a signal is
-// posted to it (awaitInterruptibly): then interrupted is true. When the
-// guest stops waiting — interrupted, or ended while it waits — the lock
-// the call takes later is removed with unlock at once. Until that is done,
-// a lock of op that may wait waits for it first, and one that may not
-// fails with syscall.EAGAIN, so that removing the late lock removes none
-// the guest asked for afterwards. err is the error of set; an error of
-// unlock is told WASIConfig.Errors under name, the name of the import.
+// takeLock takes or removes (how flockUnlock) the flock how of the
+// descriptor op with set, which may wait for a lock held elsewhere when
+// wait is true and must not otherwise. A call that may wait is made once,
+// on a goroutine of its own (detachedCall), and the guest waits for it
+// until a signal is posted to it (awaitInterruptibly): then interrupted is
+// true. When the guest stops waiting — interrupted, or ended while it
+// waits — the call is given its stop (detachedCall), and the lock it takes
+// later is removed with unlock at once; a stoppable call returns at its
+// stop, and the guest waits for that. Until that is done, a lock of op
+// that may wait waits for it first, and one that may not fails with
+// syscall.EAGAIN, so that removing the late lock removes none the guest
+// asked for afterwards. err is the error of set; an error of unlock is
+// told WASIConfig.Errors.
 //
 // The descriptor may be shared, and several of its sharers may wait for
-// the same lock (key) at once;
-// their calls all get it when it is granted. So a late grant is removed
-// only when no other wait of the descriptor for that lock is in progress
-// and none has taken it: a lock a wait took counts as held until the
-// descriptor's next lock call by this import (lockHeld).
-func (w *WasiStubs) takeLock(name string, key lockKey, op *wasiOpen, unlocks, wait bool, set func(wait bool) error, unlock func() error) (interrupted bool, err error) {
+// the same lock at once; their calls all get it when it is granted. So a
+// late grant is removed only when no other wait of the descriptor for that
+// lock is in progress and none has taken it: a lock a wait took counts as
+// held until the descriptor's next lock call (lockHeld).
+func (w *WasiStubs) takeLock(how int, op *wasiOpen, wait, stoppable bool, set func(wait bool, stop <-chan struct{}) error, unlock func() error) (interrupted bool, err error) {
+	unlocks := how == flockUnlock
 	op.mu.Lock()
 	pending := op.lockPending
 	op.mu.Unlock()
@@ -14519,15 +14575,15 @@ func (w *WasiStubs) takeLock(name string, key lockKey, op *wasiOpen, unlocks, wa
 		}
 	}
 	op.mu.Lock()
-	maps.DeleteFunc(op.lockHeld, func(held lockKey, _ bool) bool { return held.call == key.call })
+	clear(op.lockHeld)
 	op.mu.Unlock()
 	if unlocks || !wait {
-		return false, set(false)
+		return false, set(false, nil)
 	}
 	released := make(chan struct{})
 	call := newDetachedCall(func(err error) {
 		op.mu.Lock()
-		shared := op.lockWaits[key] > 0 || op.lockHeld[key]
+		shared := op.lockWaits[how] > 0 || op.lockHeld[how]
 		op.mu.Unlock()
 		if err == nil && !shared {
 			// A descriptor the guest has closed meanwhile has no lock
@@ -14535,7 +14591,7 @@ func (w *WasiStubs) takeLock(name string, key lockKey, op *wasiOpen, unlocks, wa
 			if err := unlock(); err != nil && !errors.Is(err, fs.ErrClosed) {
 				// The guest has stopped waiting: no call of its is left
 				// to fail with this.
-				w.reportError(name, err)
+				w.reportError("fd_flock", err)
 			}
 		}
 		op.mu.Lock()
@@ -14547,15 +14603,15 @@ func (w *WasiStubs) takeLock(name string, key lockKey, op *wasiOpen, unlocks, wa
 	})
 	op.mu.Lock()
 	if op.lockWaits == nil {
-		op.lockWaits = map[lockKey]int{}
+		op.lockWaits = map[int]int{}
 	}
-	op.lockWaits[key]++
+	op.lockWaits[how]++
 	op.mu.Unlock()
 	taken := false
 	defer func() {
 		op.mu.Lock()
-		if op.lockWaits[key]--; op.lockWaits[key] == 0 {
-			delete(op.lockWaits, key)
+		if op.lockWaits[how]--; op.lockWaits[how] == 0 {
+			delete(op.lockWaits, how)
 		}
 		if !taken {
 			op.lockPending = released
@@ -14563,18 +14619,21 @@ func (w *WasiStubs) takeLock(name string, key lockKey, op *wasiOpen, unlocks, wa
 		op.mu.Unlock()
 		if !taken {
 			call.leave()
+			if stoppable {
+				<-released
+			}
 		}
 	}()
-	go func() { call.finish(set(true)) }()
+	go func() { call.finish(set(true, call.stop)) }()
 	if w.awaitInterruptibly(call.done) {
 		taken = true
 		err := call.take()
 		if err == nil {
 			op.mu.Lock()
 			if op.lockHeld == nil {
-				op.lockHeld = map[lockKey]bool{}
+				op.lockHeld = map[int]bool{}
 			}
-			op.lockHeld[key] = true
+			op.lockHeld[how] = true
 			op.mu.Unlock()
 		}
 		return false, err
@@ -14597,52 +14656,88 @@ type recordLock struct {
 	pid         int32
 }
 
-// The commands of Fd_lock, and the type of a recordLock that unlocks.
+// The commands of Fd_lock, and the types of a recordLock.
 const (
 	recordLockGet  int32 = 0 // F_GETLK
 	recordLockSet  int32 = 1 // F_SETLK
 	recordLockWait int32 = 2 // F_SETLKW
+	recordRead     int32 = 0 // F_RDLCK
+	recordWrite    int32 = 1 // F_WRLCK
 	recordUnlock   int32 = 2 // F_UNLCK
 )
 
 // Fd_lock is a NON-STANDARD host import (module wasip1_posix_extension,
 // name "fd_lock") backing fcntl's F_GETLK, F_SETLK and F_SETLKW: a POSIX
-// record lock of a file of the host, by the host's fcntl(2). cmd is
+// record lock of a file of the host that path_open opened. cmd is
 // recordLockGet, recordLockSet or recordLockWait, and lockPtr the lock
-// (recordLock). recordLockGet writes back the lock that would be in the way
-// of the one asked about, or that one with type F_UNLCK when none would.
-// recordLockWait waits for a lock held elsewhere with one F_SETLKW on a
-// goroutine of its own, until a signal is posted to the guest (EINTR); the
-// range it asked for, made one from the start of the file before the wait,
-// is unlocked again at once when the lock is taken after that (see
-// takeLock). A blocked F_SETLKW cannot be called off, and a record lock is
-// one per range, not one per request: the lock it takes later replaces in
-// that range a lock the guest held there before it waited, of either type,
-// and the unlock then removes that one as well — the guest holds no lock
-// in that range after an interrupted F_SETLKW is granted.
+// (recordLock), whose range is taken from where the file's offset and size
+// are at the call (SEEK_CUR, SEEK_END).
 //
-// On Linux the locks are the open file description's (F_OFD_SETLK,
-// F_OFD_SETLKW, F_OFD_GETLK): the descriptors that share it (dup, fork)
-// share its locks, another open of the file — of the same host process, by
-// another instance or by the same — competes for them, and closing another
-// descriptor of the file keeps them. The pid of a lock in the way is -1
-// when it is such a lock, as Linux reports, and the host's pid of its
-// process for a lock of fcntl's own kind. Elsewhere the locks are the host
-// process's, as fcntl's are: every instance of the process and every
-// descriptor of the file shares them, they do not exclude each other,
-// closing any descriptor of the file releases them all, the unlock after
-// an interrupted wait unlocks that range for the whole process, removing
-// in it what the process locked meanwhile through another descriptor, and
-// a close of the descriptor waits while an F_SETLKW on it waits (the wait
-// holds the descriptor: a duplicate's close would release the process's
-// locks). On Linux the wait is made on a duplicate of the descriptor,
-// which shares its open file description, and holds nothing a close waits
-// for.
+// The locks are the instance's, as fcntl's are a process's: the threads of
+// the guest share them, a copy made by Fork or ForkProc starts without
+// any, and the instances exclude each other — an inherited descriptor
+// included. Closing any descriptor of the file, the last of a shared one
+// or not, removes the instance's locks of the file, and a lock call that
+// meets the close of its descriptor fails with EBADF, the lock it took
+// removed again. The runtime keeps the locks of the instances of a
+// generated package in one table: those of the instances of another
+// generated package are another process's to it (see below). The table
+// keeps an instance that holds a lock in memory, and the lock in force,
+// until the instance closes a descriptor of the file: an instance dropped
+// without CloseDescriptors or CloseAll keeps its locks. F_GETLK
+// writes back the lock in the way of the one asked about — of an instance,
+// with the pid of the instance's Process when the instance is of the
+// caller's fork family and -1 otherwise — or the one asked about with type
+// F_UNLCK when none would be. F_SETLKW waits for an instance's lock until a
+// signal is posted to the guest (EINTR) or the descriptor is closed
+// (EBADF).
+//
+// The other processes of the host are excluded by locks of the host that
+// hold what the table holds. On Linux they are the locks of one open file
+// description of the file, which the runtime opens again through
+// /proc/self/fd for reading and writing — with the descriptor's access
+// mode when that open fails, as it does for a file being run (ETXTBSY) —
+// and keeps while a descriptor that locked the file is open: until then
+// the file cannot be run (execve fails with ETXTBSY), and its close is an
+// IN_CLOSE_WRITE to inotify. It is a duplicate of the descriptor for a
+// file that is not a regular file, and for one that cannot be opened again
+// (no /proc). A lock of another process in the way has the pid -1 when
+// it is a lock of an open file description, as Linux reports, and the
+// host's pid of its process for one of fcntl's own kind. A lock whose kind
+// the description was not opened for, which the descriptor that asks for
+// it is, is taken on a description opened again when the locks held are
+// reads only and no call waits, and fails with ENOLCK otherwise. Elsewhere
+// the locks are the host process's, taken through the descriptor at hand:
+// the close of any descriptor of the file in the host process — of any
+// instance, of a duplicate the runtime made, or of the embedder's —
+// removes them all, while the table keeps the instances' own; the
+// instances of other generated packages and the embedder's own locks of
+// the file are the same process's, which neither excludes the other. There
+// a wait for another process's lock holds its descriptor, whose close
+// waits for it: the close of a duplicate would release the process's
+// locks.
+//
+// A wait for a lock of another process is one F_SETLKW on a goroutine of
+// its own, which cannot be called off: it goes on after the guest stops
+// waiting, and when it takes the lock after that, the locks of the host in
+// its range are brought back to what the table holds. Until it is done, a
+// lock of the range that the waiting one rules out — the instance's own
+// included — waits for it, or fails with EAGAIN without F_SETLKW: another
+// thread of the guest too, and a lock of an instance that the other
+// process waits for in turn waits until a signal, where the kernel would
+// grant it when the ranges differ. A read lock that would wait for another
+// process's lock over a write lock of the instance's fails with ENOLCK
+// instead: the read the host grants the wait, after the guest stopped
+// waiting too, replaces the write at the host.
 //
 // Returns 0 or a negative errno: EAGAIN or EACCES for a lock held
-// elsewhere, ENOTSUP for a descriptor with no file of the host behind it
-// (a stream of the embedder's, a file of an in-memory filesystem), which
-// has no other process to exclude.
+// elsewhere, ENOLCK as above, EBADF for a lock of a kind the descriptor is
+// not open for (F_RDLCK for writing only, F_WRLCK for reading only),
+// EINVAL for a range that starts before the start of the file, EOVERFLOW
+// for one that ends past the largest offset, ENOTSUP for a descriptor
+// path_open did not open a file of the host for (a stream of the
+// embedder's, a pipe, a socket, a file of an in-memory filesystem) and on
+// a system with no record locks.
 func (w *WasiStubs) Fd_lock(m *Module, fd, cmd, lockPtr int32) int32 {
 	return w.fdLock(m, fd, cmd, zext(lockPtr))
 }
@@ -14664,7 +14759,7 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 		start:  int64(binary.LittleEndian.Uint64(rec[8:])),
 		len:    int64(binary.LittleEndian.Uint64(rec[16:])),
 	}
-	if cmd < recordLockGet || cmd > recordLockWait || lk.typ < 0 || lk.typ > recordUnlock || lk.whence < 0 || lk.whence > 2 {
+	if cmd < recordLockGet || cmd > recordLockWait || lk.typ < 0 || lk.typ > recordUnlock || lk.whence < 0 || lk.whence > 2 || cmd == recordLockGet && lk.typ == recordUnlock {
 		return -_wasiEINVAL
 	}
 	w.mu.Lock()
@@ -14674,44 +14769,582 @@ func (w *WasiStubs) fdLock(m *Module, fd, cmd int32, lockPtr uint64) int32 {
 		return -_wasiEBADF
 	}
 	f, isHost := op.f.(*os.File)
-	if !isHost {
+	if !isHost || !op.hasFileKey || !hostRecordLocks {
 		return -_wasiENOTSUP
 	}
+	if cmd != recordLockGet && (lk.typ == recordRead && op.noRead || lk.typ == recordWrite && op.noWrite) {
+		return -_wasiEBADF
+	}
+	if errno := w.absoluteRecordLock(f, &lk); errno != _wasiESUCCESS {
+		return -errno
+	}
+	start, end, errno := recordRange(lk.start, lk.len)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	want := lockRow{owner: w, write: lk.typ == recordWrite, start: start, end: end}
+	if cmd != recordLockGet {
+		want.pid = w.guestPID()
+	}
+	w.recordLockUses.Add(1)
+	defer w.recordLockUses.Add(-1)
+	file := op.useLockedFile()
+	if file == nil {
+		// The descriptor was closed meanwhile.
+		return -_wasiEBADF
+	}
+	defer func() { w.reportError("fd_lock", releaseLockedFile(file, false)) }()
 	if cmd == recordLockGet {
-		if err := hostRecordLock(f, recordLockGet, &lk); err != nil {
-			return -w.guestErrno("fd_lock", err)
+		return w.getRecordLock(rec, f, file, want)
+	}
+	return w.setRecordLock(fd, op, f, file, want, lk.typ == recordUnlock, cmd == recordLockWait)
+}
+
+// getRecordLock is fdLock's F_GETLK of want, a lock of the file of f whose
+// table entry is file, which writes the answer in rec.
+func (w *WasiStubs) getRecordLock(rec []byte, f *os.File, file *lockedFile, want lockRow) int32 {
+	w.mu.Lock()
+	family := w.pidsLocked()
+	w.mu.Unlock()
+	file.mu.Lock()
+	held, found := file.conflictLocked(want, false)
+	lk := want.hostLock()
+	if found {
+		lk = held.hostLock()
+		lk.pid = -1
+		if held.family == family {
+			lk.pid = held.pid
 		}
-		binary.LittleEndian.PutUint32(rec[0:], uint32(lk.typ))
-		binary.LittleEndian.PutUint32(rec[4:], uint32(lk.whence))
-		binary.LittleEndian.PutUint64(rec[8:], uint64(lk.start))
-		binary.LittleEndian.PutUint64(rec[16:], uint64(lk.len))
-		binary.LittleEndian.PutUint32(rec[24:], uint32(lk.pid))
+	} else if err := file.hostLockLocked(f, recordLockGet, &lk); err != nil {
+		file.mu.Unlock()
+		return -w.guestErrno("fd_lock", err)
+	}
+	file.mu.Unlock()
+	binary.LittleEndian.PutUint32(rec[0:], uint32(lk.typ))
+	if lk.typ == recordUnlock {
+		// As fcntl(2) has it, only the type changes.
 		return _wasiESUCCESS
 	}
-	if cmd == recordLockWait && lk.typ != recordUnlock {
-		// The lock that is removed again after an interrupted wait is the
-		// range the wait asked for, where it was when it asked.
-		if errno := w.absoluteRecordLock(f, &lk); errno != _wasiESUCCESS {
-			return -errno
+	binary.LittleEndian.PutUint32(rec[4:], uint32(lk.whence))
+	binary.LittleEndian.PutUint64(rec[8:], uint64(lk.start))
+	binary.LittleEndian.PutUint64(rec[16:], uint64(lk.len))
+	binary.LittleEndian.PutUint32(rec[24:], uint32(lk.pid))
+	return _wasiESUCCESS
+}
+
+// setRecordLock is fdLock's F_SETLK (wait false) and F_SETLKW of want, or
+// its removal (unlocks), through descriptor fd, whose entry op is, of the
+// file of f whose table entry is file. A lock of another instance in the
+// way is waited for on the table (changed), and one of another process at
+// the host (waitHostRecordLock). The descriptor is looked at before each
+// try and after the lock is in the table (keepRecordLock), so that a lock
+// call that meets its close takes nothing (Linux's fcntl_setlk).
+func (w *WasiStubs) setRecordLock(fd int32, op *wasiOpen, f *os.File, file *lockedFile, want lockRow, unlocks, wait bool) int32 {
+	// The failure of an open the call went on past (prepareHostLocked),
+	// reported once file.mu is let go: every return comes after.
+	var passed error
+	defer func() { w.reportError("fd_lock", passed) }()
+	for {
+		w.mu.Lock()
+		open := w.openLocked(fd) == op
+		want.family = w.pidsLocked()
+		w.mu.Unlock()
+		if !open {
+			return -_wasiEBADF
 		}
-	}
-	unlock := lk
-	unlock.typ = recordUnlock
-	set := func(wait bool) error {
-		if wait {
-			return hostRecordLock(f, recordLockWait, &lk)
+		file.mu.Lock()
+		if file.gone {
+			file.mu.Unlock()
+			return -_wasiEBADF
 		}
-		return hostRecordLock(f, recordLockSet, &lk)
+		if unlocks {
+			w.setRowsLocked(file, want, true)
+			err := file.resyncLocked(want.start, want.end, f)
+			file.mu.Unlock()
+			if err != nil {
+				return -w.guestErrno("fd_lock", err)
+			}
+			return _wasiESUCCESS
+		}
+		if _, conflict := file.conflictLocked(want, true); conflict {
+			if !wait {
+				file.mu.Unlock()
+				return -_wasiEAGAIN
+			}
+			changed := file.changedLocked()
+			file.mu.Unlock()
+			if !w.awaitInterruptibly(changed) {
+				return -_wasiEINTR
+			}
+			continue
+		}
+		var err error
+		if passed, err = file.prepareHostLocked(f, op.regular, !op.noRead, !op.noWrite, want.write); err != nil {
+			file.mu.Unlock()
+			return -w.guestErrno("fd_lock", err)
+		}
+		// The table rules out a lock of another instance in the range that
+		// conflicts with want: the host's lock of the range is want's.
+		lk := want.hostLock()
+		err = file.hostLockLocked(f, recordLockSet, &lk)
+		if err == nil {
+			w.setRowsLocked(file, want, false)
+			file.mu.Unlock()
+			return w.keepRecordLock(fd, op, f, file)
+		}
+		if !wait || !errors.Is(err, syscall.EAGAIN) && !errors.Is(err, syscall.EACCES) {
+			file.mu.Unlock()
+			return -w.guestErrno("fd_lock", err)
+		}
+		if !want.write && slices.ContainsFunc(file.rows, func(r lockRow) bool { return r.owner == w && r.write && r.conflicts(want) }) {
+			// The read the host grants the wait, after the guest stopped
+			// waiting too, replaces w's write in the range, which another
+			// process can share before the table's write is set again.
+			file.mu.Unlock()
+			return -_wasiENOLCK
+		}
+		return w.waitHostRecordLock(fd, op, f, file, want)
 	}
-	interrupted, err := w.takeLock("fd_lock", lockKey{call: lockCallRecord, typ: lk.typ, whence: lk.whence, start: lk.start, len: lk.len}, op, lk.typ == recordUnlock, cmd == recordLockWait, set,
-		func() error { return hostRecordLock(f, recordLockSet, &unlock) })
-	if interrupted {
+}
+
+// keepRecordLock is the end of a lock fdLock has put in the table through
+// descriptor fd, whose entry op was: when fd holds op no longer, its close
+// came in between, and the instance's locks of the file go (EBADF), as the
+// close would have removed them.
+func (w *WasiStubs) keepRecordLock(fd int32, op *wasiOpen, f *os.File, file *lockedFile) int32 {
+	w.mu.Lock()
+	if w.openLocked(fd) == op {
+		w.mu.Unlock()
+		return _wasiESUCCESS
+	}
+	file.mu.Lock()
+	w.dropRowsLocked(file)
+	file.mu.Unlock()
+	w.mu.Unlock()
+	file.mu.Lock()
+	err := file.resyncLocked(0, recordEnd, f)
+	file.mu.Unlock()
+	// The call fails for the close; the host's locks have no call left to
+	// fail with this.
+	w.reportError("fd_lock", err)
+	return -_wasiEBADF
+}
+
+// waitHostRecordLock is setRecordLock's wait for want, which a lock of
+// another process is in the way of: one F_SETLKW on a goroutine of its own
+// (detachedCall), on a duplicate of the host's open file description of
+// the locks where there is one. The wait is in the table (waits) until
+// what it took is in the table or brought back to it. Caller holds
+// file.mu, which it lets go.
+func (w *WasiStubs) waitHostRecordLock(fd int32, op *wasiOpen, f *os.File, file *lockedFile, want lockRow) int32 {
+	waitFD, err := file.waitDescriptorLocked()
+	if err != nil {
+		file.mu.Unlock()
+		return -w.guestErrno("fd_lock", err)
+	}
+	wait := &want
+	file.waits = append(file.waits, wait)
+	file.changeLocked()
+	file.mu.Unlock()
+	call := newDetachedCall(func(err error) { w.leaveHostRecordLock(file, wait, f, err) })
+	taken := false
+	defer func() {
+		if !taken {
+			call.leave()
+		}
+	}()
+	lk := want.hostLock()
+	go func() { call.finish(hostWaitRecordLock(waitFD, f, &lk)) }()
+	if !w.awaitInterruptibly(call.done) {
 		return -_wasiEINTR
 	}
+	taken = true
+	err = call.take()
+	file.mu.Lock()
+	file.waits = slices.DeleteFunc(file.waits, func(r *lockRow) bool { return r == wait })
+	file.changeLocked()
+	if err == nil {
+		w.setRowsLocked(file, want, false)
+	}
+	file.mu.Unlock()
 	if err != nil {
 		return -w.guestErrno("fd_lock", err)
 	}
-	return _wasiESUCCESS
+	return w.keepRecordLock(fd, op, f, file)
+}
+
+// leaveHostRecordLock is the undo of a wait of waitHostRecordLock the
+// guest left, which returned err: the wait leaves the table, and the locks
+// of the host in its range, which a lock it took changed, are brought back
+// to the table's.
+func (w *WasiStubs) leaveHostRecordLock(file *lockedFile, wait *lockRow, f *os.File, err error) {
+	file.mu.Lock()
+	file.waits = slices.DeleteFunc(file.waits, func(r *lockRow) bool { return r == wait })
+	file.changeLocked()
+	var resyncErr error
+	if err == nil {
+		resyncErr = file.resyncLocked(wait.start, wait.end, f)
+	}
+	file.mu.Unlock()
+	// The guest has stopped waiting: no call of its is left to fail with
+	// these.
+	w.reportError("fd_lock", resyncErr)
+	w.reportError("fd_lock", releaseLockedFile(file, false))
+}
+
+// recordLocks is the table of the record locks (fd_lock) the instances of
+// this package hold, by file. Its lock is taken after the WasiStubs' and
+// the wasiOpens' and before the lockedFiles'.
+var recordLocks = struct {
+	mu    sync.Mutex
+	files map[fileKey]*lockedFile
+}{files: map[fileKey]*lockedFile{}}
+
+// fileKey names a file of the host: its device and inode.
+type fileKey struct{ dev, ino uint64 }
+
+// lockedFile is the entry of recordLocks for a file: the locks the
+// instances hold of it and the waits for one at the host, and the host's
+// locks that exclude the other processes.
+type lockedFile struct {
+	key fileKey
+	// uses counts the descriptors that use the entry (useLockedFile).
+	// Guarded by recordLocks.mu.
+	uses int
+
+	// mu guards the fields below. The host's locks are taken under it.
+	mu sync.Mutex
+	// rows are the locks the instances hold, by start: those of an owner
+	// do not overlap.
+	rows []lockRow
+	// waits are the locks waited for at the host (waitHostRecordLock).
+	waits []*lockRow
+	// changed is closed, and dropped for the next waiter to make a fresh
+	// one, whenever rows or waits change (changeLocked).
+	changed chan struct{}
+	// host is the host's open file description of the locks where they are
+	// a description's (hostRecordLocksOfDescription), -1 before the first;
+	// hostRead and hostWrite say what it is open for.
+	host                int
+	hostRead, hostWrite bool
+	// gone is set once the entry has left the table (releaseLockedFile).
+	gone bool
+}
+
+// lockRow is a record lock of an instance (owner), or a wait for one: a
+// write or a read lock of [start, end), end recordEnd for one to the end
+// of the file however long it grows. pid is the pid of the owner's
+// Process when it asked, and family its fork family's pid allocator, which
+// F_GETLK tells the pid to.
+type lockRow struct {
+	owner      *WasiStubs
+	family     *wasiPIDs
+	pid        int32
+	write      bool
+	start, end uint64
+}
+
+// recordEnd is the end of a range of a record lock to the end of the
+// file: one past the largest offset, the last byte of every such lock.
+const recordEnd uint64 = 1 << 63
+
+// conflicts reports whether r and o overlap and one of them is a write
+// lock.
+func (r lockRow) conflicts(o lockRow) bool {
+	return r.start < o.end && o.start < r.end && (r.write || o.write)
+}
+
+// hostLock returns r as a recordLock from the start of the file.
+func (r lockRow) hostLock() recordLock {
+	lk := recordLock{typ: recordRead, start: int64(r.start)}
+	if r.write {
+		lk.typ = recordWrite
+	}
+	if r.end != recordEnd {
+		lk.len = int64(r.end - r.start)
+	}
+	return lk
+}
+
+// recordRange returns the range [start, end) of the record lock of length
+// at start, as fcntl(2) takes one (Linux's flock64_to_posix_lock): to the
+// end of the file for length 0, the length before start for a negative
+// one. Returns a wasi errno: EINVAL for a range before the start of the
+// file, EOVERFLOW for one past the largest offset.
+func recordRange(start, length int64) (uint64, uint64, int32) {
+	switch {
+	case start < 0 || length < 0 && start+length < 0:
+		return 0, 0, _wasiEINVAL
+	case length == 0:
+		return uint64(start), recordEnd, _wasiESUCCESS
+	case length < 0:
+		return uint64(start + length), uint64(start), _wasiESUCCESS
+	case length-1 > math.MaxInt64-start:
+		return 0, 0, _wasiEOVERFLOW
+	}
+	return uint64(start), uint64(start) + uint64(length), _wasiESUCCESS
+}
+
+// useLockedFile returns the table entry of op's file, which op uses from
+// then on (uses) until closeWasiOpen lets it go; nil once op has left
+// every table, to be closed.
+func (op *wasiOpen) useLockedFile() *lockedFile {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.lockedFile == nil && op.refs > 0 {
+		recordLocks.mu.Lock()
+		file := recordLocks.files[op.fileKey]
+		if file == nil {
+			file = &lockedFile{key: op.fileKey, host: -1}
+			recordLocks.files[op.fileKey] = file
+		}
+		file.uses++
+		recordLocks.mu.Unlock()
+		op.lockedFile = file
+	}
+	return op.lockedFile
+}
+
+// releaseLockedFile lets go of a use of file (useLockedFile) when use is
+// true, and takes the entry out of the table once nothing uses it, holds a
+// lock of it or waits for one, closing the host's description of its
+// locks.
+func releaseLockedFile(file *lockedFile, use bool) error {
+	recordLocks.mu.Lock()
+	defer recordLocks.mu.Unlock()
+	if use {
+		file.uses--
+	}
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	if file.gone || file.uses > 0 || len(file.rows) > 0 || len(file.waits) > 0 {
+		return nil
+	}
+	file.gone = true
+	delete(recordLocks.files, file.key)
+	return file.closeHostLocked()
+}
+
+// changedLocked returns the channel a wait for a change of the table's
+// locks of file waits on. Caller holds file.mu.
+func (file *lockedFile) changedLocked() <-chan struct{} {
+	if file.changed == nil {
+		file.changed = make(chan struct{})
+	}
+	return file.changed
+}
+
+// changeLocked wakes the waits for a change of the locks of file: rows or
+// waits changed. Caller holds file.mu.
+func (file *lockedFile) changeLocked() {
+	if file.changed != nil {
+		close(file.changed)
+		file.changed = nil
+	}
+}
+
+// conflictLocked returns a lock of another instance than want's owner that
+// conflicts with want, the first by start, and with waits also a wait for
+// a lock that does — want's owner's included: a lock the host gives the
+// wait would replace in the host's description what want took. Caller
+// holds file.mu.
+func (file *lockedFile) conflictLocked(want lockRow, waits bool) (lockRow, bool) {
+	for _, r := range file.rows {
+		if r.owner != want.owner && r.conflicts(want) {
+			return r, true
+		}
+	}
+	if waits {
+		for _, r := range file.waits {
+			if r.conflicts(want) {
+				return *r, true
+			}
+		}
+	}
+	return lockRow{}, false
+}
+
+// holdsLocked reports whether w holds a lock of file. Caller holds
+// file.mu.
+func (file *lockedFile) holdsLocked(w *WasiStubs) bool {
+	return slices.ContainsFunc(file.rows, func(r lockRow) bool { return r.owner == w })
+}
+
+// setRowsLocked puts want, a lock of w, in the table, or removes w's locks
+// of want's range (unlocks): w's locks in the range are cut out of the
+// range, and want joins those of w of its type it touches, as fcntl(2)
+// splits and merges a process's locks. Caller holds file.mu.
+func (w *WasiStubs) setRowsLocked(file *lockedFile, want lockRow, unlocks bool) {
+	held := file.holdsLocked(w)
+	var rows []lockRow
+	for _, r := range file.rows {
+		switch {
+		case r.owner != w || r.end < want.start || want.end < r.start:
+			rows = append(rows, r)
+		case !unlocks && r.write == want.write:
+			want.start, want.end = min(want.start, r.start), max(want.end, r.end)
+		case r.end == want.start || want.end == r.start:
+			// Touching only: another type, or a range unlocked next to it.
+			rows = append(rows, r)
+		default:
+			if r.start < want.start {
+				left := r
+				left.end = want.start
+				rows = append(rows, left)
+			}
+			if want.end < r.end {
+				right := r
+				right.start = want.end
+				rows = append(rows, right)
+			}
+		}
+	}
+	if !unlocks {
+		rows = append(rows, want)
+	}
+	slices.SortFunc(rows, func(a, b lockRow) int { return cmp.Compare(a.start, b.start) })
+	file.rows = rows
+	w.countHeld(file, held)
+	file.changeLocked()
+}
+
+// dropRowsLocked removes every lock w holds of file and reports whether
+// there was one; it wakes the waits for a change either way. Caller holds
+// file.mu.
+func (w *WasiStubs) dropRowsLocked(file *lockedFile) bool {
+	held := file.holdsLocked(w)
+	file.rows = slices.DeleteFunc(file.rows, func(r lockRow) bool { return r.owner == w })
+	w.countHeld(file, held)
+	file.changeLocked()
+	return held
+}
+
+// countHeld counts in recordLockUses that w holds locks of file now, or no
+// longer, after a change of its rows: held is whether it did before.
+// Caller holds file.mu.
+func (w *WasiStubs) countHeld(file *lockedFile, held bool) {
+	switch holds := file.holdsLocked(w); {
+	case holds && !held:
+		w.recordLockUses.Add(1)
+	case held && !holds:
+		w.recordLockUses.Add(-1)
+	}
+}
+
+// resyncLocked brings the host's locks of [start, end) of file down to
+// what the table holds there, through via where the locks are the host
+// process's: in each stretch the strongest lock an instance holds, or none.
+// The stretches a wait at the host overlaps are left as they are, where
+// the host may have granted the wait its lock already. Elsewhere the
+// host's locks are the table's, and in the range of a wait no weaker (a
+// read does not wait over a write of its owner, setRecordLock): a lock set
+// here only weakens the host's, so nothing is waited for. Caller holds
+// file.mu.
+func (file *lockedFile) resyncLocked(start, end uint64, via *os.File) error {
+	if file.gone {
+		return nil
+	}
+	cuts := []uint64{start, end}
+	cut := func(at uint64) {
+		if start < at && at < end {
+			cuts = append(cuts, at)
+		}
+	}
+	for _, r := range file.rows {
+		cut(r.start)
+		cut(r.end)
+	}
+	for _, r := range file.waits {
+		cut(r.start)
+		cut(r.end)
+	}
+	slices.Sort(cuts)
+	cuts = slices.Compact(cuts)
+	type span struct {
+		typ        int32
+		start, end uint64
+	}
+	var spans []span
+	for i := 0; i+1 < len(cuts); i++ {
+		stretch := lockRow{start: cuts[i], end: cuts[i+1], write: true}
+		if slices.ContainsFunc(file.waits, func(r *lockRow) bool { return r.conflicts(stretch) }) {
+			continue
+		}
+		typ := recordUnlock
+		for _, r := range file.rows {
+			if r.conflicts(stretch) {
+				if r.write {
+					typ = recordWrite
+				} else if typ == recordUnlock {
+					typ = recordRead
+				}
+			}
+		}
+		if n := len(spans); n > 0 && spans[n-1].end == stretch.start && spans[n-1].typ == typ {
+			spans[n-1].end = stretch.end
+			continue
+		}
+		spans = append(spans, span{typ: typ, start: stretch.start, end: stretch.end})
+	}
+	var err error
+	for _, sp := range spans {
+		lk := lockRow{start: sp.start, end: sp.end}.hostLock()
+		lk.typ = sp.typ
+		// A descriptor the guest has closed meanwhile has no lock left of
+		// the process's kind: its close released them.
+		if lerr := file.hostLockLocked(via, recordLockSet, &lk); lerr != nil && !errors.Is(lerr, fs.ErrClosed) {
+			err = errors.Join(err, lerr)
+		}
+	}
+	return err
+}
+
+// lockResync is a file whose host's locks a close left to be brought down
+// to the table (resyncReleased), through via, the closed descriptor's file,
+// where they are the host process's.
+type lockResync struct {
+	file *lockedFile
+	via  *os.File
+}
+
+// releaseRecordLocksLocked removes the locks w holds of the file of op,
+// whose slot of w is being cleared, as a close removes the locks of a
+// process (Linux's locks_remove_posix), and wakes w's waits for a lock of
+// it; the host's locks are brought down once w.mu is let go
+// (resyncReleased). Caller holds w.mu.
+func (w *WasiStubs) releaseRecordLocksLocked(op *wasiOpen) {
+	if !op.hasFileKey || w.recordLockUses.Load() == 0 {
+		return
+	}
+	recordLocks.mu.Lock()
+	file := recordLocks.files[op.fileKey]
+	recordLocks.mu.Unlock()
+	if file == nil {
+		return
+	}
+	file.mu.Lock()
+	dropped := w.dropRowsLocked(file)
+	file.mu.Unlock()
+	if dropped {
+		via, _ := op.f.(*os.File)
+		w.lockResyncs = append(w.lockResyncs, lockResync{file: file, via: via})
+	}
+}
+
+// resyncReleased brings the host's locks of the files closes of w have
+// removed locks of down to the table (lockResyncs), and joins the errors.
+func (w *WasiStubs) resyncReleased() error {
+	w.mu.Lock()
+	pending := w.lockResyncs
+	w.lockResyncs = nil
+	w.mu.Unlock()
+	var err error
+	for _, p := range pending {
+		p.file.mu.Lock()
+		err = errors.Join(err, p.file.resyncLocked(0, recordEnd, p.via))
+		p.file.mu.Unlock()
+	}
+	return err
 }
 
 // absoluteRecordLock makes the range of lk, a lock of the file f, one from
@@ -16850,6 +17483,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 		"io",
 		"io/fs",
 		"maps",
+		"math",
 		"math/bits",
 		"net",
 		"net/netip",

@@ -688,33 +688,32 @@ func flockOSFile(f *os.File, how int) error {
 	})
 }
 
+// hostRecordLocks says that the system has record locks of the host
+// (fcntl(2)), which fd_lock's locks exclude the host's other processes by.
+const hostRecordLocks = true
+
 // hostRecordLock is fcntl(2) F_GETLK (recordLockGet, which writes the lock
 // in the way back into lk), F_SETLK (recordLockSet) or F_SETLKW
-// (recordLockWait) on the descriptor of f, by the commands
-// hostRecordLockCommands names. Where the locks are the open file
-// description's (hostRecordLocksOfDescription), a lock that may have to be
-// waited for is taken through a duplicate of the descriptor
-// (withDuplicateDescriptor); where they are the process's, closing the
-// duplicate would release them, and the wait holds f's descriptor. A call
-// the delivery of a signal to the host process interrupts (EINTR) is made
-// again.
+// (recordLockWait) on the descriptor of f, borrowed (withHostDescriptor),
+// by the commands hostRecordLockCommands names.
 func hostRecordLock(f *os.File, cmd int32, lk *recordLock) error {
+	return withHostDescriptor(f, func(fd uintptr) error { return hostRecordLockFD(fd, cmd, lk) })
+}
+
+// hostRecordLockFD is hostRecordLock on descriptor fd. A call the delivery
+// of a signal to the host process interrupts (EINTR) is made again.
+func hostRecordLockFD(fd uintptr, cmd int32, lk *recordLock) error {
 	types := [3]int16{syscall.F_RDLCK, syscall.F_WRLCK, syscall.F_UNLCK}
 	fl := syscall.Flock_t{Type: types[lk.typ], Whence: int16(lk.whence), Start: lk.start, Len: lk.len}
-	op := hostRecordLockCommands[cmd]
-	on := withHostDescriptor
-	if cmd == recordLockWait && hostRecordLocksOfDescription {
-		on = withDuplicateDescriptor
-	}
-	err := on(f, func(fd uintptr) error {
-		for {
-			if err := syscall.FcntlFlock(fd, op, &fl); !errors.Is(err, syscall.EINTR) {
-				return err
-			}
+	for {
+		err := syscall.FcntlFlock(fd, hostRecordLockCommands[cmd], &fl)
+		if errors.Is(err, syscall.EINTR) {
+			continue
 		}
-	})
-	if err != nil || cmd != recordLockGet {
-		return err
+		if err != nil || cmd != recordLockGet {
+			return err
+		}
+		break
 	}
 	for i, t := range types {
 		if fl.Type == t {
@@ -723,6 +722,139 @@ func hostRecordLock(f *os.File, cmd int32, lk *recordLock) error {
 	}
 	lk.whence, lk.start, lk.len, lk.pid = int32(fl.Whence), fl.Start, fl.Len, int32(fl.Pid)
 	return nil
+}
+
+// hostLockLocked is hostRecordLock of lk on the host's lock of the file:
+// on the host's open file description of the locks where they are a
+// description's (hostRecordLocksOfDescription), on via where they are the
+// process's. Before that description is opened no lock of the table is the
+// host's: a set has nothing to change, and a question goes to via, whose
+// own description the runtime takes no lock of. Caller holds file.mu.
+func (file *lockedFile) hostLockLocked(via *os.File, cmd int32, lk *recordLock) error {
+	if hostRecordLocksOfDescription {
+		if file.host >= 0 {
+			return hostRecordLockFD(uintptr(file.host), cmd, lk)
+		}
+		if cmd != recordLockGet {
+			return nil
+		}
+	}
+	return hostRecordLock(via, cmd, lk)
+}
+
+// prepareHostLocked makes the host's open file description of the locks of
+// the file, where they are a description's, one a lock of the kind
+// forWrite can be taken on, through f, a descriptor of the file open for
+// reading (read) and writing (write), which is a regular file's when
+// regular (see Fd_lock). A description open for the other kind only is
+// replaced, its read locks taken on the new one first; ENOLCK when it
+// holds a write lock, which would rule the new one out, or a wait uses it.
+// passed is the failure of the open again a duplicate stood in for
+// (openRecordLockHost), for the caller to report once file.mu is let go.
+// Caller holds file.mu.
+func (file *lockedFile) prepareHostLocked(f *os.File, regular, read, write, forWrite bool) (passed, err error) {
+	if !hostRecordLocksOfDescription || file.host >= 0 && (forWrite && file.hostWrite || !forWrite && file.hostRead) {
+		return nil, nil
+	}
+	if file.host >= 0 && (len(file.waits) > 0 || slices.ContainsFunc(file.rows, func(r lockRow) bool { return r.write })) {
+		return nil, syscall.ENOLCK
+	}
+	fd, hostRead, hostWrite, passed, err := openRecordLockHost(f, regular, read, write)
+	if err != nil {
+		return nil, err
+	}
+	if file.host >= 0 {
+		for _, r := range file.rows {
+			lk := r.hostLock()
+			if err := hostRecordLockFD(uintptr(fd), recordLockSet, &lk); err != nil {
+				return passed, errors.Join(err, syscall.Close(fd))
+			}
+		}
+		// The new description holds the locks: it is the one from here on,
+		// whatever the close of the old one reports.
+		err = syscall.Close(file.host)
+	}
+	file.host, file.hostRead, file.hostWrite = fd, hostRead, hostWrite
+	return passed, err
+}
+
+// openRecordLockHost opens the host's open file description of the record
+// locks of the file of f, a descriptor open for reading (read) and writing
+// (write): for a regular file, f's file opened again (hostReopen) for
+// reading and writing, or as f is when that open fails; a duplicate of f
+// for any other file, whose open could be what a peer of a FIFO or a
+// device waits for, and for a regular file that cannot be opened again (no
+// /proc). It reports what the description is open for, and as passed the
+// failure of the open again when a duplicate stands in for it.
+func openRecordLockHost(f *os.File, regular, read, write bool) (fd int, canRead, canWrite bool, passed, err error) {
+	if regular {
+		err = withHostDescriptor(f, func(guest uintptr) error {
+			const flags = syscall.O_NONBLOCK | syscall.O_NOCTTY
+			var openErr error
+			if fd, openErr = hostReopen(guest, syscall.O_RDWR|flags); openErr == nil {
+				canRead, canWrite = true, true
+				return nil
+			}
+			// Whatever refused the open for both (the file's mode, a file
+			// being run), the access f has is the guest's: the locks it can
+			// take are those.
+			mode := syscall.O_RDONLY
+			switch {
+			case read && write:
+				mode = syscall.O_RDWR
+			case write:
+				mode = syscall.O_WRONLY
+			}
+			canRead, canWrite = read, write
+			fd, openErr = hostReopen(guest, mode|flags)
+			return openErr
+		})
+		if err == nil {
+			return fd, canRead, canWrite, nil, nil
+		}
+		// A duplicate of f takes the locks f can take, on the description
+		// of the guest's, which a command the guest runs with the
+		// descriptor shares: the open again only keeps the locks off it.
+	}
+	passed = err
+	if fd, err = duplicateDescriptor(f); err != nil {
+		return -1, false, false, nil, errors.Join(passed, err)
+	}
+	return fd, read, write, passed, nil
+}
+
+// closeHostLocked closes the host's open file description of the locks of
+// the file, if there is one. Caller holds file.mu.
+func (file *lockedFile) closeHostLocked() error {
+	if file.host < 0 {
+		return nil
+	}
+	fd := file.host
+	file.host = -1
+	return syscall.Close(fd)
+}
+
+// waitDescriptorLocked returns a duplicate (close-on-exec) of the host's
+// open file description of the locks of the file for a wait for one, where
+// they are a description's: the duplicate is the wait's, which its close
+// does not change; -1 where they are the process's, whose wait is made on
+// the guest's descriptor (hostWaitRecordLock). Caller holds file.mu.
+func (file *lockedFile) waitDescriptorLocked() (int, error) {
+	if !hostRecordLocksOfDescription {
+		return -1, nil
+	}
+	return dupHostFD(uintptr(file.host))
+}
+
+// hostWaitRecordLock is the F_SETLKW of lk on waitFD, which it closes
+// (waitDescriptorLocked), or on via when waitFD is -1: there the wait
+// holds via's descriptor, whose close then waits for it, as the close of a
+// duplicate would release the process's locks.
+func hostWaitRecordLock(waitFD int, via *os.File, lk *recordLock) error {
+	if waitFD >= 0 {
+		return errors.Join(hostRecordLockFD(uintptr(waitFD), recordLockWait, lk), syscall.Close(waitFD))
+	}
+	return hostRecordLock(via, recordLockWait, lk)
 }
 
 // hostSyslogger is the Syslogger HostSyslog returns: at most one connection

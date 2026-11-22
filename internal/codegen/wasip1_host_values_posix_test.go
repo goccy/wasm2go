@@ -310,9 +310,9 @@ func TestFlockOnTheHost(t *testing.T) {
 	}
 }
 
-// On Linux the record locks are the open file description's: two
-// instances of one host process exclude each other, and closing another
-// descriptor of the file keeps the lock. Elsewhere they are the process's.
+// Two instances of one host process exclude each other's record locks,
+// and an instance's close of another descriptor of the file removes its
+// locks of the file.
 func TestFdLockOfTwoInstancesOfAProcess(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("abcdef"), 0o644); err != nil {
@@ -326,14 +326,14 @@ func TestFdLockOfTwoInstancesOfAProcess(t *testing.T) {
 	if rc := w1.Fd_lock(m1, fd1, recordLockSet, lockOff); rc != _wasiESUCCESS {
 		t.Fatalf("F_SETLK of the first instance rc=%d", rc)
 	}
-	closeTestFd(t, w1, m1, openTestFile(t, w1, "f"))
 	putRecordLock(m2, lockOff, 1)
-	rc := w2.Fd_lock(m2, fd2, recordLockSet, lockOff)
-	if runtime.GOOS == "linux" && rc != -_wasiEAGAIN {
+	if rc := w2.Fd_lock(m2, fd2, recordLockSet, lockOff); rc != -_wasiEAGAIN {
 		t.Fatalf("F_SETLK of the second instance rc=%d, want -EAGAIN", rc)
 	}
-	if runtime.GOOS != "linux" && rc != _wasiESUCCESS {
-		t.Fatalf("F_SETLK of the second instance rc=%d, want the process's own lock", rc)
+	closeTestFd(t, w1, m1, openTestFile(t, w1, "f"))
+	putRecordLock(m2, lockOff, 1)
+	if rc := w2.Fd_lock(m2, fd2, recordLockSet, lockOff); rc != _wasiESUCCESS {
+		t.Fatalf("F_SETLK of the second instance after the first closed a descriptor of the file rc=%d", rc)
 	}
 }
 
