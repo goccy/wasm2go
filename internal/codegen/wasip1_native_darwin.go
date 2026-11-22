@@ -225,6 +225,13 @@ func hostAccess(path string, amode uint32, effective bool) (asked bool, err erro
 	return true, syscall.Access(path, amode)
 }
 
+// rootAccess would be hostAccess for name in r; package syscall has no
+// call relative to a directory descriptor on this system, and a path of
+// the host is not looked up instead: errors.ErrUnsupported.
+func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
+	return errors.ErrUnsupported
+}
+
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,
 // recordLockSet and recordLockWait: fcntl's F_GETLK, F_SETLK and F_SETLKW,
 // whose locks are the process's.

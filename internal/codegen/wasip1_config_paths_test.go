@@ -237,7 +237,7 @@ func TestWasi_HostFSRootItself(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range []File{a, b, a} {
-		list, ok, err := hostDirListing(f, false)
+		list, ok, err := hostDirListing(f)
 		if err != nil || !ok || len(list) != 3 {
 			t.Errorf("listing of the root: %d names, %v, %v; want ., .. and f", len(list), ok, err)
 		}

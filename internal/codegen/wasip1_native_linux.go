@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"syscall"
@@ -339,13 +340,90 @@ func utsnameField[T int8 | uint8](raw []T) string {
 // amode (access's bits) to the file at path, with its effective ids or its
 // real ones: faccessat(2). asked is true: the host can always say.
 func hostAccess(path string, amode uint32, effective bool) (asked bool, err error) {
-	// faccessat's AT_FDCWD and AT_EACCESS on this system
-	const atFDCWD, atEAccess = -100, 0x200
-	flags := 0
+	return true, syscall.Faccessat(hostAtFDCWD, path, amode, hostAccessFlags(effective))
+}
+
+// faccessat's AT_FDCWD, AT_EACCESS and AT_SYMLINK_NOFOLLOW on this system.
+const hostAtFDCWD, hostAtEAccess, hostAtSymlinkNofollow = -100, 0x200, 0x100
+
+// hostAccessFlags are the flags of faccessat(2) that ask with the effective
+// ids or the real ones, as effective tells.
+func hostAccessFlags(effective bool) int {
 	if effective {
-		flags = atEAccess
+		return hostAtEAccess
 	}
-	return true, syscall.Faccessat(atFDCWD, path, amode, flags)
+	return 0
+}
+
+// atDirFile calls call with the descriptor of the directory open as dir; op
+// names call, of name, in the error it returns.
+func atDirFile(dir *os.File, name, op string, call func(dirFd int) error) error {
+	rc, err := dir.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var callErr error
+	if err := rc.Control(func(fd uintptr) { callErr = call(int(fd)) }); err != nil {
+		return err
+	}
+	if callErr != nil {
+		return &fs.PathError{Op: op, Path: name, Err: callErr}
+	}
+	return nil
+}
+
+// inRootDir calls call with the directory of name in r, which r opens
+// (O_PATH, which needs no permission to read it), and the last element of
+// name, so that what call does relative to the directory looks up no path
+// outside r. The element has no "/" but name's trailing one, which asks
+// for a directory. op names call in the error it returns.
+func inRootDir(r *os.Root, name, op string, call func(dirFd int, elem string) error) error {
+	trimmed := strings.TrimSuffix(name, "/")
+	dirName, elem := path.Split(trimmed)
+	if dirName == "" {
+		dirName = "."
+	}
+	dir, err := r.OpenFile(dirName, openPath|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	return errors.Join(atDirFile(dir, name, op, func(dirFd int) error { return call(dirFd, elem+name[len(trimmed):]) }), dir.Close())
+}
+
+// rootAccess is hostAccess for name in r, asked so that no path outside r
+// is looked up. A name with a trailing "/", which follows a symbolic link,
+// is opened through os.Root (O_PATH) as the directory it is, and asked
+// about as "." of it. Any other is asked about relative to its directory
+// (inRootDir), once a look without following (an O_PATH open, and fstat;
+// package syscall has no fstatat on every GOARCH) has found it is no
+// symbolic link, which the kernel would follow out of r: a link is
+// errors.ErrUnsupported, and Path_access decides by what os.Root finds it
+// leads to. faccessat(2) does not follow either, so a name made a link in
+// between is answered for the link itself.
+func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
+	if strings.HasSuffix(name, "/") {
+		dir, err := r.OpenFile(name, openPath|syscall.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		return errors.Join(atDirFile(dir, name, "faccessat", func(dirFd int) error {
+			return syscall.Faccessat(dirFd, ".", amode, hostAccessFlags(effective))
+		}), dir.Close())
+	}
+	return inRootDir(r, name, "faccessat", func(dirFd int, elem string) error {
+		fd, err := syscall.Openat(dirFd, elem, openPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		var st syscall.Stat_t
+		if err := errors.Join(syscall.Fstat(fd, &st), syscall.Close(fd)); err != nil {
+			return err
+		}
+		if st.Mode&syscall.S_IFMT == syscall.S_IFLNK {
+			return errors.ErrUnsupported
+		}
+		return syscall.Faccessat(dirFd, elem, amode, hostAccessFlags(effective)|hostAtSymlinkNofollow)
+	})
 }
 
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,

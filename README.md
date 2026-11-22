@@ -100,8 +100,8 @@ are no lookup and are not asked about; a signal ends a lookup with
 `EINTR` — and `Exec` gates `proc_spawn`; a nil
 one denies. A socket (`sock_open`, `sock_socketpair`, `sock_socket`)
 is one socket of the host's from its making to its close; a
-Unix-domain socket's path is a file of the host only with
-`HostFS("/")`, and `ENOTSUP` with any other `FS`. `sock_shutdown`, the
+Unix-domain socket's path is a file of the host only with an `FS` that
+is a `HostRootFS` (`HostFS("/")`), and `ENOTSUP` with any other `FS`. `sock_shutdown`, the
 socket options and timeouts (`sock_setopt`, `sock_getopt`,
 `sock_timeout`) and `pipe` consult no hook. The `FS` is given every
 guest path in one form, the one `io/fs.ValidPath` accepts (`.` for the
@@ -114,15 +114,27 @@ lexically); a nil one allows every access to the configured `FS`. The
 names of the guest's own descriptors (`/dev/fd/N`, `/proc/self/fd/N`,
 `/dev/stdin`, ...) are resolved without the `FS` by every path
 operation, and by those that take no directory descriptor even when
-there is no `FS`. `Errors` is told the errors the guest cannot be given (nil drops them). Host
+there is no `FS`. What an `FS` can do beyond `FS`'s methods it says by the
+optional interfaces it implements, which the runtime asks for and
+nothing else: `ChownFS`, `MkfifoFS`, `LockFS`, `AccessFS` (`access`:
+`HostFS`'s ask the host, for the host process's ids, but for a
+`HostFS` of a directory on darwin and a name that is a symbolic link of
+one on Linux, answered by the mode bits; `NewMemFS`'s allows what its
+`open` allows; any other `FS` is answered by the mode bits, for the ids
+of `Process`) and `HostRootFS`, and of its files `ChtimesFile`
+and `ChownFile`; an `FS` that wraps another keeps them by implementing
+them and calling the other's. `Errors` is told the errors the guest cannot be given (nil drops them). Host
 access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
 `AllowAllListen`, `AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
 host process has (its args, environment, stdio, the whole host
 filesystem and its local time zone, with every hook allowing).
 `HostFS("")` is an error. `HostFS` of a directory other than `/` is
 built on `os.Root`, which refuses a symbolic link that leads out of it
-with `EACCES`; the symbolic links the guest creates may still point
-anywhere for a reader on the host. The directory must be one that may
+with `EACCES`; a name with a trailing `/` is refused so only by the
+`os.Root` of Go 1.25.12 or later in the 1.25 series, 1.26.5 or later in
+the 1.26 series, and any later release, so the module the runtime is
+generated into must be built with one of those. The symbolic links the
+guest creates may still point anywhere for a reader on the host. The directory must be one that may
 be searched, and it is held open until the FS's `Close` method is
 called.
 
@@ -266,7 +278,8 @@ the guest keeps its own numbers. `HostUsers()`, `HostSystem()`,
 error numbers, signals, flags and socket options, ... on Linux and
 darwin) give the host's. The guest's
 `flock` locks a file of an `FS` that is a `LockFS` (what `HostFS` and
-`NewMemFS` return); `fcntl`'s record locks and `mkfifo` are the host's.
+`NewMemFS` return); `fcntl`'s record locks are the host's, and `mkfifo`
+makes a FIFO of an `FS` that is a `MkfifoFS` (`HostFS("/")`).
 A record lock is the instance's, as a process's: a forked copy does not
 inherit it, the instances of a generated package exclude each other, and
 the instance's close of any descriptor of the file releases it. The

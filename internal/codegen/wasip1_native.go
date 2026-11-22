@@ -177,6 +177,17 @@ func (e *WasiSignalError) endsInstance() {}
 // link's absolute target leads from the root. Methods
 // should return the standard fs errors (fs.ErrNotExist, fs.ErrExist,
 // fs.ErrPermission) so the host maps them to the right wasi errno.
+//
+// What an FS can do beyond these methods it says by the optional
+// interfaces it implements, which the runtime asks for and nothing else:
+// ChownFS, MkfifoFS, LockFS, AccessFS and HostRootFS, and of its files
+// ChtimesFile and ChownFile (HostFS's FS also is an io.Closer). An FS that
+// wraps another keeps what the other can do by implementing the same
+// interfaces and calling the other's methods, but for one thing: on Linux
+// the files, directories and FIFOs HostFS's FS creates get the instance's
+// umask taken out by the host's kernel, which a default ACL of their
+// directory may stand in for, and those a wrapper of it creates get the
+// requested mode less the umask (see create).
 type FS interface {
 	// OpenFile mirrors os.OpenFile: flag is O_RDONLY/O_WRONLY/O_RDWR optionally
 	// OR'd with O_CREATE/O_EXCL/O_TRUNC/O_APPEND. The returned File must
@@ -213,6 +224,65 @@ type File interface {
 	// Chmod sets the mode of the open file, as FS.Chmod does by name.
 	Chmod(mode os.FileMode) error
 	Name() string
+}
+
+// ChownFS is an FS whose files have owners the guest can change (chown,
+// lchown). The guest of an FS that is not a ChownFS fails them with ENOSYS.
+type ChownFS interface {
+	FS
+	// Chown changes the owner and group of name; -1 leaves an id as it is.
+	// With follow false a symbolic link itself is changed, not the file it
+	// names. errors.ErrUnsupported is ENOSYS to the guest.
+	Chown(name string, uid, gid int, follow bool) error
+}
+
+// MkfifoFS is an FS that makes FIFOs (mkfifo). The guest of an FS that is
+// not a MkfifoFS fails them with ENOSYS.
+type MkfifoFS interface {
+	FS
+	// Mkfifo creates a FIFO at name with the permission bits perm.
+	Mkfifo(name string, perm os.FileMode) error
+}
+
+// AccessFS is an FS that decides itself whether the guest may access its
+// files (access, faccessat). The guest of an FS that is not an AccessFS,
+// or whose Access returns errors.ErrUnsupported, is answered by the file's
+// mode bits and owner, for the ids of the Process (see Path_access).
+type AccessFS interface {
+	FS
+	// Access returns nil when the accesses of mode — access(2)'s R_OK (4),
+	// W_OK (2) and X_OK (1), or 0 for whether name exists — may be made to
+	// name, following a symbolic link, with the effective ids or the real
+	// ones as effective tells; fs.ErrPermission or the error of finding
+	// name otherwise.
+	Access(name string, mode uint32, effective bool) error
+}
+
+// HostRootFS is an FS whose names are paths of the host's: the file of
+// name is the host's file at filepath.Join(HostRoot(), name), resolved as
+// the host resolves it. The runtime gives such a path to the host where
+// the host takes one (a Unix-domain socket's address) and names a host
+// file under HostRoot by its name in the FS (the link of a standard stream
+// in /dev/fd). Of HostFS's, only the whole host filesystem's is one.
+type HostRootFS interface {
+	FS
+	// HostRoot returns the host directory the names are relative to.
+	HostRoot() string
+}
+
+// ChtimesFile is a File whose times are set through it (futimens). The
+// times of a file that is not a ChtimesFile are set by its name.
+type ChtimesFile interface {
+	File
+	Chtimes(atime, mtime time.Time) error
+}
+
+// ChownFile is a File whose owner and group are changed through it
+// (fchown), as *os.File's are. The guest's fchown of a file that is not a
+// ChownFile fails with ENOSYS.
+type ChownFile interface {
+	File
+	Chown(uid, gid int) error
 }
 
 // fileStat is what POSIX stat reports about a file beyond os.FileInfo. A
@@ -325,7 +395,11 @@ type osFS struct{}
 // For any other root it is built on os.OpenRoot(root), whose error it
 // returns: the FS holds the root directory open until its Close method is
 // called. A symbolic link the FS follows out of the root is refused by
-// os.Root, which the guest sees as EACCES; one the runtime resolves before
+// os.Root, which the guest sees as EACCES. A name with a trailing "/" is
+// refused so only by the os.Root of Go 1.25.12 or later in the 1.25
+// series, 1.26.5 or later in the 1.26 series, and any later release: the
+// runtime is compiled with the module it is generated into, which must be
+// built with one of those. One the runtime resolves before
 // a ".." (see FS) leads from the root as in chroot(2), and ".." of the root
 // is the root. The symbolic links the guest creates may point anywhere: the
 // guest cannot follow them out of the root, a reader on the host can. A
@@ -380,6 +454,10 @@ func rootEscapeOf(r *os.Root) (error, error) {
 
 // Close does nothing: the whole host filesystem holds nothing open.
 func (osFS) Close() error { return nil }
+
+// HostRoot returns "/": a name of the whole host filesystem is the host's
+// path "/"+name.
+func (osFS) HostRoot() string { return "/" }
 
 func (o osFS) join(name string) string {
 	// "." is the root itself: a call on "/" is the host's call on "/"
@@ -847,7 +925,11 @@ func (fsys *MemFS) Readlink(name string) (string, error) {
 	return "", &fs.PathError{Op: "readlink", Path: name, Err: fs.ErrInvalid}
 }
 
-// Chmod sets the permission bits of name; a MemFS keeps no other mode bits.
+// memModeBits are the mode bits Chmod sets of a MemFS file: the
+// permission bits and the setuid, setgid and sticky bits.
+const memModeBits = os.ModePerm | specialModeBits
+
+// Chmod sets the permission, setuid, setgid and sticky bits of name.
 func (fsys *MemFS) Chmod(name string, mode os.FileMode) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
@@ -855,7 +937,7 @@ func (fsys *MemFS) Chmod(name string, mode os.FileMode) error {
 	if err != nil {
 		return &fs.PathError{Op: "chmod", Path: name, Err: err}
 	}
-	n.mode = n.mode&^0o777 | mode&0o777
+	n.mode = n.mode&^memModeBits | mode&memModeBits
 	return nil
 }
 
@@ -921,7 +1003,7 @@ func (fsys *MemFS) WriteFile(name string, data []byte, perm os.FileMode) error {
 }
 
 func (n *memNode) info() memFileInfo {
-	fi := memFileInfo{ino: n.ino, name: n.name, size: int64(len(n.data)), mode: n.mode & 0o777, modTime: n.modTime, unlinked: n.unlinked}
+	fi := memFileInfo{ino: n.ino, name: n.name, size: int64(len(n.data)), mode: n.mode & memModeBits, modTime: n.modTime, unlinked: n.unlinked}
 	if n.dir {
 		fi.size = 0
 		fi.mode |= os.ModeDir
@@ -1010,7 +1092,7 @@ func (f *memFile) Sync() error { return nil }
 func (f *memFile) Chmod(mode os.FileMode) error {
 	f.fsys.mu.Lock()
 	defer f.fsys.mu.Unlock()
-	f.node.mode = f.node.mode&^0o777 | mode&0o777
+	f.node.mode = f.node.mode&^memModeBits | mode&memModeBits
 	return nil
 }
 
@@ -1246,10 +1328,6 @@ type wasiOpen struct {
 	// (dup, dup2, Fork): the descriptor is closed when the last one is
 	// cleared (setSlotLocked, clearSlotLocked). Guarded by mu.
 	refs int32
-	// hostPath records that the descriptor was opened through the whole
-	// host filesystem (osFS), whose files may be looked up by their host
-	// paths (hostDirListing). Immutable.
-	hostPath bool
 	// ahead is input a readiness probe took out of the stream: the only
 	// portable way to learn that a stream the host cannot poll is readable
 	// is to read it (see pollReady). Reads of this descriptor drain ahead
@@ -5875,9 +5953,7 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, current)
 	// A file that sets its own times is changed through the descriptor,
 	// any other by its path.
-	if f, ok := op.f.(interface {
-		Chtimes(atime, mtime time.Time) error
-	}); ok {
+	if f, ok := op.f.(ChtimesFile); ok {
 		return w.guestErrno("fd_filestat_set_times", f.Chtimes(atime, mtime))
 	}
 	if err := fsys.Chtimes(name, atime, mtime); err != nil {
@@ -7676,7 +7752,7 @@ func (op *wasiOpen) readDirCached(rewind bool) ([]os.DirEntry, error) {
 	if op.f == nil {
 		return nil, syscall.EBADF
 	}
-	if out, ok, err := hostDirListing(op.f, op.hostPath); ok {
+	if out, ok, err := hostDirListing(op.f); ok {
 		if err != nil {
 			return nil, err
 		}
@@ -8114,8 +8190,8 @@ func (w *WasiStubs) aliasInfo(name string, n int32, ids ProcessIDs, target strin
 // root, leads to, as Linux names it: the path the descriptor was opened
 // under, absolute in the guest's filesystem ("/" for the root); for a
 // standard stream that is a host file, the target of the host's own link
-// for it where the host has one (hostFDLink), only when the FS is the whole
-// host filesystem, whose names the target is of; pipe:[N] or socket:[N] for a
+// for it where the host has one (hostFDLink), when the FS is a HostRootFS
+// and the target is a name in it or names no file; pipe:[N] or socket:[N] for a
 // pipe or a socket, N the inode number fstat gives it. It is "" for a
 // descriptor that is none of them, which then has no link. errno is a wasi
 // errno.
@@ -8126,14 +8202,19 @@ func (w *WasiStubs) ownLinkTarget(op *wasiOpen, root bool) (string, int32) {
 	case op.path != "":
 		return guestPath(op.path), _wasiESUCCESS
 	}
-	if _, whole := w.fs().(osFS); whole {
+	if fsys, isHost := w.fs().(HostRootFS); isHost {
 		if file := w.streamFile(op); file != nil {
 			target, ok, err := hostStreamLink(file)
 			if err != nil {
 				return "", w.guestErrno("path_readlink", err)
 			}
+			if ok && !filepath.IsAbs(target) {
+				return target, _wasiESUCCESS // pipe:[N] and the like: no file's name
+			}
 			if ok {
-				return target, _wasiESUCCESS
+				if name, in := guestPathOf(fsys, target); in {
+					return name, _wasiESUCCESS
+				}
 			}
 		}
 	}
@@ -8238,8 +8319,7 @@ func (w *WasiStubs) openRoot(oflags, fdflags int32) (int32, int32) {
 	if err != nil {
 		return -1, w.guestErrno("path_open", err)
 	}
-	_, whole := fsys.(osFS)
-	op := &wasiOpen{f: f, isDir: true, path: ".", fdflags: fdflags, hostPath: whole, noWrite: true}
+	op := &wasiOpen{f: f, isDir: true, path: ".", fdflags: fdflags, noWrite: true}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.addFDLocked(op), _wasiESUCCESS
@@ -8577,7 +8657,6 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	fsys := w.fs()
 	openFile := fsys.OpenFile
 	w.mu.Unlock()
-	_, whole := fsys.(osFS)
 
 	var flag int
 	switch {
@@ -8703,9 +8782,8 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	}
 	op := &wasiOpen{
 		f: f, isDir: isDir, regular: st.Mode().IsRegular(), path: rel, fdflags: fdflags,
-		hostPath: whole,
-		noRead:   flag&os.O_WRONLY != 0,
-		noWrite:  flag&(os.O_WRONLY|os.O_RDWR) == 0,
+		noRead:  flag&os.O_WRONLY != 0,
+		noWrite: flag&(os.O_WRONLY|os.O_RDWR) == 0,
 	}
 	if _, isHost := f.(*os.File); isHost {
 		if hs, ok := osFileStat(st.Sys()); ok {
@@ -10369,9 +10447,10 @@ func (a wasiSockAddr) hostPort() string {
 // whole host filesystem, after asking the filesystem policy about writing it
 // (binding creates the file, connecting or sending to it takes write access),
 // or an abstract name as package syscall writes it ("@name"). It reports an
-// errno: ENOTSUP when the instance's FS is not the whole host filesystem
-// (HostFS("/")), whose files alone the host can bind sockets in, and for an
-// abstract name on a host without them.
+// errno: ENOTSUP when the instance's FS is no HostRootFS (of HostFS's, only
+// the whole host filesystem's, HostFS("/"), is one), whose files alone the
+// host can bind sockets in by their names, and for an abstract name on a
+// host without them.
 func (w *WasiStubs) unixHostPath(a wasiSockAddr, path string) (string, int32) {
 	switch {
 	case a.name == "" || path == "" && a.name[0] != 0:
@@ -10382,15 +10461,39 @@ func (w *WasiStubs) unixHostPath(a wasiSockAddr, path string) (string, int32) {
 		}
 		return "@" + a.name[1:], _wasiESUCCESS
 	}
-	_, whole := w.cfg.FS.(osFS)
-	if !whole {
+	fsys, isHost := w.cfg.FS.(HostRootFS)
+	if !isHost {
 		return "", _wasiENOTSUP
 	}
 	name, errno := w.allowedPath(path, true)
 	if errno != _wasiESUCCESS {
 		return "", errno
 	}
-	return osFS{}.join(name), _wasiESUCCESS
+	return hostPathIn(fsys, name), _wasiESUCCESS
+}
+
+// hostPathIn returns the host's path of name, a name guestName gave, in
+// fsys: under fsys.HostRoot(), with the trailing "/" of name, which
+// filepath.Join would drop.
+func hostPathIn(fsys HostRootFS, name string) string {
+	p := filepath.Join(fsys.HostRoot(), filepath.FromSlash(name))
+	if strings.HasSuffix(name, "/") {
+		p += string(filepath.Separator)
+	}
+	return p
+}
+
+// guestPathOf returns the absolute guest path that names the host's file
+// at the absolute path p in fsys, and whether there is one: whether p is
+// under fsys.HostRoot().
+func guestPathOf(fsys HostRootFS, p string) (string, bool) {
+	rel, err := filepath.Rel(fsys.HostRoot(), p)
+	if err != nil || !filepath.IsLocal(rel) {
+		// Rel fails only for a p it cannot make relative to the root:
+		// one that is not under it either.
+		return "", false
+	}
+	return guestPath(filepath.ToSlash(rel)), true
 }
 
 // unixGuestName returns the name the guest knows the Unix-domain address of
@@ -14164,15 +14267,17 @@ func detachShm(ipc IPC, attachment shmAttachment) error {
 // R_OK 4); flags bit 0 (wasiAccessEffective) asks with the effective ids
 // instead of the real ones, as AT_EACCESS does.
 //
-// A file of the whole host filesystem (HostFS("/")) is asked about with the
-// host's own check (faccessat(2)), which also knows access control lists
-// and read-only mounts, for the host process's ids; where the host cannot
-// say (an effective-id question on darwin from a process whose effective
-// ids are not its real ones, a host without the call), and for a file of
-// any other FS, by its mode bits and owner, for the ids and the
-// supplementary groups of the Process (WASIConfig.Process): user id 0 may
-// read and write anything, and run what has any x bit, or search any
-// directory. Returns 0, or a negative errno: EACCES when the access is
+// A file of an FS that is an AccessFS is asked about by the FS. HostFS's
+// ask the host's own check (faccessat(2)), which also knows access control
+// lists and read-only mounts, for the host process's ids; MemFS allows
+// every access to a file it has, as its open checks none. Where the FS
+// cannot say (errors.ErrUnsupported: an effective-id question on darwin
+// from a process whose effective ids are not its real ones, a HostFS of a
+// directory on darwin, a host without the call), for a file of any other
+// FS, and for a name of the guest's own descriptors, the access is decided
+// by the file's mode bits and owner, for the ids and the supplementary
+// groups of the Process (WASIConfig.Process): user id 0 may read and write
+// anything, and run what has any x bit, or search any directory. Returns 0, or a negative errno: EACCES when the access is
 // refused, ENOENT and the like when the file cannot be found, EINVAL for an
 // amode or flags it does not know.
 func (w *WasiStubs) Path_access(m *Module, pathPtr, pathLen, amode, flags int32) int32 {
@@ -14230,8 +14335,8 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	if whole, isHost := fsys.(osFS); isHost && !own {
-		if asked, err := hostAccess(whole.join(name), uint32(amode), effective); asked {
+	if decides, ok := fsys.(AccessFS); ok && !own {
+		if err := decides.Access(name, uint32(amode), effective); !errors.Is(err, errors.ErrUnsupported) {
 			return -w.guestErrno("path_access", err)
 		}
 	}
@@ -14284,8 +14389,8 @@ func modeAllows(fi os.FileInfo, st fileStat, amode, uid, gid uint32, groups []in
 // name "path_mkfifo") backing mkfifo: it creates a FIFO at the
 // preopen-relative path with the given permission bits, less the
 // instance's umask. Returns 0, or a negative errno: ENOSYS when the
-// filesystem of the instance makes no FIFOs — one only the whole host
-// filesystem (HostFS("/")) makes.
+// filesystem of the instance is no MkfifoFS (of HostFS's, only the whole
+// host filesystem's, HostFS("/"), is one).
 func (w *WasiStubs) Path_mkfifo(m *Module, pathPtr, pathLen, mode int32) int32 {
 	return w.pathMkfifo(m, zext(pathPtr), pathLen, mode)
 }
@@ -14308,9 +14413,7 @@ func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) i
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	maker, can := fsys.(interface {
-		Mkfifo(name string, perm os.FileMode) error
-	})
+	maker, can := fsys.(MkfifoFS)
 	if !can {
 		return -_wasiENOSYS
 	}
@@ -14318,6 +14421,29 @@ func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) i
 		return -w.guestErrno("path_mkfifo", err)
 	}
 	return _wasiESUCCESS
+}
+
+// Access asks the host about an access to a file of the host filesystem
+// (hostAccess); errors.ErrUnsupported where the host cannot say.
+func (o osFS) Access(name string, mode uint32, effective bool) error {
+	asked, err := hostAccess(o.join(name), mode, effective)
+	if !asked {
+		return errors.ErrUnsupported
+	}
+	return err
+}
+
+// Access asks the host about an access to a file of the directory, through
+// the directory os.Root holds (rootAccess).
+func (r rootFS) Access(name string, mode uint32, effective bool) error {
+	return r.refused(rootAccess(r.root, r.name(name), mode, effective))
+}
+
+// Access allows every access to a file the MemFS has: its open checks no
+// permission either.
+func (fsys *MemFS) Access(name string, mode uint32, effective bool) error {
+	_, err := fsys.Stat(name)
+	return err
 }
 
 // Mkfifo creates a FIFO in the host filesystem.
@@ -15542,7 +15668,7 @@ func (o osFS) Chown(name string, uid, gid int, follow bool) error {
 // Path_chown is a NON-STANDARD host import (name "path_chown") backing
 // chown and lchown (follow 0) for the preopen-relative path; an id of -1
 // is left as it is. Returns 0, or a negative errno: ENOSYS when the
-// filesystem of the instance keeps no owners.
+// filesystem of the instance is no ChownFS.
 func (w *WasiStubs) Path_chown(m *Module, pathPtr, pathLen, uid, gid, follow int32) int32 {
 	return w.pathChown(m, zext(pathPtr), pathLen, uid, gid, follow)
 }
@@ -15568,9 +15694,7 @@ func (w *WasiStubs) pathChown(m *Module, pathPtr uint64, pathLen, uid, gid, foll
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	owner, can := fsys.(interface {
-		Chown(name string, uid, gid int, follow bool) error
-	})
+	owner, can := fsys.(ChownFS)
 	if !can {
 		return -_wasiENOSYS
 	}
@@ -15581,8 +15705,8 @@ func (w *WasiStubs) pathChown(m *Module, pathPtr uint64, pathLen, uid, gid, foll
 }
 
 // Fd_chown is a NON-STANDARD host import (name "fd_chown") backing fchown.
-// Returns 0, or a negative errno: ENOSYS for a descriptor that is not a
-// file of the host.
+// Returns 0, or a negative errno: ENOSYS for a descriptor whose file is no
+// ChownFile.
 func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -15590,8 +15714,8 @@ func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 	if op == nil {
 		return -_wasiEBADF
 	}
-	file, isHostFile := op.f.(*os.File)
-	if !isHostFile {
+	file, can := op.f.(ChownFile)
+	if !can {
 		return -_wasiENOSYS
 	}
 	if err := file.Chown(int(uid), int(gid)); err != nil {

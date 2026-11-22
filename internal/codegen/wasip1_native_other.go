@@ -219,10 +219,9 @@ func hostHungUp(fd uintptr) bool { return false }
 // hostDirListing lists a directory of the host's file system (an *os.File,
 // which HostFS opens) in the order the system gives its names, which Go's
 // ReadDir keeps. ReadDir leaves "." and ".." out, and they come first. ok
-// is false for a directory of another file system. hostPath (the directory
-// is of the whole host filesystem) changes nothing here: dotEntry states
-// "." and ".." by their host paths either way.
-func hostDirListing(f File, hostPath bool) ([]os.DirEntry, bool, error) {
+// is false for a directory of another file system. dotEntry states "." and
+// ".." by their host paths.
+func hostDirListing(f File) ([]os.DirEntry, bool, error) {
 	d, isHost := f.(*os.File)
 	if !isHost {
 		return nil, false, nil
@@ -266,6 +265,12 @@ func hostUname() (Uname, error) { return Uname{}, errors.ErrUnsupported }
 // decides by the file's mode bits.
 func hostAccess(path string, amode uint32, effective bool) (asked bool, err error) {
 	return false, nil
+}
+
+// rootAccess would ask the host about an access to a file of r, which the
+// runtime cannot do on this platform: errors.ErrUnsupported.
+func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
+	return errors.ErrUnsupported
 }
 
 // flockOSFile would apply flock(2) to a file of the host process, which the
