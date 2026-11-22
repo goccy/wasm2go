@@ -39,20 +39,23 @@ package {{.Pkg}}
 // every instance allocates and initializes its own memory, exactly as before.
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"unsafe"
 )
 
 // SharedImage is a process-wide initialized linear-memory template.
 type SharedImage struct {
-	f       *os.File // unlinked; holds the image
-	size    uint64   // the guest's memory.size for the image
-	dataEnd uint32   // where the data segments stop and BSS begins
-	globals []uint64 // non-nil for a snapshot: the instance's wasm globals
-	err     error    // non-nil if the image could not be built
+	img     *memImage // an unlinked file that holds the image, held for good
+	size    uint64    // the guest's memory.size for the image
+	dataEnd uint32    // where the data segments stop and BSS begins
+	globals []uint64  // non-nil for a snapshot: the instance's wasm globals
+	err     error     // non-nil if the image could not be built
 }
 
 // ImageBuilder brings up one throwaway instance. The caller supplies it because
@@ -134,7 +137,7 @@ func NewSharedSnapshotInPlace(ceiling int, build InPlaceImageBuilder) *SharedIma
 
 func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bool) *SharedImage {
 	if !mmapSupported {
-		return &SharedImage{err: fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")}
+		return &SharedImage{err: errNoMappings}
 	}
 	f, err := os.CreateTemp("", "wasm2go-image-*")
 	if err != nil {
@@ -143,6 +146,10 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 	// Unlink now: the image must never be reachable by name. The pages live
 	// as long as we hold the descriptor.
 	_ = os.Remove(f.Name())
+	if err := ensureImageFits(ceiling); err != nil {
+		f.Close()
+		return &SharedImage{err: err}
+	}
 	if err := f.Truncate(int64(ceiling)); err != nil {
 		f.Close()
 		return &SharedImage{err: fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)}
@@ -153,7 +160,7 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 		return &SharedImage{err: err}
 	}
 	fail := func(err error) *SharedImage {
-		unmapMemory(mem)
+		err = errors.Join(err, unmapMemory(mem))
 		f.Close()
 		return &SharedImage{err: err}
 	}
@@ -188,14 +195,20 @@ func buildSharedImageInPlace(ceiling int, build InPlaceImageBuilder, snapshot bo
 	}
 	// The builder's mapping is not GC-managed. A finalizer ties the unmap
 	// to the module's reachability: a builder that parked agent goroutines
-	// (they reference the module) keeps its mapping until they go.
-	runtime.SetFinalizer(m, func(fm *{{.Module}}) { unmapMemory(mem) })
-	return &SharedImage{f: f, size: size, dataEnd: dataEnd, globals: globals}
+	// (they reference the module) keeps its mapping until they go. The
+	// mapping is one mmapShared made, whole: only a broken invariant fails
+	// its unmapping, and a finalizer has no one to tell.
+	runtime.SetFinalizer(m, func(fm *{{.Module}}) {
+		if err := unmapMemory(mem); err != nil {
+			panic(err)
+		}
+	})
+	return &SharedImage{img: &memImage{f: f, refs: 1}, size: size, dataEnd: dataEnd, globals: globals}
 }
 
 func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	if !mmapSupported {
-		return &SharedImage{err: fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")}
+		return &SharedImage{err: errNoMappings}
 	}
 	m, err := build()
 	if err != nil {
@@ -244,15 +257,20 @@ func buildSharedImage(build ImageBuilder, snapshot bool) *SharedImage {
 	// Unlink now: the image must never be reachable by name. The pages live
 	// as long as we hold the descriptor.
 	_ = os.Remove(f.Name())
+	if err := ensureImageFits(len(img)); err != nil {
+		f.Close()
+		return &SharedImage{err: err}
+	}
 	if _, err := f.Write(img); err != nil {
 		f.Close()
 		return &SharedImage{err: fmt.Errorf("wasm2go: shared memory image: %w", err)}
 	}
-	return &SharedImage{f: f, size: size, dataEnd: dataEnd, globals: globals}
+	return &SharedImage{img: &memImage{f: f, refs: 1}, size: size, dataEnd: dataEnd, globals: globals}
 }
 
 // Err reports why the image is unavailable, or nil. A caller that gets an
-// error must build each instance's memory itself.
+// error must build each instance's memory itself. Where the platform has no
+// mmap (windows, js/wasm), the error wraps errors.ErrUnsupported.
 func (s *SharedImage) Err() error { return s.err }
 
 // Size is the guest's memory.size for the image, in bytes: what a Module built
@@ -285,27 +303,302 @@ func (s *SharedImage) Memory(ceiling int) ([]byte, error) {
 	if uint64(ceiling) < s.size {
 		return nil, fmt.Errorf("wasm2go: memory ceiling %d is below the image (%d bytes)", ceiling, s.size)
 	}
-	return mmapImage(s.f, ceiling)
+	mem, err := mmapImage(s.img.f, ceiling)
+	if err != nil {
+		return nil, err
+	}
+	recordRuntimeMapping(mem, s.img)
+	return mem, nil
 }
 
-// UnmapMemory releases a mapping returned by SharedImage.Memory. Calling it on
-// a slice that did not come from there is a no-op on platforms without mmap
-// and undefined otherwise, so do not. Call the CloseAll of the instance's
+// MapMemory returns memory for one instance that initializes itself on it,
+// ceiling bytes long and all zeros: install the module's active data
+// segments in it with the generated InstallDataSegments, build the instance
+// with NewWithMemory (memory size InitialMemoryBytes) and initialize it as
+// an instance whose constructor allocates its memory. Nothing is imaged or
+// written first, so the instance starts as fast as such an instance, and
+// its memory keeps one address for its whole life, growing up to ceiling
+// (native code that holds pointers into it needs that). The ceiling costs
+// address space only: a page is charged to the process when it is written.
+// It is anonymous memory, private to the process.
+//
+// The mapping is NOT Go heap — the GC will not reclaim it. Pass it to
+// UnmapMemory when the instance is done. A System V shared memory segment
+// may be attached over a part of the memory of an instance on it (see
+// IPC). Where the platform has no mmap (windows, js/wasm), the error
+// wraps errors.ErrUnsupported.
+func MapMemory(ceiling int) ([]byte, error) {
+	if !mmapSupported {
+		return nil, errNoMappings
+	}
+	if ceiling <= 0 {
+		return nil, fmt.Errorf("wasm2go: a memory ceiling of %d bytes holds no memory", ceiling)
+	}
+	mem, err := mmapAnonymous(ceiling)
+	if err != nil {
+		return nil, err
+	}
+	recordRuntimeMapping(mem, nil)
+	return mem, nil
+}
+
+// ForkMemory duplicates the linear memory of an instance whose memory is a
+// mapping the runtime made (MapMemory, SharedImage.Memory, ForkMemory), for
+// a Forker that builds the instance a fork of m runs in: build it with
+// NewFromSnapshot(memory, memSize, globals). The memory is a mapping of the
+// runtime's as long as m's, which holds what m's memory holds; pass it to
+// UnmapMemory when that instance is done. m must not be executing: the
+// caller is the goroutine that runs it (inside a host import, Forker.Fork).
+// The memory of any other instance is refused with an error; where the
+// platform has no mmap, and so no memory is such a mapping, the error wraps
+// errors.ErrUnsupported.
+//
+// Where the platform tells which pages of a mapping the process has written
+// (Linux), the duplicate is copy-on-write: a private mapping of an image of
+// m's memory, into which the pages m has written since the image was made
+// are copied. When what the forks have copied since the image was made,
+// with what this fork would copy, reaches what writing a new image would
+// (the pages m has written, for anonymous memory such as MapMemory's; the
+// whole memory, for a mapping of an image), the fork writes a new image of
+// m's memory instead, a file in memory that holds the pages m has written,
+// and m's memory is mapped onto it at the same address, so that what the
+// forks after it copy starts from nothing. That is the rent-or-buy rule:
+// whatever the forks to come, the copying costs at most twice what the best
+// choice in hindsight would; the first fork of an instance on MapMemory's
+// memory writes the image. m's memory is not mapped anew while a System V
+// shared memory segment is attached over it, while it is shared (other
+// threads may run in it), where the process may not make a file as long as
+// the memory's mapping (RLIMIT_FSIZE), or under a commit policy that would
+// charge the new mapping's whole length before releasing the old one
+// (Linux's vm.overcommit_memory=2). Where it is not, and elsewhere, the
+// duplicate is a copy: a private mapping of m's image that holds the pages
+// m has written, or anonymous memory that holds the pages m has written
+// (where the platform tells which) or all of them.
+//
+// What a System V shared memory segment attached over m's memory holds is
+// copied into the duplicate: the instance the duplicate is the memory of
+// has no segment attached.
+func ForkMemory(m *{{.Module}}) (memory []byte, memSize uint64, globals []uint64, err error) {
+	if !mmapSupported {
+		return nil, 0, nil, errNoMappings
+	}
+	memory, memSize, err = forkRuntimeMapping(m)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	if memory == nil {
+		return nil, 0, nil, errors.New("wasm2go: the instance's memory is no mapping of the runtime's (MapMemory, SharedImage.Memory, ForkMemory)")
+	}
+	return memory, memSize, {{.SaveGlobals}}(m), nil
+}
+
+// errNoMappings is the failure of MapMemory, ForkMemory and the images
+// (SharedImage.Err) where the platform has no mmap.
+var errNoMappings = fmt.Errorf("wasm2go: memory mappings are not supported on this platform: %w", errors.ErrUnsupported)
+
+// forkRuntimeMapping is ForkMemory's duplicate of m's memory and m's
+// memory.size, while nothing but the caller enters m: nil memory when m's
+// memory is no runtime mapping. Writes from other goroutines (a signal's
+// flag) go through accessMemory, which takes the lock held here.
+func forkRuntimeMapping(m *{{.Module}}) (memory []byte, memSize uint64, err error) {
+	m.{{.MemMu}}.Lock()
+	defer m.{{.MemMu}}.Unlock()
+	memSize = m.{{.MemSize}}.Load()
+	r := runtimeMappingOf(m.{{.Memory}})
+	if r == nil {
+		return nil, memSize, nil
+	}
+	memory, err = r.fork(memSize, m.{{.MemShared}})
+	return memory, memSize, err
+}
+
+// fork returns the duplicate ForkMemory makes of the memory r is, of which
+// size bytes are the instance's memory; threads tells that other threads of
+// the instance may run.
+func (r *runtimeMapping) fork(size uint64, threads bool) ([]byte, error) {
+	mem := unsafe.Slice(r.start, r.length)
+	runtimeMappings.Lock()
+	image, overlays, attached, copied := r.image, slices.Clone(r.overlays), r.attached, r.copied
+	runtimeMappings.Unlock()
+	// (spaced: two opening braces start an action of the template)
+	whole := []pageRun{ {from: 0, to: size} }
+	// runs are the pages of the memory the process has written (ok), which
+	// are all that anonymous memory holds and all that a private mapping
+	// of an image holds apart from the image.
+	runs, written, ok := whole, size, false
+	if cowSupported {
+		var err error
+		if runs, written, ok, err = privatePages(mem[:size]); err != nil {
+			return nil, err
+		}
+		if !ok {
+			runs, written = whole, size
+		}
+	}
+	copying := written + pageRunsLength(overlays)
+	if ok && !threads && attached == 0 {
+		keep := whole // what a new image holds that is not zeros
+		if image == nil {
+			keep = runs
+		}
+		if copied+copying >= pageRunsLength(keep) {
+			remap, err := remapUncharged()
+			if err != nil {
+				return nil, err
+			}
+			if remap {
+				img, err := writeImage(mem, keep, r.length)
+				if err != nil {
+					return nil, err
+				}
+				if img != nil {
+					return r.rebase(img, mem)
+				}
+			}
+		}
+	}
+	var child []byte
+	var err error
+	if ok && image != nil {
+		child, err = mmapImage(image.f, r.length)
+	} else {
+		image = nil
+		child, err = mmapAnonymous(r.length)
+	}
+	if err != nil {
+		return nil, err
+	}
+	copyPageRuns(child, mem, runs)
+	copyPageRuns(child, mem, overlays)
+	recordRuntimeMapping(child, image)
+	runtimeMappings.Lock()
+	r.copied += copying
+	runtimeMappings.Unlock()
+	return child, nil
+}
+
+// rebase makes img, a file that holds what mem, the memory r is, holds,
+// the image r is a private mapping of: the duplicate of the memory is a
+// mapping of it first, then mem is mapped onto it at its address, and r's
+// image is img from then on.
+func (r *runtimeMapping) rebase(img *memImage, mem []byte) ([]byte, error) {
+	child, err := mmapImage(img.f, r.length)
+	if err != nil {
+		return nil, errors.Join(err, closeUnheldImage(img))
+	}
+	if err := remapImage(img.f, mem); err != nil {
+		return nil, errors.Join(err, munmap(child), closeUnheldImage(img))
+	}
+	runtimeMappings.Lock()
+	img.refs++
+	released := r.image.release()
+	r.image, r.overlays, r.copied = img, nil, 0
+	runtimeMappings.Unlock()
+	recordRuntimeMapping(child, img)
+	if released != nil {
+		return nil, errors.Join(released, unmapMemory(child))
+	}
+	return child, nil
+}
+
+// closeUnheldImage closes img, which no mapping holds.
+func closeUnheldImage(img *memImage) error {
+	if img.refs > 0 {
+		return nil
+	}
+	return img.f.Close()
+}
+
+// copyPageRuns copies the runs of src into dst.
+func copyPageRuns(dst, src []byte, runs []pageRun) {
+	for _, r := range runs {
+		copy(dst[r.from:r.to], src[r.from:r.to])
+	}
+}
+
+// pageRunsLength is the total length of runs.
+func pageRunsLength(runs []pageRun) uint64 {
+	var n uint64
+	for _, r := range runs {
+		n += r.to - r.from
+	}
+	return n
+}
+
+// pageRun is a run of pages, as byte offsets into a mapping.
+type pageRun struct{ from, to uint64 }
+
+// UnmapMemory releases a mapping returned by MapMemory, SharedImage.Memory or
+// ForkMemory, and returns the error of its release. Calling it on a slice
+// that did not come from there is a no-op on platforms without mmap and
+// undefined otherwise, so do not. Call the CloseAll of the instance's
 // WasiStubs first, which detaches the System V shared memory segments the
 // guest attached: a segment still attached is detached with the mapping,
 // and a later CloseAll leaves it alone.
-func UnmapMemory(mem []byte) { unmapMemory(mem) }
+func UnmapMemory(mem []byte) error { return unmapMemory(mem) }
+
+// unmapMemory unmaps mem: a runtime mapping, whole, or a mapping no record
+// holds (mmapShared's), as it is.
+func unmapMemory(mem []byte) error {
+	if len(mem) == 0 {
+		return nil
+	}
+	r, closing := forgetRuntimeMapping(mem)
+	if r == nil {
+		return munmap(mem)
+	}
+	return errors.Join(munmap(unsafe.Slice(r.start, r.length)), closing)
+}
+
+// memImage is a file that holds an image of a linear memory (an unlinked
+// temporary file, or a file in memory only), counted by what holds it:
+// the runtime mappings of it that unmapMemory has not released, and the
+// SharedImage it is of, which holds it for good. The file is closed when
+// nothing holds it; the mappings made of it keep its pages. refs is
+// guarded by runtimeMappings.
+type memImage struct {
+	f    *os.File
+	refs int
+}
+
+// release counts one holder of i out, closing the file when it was the
+// last, and returns the error of the close. Caller holds runtimeMappings;
+// i may be nil.
+func (i *memImage) release() error {
+	if i == nil {
+		return nil
+	}
+	if i.refs--; i.refs > 0 {
+		return nil
+	}
+	return i.f.Close()
+}
 
 // runtimeMapping is a mapping of an instance's memory the runtime made
-// (mmapImage) that unmapMemory has not released. It is the runtime's own
-// and does not move: an instance on it never grows past it. The wasi
-// runtime attaches System V shared memory segments over parts of an
-// instance's memory that is one (Ipc_shmat). The mapping an image is built
-// in place on (mmapShared) is not one: what a segment holds is not the
-// image's.
+// (MapMemory, SharedImage.Memory, ForkMemory) that unmapMemory has not
+// released. It is the runtime's own and does not move: an instance on it
+// never grows past it. The wasi runtime attaches System V shared memory
+// segments over parts of an instance's memory that is one (Ipc_shmat).
+// The mapping an image is built in place on (mmapShared) is not one: what
+// a segment holds is not the image's. Its fields but start and length are
+// guarded by runtimeMappings.
 type runtimeMapping struct {
 	start  *byte
 	length int
+	// image is the file the mapping is a private mapping of, nil for
+	// anonymous memory. The pages the instance has written are the
+	// process's own.
+	image *memImage
+	// overlays are the parts of the mapping that System V shared memory
+	// segments have been attached over since it became what it is
+	// (noteSegment), detached or not: what they hold is neither the
+	// image's nor what a page map tells. attached is how many segments are
+	// attached now.
+	overlays []pageRun
+	attached int
+	// copied is how many bytes the forks of the instance have copied since
+	// its image was made (see ForkMemory).
+	copied uint64
 }
 
 // runtimeMappings holds the runtimeMappings, by their first byte.
@@ -314,20 +607,63 @@ var runtimeMappings = struct {
 	byStart map[*byte]*runtimeMapping
 }{byStart: map[*byte]*runtimeMapping{}}
 
-// recordRuntimeMapping records mem, a mapping the runtime has just made.
-func recordRuntimeMapping(mem []byte) {
+// recordRuntimeMapping records mem, a private mapping the runtime has just
+// made of image (nil for anonymous memory).
+func recordRuntimeMapping(mem []byte, image *memImage) {
 	runtimeMappings.Lock()
 	defer runtimeMappings.Unlock()
+	if image != nil {
+		image.refs++
+	}
 	start := unsafe.SliceData(mem)
-	runtimeMappings.byStart[start] = &runtimeMapping{start: start, length: len(mem)}
+	runtimeMappings.byStart[start] = &runtimeMapping{start: start, length: len(mem), image: image}
 }
 
 // forgetRuntimeMapping removes mem, which is about to be unmapped, from
-// runtimeMappings. A whileRuntimeMapped on it that has begun ends first.
-func forgetRuntimeMapping(mem []byte) {
+// runtimeMappings, and returns its record, or nil when it has none, and the
+// error of the release of its image. A whileRuntimeMapped on it that has
+// begun ends first.
+func forgetRuntimeMapping(mem []byte) (*runtimeMapping, error) {
 	runtimeMappings.Lock()
 	defer runtimeMappings.Unlock()
-	delete(runtimeMappings.byStart, unsafe.SliceData(mem))
+	start := unsafe.SliceData(mem)
+	r := runtimeMappings.byStart[start]
+	if r == nil {
+		return nil, nil
+	}
+	delete(runtimeMappings.byStart, start)
+	return r, r.image.release()
+}
+
+// noteSegment records that a System V shared memory segment has been
+// attached over at, a part of m (attached), or detached from it. The
+// caller is the f of a whileRuntimeMapped on m.
+func noteSegment(m *runtimeMapping, at []byte, attached bool) {
+	if !attached {
+		m.attached--
+		return
+	}
+	from := uint64(uintptr(unsafe.Pointer(unsafe.SliceData(at))) - uintptr(unsafe.Pointer(m.start)))
+	m.overlays = addPageRun(m.overlays, pageRun{from: from, to: from + uint64(len(at))})
+	m.attached++
+}
+
+// addPageRun returns runs, which are in order and apart, with r added: r
+// and the runs it overlaps or touches become one run. So the runs a
+// mapping records stay as many as the separate parts of it they cover,
+// however often a part is recorded.
+func addPageRun(runs []pageRun, r pageRun) []pageRun {
+	merged := make([]pageRun, 0, len(runs)+1)
+	for _, o := range runs {
+		if o.to < r.from || r.to < o.from {
+			merged = append(merged, o)
+			continue
+		}
+		r = pageRun{from: min(r.from, o.from), to: max(r.to, o.to)}
+	}
+	merged = append(merged, r)
+	slices.SortFunc(merged, func(a, b pageRun) int { return cmp.Compare(a.from, b.from) })
+	return merged
 }
 
 // runtimeMappingOf returns the runtimeMapping mem, an instance's memory,

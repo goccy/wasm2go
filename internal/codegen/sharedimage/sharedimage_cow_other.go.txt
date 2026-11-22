@@ -1,0 +1,28 @@
+//go:build !linux || 386 || arm || mips || mipsle || mips64 || mips64le || ppc64 || ppc64le || s390x
+
+package {{.Pkg}}
+
+import (
+	"errors"
+	"os"
+)
+
+// cowSupported reports that the platform tells which pages of a private
+// mapping the process has written, makes files in memory, and maps a file
+// at the address of a mapping (see sharedimage_cow_linux.go). Here it does
+// not: ForkMemory copies.
+const cowSupported = false
+
+// The rest is reached only where cowSupported is true.
+
+func writeImage(mem []byte, runs []pageRun, length int) (*memImage, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func remapImage(f *os.File, mem []byte) error { return errors.ErrUnsupported }
+
+func remapUncharged() (bool, error) { return false, nil }
+
+func privatePages(mem []byte) (runs []pageRun, total uint64, ok bool, err error) {
+	return nil, 0, false, nil
+}

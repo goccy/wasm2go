@@ -2,10 +2,7 @@
 
 package {{.Pkg}}
 
-import (
-	"fmt"
-	"os"
-)
+import "os"
 
 // Platforms without mmap (windows, js/wasm, ...) get the historical behaviour:
 // every instance allocates and initializes its own linear memory. Correct, only
@@ -13,12 +10,19 @@ import (
 const mmapSupported = false
 
 func mmapImage(f *os.File, ceiling int) ([]byte, error) {
-	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+	return nil, errNoMappings
 }
-
-func unmapMemory(mem []byte) {}
 
 func mmapShared(f *os.File, length int) ([]byte, error) {
-	return nil, fmt.Errorf("wasm2go: copy-on-write memory is not supported on this platform")
+	return nil, errNoMappings
 }
 
+func mmapAnonymous(length int) ([]byte, error) {
+	return nil, errNoMappings
+}
+
+// munmap has nothing to unmap: no memory of this platform is a mapping.
+func munmap(mem []byte) error { return nil }
+
+// ensureImageFits: no image is made on this platform.
+func ensureImageFits(n int) error { return nil }

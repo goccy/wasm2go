@@ -771,6 +771,8 @@ func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
 		Module:      "Module",
 		Memory:      t.fieldName("memory"),
 		MemSize:     t.fieldName("memSize"),
+		MemMu:       t.fieldName("memMu"),
+		MemShared:   t.fieldName("memShared"),
 		DataEnd:     t.fieldName("dataEnd"),
 		SaveGlobals: saveGlobals,
 	})

@@ -1,0 +1,14 @@
+//go:build linux
+
+package {{.Pkg}}
+
+import "syscall"
+
+// mapNoReserve keeps a private mapping of a linear memory from being
+// charged in full against the system's commit limit when it is made: the
+// mapping is as long as the memory may ever grow, most of it is never
+// touched, and under the kernel's default overcommit policy a private
+// writable mapping longer than the machine's memory is refused outright.
+// Pages are charged as they are written, as the Go heap's are. The strict
+// policy (vm.overcommit_memory=2) ignores the flag.
+const mapNoReserve = syscall.MAP_NORESERVE

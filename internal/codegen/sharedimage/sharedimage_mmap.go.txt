@@ -3,6 +3,7 @@
 package {{.Pkg}}
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -12,7 +13,8 @@ const mmapSupported = true
 
 // mmapImage maps the image as one instance's linear memory: MAP_PRIVATE, so
 // reads share the image's physical pages with every other instance and a write
-// faults in a private copy of just that page.
+// faults in a private copy of just that page. Its pages are charged against
+// the commit limit as they are written, not all at once (mapNoReserve).
 //
 // The file is sparse-extended to the ceiling first, so the whole range is
 // mappable and everything past the image reads as zeros — which is what a
@@ -24,16 +26,18 @@ func mmapImage(f *os.File, ceiling int) ([]byte, error) {
 		return nil, err
 	}
 	if fi.Size() < int64(ceiling) {
+		if err := ensureImageFits(ceiling); err != nil {
+			return nil, err
+		}
 		if err := f.Truncate(int64(ceiling)); err != nil {
 			return nil, fmt.Errorf("wasm2go: sizing the shared memory image: %w", err)
 		}
 	}
 	mem, err := syscall.Mmap(int(f.Fd()), 0, ceiling,
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE)
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|mapNoReserve)
 	if err != nil {
 		return nil, fmt.Errorf("wasm2go: mapping the shared memory image: %w", err)
 	}
-	recordRuntimeMapping(mem)
 	return mem, nil
 }
 
@@ -50,11 +54,49 @@ func mmapShared(f *os.File, length int) ([]byte, error) {
 	return mem, nil
 }
 
-func unmapMemory(mem []byte) {
-	if len(mem) == 0 {
-		return
+// mmapAnonymous maps length bytes of zeros, private to the process: memory
+// of an instance's own that stays at one address, charged as it is written
+// (mapNoReserve).
+func mmapAnonymous(length int) ([]byte, error) {
+	mem, err := syscall.Mmap(-1, 0, length,
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE|syscall.MAP_ANON|mapNoReserve)
+	if err != nil {
+		return nil, fmt.Errorf("wasm2go: mapping memory of the instance's own: %w", err)
 	}
-	forgetRuntimeMapping(mem)
-	_ = syscall.Munmap(mem)
+	return mem, nil
 }
 
+func munmap(mem []byte) error { return syscall.Munmap(mem) }
+
+// errImageLimit is the failure to make or extend an image of linear memory
+// past the process's limit on the size of a file (see imageFits).
+var errImageLimit = errors.New("wasm2go: a memory image would be longer than the process may make a file (RLIMIT_FSIZE)")
+
+// imageFits reports whether the process may make a file n bytes long. An
+// image of linear memory is a file, and the process's limit on the size of
+// the files it makes (RLIMIT_FSIZE) applies to it as to any other: a
+// program may lower the limit (setrlimit; a shell's ulimit -f before the
+// process starts), and making a longer file fails with EFBIG and sends the
+// process SIGXFSZ, which an embedder that passes the process's signals on
+// to the guest would pass on as a signal about a file of the guest's. So
+// no image is made, or extended, past the limit.
+func imageFits(n int) (bool, error) {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &rl); err != nil {
+		return false, fmt.Errorf("wasm2go: the limit on the size of a file: %w", err)
+	}
+	return uint64(rl.Cur) >= uint64(n), nil
+}
+
+// ensureImageFits is imageFits as an error: errImageLimit when the process
+// may not make a file n bytes long.
+func ensureImageFits(n int) error {
+	fits, err := imageFits(n)
+	if err != nil {
+		return err
+	}
+	if !fits {
+		return errImageLimit
+	}
+	return nil
+}
