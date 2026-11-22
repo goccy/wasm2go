@@ -175,6 +175,12 @@ func hostWakeDrain(r int) error { return errors.ErrUnsupported }
 // platform has none of.
 func hostCloseFD(fd int) error { return errors.ErrUnsupported }
 
+// hostErrnoOf would return the host's error number of a wasi errno; this
+// platform has no table of them.
+func hostErrnoOf(n int32) error {
+	return fmt.Errorf("wasi errno %d, which this host has no number of", n)
+}
+
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error; on this platform the errors are told apart
 // by what package os makes of them, except a few of windows.

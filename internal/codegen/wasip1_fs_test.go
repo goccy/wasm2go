@@ -235,7 +235,7 @@ func TestOSFSRenameReplacesAFile(t *testing.T) {
 // is "/": rmdir("/") is the host's rmdir("/"), EBUSY, not rmdir("/."),
 // which is EINVAL on Linux.
 func TestOSFSRootIsSlash(t *testing.T) {
-	for _, root := range []string{"", "/", "//", "/."} {
+	for _, root := range []string{"/", "//", "/."} {
 		fsys, ok := newHostFS(t, root).(osFS)
 		if !ok {
 			t.Fatalf("HostFS(%q) is not the whole host filesystem", root)

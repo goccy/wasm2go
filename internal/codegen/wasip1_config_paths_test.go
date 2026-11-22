@@ -11,11 +11,14 @@ import (
 	"time"
 )
 
-// FSAccess is given the path cleaned as chroot(2) sees it: ".." of the
-// root is the root.
+// FSAccess is given the name the FS is given: ".." of the root is the root,
+// and the directory a ".." takes back is looked up, as a read.
 func TestWasi_FSAccessSeesTheCleanedPath(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "secret"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "pub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
@@ -29,11 +32,13 @@ func TestWasi_FSAccessSeesTheCleanedPath(t *testing.T) {
 		rc   int32
 		seen []string
 	}{
-		{"pub/../secret", _wasiEACCES, []string{"secret"}},
+		{"pub/../secret", _wasiEACCES, []string{"pub", "secret"}},
 		{"./secret/", _wasiEACCES, []string{"secret"}},
 		{"/secret", _wasiEACCES, []string{"secret"}},
 		{"../secret", _wasiEACCES, []string{"secret"}},
-		{"pub/../../secret", _wasiEACCES, []string{"secret"}},
+		{"pub/../../secret", _wasiEACCES, []string{"pub", "secret"}},
+		// what does not lead to a directory fails before the name is asked about
+		{"none/../secret", _wasiENOENT, []string{"none"}},
 		{"", _wasiESUCCESS, []string{"."}},
 		// The FS is given what the hook approved: the root.
 		{"..", _wasiESUCCESS, []string{"."}},
@@ -68,11 +73,9 @@ func pathWalkDir(t *testing.T) string {
 	return dir
 }
 
-// testGuestPathWalk checks, under prefix, what the FS is given. Without
-// FSAccess it is the guest's path as written: the system resolves ".."
-// after a symbolic link, and a trailing "/" asks for a directory. With
-// FSAccess it is the cleaned path the hook approved: "a/link/../f" is a/f,
-// which does not exist, and "file/" still asks for a directory.
+// testGuestPathWalk checks, under prefix, what the FS is given, the same
+// with FSAccess or without: ".." after a symbolic link as the system
+// resolves it, and a trailing "/" that asks for a directory.
 func testGuestPathWalk(t *testing.T, w *WasiStubs, m *Module, prefix string) {
 	t.Helper()
 	off, n := putPath(m, 128, prefix+"a/link/../f")
@@ -86,8 +89,8 @@ func testGuestPathWalk(t *testing.T, w *WasiStubs, m *Module, prefix string) {
 
 	w.cfg.FSAccess = func(string, bool) bool { return true }
 	defer func() { w.cfg.FSAccess = nil }()
-	if rc := w.Path_open(m, 3, 0, off, n, 0, 1<<1, 0, 0, 300); rc != _wasiENOENT {
-		t.Errorf("with FSAccess, open(a/link/../f) rc=%d, want ENOENT (a/f)", rc)
+	if rc := w.Path_open(m, 3, 0, off, n, 0, 1<<1, 0, 0, 300); rc != _wasiESUCCESS {
+		t.Errorf("with FSAccess, open(a/link/../f) rc=%d, want it to reach b/f", rc)
 	}
 	if rc := w.Path_unlink_file(m, 3, slash, slashLen); rc != _wasiENOTDIR {
 		t.Errorf("with FSAccess, unlink(file/) rc=%d, want ENOTDIR", rc)
@@ -137,9 +140,11 @@ func TestWasi_WholeHostGuestPaths(t *testing.T) {
 	testGuestPathWalk(t, w, m, hostRelative(t, dir)+"/") // a prefix of raw names: not path.Join, which would fold their ".."
 }
 
-// Under HostFS of a directory, os.Root keeps every path inside it: an
-// escape through "..", an absolute symbolic link or a relative one is
-// EACCES; paths inside resolve as the system does.
+// Under HostFS of a directory, every path stays inside it: ".." of the root
+// is the root, and os.Root refuses a symbolic link that leads out of it,
+// absolute or relative, with EACCES. One the runtime resolves before a
+// ".." leads from the root, as in chroot(2). Paths inside resolve as the
+// system does.
 func TestWasi_HostFSRootContainment(t *testing.T) {
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "f"), nil, 0o644); err != nil {
@@ -157,10 +162,18 @@ func TestWasi_HostFSRootContainment(t *testing.T) {
 		t.Fatal(err)
 	}
 	w, m := newTestStubs(t, dir)
-	for _, name := range []string{"../f", "a/../../f", "abs", "rel"} {
+	for _, name := range []string{"abs", "rel"} {
 		off, n := putPath(m, 128, name)
 		if rc := w.Path_open(m, 3, 1, off, n, 0, 1<<1, 0, 0, 300); rc != _wasiEACCES {
 			t.Errorf("open(%s) rc=%d, want EACCES", name, rc)
+		}
+	}
+	// "../file" and "a/../../file" are the root's file; "abs/.." is the
+	// parent of what abs names from the root, which has none.
+	for name, want := range map[string]int32{"../file": _wasiESUCCESS, "a/../../file": _wasiESUCCESS, "abs/../f": _wasiENOENT} {
+		off, n := putPath(m, 128, name)
+		if rc := w.Path_open(m, 3, 1, off, n, 0, 1<<1, 0, 0, 300); rc != want {
+			t.Errorf("open(%s) rc=%d, want %d", name, rc, want)
 		}
 	}
 	// os.Root's refusal is EACCES.
@@ -195,13 +208,11 @@ func TestWasi_FdPathIsCanonical(t *testing.T) {
 			t.Errorf("Fd_path of %q rc=%d = %q, want %q", name, rc, m.memory[300:300+readU32(m.memory, 400)], want)
 		}
 	}
-	// "." and empty components go; ".." stays, as it may follow a link.
-	for name, want := range map[string]string{"": "/", ".": "/", "b/./sub//": "/b/sub", "a/link/..": "/a/link/.."} {
+	// "." and empty components go; ".." takes back what it follows, after
+	// the link a/link -> ../b/sub.
+	for name, want := range map[string]string{"": "/", ".": "/", "b/./sub//": "/b/sub", "a/link/..": "/b", "b/sub/../": "/b"} {
 		fdPath(name, want)
 	}
-	// With FSAccess the descriptor was opened under the approved name.
-	w.cfg.FSAccess = func(string, bool) bool { return true }
-	fdPath("b/sub/../", "/b")
 }
 
 // The root of a HostFS of a directory is the directory os.Root holds:
