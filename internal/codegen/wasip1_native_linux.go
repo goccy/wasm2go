@@ -426,6 +426,82 @@ func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
 	})
 }
 
+// atRemoveDir is unlinkat's AT_REMOVEDIR, which package syscall does not
+// name on this system.
+const atRemoveDir = 0x200
+
+// unlinkDirAt removes the empty directory elem of the directory dirFd:
+// unlinkat(2) with AT_REMOVEDIR, which package syscall does not call here.
+func unlinkDirAt(dirFd int, elem string) error {
+	p, err := syscall.BytePtrFromString(elem)
+	if err != nil {
+		return err
+	}
+	if _, _, errno := syscall.Syscall(syscall.SYS_UNLINKAT, uintptr(dirFd), uintptr(unsafe.Pointer(p)), atRemoveDir); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// removeFile removes the name of a file that is not a directory, as
+// unlink(2) does, through one unlinkat(2) relative to its directory
+// (inRootDir): a name that is a directory is refused (EISDIR), even one
+// that became one since the guest looked.
+func (r rootFS) removeFile(name string) error {
+	return r.refused(inRootDir(r.root, name, "unlinkat", func(dirFd int, elem string) error {
+		return syscall.Unlinkat(dirFd, elem)
+	}))
+}
+
+// removeDir removes an empty directory, as rmdir(2) does, through one
+// unlinkat(2) with AT_REMOVEDIR relative to its directory (inRootDir): a
+// name that is no directory is refused (ENOTDIR).
+func (r rootFS) removeDir(name string) error {
+	return r.refused(inRootDir(r.root, name, "unlinkat", unlinkDirAt))
+}
+
+// openNoFollow opens name as OpenFile does, except that a symbolic link at
+// its end is not followed (ELOOP): through one openat(2) with O_NOFOLLOW
+// relative to its directory (inRootDir). os.Root's OpenFile, which follows
+// a link inside the root whatever flag says, is not used for it. A name
+// with a trailing "/" asks for the directory a link at its end leads to,
+// which the kernel follows whatever O_NOFOLLOW says: it is opened through
+// os.Root, which refuses a link that leads out of the root.
+func (r rootFS) openNoFollow(name string, flag int, perm os.FileMode) (File, error) {
+	if strings.HasSuffix(name, "/") {
+		return r.OpenFile(name, flag, perm)
+	}
+	var f *os.File
+	err := inRootDir(r.root, name, "openat", func(dirFd int, elem string) error {
+		fd, err := syscall.Openat(dirFd, elem, flag|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, unixModeBits(perm))
+		if err != nil {
+			return err
+		}
+		f = os.NewFile(uintptr(fd), r.root.Name()+"/"+name)
+		return nil
+	})
+	switch {
+	case err != nil && f != nil:
+		// the open went through and the directory did not close
+		return nil, errors.Join(err, f.Close())
+	case err != nil:
+		return nil, r.refused(err)
+	}
+	return f, nil
+}
+
+// hostFutimens sets the access and modification times of the file open as
+// f through its descriptor: utimensat(2) with no path.
+func hostFutimens(f *os.File, atime, mtime time.Time) error {
+	times := [2]syscall.Timespec{syscall.NsecToTimespec(atime.UnixNano()), syscall.NsecToTimespec(mtime.UnixNano())}
+	return atDirFile(f, f.Name(), "futimens", func(fd int) error {
+		if _, _, errno := syscall.Syscall6(syscall.SYS_UTIMENSAT, uintptr(fd), 0, uintptr(unsafe.Pointer(&times[0])), 0, 0, 0); errno != 0 {
+			return errno
+		}
+		return nil
+	})
+}
+
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,
 // recordLockSet and recordLockWait: those of the locks of an open file
 // description, F_OFD_GETLK, F_OFD_SETLK and F_OFD_SETLKW (Linux 3.15), the
