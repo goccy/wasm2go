@@ -334,7 +334,7 @@ func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, 
 // it is, and os/exec copies any other stream, to the instance's stdout and
 // stderr under the family's output lock (familyStreams). Its wait waits for
 // the copies, as Cmd.Wait does.
-func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
 	cmd := &exec.Cmd{Path: path, Args: argv, Env: env, Dir: dir}
 	if s := streams[0]; s.host != nil {
 		cmd.Stdin = s.host.(io.Reader)
@@ -383,3 +383,9 @@ func killHostGroup(pgid int, sig int32) error      { return errors.ErrUnsupporte
 func hostWaitExited(pid int) (int32, error)        { return 0, errors.ErrUnsupported }
 
 const hostJobControl = false
+
+// Nor has it a terminal of the host's for the guest (fd_ioctl).
+func hostProcessGroup() int                { return 0 }
+func hostForeground(fd int) (int, error)   { return 0, syscall.ENOTTY }
+func hostSetForeground(fd, pgid int) error { return syscall.ENOTTY }
+func dupHostFD(fd uintptr) (int, error)    { return -1, errors.ErrUnsupported }

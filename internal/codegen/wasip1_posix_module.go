@@ -48,6 +48,7 @@ var posixImports = map[string]bool{
 	"path_mkfifo":                true,
 	"path_open_mode":             true,
 	"pipe":                       true,
+	"proc_exec":                  true,
 	"proc_getpgid":               true,
 	"proc_group_at":              true,
 	"proc_group_by_id":           true,

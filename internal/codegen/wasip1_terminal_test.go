@@ -395,7 +395,7 @@ func TestFdIoctlRefusals(t *testing.T) {
 		{"a pipe with a record out of the memory", pipe, linuxTCGETS, outside, -_wasiENOTTY},
 		{"a standard stream that is no file", 1, linuxTIOCGWINSZ, termiosOff, -_wasiENOTTY},
 		{"a record out of the memory", 0, linuxTCGETS, outside, -_wasiEFAULT},
-		{"TIOCSPGRP", 0, linuxTIOCSPGRP, termiosOff, -_wasiENOSYS},
+		{"TIOCSPGRP without a Process", 0, linuxTIOCSPGRP, termiosOff, -_wasiENOTTY},
 		{"TIOCSCTTY", 0, linuxTIOCSCTTY, 0, -_wasiENOSYS},
 		{"TIOCNOTTY", 0, linuxTIOCNOTTY, 0, -_wasiENOSYS},
 		{"TIOCGPGRP without a Process", 0, linuxTIOCGPGRP, termiosOff, -_wasiENOTTY},
@@ -408,7 +408,7 @@ func TestFdIoctlRefusals(t *testing.T) {
 	// A terminal that is not the host process's controlling terminal tells
 	// an instance with a Process neither.
 	w.cfg.Process = HostProcessUmask(0o022)
-	for _, request := range []uint32{linuxTIOCGPGRP, linuxTIOCGSID} {
+	for _, request := range []uint32{linuxTIOCGPGRP, linuxTIOCSPGRP, linuxTIOCGSID} {
 		if rc := guestIoctl(w, m, 0, request, termiosOff); rc != -_wasiENOTTY {
 			t.Errorf("ioctl %#x of no controlling terminal rc=%d, want -ENOTTY", request, rc)
 		}

@@ -159,3 +159,30 @@ func TestJobs_CommandOfAnotherSessionLeadsOneOfTheHosts(t *testing.T) {
 		t.Errorf("command status %#x, want killed by SIGTERM", got)
 	}
 }
+
+// The leader of a group of the host's that is kept unreaped has what the
+// runtime copies from it delivered before its wait status is the guest's:
+// awaitLeader finishes the copies before it returns the status.
+func TestJobs_HeldLeaderDeliversItsOutputFirst(t *testing.T) {
+	root, _ := newProcTestStubs(t)
+	p, err := os.StartProcess("/bin/sh", []string{"/bin/sh", "-c", "exit 3"}, &os.ProcAttr{Sys: &syscall.SysProcAttr{Setpgid: true}})
+	if err != nil {
+		t.Skip(err)
+	}
+	leader := &wasiProc{host: p, done: make(chan struct{}), pgid: 5001}
+	member := &wasiProc{done: make(chan struct{}), pgid: 5001}
+	pids := &wasiPIDs{
+		procs:  map[int32]*wasiProc{5001: leader, 5002: member},
+		groups: map[int32]*jobGroup{5001: {host: p.Pid, leader: leader}},
+	}
+	delivered := false
+	status, reap := root.awaitLeader(pids, leader, &hostCommand{process: p, finish: func() { delivered = true }})
+	if reap == nil || status != 3<<8 {
+		t.Fatalf("awaitLeader = %#x, %v; want an exit of 3, held", status, reap != nil)
+	}
+	if !delivered {
+		t.Fatal("the status came before the copies were delivered")
+	}
+	pids.leave(5002)
+	reap()
+}

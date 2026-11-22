@@ -2292,11 +2292,13 @@ type wasiProc struct {
 	// in. They are set before the process is entered in the family's
 	// table and guarded by wasiPIDs.mu from then on.
 	pgid, sid int32
-	// inHostGroup records that the command (cmd) is in the host's process
-	// group of its group (jobGroup.host), which a signal for the group
-	// reaches as a whole, and leads that it is the command that made that
-	// group. Set before the process is entered, not changed afterwards.
-	inHostGroup, leads bool
+	// inHostGroup records that the command of the process (host, or the
+	// one its guest has become) is in the host's process group of its group
+	// (jobGroup.host), which a signal for the group reaches as a whole, and
+	// leads that it is the command that made that group; execed that the
+	// guest has become a command or is becoming one (Proc_exec). Guarded by
+	// wasiPIDs.mu; set before the wait for the command begins.
+	inHostGroup, leads, execed bool
 }
 
 // jobGroup is what the family knows of one of its process groups besides
@@ -2355,6 +2357,13 @@ type wasiPIDs struct {
 	groups                 map[int32]*jobGroup
 	hostGroup, hostSession int32
 	starts                 sync.Mutex
+	// foreground is the group the guest made the foreground one of the
+	// host process's controlling terminal (TIOCSPGRP) while it has no
+	// host's group to be that, and terminal a descriptor of the host's of
+	// the terminal meanwhile: the group's first command is started in the
+	// foreground (hostJob). 0 when there is none.
+	foreground int32
+	terminal   int
 }
 
 // enter makes proc reachable by pid for every instance of the family.
@@ -2447,21 +2456,25 @@ func (p *wasiPIDs) leaderEnded(leader *wasiProc, keep bool) (held <-chan struct{
 // commandJob is where a command is started (commandJob): in the process
 // group pgid and the session sid of the family, the ones of the process
 // that starts it, and in the host's process group and session host says.
-// group is the record the command is counted in as starting (started).
+// group is the record the command is counted in as starting (started),
+// and self the process that becomes the command (Proc_exec).
 type commandJob struct {
 	pgid, sid          int32
 	host               hostJob
 	inHostGroup, leads bool
 	group              *jobGroup
+	self               *wasiProc
 }
 
 // hostJob is the host's process group and session a command is started
 // in: a session and a group of its own (setsid), a group of its own
 // (setpgid with pgid 0), the host's group pgid (setpgid), or, with
-// neither, the host process's.
+// neither, the host process's. With foreground its group of its own is
+// made the foreground one of the terminal ctty, a descriptor of the host
+// process's, before the command runs.
 type hostJob struct {
-	setsid, setpgid bool
-	pgid            int
+	setsid, setpgid, foreground bool
+	pgid, ctty                  int
 }
 
 // commandJob decides where a command the family's process pid starts is
@@ -2478,13 +2491,18 @@ type hostJob struct {
 // group of its group when the group has none yet, and is in no host's
 // group of the family's otherwise. Without job control on the host
 // (hostJobControl) every command is in the host process's group and
-// session. Caller holds p.starts, until started.
-func (p *wasiPIDs) commandJob(pid int32) commandJob {
+// session. With execs the command is pid's process (Proc_exec), which is
+// becoming it from here on (wasiProc.execed): its group cannot be changed
+// any more. Caller holds p.starts, until started.
+func (p *wasiPIDs) commandJob(pid int32, execs bool) commandJob {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	job := commandJob{pgid: p.hostGroup, sid: p.hostSession}
 	if proc := p.procs[pid]; proc != nil {
 		job.pgid, job.sid = proc.pgid, proc.sid
+		if execs {
+			job.self, proc.execed = proc, true
+		}
 	}
 	if !hostJobControl {
 		return job
@@ -2506,25 +2524,45 @@ func (p *wasiPIDs) commandJob(pid int32) commandJob {
 		g.starting++
 		job.group = g
 	}
+	if job.leads && !job.host.setsid && p.foreground != 0 && job.pgid == p.foreground {
+		job.host.foreground, job.host.ctty = true, p.terminal
+	}
 	return job
 }
 
-// started is told that the command of job has started as proc, or has not
-// (nil): the host's group a command leads becomes its group's. Caller
+// started is told that the command of job has started as the command of
+// proc, the host's process hostPID, or has not (proc nil): the host's
+// group a command leads becomes its group's, and the foreground one of the
+// terminal once the command has been started in the foreground, when the
+// descriptor of it kept meanwhile is closed (its error returned). Caller
 // holds p.starts.
-func (p *wasiPIDs) started(job commandJob, proc *wasiProc) {
+func (p *wasiPIDs) started(job commandJob, proc *wasiProc, hostPID int) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if job.group != nil {
 		job.group.starting--
 		p.leftGroupLocked(job.pgid)
 	}
-	if proc != nil && proc.leads {
+	switch {
+	case proc == nil:
+		if job.self != nil {
+			job.self.execed = false
+		}
+		p.mu.Unlock()
+		return nil
+	case job.leads:
 		if p.groups == nil {
 			p.groups = map[int32]*jobGroup{}
 		}
-		p.groups[job.pgid] = &jobGroup{host: proc.host.Pid, leader: proc}
+		p.groups[job.pgid] = &jobGroup{host: hostPID, leader: proc}
 	}
+	proc.inHostGroup, proc.leads = job.inHostGroup, job.leads
+	if !job.host.foreground {
+		p.mu.Unlock()
+		return nil
+	}
+	p.foreground = 0
+	p.mu.Unlock()
+	return hostCloseFD(job.host.ctty)
 }
 
 // enterRoot makes the root instance root reachable by ids.PID, the pid of
@@ -2555,13 +2593,25 @@ func (p *wasiPIDs) enterRoot(ids ProcessIDs, root *WasiStubs, pgid int32) {
 	p.hostGroup = pgid
 }
 
-// leaveRoot forgets the root instance: it is gone.
-func (p *wasiPIDs) leaveRoot() {
+// leaveRoot forgets the root instance: it is gone, and with it the
+// descriptor of the host process's terminal kept for a group to become its
+// foreground one (TIOCSPGRP), which is closed (its error returned), under
+// p.starts: no start in the foreground has its number then. Caller holds no
+// lock of an instance.
+func (p *wasiPIDs) leaveRoot() error {
+	p.starts.Lock()
+	defer p.starts.Unlock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.rooted {
 		p.removeLocked(p.rootPID)
 	}
+	terminal, kept := p.terminal, p.foreground != 0
+	p.foreground = 0
+	p.mu.Unlock()
+	if kept {
+		return hostCloseFD(terminal)
+	}
+	return nil
 }
 
 // leave forgets the process known by pid.
@@ -2808,17 +2858,18 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 	w.mu.Lock()
 	creations := w.creations
 	w.creations, w.creationsClosed = nil, true
+	pids := w.pids
 	w.mu.Unlock()
 	if creations != nil {
 		creations.close()
 	}
+	var err error
+	if !w.forked && pids != nil {
+		err = pids.leaveRoot()
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.detachSignals()
-	if !w.forked && w.pids != nil {
-		w.pids.leaveRoot()
-	}
-	var err error
 	for _, wk := range w.wakes {
 		err = errors.Join(err, hostCloseFD(wk.r), hostCloseFD(wk.w))
 	}
@@ -2883,7 +2934,8 @@ func (w *WasiStubs) CloseDescriptors() error {
 // waited for: its error is returned. The commands are those in the table
 // when the call takes it: one started afterwards is not killed. They stay
 // in the instance's process table, with the status they end with. The
-// errors of the kills are joined.
+// command the guest has become (Proc_exec) is killed and waited for as
+// well. The errors of the kills are joined.
 //
 // It is for an embedder that ends an instance without letting it run on,
 // and may be called while the guest is running on another goroutine.
@@ -2909,6 +2961,16 @@ func (w *WasiStubs) KillCommands() error {
 	for _, proc := range ending {
 		<-proc.done
 	}
+	w.sig.mu.Lock()
+	execed := w.sig.execed
+	w.sig.mu.Unlock()
+	if execed == nil {
+		return err
+	}
+	if kerr := signalHostProc(execed.process, wasiSIGKILL); kerr != nil {
+		return errors.Join(err, kerr)
+	}
+	<-execed.done
 	return err
 }
 
@@ -3484,6 +3546,43 @@ func (w *WasiStubs) Proc_spawn64(m *Module, pathPtr, argvPtr, envpPtr int64, std
 // procSpawn is the body of Proc_spawn and Proc_spawn64.
 func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr uint64, stdinFd, stdoutFd, stderrFd int32, cwdPtr, pidOutPtr uint64) int32 {
 	w.endUnregistered()
+	out := w.memBytes(m, pidOutPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	return w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{stdinFd, stdoutFd, stderrFd}, false, func(cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs) {
+		proc := &wasiProc{host: cmd.process, done: make(chan struct{}), pgid: job.pgid, sid: job.sid, inHostGroup: job.inHostGroup, leads: job.leads}
+		w.mu.Lock()
+		pid := w.addProcLocked(proc, ids)
+		w.enterProcLocked(pid)
+		w.mu.Unlock()
+		w.reportError("proc_spawn", pids.started(job, proc, cmd.process.Pid))
+		go func() {
+			if proc.leads {
+				if status, reap := w.awaitLeader(pids, proc, cmd); reap != nil {
+					w.finishProc(proc, status)
+					reap()
+					return
+				}
+			}
+			w.finishProc(proc, cmd.wait())
+		}()
+		binary.LittleEndian.PutUint32(out, uint32(pid))
+	})
+}
+
+// startGuestCommand starts the command the guest asks Proc_spawn or
+// Proc_exec for: path, argv, envp and cwdPtr are as Proc_spawn takes them,
+// fds the guest's descriptors of its standard streams, -1 for the
+// instance's. The command is started where commandJob puts it, as the
+// process of the guest when execs is set, and started is then called with
+// it, while the family's command starts are held (wasiPIDs.starts).
+// Returns 0, or a negative errno: the command has not started.
+func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, cwdPtr uint64, fds [3]int32, execs bool, started func(cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs)) int32 {
+	op := "proc_spawn"
+	if execs {
+		op = "proc_exec"
+	}
 	path, ok := w.readCStr(m, pathPtr)
 	if !ok || path == "" {
 		return -_wasiEINVAL
@@ -3503,17 +3602,13 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	if !ok {
 		return -_wasiEFAULT
 	}
-	out := w.memBytes(m, pidOutPtr, 4)
-	if out == nil {
-		return -_wasiEFAULT
-	}
 
 	w.mu.Lock()
 	hook := w.cfg.Exec
 	streams := [3]commandStream{
-		w.commandStreamLocked(stdinFd, 1),
-		w.commandStreamLocked(stdoutFd, 2),
-		w.commandStreamLocked(stderrFd, 3),
+		w.commandStreamLocked(fds[0], 1),
+		w.commandStreamLocked(fds[1], 2),
+		w.commandStreamLocked(fds[2], 3),
 	}
 	share := w.streamsLocked()
 	w.mu.Unlock()
@@ -3549,10 +3644,10 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	w.mu.Unlock()
 	pids.starts.Lock()
 	defer pids.starts.Unlock()
-	job := pids.commandJob(ids.PID)
+	job := pids.commandJob(ids.PID, execs)
 	var cmd *hostCommand
 	var startErr error
-	start := func() { cmd, startErr = w.startCommand(path, argv, env, dir, job.host, &streams, share) }
+	start := func() { cmd, startErr = w.startCommand(op, path, argv, env, dir, job.host, &streams, share) }
 	// The command inherits the umask of the thread that starts it: this
 	// one where the instance's mask is the host process's, the instance's
 	// creation thread otherwise.
@@ -3569,7 +3664,7 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 			// When it cannot be read, the command is started here, in it,
 			// with the host process's umask.
 			if wd, err := os.Getwd(); err != nil {
-				w.reportError("proc_spawn", err)
+				w.reportError(op, err)
 				t = nil
 			} else {
 				dir = filepath.Join(wd, dir)
@@ -3580,52 +3675,150 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 		}
 	}
 	if startErr != nil {
-		pids.started(job, nil)
-		return -w.guestErrno("proc_spawn", startErr)
+		w.reportError(op, pids.started(job, nil, 0))
+		return -w.guestErrno(op, startErr)
 	}
-
-	proc := &wasiProc{host: cmd.process, done: make(chan struct{}), pgid: job.pgid, sid: job.sid, inHostGroup: job.inHostGroup, leads: job.leads}
-	w.mu.Lock()
-	pid := w.addProcLocked(proc, ids)
-	w.enterProcLocked(pid)
-	w.mu.Unlock()
-	pids.started(job, proc)
-	go func() {
-		if proc.leads && w.awaitHeldLeader(pids, proc, cmd) {
-			return
-		}
-		w.finishProc(proc, cmd.wait())
-	}()
-
-	binary.LittleEndian.PutUint32(out, uint32(pid))
+	started(cmd, job, pids, ids)
 	return _wasiESUCCESS
 }
 
-// awaitHeldLeader waits for the end of cmd, the command of proc, which
-// leads the host's process group of its group, without reaping it
+// awaitLeader waits for the end of cmd, the command of proc, which leads
+// the host's process group of its group, without reaping it
 // (hostWaitExited), and tells the family (leaderEnded): the command's pid
 // is the number of the host's group until the reap. When the group has
 // other members, it delivers what the runtime copies from the command
-// (hostCommand.finish), publishes the command's wait status (finishProc),
-// keeps the command unreaped until they are gone, reaps it and reports
-// true. Otherwise the family has dropped the host's group, and the caller
-// waits for the command as for any other.
-func (w *WasiStubs) awaitHeldLeader(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand) bool {
+// (hostCommand.finish) and returns the command's wait status and reap,
+// which keeps the command unreaped until they are gone and then reaps it.
+// Otherwise the family has dropped the host's group and reap is nil: the
+// caller waits for the command as for any other.
+func (w *WasiStubs) awaitLeader(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand) (status int32, reap func()) {
 	status, err := hostWaitExited(cmd.process.Pid)
 	if err != nil {
 		w.reportError("proc_wait", err)
 	}
 	held := pids.leaderEnded(proc, err == nil)
 	if held == nil {
-		return false
+		return 0, nil
 	}
 	cmd.finish()
-	w.finishProc(proc, status)
-	<-held
-	if _, err := cmd.process.Wait(); err != nil {
-		w.reportError("proc_wait", err)
+	return status, func() {
+		<-held
+		if _, err := cmd.process.Wait(); err != nil {
+			w.reportError("proc_wait", err)
+		}
 	}
-	return true
+}
+
+// Proc_exec is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "proc_exec") backing execve and the exec family: the guest becomes
+// the command path, with the arguments argv, the environment envp and the
+// working directory at cwdPtr, as Proc_spawn starts one, and with the
+// guest's descriptors 0, 1 and 2 as its standard streams. A process image
+// cannot be replaced, so the exec is emulated, as Cygwin's spawn.cc does
+// for _P_OVERLAY: once the command has started, the process keeps its pid
+// and is the command's — a signal for it (PostSignal, Proc_kill), one
+// pending for the guest the guest does not block, and a SIGKILL that
+// arrived while the command started, are the command's — the
+// guest's descriptors are closed, and the call waits for the command and
+// what the runtime copies from it, and ends the guest the way the command
+// ended, as Proc_exit or Proc_terminate end it. The command is put where
+// the process's group and session are (commandJob), and the process cannot
+// be moved into another group from the start on (Proc_setpgid). Returns
+// only when the command could not be started: a negative errno, as
+// Proc_spawn's.
+func (w *WasiStubs) Proc_exec(m *Module, pathPtr, argvPtr, envpPtr, cwdPtr int32) int32 {
+	return w.procExec(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), zext(cwdPtr))
+}
+
+// Proc_exec64 is Proc_exec for a memory64 guest.
+func (w *WasiStubs) Proc_exec64(m *Module, pathPtr, argvPtr, envpPtr, cwdPtr int64) int32 {
+	return w.procExec(m, wasiABI64, uint64(pathPtr), uint64(argvPtr), uint64(envpPtr), uint64(cwdPtr))
+}
+
+// execedCommand is the command a guest has become (Proc_exec): process is
+// its process, and done is closed once the exec has waited for it and for
+// what the runtime copies from it (KillCommands).
+type execedCommand struct {
+	process *os.Process
+	done    chan struct{}
+}
+
+// procExec is the body of Proc_exec and Proc_exec64.
+func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, cwdPtr uint64) int32 {
+	w.endUnregistered()
+	var (
+		cmd    *hostCommand
+		self   *wasiProc
+		pids   *wasiPIDs
+		execed *execedCommand
+	)
+	if rc := w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{0, 1, 2}, true, func(c *hostCommand, job commandJob, p *wasiPIDs, _ ProcessIDs) {
+		cmd, self, pids = c, job.self, p
+		w.reportError("proc_exec", pids.started(job, self, cmd.process.Pid))
+		execed = w.becomeCommand(cmd.process)
+	}); rc != _wasiESUCCESS {
+		return rc
+	}
+	w.reportError("proc_exec", w.closeFrom(0))
+	if self != nil && self.leads {
+		if status, reap := w.awaitLeader(pids, self, cmd); reap != nil {
+			go reap()
+			w.endAs(m, execed, status)
+		}
+	}
+	w.endAs(m, execed, cmd.wait())
+	return _wasiESUCCESS
+}
+
+// becomeCommand makes the process of the instance the command process,
+// which the guest has become (Proc_exec): signals for the process are the
+// command's from now on (signalProcess), and so are the signals pending
+// for the guest that it does not block, and SIGKILL when the end of the
+// instance has been asked for (requestStopLocked) while the command
+// started. A failure to send one is told WASIConfig.Errors.
+func (w *WasiStubs) becomeCommand(process *os.Process) *execedCommand {
+	execed := &execedCommand{process: process, done: make(chan struct{})}
+	w.sig.mu.Lock()
+	w.sig.execed = execed
+	pending := w.sig.pending &^ w.sig.blocked
+	w.sig.pending &^= pending
+	if w.sig.stop.Load() != nil {
+		pending |= wasiSignalBit(wasiSIGKILL)
+	}
+	w.sig.mu.Unlock()
+	for ; pending != 0; pending &= pending - 1 {
+		w.reportError("proc_exec", signalHostProc(process, int32(bits.TrailingZeros64(pending))+1))
+	}
+	return execed
+}
+
+// endAs ends the guest, which has become the command execed (Proc_exec),
+// the way a process of the wait status status ended: killed by its signal
+// (terminate), or exiting with its code (Proc_exit). It does not return.
+func (w *WasiStubs) endAs(m *Module, execed *execedCommand, status int32) {
+	w.sig.mu.Lock()
+	w.sig.execed = nil
+	w.sig.mu.Unlock()
+	close(execed.done)
+	if sig := status & 0x7f; sig != 0 {
+		w.terminate(sig)
+	}
+	w.Proc_exit(m, status>>8&0xff)
+}
+
+// signalProcess delivers sig to the process of the instance, as kill(2)
+// does: to the guest (postSignalLocked), or, once the guest has become a
+// command (Proc_exec), to the command (signalHostProc), whose error it
+// returns. It reports whether the process still takes signals: false once
+// delivery to the guest has ended.
+func (w *WasiStubs) signalProcess(sig int32) (takes bool, err error) {
+	w.sig.mu.Lock()
+	if execed := w.sig.execed; execed != nil {
+		w.sig.mu.Unlock()
+		return true, signalHostProc(execed.process, sig)
+	}
+	defer w.unlockSignals()
+	return w.postSignalLocked(sig), nil
 }
 
 // Fd_cloexec is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -4106,13 +4299,14 @@ func (w *WasiStubs) killFamilyProc(proc *wasiProc, sig int32) int32 {
 	}
 	switch {
 	case proc.instance != nil:
-		if !proc.instance.postSignal(sig) && !proc.instance.forked {
+		takes, err := proc.instance.signalProcess(sig)
+		if !takes && !proc.instance.forked {
 			// The root instance's guest has ended; nobody waits for it.
 			// A copy made by ForkProc that has ended is a zombie until
 			// its exited is called.
 			return -_wasiESRCH
 		}
-		return _wasiESUCCESS
+		return -w.guestErrno("proc_kill", err)
 	case sig == 0:
 		return _wasiESUCCESS
 	case proc.host != nil:
@@ -4127,21 +4321,27 @@ func (w *WasiStubs) killFamilyProc(proc *wasiProc, sig int32) int32 {
 // SIGKILL is os.Process.Kill, which every platform has; another signal is
 // the host's signal for it (hostSignalOf).
 func (w *WasiStubs) killHostProc(p *os.Process, sig int32) int32 {
+	return -w.guestErrno("proc_kill", signalHostProc(p, sig))
+}
+
+// signalHostProc is killHostProc returning the error: EINVAL for a signal
+// the host has none for.
+func signalHostProc(p *os.Process, sig int32) error {
 	var err error
 	if sig == wasiSIGKILL {
 		err = p.Kill()
 	} else {
 		hostSig, known := hostSignalOf(sig)
 		if !known {
-			return -_wasiEINVAL
+			return syscall.EINVAL
 		}
 		err = p.Signal(hostSig)
 	}
 	if errors.Is(err, os.ErrProcessDone) {
 		// It finished after the probe of done.
-		return _wasiESUCCESS
+		return nil
 	}
-	return -w.guestErrno("proc_kill", err)
+	return err
 }
 
 // Proc_kill64 is Proc_kill for a memory64 guest.
@@ -4299,7 +4499,7 @@ func (p *wasiPIDs) setpgid(caller, pid, pgid int32) int32 {
 		return _wasiESRCH
 	case pid != caller && proc.sid != by.sid:
 		return _wasiEPERM
-	case pid != caller && proc.instance == nil:
+	case pid != caller && (proc.instance == nil || proc.execed):
 		return _wasiEACCES
 	case proc.sid == pid, pgid != pid && !p.hasGroupLocked(pgid, by.sid):
 		return _wasiEPERM
@@ -12445,10 +12645,13 @@ func (a *terminalArg) encode(mem []byte) {
 // has, whatever signal is posted to the guest meanwhile. A terminal of the
 // host is the controlling terminal of no instance without a Process
 // (WASIConfig.Process), and the runtime changes no process's foreground
-// process group or controlling terminal. Returns what the call returned, or
-// a negative errno: EBADF, ENOTTY for a request it does not make and for a
-// descriptor that is no terminal, ENOSYS for TIOCSPGRP, TIOCSCTTY and
-// TIOCNOTTY.
+// process group or controlling terminal but through TIOCSPGRP
+// (terminalGroup): TIOCGPGRP and TIOCSPGRP read and set the foreground
+// group of the controlling terminal of the guest's session as the family's.
+// Returns what the call returned, or a negative errno: EBADF, ENOTTY for a
+// request it does not make and for a descriptor that is no terminal or not
+// the controlling terminal, EPERM for a group of another session, ENOSYS
+// for TIOCSCTTY and TIOCNOTTY.
 func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, arg int32) int32 {
 	return w.fdIoctl(m, fd, uint32(request), zext(arg), arg)
 }
@@ -12495,11 +12698,16 @@ func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, va
 			}
 		}
 		switch request {
-		case linuxTIOCGPGRP, linuxTIOCGSID:
+		case linuxTIOCGPGRP, linuxTIOCSPGRP:
 			if w.cfg.Process == nil {
 				return syscall.ENOTTY
 			}
-		case linuxTIOCSPGRP, linuxTIOCSCTTY, linuxTIOCNOTTY:
+			return w.foregroundGroup(hostFD, request == linuxTIOCSPGRP, &arg.value)
+		case linuxTIOCGSID:
+			if w.cfg.Process == nil {
+				return syscall.ENOTTY
+			}
+		case linuxTIOCSCTTY, linuxTIOCNOTTY:
 			return syscall.ENOSYS
 		}
 		var err error
@@ -12513,6 +12721,113 @@ func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, va
 		arg.encode(mem)
 	}
 	return int32(result)
+}
+
+// foregroundGroup is TIOCGPGRP, and with set TIOCSPGRP, of the guest on
+// the host's terminal fd, which is to be the controlling terminal of the
+// guest's session: the foreground process group is read into, or set from,
+// pgrp (terminalGroup). A descriptor of the terminal it keeps no more is
+// closed, a failure to close it told WASIConfig.Errors.
+func (w *WasiStubs) foregroundGroup(fd int, set bool, pgrp *int32) error {
+	w.enterRoot()
+	self := w.guestPID()
+	w.mu.Lock()
+	pids := w.pidsLocked()
+	w.mu.Unlock()
+	if set {
+		// A start in the foreground uses the descriptor kept for it.
+		pids.starts.Lock()
+		defer pids.starts.Unlock()
+	}
+	was, closing, err := pids.terminalGroup(self, fd, set, *pgrp)
+	if closing >= 0 {
+		w.reportError("fd_ioctl", hostCloseFD(closing))
+	}
+	if err == nil && !set {
+		*pgrp = was
+	}
+	return err
+}
+
+// terminalGroup returns the foreground process group of the host's
+// terminal fd as the family's process pid sees it, and with set makes it
+// pgrp, a group of pid's session; closing is a descriptor of the terminal
+// kept no more, -1 for none. The controlling terminal of the session the
+// host process is in (hostSession) is the host process's: another session
+// of the family has none (ENOTTY). A group is the host's foreground one as
+// commandJob puts the group's commands: the group the host process is in
+// is the host process's own group, another the host's group of it, and a
+// group that has none yet becomes the foreground one once its first
+// command is started, in the foreground (hostJob); a group the family does
+// not have is the host's as it is. The host's foreground group is changed
+// with SIGTTOU blocked (hostSetForeground), as a job control shell ignores
+// it: the host process may be in the background. The host's calls made do
+// not wait.
+func (p *wasiPIDs) terminalGroup(pid int32, fd int, set bool, pgrp int32) (was int32, closing int, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sid := p.hostSession
+	if proc := p.procs[pid]; proc != nil {
+		sid = proc.sid
+	}
+	if sid != p.hostSession {
+		return 0, -1, syscall.ENOTTY
+	}
+	current, err := hostForeground(fd)
+	if err != nil {
+		return 0, -1, err
+	}
+	was = int32(current)
+	switch {
+	case p.foreground != 0:
+		was = p.foreground
+	case current == hostProcessGroup():
+		was = p.hostGroup
+	default:
+		for pgid, g := range p.groups {
+			if g.host == current {
+				was = pgid
+			}
+		}
+	}
+	if !set {
+		return was, -1, nil
+	}
+	host, hosts := int(pgrp), true
+	switch g := p.groups[pgrp]; {
+	case pgrp == p.hostGroup:
+		host = hostProcessGroup()
+	case g != nil:
+		host = g.host
+	default:
+		for _, proc := range p.procs {
+			if proc.pgid == pgrp {
+				if proc.sid != sid {
+					return was, -1, syscall.EPERM
+				}
+				hosts = false
+			}
+		}
+	}
+	closing = -1
+	if p.foreground != 0 {
+		closing = p.terminal
+	}
+	if !hosts {
+		// A group of the family's without a group of the host's: the
+		// foreground one once its first command is started.
+		dup, err := dupHostFD(uintptr(fd))
+		if err != nil {
+			return was, -1, err
+		}
+		p.foreground, p.terminal = pgrp, dup
+		return was, closing, nil
+	}
+	if err := hostSetForeground(fd, host); err != nil {
+		return was, -1, err
+	}
+	p.foreground = 0
+	return was, closing, nil
 }
 
 // ----- numbers of another system -----------------------------------------------
@@ -15006,6 +15321,9 @@ type wasiSignals struct {
 	// (requestStopLocked): every thread of the guest unwinds with it
 	// (endIfStopped). It is set with mu held and read without.
 	stop atomic.Pointer[wasiStop]
+	// execed is the command the guest has become (Proc_exec) while it
+	// runs: a signal for the process is the command's (signalProcess).
+	execed *execedCommand
 }
 
 // wasiStop is an end of the instance that its threads unwind with.
@@ -15065,6 +15383,9 @@ type wasiSignalsDue struct {
 	stop        bool
 	stopOutside *wasiOutside
 	stopModule  *Module
+	// alarm is the command the guest has become (Proc_exec), to be sent
+	// the interval timer's SIGALRM (fireDueTimerLocked).
+	alarm *os.Process
 }
 
 // discards returns the signals that have no effect on the guest: the ones it
@@ -15151,20 +15472,18 @@ const wasiDefaultIgnoredSignals = uint64(1)<<(wasiSIGCHLD-1) |
 // child right after forking it — is kept for it.
 //
 // Once delivery to the instance has ended (CloseAll, proc_exit,
-// proc_terminate), what is posted is dropped.
+// proc_terminate), what is posted is dropped. Once the guest has become a
+// command (Proc_exec), the signal is the command's, as kill(2) of the
+// process is; a failure to send it is told WASIConfig.Errors (op
+// "kill").
 func (w *WasiStubs) PostSignal(sig int32) {
-	w.postSignal(sig)
+	_, err := w.signalProcess(sig)
+	w.reportError("kill", err)
 }
 
-// postSignal is PostSignal reporting whether the instance still takes
-// signals: false once delivery to it has ended.
-func (w *WasiStubs) postSignal(sig int32) bool {
-	w.sig.mu.Lock()
-	defer w.unlockSignals()
-	return w.postSignalLocked(sig)
-}
-
-// postSignalLocked is postSignal for a caller that holds w.sig.mu.
+// postSignalLocked posts sig to the guest as PostSignal does, and reports
+// whether the instance still takes signals: false once delivery to it has
+// ended. Caller holds w.sig.mu, and lets go of it with unlockSignals.
 func (w *WasiStubs) postSignalLocked(sig int32) bool {
 	s := &w.sig
 	if s.detached {
@@ -15212,6 +15531,9 @@ func (w *WasiStubs) unlockSignals() {
 	due := s.due
 	s.due = wasiSignalsDue{}
 	s.mu.Unlock()
+	if due.alarm != nil {
+		w.reportError("proc_itimer", signalHostProc(due.alarm, wasiSIGALRM))
+	}
 	outside := due.stopOutside
 	if due.raise != 0 || due.stop {
 		w.raiseSignalFlag()
@@ -15400,7 +15722,7 @@ func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 // call goes on. Caller holds w.sig.mu, which it holds again on return.
 func (w *WasiStubs) postDueTimerLocked() {
 	w.postForGuestLocked(w.fireDueTimerLocked)
-	if w.sig.due.raise != 0 || len(w.sig.due.wakes) > 0 {
+	if w.sig.due.raise != 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil {
 		w.unlockSignals()
 		w.sig.mu.Lock()
 	}
@@ -15652,6 +15974,15 @@ func (w *WasiStubs) fireDueTimerLocked() {
 	} else {
 		s.timer.Stop()
 		s.timer = nil
+	}
+	if s.execed != nil {
+		// The guest has become a command (Proc_exec): the timer's signal
+		// is the process's, as an alarm(2) set before execve(2) is, unless
+		// the guest ignores it, which an exec keeps.
+		if s.ignored&wasiSignalBit(wasiSIGALRM) == 0 {
+			s.due.alarm = s.execed.process
+		}
+		return
 	}
 	w.postSignalLocked(wasiSIGALRM)
 }

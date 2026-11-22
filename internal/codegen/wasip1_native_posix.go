@@ -474,7 +474,39 @@ func hostJobAttr(job hostJob) *syscall.SysProcAttr {
 	if !job.setsid && !job.setpgid {
 		return nil
 	}
-	return &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid}
+	return &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid, Foreground: job.foreground, Ctty: job.ctty}
+}
+
+// hostProcessGroup returns the host process's process group (getpgrp(2)).
+func hostProcessGroup() int { return syscall.Getpgrp() }
+
+// hostForeground returns the foreground process group of the terminal fd,
+// the controlling terminal of the host process (tcgetpgrp(3)): ENOTTY for
+// another terminal.
+func hostForeground(fd int) (int, error) {
+	var pgid int32
+	if _, err := hostIoctlPointer(fd, syscall.TIOCGPGRP, unsafe.Pointer(&pgid)); err != nil {
+		return 0, err
+	}
+	return int(pgid), nil
+}
+
+// hostSetForeground makes pgid the foreground process group of the
+// terminal fd (tcsetpgrp(3)) with SIGTTOU blocked on the calling thread: a
+// process of a background group is sent SIGTTOU otherwise, whose default
+// action stops it (POSIX tcsetpgrp; the job control shell of glibc's
+// manual ignores it). The goroutine keeps its thread until the mask is put
+// back.
+func hostSetForeground(fd, pgid int) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	restore, err := blockThreadSignal(syscall.SIGTTOU)
+	if err != nil {
+		return err
+	}
+	value := int32(pgid)
+	_, err = hostIoctlPointer(fd, syscall.TIOCSPGRP, unsafe.Pointer(&value))
+	return errors.Join(err, restore())
 }
 
 // killHostGroup sends sig, the guest's number of a signal, to the host's
@@ -563,16 +595,24 @@ func withDuplicateDescriptor(f syscall.Conn, use func(fd uintptr) error) error {
 func duplicateDescriptor(f syscall.Conn) (int, error) {
 	var dup int
 	err := withHostDescriptor(f, func(fd uintptr) error {
-		syscall.ForkLock.RLock()
-		defer syscall.ForkLock.RUnlock()
 		var err error
-		if dup, err = syscall.Dup(int(fd)); err != nil {
-			return err
-		}
-		syscall.CloseOnExec(dup)
-		return nil
+		dup, err = dupHostFD(fd)
+		return err
 	})
 	return dup, err
+}
+
+// dupHostFD returns a duplicate of the descriptor fd, closed on exec: made
+// under syscall.ForkLock, so that no command started meanwhile has it.
+func dupHostFD(fd uintptr) (int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	dup, err := syscall.Dup(int(fd))
+	if err != nil {
+		return -1, err
+	}
+	syscall.CloseOnExec(dup)
+	return dup, nil
 }
 
 // withHostTerminal calls use with a duplicate of the descriptor of f
@@ -1188,8 +1228,8 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (in
 // command writes to either keeps its order. The command's wait delivers
 // what it wrote before it returns, and gives the input the runtime took for
 // it and it did not read back.
-func (w *WasiStubs) startCommand(path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
-	report := func(err error) { w.reportError("proc_spawn", err) }
+func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+	report := func(err error) { w.reportError(op, err) }
 	var setup commandSetup
 	for i := range streams {
 		if i == 2 && sameDestination(&streams[1], &streams[2]) {

@@ -213,6 +213,25 @@ a group stays unreaped while the group has other members, so that the
 group's number stays its own. Where the host has no process groups
 (Windows), every command is in the host process's.
 
+The controlling terminal of the host process's session is the host
+process's: `fd_ioctl`'s `TIOCGPGRP` and `TIOCSPGRP` (`tcgetpgrp`,
+`tcsetpgrp`) read and set its foreground group as the family's, the
+host process's own group standing for the group the host process is
+in, and a group of the host's for another. A group that has no command
+yet becomes the foreground one when its first command starts. The
+runtime changes the foreground group with `SIGTTOU` blocked, as a job
+control shell ignores it. Another session of the family has no
+controlling terminal.
+
+`exec` is emulated, as Cygwin does: the guest starts the command with
+its descriptors 0, 1 and 2 (in the group and session its process is
+in), and once it has started, the process keeps its pid, its
+descriptors are closed, and the guest waits for the command and ends
+as it ended (`WasiExitError` or `WasiSignalError`, as an exit or a
+kill of its own). A signal for the process from then on is the
+command's, and so is a signal pending for the guest that it does not
+block; `KillCommands` kills it as well.
+
 `Process` also answers `getgroups` and makes the guest's `setuid`
 family, `setgroups` and `setpriority` changes; an isolated process is
 in no supplementary group, has the nice value 0 and changes nothing
