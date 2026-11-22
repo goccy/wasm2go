@@ -49,36 +49,47 @@ func record(t *testing.T, m *Module, bufPtr, neededPtr int) *recordReader {
 	return &recordReader{t: t, rec: m.memory[bufPtr : bufPtr+int(readU32(m.memory, neededPtr))]}
 }
 
-// idsProcess is a testProcess with groups and a priority, which records the
-// changes it is asked for and fails them with err.
+// idsProcess is a testProcess with groups and a priority.
 type idsProcess struct {
 	testProcess
 	groups   []int32
 	groupErr error
 	nice     int32
 	err      error
-	changes  *[]IDChange
-	set      *[][]int32
-	prios    *[][3]int32
 }
 
-func (p idsProcess) Groups() ([]int32, error) { return p.groups, p.groupErr }
-func (p idsProcess) SetIDs(c IDChange) error {
-	*p.changes = append(*p.changes, c)
-	return p.err
-}
-func (p idsProcess) SetGroups(groups []int32) error {
-	*p.set = append(*p.set, groups)
-	return p.err
-}
+func (p idsProcess) Groups() ([]int32, error)                 { return p.groups, p.groupErr }
 func (p idsProcess) Priority(which, who int32) (int32, error) { return p.nice + who, p.err }
-func (p idsProcess) SetPriority(which, who, prio int32) error {
-	*p.prios = append(*p.prios, [3]int32{which, who, prio})
-	return p.err
-}
 
 func newIDsProcess() idsProcess {
-	return idsProcess{testProcess: testProcess{ids: ProcessIDs{PID: 7}}, changes: &[]IDChange{}, set: &[][]int32{}, prios: &[][3]int32{}}
+	return idsProcess{testProcess: testProcess{ids: ProcessIDs{PID: 7}}}
+}
+
+// recordedChanges is a ProcessChanges that records the changes it is asked
+// for and fails them with err.
+type recordedChanges struct {
+	err     error
+	changes []IDChange
+	set     [][]int32
+	prios   [][3]int32
+	umasks  []os.FileMode
+}
+
+func (c *recordedChanges) SetIDs(change IDChange) error {
+	c.changes = append(c.changes, change)
+	return c.err
+}
+func (c *recordedChanges) SetGroups(groups []int32) error {
+	c.set = append(c.set, groups)
+	return c.err
+}
+func (c *recordedChanges) SetPriority(which, who, prio int32) error {
+	c.prios = append(c.prios, [3]int32{which, who, prio})
+	return c.err
+}
+func (c *recordedChanges) SetUmask(mask os.FileMode) (os.FileMode, error) {
+	c.umasks = append(c.umasks, mask)
+	return 0, c.err
 }
 
 func TestProcGroupsOfTheProcess(t *testing.T) {
@@ -117,8 +128,8 @@ func TestProcGroupsOfTheProcess(t *testing.T) {
 	}
 }
 
-// proc_setids hands the Process the call and its ids, -1 past those the
-// call takes; an isolated process changes none (ENOSYS).
+// proc_setids hands the ProcessChanges the call and its ids, -1 past those
+// the call takes; without one none is changed (ENOSYS).
 func TestProcSetidsGoesToTheProcess(t *testing.T) {
 	w, m := newProcTestStubs(t)
 	if rc := w.Proc_setids(m, int32(IDSetuid), 0, -1, -1); rc != -_wasiENOSYS {
@@ -127,8 +138,8 @@ func TestProcSetidsGoesToTheProcess(t *testing.T) {
 	if rc := w.Proc_setgroups(m, 64, 0); rc != -_wasiENOSYS {
 		t.Fatalf("Proc_setgroups of an isolated guest rc=%d, want -ENOSYS", rc)
 	}
-	p := newIDsProcess()
-	w.cfg.Process = p
+	p := &recordedChanges{}
+	w.cfg.ProcessChanges = p
 	for call := IDSetuid; call <= IDSetresgid; call++ {
 		if rc := w.Proc_setids(m, int32(call), 1, 2, 3); rc != _wasiESUCCESS {
 			t.Fatalf("Proc_setids(%d) rc=%d", call, rc)
@@ -140,8 +151,8 @@ func TestProcSetidsGoesToTheProcess(t *testing.T) {
 		{IDSetgid, [3]int32{1, -1, -1}}, {IDSetegid, [3]int32{1, -1, -1}},
 		{IDSetregid, [3]int32{1, 2, -1}}, {IDSetresgid, [3]int32{1, 2, 3}},
 	}
-	if !slices.Equal(*p.changes, want) {
-		t.Fatalf("changes = %v, want %v", *p.changes, want)
+	if !slices.Equal(p.changes, want) {
+		t.Fatalf("changes = %v, want %v", p.changes, want)
 	}
 	for _, request := range []int32{-1, int32(IDSetresgid) + 1} {
 		if rc := w.Proc_setids(m, request, 1, 2, 3); rc != -_wasiEINVAL {
@@ -153,7 +164,7 @@ func TestProcSetidsGoesToTheProcess(t *testing.T) {
 	if rc := w.Proc_setgroups(m, 64, 2); rc != _wasiESUCCESS {
 		t.Fatalf("Proc_setgroups rc=%d", rc)
 	}
-	if got := *p.set; len(got) != 1 || !slices.Equal(got[0], []int32{5, 6}) {
+	if got := p.set; len(got) != 1 || !slices.Equal(got[0], []int32{5, 6}) {
 		t.Fatalf("groups set = %v, want [[5 6]]", got)
 	}
 	for _, count := range []int32{-1, 65537} {
@@ -173,7 +184,6 @@ func TestProcSetidsGoesToTheProcess(t *testing.T) {
 		{errors.ErrUnsupported, _wasiENOSYS},
 	} {
 		p.err = c.err
-		w.cfg.Process = p
 		if rc := w.Proc_setids(m, int32(IDSetuid), 1, -1, -1); rc != -c.want {
 			t.Errorf("Proc_setids failing with %v rc=%d, want %d", c.err, rc, -c.want)
 		}
@@ -184,7 +194,7 @@ func TestProcSetidsGoesToTheProcess(t *testing.T) {
 }
 
 // proc_priority reads the nice value from the Process, after setting it
-// when asked; the guest's own pid is 0 to the Process.
+// through the ProcessChanges when asked; the guest's own pid is 0 to them.
 func TestProcPriorityGoesToTheProcess(t *testing.T) {
 	const out = 64
 	w, m := newProcTestStubs(t)
@@ -197,13 +207,15 @@ func TestProcPriorityGoesToTheProcess(t *testing.T) {
 	p := newIDsProcess()
 	p.nice = 3
 	w.cfg.Process = p
+	changes := &recordedChanges{}
+	w.cfg.ProcessChanges = changes
 	if rc := w.Proc_priority(m, 0, 7, 1, 5, out); rc != _wasiESUCCESS || readU32(m.memory, out) != 3 {
 		t.Fatalf("Proc_priority of the own pid rc=%d nice=%d, want 3", rc, readU32(m.memory, out))
 	}
 	if rc := w.Proc_priority(m, 2, 7, 0, 0, out); rc != _wasiESUCCESS || readU32(m.memory, out) != 10 {
 		t.Fatalf("Proc_priority of user 7 rc=%d nice=%d, want 10", rc, readU32(m.memory, out))
 	}
-	if got := *p.prios; !slices.Equal(got, [][3]int32{{0, 0, 5}}) {
+	if got := changes.prios; !slices.Equal(got, [][3]int32{{0, 0, 5}}) {
 		t.Fatalf("priorities set = %v, want [[0 0 5]]", got)
 	}
 	token, _ := w.NewProc(nil)
@@ -226,20 +238,22 @@ func TestProcPriorityGoesToTheProcess(t *testing.T) {
 	if rc := w.Proc_priority(m, 0, 0, 0, 0, 1<<16-2); rc != -_wasiEFAULT {
 		t.Fatalf("Proc_priority past the memory rc=%d, want -EFAULT", rc)
 	}
-	p.err = syscall.EACCES
-	w.cfg.Process = p
+	changes.err = syscall.EACCES
 	if rc := w.Proc_priority(m, 0, 0, 1, 5, out); rc != -_wasiEACCES {
 		t.Fatalf("setting a priority failing with EACCES rc=%d", rc)
 	}
+	p.err = syscall.EACCES
+	w.cfg.Process = p
 	if rc := w.Proc_priority(m, 0, 0, 0, 0, out); rc != -_wasiEACCES {
 		t.Fatalf("reading a priority failing with EACCES rc=%d", rc)
 	}
 }
 
-// HostProcess reports the host process's groups and priority, and changes
-// its ids and priority by the host's calls.
+// HostProcess reports the host process's groups and priority, and
+// HostProcessChanges changes its ids and priority by the host's calls.
 func TestHostProcessGroupsIDsAndPriority(t *testing.T) {
 	p := HostProcessUmask(0o022)
+	pc := HostProcessChanges()
 	groups, err := p.Groups()
 	want, wantErr := os.Getgroups()
 	if (err == nil) != (wantErr == nil) {
@@ -252,9 +266,9 @@ func TestHostProcessGroupsIDsAndPriority(t *testing.T) {
 	}
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		for _, err := range []error{
-			p.SetIDs(IDChange{Call: IDSetuid, IDs: [3]int32{0, -1, -1}}),
-			p.SetGroups(nil),
-			p.SetPriority(0, 0, 0),
+			pc.SetIDs(IDChange{Call: IDSetuid, IDs: [3]int32{0, -1, -1}}),
+			pc.SetGroups(nil),
+			pc.SetPriority(0, 0, 0),
 		} {
 			if !errors.Is(err, errors.ErrUnsupported) {
 				t.Fatalf("a change on %s: %v, want ErrUnsupported", runtime.GOOS, err)
@@ -266,7 +280,7 @@ func TestHostProcessGroupsIDsAndPriority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.SetPriority(0, 0, nice); err != nil {
+	if err := pc.SetPriority(0, 0, nice); err != nil {
 		t.Fatalf("SetPriority to the nice value in effect: %v", err)
 	}
 	uid, gid := int32(os.Getuid()), int32(os.Getgid())
@@ -276,18 +290,18 @@ func TestHostProcessGroupsIDsAndPriority(t *testing.T) {
 		{IDSetgid, [3]int32{gid, -1, -1}}, {IDSetegid, [3]int32{gid, -1, -1}},
 		{IDSetregid, [3]int32{-1, -1, -1}}, {IDSetresgid, [3]int32{-1, -1, -1}},
 	} {
-		if err := p.SetIDs(c); err != nil {
+		if err := pc.SetIDs(c); err != nil {
 			t.Errorf("SetIDs(%v) to the ids in effect: %v", c, err)
 		}
 	}
-	if err := p.SetIDs(IDChange{Call: IDSetresgid + 1}); !errors.Is(err, syscall.EINVAL) {
+	if err := pc.SetIDs(IDChange{Call: IDSetresgid + 1}); !errors.Is(err, syscall.EINVAL) {
 		t.Errorf("SetIDs of an unknown call: %v, want EINVAL", err)
 	}
 	if os.Getuid() != 0 {
-		if err := p.SetIDs(IDChange{Call: IDSetuid, IDs: [3]int32{uid + 1, -1, -1}}); !errors.Is(err, syscall.EPERM) {
+		if err := pc.SetIDs(IDChange{Call: IDSetuid, IDs: [3]int32{uid + 1, -1, -1}}); !errors.Is(err, syscall.EPERM) {
 			t.Errorf("setuid to another user: %v, want EPERM", err)
 		}
-		if err := p.SetGroups([]int32{gid}); !errors.Is(err, syscall.EPERM) {
+		if err := pc.SetGroups([]int32{gid}); !errors.Is(err, syscall.EPERM) {
 			t.Errorf("setgroups of a user who is not the superuser: %v, want EPERM", err)
 		}
 	}
@@ -1267,5 +1281,215 @@ func TestReportErrorGoesToErrors(t *testing.T) {
 	w.reportError("close", syscall.EBADF)
 	if want := []string{"close: " + syscall.EBADF.Error()}; !slices.Equal(got, want) {
 		t.Fatalf("Errors was told %q, want %q", got, want)
+	}
+}
+
+// A forked instance's guest changes its own ids, groups and nice value, as
+// Linux's calls change a process's: the ProcessChanges is not reached, the
+// root's guest reads what it read, and an unprivileged copy gets EPERM where
+// Linux refuses.
+func TestForkedInstanceChangesItsOwnProcess(t *testing.T) {
+	const out = 64
+	w, m := newProcTestStubs(t)
+	p := newIDsProcess()
+	p.ids = ProcessIDs{PID: 7, UID: 1000, EUID: 1000, GID: 100, EGID: 100}
+	p.groups = []int32{100}
+	p.nice = 0
+	w.cfg.Process = p
+	changes := &recordedChanges{}
+	w.cfg.ProcessChanges = changes
+	child := w.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	cm := newForkTestModule()
+	for _, c := range []struct {
+		call    IDCall
+		a, b, c int32
+		want    int32
+	}{
+		{IDSetuid, 0, -1, -1, -_wasiEPERM},
+		{IDSeteuid, 0, -1, -1, -_wasiEPERM},
+		{IDSetreuid, 2000, -1, -1, -_wasiEPERM},
+		{IDSetresuid, -1, 1000, -1, _wasiESUCCESS},
+		{IDSetgid, 100, -1, -1, _wasiESUCCESS},
+		{IDSetgid, -1, -1, -1, -_wasiEINVAL},
+		{IDSeteuid, 1000, -1, -1, _wasiESUCCESS},
+		{IDSetreuid, 1000, 1000, -1, _wasiESUCCESS},
+		{IDSetresuid, 0, -1, -1, -_wasiEPERM},
+		{IDSetregid, -1, 100, -1, _wasiESUCCESS},
+	} {
+		if rc := child.Proc_setids(cm, int32(c.call), c.a, c.b, c.c); rc != c.want {
+			t.Fatalf("copy's Proc_setids(%d, %d, %d, %d) rc=%d, want %d", c.call, c.a, c.b, c.c, rc, c.want)
+		}
+	}
+	if rc := child.Proc_setgroups(cm, 64, 0); rc != -_wasiEPERM {
+		t.Fatalf("an unprivileged copy's setgroups rc=%d, want -EPERM", rc)
+	}
+	if rc := child.Proc_priority(cm, 0, 0, 1, 5, out); rc != _wasiESUCCESS || readU32(cm.memory, out) != 5 {
+		t.Fatalf("copy's nice(5) rc=%d nice=%d, want 5", rc, readU32(cm.memory, out))
+	}
+	if rc := child.Proc_priority(cm, 0, 0, 1, 3, out); rc != -_wasiEACCES {
+		t.Fatalf("an unprivileged copy lowering its nice value rc=%d, want -EACCES", rc)
+	}
+	if rc := child.Proc_priority(cm, 2, 1000, 1, 5, out); rc != -_wasiEPERM {
+		t.Fatalf("a copy setting a user's priority rc=%d, want -EPERM", rc)
+	}
+	if rc := w.Proc_priority(m, 0, 0, 0, 0, out); rc != _wasiESUCCESS || readU32(m.memory, out) != 0 {
+		t.Fatalf("the root's nice value rc=%d nice=%d, want the Process's 0", rc, readU32(m.memory, out))
+	}
+	if len(changes.changes)+len(changes.set)+len(changes.prios) != 0 {
+		t.Fatalf("the ProcessChanges was reached by a copy: %+v", changes)
+	}
+	// A copy of the copy starts with what it changed.
+	grand := child.Fork()
+	t.Cleanup(func() {
+		if err := grand.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	gm := newForkTestModule()
+	if rc := grand.Proc_priority(gm, 0, 0, 0, 0, out); rc != _wasiESUCCESS || readU32(gm.memory, out) != 5 {
+		t.Fatalf("the nice value of the copy's copy rc=%d nice=%d, want the copy's 5", rc, readU32(gm.memory, out))
+	}
+	if got, want := procIDs(t, grand), procIDs(t, child); got != want {
+		t.Fatalf("the copy's copy's ids = %v, want the copy's %v", got, want)
+	}
+
+	// A privileged copy sets any id, and drops privilege for good.
+	p.ids = ProcessIDs{PID: 7}
+	w.cfg.Process = p
+	root := w.Fork()
+	t.Cleanup(func() {
+		if err := root.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	rm := newForkTestModule()
+	binary.LittleEndian.PutUint32(rm.memory[64:], 5)
+	if rc := root.Proc_setgroups(rm, 64, 1); rc != _wasiESUCCESS {
+		t.Fatalf("a privileged copy's setgroups rc=%d", rc)
+	}
+	if rc := root.Proc_setids(rm, int32(IDSetuid), 5, -1, -1); rc != _wasiESUCCESS {
+		t.Fatalf("a privileged copy's setuid(5) rc=%d", rc)
+	}
+	if rc := root.Proc_setids(rm, int32(IDSetuid), 0, -1, -1); rc != -_wasiEPERM {
+		t.Fatalf("setuid(0) after dropping privilege rc=%d, want -EPERM", rc)
+	}
+	if got := procIDs(t, root); got != [6]uint32{7, 0, 5, 5, 0, 0} {
+		t.Fatalf("the copy's ids = %v, want uid and euid 5", got)
+	}
+	if got := procIDs(t, w); got != [6]uint32{7, 0, 0, 0, 0, 0} {
+		t.Fatalf("the root's ids = %v, want the Process's", got)
+	}
+	if rc := root.Proc_groups(rm, 256, 4, 128); rc != _wasiESUCCESS || readU32(rm.memory, 128) != 1 || readU32(rm.memory, 256) != 5 {
+		t.Fatalf("the copy's groups rc=%d, want [5]", rc)
+	}
+}
+
+// HostProcessChanges's SetUmask is umask(2): set to the umask in effect, it
+// returns that umask.
+func TestHostProcessChangesSetUmask(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		if _, err := HostProcessChanges().SetUmask(0o022); !errors.Is(err, errors.ErrUnsupported) {
+			t.Fatalf("SetUmask on %s: %v, want ErrUnsupported", runtime.GOOS, err)
+		}
+		return
+	}
+	current := hostUmask(t)
+	prev, err := HostProcessChanges().SetUmask(current)
+	if err != nil || prev != current {
+		t.Fatalf("SetUmask(%o) = %o, %v, want %o", current, prev, err, current)
+	}
+}
+
+// sharedProcess is a Process whose values are those of state, shared by
+// every copy of it, as the host process's are by the instances of a fork
+// family. lock, when it is set, is called by IDs.
+type sharedProcess struct {
+	isolatedProcess
+	state *sharedState
+}
+
+type sharedState struct {
+	ids    ProcessIDs
+	groups []int32
+	nice   int32
+	lock   func()
+}
+
+func (p sharedProcess) IDs() ProcessIDs {
+	if p.state.lock != nil {
+		p.state.lock()
+	}
+	return p.state.ids
+}
+func (p sharedProcess) Groups() ([]int32, error)                 { return p.state.groups, nil }
+func (p sharedProcess) Priority(which, who int32) (int32, error) { return p.state.nice, nil }
+
+// A copy starts with the ids, groups and nice value its parent's guest had:
+// a later change of the root's, which reaches the host process, is not the
+// copy's. The Process is asked without the instance's lock held.
+func TestForkedInstanceStartsWithTheParentsValues(t *testing.T) {
+	const out = 64
+	w, _ := newProcTestStubs(t)
+	state := &sharedState{ids: ProcessIDs{PID: 7, UID: 1000, EUID: 1000, GID: 100, EGID: 100}, groups: []int32{100}, nice: 2}
+	w.cfg.Process = sharedProcess{state: state}
+	w.cfg.ProcessChanges = &recordedChanges{}
+	child := w.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	cm := newForkTestModule()
+	// The root's change reaches the host process.
+	state.ids.UID, state.ids.EUID, state.groups, state.nice = 2000, 2000, []int32{200}, 9
+	if got := procIDs(t, child); got[2] != 1000 || got[3] != 1000 {
+		t.Fatalf("the copy's uid and euid = %d, %d, want its parent's 1000", got[2], got[3])
+	}
+	if rc := child.Proc_groups(cm, 256, 4, 128); rc != _wasiESUCCESS || readU32(cm.memory, 128) != 1 || readU32(cm.memory, 256) != 100 {
+		t.Fatalf("the copy's groups rc=%d, want its parent's [100]", rc)
+	}
+	if rc := child.Proc_priority(cm, 0, 0, 0, 0, out); rc != _wasiESUCCESS || readU32(cm.memory, out) != 2 {
+		t.Fatalf("the copy's nice value rc=%d nice=%d, want its parent's 2", rc, readU32(cm.memory, out))
+	}
+	if got := procIDs(t, w); got[2] != 2000 {
+		t.Fatalf("the root's uid = %d, want the host process's 2000", got[2])
+	}
+	state.lock = func() {
+		if !child.mu.TryLock() {
+			t.Error("the Process is asked with the instance's lock held")
+			return
+		}
+		child.mu.Unlock()
+	}
+	if rc := child.Proc_setids(cm, int32(IDSeteuid), 1000, -1, -1); rc != _wasiESUCCESS {
+		t.Fatalf("the copy's seteuid rc=%d", rc)
+	}
+}
+
+// With the host's ProcessChanges, whose credentials the kernel checks for
+// every instance of the family, a copy changes no ids or groups of its own:
+// EPERM.
+func TestForkedInstanceChangesNoHostCredentials(t *testing.T) {
+	w, _ := newProcTestStubs(t)
+	w.cfg.Process = HostProcessUmask(0o022)
+	w.cfg.ProcessChanges = HostProcessChanges()
+	child := w.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	cm := newForkTestModule()
+	uid := int32(os.Getuid())
+	if rc := child.Proc_setids(cm, int32(IDSetuid), uid, -1, -1); rc != -_wasiEPERM {
+		t.Fatalf("a copy's setuid to its own uid rc=%d, want -EPERM", rc)
+	}
+	if rc := child.Proc_setgroups(cm, 64, 0); rc != -_wasiEPERM {
+		t.Fatalf("a copy's setgroups rc=%d, want -EPERM", rc)
 	}
 }

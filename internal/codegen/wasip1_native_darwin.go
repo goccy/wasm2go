@@ -32,6 +32,16 @@ func lstatAt(dir *os.File, name string) (os.FileInfo, error) {
 	return nil, &fs.PathError{Op: "lstatat", Path: name, Err: errors.ErrUnsupported}
 }
 
+// hostThreadUmask says that no thread here has a umask of its own: the
+// umask is the process's.
+const hostThreadUmask = false
+
+// hostOnMainThread: no creation thread is made here.
+func hostOnMainThread() bool { return false }
+
+// hostUnshareFS: no thread here has file system attributes of its own.
+func hostUnshareFS() error { return errors.ErrUnsupported }
+
 // chmodRefused reports whether err is chmod(2)'s refusal of a mode bit to
 // this user or this file: EPERM, or EFTYPE for a sticky bit of a file that
 // is no directory.
