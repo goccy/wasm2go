@@ -2056,6 +2056,11 @@ type WASIConfig struct {
 	// tells nobody.
 	Chdir  func(dir string) error
 	Setenv func(name, value string, unset bool) error
+
+	// IPC gives the guest System V IPC: msgget, semget and shmget and the
+	// calls on the objects they name. nil gives it none: each of those
+	// calls fails with ENOSYS. HostIPC gives the host's.
+	IPC IPC
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -2477,7 +2482,9 @@ func (w *WasiStubs) Fork() *WasiStubs {
 // host state of a finished instance.
 // It also ends signal delivery to the instance — the interval timer is disarmed, and
 // PostSignal drops what it is given from here on — so the guest's memory
-// can be released afterwards.
+// can be released afterwards. A call of IPC the guest is waiting in
+// (IPC.Semop, Msgsnd, Msgrcv) is not ended: it uses the guest's memory
+// until it returns.
 // Calling it again is a no-op: a call made while another one closes the
 // descriptors returns without waiting for those closes. The close errors
 // are joined.
@@ -10201,7 +10208,7 @@ func (w *WasiStubs) procTimes(m *Module, outPtr uint64) int32 {
 }
 
 // hookErrno returns the errno a guest's call fails with when a value of
-// the configuration (a Process, Users, System, Services or Syslogger)
+// the configuration (a Process, Users, System, Services, Syslogger or IPC)
 // returned err: the errno of its name for an error that carries a
 // syscall.Errno; for any other, ENOSYS for errors.ErrUnsupported, which
 // says that the value cannot do what was asked, and mapOSError's errno
@@ -11635,6 +11642,307 @@ func (w *WasiStubs) Proc_syslog_close(m *Module) int32 {
 // Proc_syslog_close64 is Proc_syslog_close for a memory64 guest.
 func (w *WasiStubs) Proc_syslog_close64(m *Module) int32 {
 	return w.Proc_syslog_close(m)
+}
+
+// ----- System V IPC -------------------------------------------------------------
+
+// IPC gives the guest System V IPC (WASIConfig.IPC): message queues,
+// semaphore sets and shared memory segments. Numbers and structures are the
+// guest's: Linux's, the structures laid out as on a 64-bit architecture of
+// asm-generic. The runtime calls the methods without any lock of the
+// WasiStubs held. A call that waits (semop, msgsnd and msgrcv without
+// IPC_NOWAIT) waits until it is done: neither a signal posted to the guest
+// nor CloseAll ends it, and the guest takes a signal posted meanwhile once
+// the call has returned. An error that is errors.ErrUnsupported makes the
+// guest's call fail with ENOSYS; another one is its errno. A shared memory
+// segment is made and controlled through Get and Control; attaching one to
+// the guest's memory is not a call of IPC.
+//
+// A wasm32 guest has msgget, semget, shmget and semop alone: its own
+// structures of the others (its msqid_ds, semid_ds and shmid_ds, the
+// message whose type is a 4-byte long) are not the ones of a 64-bit
+// architecture the runtime passes on, so its msgsnd and msgrcv fail with
+// ENOSYS, and so do its msgctl, semctl and shmctl of a command that passes
+// one (ipcCommandPassesNoStructure).
+type IPC interface {
+	// Get is msgget, semget or shmget: the id of the object of the kind with
+	// the key. arg is the number of semaphores of a set, or the size of a
+	// segment.
+	Get(kind IPCKind, key int32, arg uint64, flags int32) (id int32, err error)
+	// Control is msgctl, semctl or shmctl: the command cmd on the object id
+	// of the kind, num being the semaphore of a set, and what the call
+	// returns. For IPC_STAT and IPC_SET buf holds the kind's structure; for
+	// GETALL and SETALL the values of the set's semaphores, an unsigned
+	// short each; for SETVAL arg is the value. buf is the guest's memory
+	// from the address the guest gave to its end (nil for an address past
+	// it): the command uses what it reads and writes of it, and fails with
+	// EFAULT when buf is shorter.
+	Control(kind IPCKind, id, num, cmd int32, arg uint64, buf []byte) (int64, error)
+	// Semop is semop: ops are the operations, struct sembuf each (unsigned
+	// short sem_num, short sem_op, short sem_flg).
+	Semop(id int32, ops []byte) error
+	// Msgsnd is msgsnd: msg is the message, its type (a long, 8 bytes) and
+	// then its bytes.
+	Msgsnd(id int32, msg []byte, flags int32) error
+	// Msgrcv is msgrcv: a message of the type is received into msg (its
+	// type, then room for its bytes), and the number of its bytes returned.
+	Msgrcv(id int32, msg []byte, typ int64, flags int32) (int, error)
+}
+
+// IPCKind is the kind of a System V IPC object.
+type IPCKind int32
+
+// The kinds of System V IPC object.
+const (
+	IPCMessageQueue IPCKind = 0
+	IPCSemaphoreSet IPCKind = 1
+	IPCSharedMemory IPCKind = 2
+)
+
+// HostIPC returns an IPC that reaches the System V IPC objects of the host,
+// which other processes of the system share, for WASIConfig.IPC. It has
+// them on Linux on amd64, arm64, riscv64 and loong64, whose structures are
+// the guest's; elsewhere every call fails with errors.ErrUnsupported. A
+// call that the host process is interrupted in (EINTR) is made again. The
+// operations made with SEM_UNDO are undone when the host process ends, not
+// when the instance does.
+func HostIPC() IPC { return hostIPC{} }
+
+// hostIPC is the IPC HostIPC returns. Its methods are the platform's.
+type hostIPC struct{}
+
+// The guest's commands of msgctl, semctl and shmctl, which are Linux's.
+const (
+	ipcCmdRmid    = 0
+	ipcCmdSet     = 1
+	ipcCmdStat    = 2
+	ipcCmdGetPid  = 11
+	ipcCmdGetVal  = 12
+	ipcCmdGetAll  = 13
+	ipcCmdGetNcnt = 14
+	ipcCmdGetZcnt = 15
+	ipcCmdSetVal  = 16
+	ipcCmdSetAll  = 17
+	// shmctl's own commands, whose numbers are semctl's GETPID and GETVAL
+	ipcCmdShmLock   = 11
+	ipcCmdShmUnlock = 12
+)
+
+// ipcCommandPassesNoStructure reports whether the command cmd of msgctl,
+// semctl or shmctl, on an object of the kind, passes no structure: IPC_RMID,
+// semctl's GETPID, GETVAL, GETNCNT, GETZCNT and SETVAL, and shmctl's
+// SHM_LOCK and SHM_UNLOCK.
+func ipcCommandPassesNoStructure(kind, cmd int32) bool {
+	switch {
+	case cmd == ipcCmdRmid:
+		return true
+	case kind == int32(IPCSemaphoreSet):
+		return cmd == ipcCmdGetPid || cmd == ipcCmdGetVal || cmd == ipcCmdGetNcnt || cmd == ipcCmdGetZcnt || cmd == ipcCmdSetVal
+	case kind == int32(IPCSharedMemory):
+		return cmd == ipcCmdShmLock || cmd == ipcCmdShmUnlock
+	}
+	return false
+}
+
+// ipc returns the IPC of the instance for a call on objects of the kind,
+// or a wasi errno: ENOSYS without one, EINVAL for a kind there is none of.
+func (w *WasiStubs) ipc(kind int32) (IPC, int32) {
+	switch {
+	case w.cfg.IPC == nil:
+		return nil, _wasiENOSYS
+	case kind < int32(IPCMessageQueue) || kind > int32(IPCSharedMemory):
+		return nil, _wasiEINVAL
+	}
+	return w.cfg.IPC, _wasiESUCCESS
+}
+
+// Ipc_get is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_get") backing msgget, semget and shmget (IPC.Get): the id is
+// written at idPtr (i32). Returns 0 or a negative errno.
+func (w *WasiStubs) Ipc_get(m *Module, kind, key int32, arg int64, flags, idPtr int32) int32 {
+	return w.ipcGet(m, kind, key, uint64(arg), flags, zext(idPtr))
+}
+
+// Ipc_get64 is Ipc_get for a memory64 guest.
+func (w *WasiStubs) Ipc_get64(m *Module, kind, key int32, arg int64, flags int32, idPtr int64) int32 {
+	return w.ipcGet(m, kind, key, uint64(arg), flags, uint64(idPtr))
+}
+
+// ipcGet is the body of Ipc_get and Ipc_get64.
+func (w *WasiStubs) ipcGet(m *Module, kind, key int32, arg uint64, flags int32, idPtr uint64) int32 {
+	w.endUnregistered()
+	out := w.memBytes(m, idPtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	ipc, errno := w.ipc(kind)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	id, err := ipc.Get(IPCKind(kind), key, arg, flags)
+	if err != nil {
+		return -hookErrno(err)
+	}
+	binary.LittleEndian.PutUint32(out, uint32(id))
+	return _wasiESUCCESS
+}
+
+// Ipc_ctl is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_ctl") backing msgctl, semctl and shmctl (IPC.Control): bufPtr
+// is the command's buffer, and what the call returns is written at
+// resultPtr (i64). Returns 0 or a negative errno; ENOSYS for a wasm32
+// guest's command that passes a structure (IPC).
+func (w *WasiStubs) Ipc_ctl(m *Module, kind, id, num, cmd int32, arg int64, bufPtr, resultPtr int32) int32 {
+	// a kind there is none of fails as it does for a memory64 guest (ipcCtl)
+	if _, errno := w.ipc(kind); errno == _wasiESUCCESS && !ipcCommandPassesNoStructure(kind, cmd) {
+		return -_wasiENOSYS
+	}
+	return w.ipcCtl(m, kind, id, num, cmd, uint64(arg), zext(bufPtr), zext(resultPtr))
+}
+
+// Ipc_ctl64 is Ipc_ctl for a memory64 guest.
+func (w *WasiStubs) Ipc_ctl64(m *Module, kind, id, num, cmd int32, arg, bufPtr, resultPtr int64) int32 {
+	return w.ipcCtl(m, kind, id, num, cmd, uint64(arg), uint64(bufPtr), uint64(resultPtr))
+}
+
+// ipcCtl is the body of Ipc_ctl and Ipc_ctl64.
+func (w *WasiStubs) ipcCtl(m *Module, kind, id, num, cmd int32, arg, bufPtr, resultPtr uint64) int32 {
+	w.endUnregistered()
+	out := w.memBytes(m, resultPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	ipc, errno := w.ipc(kind)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var buf []byte
+	if mem := w.guestMemory(m); bufPtr <= uint64(len(mem)) {
+		buf = mem[bufPtr:]
+	}
+	r, err := ipc.Control(IPCKind(kind), id, num, cmd, arg, buf)
+	if err != nil {
+		return -hookErrno(err)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(r))
+	return _wasiESUCCESS
+}
+
+// Ipc_semop is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_semop") backing semop (IPC.Semop): the nops operations at
+// opsPtr. Returns 0 or a negative errno.
+func (w *WasiStubs) Ipc_semop(m *Module, id, opsPtr int32, nops int64) int32 {
+	return w.ipcSemop(m, id, zext(opsPtr), uint64(nops))
+}
+
+// Ipc_semop64 is Ipc_semop for a memory64 guest.
+func (w *WasiStubs) Ipc_semop64(m *Module, id int32, opsPtr, nops int64) int32 {
+	return w.ipcSemop(m, id, uint64(opsPtr), uint64(nops))
+}
+
+// ipcSemop is the body of Ipc_semop and Ipc_semop64. A call that waits
+// looks for a signal that ends the guest again when it returns
+// (endUnregistered).
+func (w *WasiStubs) ipcSemop(m *Module, id int32, opsPtr, nops uint64) int32 {
+	w.endUnregistered()
+	ipc, errno := w.ipc(int32(IPCSemaphoreSet))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	// struct sembuf is 6 bytes; a count no memory holds is no count.
+	if nops > ^uint64(0)/6 {
+		return -_wasiE2BIG
+	}
+	ops := w.memBytes(m, opsPtr, nops*6)
+	if ops == nil {
+		return -_wasiEFAULT
+	}
+	err := ipc.Semop(id, ops)
+	w.endUnregistered()
+	if err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// Ipc_msgsnd is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_msgsnd") backing msgsnd (IPC.Msgsnd): the message at msgPtr,
+// its type and then size bytes. Returns 0 or a negative errno; ENOSYS for
+// a wasm32 guest (IPC).
+func (w *WasiStubs) Ipc_msgsnd(m *Module, id, msgPtr int32, size int64, flags int32) int32 {
+	return -_wasiENOSYS
+}
+
+// Ipc_msgsnd64 is Ipc_msgsnd for a memory64 guest.
+func (w *WasiStubs) Ipc_msgsnd64(m *Module, id int32, msgPtr, size int64, flags int32) int32 {
+	return w.ipcMsgsnd(m, id, uint64(msgPtr), uint64(size), flags)
+}
+
+// ipcMsgsnd is the body of Ipc_msgsnd and Ipc_msgsnd64. A call that waits
+// looks for a signal that ends the guest again when it returns
+// (endUnregistered).
+func (w *WasiStubs) ipcMsgsnd(m *Module, id int32, msgPtr, size uint64, flags int32) int32 {
+	w.endUnregistered()
+	ipc, errno := w.ipc(int32(IPCMessageQueue))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	msg := w.ipcMessage(m, msgPtr, size)
+	if msg == nil {
+		return -_wasiEFAULT
+	}
+	err := ipc.Msgsnd(id, msg, flags)
+	w.endUnregistered()
+	if err != nil {
+		return -hookErrno(err)
+	}
+	return _wasiESUCCESS
+}
+
+// ipcMessage returns the message buffer at msgPtr: its type, a long, then
+// size bytes; nil when that is not all in the guest's memory.
+func (w *WasiStubs) ipcMessage(m *Module, msgPtr, size uint64) []byte {
+	if size > ^uint64(0)-8 {
+		return nil
+	}
+	return w.memBytes(m, msgPtr, 8+size)
+}
+
+// Ipc_msgrcv is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "ipc_msgrcv") backing msgrcv (IPC.Msgrcv): a message of the type is
+// received into msgPtr (its type, then at most size bytes), and the number
+// of its bytes written at receivedPtr (i64). Returns 0 or a negative errno;
+// ENOSYS for a wasm32 guest (IPC).
+func (w *WasiStubs) Ipc_msgrcv(m *Module, id, msgPtr int32, size, typ int64, flags, receivedPtr int32) int32 {
+	return -_wasiENOSYS
+}
+
+// Ipc_msgrcv64 is Ipc_msgrcv for a memory64 guest.
+func (w *WasiStubs) Ipc_msgrcv64(m *Module, id int32, msgPtr, size, typ int64, flags int32, receivedPtr int64) int32 {
+	return w.ipcMsgrcv(m, id, uint64(msgPtr), uint64(size), typ, flags, uint64(receivedPtr))
+}
+
+// ipcMsgrcv is the body of Ipc_msgrcv and Ipc_msgrcv64. A call that waits
+// looks for a signal that ends the guest again when it returns
+// (endUnregistered).
+func (w *WasiStubs) ipcMsgrcv(m *Module, id int32, msgPtr, size uint64, typ int64, flags int32, receivedPtr uint64) int32 {
+	w.endUnregistered()
+	ipc, errno := w.ipc(int32(IPCMessageQueue))
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	msg := w.ipcMessage(m, msgPtr, size)
+	out := w.memBytes(m, receivedPtr, 8)
+	if msg == nil || out == nil {
+		return -_wasiEFAULT
+	}
+	n, err := ipc.Msgrcv(id, msg, typ, flags)
+	w.endUnregistered()
+	if err != nil {
+		return -hookErrno(err)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(n))
+	return _wasiESUCCESS
 }
 
 // ----- access, FIFOs and locks -------------------------------------------------
@@ -14055,6 +14363,10 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"linuxTermios": true,
 			"linuxWinsize": true,
 			"terminalArg":  true,
+
+			"IPC":     true,
+			"IPCKind": true,
+			"hostIPC": true,
 		},
 		keepFuncNames: map[string]bool{
 			"NewWASI":                 true,
@@ -14206,6 +14518,9 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 			"parsePosixZone":          true,
 			"locationMoment":          true,
 			"zoneReading":             true,
+
+			"HostIPC":                     true,
+			"ipcCommandPassesNoStructure": true,
 		},
 		keepVarNames: map[string]bool{"idCallArgs": true, "creationThreadsRefused": true, "reportCreationThreadsRefused": true, "hostUmaskState": true},
 		keepConstAll: true,
@@ -14309,6 +14624,11 @@ var (
 	wasip1NativeTerminalLinuxRaw []byte
 	//go:embed wasip1_native_terminal_darwin.go
 	wasip1NativeTerminalDarwinRaw []byte
+
+	//go:embed wasip1_native_ipc_linux.go
+	wasip1NativeIPCLinuxRaw []byte
+	//go:embed wasip1_native_ipc_other.go
+	wasip1NativeIPCOtherRaw []byte
 )
 
 // emitWasip1Platform returns the per-platform companions of the native wasi
@@ -14339,6 +14659,9 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 
 		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
 		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
+
+		"wasip1_native_ipc_linux.go": wasip1NativeIPCLinuxRaw,
+		"wasip1_native_ipc_other.go": wasip1NativeIPCOtherRaw,
 	} {
 		src, err := renamePackage(raw, pkg)
 		if err != nil {

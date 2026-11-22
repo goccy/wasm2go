@@ -92,6 +92,12 @@ var posixImports = map[string]bool{
 
 	"proc_chdir":  true,
 	"proc_setenv": true,
+
+	"ipc_ctl":    true,
+	"ipc_get":    true,
+	"ipc_msgrcv": true,
+	"ipc_msgsnd": true,
+	"ipc_semop":  true,
 }
 
 // wasiReleasedPosixImports are the imports of wasip1_posix_extension that
