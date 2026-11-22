@@ -1634,8 +1634,20 @@ func (w *WasiStubs) takeWake() (*wasiWake, error) {
 		return wk, nil
 	}
 	w.mu.Unlock()
-	r, wr, err := hostWakePipe()
-	if err != nil {
+	var r, wr int
+	if err := makeRuntimeDescriptors(func() error {
+		var err error
+		if r, wr, err = hostWakePipe(); err != nil {
+			return err
+		}
+		if r, err = keepRuntimeFD(r); err != nil {
+			return errors.Join(err, hostCloseFD(wr))
+		}
+		if wr, err = keepRuntimeFD(wr); err != nil {
+			return errors.Join(err, hostCloseFD(r))
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	return &wasiWake{r: r, w: wr}, nil
@@ -1770,6 +1782,59 @@ func (w *WasiStubs) reportError(op string, err error) {
 	if err != nil && w.cfg.Errors != nil {
 		w.cfg.Errors(op, err)
 	}
+}
+
+// reportLater tells WASIConfig.Errors of err, a failure of op found with
+// w.mu held, under which Errors is not told: once w.mu is let go. nil is no
+// failure. Caller holds w.mu.
+func (w *WasiStubs) reportLater(op string, err error) {
+	if err != nil {
+		w.mu.afterUnlock(func() { w.reportError(op, err) })
+	}
+}
+
+// instanceMutex is the lock of a WasiStubs (mu): a sync.Mutex whose Unlock
+// then runs what was left for it while the lock was held (afterUnlock) —
+// the reports and closes that may not be made under it.
+type instanceMutex struct {
+	sync.Mutex
+	// unlockQueued is set while unlockRuns holds something; unlockRuns is
+	// guarded by the mutex itself.
+	unlockQueued atomic.Bool
+	unlockRuns   []func()
+}
+
+// afterUnlock leaves run for Unlock to run once the lock is let go. Caller
+// holds the lock.
+func (l *instanceMutex) afterUnlock(run func()) {
+	l.unlockRuns = append(l.unlockRuns, run)
+	l.unlockQueued.Store(true)
+}
+
+// Unlock lets the lock go and runs what afterUnlock left, in order.
+func (l *instanceMutex) Unlock() {
+	if !l.unlockQueued.Load() {
+		l.Mutex.Unlock()
+		return
+	}
+	runs := l.unlockRuns
+	l.unlockRuns = nil
+	l.unlockQueued.Store(false)
+	l.Mutex.Unlock()
+	for _, run := range runs {
+		run()
+	}
+}
+
+// errnoLater is guestErrno for a failure found with w.mu held: an error
+// without an errno is told Errors once w.mu is let go (reportLater).
+// Caller holds w.mu.
+func (w *WasiStubs) errnoLater(op string, err error) int32 {
+	errno, known := wasiErrnoOf(err)
+	if !known {
+		w.reportLater(op, err)
+	}
+	return errno
 }
 
 // blockingAttempt runs attempt as a blocking call of the guest's
@@ -2287,6 +2352,39 @@ type WASIConfig struct {
 	// (Proc_fork). nil denies every fork: it fails with ENOSYS.
 	// CopyForker makes a copy of the forking instance.
 	Fork Forker
+
+	// Files are descriptors the guest has from its start, under the numbers
+	// they are given at (inherited ones, a listening socket of a
+	// supervisor's). The instance takes them over: the guest's close, or
+	// CloseAll, closes them. A socket is given to the guest as a socket of
+	// the host's in non-blocking mode, which is a mode of the open file
+	// description and so of every other descriptor of it too, as with
+	// net.FileConn. A file at 0, 1 or 2 takes the place of that standard
+	// stream, and one at 3 the preopened root's (see Fd_dup2). A file that
+	// cannot be taken over is closed and reported to Errors, and the guest
+	// finds its number closed.
+	Files map[int32]*os.File
+
+	// HostDescriptors makes the guest's descriptors those of the host
+	// process: descriptor N of the guest is descriptor N of the host, in
+	// both directions. A new descriptor gets the lowest number the process
+	// has free; native code the embedder runs for the guest can be given
+	// the number (HostDescriptor) and finds the guest's open file there; and
+	// a descriptor of the process that no instance has and that was not
+	// open when the first such instance was made — native code opened it —
+	// is the guest's to use by its number, and is closed by the guest's
+	// close. The descriptors open when that instance was made are the
+	// process's own, out of the guest's reach, except those given in Files.
+	// A standard stream that is the host's file under its own number
+	// (os.Stdin, os.Stdout, os.Stderr) is that descriptor: the guest's close
+	// closes it, and the next descriptor the guest makes gets the number.
+	// The guest's numbers are below 1024 (FD_SETSIZE); from the first such
+	// instance on, the descriptors the runtime makes for itself, of every
+	// instance in the process, are at 1024 or above. It applies to the
+	// instance NewWASI makes; a copy made by Fork or ForkProc numbers its
+	// descriptors itself, as a child process's are its own. It has an
+	// effect on darwin and linux only.
+	HostDescriptors bool
 }
 
 // AllowAllNetAccess is a WASIConfig.NetAccess that allows every socket
@@ -2338,7 +2436,7 @@ type WasiStubs struct {
 	// sig.flagMu before sig.mu and before the module's memory lock
 	// (accessMemory). sig.mu and the wasiPIDs' mu are leaves: nothing is
 	// locked under them.
-	mu sync.Mutex
+	mu instanceMutex
 
 	// cfg is the configuration the instance was built from (NewWASI). It
 	// never changes, and is read without a lock, as monoStart is. Its
@@ -2437,6 +2535,18 @@ type WasiStubs struct {
 	shmMu     sync.Mutex
 	shm       map[uint64]shmAttachment
 	shmClosed bool
+
+	// ownStandard records the standard numbers (0, 1, 2) of an instance
+	// whose descriptors are the host's where its standard stream is not the
+	// process's descriptor (takeStandardLocked): what the guest puts there
+	// is its own, and the process's descriptor is left alone. Set with the
+	// table; guarded by mu.
+	ownStandard [3]bool
+
+	// adopted holds, by slot, what the host's descriptor of a slot taken in
+	// from outside the guest was open on (adoptHostLocked, currentLocked).
+	// Guarded by mu.
+	adopted map[int32]hostIdentity
 }
 
 // wasiProc is a process the guest can wait for: a host process spawned by
@@ -2446,7 +2556,7 @@ type WasiStubs struct {
 // and non-blocking (WNOHANG) forms without holding the WasiStubs lock across
 // the child's lifetime.
 type wasiProc struct {
-	host   *os.Process
+	host   *commandProcess
 	done   chan struct{}
 	status int32 // POSIX wait status, valid once done is closed
 	// kill delivers a signal to an embedder-run process (Proc_kill). nil
@@ -2838,7 +2948,118 @@ func NewWASI(cfg WASIConfig) *WasiStubs {
 	}
 	cfg.Args = append([]string(nil), cfg.Args...)
 	cfg.Env = append([]string(nil), cfg.Env...)
-	return &WasiStubs{cfg: cfg, monoStart: time.Now()}
+	cfg.Files = maps.Clone(cfg.Files)
+	w := &WasiStubs{cfg: cfg, monoStart: time.Now()}
+	if w.hostFamily() {
+		w.reportError("host_descriptors", startHostNumbers(cfg.Files))
+	}
+	return w
+}
+
+// takeFileLocked enters f, a file of the configuration's Files, at fd
+// (fileEntry; placeFileLocked where the descriptors are the host's): what
+// fd held before, a standard stream, is closed. A failure is told Errors
+// later (reportLater), f is closed, and the guest finds fd closed. Caller
+// holds w.mu.
+func (w *WasiStubs) takeFileLocked(fd int32, f *os.File) {
+	w.reportLater("files", w.enterFileLocked(fd, f))
+}
+
+// enterFileLocked is takeFileLocked but for the report of the failure.
+// Caller holds w.mu.
+func (w *WasiStubs) enterFileLocked(fd int32, f *os.File) error {
+	switch {
+	case f == nil:
+		return fmt.Errorf("descriptor %d: no file", fd)
+	case fd < 0 || fd >= wasiRootFD:
+		return errors.Join(fmt.Errorf("descriptor %d: %w", fd, syscall.EBADF), f.Close())
+	case w.hostNumbered():
+		return w.placeFileLocked(fd, f)
+	}
+	op, err := fileEntry(f)
+	if err != nil {
+		return err
+	}
+	w.replaceSlotLocked("files", fd, op)
+	return nil
+}
+
+// replaceSlotLocked puts op at fd in place of what fd held (takeSlotLocked),
+// for the instance's own use (Files, the drop of a stale slot): what is
+// left of the old entry, and the host's locks of its file (resyncReleased),
+// is closed once w.mu is let go, its failure told Errors under op. Caller
+// holds w.mu.
+func (w *WasiStubs) replaceSlotLocked(call string, fd int32, op *wasiOpen) {
+	old := w.takeSlotLocked(fd)
+	w.mu.afterUnlock(func() {
+		err := w.resyncReleased()
+		if old != nil {
+			err = errors.Join(err, closeWasiOpen(old))
+		}
+		w.reportError(call, err)
+	})
+	if op != nil {
+		w.setSlotLocked(fd, op)
+	}
+}
+
+// hostFamily reports whether the instance is of a fork family whose first
+// instance has the host process's descriptor numbers
+// (WASIConfig.HostDescriptors). For every instance of it, fd 3 is a number
+// like any other, as it is for the host (preopened).
+func (w *WasiStubs) hostFamily() bool {
+	return hostDescriptorsSupported && w.cfg.HostDescriptors
+}
+
+// hostNumbered reports whether the instance's descriptor numbers are the
+// host process's (WASIConfig.HostDescriptors): the instance NewWASI made,
+// not a copy made by Fork.
+func (w *WasiStubs) hostNumbered() bool {
+	return w.hostFamily() && !w.forked
+}
+
+// HostDescriptor returns the descriptor of the host process behind the
+// guest's descriptor fd: fd itself for an instance whose descriptors are
+// the host's (WASIConfig.HostDescriptors), the descriptor of its file or
+// socket otherwise. The number names it while the guest has fd open. ok is
+// false when fd is not open or has no descriptor of the host behind it (a
+// file of a MemFS, a standard stream that is a reader or writer).
+func (w *WasiStubs) HostDescriptor(fd int32) (host uintptr, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	op := w.openLocked(fd)
+	conn := w.entryHostConnLocked(op)
+	if conn == nil {
+		return 0, false
+	}
+	if w.hostNumbered() {
+		return uintptr(fd), w.hostSlotHeld(fd)
+	}
+	return host, hostDescriptor(conn, func(d uintptr) { host = d })
+}
+
+// entryHostConnLocked returns the file or socket of the host behind the
+// entry op, nil for none. A standard stream is one only where it is not a
+// descriptor of the host's under its own number in an instance whose
+// descriptors are the host's (see takeStandardLocked). Caller holds w.mu.
+func (w *WasiStubs) entryHostConnLocked(op *wasiOpen) syscall.Conn {
+	if op == nil {
+		return nil
+	}
+	if host := op.hostSocket(); host != nil {
+		return host
+	}
+	if f, ok := op.f.(*os.File); ok {
+		return f
+	}
+	if op.stdio == 0 || w.hostNumbered() {
+		return nil
+	}
+	conn, _ := [...]any{w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr}[op.stdio-1].(*os.File)
+	if conn == nil {
+		return nil
+	}
+	return conn
 }
 
 // fs returns the filesystem of the instance: noFS when the configuration
@@ -3062,7 +3283,8 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 		err = errors.Join(err, hostCloseFD(wk.r), hostCloseFD(wk.w))
 	}
 	w.wakes, w.wakesClosed = nil, true
-	closing := w.clearSlotsFromLocked(0)
+	closing, clearErr := w.endSlotsLocked()
+	err = errors.Join(err, clearErr)
 	// Nobody is left to wait for this instance's processes: the finished
 	// ones are gone, and the running ones go when they finish (finishProc
 	// finds them missing from the table).
@@ -3093,9 +3315,21 @@ func (w *WasiStubs) Fd_closefrom(m *Module, lowFd int32) int32 {
 // would, and joins the close errors.
 func (w *WasiStubs) closeFrom(lowFd int32) error {
 	w.mu.Lock()
-	closing := w.clearSlotsFromLocked(lowFd)
+	closing, err := w.clearSlotsFromLocked(lowFd)
 	w.mu.Unlock()
-	return errors.Join(w.resyncReleased(), closeWasiOpens(closing))
+	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing))
+}
+
+// endSlotsLocked clears every slot for an end of the instance (CloseAll,
+// CloseDescriptors) and returns the entries to close. The standard
+// descriptors of the host process stay open where the guest has them: the
+// embedder writes to them after the instance. A table not set up yet is set
+// up first, which takes the configuration's Files over to be closed.
+// Caller holds w.mu.
+func (w *WasiStubs) endSlotsLocked() ([]*wasiOpen, error) {
+	w.fdsLocked()
+	w.leaveStandardNumbersLocked()
+	return w.clearSlotsFromLocked(0)
 }
 
 // CloseDescriptors closes every descriptor of this instance in its table,
@@ -3107,7 +3341,10 @@ func (w *WasiStubs) closeFrom(lowFd int32) error {
 // it opened, and its standard ones, closed. CloseAll is still to be called
 // once the guest no longer runs. The close errors are joined.
 func (w *WasiStubs) CloseDescriptors() error {
-	return w.closeFrom(0)
+	w.mu.Lock()
+	closing, err := w.endSlotsLocked()
+	w.mu.Unlock()
+	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing))
 }
 
 // KillCommands ends the commands this instance started (Proc_spawn) and
@@ -3184,18 +3421,28 @@ const wasiRootFD int32 = 0x7ffffff0
 // number no longer names it; wasiRootFD still does.
 func (w *WasiStubs) preopened(fd int32) bool {
 	_, none := w.fs().(noFS)
-	return !none && (fd == wasiRootFD || fd == wasiPreopenFD && !w.preopenReplaced.Load())
+	return !none && (fd == wasiRootFD || fd == wasiPreopenFD && (w.hostFamily() || !w.preopenReplaced.Load()))
 }
 
 // fdsLocked returns the fd table. On first use it sets the table up with
-// fds 0, 1 and 2 referring to the instance's stdin, stdout and stderr; from
-// then on those are ordinary slots that the guest can close, dup and reuse.
-// Caller holds w.mu.
+// fds 0, 1 and 2 referring to the instance's stdin, stdout and stderr (see
+// takeStandardLocked), and the Files of the configuration under their
+// numbers; from then on those are ordinary slots that the guest can close,
+// dup and reuse. Caller holds w.mu.
 func (w *WasiStubs) fdsLocked() map[int32]*wasiOpen {
 	if w.fdTable == nil {
 		w.fdTable = map[int32]*wasiOpen{}
 		for fd, stdio := range []int8{1, 2, 3} {
+			if w.hostNumbered() {
+				if w.takeStandardLocked(int32(fd)) {
+					continue
+				}
+				w.ownStandard[fd] = true
+			}
 			w.setSlotLocked(int32(fd), &wasiOpen{stdio: stdio})
+		}
+		for _, fd := range slices.Sorted(maps.Keys(w.cfg.Files)) {
+			w.takeFileLocked(fd, w.cfg.Files[fd])
 		}
 	}
 	return w.fdTable
@@ -3210,21 +3457,38 @@ func (w *WasiStubs) setSlotLocked(fd int32, op *wasiOpen) {
 	op.mu.Unlock()
 	w.fdsLocked()[fd] = op
 	delete(w.cloexec, fd)
+	delete(w.adopted, fd)
 	if fd == wasiPreopenFD {
 		w.preopenReplaced.Store(true)
 	}
 }
 
 // clearSlotLocked takes fd out of the table, close-on-exec mark and all,
-// with the instance's record locks of its file (releaseRecordLocksLocked).
-// It returns the entry fd held when that was its last slot, of any
-// instance, for the caller to close once w.mu is let go (closeWasiOpen);
-// nil otherwise, and for an fd that holds nothing. Caller holds w.mu.
-func (w *WasiStubs) clearSlotLocked(fd int32) (closing *wasiOpen) {
+// with the instance's record locks of its file (releaseRecordLocksLocked),
+// and in an instance whose descriptors are the host's closes the host's
+// descriptor fd (releaseHostSlotLocked), whose error it returns. It
+// returns the entry fd held when that was its last slot, of any instance,
+// for the caller to close once w.mu is let go (closeWasiOpen); nil
+// otherwise, and for an fd that holds nothing. Caller holds w.mu.
+func (w *WasiStubs) clearSlotLocked(fd int32) (closing *wasiOpen, err error) {
+	if w.fdsLocked()[fd] == nil {
+		return nil, nil
+	}
+	if w.hostNumbered() {
+		err = w.releaseHostSlotLocked(fd)
+	}
+	return w.takeSlotLocked(fd), err
+}
+
+// takeSlotLocked is clearSlotLocked but for the host's descriptor fd, which
+// it leaves as it is: one that a placement (placeHostSlotLocked) has just
+// made another file's. Caller holds w.mu.
+func (w *WasiStubs) takeSlotLocked(fd int32) (closing *wasiOpen) {
 	op := w.fdsLocked()[fd]
 	if op == nil {
 		return nil
 	}
+	delete(w.adopted, fd)
 	delete(w.fdsLocked(), fd)
 	delete(w.cloexec, fd)
 	w.releaseRecordLocksLocked(op)
@@ -3239,48 +3503,76 @@ func (w *WasiStubs) clearSlotLocked(fd int32) (closing *wasiOpen) {
 }
 
 // clearSlotsFromLocked clears every fd numbered lowFd or higher
-// (clearSlotLocked) and returns the entries to close. Caller holds w.mu.
-func (w *WasiStubs) clearSlotsFromLocked(lowFd int32) []*wasiOpen {
+// (clearSlotLocked) and returns the entries to close, with the errors of
+// the clearing joined. Caller holds w.mu.
+func (w *WasiStubs) clearSlotsFromLocked(lowFd int32) ([]*wasiOpen, error) {
 	var closing []*wasiOpen
+	var err error
 	for fd := range w.fdsLocked() {
 		if fd < lowFd {
 			continue
 		}
-		if op := w.clearSlotLocked(fd); op != nil {
+		op, clearErr := w.clearSlotLocked(fd)
+		err = errors.Join(err, clearErr)
+		if op != nil {
 			closing = append(closing, op)
 		}
 	}
-	return closing
+	return closing, err
 }
 
 // openLocked returns the entry the guest knows as descriptor fd, or nil
-// when it has none. Caller holds w.mu.
+// when it has none. In an instance whose descriptors are the host's, a
+// descriptor of the process that is nobody's becomes the guest's here
+// (adoptHostLocked). Caller holds w.mu.
 func (w *WasiStubs) openLocked(fd int32) *wasiOpen {
-	return w.fdsLocked()[fd]
+	op := w.fdsLocked()[fd]
+	if w.hostNumbered() && (op == nil || !w.currentLocked(fd)) {
+		return w.adoptHostLocked(fd)
+	}
+	return op
 }
 
 // addFDLocked stores op under the lowest fd number not in use, as POSIX
-// requires of open, pipe, dup, socket and accept, and returns that number.
-// Caller holds w.mu.
-func (w *WasiStubs) addFDLocked(op *wasiOpen) int32 {
-	// From 0 there is a free number: the table would have to hold an
-	// entry for every number below wasiRootFD.
-	fd, _ := w.addFDFromLocked(op, 0)
-	return fd
+// requires of open, pipe, dup, socket and accept, and returns that number
+// and an errno: EMFILE where the host has no number for it (see
+// addFDFromLocked). Caller holds w.mu.
+func (w *WasiStubs) addFDLocked(op *wasiOpen) (int32, int32) {
+	return w.addFDFromLocked(op, 0)
 }
 
 // addFDFromLocked enters op under the lowest free number that is at least
-// min (fcntl's F_DUPFD) and below wasiRootFD, and reports whether there
-// was one.
-func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) (int32, bool) {
+// min (fcntl's F_DUPFD) and below wasiRootFD, and returns it and an errno:
+// EMFILE when there is none. Where the descriptors are the host's, the
+// host gives the number (hostSlotLocked). A new entry (one no slot holds
+// yet) that is not entered is closed once w.mu is let go. Caller holds
+// w.mu.
+func (w *WasiStubs) addFDFromLocked(op *wasiOpen, min int32) (int32, int32) {
+	op.mu.Lock()
+	fresh := op.refs == 0
+	op.mu.Unlock()
+	fail := func(err error) (int32, int32) {
+		if fresh {
+			w.mu.afterUnlock(func() { w.reportError("descriptors", closeWasiOpen(op)) })
+		}
+		return -1, w.errnoLater("descriptors", err)
+	}
+	if w.hostNumbered() {
+		fd, err := w.hostSlotLocked(op, min)
+		if err != nil {
+			return fail(err)
+		}
+		w.setSlotLocked(fd, op)
+		return fd, _wasiESUCCESS
+	}
 	fds := w.fdsLocked()
 	for fd := min; fd < wasiRootFD; fd++ {
-		if _, used := fds[fd]; !used && !w.preopened(fd) {
+		if _, used := fds[fd]; !used && (fd == wasiPreopenFD && w.hostFamily() || !w.preopened(fd)) {
 			w.setSlotLocked(fd, op)
-			return fd, true
+			return fd, _wasiESUCCESS
 		}
 	}
-	return -1, false
+	return fail(syscall.EMFILE)
 }
 
 // enterRoot enters the root instance in the table of its family
@@ -3951,7 +4243,7 @@ func (w *WasiStubs) Proc_exec64(m *Module, pathPtr, argvPtr, envpPtr, cwdPtr int
 // its process, and done is closed once the exec has waited for it and for
 // what the runtime copies from it (KillCommands).
 type execedCommand struct {
-	process *os.Process
+	process *commandProcess
 	done    chan struct{}
 }
 
@@ -3991,7 +4283,7 @@ func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, 
 // been asked for (requestStopLocked) while the command started. The command
 // is given no mask: the pending signals the thread blocks are dropped. A
 // failure to send one is told WASIConfig.Errors.
-func (w *WasiStubs) becomeCommand(m *Module, process *os.Process) *execedCommand {
+func (w *WasiStubs) becomeCommand(m *Module, process *commandProcess) *execedCommand {
 	execed := &execedCommand{process: process, done: make(chan struct{})}
 	s := &w.sig
 	t := w.lockSignalThread(m)
@@ -4194,13 +4486,28 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	r, wr, err := os.Pipe()
-	if err != nil {
+	var r, wr *os.File
+	if err := makeRuntimeDescriptors(func() error {
+		var err error
+		r, wr, err = runtimePipe()
+		return err
+	}); err != nil {
 		return -w.guestErrno("pipe", err)
 	}
 	w.mu.Lock()
-	rfd := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
-	wfd := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
+	rfd, errno := w.addFDLocked(&wasiOpen{f: r, noWrite: true})
+	if errno != _wasiESUCCESS {
+		w.mu.Unlock()
+		w.reportError("pipe", wr.Close())
+		return -errno
+	}
+	wfd, errno := w.addFDLocked(&wasiOpen{f: wr, noRead: true})
+	if errno != _wasiESUCCESS {
+		closing, err := w.clearSlotLocked(rfd)
+		w.mu.Unlock()
+		w.reportError("pipe", errors.Join(err, closeWasiOpen(closing)))
+		return -errno
+	}
 	w.mu.Unlock()
 	binary.LittleEndian.PutUint32(out[0:], uint32(rfd))
 	binary.LittleEndian.PutUint32(out[4:], uint32(wfd))
@@ -4559,15 +4866,15 @@ func (w *WasiStubs) killFamilyProc(proc *wasiProc, sig int32) int32 {
 }
 
 // killHostProc delivers sig to a host process started by Proc_spawn.
-// SIGKILL is os.Process.Kill, which every platform has; another signal is
-// the host's signal for it (hostSignalOf).
-func (w *WasiStubs) killHostProc(p *os.Process, sig int32) int32 {
+// SIGKILL is the process's Kill, which every platform has; another signal
+// is the host's signal for it (hostSignalOf).
+func (w *WasiStubs) killHostProc(p *commandProcess, sig int32) int32 {
 	return -w.guestErrno("proc_kill", signalHostProc(p, sig))
 }
 
 // signalHostProc is killHostProc returning the error: EINVAL for a signal
 // the host has none for.
-func signalHostProc(p *os.Process, sig int32) error {
+func signalHostProc(p *commandProcess, sig int32) error {
 	var err error
 	if sig == wasiSIGKILL {
 		err = p.Kill()
@@ -4592,13 +4899,13 @@ func (w *WasiStubs) Proc_kill64(m *Module, pid, sig int32) int32 {
 
 // hostCommand is a command startCommand started on the host: process is
 // its process, and wait waits for it to end and for what the runtime copies
-// from it to be delivered, and returns its wait status (waitStatusOf).
+// from it to be delivered, and returns its wait status as the guest gets it.
 // finish delivers what the runtime copies from it once it has ended, the
 // part of wait after the reap, for a command known to have ended before it
 // is reaped (awaitHeldLeader); it is nil where no command is (no job
 // control on the host, hostJobControl).
 type hostCommand struct {
-	process *os.Process
+	process *commandProcess
 	wait    func() int32
 	finish  func()
 }
@@ -5681,9 +5988,9 @@ func (w *WasiStubs) Fd_close(m *Module, fd int32) int32 {
 		w.mu.Unlock()
 		return _wasiEBADF
 	}
-	closing := w.clearSlotLocked(fd)
+	closing, err := w.clearSlotLocked(fd)
 	w.mu.Unlock()
-	err := w.resyncReleased()
+	err = errors.Join(err, w.resyncReleased())
 	if closing != nil {
 		err = errors.Join(err, closeWasiOpen(closing))
 	}
@@ -7602,9 +7909,9 @@ func (w *WasiStubs) fdDup(m *Module, fd int32, outPtr uint64) int32 {
 // dupLocked enters a duplicate of op under the lowest free number that is
 // at least min, and writes the number at out. Caller holds w.mu.
 func (w *WasiStubs) dupLocked(op *wasiOpen, min int32, out []byte) int32 {
-	nfd, ok := w.addFDFromLocked(op, min)
-	if !ok {
-		return _wasiEMFILE
+	nfd, errno := w.addFDFromLocked(op, min)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	binary.LittleEndian.PutUint32(out, uint32(nfd))
 	return _wasiESUCCESS
@@ -7669,8 +7976,13 @@ func (w *WasiStubs) takeDup2(from, to int32) (replaced *wasiOpen, errno int32) {
 	if from == to {
 		return nil, _wasiESUCCESS
 	}
+	if w.hostNumbered() {
+		if err := w.placeHostSlotLocked(to, src); err != nil {
+			return nil, w.errnoLater("descriptors", err)
+		}
+	}
 	// A to that holds src already is not its last slot: from holds it.
-	replaced = w.clearSlotLocked(to)
+	replaced = w.takeSlotLocked(to)
 	w.setSlotLocked(to, src)
 	return replaced, _wasiESUCCESS
 }
@@ -7718,10 +8030,19 @@ func (w *WasiStubs) takeRenumber(from, to int32) (replaced *wasiOpen, errno int3
 	if src == nil || to < 0 || to >= wasiRootFD {
 		return nil, _wasiEBADF
 	}
+	if w.hostNumbered() {
+		if err := w.placeHostSlotLocked(to, src); err != nil {
+			return nil, w.errnoLater("descriptors", err)
+		}
+	}
 	// to holds src before from lets it go: from's is not its last slot.
-	replaced = w.clearSlotLocked(to)
+	replaced = w.takeSlotLocked(to)
 	w.setSlotLocked(to, src)
-	w.clearSlotLocked(from)
+	// from's is not src's last slot (to holds it): what fails is the close
+	// of from's descriptor of the host's, after the call has done what it
+	// was asked, as for closeReplaced.
+	_, err := w.clearSlotLocked(from)
+	w.reportLater("fd_renumber", err)
 	return replaced, _wasiESUCCESS
 }
 
@@ -8315,14 +8636,21 @@ func (w *WasiStubs) openRoot(oflags, fdflags int32) (int32, int32) {
 		return -1, _wasiEISDIR
 	}
 	fsys := w.fs()
-	f, err := fsys.OpenFile(".", os.O_RDONLY, 0)
-	if err != nil {
+	var f File
+	if err := makeRuntimeDescriptors(func() error {
+		var err error
+		if f, err = fsys.OpenFile(".", os.O_RDONLY, 0); err != nil {
+			return err
+		}
+		f, err = keepRuntimeOpened(f)
+		return err
+	}); err != nil {
 		return -1, w.guestErrno("path_open", err)
 	}
 	op := &wasiOpen{f: f, isDir: true, path: ".", fdflags: fdflags, noWrite: true}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(op), _wasiESUCCESS
+	return w.addFDLocked(op)
 }
 
 // openDescriptorListing opens dir, a directory that lists the guest's
@@ -8356,7 +8684,10 @@ func (w *WasiStubs) openDescriptorListing(dir string, oflags int32, canWrite boo
 	listing := &descriptorListing{info: w.listingInfo(path.Base(dir), ids)}
 	// The entries are complete before w.mu lets anyone else find the
 	// descriptor.
-	fd := w.addFDLocked(&wasiOpen{f: listing, isDir: true, path: dir, noWrite: true})
+	fd, errno := w.addFDLocked(&wasiOpen{f: listing, isDir: true, path: dir, noWrite: true})
+	if errno != _wasiESUCCESS {
+		return -1, errno
+	}
 	entries = append(entries, ownNameEntry{w.linkInfo(strconv.Itoa(int(fd)), fd, true, false, ids, guestPath(dir)), fd})
 	slices.SortFunc(entries, func(a, b ownNameEntry) int { return cmp.Compare(a.fd, b.fd) })
 	for _, e := range entries {
@@ -8655,8 +8986,20 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	}
 	w.mu.Lock()
 	fsys := w.fs()
-	openFile := fsys.OpenFile
 	w.mu.Unlock()
+	// An open that does not wait is made as the runtime makes its own
+	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
+	// the other end (openFIFO) is moved up once it is made.
+	openFile := func(name string, flag int, perm os.FileMode) (f File, err error) {
+		err = makeRuntimeDescriptors(func() error {
+			if f, err = fsys.OpenFile(name, flag, perm); err != nil {
+				return err
+			}
+			f, err = keepRuntimeOpened(f)
+			return err
+		})
+		return f, err
+	}
 
 	var flag int
 	switch {
@@ -8756,6 +9099,9 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		if f, errno = w.openFIFO(m, fsys, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
+		if f, err = keepRuntimeOpened(f); err != nil {
+			return -1, w.guestErrno("path_open", err)
+		}
 	case flag&os.O_CREATE != 0:
 		if err = w.create(fsys, mode, func(perm os.FileMode) error {
 			var err error
@@ -8792,7 +9138,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(op), _wasiESUCCESS
+	return w.addFDLocked(op)
 }
 
 func (w *WasiStubs) Path_create_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -9866,7 +10212,16 @@ func (w *WasiStubs) Sock_socket(m *Module, domain, typ int32) int32 {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{isSocket: true})
+	return negativeFD(w.addFDLocked(&wasiOpen{isSocket: true}))
+}
+
+// negativeFD is the result of an import that returns a new descriptor fd,
+// or a negative errno: -errno when errno is not ESUCCESS.
+func negativeFD(fd, errno int32) int32 {
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	return fd
 }
 
 // Sock_socket64 is Sock_socket for a memory64 guest.
@@ -10012,8 +10367,11 @@ func (w *WasiStubs) sockAccept(m *Module, fd, flags int32, fdOutPtr uint64) int3
 		return w.guestErrno("sock_accept", err)
 	}
 	w.mu.Lock()
-	newFD := w.addFDLocked(&wasiOpen{conn: conn})
+	newFD, errno := w.addFDLocked(&wasiOpen{conn: conn})
 	w.mu.Unlock()
+	if errno != _wasiESUCCESS {
+		return errno
+	}
 	binary.LittleEndian.PutUint32(out, uint32(newFD))
 	return _wasiESUCCESS
 }
@@ -10786,13 +11144,13 @@ func (w *WasiStubs) Sock_open64(m *Module, family, typ int32) int32 {
 // openSocketEntry makes a socket of the host's of the family and type and
 // gives the guest a slot for it. Returns the fd, or a negative errno.
 func (w *WasiStubs) openSocketEntry(family int32, dgram bool) int32 {
-	host, err := openHostSocket(family, dgram)
+	host, err := runtimeFile(func() (*os.File, error) { return openHostSocket(family, dgram) })
 	if err != nil {
 		return -w.guestErrno("sock_open", err)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{isSocket: true, family: family, dgram: dgram, sock: &wasiSocket{host: host}})
+	return negativeFD(w.addFDLocked(&wasiOpen{isSocket: true, family: family, dgram: dgram, sock: &wasiSocket{host: host}}))
 }
 
 // Sock_bind_addr is a NON-STANDARD host import (module
@@ -10917,7 +11275,7 @@ func (w *WasiStubs) addAccepted(op *wasiOpen, conn int, fdflags int32) (int32, i
 	op.mu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(accepted), _wasiESUCCESS
+	return w.addFDLocked(accepted)
 }
 
 // Sock_connect_addr is a NON-STANDARD host import (module
@@ -11213,16 +11571,39 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 		return -_wasiENOTSUP
 	}
 	dgram := typ == wasiSockTypeDgram
-	a, b, err := hostSocketPair(dgram)
-	if err != nil {
+	var a, b *os.File
+	if err := makeRuntimeDescriptors(func() error {
+		var err error
+		if a, b, err = hostSocketPair(dgram); err != nil {
+			return err
+		}
+		if a, err = keepRuntimeFile(a); err != nil {
+			return errors.Join(err, b.Close())
+		}
+		if b, err = keepRuntimeFile(b); err != nil {
+			return errors.Join(err, a.Close())
+		}
+		return nil
+	}); err != nil {
 		return -w.guestErrno("sock_socketpair", err)
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	for i, host := range []*os.File{a, b} {
-		fd := w.addFDLocked(&wasiOpen{isSocket: true, family: wasiSockFamilyUnix, dgram: dgram, sock: &wasiSocket{host: host}})
-		binary.LittleEndian.PutUint32(out[4*i:], uint32(fd))
+	afd, errno := w.addFDLocked(&wasiOpen{isSocket: true, family: wasiSockFamilyUnix, dgram: dgram, sock: &wasiSocket{host: a}})
+	if errno != _wasiESUCCESS {
+		w.mu.Unlock()
+		w.reportError("sock_socketpair", b.Close())
+		return -errno
 	}
+	bfd, errno := w.addFDLocked(&wasiOpen{isSocket: true, family: wasiSockFamilyUnix, dgram: dgram, sock: &wasiSocket{host: b}})
+	if errno != _wasiESUCCESS {
+		closing, err := w.clearSlotLocked(afd)
+		w.mu.Unlock()
+		w.reportError("sock_socketpair", errors.Join(err, closeWasiOpen(closing)))
+		return -errno
+	}
+	w.mu.Unlock()
+	binary.LittleEndian.PutUint32(out[0:], uint32(afd))
+	binary.LittleEndian.PutUint32(out[4:], uint32(bfd))
 	return _wasiESUCCESS
 }
 
@@ -16785,7 +17166,7 @@ type wasiSignalsDue struct {
 	stopModule  *Module
 	// alarm is the command the guest has become (Proc_exec), to be sent
 	// the interval timer's SIGALRM (fireDueTimerLocked).
-	alarm *os.Process
+	alarm *commandProcess
 	// alarmToOffer records a firing of the interval timer to offer
 	// WASIConfig.TakeSignal (fireDueTimerLocked); alarmFor, the thread whose
 	// own host call it came due in, to post it for if not taken
@@ -18160,6 +18541,8 @@ var (
 	wasip1NativeOtherRaw []byte
 	//go:embed wasip1_native_hostfd.go
 	wasip1NativeHostFDRaw []byte
+	//go:embed wasip1_native_descriptors.go
+	wasip1NativeDescriptorsRaw []byte
 	//go:embed wasip1_native_linux_msg.go
 	wasip1NativeLinuxMsgRaw []byte
 	//go:embed wasip1_native_linux_386.go
@@ -18207,6 +18590,8 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
 		"wasip1_native_other.go":  wasip1NativeOtherRaw,
 		"wasip1_native_hostfd.go": wasip1NativeHostFDRaw,
+
+		"wasip1_native_descriptors.go": wasip1NativeDescriptorsRaw,
 
 		"wasip1_native_linux_msg.go": wasip1NativeLinuxMsgRaw,
 		"wasip1_native_linux_386.go": wasip1NativeLinux386Raw,

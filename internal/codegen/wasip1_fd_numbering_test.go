@@ -3,12 +3,24 @@ package codegen
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// addTestFD enters op under the lowest free number (addFDLocked) and
+// returns it; a test that cannot enter it fails, by a panic of the
+// goroutine that runs it. Caller holds w.mu.
+func addTestFD(w *WasiStubs, op *wasiOpen) int32 {
+	fd, errno := w.addFDLocked(op)
+	if errno != _wasiESUCCESS {
+		panic(fmt.Sprintf("addFDLocked: errno %d", errno))
+	}
+	return fd
+}
 
 // dupTestFd duplicates fd through Fd_dup and returns the new fd.
 func dupTestFd(t *testing.T, w *WasiStubs, m *Module, fd int32) int32 {
@@ -353,8 +365,8 @@ func TestWasi_SpawnWithSocketAsStandardStream(t *testing.T) {
 		}
 	})
 	w.mu.Lock()
-	sock := w.addFDLocked(&wasiOpen{conn: local})
-	unconnected := w.addFDLocked(&wasiOpen{isSocket: true})
+	sock := addTestFD(w, &wasiOpen{conn: local})
+	unconnected := addTestFD(w, &wasiOpen{isSocket: true})
 	w.mu.Unlock()
 	t.Cleanup(func() {
 		if err := w.CloseAll(); err != nil {

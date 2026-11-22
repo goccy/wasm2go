@@ -51,6 +51,13 @@ type Names struct {
 	// SaveGlobals is the generated globals-snapshot function (see
 	// emitGlobalsSnapshot); multi-package output exports it.
 	SaveGlobals string
+
+	// RuntimeFile is the WASI runtime's function the files of the images
+	// are made with (func(make func() (*os.File, error)) (*os.File, error)),
+	// which keeps their descriptors out of the numbers of a guest whose
+	// descriptors are the host process's; empty for a package without the
+	// WASI runtime.
+	RuntimeFile string
 }
 
 // Files renders the runtime: output filename → formatted Go source. The

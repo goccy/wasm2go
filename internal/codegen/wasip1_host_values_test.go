@@ -1094,7 +1094,7 @@ func TestFlockWaits(t *testing.T) {
 	}
 	// A socket has no file to lock.
 	w.mu.Lock()
-	sock := w.addFDLocked(&wasiOpen{isSocket: true})
+	sock := addTestFD(w, &wasiOpen{isSocket: true})
 	w.mu.Unlock()
 	if rc := w.Fd_flock(m, sock, 2, 0); rc != -_wasiEINVAL {
 		t.Fatalf("lock of a socket rc=%d, want -EINVAL", rc)

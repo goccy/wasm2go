@@ -130,7 +130,7 @@ func TestGuestErrnoReportsWithoutLocks(t *testing.T) {
 	var told []string
 	w.cfg.Errors = func(name string, err error) {
 		told = append(told, name)
-		for _, mu := range []*sync.Mutex{&w.mu, &op.mu} {
+		for _, mu := range []*sync.Mutex{&w.mu.Mutex, &op.mu} {
 			if !mu.TryLock() {
 				t.Errorf("%s: Errors told with a lock held", name)
 				continue

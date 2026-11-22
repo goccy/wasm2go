@@ -78,7 +78,7 @@ func closeFd(t *testing.T, w *WasiStubs, m *Module, fd int32) {
 }
 
 // execedProcess returns the host process of the command w's guest became.
-func execedProcess(w *WasiStubs) *os.Process {
+func execedProcess(w *WasiStubs) *commandProcess {
 	w.sig.mu.Lock()
 	defer w.sig.mu.Unlock()
 	return w.sig.execed.process
@@ -236,7 +236,7 @@ func TestExec_KillDuringTheStartIsTheCommands(t *testing.T) {
 	w.sig.mu.Lock()
 	w.requestStopLocked(nil, &WasiSignalError{Signal: wasiSIGKILL})
 	w.unlockSignals()
-	w.becomeCommand(m, p)
+	w.becomeCommand(m, &commandProcess{Pid: p.Pid})
 	// The command's input ends: a command that was not killed exits.
 	if err := input.Close(); err != nil {
 		t.Fatal(err)
@@ -278,7 +278,7 @@ func TestExec_IgnoredTimerIsNotTheCommands(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
-	w.becomeCommand(m, p)
+	w.becomeCommand(m, &commandProcess{Pid: p.Pid})
 	w.sig.mu.Lock()
 	w.sig.timer = time.AfterFunc(time.Hour, func() {})
 	w.sig.timerAt = time.Now()
@@ -321,7 +321,7 @@ func TestExec_TheCommandGetsWhatWaitsForTheExecingThread(t *testing.T) {
 			if err != nil {
 				t.Skip(err)
 			}
-			w.becomeCommand(m, p)
+			w.becomeCommand(m, &commandProcess{Pid: p.Pid})
 			// What becomeCommand sent, it sent before it returned.
 			if err := p.Signal(syscall.SIGTERM); err != nil {
 				t.Fatal(err)

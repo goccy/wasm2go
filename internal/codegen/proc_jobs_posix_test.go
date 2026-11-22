@@ -3,14 +3,33 @@
 package codegen
 
 import (
+	"errors"
 	"os"
 	"syscall"
 	"testing"
 )
 
+// A command whose pid is no child of the process's is taken for reaped by
+// its wait (ECHILD), and a signal to a pid the host has no process under
+// (ESRCH) reports os.ErrProcessDone, as os.Process does. The pid is above
+// the highest one either host gives a process.
+func TestCommandProcessGone(t *testing.T) {
+	const none = 1 << 30
+	p := &commandProcess{Pid: none}
+	if _, err := p.Wait(); !errors.Is(err, syscall.ECHILD) {
+		t.Fatalf("Wait = %v, want ECHILD", err)
+	}
+	if !p.reaped {
+		t.Error("a wait that found no child left the command unreaped")
+	}
+	if err := (&commandProcess{Pid: none}).Signal(syscall.Signal(0)); !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("Signal of a pid without a process = %v, want os.ErrProcessDone", err)
+	}
+}
+
 // spawnCommand starts argv as a command of w and returns its pid token and
 // its host process.
-func spawnCommand(t *testing.T, w *WasiStubs, m *Module, argv ...string) (int32, *os.Process) {
+func spawnCommand(t *testing.T, w *WasiStubs, m *Module, argv ...string) (int32, *commandProcess) {
 	t.Helper()
 	pid := spawnTestProc(t, w, m, argv...)
 	w.mu.Lock()
@@ -28,7 +47,7 @@ func waitStatus(t *testing.T, w *WasiStubs, m *Module, pid int32) uint32 {
 }
 
 // hostPgidOf returns the host's process group of p.
-func hostPgidOf(t *testing.T, p *os.Process) int {
+func hostPgidOf(t *testing.T, p *commandProcess) int {
 	t.Helper()
 	pgid, err := syscall.Getpgid(p.Pid)
 	if err != nil {
@@ -169,14 +188,15 @@ func TestJobs_HeldLeaderDeliversItsOutputFirst(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
-	leader := &wasiProc{host: p, done: make(chan struct{}), pgid: 5001}
+	command := &commandProcess{Pid: p.Pid}
+	leader := &wasiProc{host: command, done: make(chan struct{}), pgid: 5001}
 	member := &wasiProc{done: make(chan struct{}), pgid: 5001}
 	pids := &wasiPIDs{
 		procs:  map[int32]*wasiProc{5001: leader, 5002: member},
 		groups: map[int32]*jobGroup{5001: {host: p.Pid, leader: leader}},
 	}
 	delivered := false
-	status, reap := root.awaitLeader(pids, leader, &hostCommand{process: p, finish: func() { delivered = true }})
+	status, reap := root.awaitLeader(pids, leader, &hostCommand{process: command, finish: func() { delivered = true }})
 	if reap == nil || status != 3<<8 {
 		t.Fatalf("awaitLeader = %#x, %v; want an exit of 3, held", status, reap != nil)
 	}

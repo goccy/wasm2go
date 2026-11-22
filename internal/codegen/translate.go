@@ -766,8 +766,13 @@ func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
 	if t.multiPackage {
 		saveGlobals = "SaveGlobals"
 	}
+	runtimeFile := ""
+	if t.wasmImportsWasi() {
+		runtimeFile = "runtimeFile"
+	}
 	return sharedimage.Files(sharedimage.Names{
 		Pkg:         pkg,
+		RuntimeFile: runtimeFile,
 		Module:      "Module",
 		Memory:      t.fieldName("memory"),
 		MemSize:     t.fieldName("memSize"),

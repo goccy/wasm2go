@@ -52,6 +52,12 @@ func hostWakePipe() (r, w int, err error) {
 	return p[0], p[1], nil
 }
 
+// hostDupTo makes descriptor to a close-on-exec duplicate of fd in one step
+// (dup3), closing what to was open on.
+func hostDupTo(fd, to int) error {
+	return os.NewSyscallError("dup3", syscall.Dup3(fd, to, syscall.O_CLOEXEC))
+}
+
 // hostPollCall is poll(2): it waits no longer than timeout, and without
 // limit when timeout is negative.
 func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
@@ -532,8 +538,15 @@ func (w *WasiStubs) openFIFOWatched(m *Module, openFile func(name string, flag i
 		w.reportError("path_open", err)
 		return nil, _wasiESUCCESS, false
 	}
-	f, err := openFile(name, flag|syscall.O_NONBLOCK, perm)
-	if err != nil {
+	var f File
+	if err := makeRuntimeDescriptors(func() error {
+		var err error
+		if f, err = openFile(name, flag|syscall.O_NONBLOCK, perm); err != nil {
+			return err
+		}
+		f, err = keepRuntimeOpened(f)
+		return err
+	}); err != nil {
 		return nil, w.guestErrno("path_open", errors.Join(err, fw.Close())), true
 	}
 	ended := false
@@ -622,15 +635,32 @@ type fifoWatch struct {
 	tee    [2]int
 }
 
-// newFIFOWatch makes a fifoWatch, which watches nothing yet.
-func newFIFOWatch() (*fifoWatch, error) {
-	fd, err := syscall.InotifyInit1(syscall.IN_NONBLOCK | syscall.IN_CLOEXEC)
+// newFIFOWatch makes a fifoWatch, which watches nothing yet. Its
+// descriptors are made as the runtime makes its own
+// (makeRuntimeDescriptors).
+func newFIFOWatch() (fw *fifoWatch, err error) {
+	err = makeRuntimeDescriptors(func() error {
+		fd, err := syscall.InotifyInit1(syscall.IN_NONBLOCK | syscall.IN_CLOEXEC)
+		if err != nil {
+			return os.NewSyscallError("inotify_init1", err)
+		}
+		if fd, err = keepRuntimeFD(fd); err != nil {
+			return err
+		}
+		fw = &fifoWatch{events: os.NewFile(uintptr(fd), "inotify"), fd: fd}
+		if err := syscall.Pipe2(fw.tee[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+			return errors.Join(os.NewSyscallError("pipe2", err), fw.events.Close())
+		}
+		if fw.tee[0], err = keepRuntimeFD(fw.tee[0]); err != nil {
+			return errors.Join(err, hostCloseFD(fw.tee[1]), fw.events.Close())
+		}
+		if fw.tee[1], err = keepRuntimeFD(fw.tee[1]); err != nil {
+			return errors.Join(err, hostCloseFD(fw.tee[0]), fw.events.Close())
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, os.NewSyscallError("inotify_init1", err)
-	}
-	fw := &fifoWatch{events: os.NewFile(uintptr(fd), "inotify"), fd: fd}
-	if err := syscall.Pipe2(fw.tee[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
-		return nil, errors.Join(os.NewSyscallError("pipe2", err), fw.events.Close())
+		return nil, err
 	}
 	return fw, nil
 }

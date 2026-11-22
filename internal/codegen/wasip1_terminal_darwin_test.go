@@ -75,7 +75,7 @@ func TestFdIoctlPseudoTerminalMaster(t *testing.T) {
 	master, _ := openTestPty(t)
 	w, m := newProcTestStubs(t)
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{f: master})
+	fd := addTestFD(w, &wasiOpen{f: master})
 	w.mu.Unlock()
 	for _, request := range []uint32{linuxTIOCGPTN, linuxTIOCSPTLCK} {
 		if rc := guestIoctl(w, m, fd, request, termiosOff); rc != -_wasiENOTTY {

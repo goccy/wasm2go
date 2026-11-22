@@ -68,7 +68,7 @@ func TestWasi_CloseWakesWaitsOnceClosed(t *testing.T) {
 	closeAllAtCleanup(t, w)
 	conn, release := newCloseConn(t)
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{conn: conn})
+	fd := addTestFD(w, &wasiOpen{conn: conn})
 	op := w.openLocked(fd)
 	w.mu.Unlock()
 	wk, err := w.takeWake()
@@ -111,7 +111,7 @@ func TestWasi_OnlyTheLastSlotWakesWaits(t *testing.T) {
 		}
 	})
 	w.mu.Lock()
-	fd := w.addFDLocked(&wasiOpen{conn: local})
+	fd := addTestFD(w, &wasiOpen{conn: local})
 	op := w.openLocked(fd)
 	w.mu.Unlock()
 	wk, err := w.takeWake()
@@ -240,7 +240,7 @@ func pipeSlot(t *testing.T, w *WasiStubs, failing bool) int32 {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.addFDLocked(&wasiOpen{conn: conn})
+	return addTestFD(w, &wasiOpen{conn: conn})
 }
 
 // A close does not hold the instance's lock while the descriptor closes,
@@ -263,7 +263,7 @@ func TestWasi_CloseLetsOtherCallsGoOn(t *testing.T) {
 			closeAllAtCleanup(t, w)
 			conn, release := newCloseConn(t)
 			w.mu.Lock()
-			fd := w.addFDLocked(&wasiOpen{conn: conn})
+			fd := addTestFD(w, &wasiOpen{conn: conn})
 			w.mu.Unlock()
 			closed := make(chan int32, 1)
 			go func() { closed <- c.close(w, newForkTestModule(), fd) }()
