@@ -181,6 +181,10 @@ func hostErrnoOf(n int32) error {
 	return fmt.Errorf("wasi errno %d, which this host has no number of", n)
 }
 
+// hostNumberTable returns no numbers: the runtime has no table of this
+// host's.
+func hostNumberTable(family int32) []hostNumber { return nil }
+
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error; on this platform the errors are told apart
 // by what package os makes of them, except a few of windows.

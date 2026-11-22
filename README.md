@@ -257,7 +257,9 @@ report, `Services` the services database (`getservbyname`,
 in place of those of its own C library. A nil one is none: a lookup
 finds nothing (`ENOENT`), `uname` and `syslog` fail with `ENOSYS`, and
 the guest keeps its own numbers. `HostUsers()`, `HostSystem()`,
-`HostServices()` and `HostSyslog()` give the host's. The guest's
+`HostServices()`, `HostSyslog()` and `HostNumbering()` (the host's
+error numbers, signals, flags and socket options, ... on Linux and
+darwin) give the host's. The guest's
 `flock` locks a file of an `FS` that is a `LockFS` (what `HostFS` and
 `NewMemFS` return); `fcntl`'s record locks and `mkfifo` are the host's.
 A record lock is the instance's, as a process's: a forked copy does not

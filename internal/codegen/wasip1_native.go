@@ -13326,6 +13326,38 @@ type Numbering interface {
 	NumberAt(family, index int32) (name string, value int64, ok bool)
 }
 
+// HostNumbering returns the numbers of the host's system that the runtime
+// has, for WASIConfig.Numbering, each under its name in C. On linux and
+// darwin its families are the error numbers (1), the signals (2), the flags
+// of open (3), the events of poll (4), the address families (5), the socket
+// types (6), on linux the flags of a socket type (7), the socket level (8),
+// the socket options (9), the options of IP (10), IPv6 (11) and TCP (12),
+// the flags of send and recv (13), of getaddrinfo (14) and getnameinfo
+// (15), the errors of getaddrinfo (16), the locale categories (17), how
+// sigprocmask changes the mask (18), the flags of sigaction (19), the
+// commands of fcntl (20), the requests of ioctl (21), the items of
+// nl_langinfo (22) and, on darwin, the terminal settings (23). On the mips
+// architectures of linux it has only the numbers package syscall has. On
+// another system it has none.
+func HostNumbering() Numbering { return hostNumbering{} }
+
+// hostNumbering is the Numbering HostNumbering returns.
+type hostNumbering struct{}
+
+func (hostNumbering) NumberAt(family, index int32) (string, int64, bool) {
+	numbers := hostNumberTable(family)
+	if index < 0 || int(index) >= len(numbers) {
+		return "", 0, false
+	}
+	return numbers[index].name, numbers[index].value, true
+}
+
+// hostNumber is a number of the operating system under its name in C.
+type hostNumber struct {
+	name  string
+	value int64
+}
+
 // Host_numbering is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "host_numbering"): it tells the guest whose
 // numbers its program sees. 0: the numbers of the guest's own C library,
@@ -17898,6 +17930,10 @@ var (
 	wasip1NativeLinuxMIPSReusePortRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
+	//go:embed wasip1_hostnumbers_linux_headers.go
+	wasip1HostNumbersLinuxHeadersRaw []byte
+	//go:embed wasip1_hostnumbers_linux_noheaders.go
+	wasip1HostNumbersLinuxNoHeadersRaw []byte
 	//go:embed wasip1_hostnumbers_darwin.go
 	wasip1HostNumbersDarwinRaw []byte
 
@@ -17938,8 +17974,10 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_linux_reuseport.go":     wasip1NativeLinuxReusePortRaw,
 		"wasip1_native_linux_mipsreuseport.go": wasip1NativeLinuxMIPSReusePortRaw,
 
-		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
-		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,
+		"wasip1_hostnumbers_linux.go":           wasip1HostNumbersLinuxRaw,
+		"wasip1_hostnumbers_linux_headers.go":   wasip1HostNumbersLinuxHeadersRaw,
+		"wasip1_hostnumbers_linux_noheaders.go": wasip1HostNumbersLinuxNoHeadersRaw,
+		"wasip1_hostnumbers_darwin.go":          wasip1HostNumbersDarwinRaw,
 
 		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
 		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
