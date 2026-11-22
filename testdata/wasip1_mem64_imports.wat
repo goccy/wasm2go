@@ -190,6 +190,34 @@
     (func $proc_syslog (param i32 i32 i32 i64 i32 i64 i32) (result i32)))
   (import "wasip1_posix_extension" "proc_syslog_close"
     (func $proc_syslog_close (result i32)))
+  (import "wasi_snapshot_preview1" "sock_socket"
+    (func $sock_socket (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_connect"
+    (func $sock_connect (param i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_accept"
+    (func $sock_accept (param i32 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_recv"
+    (func $sock_recv (param i32 i64 i64 i32 i64 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_send"
+    (func $sock_send (param i32 i64 i64 i32 i64) (result i32)))
+  (import "wasi_snapshot_preview1" "sock_shutdown"
+    (func $sock_shutdown (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "sock_open"
+    (func $sock_open (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "sock_bind_addr"
+    (func $sock_bind_addr (param i32 i64 i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "sock_listen"
+    (func $sock_listen (param i32 i32) (result i32)))
+  (import "wasip1_posix_extension" "sock_connect_addr"
+    (func $sock_connect_addr (param i32 i64 i64 i32) (result i32)))
+  (import "wasip1_posix_extension" "sock_name"
+    (func $sock_name (param i32 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_sendto_addr"
+    (func $sock_sendto_addr (param i32 i64 i32 i32 i64 i64 i32 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_recvfrom_addr"
+    (func $sock_recvfrom_addr (param i32 i64 i32 i32 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "sock_socketpair"
+    (func $sock_socketpair (param i32 i32 i64) (result i32)))
 
   (memory (export "memory") i64 1)
 
@@ -286,5 +314,19 @@
     (drop (call $proc_syslog_open (i64.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
     (drop (call $proc_syslog (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i32.const 0)))
     (drop (call $proc_syslog_close))
+    (drop (call $sock_socket (i32.const 0) (i32.const 0)))
+    (drop (call $sock_connect (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $sock_accept (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_recv (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_send (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_shutdown (i32.const 0) (i32.const 0)))
+    (drop (call $sock_open (i32.const 0) (i32.const 0)))
+    (drop (call $sock_bind_addr (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $sock_listen (i32.const 0) (i32.const 0)))
+    (drop (call $sock_connect_addr (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0)))
+    (drop (call $sock_name (i32.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_sendto_addr (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0) (i32.const 0) (i64.const 0)))
+    (drop (call $sock_recvfrom_addr (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $sock_socketpair (i32.const 0) (i32.const 0) (i64.const 0)))
   )
 )

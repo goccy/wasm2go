@@ -8,8 +8,10 @@ import (
 	"io/fs"
 	"log/syslog"
 	"math"
+	"net"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -264,10 +266,11 @@ func writevRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 }
 
 // messageIO makes system call trap, recvmsg(2) or sendmsg(2)
-// (hostSysRecvmsg, hostSysSendmsg), on socket fd over iov once, without
-// waiting (MSG_DONTWAIT): see hostIO. (syscall.Recvmsg and SendmsgN take
-// one buffer, not the guest's iovecs.)
-func messageIO(trap, fd uintptr, iov []syscall.Iovec) (n int, again bool, err error) {
+// (hostSysRecvmsg, hostSysSendmsg), on socket fd over iov once, with flags
+// (MSG_*): see hostIO. msgFlags are the flags the host gives back (a
+// receive's MSG_TRUNC). (syscall.Recvmsg and SendmsgN take one buffer, not
+// the guest's iovecs.)
+func messageIO(trap, fd uintptr, iov []syscall.Iovec, flags int) (n int, msgFlags int32, again bool, err error) {
 	var h syscall.Msghdr
 	if len(iov) > 0 {
 		h.Iov = &iov[0]
@@ -275,18 +278,20 @@ func messageIO(trap, fd uintptr, iov []syscall.Iovec) (n int, again bool, err er
 			h.Iovlen++ // its type differs from host to host
 		}
 	}
-	return hostIO(func() (uintptr, syscall.Errno) {
-		r, _, errno := syscall.Syscall(trap, fd, uintptr(unsafe.Pointer(&h)), syscall.MSG_DONTWAIT)
+	n, again, err = hostIO(func() (uintptr, syscall.Errno) {
+		r, _, errno := syscall.Syscall(trap, fd, uintptr(unsafe.Pointer(&h)), uintptr(flags))
 		runtime.KeepAlive(&h)
 		runtime.KeepAlive(iov)
 		return r, errno
 	})
+	return n, h.Flags, again, err
 }
 
 // recvNow receives into bufs from socket fd without waiting.
 func recvNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 	iov, _ := hostIovecs(bufs)
-	return messageIO(hostSysRecvmsg, fd, iov)
+	n, _, again, err = messageIO(hostSysRecvmsg, fd, iov, syscall.MSG_DONTWAIT)
+	return n, again, err
 }
 
 // sendNow sends bufs to socket fd without waiting.
@@ -295,7 +300,8 @@ func sendNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 	if err != nil {
 		return 0, false, err
 	}
-	return messageIO(hostSysSendmsg, fd, iov)
+	n, _, again, err = messageIO(hostSysSendmsg, fd, iov, syscall.MSG_DONTWAIT)
+	return n, again, err
 }
 
 // hostCloseFD closes a descriptor of the runtime's own.
@@ -641,3 +647,234 @@ func clearHostNonblock(f File) error {
 // hostONonblock is the open flag of the host that opens a file without
 // waiting (a FIFO nobody writes to, or reads from).
 const hostONonblock = syscall.O_NONBLOCK
+
+// ----- sockets ----------------------------------------------------------------
+
+// hostOpensSockets says that the runtime makes sockets of the host's.
+const hostOpensSockets = true
+
+// hostDomain is the host's address family of a guest's (wasiSockFamily*).
+func hostDomain(family int32) int {
+	switch family {
+	case wasiSockFamilyIPv6:
+		return syscall.AF_INET6
+	case wasiSockFamilyUnix:
+		return syscall.AF_UNIX
+	}
+	return syscall.AF_INET
+}
+
+// hostSocketType is the host's socket type of a datagram socket (dgram) or a
+// stream one.
+func hostSocketType(dgram bool) int {
+	if dgram {
+		return syscall.SOCK_DGRAM
+	}
+	return syscall.SOCK_STREAM
+}
+
+// openHostSocket makes a socket of the host's of the family and type, in
+// non-blocking mode and closed on exec (hostSocketFD).
+func openHostSocket(family int32, dgram bool) (*os.File, error) {
+	fd, err := hostSocketFD(hostDomain(family), hostSocketType(dgram))
+	if err != nil {
+		return nil, os.NewSyscallError("socket", err)
+	}
+	return os.NewFile(uintptr(fd), "socket"), nil
+}
+
+// hostSocketPair makes two connected Unix-domain sockets of the host's of
+// the type, in non-blocking mode and closed on exec (hostSocketPairFDs).
+func hostSocketPair(dgram bool) (a, b *os.File, err error) {
+	fds, err := hostSocketPairFDs(hostSocketType(dgram))
+	if err != nil {
+		return nil, nil, os.NewSyscallError("socketpair", err)
+	}
+	return os.NewFile(uintptr(fds[0]), "socket"), os.NewFile(uintptr(fds[1]), "socket"), nil
+}
+
+// hostSockaddr is the host's address of the guest's a; hostPath is the
+// host's name of a Unix-domain one (unixHostPath).
+func hostSockaddr(a wasiSockAddr, hostPath string) syscall.Sockaddr {
+	switch a.family {
+	case wasiSockFamilyIPv4:
+		sa := &syscall.SockaddrInet4{Port: a.port}
+		copy(sa.Addr[:], a.ip.To4())
+		return sa
+	case wasiSockFamilyIPv6:
+		sa := &syscall.SockaddrInet6{Port: a.port, ZoneId: a.scope}
+		copy(sa.Addr[:], a.ip.To16())
+		return sa
+	}
+	return &syscall.SockaddrUnix{Name: hostPath}
+}
+
+// guestSockAddr is the guest's address of the host's sa: of family 0 for
+// none.
+func guestSockAddr(sa syscall.Sockaddr) wasiSockAddr {
+	switch sa := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return wasiSockAddr{family: wasiSockFamilyIPv4, ip: append(net.IP(nil), sa.Addr[:]...), port: sa.Port}
+	case *syscall.SockaddrInet6:
+		return wasiSockAddr{family: wasiSockFamilyIPv6, ip: append(net.IP(nil), sa.Addr[:]...), port: sa.Port, scope: sa.ZoneId}
+	case *syscall.SockaddrUnix:
+		return wasiSockAddr{family: wasiSockFamilyUnix, name: unixGuestName(sa.Name)}
+	}
+	return wasiSockAddr{}
+}
+
+// hostBind binds socket fd to a (bind(2)).
+func hostBind(fd int, a wasiSockAddr, hostPath string) error {
+	return os.NewSyscallError("bind", syscall.Bind(fd, hostSockaddr(a, hostPath)))
+}
+
+// hostListen makes socket fd listen (listen(2)).
+func hostListen(fd, backlog int) error {
+	return os.NewSyscallError("listen", syscall.Listen(fd, backlog))
+}
+
+// hostAccept accepts a connection on socket fd (accept(2)) without
+// waiting, as hostAcceptFD makes it; again reports that none is waiting. A
+// connection that was aborted before it was accepted is none, as Go's
+// internal/poll has it.
+func hostAccept(fd int) (conn int, again bool, err error) {
+	for {
+		conn, err := hostAcceptFD(fd)
+		switch {
+		case err == nil:
+			return conn, false, nil
+		case errors.Is(err, syscall.EINTR), errors.Is(err, syscall.ECONNABORTED):
+			continue
+		case errors.Is(err, syscall.EAGAIN):
+			return -1, true, nil
+		}
+		return -1, false, os.NewSyscallError("accept", err)
+	}
+}
+
+// hostConnect starts connecting socket fd to a (connect(2)), which does not
+// wait: EINPROGRESS for a connection that is not made at once. For a of
+// family 0 it gives the host AF_UNSPEC, which package syscall has no
+// address of.
+func hostConnect(fd int, a wasiSockAddr, hostPath string) error {
+	if a.family != 0 {
+		return os.NewSyscallError("connect", syscall.Connect(fd, hostSockaddr(a, hostPath)))
+	}
+	unspec := syscall.RawSockaddr{Family: syscall.AF_UNSPEC}
+	_, _, errno := syscall.Syscall(hostSysConnect, uintptr(fd), uintptr(unsafe.Pointer(&unspec)), unsafe.Sizeof(unspec))
+	if errno != 0 {
+		return os.NewSyscallError("connect", errno)
+	}
+	return nil
+}
+
+// hostConnectDone reports whether the connection socket fd started has
+// ended (again: not yet), and how: as Go's package net finds out (netFD's
+// connect), SO_ERROR gives the failure, and with none, getpeername tells a
+// connection made from one still under way.
+func hostConnectDone(fd int) (again bool, err error) {
+	failure, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+	if err != nil {
+		return false, os.NewSyscallError("getsockopt", err)
+	}
+	switch e := syscall.Errno(failure); e {
+	case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
+		return true, nil
+	case 0:
+		// woken without the connection made (Go's issues 14548, 19289)
+		switch _, err := syscall.Getpeername(fd); err {
+		case nil:
+			return false, nil
+		case syscall.ENOTCONN:
+			return true, nil
+		default:
+			return false, os.NewSyscallError("getpeername", err)
+		}
+	default:
+		return false, os.NewSyscallError("connect", e)
+	}
+}
+
+// hostSocketName returns the name of socket fd, or of its peer
+// (getsockname(2), getpeername(2)).
+func hostSocketName(fd int, peer bool) (wasiSockAddr, error) {
+	if peer {
+		sa, err := syscall.Getpeername(fd)
+		return guestSockAddr(sa), os.NewSyscallError("getpeername", err)
+	}
+	sa, err := syscall.Getsockname(fd)
+	return guestSockAddr(sa), os.NewSyscallError("getsockname", err)
+}
+
+// hostReceive receives into bufs from socket fd once, without waiting
+// (recvmsg(2)); peek leaves what it receives there (MSG_PEEK). truncated
+// reports a datagram cut to the buffers; see hostIO for the rest.
+func hostReceive(fd int, bufs [][]byte, peek bool) (n int, truncated, again bool, err error) {
+	flags := syscall.MSG_DONTWAIT
+	if peek {
+		flags |= syscall.MSG_PEEK
+	}
+	iov, _ := hostIovecs(bufs)
+	n, msgFlags, again, err := messageIO(hostSysRecvmsg, uintptr(fd), iov, flags)
+	return n, msgFlags&syscall.MSG_TRUNC != 0, again, os.NewSyscallError("recvmsg", err)
+}
+
+// hostReceiveFrom receives into buf from socket fd once, without waiting,
+// and returns the sender (recvmsg(2)); peek leaves what it receives there.
+// See hostIO for the rest.
+func hostReceiveFrom(fd int, buf []byte, peek bool) (n int, from wasiSockAddr, again bool, err error) {
+	flags := syscall.MSG_DONTWAIT
+	if peek {
+		flags |= syscall.MSG_PEEK
+	}
+	var sa syscall.Sockaddr
+	n, again, err = hostIO(func() (uintptr, syscall.Errno) {
+		k, _, _, got, err := syscall.Recvmsg(fd, buf, nil, flags)
+		sa = got
+		return uintptr(k), errnoOf(err)
+	})
+	return n, guestSockAddr(sa), again, os.NewSyscallError("recvmsg", err)
+}
+
+// hostSend sends bufs on socket fd once, without waiting (sendmsg(2)): to
+// the address to, with hostPath the host's name of a Unix-domain one, or,
+// for to nil, to the socket's peer. See hostIO for the rest.
+func hostSend(fd int, bufs [][]byte, to *wasiSockAddr, hostPath string) (n int, again bool, err error) {
+	if to == nil && firstBuffer(bufs) != nil {
+		n, again, err = sendNow(uintptr(fd), bufs)
+		return n, again, os.NewSyscallError("sendmsg", err)
+	}
+	// A send to an address, or of nothing (one empty iovec: darwin
+	// refuses none)
+	var sa syscall.Sockaddr
+	if to != nil {
+		sa = hostSockaddr(*to, hostPath)
+	}
+	buf := slices.Concat(bufs...)
+	n, again, err = hostIO(func() (uintptr, syscall.Errno) {
+		k, err := syscall.SendmsgN(fd, buf, nil, sa, syscall.MSG_DONTWAIT)
+		return uintptr(k), errnoOf(err)
+	})
+	return n, again, os.NewSyscallError("sendmsg", err)
+}
+
+// errnoOf is the error number err of a call of package syscall is, which
+// returns no other: 0 for none.
+func errnoOf(err error) syscall.Errno {
+	var errno syscall.Errno
+	errors.As(err, &errno)
+	return errno
+}
+
+// hostShutdown shuts the halves how (1 reading, 2 writing) of socket fd
+// down (shutdown(2)).
+func hostShutdown(fd int, how int32) error {
+	halves := syscall.SHUT_RDWR
+	switch how {
+	case 0x1:
+		halves = syscall.SHUT_RD
+	case 0x2:
+		halves = syscall.SHUT_WR
+	}
+	return os.NewSyscallError("shutdown", syscall.Shutdown(fd, halves))
+}
