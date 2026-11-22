@@ -608,6 +608,8 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"path_access", func() int32 { return w.Path_access64(m, highAddr, 1, 0, 0) }, -_wasiEFAULT},
 		{"path_mkfifo", func() int32 { return w.Path_mkfifo64(m, highAddr, 1, 0o600) }, -_wasiEFAULT},
 		{"fd_lock", func() int32 { return w.Fd_lock64(m, fd, 0, highAddr) }, -_wasiEFAULT},
+		{"sock_getopt", func() int32 { return w.Sock_getopt64(m, fd, 1, highAddr) }, -_wasiEFAULT},
+		{"sock_timeout", func() int32 { return w.Sock_timeout64(m, fd, 1, 0, 0, highAddr) }, -_wasiEFAULT},
 	} {
 		before := bytes.Clone(m.memory)
 		if got := tc.call(); got != tc.want {

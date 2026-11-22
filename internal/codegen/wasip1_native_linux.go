@@ -342,6 +342,12 @@ func setHostPriority(which, who, nice int) error {
 // names (a leading NUL), which are no files.
 const hostAbstractSockets = true
 
+// hostSOLinger is the name of SO_LINGER, whose time is in seconds.
+const hostSOLinger = syscall.SO_LINGER
+
+// hostTCPDeferAccept is the name of TCP_DEFER_ACCEPT.
+const hostTCPDeferAccept = syscall.TCP_DEFER_ACCEPT
+
 // hostSocketFD makes a socket of the host's, in non-blocking mode and
 // closed on exec at once, as Go's package net makes one (sysSocket).
 func hostSocketFD(domain, typ int) (int, error) {

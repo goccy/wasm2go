@@ -295,3 +295,11 @@ func hostSend(fd int, bufs [][]byte, to *wasiSockAddr, hostPath string) (n int, 
 }
 
 func hostShutdown(fd int, how int32) error { return errors.ErrUnsupported }
+
+func setHostSockOpt(fd int, option, value int32) error { return errors.ErrUnsupported }
+
+func getHostSockOpt(fd int, option int32) (int32, error) { return 0, errors.ErrUnsupported }
+
+func hostSocketTimeout(fd int, send bool) (time.Duration, error) { return 0, errors.ErrUnsupported }
+
+func setHostSocketTimeout(fd int, send bool, d time.Duration) error { return errors.ErrUnsupported }

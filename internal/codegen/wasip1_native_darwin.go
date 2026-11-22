@@ -101,6 +101,8 @@ const (
 	hostSysRecvmsg = syscall.SYS_RECVMSG
 	hostSysSendmsg = syscall.SYS_SENDMSG
 	hostSysConnect = syscall.SYS_CONNECT
+
+	hostSysGetsockopt = syscall.SYS_GETSOCKOPT
 )
 
 // hostWakePipe makes a pipe whose ends do not wait and are closed on exec:
@@ -213,6 +215,17 @@ const hostRecordLocksOfDescription = false
 // hostAbstractSockets says that Unix-domain sockets here have no abstract
 // names.
 const hostAbstractSockets = false
+
+// hostSOLinger is the name of SO_LINGER_SEC, the SO_LINGER whose time is
+// in seconds (darwin's SO_LINGER counts in clock ticks).
+const hostSOLinger = syscall.SO_LINGER_SEC
+
+// hostSOReusePort is the name of SO_REUSEPORT.
+const hostSOReusePort = syscall.SO_REUSEPORT
+
+// hostTCPDeferAccept is the name of TCP_DEFER_ACCEPT, which darwin has not
+// (-1).
+const hostTCPDeferAccept = -1
 
 // hostSocketFD makes a socket of the host's, closed on exec under
 // syscall.ForkLock and in non-blocking mode, as Go's package net makes one

@@ -8274,10 +8274,11 @@ func (w *WasiStubs) Sock_shutdown(m *Module, fd, how int32) int32 {
 // (fd_fdstat_set_flags) is the entry's alone (fdflags). A call of the
 // guest that is to wait — a blocking accept, receive, send, or a connect
 // that is not made at once — waits in poll(2) between attempts
-// (socketWait), and a signal posted to the guest meanwhile ends it with
-// EINTR. What the socket is — bound, listening, connecting, connected,
-// shut down, the peer of a datagram socket — is the host's to know and to
-// say: the runtime keeps only what the policies have allowed the socket
+// (socketWait), no longer than the socket's timeout, and a signal posted
+// to the guest meanwhile ends it with EINTR. What the socket is — bound,
+// listening, connecting, connected, shut down, the peer of a datagram
+// socket, its options and timeouts — is the host's to know and to say:
+// the runtime keeps only what the policies have allowed the socket
 // (wasiSocket.reachable) and the names of a Unix-domain socket as the
 // guest gave them.
 //
@@ -8644,10 +8645,16 @@ func (w *WasiStubs) destination(op *wasiOpen, a wasiSockAddr, path string) (stri
 // and Go's internal/poll do: a call that does not wait (nonblocking) makes
 // it once and reports EAGAIN when it would. A blocking one waits in poll(2)
 // for what want names (hostWant...) between attempts, and a signal posted
-// to the guest meanwhile ends the wait with EINTR. A host socket closed
-// meanwhile is EBADF. Returns the errno of the attempt that did not have to
-// wait. call is the import's name.
-func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want int, nonblocking bool, attempt func(fd int) (again bool, err error)) int32 {
+// to the guest meanwhile ends the wait with EINTR. It waits no longer than
+// the socket's timeout, which it reads at its first wait, as gVisor fixes
+// a call's deadline once: the receive timeout (SO_RCVTIMEO) for input or a
+// connection, the send timeout (SO_SNDTIMEO) for room; once that has passed
+// it reports expired. A host socket closed meanwhile is EBADF. Returns the
+// errno of the attempt that did not have to wait. call is the import's
+// name.
+func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want int, nonblocking bool, expired int32, attempt func(fd int) (again bool, err error)) int32 {
+	waited := false
+	var until time.Time
 	for {
 		var again bool
 		var failed error
@@ -8659,9 +8666,23 @@ func (w *WasiStubs) socketWait(call string, op *wasiOpen, host *os.File, want in
 			return mapOSError(failed)
 		case nonblocking:
 			return _wasiEAGAIN
+		case waited && !until.IsZero() && !time.Now().Before(until):
+			return expired
+		case !waited:
+			var timeout time.Duration
+			if errno := socketCall(host, func(fd int) { timeout, failed = hostSocketTimeout(fd, want == hostWantRoom) }); errno != _wasiESUCCESS {
+				return errno
+			}
+			if failed != nil {
+				return mapOSError(failed)
+			}
+			if timeout > 0 {
+				until = time.Now().Add(timeout)
+			}
+			waited = true
 		}
 		set := []hostWaitFD{{stream: host, want: want, op: op}}
-		interrupted, err := w.waitHostInterruptibly(call, set, time.Time{})
+		interrupted, err := w.waitHostInterruptibly(call, set, until)
 		if err != nil {
 			return mapOSError(err)
 		}
@@ -8700,7 +8721,7 @@ func (w *WasiStubs) socketReceive(call string, op *wasiOpen, host *os.File, bufs
 	waitAll := flags&wasiMsgWaitAll != 0 && !op.dgram && !peek
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
 	got := 0
-	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, func(fd int) (bool, error) {
+	errno = w.socketWait(call, op, host, hostWantInput, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		start := got
 		if peek {
 			start = 0
@@ -8748,7 +8769,7 @@ func (w *WasiStubs) socketSend(call string, op *wasiOpen, host *os.File, bufs []
 	// a send does not wait, where Linux would.
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0 || op.family == wasiSockFamilyUnix && op.dgram && to != nil
 	sent := 0
-	errno := w.socketWait(call, op, host, hostWantRoom, nonblocking, func(fd int) (bool, error) {
+	errno := w.socketWait(call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
 		k, again, err := hostSend(fd, leadingFrom(bufs, sent), to, hostPath)
 		if err != nil || again {
 			return again, err
@@ -8913,7 +8934,7 @@ func (w *WasiStubs) acceptSocket(op *wasiOpen, host *os.File, fdflags int32) (in
 		return 0, _wasiEACCES
 	}
 	conn := -1
-	errno := w.socketWait("sock_accept", op, host, hostWantInput, op.nonblocking(), func(fd int) (bool, error) {
+	errno := w.socketWait("sock_accept", op, host, hostWantInput, op.nonblocking(), _wasiEAGAIN, func(fd int) (bool, error) {
 		var again bool
 		var err error
 		conn, again, err = hostAccept(fd)
@@ -9015,7 +9036,7 @@ func (w *WasiStubs) connectSocket(call string, op *wasiOpen, host *os.File, a wa
 	if !underWay || op.nonblocking() {
 		return mapOSError(started)
 	}
-	if errno := w.socketWait(call, op, host, hostWantRoom, false, hostConnectDone); errno != _wasiESUCCESS {
+	if errno := w.socketWait(call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
 		return errno
 	}
 	// The host takes the socket for connected, and refuses a later connect
@@ -9190,7 +9211,7 @@ func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen,
 	}
 	var from wasiSockAddr
 	n := 0
-	errno = w.socketWait("sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, func(fd int) (bool, error) {
+	errno = w.socketWait("sock_recvfrom_addr", op, host, hostWantInput, op.nonblocking() || flags&wasiMsgDontWait != 0, _wasiEAGAIN, func(fd int) (bool, error) {
 		var again bool
 		var err error
 		n, from, again, err = hostReceiveFrom(fd, buf, flags&wasiMsgPeek != 0)
@@ -9242,6 +9263,140 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 		fd := w.addFDLocked(&wasiOpen{isSocket: true, family: wasiSockFamilyUnix, dgram: dgram, sock: &wasiSocket{host: host}})
 		binary.LittleEndian.PutUint32(out[4*i:], uint32(fd))
 	}
+	return _wasiESUCCESS
+}
+
+// The socket options of Sock_setopt and Sock_getopt, as the guest's C
+// library names them to the imports (a libc's option numbers differ from
+// libc to libc).
+const (
+	wasiSockOptReuseAddr int32 = 1  // SO_REUSEADDR
+	wasiSockOptReusePort int32 = 2  // SO_REUSEPORT
+	wasiSockOptKeepAlive int32 = 3  // SO_KEEPALIVE
+	wasiSockOptNoDelay   int32 = 4  // TCP_NODELAY
+	wasiSockOptRcvBuf    int32 = 5  // SO_RCVBUF
+	wasiSockOptSndBuf    int32 = 6  // SO_SNDBUF
+	wasiSockOptLinger    int32 = 7  // SO_LINGER: seconds, or -1 for off
+	wasiSockOptError     int32 = 8  // SO_ERROR (read only): the guest's errno
+	wasiSockOptType      int32 = 9  // SO_TYPE (read only): a wasiSockType
+	wasiSockOptAccepting int32 = 10 // SO_ACCEPTCONN (read only)
+	wasiSockOptV6Only    int32 = 11 // IPV6_V6ONLY
+	wasiSockOptBroadcast int32 = 12 // SO_BROADCAST
+	wasiSockOptDefer     int32 = 13 // TCP_DEFER_ACCEPT: seconds
+)
+
+// The two timeouts of a socket, as Sock_timeout names them.
+const (
+	wasiSockTimeoutReceive int32 = 1 // SO_RCVTIMEO
+	wasiSockTimeoutSend    int32 = 2 // SO_SNDTIMEO
+)
+
+// Sock_setopt is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_setopt") backing setsockopt() for the options above: it sets
+// the option of the socket fd's host socket to value, as setsockopt(2)
+// does. Returns 0, or a negative errno: ENOPROTOOPT for an option that is
+// unknown, or that the host has not, and the host's, such as ENOPROTOOPT
+// for an option it only reads.
+func (w *WasiStubs) Sock_setopt(m *Module, fd, option, value int32) int32 {
+	_, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var failed error
+	if errno := socketCall(host, func(fd int) { failed = setHostSockOpt(fd, option, value) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	return -mapOSError(failed)
+}
+
+// Sock_setopt64 is Sock_setopt for a memory64 guest.
+func (w *WasiStubs) Sock_setopt64(m *Module, fd, option, value int32) int32 {
+	return w.Sock_setopt(m, fd, option, value)
+}
+
+// Sock_getopt is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_getopt") backing getsockopt() for the options above: it
+// writes the value of the option of the socket fd's host socket (i32) at
+// valuePtr, as getsockopt(2) gives it (getHostSockOpt). Returns 0, or a
+// negative errno as Sock_setopt does.
+func (w *WasiStubs) Sock_getopt(m *Module, fd, option, valuePtr int32) int32 {
+	return w.sockGetopt(m, fd, option, zext(valuePtr))
+}
+
+// Sock_getopt64 is Sock_getopt for a memory64 guest.
+func (w *WasiStubs) Sock_getopt64(m *Module, fd, option int32, valuePtr int64) int32 {
+	return w.sockGetopt(m, fd, option, uint64(valuePtr))
+}
+
+// sockGetopt is the body of Sock_getopt and Sock_getopt64.
+func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int32 {
+	out := w.memBytes(m, valuePtr, 4)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	_, host, errno := w.rawSocketOf(fd)
+	if errno != _wasiESUCCESS {
+		return -errno
+	}
+	var value int32
+	var failed error
+	if errno := socketCall(host, func(fd int) { value, failed = getHostSockOpt(fd, option) }); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if failed != nil {
+		return -mapOSError(failed)
+	}
+	binary.LittleEndian.PutUint32(out, uint32(value))
+	return _wasiESUCCESS
+}
+
+// Sock_timeout is a NON-STANDARD host import (module wasip1_posix_extension,
+// name "sock_timeout") backing SO_RCVTIMEO and SO_SNDTIMEO: which names the
+// timeout (wasiSockTimeout...), which is the host socket's. The timeout
+// before the call is written at oldPtr in nanoseconds (i64; 0 is no limit);
+// when set is non-zero it is then replaced by nanos, in microseconds
+// rounded up. A blocking receive or accept that has waited the receive
+// timeout gives up with EAGAIN, as a blocking send does that has waited
+// the send timeout, and a blocking connect with EINPROGRESS (socketWait).
+// A connection accepted on the socket has its timeouts, as the host gives
+// them. Returns 0, or a negative errno: EINVAL for another which or a
+// negative time, and the host's.
+func (w *WasiStubs) Sock_timeout(m *Module, fd, which, set int32, nanos int64, oldPtr int32) int32 {
+	return w.sockTimeout(m, fd, which, set, nanos, zext(oldPtr))
+}
+
+// Sock_timeout64 is Sock_timeout for a memory64 guest.
+func (w *WasiStubs) Sock_timeout64(m *Module, fd, which, set int32, nanos, oldPtr int64) int32 {
+	return w.sockTimeout(m, fd, which, set, nanos, uint64(oldPtr))
+}
+
+// sockTimeout is the body of Sock_timeout and Sock_timeout64.
+func (w *WasiStubs) sockTimeout(m *Module, fd, which, set int32, nanos int64, oldPtr uint64) int32 {
+	out := w.memBytes(m, oldPtr, 8)
+	if out == nil {
+		return -_wasiEFAULT
+	}
+	_, host, errno := w.rawSocketOf(fd)
+	switch {
+	case errno != _wasiESUCCESS:
+		return -errno
+	case which != wasiSockTimeoutReceive && which != wasiSockTimeoutSend, set != 0 && nanos < 0:
+		return -_wasiEINVAL
+	}
+	send := which == wasiSockTimeoutSend
+	var old time.Duration
+	var failed error
+	if errno := socketCall(host, func(fd int) {
+		if old, failed = hostSocketTimeout(fd, send); failed == nil && set != 0 {
+			failed = setHostSocketTimeout(fd, send, time.Duration(nanos))
+		}
+	}); errno != _wasiESUCCESS {
+		return -errno
+	}
+	if failed != nil {
+		return -mapOSError(failed)
+	}
+	binary.LittleEndian.PutUint64(out, uint64(old))
 	return _wasiESUCCESS
 }
 
@@ -13623,6 +13778,10 @@ var (
 	wasip1NativeLinuxMsgRaw []byte
 	//go:embed wasip1_native_linux_386.go
 	wasip1NativeLinux386Raw []byte
+	//go:embed wasip1_native_linux_reuseport.go
+	wasip1NativeLinuxReusePortRaw []byte
+	//go:embed wasip1_native_linux_mipsreuseport.go
+	wasip1NativeLinuxMIPSReusePortRaw []byte
 	//go:embed wasip1_hostnumbers_linux.go
 	wasip1HostNumbersLinuxRaw []byte
 	//go:embed wasip1_hostnumbers_darwin.go
@@ -13648,6 +13807,9 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 
 		"wasip1_native_linux_msg.go": wasip1NativeLinuxMsgRaw,
 		"wasip1_native_linux_386.go": wasip1NativeLinux386Raw,
+
+		"wasip1_native_linux_reuseport.go":     wasip1NativeLinuxReusePortRaw,
+		"wasip1_native_linux_mipsreuseport.go": wasip1NativeLinuxMIPSReusePortRaw,
 
 		"wasip1_hostnumbers_linux.go":  wasip1HostNumbersLinuxRaw,
 		"wasip1_hostnumbers_darwin.go": wasip1HostNumbersDarwinRaw,

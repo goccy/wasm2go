@@ -866,6 +866,144 @@ func errnoOf(err error) syscall.Errno {
 	return errno
 }
 
+// hostSockOpt returns the level and name of a socket option of Sock_setopt
+// and Sock_getopt (wasiSockOpt...) as the host has it, and whether it has
+// it.
+func hostSockOpt(option int32) (level, name int, held bool) {
+	switch option {
+	case wasiSockOptReuseAddr:
+		return syscall.SOL_SOCKET, syscall.SO_REUSEADDR, true
+	case wasiSockOptReusePort:
+		return syscall.SOL_SOCKET, hostSOReusePort, true
+	case wasiSockOptKeepAlive:
+		return syscall.SOL_SOCKET, syscall.SO_KEEPALIVE, true
+	case wasiSockOptNoDelay:
+		return syscall.IPPROTO_TCP, syscall.TCP_NODELAY, true
+	case wasiSockOptRcvBuf:
+		return syscall.SOL_SOCKET, syscall.SO_RCVBUF, true
+	case wasiSockOptSndBuf:
+		return syscall.SOL_SOCKET, syscall.SO_SNDBUF, true
+	case wasiSockOptLinger:
+		return syscall.SOL_SOCKET, hostSOLinger, true
+	case wasiSockOptError:
+		return syscall.SOL_SOCKET, syscall.SO_ERROR, true
+	case wasiSockOptType:
+		return syscall.SOL_SOCKET, syscall.SO_TYPE, true
+	case wasiSockOptAccepting:
+		return syscall.SOL_SOCKET, syscall.SO_ACCEPTCONN, true
+	case wasiSockOptV6Only:
+		return syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, true
+	case wasiSockOptBroadcast:
+		return syscall.SOL_SOCKET, syscall.SO_BROADCAST, true
+	case wasiSockOptDefer:
+		return syscall.IPPROTO_TCP, hostTCPDeferAccept, hostTCPDeferAccept >= 0
+	}
+	return 0, 0, false
+}
+
+// setHostSockOpt sets option (wasiSockOpt...) of socket fd to value
+// (setsockopt(2)); linger is in seconds, or -1 for off. An option the host
+// has not is ENOPROTOOPT; the host refuses one it only reads.
+func setHostSockOpt(fd int, option, value int32) error {
+	level, name, held := hostSockOpt(option)
+	switch {
+	case !held:
+		return os.NewSyscallError("setsockopt", syscall.ENOPROTOOPT)
+	case option == wasiSockOptLinger:
+		linger := &syscall.Linger{Linger: max(value, 0)}
+		if value >= 0 {
+			linger.Onoff = 1
+		}
+		return os.NewSyscallError("setsockopt", syscall.SetsockoptLinger(fd, level, name, linger))
+	}
+	return os.NewSyscallError("setsockopt", syscall.SetsockoptInt(fd, level, name, int(value)))
+}
+
+// getHostSockOpt returns the value of option (wasiSockOpt...) of socket fd
+// (getsockopt(2)), as the host has it: linger in seconds, or -1 for off;
+// SO_ERROR as the guest's errno; SO_TYPE as a wasiSockType. An option the
+// host has not is ENOPROTOOPT.
+func getHostSockOpt(fd int, option int32) (int32, error) {
+	level, name, held := hostSockOpt(option)
+	switch {
+	case !held:
+		return 0, os.NewSyscallError("getsockopt", syscall.ENOPROTOOPT)
+	case option == wasiSockOptLinger:
+		var linger syscall.Linger
+		if err := hostGetsockopt(fd, level, name, unsafe.Pointer(&linger), unsafe.Sizeof(linger)); err != nil {
+			return 0, err
+		}
+		if linger.Onoff == 0 {
+			return -1, nil
+		}
+		return linger.Linger, nil
+	}
+	v, err := syscall.GetsockoptInt(fd, level, name)
+	if err != nil {
+		return 0, os.NewSyscallError("getsockopt", err)
+	}
+	switch option {
+	case wasiSockOptError:
+		if v == 0 {
+			return 0, nil
+		}
+		return mapOSError(syscall.Errno(v)), nil
+	case wasiSockOptType:
+		if v == syscall.SOCK_DGRAM {
+			return wasiSockTypeDgram, nil
+		}
+		return wasiSockTypeStream, nil
+	}
+	return int32(v), nil
+}
+
+// hostGetsockopt reads the value of the option (level, name) of socket fd
+// into the size bytes at val (getsockopt(2)), for a value that package
+// syscall reads not (a timeval, a linger).
+func hostGetsockopt(fd, level, name int, val unsafe.Pointer, size uintptr) error {
+	n := uint32(size)
+	if _, _, errno := syscall.Syscall6(hostSysGetsockopt, uintptr(fd), uintptr(level), uintptr(name), uintptr(val), uintptr(unsafe.Pointer(&n)), 0); errno != 0 {
+		return os.NewSyscallError("getsockopt", errno)
+	}
+	return nil
+}
+
+// hostTimeoutName is the name of the receive timeout (SO_RCVTIMEO) or, with
+// send, the send timeout (SO_SNDTIMEO).
+func hostTimeoutName(send bool) int {
+	if send {
+		return syscall.SO_SNDTIMEO
+	}
+	return syscall.SO_RCVTIMEO
+}
+
+// hostSocketTimeout returns the receive or, with send, the send timeout of
+// socket fd; 0 is no limit.
+func hostSocketTimeout(fd int, send bool) (time.Duration, error) {
+	var tv syscall.Timeval
+	if err := hostGetsockopt(fd, syscall.SOL_SOCKET, hostTimeoutName(send), unsafe.Pointer(&tv), unsafe.Sizeof(tv)); err != nil {
+		return 0, err
+	}
+	return time.Duration(tv.Nano()), nil
+}
+
+// setHostSocketTimeout sets the receive or, with send, the send timeout of
+// socket fd to d (0: no limit), in microseconds rounded up, as the guest's
+// timeval gives it; one longer than the host's timeval holds is the
+// longest it holds.
+func setHostSocketTimeout(fd int, send bool, d time.Duration) error {
+	var tv syscall.Timeval
+	if d <= math.MaxInt64-time.Microsecond {
+		// NsecToTimeval rounds up to the microsecond
+		tv = syscall.NsecToTimeval(int64(d))
+	}
+	if tv.Nano() < int64(d) {
+		// the timeval's seconds did not hold d
+		tv.Sec, tv.Usec = math.MaxInt32, 999999
+	}
+	return os.NewSyscallError("setsockopt", syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, hostTimeoutName(send), &tv))
+}
+
 // hostShutdown shuts the halves how (1 reading, 2 writing) of socket fd
 // down (shutdown(2)).
 func hostShutdown(fd int, how int32) error {
