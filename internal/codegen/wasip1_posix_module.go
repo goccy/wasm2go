@@ -93,6 +93,8 @@ var posixImports = map[string]bool{
 	"proc_chdir":  true,
 	"proc_setenv": true,
 
+	"sys_syscall": true,
+
 	"proc_fork": true,
 }
 

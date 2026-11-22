@@ -414,3 +414,13 @@ func hostAcceptFD(fd int) (int, error) {
 	conn, _, err := syscall.Accept4(fd, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
 	return conn, os.NewSyscallError("accept4", err)
 }
+
+// hostSyscall makes the guest's system call of the number (HostSyscalls) as
+// the host's call of its name (hostSyscallNumber).
+func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	n, ok := hostSyscallNumber(number)
+	if !ok {
+		return 0, syscall.ENOSYS
+	}
+	return hostRawSyscall(n, args, ptrs, mem)
+}

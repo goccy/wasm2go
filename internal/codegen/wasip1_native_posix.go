@@ -1071,6 +1071,26 @@ func hostShutdown(fd int, how int32) error {
 	return os.NewSyscallError("shutdown", syscall.Shutdown(fd, halves))
 }
 
+// hostRawSyscall makes the host's system call number with args, an argument
+// whose bit is set in ptrs being an offset in mem, at most its length, which
+// the call is given the address of (HostSyscalls).
+func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (int64, error) {
+	var a [6]uintptr
+	for i, v := range args {
+		if ptrs&(1<<i) != 0 {
+			a[i] = uintptr(unsafe.Pointer(unsafe.SliceData(mem[v:])))
+		} else {
+			a[i] = uintptr(v)
+		}
+	}
+	r, _, errno := syscall.Syscall6(number, a[0], a[1], a[2], a[3], a[4], a[5])
+	runtime.KeepAlive(mem)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int64(r), nil
+}
+
 // ---- commands ----------------------------------------------------------
 
 // startCommand starts the command path with argv and env in dir (the host
