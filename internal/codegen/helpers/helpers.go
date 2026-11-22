@@ -144,13 +144,32 @@ func wasm_trap_invalid_conv() { panic("wasm: invalid conversion to integer") }
 func wasm_trap_unreachable() { panic("wasm: unreachable") }
 
 //go:noinline
-func wasm_trap_memfill_oob() { panic("wasm: memory.fill out of bounds") }
+func wasm_trap_memfill_oob() { panic(memoryOutOfBounds{}) }
 
 //go:noinline
-func wasm_trap_memcopy_oob() { panic("wasm: memory.copy out of bounds") }
+func wasm_trap_memcopy_oob() { panic(memoryOutOfBounds{}) }
 
 //go:noinline
-func wasm_trap_meminit_oob() { panic("wasm: memory.init out of bounds") }
+func wasm_trap_meminit_oob() { panic(memoryOutOfBounds{}) }
+
+// memoryOutOfBounds is the trap value of every out-of-bounds linear-memory
+// access: a wasm32 access faulting in its guard reservation, a memory64
+// access past its memory, and the range checks of the bulk, atomic and SIMD
+// helpers. All its values are equal, so a recovered trap compares with == or
+// errors.Is.
+type memoryOutOfBounds struct{}
+
+func (memoryOutOfBounds) Error() string { return "wasm: out of bounds memory access" }
+
+// wasm_trap_memory_oob panics with memoryOutOfBounds: the target of the
+// memory64 access checks, in generated code and in asm (directly, or
+// through the asm bundle's gcasmTrapMemoryOOB).
+//
+//go:noinline
+func wasm_trap_memory_oob() { panic(memoryOutOfBounds{}) }
+
+// wasm_trap_memory_oob is only called from generated code and asm.
+var _ = wasm_trap_memory_oob
 
 // ----- Exception handling (EH proposal / setjmp-longjmp) --------------------
 //
@@ -864,7 +883,7 @@ func memoryAccessTrap(m *Module, r any) any {
 		return r
 	}
 	if guardedLinearMemory && uint64(f.Addr()-uintptr(m.M)) < linearMemoryReserve {
-		return "wasm: out of bounds memory access"
+		return memoryOutOfBounds{}
 	}
 	panic(r)
 }
@@ -1318,7 +1337,7 @@ func memoryCopy(m *Module, dst int32, src int32, n int32) {
 // which is every architecture wasm2go targets.
 
 //go:noinline
-func wasm_trap_atomic_oob() { panic("wasm: atomic access out of bounds") }
+func wasm_trap_atomic_oob() { panic(memoryOutOfBounds{}) }
 
 //go:noinline
 func wasm_trap_atomic_unaligned() { panic("wasm: unaligned atomic access") }
@@ -2640,20 +2659,21 @@ func ThreadsWait(m *Module) { m.threads.wg.Wait() }
 // instead of inlined bodies.
 
 //go:noinline
-func wasm_trap_simd_oob() { panic("wasm: v128 memory access out of bounds") }
+func wasm_trap_simd_oob() { panic(memoryOutOfBounds{}) }
 
 // gcasmMemProbe anchors the Module field offsets the gcasm memory-op
 // splices hardcode. The splices read m.M and m.memSize straight off the
 // receiver in generated assembly, and the offsets of those fields
 // depend on the module (the import-interface fields between them vary).
-// Rather than re-deriving Go's struct layout, gcasm extracts the two
-// offsets from THIS function's captured assembly — two loads off R0/AX,
-// M first — so they always come from the same compile that produced the
-// code being spliced. Never called at run time.
+// Rather than re-deriving Go's struct layout, gcasm extracts the
+// offsets from THIS function's captured assembly — three loads off
+// R0/AX: M, memSize, then len(memory), which pins the memory slice at
+// offset 0 — so they always come from the same compile that produced
+// the code being spliced. Never called at run time.
 //
 //go:noinline
-func gcasmMemProbe(m *Module) (unsafe.Pointer, *atomic.Uint64) {
-	return m.M, m.memSize
+func gcasmMemProbe(m *Module) (unsafe.Pointer, *atomic.Uint64, int) {
+	return m.M, m.memSize, len(m.memory)
 }
 
 func simdEA(m *Module, addr int32, offset int32, size uint64) uint64 {
@@ -3226,7 +3246,7 @@ func simd_p_v128_store64_lane(m *Module, addr int32, offset int32, lane int32, v
 // page counts are u64/i64; effective-address arithmetic is u64 with
 // explicit overflow traps (there is no benign wrap at 2^64). Plain
 // scalar loads/stores never come through here — the emitter derefs
-// them inline with a uint64 cast, exactly like the uint32 form.
+// them inline behind a bounds check (see codegen's memBoundsTrapStmt).
 
 // mem64HardCap bounds a memory64's linear memory. Far above any real
 // host, it exists so effective-address arithmetic in the checked

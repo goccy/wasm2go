@@ -27,6 +27,6 @@ func releaseLinearMemory(mem []byte) {
 	}
 }
 
-func mapLinearMemory(fd, length, flags int) ([]byte, error) {
+func mapLinearMemory(fd, length, flags int, _ bool) ([]byte, error) {
 	return syscall.Mmap(fd, 0, length, syscall.PROT_READ|syscall.PROT_WRITE, flags)
 }

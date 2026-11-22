@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"math/bits"
 	"strconv"
 
 	"github.com/goccy/wasm2go/internal/ssa"
@@ -34,16 +35,18 @@ import (
 //
 // Bounds check
 //
-// The wasm spec traps on out-of-bounds memory access. The access itself
-// carries no bounds check; the memory layout enforces it instead. On
-// 64-bit linux and darwin a wasm32 linear memory sits at the start of a
-// reservation that covers every address an access can form (base + u32
+// The wasm spec traps on out-of-bounds memory access. A wasm32 access
+// itself carries no bounds check; the memory layout enforces it instead.
+// On 64-bit linux and darwin a wasm32 linear memory sits at the start of
+// a reservation that covers every address an access can form (base + u32
 // address + u32 offset, plus the access width), and only the instance's
 // own pages are mapped readable and writable — see
 // helpers/linearmem_guard.go. An out-of-range access faults in the
 // reservation, and the export entry points turn that fault into the
-// out-of-bounds trap. Access cost stays zero. Other hosts and memory64
-// have no such bound and are not covered.
+// out-of-bounds trap. Access cost stays zero. Other hosts have no such
+// bound and are not covered. A memory64 address has no bound a
+// reservation could cover, so each memory64 access is preceded by an
+// explicit check (see memBoundsTrapStmt).
 //
 // Entry points
 //
@@ -461,11 +464,11 @@ func storeSpec(v *ssa.Value) (memOpSpec, bool) {
 // LDAR / STLR-class instruction, no CALL — and give exactly the
 // seq-cst ordering the wasm threads proposal requires.
 //
-// Alignment and bounds checks are dropped, mirroring the plain
-// load/store rationale at the top of this file: validated wasm from a
+// Bounds are enforced as for plain loads and stores (see the top of
+// this file). The alignment check is dropped: validated wasm from a
 // C/C++/Rust toolchain only issues ABI-aligned atomics, so a
-// misaligned or out-of-bounds atomic indicates a bug in the input, not
-// a runtime condition. (A misaligned inline atomic fails loudly anyway:
+// misaligned atomic indicates a bug in the input, not a runtime
+// condition. (A misaligned inline atomic fails loudly anyway:
 // LDAR/STLR fault, and Go's race-free unaligned 64-bit atomics panic on
 // 32-bit-aligned addresses.)
 //
@@ -500,6 +503,116 @@ var atomicInlineSpecs = map[string]atomicInlineSpec{
 	"atomicStore64_m64": {elemType: "uint64", fn: "StoreUint64", isStore: true},
 }
 
+// atomicInlineAccess reports whether the OpAtomicCall v is emitted inline
+// (see emitAtomicInline) and returns its spec and static offset. The offset
+// is the OpConst32 (wasm32) or OpConst64 (memory64) the lowering built; its
+// width decides the truncation-free extraction. memOffsetExpr dispatches on
+// em.mem64 for the address math.
+func (em *ssaEmitter) atomicInlineAccess(v *ssa.Value) (atomicInlineSpec, uint64, bool) {
+	name, _ := v.Aux.(string)
+	spec, ok := atomicInlineSpecs[name]
+	if !ok {
+		return atomicInlineSpec{}, 0, false
+	}
+	if em.mem64 {
+		off := ssaConstBase64(v.Args[1])
+		if off == nil {
+			return atomicInlineSpec{}, 0, false
+		}
+		return spec, uint64(off.AuxInt), true
+	}
+	off := ssaConstBase(v.Args[1])
+	if off == nil {
+		return atomicInlineSpec{}, 0, false
+	}
+	return spec, uint64(uint32(off.AuxInt)), true
+}
+
+// memBoundsTrapStmt returns the statement a memory64 load, store or inline
+// atomic v is preceded by, and nil for any other value:
+//
+//	if memSize := m.memSize.Load(); memSize < end || uint64(base) > memSize-end {
+//		wasm_trap_memory_oob()
+//	}
+//
+// end is the access's static offset plus its width, so no base however
+// close to 2^64 passes, and memory.size is the bound. A constant base
+// folds into end (`if m.memSize.Load() < end`), and an end past 2^64
+// traps unconditionally. An end of largeConstThreshold or more is read
+// from the _consts table, like memOffsetExpr's constants.
+func (em *ssaEmitter) memBoundsTrapStmt(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) (ast.Stmt, error) {
+	if !em.mem64 {
+		return nil, nil
+	}
+	var elemType string
+	offset := uint64(v.AuxInt)
+	if spec, ok := loadSpec(v); ok {
+		elemType = spec.elemType
+	} else if spec, ok := storeSpec(v); ok {
+		elemType = spec.elemType
+	} else if v.Op == ssa.OpAtomicCall {
+		spec, off, ok := em.atomicInlineAccess(v)
+		if !ok {
+			return nil, nil
+		}
+		elemType, offset = spec.elemType, off
+	} else {
+		return nil, nil
+	}
+	em.useHelper("wasm_trap_memory_oob")
+	trap := &ast.ExprStmt{X: &ast.CallExpr{Fun: em.helperRef("wasm_trap_memory_oob")}}
+	end, carry := bits.Add64(offset, memElemSize(elemType), 0)
+	c := ssaConstBase64(v.Args[0])
+	if c != nil && carry == 0 {
+		end, carry = bits.Add64(end, uint64(c.AuxInt), 0)
+	}
+	if carry != 0 {
+		return trap, nil
+	}
+	endExpr := ast.Expr(uintLit(end))
+	if end >= largeConstThreshold && em.t != nil {
+		endExpr = &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{em.constsIndexExpr(end)}}
+	}
+	memSize := ast.Expr(&ast.CallExpr{Fun: &ast.SelectorExpr{X: em.fieldRef("memSize"), Sel: newID("Load")}})
+	check := &ast.IfStmt{Body: &ast.BlockStmt{List: []ast.Stmt{trap}}}
+	if c != nil {
+		check.Cond = &ast.BinaryExpr{X: memSize, Op: token.LSS, Y: endExpr}
+		return check, nil
+	}
+	base, err := emit(v.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	check.Init = &ast.AssignStmt{Tok: token.DEFINE, Lhs: []ast.Expr{newID("memSize")}, Rhs: []ast.Expr{memSize}}
+	check.Cond = &ast.BinaryExpr{
+		X:  &ast.BinaryExpr{X: newID("memSize"), Op: token.LSS, Y: endExpr},
+		Op: token.LOR,
+		Y: &ast.BinaryExpr{
+			X:  &ast.CallExpr{Fun: newID("uint64"), Args: []ast.Expr{base}},
+			Op: token.GTR,
+			Y:  &ast.BinaryExpr{X: newID("memSize"), Op: token.SUB, Y: endExpr},
+		},
+	}
+	return check, nil
+}
+
+// memElemSize is the byte width of a memOpSpec / atomicInlineSpec element
+// type. Those specs name only the types below, so any other type is an
+// emitter bug and panics.
+func memElemSize(elemType string) uint64 {
+	switch elemType {
+	case "int8", "uint8":
+		return 1
+	case "int16", "uint16":
+		return 2
+	case "int32", "uint32", "float32":
+		return 4
+	case "int64", "uint64", "float64":
+		return 8
+	}
+	panic(fmt.Sprintf("memElemSize: no memory access of type %s", elemType))
+}
+
 // emitAtomicInline renders an OpAtomicCall as an inline sync/atomic
 // expression when the helper has an entry in atomicInlineSpecs and the
 // op's static offset operand is the OpConst32 the lowering built
@@ -507,27 +620,10 @@ var atomicInlineSpecs = map[string]atomicInlineSpec{
 // back to the helper call). Loads return the value expression; stores
 // return the atomic.Store call expression, which the side-effect
 // statement path wraps in an ExprStmt.
-func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, name string, emitExpr func(*ssa.Value) (ast.Expr, error)) (ast.Expr, bool, error) {
-	spec, ok := atomicInlineSpecs[name]
+func (em *ssaEmitter) emitAtomicInline(v *ssa.Value, emitExpr func(*ssa.Value) (ast.Expr, error)) (ast.Expr, bool, error) {
+	spec, offU, ok := em.atomicInlineAccess(v)
 	if !ok {
 		return nil, false, nil
-	}
-	// The static offset is the OpConst32 (wasm32) or OpConst64 (memory64)
-	// the lowering built; its width decides the truncation-free extraction.
-	// memOffsetExpr itself dispatches on em.mem64 for the address math.
-	var offU uint64
-	if em.mem64 {
-		off := ssaConstBase64(v.Args[1])
-		if off == nil {
-			return nil, false, nil
-		}
-		offU = uint64(off.AuxInt)
-	} else {
-		off := ssaConstBase(v.Args[1])
-		if off == nil {
-			return nil, false, nil
-		}
-		offU = uint64(uint32(off.AuxInt))
 	}
 	baseExpr, err := emitExpr(v.Args[0])
 	if err != nil {

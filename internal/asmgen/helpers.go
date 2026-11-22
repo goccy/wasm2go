@@ -147,6 +147,7 @@ var helperSigs = map[string]helperSpec{
 
 	// --- wasm trap helpers (zero-arg, no-result, panic) ---
 	"wasm_trap_div_zero":     {nil, ssa.TypeInvalid},
+	"wasm_trap_memory_oob":   {nil, ssa.TypeInvalid},
 	"wasm_trap_int_overflow": {nil, ssa.TypeInvalid},
 	"wasm_trap_invalid_conv": {nil, ssa.TypeInvalid},
 }

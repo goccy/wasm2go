@@ -2,6 +2,7 @@ package transpile_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,7 +22,7 @@ import (
 // both ways an instance gets its memory: the constructor's own allocation and
 // a copy-on-write snapshot mapping.
 func TestOutOfBoundsAccessTraps(t *testing.T) {
-	runOOBPrograms(t, "cg_oob.wasm", oobMain, `inbounds ok 0
+	runOOBPrograms(t, "cg_oob.wasm", oobMain, []int{0, 1, 2, 4}, false, `inbounds ok 0
 pastsize trap
 wrapped trap
 store trap
@@ -38,21 +39,28 @@ done`)
 // TestOutOfBoundsStartSectionTraps requires a start section's out-of-bounds
 // access to reach the constructor's caller as the wasm trap.
 func TestOutOfBoundsStartSectionTraps(t *testing.T) {
-	runOOBPrograms(t, "cg_oob_start.wasm", oobStartMain, "new trap")
+	runOOBPrograms(t, "cg_oob_start.wasm", oobStartMain, []int{0}, false, "new trap")
 }
 
 // runOOBPrograms translates the fixture with both backends into both output
-// layouts, runs mainSrc against each, and compares the output with want.
-func runOOBPrograms(t *testing.T, fixture, mainSrc, want string) {
+// layouts, runs mainSrc against each, and compares the output with want. The
+// gcasm builds must carry an asm body for each function index in fns: with
+// direct, one the direct-asm path emitted (and no pure build runs);
+// otherwise one the listing transform made.
+func runOOBPrograms(t *testing.T, fixture, mainSrc string, fns []int, direct bool, want string) {
 	if runtime.GOOS == "windows" || runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
 		t.Skip("linear memories are confined only on unix hosts")
 	}
 	bin := testfixture.Wasm(t, fixture)
 	for _, multi := range []bool{false, true} {
 		for _, pure := range []bool{false, true} {
+			if pure && direct {
+				continue
+			}
 			name := "single"
+			format := "fn%d"
 			if multi {
-				name = "multi"
+				name, format = "multi", "Fn%d"
 			}
 			if pure {
 				name += "/pure"
@@ -60,7 +68,17 @@ func runOOBPrograms(t *testing.T, fixture, mainSrc, want string) {
 				name += "/gcasm"
 			}
 			t.Run(name, func(t *testing.T) {
-				dir := buildOOBProgram(t, bin, multi, pure, mainSrc)
+				var names, directNames []string
+				for _, fn := range fns {
+					names = append(names, fmt.Sprintf(format, fn))
+				}
+				if direct {
+					directNames = names
+				}
+				dir := buildOOBProgram(t, bin, multi, pure, mainSrc, directNames)
+				if !pure {
+					requireAsmBodies(t, dir, names, direct)
+				}
 				envs := [][]string{nil}
 				if !pure && runtime.GOARCH == "amd64" {
 					envs = [][]string{{"GOAMD64=v2"}, {"GOAMD64=v1"}}
@@ -82,7 +100,38 @@ func runOOBPrograms(t *testing.T, fixture, mainSrc, want string) {
 	}
 }
 
-func buildOOBProgram(t *testing.T, bin []byte, multi, pure bool, mainSrc string) string {
+// requireAsmBodies requires the asm files under dir to hold a body for each
+// of names on both arches: a direct-asm one with direct, a transformed one
+// otherwise.
+func requireAsmBodies(t *testing.T, dir string, names []string, direct bool) {
+	t.Helper()
+	var asm strings.Builder
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".s" {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		asm.Write(data)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		marker := "TEXT ·" + name + "(SB)"
+		if direct {
+			marker = "// direct-asm: " + name + "\n"
+		}
+		if got := strings.Count(asm.String(), marker); got != 2 {
+			t.Errorf("%q appears %d times in the asm, want 2 (both arches)", marker, got)
+		}
+	}
+}
+
+// buildOOBProgram translates bin, with direct as Options.DirectAsmFuncs, and
+// writes it with mainSrc as a runnable program. A hook file exports the
+// helpers' out-of-bounds trap value as OOBTrap.
+func buildOOBProgram(t *testing.T, bin []byte, multi, pure bool, mainSrc string, direct []string) string {
 	t.Helper()
 	if multi {
 		t.Cleanup(transpile.SetMultiPackageThreshold(0))
@@ -97,6 +146,7 @@ func buildOOBProgram(t *testing.T, bin []byte, multi, pure bool, mainSrc string)
 		OutputImportPath: "oobtest/pkg",
 		BulkExportPrefix: "w_",
 		PureOnly:         pure,
+		DirectAsmFuncs:   direct,
 	})
 	if err != nil {
 		t.Fatalf("translate: %v", err)
@@ -133,7 +183,9 @@ func buildOOBProgram(t *testing.T, bin []byte, multi, pure bool, mainSrc string)
 		"$RT", "pkg",
 		"$LOADAT", "m.LoadAt(0x7ffffff0)",
 	)
+	hook := "pkg/oobtrap_hook.go"
 	if multi {
+		hook = "pkg/base/oobtrap_hook.go"
 		r = strings.NewReplacer(
 			"$IMPORTS", "\"oobtest/pkg\"\n\t\"oobtest/pkg/base\"",
 			"$MOD", "base.Module",
@@ -141,24 +193,25 @@ func buildOOBProgram(t *testing.T, bin []byte, multi, pure bool, mainSrc string)
 			"$LOADAT", "pkg.LoadAt(m, 0x7ffffff0)",
 		)
 	}
+	write(hook, []byte("package "+filepath.Base(filepath.Dir(hook))+"\n\nvar OOBTrap error = memoryOutOfBounds{}\n"))
 	write("main.go", []byte(r.Replace(mainSrc)))
 	return dir
 }
 
-// oobTrapCheck is shared by the main programs: it reports whether a
-// recovered panic value is the out-of-bounds trap.
+// oobTrapCheck is shared by the main programs: it reports whether r, an
+// Inv_* error or a recovered panic value, is the out-of-bounds trap.
 const oobTrapCheck = `
 func isOOBTrap(r any) bool {
-	s, ok := r.(string)
-	return ok && s == "wasm: out of bounds memory access"
+	err, ok := r.(error)
+	return ok && errors.Is(err, $RT.OOBTrap)
 }
 `
 
 const oobMain = `package main
 
 import (
+	"errors"
 	"fmt"
-	"strings"
 
 	$IMPORTS
 )
@@ -170,7 +223,7 @@ func try(label string, m *$MOD, f invoke, l0 int32) {
 	switch {
 	case err == nil:
 		fmt.Println(label, "ok", v)
-	case strings.Contains(err.Error(), "wasm: out of bounds memory access"):
+	case isOOBTrap(err):
 		fmt.Println(label, "trap")
 	default:
 		fmt.Println(label, "error", err)
@@ -221,6 +274,7 @@ func main() {
 const oobStartMain = `package main
 
 import (
+	"errors"
 	"fmt"
 
 	$IMPORTS
@@ -241,4 +295,115 @@ func main() {
 }
 
 var _ = $RT.UnmapMemory
+`
+
+// TestMemory64OutOfBoundsAccessTraps is TestOutOfBoundsAccessTraps for a
+// memory64 module: loads, stores, atomics and constant addresses past
+// memory.size, past 4 GiB and near 2^64 — where the address plus offset or
+// width wraps — all trap, through Inv_* entry points and a direct export,
+// with the constructor's memory and with a copy-on-write snapshot whose
+// ceiling is longer than a wasm32 reservation, before and after it grows
+// to that ceiling. memory.size bounds every access.
+func TestMemory64OutOfBoundsAccessTraps(t *testing.T) {
+	runOOBPrograms(t, "cg_oob64.wasm", oob64Main, []int{0, 1, 2, 4, 5, 6}, false, oob64Want)
+}
+
+const oob64Want = `inbounds ok 0
+pastsize trap
+high trap
+top trap
+store trap
+offset-wrap trap
+atomic trap
+constoff trap
+grow ok 1
+grown ok 0
+grown-past trap
+direct trap
+snap-data ok 6451055
+snap-pastsize trap
+snap-top trap
+snap-grow ok 1
+snap-grown-top ok 0
+snap-pastceiling trap
+done`
+
+// TestMemory64DirectAsmOutOfBoundsTraps runs TestMemory64OutOfBoundsAccessTraps
+// with the loads and stores emitted by the direct-asm path, whose bounds
+// checks branch to the bundle's bounds trap.
+func TestMemory64DirectAsmOutOfBoundsTraps(t *testing.T) {
+	runOOBPrograms(t, "cg_oob64.wasm", oob64Main, []int{0, 1, 2, 5, 6}, true, oob64Want)
+}
+
+const oob64Main = `package main
+
+import (
+	"errors"
+	"fmt"
+
+	$IMPORTS
+)
+
+type invoke func(m *$MOD, l0, l1 int64) (int64, error)
+
+func try(label string, m *$MOD, f invoke, addr uint64) {
+	v, err := f(m, int64(addr), 0)
+	switch {
+	case err == nil:
+		fmt.Println(label, "ok", v)
+	case isOOBTrap(err):
+		fmt.Println(label, "trap")
+	default:
+		fmt.Println(label, "error", err)
+	}
+}
+
+func direct(m *$MOD) {
+	defer func() {
+		if r := recover(); r != nil {
+			if isOOBTrap(r) {
+				fmt.Println("direct trap")
+			} else {
+				fmt.Println("direct panic", r)
+			}
+		}
+	}()
+	fmt.Println("direct ok", $LOADAT)
+}
+` + oobTrapCheck + `
+func main() {
+	m := pkg.New()
+	try("inbounds", m, pkg.Inv_1_0, 65536-8)
+	try("pastsize", m, pkg.Inv_1_0, 65536-7)
+	try("high", m, pkg.Inv_1_0, 1<<32)
+	try("top", m, pkg.Inv_1_0, 1<<64-8)
+	try("store", m, pkg.Inv_1_1, 65536-4)
+	try("offset-wrap", m, pkg.Inv_1_2, 1<<64-16)
+	try("atomic", m, pkg.Inv_1_4, 65536-2)
+	try("constoff", m, pkg.Inv_1_5, 0)
+	try("grow", m, pkg.Inv_1_3, 1)
+	try("grown", m, pkg.Inv_1_0, 2*65536-8)
+	try("grown-past", m, pkg.Inv_1_0, 2*65536-7)
+	direct(m)
+
+	img := $RT.NewSharedSnapshot(func() (*$MOD, error) { return pkg.New(), nil })
+	if err := img.Err(); err != nil {
+		panic(err)
+	}
+	// The smallest ceiling longer than a wasm32 reservation.
+	const ceiling = 8<<30 + 64<<10 + 65536
+	mem, err := img.Memory(ceiling)
+	if err != nil {
+		panic(err)
+	}
+	s := pkg.NewFromSnapshot(mem, img.Size(), img.Globals())
+	try("snap-data", s, pkg.Inv_1_0, 1024)
+	try("snap-pastsize", s, pkg.Inv_1_0, 65536-7)
+	try("snap-top", s, pkg.Inv_1_0, ceiling-8)
+	try("snap-grow", s, pkg.Inv_1_3, ceiling/65536-1)
+	try("snap-grown-top", s, pkg.Inv_1_0, ceiling-8)
+	try("snap-pastceiling", s, pkg.Inv_1_0, ceiling-7)
+	$RT.UnmapMemory(mem)
+	fmt.Println("done")
+}
 `

@@ -21,6 +21,26 @@ const ModuleMOffset = moduleMOffset
 // this layout; the moduleMOffset test pins it explicitly.
 const moduleMOffset = 32
 
+// isScalarMemOp reports whether op is a scalar linear-memory load or
+// store.
+func isScalarMemOp(op ssa.Op) bool { return memAccessSize(op) != 0 }
+
+// memAccessSize is the byte width of a scalar load or store op, and 0
+// for any other op.
+func memAccessSize(op ssa.Op) int {
+	switch op {
+	case ssa.OpLoad8U, ssa.OpLoad8S, ssa.OpStore8:
+		return 1
+	case ssa.OpLoad16U, ssa.OpLoad16S, ssa.OpStore16:
+		return 2
+	case ssa.OpLoad32, ssa.OpLoad32U, ssa.OpLoad32S, ssa.OpLoadF32, ssa.OpStore32, ssa.OpStoreF32:
+		return 4
+	case ssa.OpLoad64, ssa.OpLoadF64, ssa.OpStore64, ssa.OpStoreF64:
+		return 8
+	}
+	return 0
+}
+
 // archAMD64 implements the arch interface for the x86_64 target.
 type archAMD64 struct{}
 
@@ -973,32 +993,43 @@ func emitCmp64(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame,
 //     mode's displacement (sign-extension of a positive disp equals
 //     the zero-extension the wrap rule wants); negative offsets keep
 //     the explicit ADDL.
-//   - memory64: address = base + off in full 64-bit, no wrap (the
-//     pure-Go path is `uint64(base) + offset`). Offsets beyond the
-//     int32 displacement range are materialised through AX — safe as
-//     a temp here because address formation completes before AX
-//     carries the access value.
-func emitMemAddrAMD64(b *strings.Builder, baseArg *ssa.Value, aux int64, plan *funcPlan, frame argFrame) string {
+//   - memory64: address = base + off in full 64-bit, bounded like the
+//     pure-Go path (see codegen's memPtr64): SI = base + off, and the
+//     access branches to plan.boundsTrap on a carry out of that sum or
+//     unless SI + size <= m.memSize. AX carries the offset and the
+//     bound — safe as a temp here because address formation completes
+//     before AX carries the access value. The offset goes through AX
+//     and the bound through a load so that no peephole folds an add
+//     whose carry the check reads into a LEAQ.
+func emitMemAddrAMD64(b *strings.Builder, v *ssa.Value, size int, plan *funcPlan, frame argFrame) string {
+	baseArg, aux := v.Args[0], v.AuxInt
 	if plan.mem64 {
+		trapLbl, okLbl := fmt.Sprintf("MEMOOB_%d", v.ID), fmt.Sprintf("MEMOK_%d", v.ID)
 		if base, ok := inlineableI64(baseArg); ok {
-			total := base + aux
-			if total >= 0 && total <= 0x7fffffff {
-				return fmt.Sprintf("%d(BX)", total)
-			}
-			fmt.Fprintf(b, "\tMOVQ $%d, SI\n", total)
-			return "(BX)(SI*1)"
+			fmt.Fprintf(b, "\tMOVQ $%d, SI\n", base)
+		} else {
+			fmt.Fprintf(b, "\tMOVQ %s, SI\n", operandSrc64(baseArg, plan, frame, "SP"))
 		}
-		fmt.Fprintf(b, "\tMOVQ %s, SI\n", operandSrc64(baseArg, plan, frame, "SP"))
-		switch {
-		case aux == 0:
-			return "(BX)(SI*1)"
-		case aux > 0 && aux <= 0x7fffffff:
-			return fmt.Sprintf("%d(BX)(SI*1)", aux)
-		default:
+		if aux != 0 {
 			fmt.Fprintf(b, "\tMOVQ $%d, AX\n", aux)
-			fmt.Fprintf(b, "\tADDQ AX, SI\n")
-			return "(BX)(SI*1)"
+			b.WriteString("\tADDQ AX, SI\n")
+			fmt.Fprintf(b, "\tJCS %s\n", trapLbl)
 		}
+		if plan.mCacheReg != "" {
+			fmt.Fprintf(b, "\tMOVQ %d(%s), AX\n", plan.memSizeOffset, plan.mCacheReg)
+		} else {
+			b.WriteString("\tMOVQ m+0(FP), AX\n")
+			fmt.Fprintf(b, "\tMOVQ %d(AX), AX\n", plan.memSizeOffset)
+		}
+		b.WriteString("\tMOVQ (AX), AX\n")
+		fmt.Fprintf(b, "\tSUBQ $%d, AX\n", size)
+		fmt.Fprintf(b, "\tJCS %s\n", trapLbl)
+		b.WriteString("\tCMPQ SI, AX\n")
+		fmt.Fprintf(b, "\tJLS %s\n", okLbl)
+		fmt.Fprintf(b, "%s:\n", trapLbl)
+		fmt.Fprintf(b, "\tCALL %s(SB)\n", plan.boundsTrap)
+		fmt.Fprintf(b, "%s:\n", okLbl)
+		return "(BX)(SI*1)"
 	}
 	off := int32(aux)
 	// Constant-base fast path: fold `base + off` at generation time
@@ -1043,7 +1074,7 @@ func emitLoad(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame) 
 		fmt.Fprintf(b, "\tMOVQ m+0(FP), BX\n")
 		fmt.Fprintf(b, "\tMOVQ %d(BX), BX\n", moduleMOffset)
 	}
-	addr := emitMemAddrAMD64(b, v.Args[0], v.AuxInt, plan, frame)
+	addr := emitMemAddrAMD64(b, v, memAccessSize(v.Op), plan, frame)
 	// Narrow loads (8/16-bit) produce either i32 or i64 depending
 	// on the wasm op — i32.load8_u vs i64.load8_u both lower to
 	// OpLoad8U, distinguished only by v.Type. The asm has to
@@ -1160,7 +1191,7 @@ func emitStore(b *strings.Builder, v *ssa.Value, plan *funcPlan, frame argFrame)
 		fmt.Fprintf(b, "\tMOVQ m+0(FP), BX\n")
 		fmt.Fprintf(b, "\tMOVQ %d(BX), BX\n", moduleMOffset)
 	}
-	addr := emitMemAddrAMD64(b, v.Args[0], v.AuxInt, plan, frame)
+	addr := emitMemAddrAMD64(b, v, memAccessSize(v.Op), plan, frame)
 	// The wasm store-narrow ops truncate the low N bits of the value.
 	// On amd64 the small-store mnemonics (MOVB/MOVW) naturally write
 	// only the low bits of the register, so we just MOV the value

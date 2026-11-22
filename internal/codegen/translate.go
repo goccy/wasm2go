@@ -369,6 +369,9 @@ func Translate(w io.Writer, m *wasm.Module, opts Options) (Result, error) {
 	// emitHelpers runs (the pure fallback render), so lazy helperRef
 	// registration is too late — pre-register like the others.
 	t.helpers["wasm_trap_unreachable"] = true
+	// wasm_trap_memory_oob is the CALL target of gcasmTrapMemoryOOB,
+	// which every package of an asm bundle defines.
+	t.helpers["wasm_trap_memory_oob"] = true
 
 	// accessMemory is the host-facing synchronised window into linear
 	// memory (out-of-band writers like go-python's interrupter use it;
@@ -777,6 +780,7 @@ func (t *translator) emitSharedImage(pkg string) (map[string][]byte, error) {
 		MemSize:     t.fieldName("memSize"),
 		DataEnd:     t.fieldName("dataEnd"),
 		SaveGlobals: saveGlobals,
+		GuardMemory: !t.mod.Memory64(),
 	})
 }
 
@@ -4056,6 +4060,25 @@ func (t *translator) emitHelpers() ([]ast.Decl, error) {
 				continue
 			}
 			out = append(out, fn)
+		}
+	}
+	// memoryOutOfBounds, the value the out-of-bounds traps panic with, is a
+	// type with a method, which the function-only extraction above cannot
+	// see. It stays unexported in both layouts: only base's helpers make it.
+	if t.helpers["wasm_trap_memory_oob"] {
+		for _, decl := range t.helpersFile.Decls {
+			switch d := decl.(type) {
+			case *ast.GenDecl:
+				if d.Tok == token.TYPE && len(d.Specs) == 1 && d.Specs[0].(*ast.TypeSpec).Name.Name == "memoryOutOfBounds" {
+					out = append(out, d)
+				}
+			case *ast.FuncDecl:
+				if d.Recv != nil && len(d.Recv.List) == 1 {
+					if id, ok := d.Recv.List[0].Type.(*ast.Ident); ok && id.Name == "memoryOutOfBounds" {
+						out = append(out, d)
+					}
+				}
+			}
 		}
 	}
 	if t.usesWasmExc {

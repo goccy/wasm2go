@@ -5,6 +5,7 @@ package helpers
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -44,7 +45,7 @@ func newLinearMemory(minBytes, capBytes uint64) (mem, reserve []byte, err error)
 	// reachable.
 	minBytes = min(minBytes, 1<<32)
 	size := linearMemoryReserve
-	reserve, err = syscall.Mmap(-1, 0, int(size), syscall.PROT_NONE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	reserve, err = mmapLinearMemory(-1, int(size), syscall.PROT_NONE, syscall.MAP_PRIVATE|syscall.MAP_ANON)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reserving linear memory: %w", err)
 	}
@@ -66,47 +67,74 @@ func commitLinearMemory(reserve []byte, from, to uint64) error {
 	return nil
 }
 
+// linearMappings records the length of every mapping this file made, by its
+// base address: a release unmaps exactly that mapping, whatever length and
+// capacity the slice it is handed has.
+var linearMappings = struct {
+	sync.Mutex
+	length map[uintptr]int
+}{length: map[uintptr]int{}}
+
+// mmapLinearMemory is syscall.Mmap of length bytes at offset 0, recorded in
+// linearMappings.
+func mmapLinearMemory(fd, length, prot, flags int) ([]byte, error) {
+	mem, err := syscall.Mmap(fd, 0, length, prot, flags)
+	if err != nil {
+		return nil, err
+	}
+	linearMappings.Lock()
+	linearMappings.length[uintptr(unsafe.Pointer(unsafe.SliceData(mem)))] = length
+	linearMappings.Unlock()
+	return mem, nil
+}
+
 // releaseLinearMemory returns a linear memory from newLinearMemory or
-// mapLinearMemory to the OS — the whole reservation, whatever length the
-// slice has. Unmapping a mapping this package made can only fail on a slice
-// that did not come from it, so a failure is a bug and panics.
+// mapLinearMemory to the OS — the whole mapping, whatever length the slice
+// has. Unmapping a mapping this package made can only fail on a slice that
+// did not come from it, so a failure is a bug and panics.
 func releaseLinearMemory(mem []byte) {
 	if err := releaseReservation(mem); err != nil {
 		panic("wasm2go: " + err.Error())
 	}
 }
 
+// releaseReservation unmaps the mapping that starts at mem's base, as long
+// as linearMappings recorded it.
 func releaseReservation(mem []byte) error {
-	whole := mem[:cap(mem)]
-	if guardedLinearMemory {
-		size := linearMemoryReserve
-		whole = unsafe.Slice(unsafe.SliceData(mem), size)
+	base := unsafe.SliceData(mem)
+	linearMappings.Lock()
+	length, ok := linearMappings.length[uintptr(unsafe.Pointer(base))]
+	delete(linearMappings.length, uintptr(unsafe.Pointer(base)))
+	linearMappings.Unlock()
+	if !ok {
+		return fmt.Errorf("releasing linear memory: %p is not the start of a linear memory mapping", base)
 	}
-	if err := syscall.Munmap(whole); err != nil {
+	if err := syscall.Munmap(unsafe.Slice(base, length)); err != nil {
 		return fmt.Errorf("releasing linear memory: %w", err)
 	}
 	return nil
 }
 
-// mapLinearMemory maps length bytes of the file fd as a linear memory, inside
-// a guarded reservation like newLinearMemory's: the file occupies the start
-// of the range and everything past length faults. flags selects
-// MAP_PRIVATE (copy-on-write instances) or MAP_SHARED (in-place image
-// builds). The returned slice is exactly length long and wide; release it
-// with releaseLinearMemory.
-func mapLinearMemory(fd, length, flags int) ([]byte, error) {
+// mapLinearMemory maps length bytes of the file fd as a linear memory. With
+// guard (a wasm32 memory) the file occupies the start of a guarded
+// reservation like newLinearMemory's, and everything past length faults; a
+// memory64, whose accesses carry their own bounds checks, maps exactly
+// length bytes. flags selects MAP_PRIVATE (copy-on-write instances) or
+// MAP_SHARED (in-place image builds). The returned slice is exactly length
+// long and wide; release it with releaseLinearMemory.
+func mapLinearMemory(fd, length, flags int, guard bool) ([]byte, error) {
 	if length <= 0 {
 		// Nothing could release a mapping that its slice cannot locate.
 		return nil, fmt.Errorf("linear memory of %d bytes cannot be mapped", length)
 	}
-	if !guardedLinearMemory {
-		return syscall.Mmap(fd, 0, length, syscall.PROT_READ|syscall.PROT_WRITE, flags)
+	if !guardedLinearMemory || !guard {
+		return mmapLinearMemory(fd, length, syscall.PROT_READ|syscall.PROT_WRITE, flags)
 	}
 	size := linearMemoryReserve
 	if uint64(length) > size {
 		return nil, fmt.Errorf("linear memory of %d bytes exceeds the %d-byte reservation", length, size)
 	}
-	mem, err := syscall.Mmap(fd, 0, int(size), syscall.PROT_NONE, flags)
+	mem, err := mmapLinearMemory(fd, int(size), syscall.PROT_NONE, flags)
 	if err != nil {
 		return nil, err
 	}

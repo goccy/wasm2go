@@ -570,7 +570,7 @@ func (em *ssaEmitter) emitBlockInto(blk *ssa.Block, out *[]ast.Stmt, ec *emitCtx
 		if v.Op == ssa.OpPhi {
 			continue
 		}
-		if pre, err := em.callPrelude(v, ec.emitExpr); err != nil {
+		if pre, err := em.valuePrelude(v, ec.emitExpr); err != nil {
 			return err
 		} else if len(pre) > 0 {
 			*out = append(*out, pre...)
@@ -1019,7 +1019,7 @@ func (em *ssaEmitter) emitOp(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, erro
 		}
 		// Full-width aligned loads/stores skip the helper chain and
 		// emit sync/atomic intrinsics directly; see emit_memops.go.
-		if expr, done, err := em.emitAtomicInline(v, name, emit); err != nil {
+		if expr, done, err := em.emitAtomicInline(v, emit); err != nil {
 			return nil, err
 		} else if done {
 			return expr, nil
@@ -1337,7 +1337,7 @@ func (em *ssaEmitter) fieldRef(field string) ast.Expr {
 func (em *ssaEmitter) emitCallDirect(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) (ast.Expr, error) {
 	// A synthetic callee (an outlined loop) with a packed boundary
 	// reads its arguments from the per-module scratch slots that
-	// callPrelude filled right before this statement; the call itself
+	// valuePrelude filled right before this statement; the call itself
 	// carries only the module pointer.
 	synthName, _ := v.Aux.(string)
 	if synthName != "" && em.t != nil && em.t.outlinedSigs[synthName].Packed {
@@ -1364,11 +1364,15 @@ func (em *ssaEmitter) emitCallDirect(v *ssa.Value, emit func(*ssa.Value) (ast.Ex
 	return &ast.CallExpr{Fun: fun, Args: args}, nil
 }
 
-// callPrelude returns the statements a value's emission must be
-// preceded by: a packed outlined call fills the per-module scratch
-// slots with its boundary values here, immediately before the call
-// statement, so nothing can overwrite them in between.
-func (em *ssaEmitter) callPrelude(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) ([]ast.Stmt, error) {
+// valuePrelude returns the statements a value's emission must be
+// preceded by: a memory64 access's bounds check (see memBoundsTrapStmt),
+// and the boundary values a packed outlined call fills the per-module
+// scratch slots with, immediately before the call statement, so nothing
+// can overwrite them in between.
+func (em *ssaEmitter) valuePrelude(v *ssa.Value, emit func(*ssa.Value) (ast.Expr, error)) ([]ast.Stmt, error) {
+	if check, err := em.memBoundsTrapStmt(v, emit); err != nil || check != nil {
+		return []ast.Stmt{check}, err
+	}
 	if v.Op != ssa.OpCallDirect || em.t == nil {
 		return nil, nil
 	}

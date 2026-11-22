@@ -53,7 +53,13 @@ func emitDirectAsmBody(mod *wasm.Module, name string, df DirectAsmFn, archName s
 		return "", false
 	}
 	emit := asmgen.EmitFuncAMD64
-	opts := asmgen.FuncOptions{Module: mod, ForbidCalls: true}
+	// The memory64 bounds trap is the decls file's, which every
+	// package of the bundle has; the bound is memSize, at the probed
+	// offset.
+	opts := asmgen.FuncOptions{Module: mod, ForbidCalls: true, BoundsTrapSymbol: "·gcasmTrapMemoryOOB"}
+	if modOffs != nil {
+		opts.MemSizeOffset = modOffs.MemSize
+	}
 	if df.Packed {
 		opts.PackedParams = df.PackedParams
 	}

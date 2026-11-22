@@ -123,6 +123,38 @@ func TestBuildPackageFilesARM64Assembles(t *testing.T) {
 	}
 }
 
+// TestBuildPackageFilesMemory64 requires BuildPackageFiles to emit a
+// memory64 module's loads and stores, whose bounds checks CALL
+// wasm_trap_memory_oob — through a trampoline in a multi-package chunk —
+// instead of stubbing them.
+func TestBuildPackageFilesMemory64(t *testing.T) {
+	mod, err := wasm.Parse(bytes.NewReader(testfixture.Wasm(t, "cg_mem64_memops")))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, multi := range []bool{false, true} {
+		opts := BuildPackageOptions{Package: "main", MemSizeOffset: driverMemSizeOffset}
+		if multi {
+			opts.MultiPackage, opts.BasePkgImport = true, "asmgentest/base"
+		}
+		files, err := BuildPackageFiles(mod, opts)
+		if err != nil {
+			t.Fatalf("multi=%v: BuildPackageFiles: %v", multi, err)
+		}
+		for _, arch := range []string{"amd64", "arm64"} {
+			if stubs, ok := files["stubs_"+arch+".go"]; ok {
+				t.Errorf("multi=%v %s: functions stubbed:\n%s", multi, arch, stubs)
+			}
+			if !strings.Contains(files[arch+".s"], "CALL ·wasm_trap_memory_oob(SB)") {
+				t.Errorf("multi=%v %s: no bounds-trap CALL", multi, arch)
+			}
+		}
+		if tramp := files["helpers_trampolines.go"]; multi && !strings.Contains(tramp, "func wasm_trap_memory_oob()") {
+			t.Errorf("no wasm_trap_memory_oob trampoline:\n%s", tramp)
+		}
+	}
+}
+
 // sharedModuleSource returns the shared (always-on) Go source for a
 // given fixture: the Module struct plus any companion declarations
 // the asm's CALL-into-Go wrappers need to compile. Naming mirrors
@@ -391,9 +423,11 @@ func buildAndRunDriverArch(t *testing.T, fixture string, exports []string, drive
 			emit = EmitFuncARM64
 		}
 		asm, decl, err := emit(name, sig, fn, FuncOptions{
-			ModulePkgRef: "*Module",
-			Module:       mod,
-			FuncSymbol:   funcSymbol,
+			ModulePkgRef:     "*Module",
+			Module:           mod,
+			FuncSymbol:       funcSymbol,
+			BoundsTrapSymbol: "·wasm_trap_memory_oob",
+			MemSizeOffset:    driverMemSizeOffset,
 		})
 		if err != nil {
 			t.Logf("emit %s skipped (%v); stubbing", name, err)
@@ -1136,8 +1170,37 @@ func memoryGrow(m *Module, delta int32) int32 {`, `func memorySize64(m *Module) 
 
 func memoryGrow64(m *Module, delta int64) int64 {`, 1)
 	d.moduleSrc = strings.Replace(d.moduleSrc, `	cur := int32(len(m.Memory) / 65536)`, `	cur := int64(len(m.Memory) / 65536)`, 1)
+	// The bounds trap the memory64 accesses CALL: a trapping case
+	// prints "oob" and exits. Their bound is MemSize, right after M
+	// (driverMemSizeOffset), which grow keeps current.
+	d.moduleSrc = strings.Replace(d.moduleSrc, `import "unsafe"`, `import (
+	"os"
+	"sync/atomic"
+	"unsafe"
+)
+
+func wasm_trap_memory_oob() {
+	println("oob")
+	os.Exit(0)
+}`, 1)
+	d.moduleSrc = strings.Replace(d.moduleSrc, `	M      unsafe.Pointer
+}`, `	M      unsafe.Pointer
+	MemSize *atomic.Uint64
+}`, 1)
+	d.moduleSrc = strings.Replace(d.moduleSrc, `		M:      unsafe.Pointer(&mem[0]),
+	}`, `		M:      unsafe.Pointer(&mem[0]),
+		MemSize: &atomic.Uint64{},
+	}
+	modPtr.MemSize.Store(uint64(len(mem)))`, 1)
+	d.moduleSrc = strings.Replace(d.moduleSrc, `	m.M = unsafe.Pointer(&grown[0])
+	return cur`, `	m.M = unsafe.Pointer(&grown[0])
+	m.MemSize.Store(want)
+	return cur`, 1)
 	return d
 }
+
+// driverMemSizeOffset is the offset of driverWithMemory64's MemSize.
+const driverMemSizeOffset = 40
 
 // mem64MemopsCases is the memory64 twin of the TestEmitMemopsAMD64
 // case list: same data segment, same expected values, i64 addresses.
@@ -1183,6 +1246,15 @@ func mem64MemopsCases() ([]string, []driverCase) {
 		{"mem_size", []string{}, "2"},
 		{"mem_grow", []string{"3"}, "2"},
 		{"mem_grow", []string{"-1"}, "-1"},
+		// The last bytes of the 2-page memory, and one past them.
+		{"l_i64", []string{"131064"}, "0"},
+		{"l_i64", []string{"131065"}, "oob"},
+		{"l_i32_8u", []string{"131071"}, "0"},
+		{"l_i32_8u", []string{"131072"}, "oob"},
+		{"s_i32", []string{"131069", "1"}, "oob"},
+		// Addresses whose sum with the offset or the width wraps 2^64.
+		{"l_offset", []string{"-8"}, "oob"},
+		{"l_i64", []string{"-1"}, "oob"},
 	}
 	return exports, cases
 }
