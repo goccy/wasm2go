@@ -416,6 +416,18 @@ var wasiErrnoOfHost = sync.OnceValue(func() map[syscall.Errno]int32 {
 	return byHost
 })
 
+// hostErrnoOf returns the host's error number of the same name as the wasi
+// errno n, for an error the host is to be told of (WASIConfig.Errors): the
+// error of the wasi errno.
+func hostErrnoOf(n int32) error {
+	for _, h := range hostNumberTable(hostNumberFamilyErrno) {
+		if int(n) < len(wasiErrnoNames) && h.name == wasiErrnoNames[n] {
+			return syscall.Errno(h.value)
+		}
+	}
+	return fmt.Errorf("wasi errno %d, which this host has no number of", n)
+}
+
 // wasiErrno returns the wasi errno of an error number of the host, and
 // whether wasi has that error.
 func wasiErrno(e syscall.Errno) (int32, bool) {

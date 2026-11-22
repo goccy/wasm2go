@@ -103,22 +103,28 @@ is one socket of the host's from its making to its close; a
 Unix-domain socket's path is a file of the host only with
 `HostFS("/")`, and `ENOTSUP` with any other `FS`. `sock_shutdown`, the
 socket options and timeouts (`sock_setopt`, `sock_getopt`,
-`sock_timeout`) and `pipe` consult no hook. `FSAccess` is consulted on every path operation with the path
-cleaned as `chroot(2)` sees it (`..` of the root is the root; a
-symbolic link's target too) and the `FS` is given that approved path
-(`FSAccess` is a policy on path names); a nil one allows every access
-to the configured `FS`, which is then given the path as the guest wrote
-it. `Errors` is told the errors the guest cannot be given (nil drops them). Host
+`sock_timeout`) and `pipe` consult no hook. The `FS` is given every
+guest path in one form, the one `io/fs.ValidPath` accepts (`.` for the
+root), with a trailing `/` when the guest asks for a directory: the
+runtime resolves `..` itself, after the symbolic links before it as the
+system does (`..` of the root is the root). `FSAccess` is consulted on
+every path operation with that name (`FSAccess` is a policy on path
+names; a symbolic link's target, which names nothing yet, is cleaned
+lexically); a nil one allows every access to the configured `FS`. The
+names of the guest's own descriptors (`/dev/fd/N`, `/proc/self/fd/N`,
+`/dev/stdin`, ...) are resolved without the `FS` by every path
+operation, and by those that take no directory descriptor even when
+there is no `FS`. `Errors` is told the errors the guest cannot be given (nil drops them). Host
 access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
 `AllowAllListen`, `AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
 host process has (its args, environment, stdio, the whole host
 filesystem and its local time zone, with every hook allowing).
-`HostFS` of a directory other than `/` is built on `os.Root`, which
-refuses every path the guest names that escapes it (through `..` or a
-symbolic link) with `EACCES`; the symbolic links the guest creates may
-still point anywhere for a reader on the host. The directory must be
-one that may be searched, and it is held open until the FS's `Close`
-method is called.
+`HostFS("")` is an error. `HostFS` of a directory other than `/` is
+built on `os.Root`, which refuses a symbolic link that leads out of it
+with `EACCES`; the symbolic links the guest creates may still point
+anywhere for a reader on the host. The directory must be one that may
+be searched, and it is held open until the FS's `Close` method is
+called.
 
 `Process` supplies the values the guest reads of its process: what
 `getpid`, `getppid`, the `getuid` family, `getgroups`, `getpriority`
@@ -270,7 +276,7 @@ if err != nil {
 	return err
 }
 defer func() {
-	if err := fsys.(io.Closer).Close(); err != nil {
+	if err := fsys.Close(); err != nil {
 		log.Print(err)
 	}
 }()

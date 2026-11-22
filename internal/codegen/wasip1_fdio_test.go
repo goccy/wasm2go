@@ -441,7 +441,7 @@ func TestWasi_OwnDescriptorNames(t *testing.T) {
 		n    int32
 		ok   bool
 	}{
-		{"dev/stdin", 0, true}, {"/dev/stdout", 1, true}, {"dev/stderr", 2, true},
+		{"dev/stdin", 0, true}, {"dev/stdout", 1, true}, {"dev/stderr", 2, true},
 		{"dev/fd/7", 7, true}, {"proc/self/fd/12", 12, true}, {"proc/4242/fd/5", 5, true},
 		{"dev/fd/", 0, false}, {"dev/fd/x", 0, false}, {"dev/fd/7x", 0, false}, {"dev/fd/-1", 0, false}, {"dev/null", 0, false},
 		{"proc/4243/fd/5", 0, false}, {"proc/4242/fd", 0, false},
@@ -829,20 +829,32 @@ func TestWasi_OwnDescriptorNamesOfTheRootAndAClosedStream(t *testing.T) {
 // repeated slashes, "." and ".." elements it does not reach the host's file
 // of that name.
 func TestWasi_OwnDescriptorNamesInAnySpelling(t *testing.T) {
+	w, m := newTestStubs(t, t.TempDir())
+	own := func(name string) (int32, string, bool, string) {
+		t.Helper()
+		clean, errno := w.guestName(name)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("guestName(%.40q) errno=%d", name, errno)
+		}
+		return ownDescriptorPath(clean, w.guestPID)
+	}
 	for _, tc := range []struct {
 		name string
 		n    int32
 	}{
 		{"dev//fd/5", 5}, {"dev/./stdout", 1}, {"//dev/stderr", 2}, {"../dev/fd/7", 7}, {"./../.././dev/stdin", 0},
+		// ".." of a listing directory takes it back
+		{"proc/self/fd/../fd/1", 1},
 	} {
-		if n, rest, ok, _ := ownDescriptorPath(tc.name, fixedPID(42)); n != tc.n || rest != "" || !ok {
+		if n, rest, ok, _ := own(tc.name); n != tc.n || rest != "" || !ok {
 			t.Errorf("ownDescriptorPath(%q) = %d, %q, %v; want %d, \"\", true", tc.name, n, rest, ok, tc.n)
 		}
 	}
 	for name, want := range map[string]string{
 		"dev//fd": "dev/fd", "dev/./fd/": "dev/fd", "../proc/self/fd": "proc/self/fd", "proc/42/fd/.": "proc/42/fd",
+		"proc/self/fd/../fd": "proc/self/fd",
 	} {
-		if _, _, named, dir := ownDescriptorPath(name, fixedPID(42)); named || dir != want {
+		if _, _, named, dir := own(name); named || dir != want {
 			t.Errorf("ownDescriptorPath(%q) = %v, %q; want the directory %q", name, named, dir, want)
 		}
 	}
@@ -852,17 +864,19 @@ func TestWasi_OwnDescriptorNamesInAnySpelling(t *testing.T) {
 	for _, name := range []string{
 		"", ".", "dev", "proc", "dev/fd/..", "dev/null", "proc/43/fd", "proc/self/fdx", "proc/self/fd/x",
 		"a/dev/fd/5", "usr/dev/stdout", "home/proc/self/fd", "dev/fd0", "dev/stdoutx",
-		// the host resolves a ".." that takes back an element after
-		// symbolic links, which /dev/fd and /proc/self are
-		"proc/self/fd/../fd/1", "dev/fd/../../dev/stdin", "proc/self/fd/../fd", "a/../dev/stdout",
 		deep + "dev/fd/5", deep + "proc/self/fd", deep + "file.txt",
 	} {
-		if n, rest, named, dir := ownDescriptorPath(name, fixedPID(42)); named || dir != "" {
+		if n, rest, named, dir := own(name); named || dir != "" {
 			t.Errorf("ownDescriptorPath(%.40q) = %d, %q, %v, %q; want none", name, n, rest, named, dir)
 		}
 	}
+	// A ".." after a name the FS does not have fails.
+	for _, name := range []string{"a/../dev/stdout", "dev/fd/../../dev/stdin"} {
+		if _, errno := w.guestName(name); errno != _wasiENOENT {
+			t.Errorf("guestName(%q) errno=%d, want ENOENT", name, errno)
+		}
+	}
 
-	w, m := newTestStubs(t, t.TempDir())
 	var out bytes.Buffer
 	w.cfg.Stdout = &out
 	for _, name := range []string{"dev//fd/1", "dev/./stdout", "../proc/self/fd/1"} {
