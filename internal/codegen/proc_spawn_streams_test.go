@@ -261,3 +261,28 @@ func TestSpawn_SocketAsStdinLeavesTheRestToTheGuest(t *testing.T) {
 		t.Fatalf("the other socket read %q, want the end of the stream", got)
 	}
 }
+
+// A copy of a command's input that has ended has closed the pipe it wrote
+// to and the duplicate it read: finish finds nothing to end there, which is
+// no failure.
+func TestSpawn_FinishOfAnEndedInputCopyIsNoFailure(t *testing.T) {
+	src, srcEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srcEnd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, wr, err := runtimePipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, r)
+	c := &inputCopy{src: src, srcFile: src, dst: wr, owned: src, done: make(chan struct{}), report: func(err error) {
+		if err != nil {
+			t.Error(err)
+		}
+	}}
+	c.run()
+	c.finish()
+}

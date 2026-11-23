@@ -2066,11 +2066,11 @@ func (c *inputCopy) finish() {
 	c.mu.Unlock()
 	// A copy that has ended has closed dst and srcFile already: ErrClosed
 	// says there is nothing left to end.
-	if err := c.dst.SetWriteDeadline(time.Unix(0, 1)); err != nil && !errors.Is(err, os.ErrClosed) {
+	if err := deadlineErr(c.dst, c.dst.SetWriteDeadline(time.Unix(0, 1))); err != nil && !errors.Is(err, os.ErrClosed) {
 		c.report(err)
 	}
 	if c.srcFile != nil {
-		switch err := c.srcFile.SetReadDeadline(time.Unix(0, 1)); {
+		switch err := deadlineErr(c.srcFile, c.srcFile.SetReadDeadline(time.Unix(0, 1))); {
 		case err == nil:
 			reading = false
 		case !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrNoDeadline):

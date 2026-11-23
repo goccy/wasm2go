@@ -2002,6 +2002,21 @@ func rawCallErr(rc syscall.RawConn, err error) error {
 	return err
 }
 
+// deadlineErr returns err, the failure of setting a deadline of stream, as
+// rawCallErr does: os.File's SetReadDeadline and SetWriteDeadline report a
+// file that is closed, or being closed, with the poller's error as well.
+func deadlineErr(stream any, err error) error {
+	conn, isConn := stream.(syscall.Conn)
+	if err == nil || !isConn {
+		return err
+	}
+	rc, rcErr := conn.SyscallConn()
+	if rcErr != nil {
+		return errors.Join(err, rcErr)
+	}
+	return rawCallErr(rc, err)
+}
+
 // readResult is what the guest's read of a stream returns for a read that
 // got n bytes and err: the count, or the errno of a failure other than the
 // end of input that left nothing read.
@@ -6734,7 +6749,7 @@ func (w *WasiStubs) writeInterruptibly(m *Module, call string, op *wasiOpen, dst
 	defer op.passOutputTurn()
 	// A deadline left now was left by a holder that was unwound.
 	if err := dst.SetWriteDeadline(time.Time{}); err != nil {
-		return 0, w.guestErrno(call, err)
+		return 0, w.guestErrno(call, deadlineErr(dst, err))
 	}
 	var total uint64
 	var failure error
@@ -6766,7 +6781,7 @@ func (w *WasiStubs) writeInterruptibly(m *Module, call string, op *wasiOpen, dst
 			break
 		}
 		if woken {
-			failure = clearDeadline()
+			failure = deadlineErr(dst, clearDeadline())
 		}
 		if errors.Is(waitErr, os.ErrDeadlineExceeded) && failure == nil {
 			if interrupted {
@@ -6777,7 +6792,7 @@ func (w *WasiStubs) writeInterruptibly(m *Module, call string, op *wasiOpen, dst
 				// Only the holder of the turn sets a deadline, so this one
 				// is not the stream's any more: it was left behind.
 				if err := dst.SetWriteDeadline(time.Time{}); err != nil {
-					failure = err
+					failure = deadlineErr(dst, err)
 					break
 				}
 			}
@@ -18823,7 +18838,7 @@ func (w *WasiStubs) readInterruptibly(m *Module, call string, op *wasiOpen, src 
 	// left by a holder that was unwound. A stream that takes none (a FIFO
 	// with a name the Go runtime does not poll, a stream of a host without
 	// poll(2)) cannot be cut short: its read waits for input.
-	switch err := src.SetReadDeadline(time.Time{}); {
+	switch err := deadlineErr(src, src.SetReadDeadline(time.Time{})); {
 	case err == nil:
 	case !errors.Is(err, os.ErrNoDeadline):
 		return 0, w.guestErrno(call, err)
@@ -18866,7 +18881,7 @@ func (w *WasiStubs) readInterruptibly(m *Module, call string, op *wasiOpen, src 
 		}
 		var clearErr error
 		if woken || aheadWoken {
-			clearErr = errors.Join(aheadErr, clearDeadline())
+			clearErr = deadlineErr(src, errors.Join(aheadErr, clearDeadline()))
 		}
 		switch {
 		case refused:
@@ -18886,7 +18901,7 @@ func (w *WasiStubs) readInterruptibly(m *Module, call string, op *wasiOpen, src 
 			// Only the holder of the turn sets a deadline, so this one is
 			// not the stream's any more: it was left behind.
 			if err := src.SetReadDeadline(time.Time{}); err != nil {
-				return 0, w.guestErrno(call, err)
+				return 0, w.guestErrno(call, deadlineErr(src, err))
 			}
 		}
 		// Woken by a signal another blocking call reports, or by input a
