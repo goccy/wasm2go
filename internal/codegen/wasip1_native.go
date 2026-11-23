@@ -8577,16 +8577,15 @@ func (w *WasiStubs) writeInterruptibly(m *Module, call string, op *wasiOpen, dst
 // EAGAIN when that is nothing, without the turn at the stream's output.
 //
 // A write that waits takes that turn before it writes anything and holds it
-// until all is written, as writeInterruptibly does. Where the host has a
-// write that does not wait in one call (hostWritesWithoutWaiting), it
-// writes in steps that do not wait in the kernel whatever the mode of the
-// open file description (writeWithoutWaiting), and waits for room in poll(2)
-// between them: a signal posted to the guest meanwhile ends the wait, with
-// EINTR when nothing was written and the count otherwise; what there is
-// room for then is written all the same, as write(2) takes it from a
-// process with a signal pending. Elsewhere (darwin) each writev(2) is one,
-// which to a descriptor in blocking mode waits in the kernel until all is
-// written, and a signal does not end it.
+// until all is written, as writeInterruptibly does. Where it is made in
+// steps (writesInSteps), it writes in steps that do not wait in the kernel
+// whatever the mode of the open file description (writeWithoutWaiting), and
+// waits for room in poll(2) between them: a signal posted to the guest
+// meanwhile ends the wait, with EINTR when nothing was written and the count
+// otherwise; what there is room for then is written all the same, as
+// write(2) takes it from a process with a signal pending. Elsewhere each
+// writev(2) is one, which to a descriptor in blocking mode waits in the
+// kernel until all is written, and a signal does not end it.
 func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst syscall.Conn, bufs [][]byte, flags int32) (uint64, int32) {
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
 	if !nonblocking {
@@ -8598,6 +8597,10 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 	rest := append([][]byte(nil), bufs...)
 	var total uint64
 	file := op.streamFile(dst)
+	steps, err := op.writesInSteps(file)
+	if err != nil {
+		return 0, w.guestErrno(call, err)
+	}
 	// write writes rest once. With wait, which holds the turn, the mode is
 	// not asked: in steps the write does not wait in either, and otherwise
 	// the writev(2) waits in blocking mode and takes what fits in
@@ -8606,7 +8609,7 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 	write := func(wait bool) (again, mayBlock bool, errno int32) {
 		var n int
 		n, again, errno = w.tryStream(call, dst, func(fd uintptr) (int, bool, error) {
-			if wait && hostWritesWithoutWaiting {
+			if wait && steps {
 				return op.writeWithoutWaiting(file, fd, rest)
 			}
 			if wait {
@@ -8658,7 +8661,7 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 			// What there is room for is written in a step, where writes are
 			// made in steps, and elsewhere only to a descriptor that does
 			// not wait in the kernel.
-			if again, _, errno := write(hostWritesWithoutWaiting); !again || total > 0 {
+			if again, _, errno := write(steps); !again || total > 0 {
 				w.keepInterrupt(m)
 				return written(errno)
 			}
@@ -8666,6 +8669,26 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 		}
 	}
 	return total, _wasiESUCCESS
+}
+
+// writesInSteps reports whether a write that waits to file, the stream of
+// the entry op, is made in steps that do not wait in the kernel
+// (writeWithoutWaiting): where the host has such a write
+// (hostWritesWithoutWaiting), and, wherever poll(2) waits for room, to a
+// pipe, not a FIFO with a name, which the host tells (hostPipeWriteNow),
+// and to a terminal (terminalOf).
+func (op *wasiOpen) writesInSteps(file *os.File) (bool, error) {
+	if hostWritesWithoutWaiting {
+		return true, nil
+	}
+	if !hostPolls {
+		return false, nil
+	}
+	mode, namedFIFO := op.statOf(file)
+	if mode&os.ModeCharDevice != 0 {
+		return op.terminalOf(file)
+	}
+	return mode&os.ModeNamedPipe != 0 && !namedFIFO, nil
 }
 
 // writeHostOnce is a write that does not wait to dst, a descriptor that can

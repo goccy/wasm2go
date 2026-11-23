@@ -861,8 +861,7 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 
 	// A call of the guest's that waits does so in the runtime, never in
 	// the kernel, whatever the mode of the description, so that a signal
-	// ends it: where the host has a write that does not wait in one call
-	// (Linux), a write to a full pipe in blocking mode, which reports what
+	// ends it: a write to a full pipe in blocking mode, which reports what
 	// it wrote once it wrote something; an accept and, where MSG_DONTWAIT
 	// does not keep a send from waiting, a send that is not to wait, each
 	// made by the holder of a turn; a send with room for it whole; and on Linux, a read of a FIFO the guest put in blocking mode
@@ -897,8 +896,8 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			got += len(s)
 		}
 
-		// where a write that waits is made in steps (hostWritesWithoutWaiting)
-		if hostWritesWithoutWaiting {
+		// a write that waits to a pipe is made in steps (writesInSteps)
+		{
 			r, wr := newTestPipe(t, w, m)
 			// filled through the host's descriptor (the guest's number), in
 			// non-blocking mode for the fill only

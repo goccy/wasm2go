@@ -1194,8 +1194,9 @@ func hostReceive(fd int, bufs [][]byte, peek bool) (n int, truncated, again bool
 }
 
 // hostReceiveFrom receives into buf from socket fd once, without waiting,
-// and returns the sender (recvmsg(2)); peek leaves what it receives there.
-// See hostIO for the rest.
+// and returns the sender (recvmsg(2)), of family 0 for one without a name,
+// as Linux reports it (darwin reports an AF_UNIX address without a path);
+// peek leaves what it receives there. See hostIO for the rest.
 func hostReceiveFrom(fd int, buf []byte, peek bool) (n int, from wasiSockAddr, again bool, err error) {
 	flags := syscall.MSG_DONTWAIT
 	if peek {
@@ -1207,7 +1208,11 @@ func hostReceiveFrom(fd int, buf []byte, peek bool) (n int, from wasiSockAddr, a
 		sa = got
 		return uintptr(k), errnoOf(err)
 	})
-	return n, guestSockAddr(sa), again, os.NewSyscallError("recvmsg", err)
+	from = guestSockAddr(sa)
+	if from.family == wasiSockFamilyUnix && from.name == "" {
+		from = wasiSockAddr{}
+	}
+	return n, from, again, os.NewSyscallError("recvmsg", err)
 }
 
 // hostSend sends bufs on socket fd once, without waiting (sendmsg(2)): to

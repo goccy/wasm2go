@@ -503,6 +503,24 @@ func TestSocket_UnixPaths(t *testing.T) {
 	}
 }
 
+// A datagram from a Unix-domain socket without a name comes from an
+// address of no family, as Linux reports it.
+func TestSocket_UnixDatagramFromNoName(t *testing.T) {
+	w, m, dir := newSocketStubs(t)
+	receiver := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeDgram)
+	n := putUnixAddr(m, sockAddrOff, filepath.Join(dir, "dg"))
+	if rc := w.Sock_bind_addr(m, receiver, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS {
+		t.Fatalf("bind rc=%d", rc)
+	}
+	sender := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeDgram)
+	if rc := sendTo(w, m, sender, "x", true, n); rc != _wasiESUCCESS {
+		t.Fatalf("sendto rc=%d", rc)
+	}
+	if got, from, rc := recvFrom(w, m, receiver, 64, 0); rc != _wasiESUCCESS || got != "x" || from != (sockRecord{}) {
+		t.Fatalf("recvfrom = %q from %+v rc=%d, want \"x\" from no family", got, from, rc)
+	}
+}
+
 // Two connected sockets of a pair; datagrams keep their boundaries.
 func TestSocket_Pairs(t *testing.T) {
 	w, m, _ := newSocketStubs(t)
