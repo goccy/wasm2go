@@ -1842,6 +1842,10 @@ type wasiOpen struct {
 	statFile  *os.File
 	statMode  os.FileMode
 	namedFIFO bool
+	// terminalFile is the host file terminalOf last asked about, and
+	// terminal what it learnt. Guarded by mu.
+	terminalFile *os.File
+	terminal     bool
 	// lowatFile is the socket file streamSendLowat last asked about, and
 	// lowat what it learnt. Guarded by mu.
 	lowatFile *os.File
@@ -3009,6 +3013,21 @@ func (op *wasiOpen) statOf(file *os.File) (mode os.FileMode, namedFIFO bool) {
 		op.namedFIFO = op.statMode&os.ModeNamedPipe != 0 && known && st.nlink > 0
 	}
 	return op.statMode, op.namedFIFO
+}
+
+// terminalOf reports whether file, the host file behind this entry, is a
+// terminal of the host (withHostTerminal). The host is asked once per file.
+func (op *wasiOpen) terminalOf(file *os.File) (bool, error) {
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.terminalFile != file {
+		err := withHostTerminal(file, func(int) error { return nil })
+		if err != nil && !errors.Is(err, syscall.ENOTTY) {
+			return false, err
+		}
+		op.terminalFile, op.terminal = file, err == nil
+	}
+	return op.terminal, nil
 }
 
 // streamSendLowat is hostStreamSendLowat for file, the socket behind this
@@ -7507,6 +7526,18 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 		}
 		fdflags = uint16(op.fdflags)
 		op.mu.Unlock()
+		if file := w.opHostFileLocked(op); file != nil {
+			terminal, err := op.terminalOf(file)
+			if err != nil {
+				return w.errnoLater("fd_fdstat_get", err)
+			}
+			if terminal {
+				// What tells a terminal from another character device
+				// to wasi-libc's isatty: it cannot be sought on.
+				ftype = 2
+				rights &^= wasiRightFdSeek | wasiRightFdTell
+			}
+		}
 	} else if w.preopened(fd) {
 		ftype = 3 // preopen "/"
 		rights = wasiRootRights
@@ -7524,6 +7555,8 @@ func (w *WasiStubs) fdstatFill(fd int32, out []byte) int32 {
 // The rights of fd_fdstat_get that tell what a descriptor is open for.
 const (
 	wasiRightFdRead    uint64 = 1 << 1
+	wasiRightFdSeek    uint64 = 1 << 2
+	wasiRightFdTell    uint64 = 1 << 5
 	wasiRightFdWrite   uint64 = 1 << 6
 	wasiRightFdReaddir uint64 = 1 << 14
 )
@@ -9362,6 +9395,30 @@ func (w *WasiStubs) streamFile(op *wasiOpen) *os.File {
 		return nil
 	}
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.streamFileLocked(op)
+}
+
+// opHostFile returns the host file behind op: that of a standard stream
+// (streamFile), op's own otherwise; nil when there is none.
+func (w *WasiStubs) opHostFile(op *wasiOpen) *os.File {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.opHostFileLocked(op)
+}
+
+// opHostFileLocked is opHostFile with w.mu held. Caller holds w.mu.
+func (w *WasiStubs) opHostFileLocked(op *wasiOpen) *os.File {
+	if op.stdio != 0 {
+		return w.streamFileLocked(op)
+	}
+	file, _ := op.f.(*os.File)
+	return file
+}
+
+// streamFileLocked is streamFile for a standard stream (op.stdio != 0).
+// Caller holds w.mu.
+func (w *WasiStubs) streamFileLocked(op *wasiOpen) *os.File {
 	var stream any
 	switch op.stdio {
 	case 1:
@@ -9371,7 +9428,6 @@ func (w *WasiStubs) streamFile(op *wasiOpen) *os.File {
 	case 3:
 		stream = w.stderr()
 	}
-	w.mu.Unlock()
 	file, _ := stream.(*os.File)
 	return file
 }
@@ -15575,12 +15631,7 @@ func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, va
 	if !arg.of(request) {
 		return -_wasiENOTTY
 	}
-	var file *os.File
-	if op.stdio != 0 {
-		file = w.streamFile(op)
-	} else {
-		file, _ = op.f.(*os.File)
-	}
+	file := w.opHostFile(op)
 	if file == nil {
 		return -_wasiENOTTY
 	}

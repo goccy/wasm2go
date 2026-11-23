@@ -530,3 +530,104 @@ func TestFdIoctlInTheSessionLeader(t *testing.T) {
 		}
 	}
 }
+
+// fdstatOf returns the filetype and the rights fd_fdstat_get reports for fd.
+func fdstatOf(t *testing.T, w *WasiStubs, m *Module, fd int32) (filetype byte, base, inheriting uint64) {
+	t.Helper()
+	const out int32 = 5200
+	if rc := w.Fd_fdstat_get(m, fd, out); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_fdstat_get(%d) rc=%d", fd, rc)
+	}
+	return m.memory[out], binary.LittleEndian.Uint64(m.memory[out+8:]), binary.LittleEndian.Uint64(m.memory[out+16:])
+}
+
+// A terminal is a character device that cannot be sought on, as wasi-libc's
+// isatty tells one: a standard stream, a file of Files and a file path_open
+// opened that are a terminal of the host have no FD_SEEK and FD_TELL. A
+// pipe and a regular file keep them.
+func TestFdstatOfATerminalHasNoSeek(t *testing.T) {
+	const seekTell = wasiRightFdSeek | wasiRightFdTell
+	_, slave := openTestPty(t)
+	r, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, r)
+	closeAtEnd(t, wr)
+	given, err := os.OpenFile(slave.Name(), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, m := newProcTestStubs(t)
+	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = slave, slave, wr
+	w.cfg.Files = map[int32]*os.File{7: given}
+	closeAllAtCleanup(t, w)
+
+	for _, fd := range []int32{0, 1, 7} {
+		filetype, base, inheriting := fdstatOf(t, w, m, fd)
+		if filetype != 2 || base&seekTell != 0 || inheriting != ^uint64(0) {
+			t.Errorf("fdstat of the terminal at %d: filetype %d rights %#x %#x, want 2 without FD_SEEK and FD_TELL", fd, filetype, base, inheriting)
+		}
+	}
+	if filetype, base, _ := fdstatOf(t, w, m, 2); filetype != 2 || base&seekTell != seekTell {
+		t.Errorf("fdstat of a pipe: filetype %d rights %#x, want 2 with FD_SEEK and FD_TELL", filetype, base)
+	}
+	file := createTestFile(t, w, "a.txt")
+	if filetype, base, _ := fdstatOf(t, w, m, file); filetype != 4 || base&seekTell != seekTell {
+		t.Errorf("fdstat of a regular file: filetype %d rights %#x, want 4 with FD_SEEK and FD_TELL", filetype, base)
+	}
+
+	w.cfg.FS = osFS{}
+	tty, errno := w.pathOpen(m, slave.Name()[1:], 0, 0, 1<<1|1<<6, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open %s errno=%d", slave.Name(), errno)
+	}
+	if filetype, base, _ := fdstatOf(t, w, m, tty); filetype != 2 || base&seekTell != 0 {
+		t.Errorf("fdstat of %s path_open opened: filetype %d rights %#x, want 2 without FD_SEEK and FD_TELL", slave.Name(), filetype, base)
+	}
+	closeTestFd(t, w, m, tty)
+}
+
+// hostTerminalEnv holds the name of the terminal that is the standard
+// input of the process TestHostDescriptorsOnATerminal starts to run
+// TestHostDescriptorsOnATerminalInAProcess in.
+const hostTerminalEnv = "WASM2GO_HOST_TERMINAL"
+
+// TestHostDescriptorsOnATerminal runs
+// TestHostDescriptorsOnATerminalInAProcess in a process of its own, with
+// the slave of a pseudo-terminal as its standard input.
+func TestHostDescriptorsOnATerminal(t *testing.T) {
+	if os.Getenv(hostTerminalEnv) != "" {
+		t.Skip("this is the process of the tests")
+	}
+	_, slave := openTestPty(t)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHostDescriptorsOnATerminalInAProcess$", "-test.v")
+	cmd.Env = append(os.Environ(), hostTerminalEnv+"="+slave.Name())
+	cmd.Stdin = slave
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("the process of the tests: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("--- PASS: TestHostDescriptorsOnATerminalInAProcess")) {
+		t.Fatalf("the process of the tests ran no test:\n%s", out)
+	}
+}
+
+// The standard input an instance whose descriptors are the host's takes
+// over (takeStandardLocked) is a terminal to the guest when it is the
+// host's.
+func TestHostDescriptorsOnATerminalInAProcess(t *testing.T) {
+	if os.Getenv(hostTerminalEnv) == "" {
+		t.Skip("run by TestHostDescriptorsOnATerminal")
+	}
+	w, m := newHostNumberedStubs(t, nil, os.Stdin)
+	w.mu.Lock()
+	op := w.openLocked(0)
+	w.mu.Unlock()
+	if op == nil || op.stdio != 0 {
+		t.Fatal("fd 0 is not the host's standard input")
+	}
+	if filetype, base, _ := fdstatOf(t, w, m, 0); filetype != 2 || base&(wasiRightFdSeek|wasiRightFdTell) != 0 {
+		t.Errorf("fdstat of the terminal at 0: filetype %d rights %#x, want 2 without FD_SEEK and FD_TELL", filetype, base)
+	}
+}
