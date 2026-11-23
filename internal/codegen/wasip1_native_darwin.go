@@ -203,7 +203,7 @@ func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
 	if timeout >= 0 {
 		// poll(2) takes an int of milliseconds; a longer wait ends early,
 		// and the caller waits again.
-		ms = int(min((timeout+time.Millisecond-1)/time.Millisecond, math.MaxInt32))
+		ms = int((min(timeout, math.MaxInt32*time.Millisecond) + time.Millisecond - 1) / time.Millisecond)
 	}
 	var first *hostPoll
 	if len(fds) > 0 {

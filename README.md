@@ -217,6 +217,29 @@ thread is never ended: once the instance is closed (`CloseAll`, or the
 garbage collector collecting an instance dropped without it), it is kept
 for the next instance that needs one.
 
+`MonotonicClock` reads the guest's monotonic clock (`CLOCK_MONOTONIC`),
+in nanoseconds: what `clock_time_get` reports, what a clock
+subscription of `poll_oneoff` on it waits for (relative or absolute),
+and what the interval timer (`setitimer`, `alarm`) counts. Such a wait
+never ends before the clock reads its end, so that a guest's sleeps and
+timeouts agree with the clock it reads: the host's timers count the
+time left at the last reading, and the clock is read again, the wait
+going on for what is still left. With a clock faster than the host's
+timers, a wait ends when they have counted what was left; with one
+that is slower, coarser or stands still, it waits again each time
+until the clock moves on to the end. A nil one counts from `NewWASI`.
+A forked instance reads its parent's clock.
+
+`HostMonotonicClock()` returns a reader of the clock the Go runtime's
+timers count, by which the guest's waits then end: `CLOCK_MONOTONIC`
+on Linux, the BSDs, Solaris and illumos; `mach_absolute_time` on macOS,
+which is `CLOCK_UPTIME_RAW` and not `CLOCK_MONOTONIC` (it stands still
+while the system sleeps, and the two part by the time the system has
+slept: an embedder whose guest is to read macOS's `CLOCK_MONOTONIC`
+supplies a `MonotonicClock` of its own that reads it); the interrupt
+time (`QueryInterruptTime`) on Windows; and `CLOCK_REALTIME`, the one
+the Go runtime counts by there, on AIX.
+
 `Signals` connects the guest's signals with what is outside it: its
 `Kill` is given the guest's `kill` of a process that is not the
 guest's own (not the guest, not a child or fork it made) or of a

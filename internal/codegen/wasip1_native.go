@@ -3388,6 +3388,21 @@ type WASIConfig struct {
 	// as tzfile(5) has it. nil is the host's, which time.LoadLocation reads.
 	// A TZ that starts with '/' names a zone file of FS instead.
 	ZoneInfo fs.FS
+	// MonotonicClock reads the guest's monotonic clock (CLOCK_MONOTONIC), in
+	// nanoseconds, whose readings never decrease: what clock_time_get
+	// reports, what a clock subscription of poll_oneoff on it waits for
+	// (relative or absolute), and what the interval timer (setitimer, alarm)
+	// counts. Such a wait never ends before the clock reads its end: the
+	// runtime has the host's timers count the time left at the last
+	// reading, then reads the clock again and, while it has not come to the
+	// end, waits again for what is left. With a clock faster than the host's
+	// timers, a wait ends when they have counted what was left; with one
+	// that is slower, coarser or stands still, it waits again each time
+	// until the clock moves on to the end. It is called from any goroutine,
+	// with the instance's locks held, and does not call the instance. nil
+	// counts from NewWASI; HostMonotonicClock is the clock the host's timers
+	// count. A forked instance reads its parent's.
+	MonotonicClock func() uint64
 	// Errors is told the errors of operations whose caller cannot be given
 	// them (op names the operation), among them an error the guest's call
 	// fails with that has no errno of its own (the call fails with EIO); nil
@@ -7456,10 +7471,38 @@ func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 	case 0: // CLOCK_REALTIME
 		return uint64(time.Now().UnixNano()), _wasiESUCCESS
 	case 1: // CLOCK_MONOTONIC
-		return uint64(time.Since(w.monoStart).Nanoseconds()), _wasiESUCCESS
+		return w.monotonicNanos(), _wasiESUCCESS
 	default:
 		return 0, _wasiEINVAL
 	}
+}
+
+// monotonicNanos reads the guest's monotonic clock
+// (WASIConfig.MonotonicClock).
+func (w *WasiStubs) monotonicNanos() uint64 {
+	if w.cfg.MonotonicClock != nil {
+		return w.cfg.MonotonicClock()
+	}
+	return uint64(time.Since(w.monoStart).Nanoseconds())
+}
+
+// monotonicAfter returns the reading of the monotonic clock d after
+// reading, the largest reading for one beyond it.
+func monotonicAfter(reading uint64, d time.Duration) uint64 {
+	at, carry := bits.Add64(reading, uint64(d), 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return at
+}
+
+// readingsApart returns the time from reading until a clock reads at: 0
+// once it has, and at most the longest time.Duration.
+func readingsApart(reading, at uint64) time.Duration {
+	if at <= reading {
+		return 0
+	}
+	return time.Duration(min(at-reading, math.MaxInt64))
 }
 
 // closeWasiOpens closes the descriptors of ops (closeWasiOpen), which have
@@ -11540,7 +11583,12 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		isRead   bool
 		errno    int32
 	}
-	var minClockNs int64 = -1
+	// The first clock subscription on the guest's monotonic clock is due
+	// once that clock reads monoAt (monoWaits), the first on any other at
+	// endAt, a time of the host's timers (endWaits).
+	var monoAt uint64
+	var endAt time.Time
+	monoWaits, endWaits := false, false
 	var clockEvents []pollItem
 	var fdEvents []pollItem
 	for i := uint64(0); i < nsubs; i++ {
@@ -11550,23 +11598,33 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		switch etype {
 		case 0: // clock
 			clockID := int32(binary.LittleEndian.Uint32(subs[base+16:]))
-			timeout := int64(binary.LittleEndian.Uint64(subs[base+24:]))
-			flags := binary.LittleEndian.Uint16(subs[base+40:])
-			ns := timeout
+			timeout := binary.LittleEndian.Uint64(subs[base+24:])
+			abs := binary.LittleEndian.Uint16(subs[base+40:])&0x1 != 0
 			var errno int32
-			if flags&0x1 != 0 {
-				// Absolute timeout in nanoseconds of the subscription's
-				// clock: the time left until it. A clock there is none of
-				// has its event at once, carrying the error.
-				var now uint64
-				now, errno = w.clockNanos(clockID)
-				ns = 0
-				if at := uint64(timeout); errno == _wasiESUCCESS && at > now {
-					ns = int64(min(at-now, 1<<63-1))
+			if clockID == 1 { // CLOCK_MONOTONIC
+				at := timeout
+				if !abs {
+					at = monotonicAfter(w.monotonicNanos(), readingsApart(0, timeout))
 				}
-			}
-			if minClockNs < 0 || ns < minClockNs {
-				minClockNs = ns
+				if !monoWaits || at < monoAt {
+					monoAt, monoWaits = at, true
+				}
+			} else {
+				left := readingsApart(0, timeout)
+				if abs {
+					// Absolute timeout in nanoseconds of the subscription's
+					// clock: the time left until it. A clock there is none
+					// of has its event at once, carrying the error.
+					var reading uint64
+					reading, errno = w.clockNanos(clockID)
+					left = 0
+					if errno == _wasiESUCCESS {
+						left = readingsApart(reading, timeout)
+					}
+				}
+				if end := time.Now().Add(left); !endWaits || end.Before(endAt) {
+					endAt, endWaits = end, true
+				}
 			}
 			clockEvents = append(clockEvents, pollItem{userdata: userdata, etype: 0, errno: errno})
 		case 1, 2: // fd_read / fd_write
@@ -11577,6 +11635,21 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			clockEvents = append(clockEvents, pollItem{userdata: userdata, etype: etype})
 		}
 	}
+	// clockDue returns the time in nanoseconds until the first clock
+	// subscription is due, -1 for none.
+	clockDue := func() int64 {
+		due := int64(-1)
+		if endWaits {
+			due = int64(max(time.Until(endAt), 0))
+		}
+		if monoWaits {
+			if left := int64(readingsApart(w.monotonicNanos(), monoAt)); due < 0 || left < due {
+				due = left
+			}
+		}
+		return due
+	}
+	minClockNs := clockDue()
 
 	// Decide which fd subscriptions are ready. A descriptor whose read or
 	// write cannot block — a regular file, a Writer of the embedder's no
@@ -11748,11 +11821,11 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// and no timeout, a signal is all there is to wait for, as for poll(2).
 	onlySignal := !anyReady && len(hostSet) == 0 && minClockNs < 0 && len(fdEvents) > 0
 	waits := !anyReady && minClockNs != 0 && (len(hostSet) > 0 || minClockNs > 0 || onlySignal)
-	// How long the descriptors may be waited for: until the timeout when
-	// there is one, otherwise until one is ready.
-	var hostDeadline time.Time
+	// How long the call waits: until the first clock subscription is due
+	// when there is one, otherwise until a descriptor is ready.
+	var clockEnd time.Time
 	if minClockNs >= 0 {
-		hostDeadline = time.Now().Add(time.Duration(minClockNs))
+		clockEnd = time.Now().Add(time.Duration(minClockNs))
 	}
 	// The wake of this call, which a signal, a reader that has input or a
 	// close of a descriptor waited for wakes.
@@ -11818,14 +11891,13 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		given = false
 		defer w.giveWakeOnUnwind("poll_oneoff", &given, wk, hostSet)
 	}
-	clockEnd := time.Now().Add(time.Duration(minClockNs))
 	// wait waits once for what the call waits for, until stop (nil for
 	// none) is closed.
 	wait := func(stop <-chan struct{}) {
 		switch {
 		case !waits:
 		case len(hostSet) > 0:
-			waitHostWoken(hostDeadline, stop)
+			waitHostWoken(clockEnd, stop)
 		case minClockNs > 0:
 			// The clock paces the call only when nothing else can end it.
 			timer := time.NewTimer(time.Until(clockEnd))
@@ -11857,9 +11929,23 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			}
 			return _wasiEINTR
 		}
+		if interrupted || anyReady {
+			break
+		}
+		// Once the host's timers reach the end of the wait, the call ends
+		// if a clock subscription is due, and waits on for the time the
+		// guest's monotonic clock still has to go.
+		if minClockNs >= 0 && !time.Now().Before(clockEnd) {
+			left := clockDue()
+			if left == 0 {
+				break
+			}
+			clockEnd = time.Now().Add(time.Duration(left))
+			continue
+		}
 		// A signal another blocking call reports leaves the wait on while
 		// nothing is ready and time remains.
-		if !woken || interrupted || anyReady || minClockNs >= 0 && !time.Now().Before(clockEnd) {
+		if !woken {
 			break
 		}
 	}
@@ -19404,11 +19490,12 @@ type wasiSignals struct {
 	// due is what the changes made under mu leave to do once it is let go.
 	due wasiSignalsDue
 	// timer is the running real-time interval timer (setitimer's
-	// ITIMER_REAL, which alarm and ualarm set as well), timerAt the time it
-	// fires next, and timerEvery the interval at which it fires again after
-	// that: 0 for a timer that fires once.
+	// ITIMER_REAL, which alarm and ualarm set as well), timerAt the reading
+	// of the guest's monotonic clock it fires next at, and timerEvery the
+	// interval at which it fires again after that: 0 for a timer that fires
+	// once.
 	timer      *time.Timer
-	timerAt    time.Time
+	timerAt    uint64
 	timerEvery time.Duration
 	// detached records that delivery has ended (detachSignals): what is
 	// posted from then on is dropped, for a forked instance too.
@@ -20362,7 +20449,7 @@ func (w *WasiStubs) timerStateLocked() (left, every time.Duration) {
 	if s.timer == nil {
 		return 0, 0
 	}
-	left = time.Until(s.timerAt)
+	left = readingsApart(w.monotonicNanos(), s.timerAt)
 	if left <= 0 {
 		// It is about to fire; a set timer never reports that it is not.
 		left = 1
@@ -20378,14 +20465,21 @@ func (w *WasiStubs) timerStateLocked() (left, every time.Duration) {
 func (w *WasiStubs) startTimerLocked(value, every time.Duration) {
 	// The moment is taken before the host's timer is set, so that the
 	// host's timer never runs ahead of it.
-	at := time.Now().Add(value)
+	at := monotonicAfter(w.monotonicNanos(), value)
 	var timer *time.Timer
 	timer = time.AfterFunc(value, func() {
 		w.sig.mu.Lock()
 		defer w.unlockSignals()
-		if w.sig.timer == timer {
-			w.fireDueTimerLocked()
+		if w.sig.timer != timer {
+			return
 		}
+		// The guest's monotonic clock may not have come to the time yet:
+		// the host's timer is set for what it has left.
+		if left := readingsApart(w.monotonicNanos(), w.sig.timerAt); left > 0 {
+			timer.Reset(left)
+			return
+		}
+		w.fireDueTimerLocked()
 	})
 	w.sig.timer, w.sig.timerAt, w.sig.timerEvery = timer, at, every
 }
@@ -20405,17 +20499,17 @@ func (w *WasiStubs) fireDueTimerLocked() {
 	if s.timer == nil {
 		return
 	}
-	now := time.Now()
-	if s.timerAt.After(now) {
+	now := w.monotonicNanos()
+	if s.timerAt > now {
 		return
 	}
 	if s.timerEvery > 0 {
-		next := s.timerAt.Add(s.timerEvery)
-		if !next.After(now) {
-			next = now.Add(s.timerEvery)
+		next := monotonicAfter(s.timerAt, s.timerEvery)
+		if next <= now {
+			next = monotonicAfter(now, s.timerEvery)
 		}
 		s.timerAt = next
-		s.timer.Reset(next.Sub(now))
+		s.timer.Reset(readingsApart(now, next))
 	} else {
 		s.timer.Stop()
 		s.timer = nil
@@ -21174,6 +21268,8 @@ var (
 	wasip1NativeHostFDRaw []byte
 	//go:embed wasip1_native_nolinux.go
 	wasip1NativeNoLinuxRaw []byte
+	//go:embed wasip1_native_clock.go
+	wasip1NativeClockRaw []byte
 	//go:embed wasip1_native_descriptors.go
 	wasip1NativeDescriptorsRaw []byte
 	//go:embed wasip1_native_linux_msg.go
@@ -21228,6 +21324,7 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_other.go":   wasip1NativeOtherRaw,
 		"wasip1_native_hostfd.go":  wasip1NativeHostFDRaw,
 		"wasip1_native_nolinux.go": wasip1NativeNoLinuxRaw,
+		"wasip1_native_clock.go":   wasip1NativeClockRaw,
 
 		"wasip1_native_descriptors.go": wasip1NativeDescriptorsRaw,
 

@@ -102,7 +102,7 @@ func TestTakeSignal_TimerAlarm(t *testing.T) {
 func TestTakeSignal_DueTimerInAGuestsCall(t *testing.T) {
 	overdue := func(w *WasiStubs) {
 		w.sig.mu.Lock()
-		w.sig.timerAt = time.Now().Add(-time.Millisecond)
+		w.sig.timerAt = 0
 		w.sig.mu.Unlock()
 	}
 	for _, take := range []bool{true, false} {
