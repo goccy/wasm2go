@@ -287,6 +287,46 @@ func TestWasi_AWriteThatCanBlockInTheKernelTakesTheTurnFirst(t *testing.T) {
 	}
 }
 
+// A read and a write that wait for their turn at a stream closed meanwhile
+// find it closed: EBADF, which is no failure of the runtime's.
+func TestWasi_ACallWaitingForItsTurnAtAClosedStreamIsEBADF(t *testing.T) {
+	w, m := newProcTestStubs(t)
+	w.cfg.Errors = func(op string, err error) { t.Errorf("%s: %v", op, err) }
+	readFd, writeFd := newTestPipe(t, w, m)
+	t.Run("Read", func(t *testing.T) {
+		turn := entryOf(t, w, readFd).inputTurn()
+		turn <- struct{}{} // another reader is looking
+		read := readAsync(w, newForkTestModule(), readFd)
+		if blocked, res := blockedOrDone(t, w, read); !blocked {
+			t.Fatalf("the read went through (%q rc=%d) while another reader held the turn", res.got, res.rc)
+		}
+		if rc := w.Fd_close(m, readFd); rc != _wasiESUCCESS {
+			t.Fatalf("close rc=%d", rc)
+		}
+		<-turn
+		if res := within(t, "fd_read", read); res.rc != _wasiEBADF {
+			t.Fatalf("read = %q rc=%d, want EBADF", res.got, res.rc)
+		}
+	})
+	t.Run("Write", func(t *testing.T) {
+		skipWithoutStreamWrites(t)
+		turn := entryOf(t, w, writeFd).outputTurn()
+		turn <- struct{}{} // another write that waits is under way
+		wrote := make(chan int32, 1)
+		go func() { wrote <- fdWriteString(w, newForkTestModule(), writeFd, "x") }()
+		if blocked, rc := blockedOrDone(t, w, wrote); !blocked {
+			t.Fatalf("the write went through (rc=%d) while another held the turn", rc)
+		}
+		if rc := w.Fd_close(m, writeFd); rc != _wasiESUCCESS {
+			t.Fatalf("close rc=%d", rc)
+		}
+		<-turn
+		if rc := within(t, "fd_write", wrote); rc != _wasiEBADF {
+			t.Fatalf("write rc=%d, want EBADF", rc)
+		}
+	})
+}
+
 // Two readers of one pipe wait together, one in the Go runtime's poller
 // with the turn at the input and the other for the turn: input reaches
 // one, and the other waits on, for its signal.

@@ -537,9 +537,6 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 	t.Run("RunningCommand", func(t *testing.T) {
 		w, m := newHostNumberedStubs(t, nil, nil)
 		w.cfg.Exec = AllowAllExec
-		// The copy of the command's input tells Errors of its end as a
-		// failure (inputCopy.finish), a fault of its own: not looked at here.
-		w.cfg.Errors = nil
 		r, wr := newTestPipe(t, w, m)
 		_, out := newTestPipe(t, w, m)
 		before, err := openHostDescriptors()
