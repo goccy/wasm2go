@@ -1561,18 +1561,12 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			t.Fatalf("clear O_NONBLOCK rc=%d", rc)
 		}
 		read := readAsync(w, newForkTestModule(), fd)
-		// The read waits: in the Go runtime's poller as a blocking call, or
-		// in the read itself, holding the turn at the input.
+		// The read waits as a blocking call: in the Go runtime's poller, or
+		// for the FIFO's reader, which is in a read of the FIFO.
 		waiting := make(chan struct{})
 		go func() {
 			defer close(waiting)
-			if polled {
-				awaitBlockedCalls(w, 1)
-				return
-			}
-			for len(op.inputTurn()) == 0 {
-				runtime.Gosched()
-			}
+			awaitBlockedCalls(w, 1)
 		}()
 		within(t, "the read's wait", waiting)
 		closed := make(chan int32, 1)

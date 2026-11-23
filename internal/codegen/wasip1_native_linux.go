@@ -946,7 +946,7 @@ func (fw *fifoWatch) hasWriter(f File) (bool, error) {
 		return false, os.NewSyscallError("tee", err)
 	}
 	set := []hostWaitFD{{stream: f, want: hostWantInput}}
-	if err := waitHostReady(set, time.Now(), -1); err != nil {
+	if err := waitHostReady(set, time.Now(), nil); err != nil {
 		return false, err
 	}
 	return set[0].ready, nil

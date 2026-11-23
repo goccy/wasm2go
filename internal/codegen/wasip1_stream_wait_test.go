@@ -585,7 +585,7 @@ func TestWasi_AStreamOfTheEmbeddersIsWaitedForOnADuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := []hostWaitFD{{stream: conn, want: hostWantInput, op: &wasiOpen{stdio: 1}}}
-	returnsWithin(t, "the wait", func() { err = waitHostReady(set, time.Time{}, wakeR) })
+	returnsWithin(t, "the wait", func() { err = waitHostReady(set, time.Time{}, &wasiWake{r: wakeR, w: wakeW}) })
 	if err != nil {
 		t.Fatal(err)
 	}

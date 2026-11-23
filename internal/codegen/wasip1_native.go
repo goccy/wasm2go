@@ -1801,14 +1801,14 @@ type wasiOpen struct {
 	// (dup, dup2, Fork): the descriptor is closed when the last one is
 	// cleared (setSlotLocked, clearSlotLocked). Guarded by mu.
 	refs int32
-	// ahead is input a readiness probe took out of the stream: the only
-	// portable way to learn that a stream the host cannot poll is readable
-	// is to read it (see pollReady). Reads of this descriptor drain ahead
-	// before they touch the stream. aheadEnd is the end of input a probe
-	// ran into (io.EOF or a read failure), reported once, when ahead is
-	// drained. Both guarded by mu.
-	ahead    []byte
-	aheadEnd error
+	// ahead is input of the descriptor's a command was given and did not
+	// read (giveAhead). Reads of this descriptor drain ahead before they
+	// touch the stream. Guarded by mu.
+	ahead []byte
+	// reader is the reader of the stream behind the entry when poll(2)
+	// does not wait for it (inputReader), made on first use; nil for the
+	// instance's stdin, whose reader is its family's. Guarded by mu.
+	reader *streamReader
 	// turn is the turn at this descriptor's input and outTurn the turn at
 	// its output; see inputTurn. Made on first use; guarded by mu.
 	turn    chan struct{}
@@ -1874,30 +1874,14 @@ type deadlineReader interface {
 	SetReadDeadline(t time.Time) error
 }
 
-// pollProbeGrace bounds a probe that must not wait: long enough for the
-// read to be attempted, which is all a "what is ready right now" poll needs.
-const pollProbeGrace = 200 * time.Microsecond
-
-// takeAhead serves a read from the input a readiness probe already took. ok
-// is false when there is none and the read must go to the stream. Once that
-// input is drained, one read finds what ended the probe's: the end of
-// input, as zero bytes, or the failure, as its errno. The reads after it go
-// to the stream again, which can have input by then (a terminal after its
-// end-of-file character, a FIFO with a new writer).
+// takeAhead serves a read from the input a command left (ahead). ok is
+// false when there is none and the read must go to the stream.
 func (w *WasiStubs) takeAhead(call string, op *wasiOpen, bufs [][]byte) (n uint64, errno int32, ok bool) {
 	op.mu.Lock()
-	if len(op.ahead) == 0 {
-		end := op.aheadEnd
-		op.aheadEnd = nil
-		op.mu.Unlock()
-		if end == nil || errors.Is(end, io.EOF) {
-			// A probe that hit end of input leaves a zero-byte read behind.
-			return 0, _wasiESUCCESS, end != nil
-		}
-		// Errors is told without the lock held.
-		return 0, w.guestErrno(call, end), true
-	}
 	defer op.mu.Unlock()
+	if len(op.ahead) == 0 {
+		return 0, _wasiESUCCESS, false
+	}
 	return op.copyAheadLocked(bufs, false), _wasiESUCCESS, true
 }
 
@@ -1921,16 +1905,16 @@ func (op *wasiOpen) copyAheadLocked(bufs [][]byte, peek bool) uint64 {
 }
 
 // aheadReady reports whether a read would return without blocking because
-// of probed input, and how many bytes are waiting.
+// of input a command left, and how many bytes are waiting.
 func (op *wasiOpen) aheadReady() (ready bool, pending int) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
-	return len(op.ahead) > 0 || op.aheadEnd != nil, len(op.ahead)
+	return len(op.ahead) > 0, len(op.ahead)
 }
 
 // inputTurn returns the channel that holds the turn at this descriptor's
 // input: whoever has put a value in it has the turn, and gives it back by
-// taking the value out (takeInputTurn, passInputTurn).
+// taking the value out (awaitInputTurn, passInputTurn).
 //
 // A descriptor can be shared — by the slots of one instance (dup) and by the
 // instances of a fork family, each on a goroutine of its own. Reading a
@@ -1941,14 +1925,15 @@ func (op *wasiOpen) aheadReady() (ready bool, pending int) {
 // not be reached by a signal.
 //
 // So the waiting is done in turns. Whoever is about to read a descriptor
-// takes its turn first, in a select that a signal or a timeout can end, and
-// only the holder of the turn enters the host's call and sets the deadline
-// that bounds it. The turn also keeps what probes take off the descriptor
-// (ahead) in the order it arrived.
+// takes its turn first, in a select that a signal can end, and only the
+// holder of the turn enters the host's call and sets the deadline that
+// bounds it.
 //
 // A descriptor that poll(2) waits for is waited for without the turn
 // (readHostStream): only the read of one that can wait in the kernel takes
-// it, for the look and the read that follows (readHostAttempt).
+// it, for the look and the read that follows (readHostAttempt). A stream
+// poll(2) does not wait for is read by its reader, which takes no turn
+// (streamReader).
 func (op *wasiOpen) inputTurn() chan struct{} {
 	op.mu.Lock()
 	defer op.mu.Unlock()
@@ -1974,35 +1959,21 @@ func (op *wasiOpen) outputTurn() chan struct{} {
 	return op.outTurn
 }
 
-// takeInputTurn waits for the turn at the descriptor's input and reports
-// whether it got it: not when until passed first (the zero time is no
-// limit), nor when stop was closed first.
-func (op *wasiOpen) takeInputTurn(until time.Time, stop <-chan struct{}) bool {
-	return takeTurn(op.inputTurn(), until, stop)
-}
-
 // passOutputTurn gives the turn at the descriptor's output back.
 func (op *wasiOpen) passOutputTurn() { <-op.outputTurn() }
 
-// takeTurn waits for a turn and reports whether it got it: not when until
-// passed first (the zero time is no limit), nor when stop was closed first.
-func takeTurn(turn chan struct{}, until time.Time, stop <-chan struct{}) bool {
+// takeTurn waits for a turn and reports whether it got it: not when stop
+// was closed first.
+func takeTurn(turn chan struct{}, stop <-chan struct{}) bool {
 	select {
 	case turn <- struct{}{}:
 		return true
 	default:
 	}
-	var expired <-chan time.Time
-	if !until.IsZero() {
-		timer := time.NewTimer(time.Until(until))
-		defer timer.Stop()
-		expired = timer.C
-	}
 	select {
 	case turn <- struct{}{}:
 		return true
 	case <-stop:
-	case <-expired:
 	}
 	return false
 }
@@ -2010,75 +1981,434 @@ func takeTurn(turn chan struct{}, until time.Time, stop <-chan struct{}) bool {
 // passInputTurn gives the turn back.
 func (op *wasiOpen) passInputTurn() { <-op.inputTurn() }
 
-// probeInput is a readiness probe of the descriptor's input. It waits — no
-// longer than until (the zero time is no limit), and not after stop is
-// closed — first for the turn and then in attempt, which makes one read and
-// keeps what it got on the entry. kept reports whether something is kept
-// there, in which case the descriptor is ready. setDeadline bounds the host
-// call attempt makes.
+// streamReader is the reader of an input stream that poll(2) does not wait
+// for (inputPolled): a stream of the embedder's that is no descriptor of
+// the host's, a FIFO whose end poll(2) does not report, any stream where
+// the host has no poll(2). One goroutine of its own calls the stream's
+// Read, once each time it is asked to (request), and keeps what it returns
+// until a read takes it (take). Nothing else of the runtime's calls Read
+// (package os/exec does, for the stdin of a command where the host has no
+// poll(2)), and the stream is read only when the guest asks for input: a
+// read, a poll, the stdin of a command it starts. The
+// waits for input are woken by the goroutine when it has some (addWaiter),
+// so that whether there is input is a look at what the reader keeps, and
+// no wait is bounded by a time (os/exec gives a Reader that is no file to
+// a command through a goroutine that copies it, childStdin; wasmtime's
+// stdin is read by a thread of its own when the guest asks).
 //
-// refused is true when the stream takes no deadline, or no longer does
-// because it was closed meanwhile: the caller decides what an unbounded
-// read is worth to it, and that read reports the closing.
-func (op *wasiOpen) probeInput(setDeadline func(time.Time) error, until time.Time, stop <-chan struct{}, kept func() bool, attempt func()) (ready, refused bool) {
-	if kept() {
-		return true, false
-	}
-	if !op.takeInputTurn(until, stop) {
-		return kept(), false
-	}
-	defer op.passInputTurn()
-	// Whoever had the turn before may have found something.
-	if kept() {
-		return true, false
-	}
-	if err := setDeadline(until); err != nil {
-		return false, true
-	}
-	var stopErr error
-	if stop == nil {
-		attempt()
-	} else {
-		// stop ends the attempt in progress. The goroutine is gone before
-		// the deadline is cleared below, so no deadline is left behind.
-		attempted, watched := make(chan struct{}), make(chan struct{})
-		go func() {
-			defer close(watched)
-			select {
-			case <-stop:
-				stopErr = setDeadline(time.Now())
-			case <-attempted:
-			}
-		}()
-		attempt()
-		close(attempted)
-		<-watched
-	}
-	// The stream took the deadline above; it refuses one only once it is
-	// closed, which has ended the attempt as well.
-	if err := errors.Join(stopErr, setDeadline(time.Time{})); err != nil {
-		return kept(), true
-	}
-	return kept(), false
+// The reader is stopped once the stream's last descriptor is closed and by
+// CloseAll (stop): it is asked for nothing more. A Read in progress cannot
+// be ended; what it returns is kept, and nothing is told of a failure.
+type streamReader struct {
+	src io.Reader
+	// asked tells the goroutine to read once; it is closed by stop.
+	asked chan struct{}
+
+	mu sync.Mutex
+	// buf is what the reader read and no read has taken yet; end is what
+	// ended a Read (io.EOF or its failure), reported once buf is taken.
+	buf []byte
+	end error
+	// reading is set from a request to the end of the Read it asks for,
+	// started once the goroutine runs, stopped once stop is called.
+	reading, started, stopped bool
+	// waiters are the wakes of the waits for input, written to when the
+	// reader has some or is stopped.
+	waiters map[*wasiWake]bool
+	// report is told the failure of a wake no call is left to return
+	// (WASIConfig.Errors).
+	report func(error)
 }
 
-// probeRead reads src once, as probeInput describes, and keeps what arrives
-// in ahead. It reports whether the descriptor is now readable.
-func (op *wasiOpen) probeRead(src deadlineReader, until time.Time, stop <-chan struct{}) (ready, refused bool) {
-	kept := func() bool {
-		ready, _ := op.aheadReady()
-		return ready
+// newStreamReader returns the reader of src; report is told the failures of
+// its wakes.
+func newStreamReader(src io.Reader, report func(error)) *streamReader {
+	return &streamReader{src: src, asked: make(chan struct{}, 1), report: report}
+}
+
+// request asks for a Read of the stream, unless the reader has input or an
+// end to give, a Read is in progress, or the reader is stopped.
+func (r *streamReader) request() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.buf) > 0 || r.end != nil || r.reading || r.stopped {
+		return
 	}
-	return op.probeInput(src.SetReadDeadline, until, stop, kept, func() {
-		buf := make([]byte, 32<<10)
-		n, err := src.Read(buf)
-		op.mu.Lock()
-		defer op.mu.Unlock()
-		op.ahead = append(op.ahead, buf[:n]...)
-		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
-			op.aheadEnd = err
+	r.reading = true
+	if !r.started {
+		r.started = true
+		go r.run()
+	}
+	r.asked <- struct{}{}
+}
+
+// run is the reader's goroutine: a Read for each request, until stop.
+func (r *streamReader) run() {
+	buf := make([]byte, 32<<10)
+	for range r.asked {
+		n, err := r.src.Read(buf)
+		r.mu.Lock()
+		r.buf = append(r.buf, buf[:n]...)
+		if err != nil {
+			r.end = err
 		}
-	})
+		r.reading = false
+		stopped := r.stopped
+		err = r.wakeLocked()
+		r.mu.Unlock()
+		r.report(err)
+		if stopped {
+			return
+		}
+	}
+}
+
+// take serves a read from what the reader keeps, as a Read returns it: the
+// count, or the end (io.EOF, a failure, os.ErrClosed for a stopped reader);
+// ok is false when it keeps nothing. Once its input is taken, one read finds
+// the end the Read ran into. The reads after it ask the stream again, which
+// can have input by then (a terminal after its end-of-file character).
+func (r *streamReader) take(bufs [][]byte) (n int, err error, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.buf) == 0 {
+		if r.end == nil && r.stopped {
+			// The stream's descriptors are closed.
+			return 0, os.ErrClosed, true
+		}
+		end := r.end
+		r.end = nil
+		return 0, end, end != nil
+	}
+	k := 0
+	for _, buf := range bufs {
+		k += copy(buf, r.buf[k:])
+		if k == len(r.buf) {
+			break
+		}
+	}
+	r.buf = r.buf[k:]
+	if len(r.buf) == 0 {
+		r.buf = nil
+	}
+	return k, nil, true
+}
+
+// readerInput is a stream's reader read as an io.Reader, by the copy of a
+// command's stdin (inputCopy): a Read takes what the reader keeps, or asks
+// it for a Read and waits for that, until stop is called, which ends the
+// Read with os.ErrDeadlineExceeded, as a read deadline in the past ends a
+// read of a descriptor.
+type readerInput struct {
+	r       *streamReader
+	wake    *wasiWake
+	stopped chan struct{}
+}
+
+// newReaderInput returns the input of r, which waits for r until stop.
+func newReaderInput(r *streamReader) *readerInput {
+	in := &readerInput{r: r, wake: newChannelWake(), stopped: make(chan struct{})}
+	r.addWaiter(in.wake)
+	return in
+}
+
+func (in *readerInput) Read(p []byte) (int, error) {
+	for {
+		if n, err, ok := in.r.take([][]byte{p}); ok {
+			return n, err
+		}
+		in.r.request()
+		select {
+		case <-in.wake.ch:
+		case <-in.stopped:
+			return 0, os.ErrDeadlineExceeded
+		}
+	}
+}
+
+// stop ends the Read in progress and the waits for the reader.
+func (in *readerInput) stop() {
+	in.r.removeWaiter(in.wake)
+	close(in.stopped)
+}
+
+// unread gives b back, input a command was given of the stream and did not
+// read, ahead of what the reader read after it, and wakes the waits.
+func (r *streamReader) unread(b []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(b, r.buf...)
+	return r.wakeLocked()
+}
+
+// ready reports whether a read takes something without waiting.
+func (r *streamReader) ready() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.buf) > 0 || r.end != nil || r.stopped
+}
+
+// pending returns how many bytes the reader keeps.
+func (r *streamReader) pending() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.buf)
+}
+
+// streamTurn is the turn at a Writer of the embedder's that is no
+// descriptor of the host's: whoever has put a value in turn calls Write,
+// and nobody else does, so that the Writer is written one call at a time,
+// by the guests of a fork family and the copies of their commands' output,
+// as os/exec writes the Stdout and Stderr of a command that are one Writer.
+// A blocking write waits for it (awaitStreamTurn), which a signal ends, and
+// is handed it in the order of the waits when it is given back (give), as
+// a sync.Mutex in starvation mode hands itself on; a write that does not
+// wait does not, and a poll for writing waits until it is free.
+type streamTurn struct {
+	// held is set while somebody has the turn. A turn given back with waits
+	// queued is handed on; only within a give that let it go without the
+	// lock can a wait be queued while it is free, and the next give hands
+	// it to that wait.
+	held atomic.Bool
+
+	mu sync.Mutex
+	// queue are the waits to take the turn (turnWait), in order; waiters
+	// the wakes of the polls waiting for it to be free. Guarded by mu;
+	// waiting is how many there are of both, which give reads without it.
+	queue   []*turnWait
+	waiters map[*wasiWake]bool
+	waiting atomic.Int32
+}
+
+// turnWait is the wait of one call to take a turn: it keeps its place in
+// the turn's queue across the waits of the call (awaitStreamTurn), and the
+// turn is handed to it (given) when it is the first.
+type turnWait struct {
+	t *streamTurn
+	// wk is the wake of the wait in progress, nil between two; queued says
+	// the wait is in t's queue, given that the turn was handed to it.
+	// Guarded by t.mu.
+	wk            *wasiWake
+	queued, given bool
+}
+
+// tryTake takes the turn when nobody has it, and reports whether it did.
+func (t *streamTurn) tryTake() bool { return t.held.CompareAndSwap(false, true) }
+
+// take takes the turn, waiting for it on wk, a wake of no call of the
+// guest's (the copy of a command's output), which no signal ends.
+func (t *streamTurn) take(wk *wasiWake) {
+	if t.tryTake() {
+		return
+	}
+	q := &turnWait{t: t}
+	q.addWaiter(wk)
+	for !q.ready() {
+		<-wk.ch
+	}
+	q.removeWaiter(wk)
+}
+
+// give gives the turn back: to the first of the waits queued, which is
+// woken, or else free, which wakes the polls waiting for it.
+func (t *streamTurn) give() error {
+	if t.waiting.Load() == 0 {
+		t.held.Store(false)
+		if t.waiting.Load() == 0 {
+			return nil
+		}
+		// A wait registered meanwhile may have found the turn held: it is
+		// handed the turn, unless somebody took it first.
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if !t.held.CompareAndSwap(false, true) {
+			return nil
+		}
+		return t.handLocked()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.handLocked()
+}
+
+// handLocked hands the turn, which the caller has, to the first wait of the
+// queue, or makes it free when there is none. Caller holds t.mu.
+func (t *streamTurn) handLocked() error {
+	if len(t.queue) > 0 {
+		q := t.queue[0]
+		t.queue = t.queue[1:]
+		t.waiting.Add(-1)
+		q.queued, q.given = false, true
+		if q.wk == nil {
+			return nil
+		}
+		return q.wk.wake()
+	}
+	t.held.Store(false)
+	var err error
+	for wk := range t.waiters {
+		err = errors.Join(err, wk.wake())
+	}
+	return err
+}
+
+// ready reports whether nobody has the turn.
+func (t *streamTurn) ready() bool { return !t.held.Load() }
+
+// awaitStreamTurn takes t for a blocking call of the guest's, as awaitTurn
+// takes a turn: false when the call is to report a signal posted
+// meanwhile, and the turn is not held. A free turn is taken without
+// waiting, whatever signal is posted; a held one is waited for in the
+// turn's queue.
+func (w *WasiStubs) awaitStreamTurn(m *Module, call string, t *streamTurn) (bool, error) {
+	if t.tryTake() {
+		return true, nil
+	}
+	q := &turnWait{t: t}
+	set := []hostWaitFD{{source: q}}
+	returned := false
+	defer func() {
+		// A call that terminate unwinds leaves the queue, and hands on a
+		// turn handed to it.
+		if !returned {
+			w.reportError(call, q.leave())
+		}
+	}()
+	for {
+		interrupted, err := w.waitHostInterruptibly(m, call, set, time.Time{})
+		if err != nil || interrupted {
+			returned = true
+			return false, errors.Join(err, q.leave())
+		}
+		if q.ready() {
+			returned = true
+			return true, nil
+		}
+	}
+}
+
+// addWaiter registers wk as the wake of a poll waiting for the turn to be
+// free.
+func (t *streamTurn) addWaiter(wk *wasiWake) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.waiters == nil {
+		t.waiters = map[*wasiWake]bool{}
+	}
+	if !t.waiters[wk] {
+		t.waiters[wk] = true
+		t.waiting.Add(1)
+	}
+}
+
+// removeWaiter undoes addWaiter.
+func (t *streamTurn) removeWaiter(wk *wasiWake) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.waiters[wk] {
+		delete(t.waiters, wk)
+		t.waiting.Add(-1)
+	}
+}
+
+// ready reports whether the turn was handed to q.
+func (q *turnWait) ready() bool {
+	q.t.mu.Lock()
+	defer q.t.mu.Unlock()
+	return q.given
+}
+
+// addWaiter makes wk the wake of q's wait, and queues q for the turn the
+// first time. A free turn is q's at once.
+func (q *turnWait) addWaiter(wk *wasiWake) {
+	t := q.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	q.wk = wk
+	if q.queued || q.given {
+		return
+	}
+	// Counted before the turn is tried: a give that finds the turn held and
+	// no wait counted lets it go without the lock, and the try then takes
+	// it (give).
+	t.waiting.Add(1)
+	if t.held.CompareAndSwap(false, true) {
+		t.waiting.Add(-1)
+		q.given = true
+		return
+	}
+	q.queued = true
+	t.queue = append(t.queue, q)
+}
+
+// removeWaiter ends the wait of wk: q keeps its place in the queue, and is
+// not woken until its next wait.
+func (q *turnWait) removeWaiter(wk *wasiWake) {
+	q.t.mu.Lock()
+	defer q.t.mu.Unlock()
+	if q.wk == wk {
+		q.wk = nil
+	}
+}
+
+// leave takes q out of the turn's queue, for a call that no longer waits;
+// a turn handed to it already is handed on.
+func (q *turnWait) leave() error {
+	t := q.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if q.given {
+		q.given = false
+		return t.handLocked()
+	}
+	if i := slices.Index(t.queue, q); i >= 0 {
+		t.queue = slices.Delete(t.queue, i, i+1)
+		t.waiting.Add(-1)
+		q.queued = false
+	}
+	return nil
+}
+
+// addWaiter registers wk as the wake of a wait for input.
+func (r *streamReader) addWaiter(wk *wasiWake) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.waiters == nil {
+		r.waiters = map[*wasiWake]bool{}
+	}
+	r.waiters[wk] = true
+}
+
+// removeWaiter undoes addWaiter.
+func (r *streamReader) removeWaiter(wk *wasiWake) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.waiters, wk)
+}
+
+// wakeLocked wakes the waits for input. Caller holds r.mu.
+func (r *streamReader) wakeLocked() error {
+	var err error
+	for wk := range r.waiters {
+		err = errors.Join(err, wk.wake())
+	}
+	return err
+}
+
+// stop asks the reader for nothing more and wakes the waits.
+func (r *streamReader) stop() {
+	r.mu.Lock()
+	if r.stopped {
+		r.mu.Unlock()
+		return
+	}
+	r.stopped = true
+	if r.started && !r.reading {
+		close(r.asked)
+	}
+	err := r.wakeLocked()
+	r.mu.Unlock()
+	r.report(err)
 }
 
 // hostDescriptor runs use on the descriptor of the host behind stream — a
@@ -2113,11 +2443,67 @@ type hostWaitFD struct {
 	// op is the entry the stream is behind: the close of its last slot
 	// wakes the wait (closeWasiOpen).
 	op *wasiOpen
+	// source, in place of a stream, is what the wait is for that poll(2)
+	// is not asked about: the reader of a stream poll(2) does not wait for
+	// (streamReader), the turn at a Writer of the embedder's (streamTurn).
+	source waitSource
 }
 
-// wasiWake is a wake pipe of an instance's (takeWake): a wait in poll(2)
-// watches r, and a byte written to w ends the wait.
-type wasiWake struct{ r, w int }
+// waitSource is what a wait is for that poll(2) is not asked about
+// (hostWaitFD.source): whether it is ready, and the wakes it wakes when it
+// becomes ready.
+type waitSource interface {
+	ready() bool
+	addWaiter(wk *wasiWake)
+	removeWaiter(wk *wasiWake)
+}
+
+// wasiWake is a wake of an instance's (takeWake): a wait in poll(2)
+// watches the pipe r, a wait for no descriptor of the host's receives from
+// ch, and wake ends either. A wake where the host has no poll(2) has no
+// pipe (r and w are -1).
+type wasiWake struct {
+	r, w int
+	ch   chan struct{}
+}
+
+// newChannelWake returns a wake without a pipe.
+func newChannelWake() *wasiWake { return &wasiWake{r: -1, w: -1, ch: make(chan struct{}, 1)} }
+
+// wake ends the wait wk is the wake of: a byte in its channel, which holds
+// one, and in its pipe when it has one.
+func (wk *wasiWake) wake() error {
+	select {
+	case wk.ch <- struct{}{}:
+	default:
+	}
+	if wk.w < 0 {
+		return nil
+	}
+	return hostWakeWrite(wk.w)
+}
+
+// drain empties the wake.
+func (wk *wasiWake) drain() error {
+	select {
+	case <-wk.ch:
+	default:
+	}
+	if wk.r < 0 {
+		return nil
+	}
+	return hostWakeDrain(wk.r)
+}
+
+// wakeFor returns the wake of a call that waits for set: one of the pool
+// (takeWake), or one without a pipe for a wait for no descriptor of the
+// host's (only sources), which poll(2) is not asked about.
+func (w *WasiStubs) wakeFor(set []hostWaitFD) (*wasiWake, error) {
+	if !slices.ContainsFunc(set, func(e hostWaitFD) bool { return e.source == nil }) {
+		return newChannelWake(), nil
+	}
+	return w.takeWake()
+}
 
 // takeWake takes a wake pipe of the instance's pool for a call that waits,
 // making one when the pool is empty. The call has it to itself until it
@@ -2131,6 +2517,9 @@ func (w *WasiStubs) takeWake() (*wasiWake, error) {
 		return wk, nil
 	}
 	w.mu.Unlock()
+	if !hostPolls {
+		return newChannelWake(), nil
+	}
 	var r, wr int
 	if err := makeRuntimeDescriptors(func() error {
 		var err error
@@ -2147,7 +2536,9 @@ func (w *WasiStubs) takeWake() (*wasiWake, error) {
 	}); err != nil {
 		return nil, err
 	}
-	return &wasiWake{r: r, w: wr}, nil
+	wk := newChannelWake()
+	wk.r, wk.w = r, wr
+	return wk, nil
 }
 
 // giveWake gives back the wake pipe the call took for the waits of set,
@@ -2159,8 +2550,15 @@ func (w *WasiStubs) giveWake(wk *wasiWake, set []hostWaitFD) error {
 		if e.op != nil {
 			e.op.removeWaiter(wk)
 		}
+		if e.source != nil {
+			e.source.removeWaiter(wk)
+		}
 	}
-	err := hostWakeDrain(wk.r)
+	if wk.r < 0 {
+		// A wake without a pipe is the call's own: nothing to give back.
+		return nil
+	}
+	err := wk.drain()
 	w.mu.Lock()
 	if err == nil && !w.wakesClosed {
 		w.wakes = append(w.wakes, wk)
@@ -2168,7 +2566,15 @@ func (w *WasiStubs) giveWake(wk *wasiWake, set []hostWaitFD) error {
 		return nil
 	}
 	w.mu.Unlock()
-	return errors.Join(err, hostCloseFD(wk.r), hostCloseFD(wk.w))
+	return errors.Join(err, wk.closePipe())
+}
+
+// closePipe closes the wake's pipe, when it has one.
+func (wk *wasiWake) closePipe() error {
+	if wk.r < 0 {
+		return nil
+	}
+	return errors.Join(hostCloseFD(wk.r), hostCloseFD(wk.w))
 }
 
 // addWaiter registers wk as the wake of a wait for the entry's descriptor,
@@ -2211,17 +2617,18 @@ func streamPolled(stream any) bool {
 
 // waitHostReady asks poll(2) about the streams of set and records which are
 // ready: at once when until has passed, otherwise waiting until one is,
-// until passes (the zero time is no limit) or wake, a descriptor of the
-// host's (-1 for none), is readable. poll(2) is asked about the descriptor
-// numbers, which nothing holds open meanwhile: the guest's close of an
-// entry's last slot wakes the wait (closeWasiOpen). A stream of the
+// until passes (the zero time is no limit) or wake (nil for none) is woken.
+// What poll(2) is not asked about (source) is ready as it says. poll(2) is
+// asked about the descriptor numbers, which nothing holds open meanwhile:
+// the guest's close of an entry's last slot wakes the wait (closeWasiOpen).
+// A stream of the
 // embedder's (an instance's standard stream), which it can close as the
 // guest waits for it, is waited for on a duplicate of its descriptor held
 // for the wait, so that the wait never asks about another file that gets
 // the number. A stream closed already is ready, and the call on it reports
 // the closing; so is one asked about input of an entry that has input
 // ahead (giveAhead, which wakes the wait).
-func waitHostReady(set []hostWaitFD, until time.Time, wake int) error {
+func waitHostReady(set []hostWaitFD, until time.Time, wake *wasiWake) error {
 	waits := until.IsZero() || time.Now().Before(until)
 	var fds []uintptr
 	var wants, at, dups []int
@@ -2232,10 +2639,17 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake int) error {
 		}
 		return err
 	}
+	// found is set once an entry is ready without poll(2).
+	found := false
 	for i, e := range set {
+		if e.source != nil {
+			set[i].ready = e.source.ready()
+			found = found || set[i].ready
+			continue
+		}
 		if e.want == hostWantInput && e.op != nil {
 			if ahead, _ := e.op.aheadReady(); ahead {
-				set[i].ready = true
+				set[i].ready, found = true, true
 				continue
 			}
 		}
@@ -2245,27 +2659,58 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake int) error {
 			dup, err := duplicateDescriptor(conn)
 			switch {
 			case errors.Is(err, fs.ErrClosed):
-				set[i].ready = true
+				set[i].ready, found = true, true
 				continue
 			case err != nil:
 				return errors.Join(err, closeDups())
 			}
 			dups, fd = append(dups, dup), uintptr(dup)
 		} else if !hostDescriptor(e.stream, func(d uintptr) { fd = d }) {
-			set[i].ready = true
+			set[i].ready, found = true, true
 			continue
 		}
 		fds, wants, at = append(fds, fd), append(wants, e.want), append(at, i)
 	}
-	if len(fds) < len(set) {
+	if found {
 		until = time.Now() // a closed one is ready: no wait
 	}
+	if len(fds) == 0 {
+		waitWake(until, wake)
+		return nil
+	}
+	wakeFD := -1
+	if wake != nil {
+		wakeFD = wake.r
+	}
 	ready := make([]bool, len(fds))
-	err := hostWaitReady(fds, wants, ready, until, wake)
+	err := hostWaitReady(fds, wants, ready, until, wakeFD)
 	for k, r := range ready {
 		set[at[k]].ready = r
 	}
 	return errors.Join(err, closeDups())
+}
+
+// waitWake waits until wake (nil for none) is woken or until passes (the
+// zero time is no limit): a wait for no descriptor of the host's.
+func waitWake(until time.Time, wake *wasiWake) {
+	var woken <-chan struct{}
+	if wake != nil {
+		woken = wake.ch
+	}
+	var expired <-chan time.Time
+	if !until.IsZero() {
+		left := time.Until(until)
+		if left <= 0 {
+			return
+		}
+		timer := time.NewTimer(left)
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case <-woken:
+	case <-expired:
+	}
 }
 
 // waitHostInterruptibly is waitHostReady for a blocking call of the guest's:
@@ -2274,7 +2719,7 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake int) error {
 // set is closed (its last slot is cleared). The call takes a wake pipe of
 // the instance's for the wait.
 func (w *WasiStubs) waitHostInterruptibly(m *Module, call string, set []hostWaitFD, until time.Time) (interrupted bool, err error) {
-	wk, err := w.takeWake()
+	wk, err := w.wakeFor(set)
 	if err != nil {
 		return false, err
 	}
@@ -2282,12 +2727,15 @@ func (w *WasiStubs) waitHostInterruptibly(m *Module, call string, set []hostWait
 		if e.op != nil {
 			e.op.addWaiter(wk)
 		}
+		if e.source != nil {
+			e.source.addWaiter(wk)
+		}
 	}
 	given := false
 	defer w.giveWakeOnUnwind(call, &given, wk, set)
 	var wakeErr error
-	interrupted, _, refused := w.blockingAttempt(m, func() { wakeErr = hostWakeWrite(wk.w) }, nil,
-		func(<-chan struct{}) { err = waitHostReady(set, until, wk.r) })
+	interrupted, _, refused := w.blockingAttempt(m, func() { wakeErr = wk.wake() }, nil,
+		func(<-chan struct{}) { err = waitHostReady(set, until, wk) })
 	given = true
 	return interrupted || refused, errors.Join(err, wakeErr, w.giveWake(wk, set))
 }
@@ -2421,30 +2869,11 @@ func firstBuffer(bufs [][]byte) []byte {
 	return nil
 }
 
-// readOnce reads src once into bufs: a descriptor of the host's (hostRaw)
-// with readv(2) — waiting for input, as src's own Read does, in the poller
-// of the Go runtime and no longer than src's deadline — and any other stream
-// with its Read. That one is read into the first buffer when no other has
-// room or it holds 64 KiB; otherwise into a buffer of the runtime's of no
-// more than 64 KiB, whose bytes then fill the buffers. A datagram stays one
-// message, cut to what the buffer read into holds.
+// readOnce reads src, a descriptor of the host's that the Go runtime polls
+// (readInterruptibly), once into bufs with readv(2), waiting for input, as
+// src's own Read does, in the poller of the Go runtime and no longer than
+// src's deadline.
 func readOnce(src io.Reader, bufs [][]byte) (int, error) {
-	if !hostPolls || !hostRaw(src) {
-		const scratch = 64 << 10
-		first, total := firstBuffer(bufs), 0
-		for _, buf := range bufs {
-			total += len(buf)
-		}
-		if len(first) == total || len(first) >= scratch {
-			return src.Read(first)
-		}
-		p := make([]byte, min(total, scratch))
-		n, err := src.Read(p)
-		for rest := p[:n]; len(rest) > 0; bufs = bufs[1:] {
-			rest = rest[copy(bufs[0], rest):]
-		}
-		return n, err
-	}
 	rc, err := src.(syscall.Conn).SyscallConn()
 	if err != nil {
 		return 0, err
@@ -2534,6 +2963,22 @@ func (op *wasiOpen) readBlocks(src io.Reader) (deadlineReader, bool) {
 		return stream, true
 	}
 	return stream, op.fileIsStream(file)
+}
+
+// readsStream reports whether a read of src, the stream behind this entry,
+// can wait for input (readBlocks), or src is the instance's stdin of the
+// embedder's that is no file, whose Read may wait for all the runtime knows:
+// it is read through a reader (streamReader). A Reader of package bytes' or
+// strings' has its input in memory, and its Read does not wait.
+func (op *wasiOpen) readsStream(src io.Reader) bool {
+	if _, blocks := op.readBlocks(src); blocks {
+		return true
+	}
+	switch src.(type) {
+	case *os.File, *bytes.Reader, *strings.Reader, *bytes.Buffer:
+		return false
+	}
+	return op.stdio == 1
 }
 
 // fileIsStream reports whether file, the host file behind this entry, is a
@@ -2671,7 +3116,7 @@ func filePolled(stream any) (bool, error) {
 func (op *wasiOpen) watchAhead(wake func()) (ahead bool) {
 	op.mu.Lock()
 	defer op.mu.Unlock()
-	if wake != nil && (len(op.ahead) > 0 || op.aheadEnd != nil) {
+	if wake != nil && len(op.ahead) > 0 {
 		return true
 	}
 	op.inputWake = wake
@@ -2765,6 +3210,26 @@ type WASIConfig struct {
 	// guest fds 0/1/2 refer to until the guest closes or replaces them. A
 	// nil Stdin reads as empty (EOF); a nil Stdout or Stderr discards what
 	// is written.
+	//
+	// The instances of a fork family (Fork) and their threads share them.
+	// A Stdin the runtime cannot wait for in poll(2) (one that is no file
+	// or connection of the host's, a FIFO poll(2) does not report the end
+	// of, any stream of a host without poll(2)) is read by one goroutine of
+	// the runtime's, once each time the guest asks for input — a read, a
+	// poll, the stdin of a command it starts — and what a Read returns is
+	// kept for the guest's next read, also when the guest stopped waiting
+	// for it (a signal) or ended: a Read in progress is not ended. Where the
+	// host has no poll(2), a command's stdin is read by package os/exec
+	// itself, at the same time. A *bytes.Reader, *strings.Reader or
+	// *bytes.Buffer is read by the guest's calls, and by the copy of a
+	// command's stdin at the same time. A Stdout or Stderr that is no
+	// file of the host's is written by the guests' writes and the copies of
+	// their commands' output one Write at a time, the same turn for both
+	// when Stdout == Stderr (as os/exec decides it); a Write runs to its end
+	// on the call of the guest's that makes it, and a signal ends only the
+	// wait for another one to finish. The runtime sets no deadline on a
+	// stream that is no file or connection of the host's. Instances that
+	// are not of one family call them independently.
 	Stdin          io.Reader
 	Stdout, Stderr io.Writer
 	// FS is the filesystem every guest path operation is routed through,
@@ -2792,7 +3257,9 @@ type WASIConfig struct {
 	// or ENOENT for a number that is not open; one that removes or renames
 	// one fails with EACCES (EPERM for a guest of effective user id 0); a
 	// rename or link between such a name and one of the FS fails with
-	// EXDEV.
+	// EXDEV. The FS and its files are called concurrently, by the instances
+	// of a fork family and their threads; a File is closed by the guest's
+	// close of its last descriptor, and is not to be closed before.
 	FS FS
 	// NetAccess is consulted before Sock_accept, Sock_recv and Sock_send
 	// with "accept", "recv" or "send". Returning false denies the operation
@@ -3073,8 +3540,10 @@ type WasiStubs struct {
 	pids *wasiPIDs
 	// streams is what the family shares of the instance's standard streams
 	// for the commands it starts (familyStreams). Like pids, it is created
-	// on first use (streamsLocked) and shared through Fork.
-	streams *familyStreams
+	// on first use (streamsLocked) and shared through Fork. streamsLeft is
+	// set once CloseAll has counted the instance out of it (live).
+	streams     *familyStreams
+	streamsLeft bool
 	// procFinished is closed, and dropped so the next waiter makes a fresh
 	// one, whenever a process in procs finishes. Proc_wait_any blocks on it
 	// instead of polling. Guarded by mu.
@@ -3688,41 +4157,76 @@ func (w *WasiStubs) stdin() io.Reader {
 // familyStreams is what the instances of a fork family share of their
 // standard streams (WASIConfig.Stdin, Stdout, Stderr) for the commands they
 // start, whose streams the runtime copies when they are not files of the
-// host. output makes the writes to the instance's stdout and stderr one at
-// a time: the guests' and those of the runtime's copies of command output.
-// polled is whether the Go runtime polls each stream (filePolled), asked
-// once (asked) before any call of the family on a standard stream could
-// wait for it, since asking clears a read deadline such a wait can have.
-// The streams are the configuration's, which every instance of the family
-// shares.
+// host. stdout and stderr are the turns at the instance's stdout and stderr
+// that are no files of the host's, one turn when they are one Writer
+// (interfaceEqual, as os/exec decides that Stdout is Stderr): the guests'
+// writes and those of the runtime's copies of command output take them.
+// stdin is the reader of the instance's stdin, which reads it when poll(2)
+// does not wait for it (inputReader). polled is whether the
+// Go runtime polls each stream (filePolled), asked once (asked) before any
+// call of the family on a standard stream could wait for it, since asking
+// clears a read deadline such a wait can have. The streams are the
+// configuration's, which every instance of the family shares.
 type familyStreams struct {
-	output sync.Mutex
-	asked  sync.Once
-	polled [3]bool
+	stdout, stderr *streamTurn
+	stdin          *streamReader
+	asked          sync.Once
+	polled         [3]bool
+	// live counts the instances of the family that share these and have
+	// not been closed (CloseAll): the last one's CloseAll stops stdin.
+	live atomic.Int32
+}
+
+// turn returns the family's turn at its standard stream stdio (2 the
+// stdout, 3 the stderr, as wasiOpen.stdio).
+func (s *familyStreams) turn(stdio int8) *streamTurn {
+	if stdio == 3 {
+		return s.stderr
+	}
+	return s.stdout
+}
+
+// interfaceEqual is a == b, and false where a and b hold values of one
+// type that is not comparable, whose comparison panics: as os/exec's
+// interfaceEqual, which decides that Stdout is Stderr so.
+func interfaceEqual(a, b any) (equal bool) {
+	defer func() {
+		// The panic of the comparison says only that the values cannot be
+		// compared: they are taken for different ones.
+		if recover() != nil {
+			equal = false
+		}
+	}()
+	return a == b
 }
 
 // streamsLocked returns the family's familyStreams, made on first use.
 // Caller holds w.mu.
 func (w *WasiStubs) streamsLocked() *familyStreams {
 	if w.streams == nil {
-		w.streams = &familyStreams{}
+		w.streams = &familyStreams{stdout: new(streamTurn), stdin: newStreamReader(w.stdin(), func(err error) { w.reportError("fd_read", err) })}
+		w.streams.live.Store(1)
+		w.streams.stderr = w.streams.stdout
+		if !interfaceEqual(w.stdout(), w.stderr()) {
+			w.streams.stderr = new(streamTurn)
+		}
 	}
 	return w.streams
 }
 
-// outputLockLocked returns the lock a write of the guest's to dst, the
-// destination of the entry op, is made under: the family's output lock for
-// the instance's stdout or stderr that is not a file of the host, which
-// the runtime's copies of command output write to as well (familyStreams);
-// nil for any other. Caller holds w.mu.
-func (w *WasiStubs) outputLockLocked(op *wasiOpen, dst io.Writer) *sync.Mutex {
+// outputTurnLocked returns the turn a write of the guest's to dst, the
+// destination of the entry op, is made with: the family's turn at the
+// instance's stdout or stderr that is not a file of the host, which the
+// runtime's copies of command output take as well (familyStreams); nil for
+// any other. Caller holds w.mu.
+func (w *WasiStubs) outputTurnLocked(op *wasiOpen, dst io.Writer) *streamTurn {
 	if op == nil || op.stdio < 2 {
 		return nil
 	}
 	if _, isFile := dst.(*os.File); isFile {
 		return nil
 	}
-	return &w.streamsLocked().output
+	return w.streamsLocked().turn(op.stdio)
 }
 
 // stdout returns the standard output of the instance: io.Discard when the
@@ -3856,6 +4360,7 @@ func (w *WasiStubs) forkHost() *WasiStubs {
 		}
 		child.changed = start
 	}
+	child.streams.live.Add(1)
 	return child
 }
 
@@ -3874,6 +4379,16 @@ func (w *WasiStubs) forkHost() *WasiStubs {
 // are joined.
 func (w *WasiStubs) CloseAll() error {
 	closing, err := w.takeAll()
+	// The last instance of the family to be closed stops the reader of its
+	// stdin, which nothing asks for input from then on.
+	w.mu.Lock()
+	share := w.streams
+	leaves := share != nil && !w.streamsLeft
+	w.streamsLeft = true
+	w.mu.Unlock()
+	if leaves && share.live.Add(-1) == 0 {
+		share.stdin.stop()
+	}
 	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm())
 }
 
@@ -3897,7 +4412,7 @@ func (w *WasiStubs) takeAll() ([]*wasiOpen, error) {
 	defer w.mu.Unlock()
 	w.detachSignals()
 	for _, wk := range w.wakes {
-		err = errors.Join(err, hostCloseFD(wk.r), hostCloseFD(wk.w))
+		err = errors.Join(err, wk.closePipe())
 	}
 	w.wakes, w.wakesClosed = nil, true
 	closing, clearErr := w.endSlotsLocked()
@@ -4741,6 +5256,17 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 	if errno != _wasiESUCCESS {
 		return -errno
 	}
+	// The command's stdin that the guest reads through a reader is copied
+	// from that reader: the stream has one goroutine that reads it.
+	if s := &streams[0]; s.reader != nil {
+		in := s.op
+		if in == nil {
+			in = &wasiOpen{stdio: 1}
+		}
+		if in.readsStream(s.reader) && !w.netpolled(in, s.reader) && !in.inputPolled(s.reader) {
+			s.input = w.inputReader(in, s.reader)
+		}
+	}
 	// A process that has been killed, while the Exec hook ran too, starts
 	// nothing more.
 	w.endIfStopped()
@@ -5138,6 +5664,9 @@ type commandStream struct {
 	host   syscall.Conn
 	reader io.Reader
 	writer io.Writer
+	// input is the reader (streamReader) the copy of reader takes the
+	// command's stdin from, when the guest's reads of it go through one.
+	input *streamReader
 	// socket marks a host descriptor that is a socket, which the runtime
 	// copies to or from: its open file description stays in the
 	// non-blocking mode the runtime uses it in.
@@ -6814,7 +7343,11 @@ func closeWasiOpen(op *wasiOpen) error {
 	// closed.
 	op.mu.Lock()
 	err = errors.Join(err, op.wakeWaitersLocked())
+	reader := op.reader
 	op.mu.Unlock()
+	if reader != nil {
+		reader.stop()
+	}
 	return err
 }
 
@@ -6823,7 +7356,7 @@ func closeWasiOpen(op *wasiOpen) error {
 func (op *wasiOpen) wakeWaitersLocked() error {
 	var err error
 	for wk := range op.waiters {
-		err = errors.Join(err, hostWakeWrite(wk.w))
+		err = errors.Join(err, wk.wake())
 	}
 	return err
 }
@@ -7270,8 +7803,8 @@ func (w *WasiStubs) fdRead(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nrea
 	}
 	n, errno, served := w.takeAhead("fd_read", op, bufs)
 	if !served {
-		if stream, blocks := op.readBlocks(src); blocks {
-			n, errno = w.readStream(m, "fd_read", op, stream, bufs)
+		if op.readsStream(src) {
+			n, errno = w.readStream(m, "fd_read", op, src, bufs)
 		} else {
 			n, errno = w.readVec("fd_read", src, bufs, op.regular)
 		}
@@ -7952,7 +8485,7 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	w.endUnregistered()
 	w.mu.Lock()
 	dst, op := w.fdDstLocked(fd)
-	output := w.outputLockLocked(op, dst)
+	turn := w.outputTurnLocked(op, dst)
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
 	// nwritten is a __wasi_size_t.
@@ -7979,9 +8512,25 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 		}
 		return _wasiEBADF
 	}
-	if output != nil {
-		output.Lock()
-		defer output.Unlock()
+	if turn != nil {
+		// A write that does not wait finds the Writer busy with another
+		// call's Write; one that waits waits for it.
+		if !turn.tryTake() {
+			if op.nonblocking() {
+				abi.putWord(nwrittenSlice, 0)
+				return _wasiEAGAIN
+			}
+			taken, err := w.awaitStreamTurn(m, "fd_write", turn)
+			if err != nil {
+				abi.putWord(nwrittenSlice, 0)
+				return w.guestErrno("fd_write", err)
+			}
+			if !taken {
+				abi.putWord(nwrittenSlice, 0)
+				return _wasiEINTR
+			}
+		}
+		defer func() { w.reportError("fd_write", turn.give()) }()
 	}
 	n, errno := w.writeFd(m, "fd_write", op, dst, bufs, 0)
 	abi.putWord(nwrittenSlice, n)
@@ -10144,7 +10693,7 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 	// The guest's NONBLOCK is its fdflags. A FIFO opened without waiting
 	// that is waited for in the Go runtime's poller (polled) is left in the
 	// non-blocking mode its poller takes (netpolled). Any other is put in
-	// blocking mode, as its read waits in the read (readStreamAs): the Go
+	// blocking mode, as its reader waits in the read (streamReader): the Go
 	// runtime's poller cannot wait for one it does not poll, and would
 	// report EAGAIN in that mode.
 	// (Where the guest's mode is the description's, it is the guest's
@@ -10681,9 +11230,10 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	}
 
 	// Decide which fd subscriptions are ready. A descriptor whose read or
-	// write cannot block — a regular file, a stream this host cannot probe
-	// — is ready at once. A stream whose read CAN block (pipe, socket,
-	// terminal) is ready only when input is actually there: reporting it
+	// write cannot block — a regular file, a Writer of the embedder's no
+	// other call is writing to — is ready at once. A stream whose read CAN
+	// block (pipe, socket, terminal) is ready only when input is actually
+	// there: reporting it
 	// ready regardless sends a guest multiplexing two pipes into a blocking
 	// read of the idle one while the busy one fills up and its writer
 	// stalls. Likewise a stream is writable only while it has room, and the
@@ -10700,9 +11250,9 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// asked about when its event is reported (streamHungUp).
 	hangStreams := make([]any, len(fdEvents))
 	// The streams that are descriptors of the host's are asked about in one
-	// poll(2) (hostSet, which subscription i asks about at hostIndex[i]),
-	// any other stream by a probe of its own (probes, at probeIndex[i]).
-	// Subscriptions of one key share their entry.
+	// poll(2), any other stream's reader for what it keeps (hostSet, which
+	// subscription i asks about at hostIndex[i]). Subscriptions of one key
+	// share their entry.
 	var hostSet []hostWaitFD
 	hostOf := map[probeKey]int{}
 	hostIndex := make([]int, len(fdEvents))
@@ -10711,21 +11261,22 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// another number of the same descriptor, which shares its entry of
 	// hostSet, waits on.
 	slotClosed := make([]bool, len(fdEvents))
-	addHost := func(i int, key probeKey, stream any, want int) {
+	addEntry := func(i int, key probeKey, e hostWaitFD) {
 		if at, seen := hostOf[key]; seen {
 			hostIndex[i] = at
 			return
 		}
 		hostOf[key] = len(hostSet)
 		hostIndex[i] = len(hostSet)
-		hostSet = append(hostSet, hostWaitFD{stream: stream, want: want, op: ops[i]})
+		e.op = ops[i]
+		hostSet = append(hostSet, e)
 	}
-	var probes []pollProbe
-	probeOf := map[probeKey]int{}
-	probeIndex := make([]int, len(fdEvents))
+	addHost := func(i int, key probeKey, stream any, want int) {
+		addEntry(i, key, hostWaitFD{stream: stream, want: want})
+	}
 	anyReady := false
 	for i, ev := range fdEvents {
-		probeIndex[i], hostIndex[i] = -1, -1
+		hostIndex[i] = -1
 		w.mu.Lock()
 		src, op := w.fdSrcLocked(ev.fd)
 		dst, _ := w.fdDstLocked(ev.fd)
@@ -10774,10 +11325,17 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		}
 		if !ev.isRead {
 			stream, how := op.writeReadiness(dst, stdin)
-			switch how {
-			case pollWriteReady:
+			w.mu.Lock()
+			turn := w.outputTurnLocked(op, dst)
+			w.mu.Unlock()
+			switch {
+			case how == pollWriteReady && turn != nil && !turn.ready():
+				// Writable once the Writer is done with another call's
+				// Write.
+				addEntry(i, probeKey{op: op, write: true}, hostWaitFD{source: turn})
+			case how == pollWriteReady:
 				ready[i], anyReady = true, true
-			case pollWriteProbe:
+			case how == pollWriteProbe:
 				addHost(i, probeKey{op: op, write: true}, stream, hostWantRoom)
 			}
 			continue
@@ -10788,34 +11346,23 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			addHost(i, probeKey{op: op}, op.listener, hostWantInput)
 			continue
 		}
-		stream, blocks := op.readBlocks(src)
-		if !blocks {
+		if !op.readsStream(src) {
 			ready[i], anyReady = true, true
 			continue
 		}
-		hangStreams[i] = stream
+		hangStreams[i] = src
 		if pending, _ := op.aheadReady(); pending {
 			ready[i], anyReady = true, true
 			continue
 		}
-		if op.inputPolled(stream) {
-			addHost(i, probeKey{op: op}, stream, hostWantInput)
+		if op.inputPolled(src) {
+			addHost(i, probeKey{op: op}, src, hostWantInput)
 			continue
 		}
-		if at, seen := probeOf[probeKey{op: op}]; seen {
-			probeIndex[i] = at
-			continue
-		}
-		probeOf[probeKey{op: op}] = len(probes)
-		probeIndex[i] = len(probes)
-		probes = append(probes, pollProbe{
-			probe: func(until time.Time, stop <-chan struct{}) bool {
-				// A stream that takes no deadline cannot be asked: it
-				// counts as readable, and the read finds out.
-				ready, refused := op.probeRead(stream, until, stop)
-				return ready || refused
-			},
-		})
+		// Asked for input from here on: what it reads ends the wait.
+		reader := w.inputReader(op, src)
+		reader.request()
+		addEntry(i, probeKey{op: op}, hostWaitFD{source: reader})
 	}
 	// hostErr is why poll(2) could not be asked: every descriptor it was
 	// to be asked about is ready with that error.
@@ -10831,7 +11378,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		}
 	}
 	if len(hostSet) > 0 {
-		hostErr = waitHostReady(hostSet, time.Now(), -1)
+		hostErr = waitHostReady(hostSet, time.Now(), nil)
 		markHost()
 	}
 
@@ -10839,22 +11386,16 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// something to wait for, unless its timeout is zero; a signal posted
 	// meanwhile ends the wait. With descriptors that can never become ready
 	// and no timeout, a signal is all there is to wait for, as for poll(2).
-	onlySignal := !anyReady && len(probes) == 0 && len(hostSet) == 0 && minClockNs < 0 && len(fdEvents) > 0
-	waits := !anyReady && minClockNs != 0 && (len(probes) > 0 || len(hostSet) > 0 || minClockNs > 0 || onlySignal)
-	// How long the descriptors may be waited for: not at all when something
-	// is ready already, until the timeout when there is one, otherwise until
-	// one is ready.
-	var deadline, hostDeadline time.Time
-	switch {
-	case anyReady:
-		deadline = time.Now().Add(pollProbeGrace)
-	case minClockNs >= 0:
+	onlySignal := !anyReady && len(hostSet) == 0 && minClockNs < 0 && len(fdEvents) > 0
+	waits := !anyReady && minClockNs != 0 && (len(hostSet) > 0 || minClockNs > 0 || onlySignal)
+	// How long the descriptors may be waited for: until the timeout when
+	// there is one, otherwise until one is ready.
+	var hostDeadline time.Time
+	if minClockNs >= 0 {
 		hostDeadline = time.Now().Add(time.Duration(minClockNs))
-		deadline = time.Now().Add(max(time.Duration(minClockNs), pollProbeGrace))
 	}
-	// The wake pipe of this call: a wait in poll(2) watches it, which a
-	// signal, a probe that is done or a close of a descriptor waited for
-	// writes to.
+	// The wake of this call, which a signal, a reader that has input or a
+	// close of a descriptor waited for wakes.
 	var wk *wasiWake
 	var wakeErr error
 	// closedSlots marks the subscriptions whose slot was closed since the
@@ -10881,12 +11422,12 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			return true
 		}
 		for {
-			if hostErr = waitHostReady(hostSet, until, wk.r); hostErr != nil {
+			if hostErr = waitHostReady(hostSet, until, wk); hostErr != nil {
 				return true
 			}
 			// The wake is read empty before what woke the wait is looked
 			// at, so that a wake written meanwhile ends the next wait.
-			if hostErr = hostWakeDrain(wk.r); hostErr != nil {
+			if hostErr = wk.drain(); hostErr != nil {
 				return true
 			}
 			if closedSlots() {
@@ -10905,49 +11446,23 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// given is false while the call holds a wake pipe it has to give back.
 	given := true
 	if waits && len(hostSet) > 0 {
-		if wk, hostErr = w.takeWake(); hostErr != nil {
+		if wk, hostErr = w.wakeFor(hostSet); hostErr != nil {
 			return w.guestErrno("poll_oneoff", hostErr)
 		}
 		for _, e := range hostSet {
 			e.op.addWaiter(wk)
+			if e.source != nil {
+				e.source.addWaiter(wk)
+			}
 		}
 		given = false
 		defer w.giveWakeOnUnwind("poll_oneoff", &given, wk, hostSet)
-		if len(probes) > 0 {
-			// The probes end the wait in poll(2) through the wake pipe.
-			probes = append(probes, pollProbe{
-				probe: func(until time.Time, stop <-chan struct{}) bool {
-					done, watched := make(chan struct{}), make(chan struct{})
-					var stopErr error
-					go func() {
-						defer close(watched)
-						select {
-						case <-stop:
-							stopErr = hostWakeWrite(wk.w)
-						case <-done:
-						}
-					}()
-					found := waitHostWoken(hostDeadline, stop)
-					close(done)
-					<-watched
-					hostErr = errors.Join(hostErr, stopErr)
-					return found
-				},
-			})
-		}
 	}
 	clockEnd := time.Now().Add(time.Duration(minClockNs))
 	// wait waits once for what the call waits for, until stop (nil for
 	// none) is closed.
 	wait := func(stop <-chan struct{}) {
 		switch {
-		case len(probes) > 0:
-			pollReady(probes, deadline, stop)
-			for i := range fdEvents {
-				if at := probeIndex[i]; at >= 0 && probes[at].ready {
-					ready[i], anyReady = true, true
-				}
-			}
 		case !waits:
 		case len(hostSet) > 0:
 			waitHostWoken(hostDeadline, stop)
@@ -10969,7 +11484,7 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	for waits {
 		interrupted, woken, refused := w.blockingAttempt(m, func() {
 			if wk != nil {
-				wakeErr = errors.Join(wakeErr, hostWakeWrite(wk.w))
+				wakeErr = errors.Join(wakeErr, wk.wake())
 			}
 		}, nil, wait)
 		markHost()
@@ -11021,10 +11536,16 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			}
 		}
 		var nbytes uint64
+		var reader *streamReader
+		if at := hostIndex[i]; at >= 0 {
+			reader, _ = hostSet[at].source.(*streamReader)
+		}
 		if op := ops[i]; op != nil && ev.isRead && errnos[i] == 0 {
-			if _, pending := op.aheadReady(); pending > 0 {
+			if reader != nil {
+				nbytes = uint64(reader.pending())
+			} else if _, pending := op.aheadReady(); pending > 0 {
 				nbytes = uint64(pending)
-			} else if op.f != nil && probeIndex[i] < 0 {
+			} else if op.f != nil && hostIndex[i] < 0 {
 				// Regular file: pass through the bytes left to read
 				// (best-effort; the read itself reports the real state).
 				if st, err := op.f.Stat(); err == nil {
@@ -11056,64 +11577,6 @@ func streamHungUp(stream any) bool {
 	var hup bool
 	hostDescriptor(stream, func(fd uintptr) { hup = hostHungUp(fd) })
 	return hup
-}
-
-// pollProbe is one stream poll_oneoff has to probe for readiness that is
-// not a descriptor of the host's, or the wait in poll(2) for those that
-// are. probe waits for it — no longer than until (the zero time is no
-// limit), and not after stop is closed — and reports whether it is ready;
-// what it took off the stream to find out stays with the stream's entry.
-type pollProbe struct {
-	probe func(until time.Time, stop <-chan struct{}) bool
-	ready bool
-}
-
-// pollReady waits until one of the probed descriptors is ready, or until
-// deadline — the zero time means no limit — and records which are. For
-// input the readiness test is a read: whatever arrives is kept on the
-// stream's entry and handed to the guest's next read of it.
-//
-// cancel, when non-nil, ends the wait early once it is closed.
-func pollReady(probes []pollProbe, deadline time.Time, cancel <-chan struct{}) {
-	if len(probes) == 1 && cancel == nil {
-		probes[0].ready = probes[0].probe(deadline, nil)
-		return
-	}
-	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	hit := make(chan struct{}, len(probes))
-	for i := range probes {
-		wg.Add(1)
-		go func(pr *pollProbe) {
-			defer wg.Done()
-			if pr.ready = pr.probe(deadline, stop); pr.ready {
-				hit <- struct{}{}
-			}
-		}(&probes[i])
-	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-hit:
-		// One is ready: stop waiting on the rest, once they have had the
-		// time a probe needs to find what is ready right now — a poll
-		// reports every descriptor that is ready, not the first. Their
-		// probes then end at once, keeping whatever they had received.
-		grace := time.NewTimer(pollProbeGrace)
-		select {
-		case <-done:
-		case <-cancel:
-		case <-grace.C:
-		}
-		grace.Stop()
-	case <-cancel:
-	case <-done:
-	}
-	close(stop)
-	<-done
 }
 
 func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64, flags uint16) {
@@ -19419,16 +19882,73 @@ func (w *WasiStubs) detachSignals() {
 // input is there, a blocking one waits and reports EINTR when a signal is
 // posted to the guest meanwhile. A stream of the entry's own that the Go
 // runtime polls is read by readPolledStream, any other descriptor of the
-// host's that poll(2) waits for by readHostStream, any other stream by
-// readStreamAs.
-func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (uint64, int32) {
+// host's that poll(2) waits for by readHostStream, any other stream through
+// its reader (readThroughReader).
+func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src io.Reader, bufs [][]byte) (uint64, int32) {
 	switch {
 	case w.netpolled(op, src):
-		return w.readPolledStream(m, call, op, src, bufs)
+		return w.readPolledStream(m, call, op, src.(deadlineReader), bufs)
 	case op.inputPolled(src):
 		return w.readHostStream(m, call, op, src.(syscall.Conn), bufs, op.nonblocking())
 	}
-	return w.readStreamAs(m, call, op, src, bufs, op.nonblocking())
+	return w.readThroughReader(m, call, op, w.inputReader(op, src), bufs, op.nonblocking())
+}
+
+// readThroughReader reads the stream behind the entry op through its reader
+// r, as the guest asked for it: what the reader keeps, or else a Read it is
+// asked for. A non-blocking read (nonblocking) reports EAGAIN when the
+// reader keeps nothing, which the Read it asks for ends the wait of a poll
+// for; a blocking one waits for it, and a signal posted to the guest
+// meanwhile ends the wait with EINTR. What the reader has when the signal
+// ends the wait is read all the same, as read(2) returns the input there to
+// a process with a signal pending; a Read that returns later keeps its
+// input for the next read. The wait holds no turn: the reads it wakes each
+// take what there is, and one that finds nothing waits again.
+func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, r *streamReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
+	set := []hostWaitFD{{source: r, op: op}}
+	for {
+		if n, err, ok := r.take(bufs); ok {
+			return w.readResult(call, n, err)
+		}
+		r.request()
+		if nonblocking {
+			return 0, _wasiEAGAIN
+		}
+		interrupted, err := w.waitHostInterruptibly(m, call, set, time.Time{})
+		if err != nil {
+			return 0, w.guestErrno(call, err)
+		}
+		if !interrupted {
+			continue
+		}
+		n, err, ok := r.take(bufs)
+		if !ok {
+			return 0, _wasiEINTR
+		}
+		// The read went through: the next call that waits reports the
+		// signal.
+		w.keepInterrupt(m)
+		return w.readResult(call, n, err)
+	}
+}
+
+// inputReader returns the reader of src, the stream behind the entry op
+// that poll(2) does not wait for (readStream): the family's for the
+// instance's stdin, which every instance of the family reads from
+// (familyStreams), the entry's own for any other stream, which every slot
+// of the entry reads from, made on first use.
+func (w *WasiStubs) inputReader(op *wasiOpen, src io.Reader) *streamReader {
+	if op.stdio == 1 {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.streamsLocked().stdin
+	}
+	op.mu.Lock()
+	defer op.mu.Unlock()
+	if op.reader == nil {
+		op.reader = newStreamReader(src, func(err error) { w.reportError("fd_read", err) })
+	}
+	return op.reader
 }
 
 // readPolledStream reads src, a stream of the entry op that the Go runtime
@@ -19624,45 +20144,6 @@ func (w *WasiStubs) readHostAttempt(m *Module, call string, op *wasiOpen, src sy
 	return uint64(k), again, errno, true
 }
 
-// readStreamAs reads src, a stream neither the Go runtime nor poll(2)
-// waits for (readStream), with the blocking mode given by the caller.
-func (w *WasiStubs) readStreamAs(m *Module, call string, op *wasiOpen, src deadlineReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
-	if !nonblocking {
-		n, errno := w.readInterruptibly(m, call, op, src, bufs)
-		if errno == _wasiEINTR {
-			// A signal interrupts a read that has to wait. Input that is
-			// there is read all the same, as read(2) returns it to a
-			// process with a signal pending — whether the signal was
-			// posted before the call or while it was on its way.
-			if got, errno, refused := w.readAvailable(call, op, src, bufs); !refused && errno != _wasiEAGAIN {
-				w.keepInterrupt(m)
-				return got, errno
-			}
-		}
-		return n, errno
-	}
-	n, errno, refused := w.readAvailable(call, op, src, bufs)
-	if refused {
-		// A stream whose read cannot be bounded: all there is is the read.
-		return w.readVec(call, src, bufs, false)
-	}
-	return n, errno
-}
-
-// readAvailable reads the input src, a stream readStreamAs reads, has right
-// now without waiting, and reports EAGAIN when there is none. The probe is
-// the read: it waits just long enough for the read to be attempted and
-// keeps what arrives. refused is true when that cannot be told (the stream
-// takes no deadline): nothing was read.
-func (w *WasiStubs) readAvailable(call string, op *wasiOpen, src deadlineReader, bufs [][]byte) (n uint64, errno int32, refused bool) {
-	ready, refused := op.probeRead(src, time.Now().Add(pollProbeGrace), nil)
-	if refused || !ready {
-		return 0, _wasiEAGAIN, refused
-	}
-	n, errno, _ = w.takeAhead(call, op, bufs)
-	return n, errno, false
-}
-
 // awaitOutputTurn takes the turn at op's output for a blocking write of the
 // guest's (awaitTurn).
 func (w *WasiStubs) awaitOutputTurn(m *Module, op *wasiOpen) bool {
@@ -19696,7 +20177,7 @@ func (w *WasiStubs) awaitTurn(m *Module, turn chan struct{}) bool {
 	}()
 	for {
 		interrupted, _, refused := w.blockingAttempt(m, func() {}, nil,
-			func(stop <-chan struct{}) { held = takeTurn(turn, time.Time{}, stop) })
+			func(stop <-chan struct{}) { held = takeTurn(turn, stop) })
 		if refused || interrupted {
 			return false
 		}
@@ -19708,7 +20189,7 @@ func (w *WasiStubs) awaitTurn(m *Module, turn chan struct{}) bool {
 }
 
 // readInterruptibly is readVec for a stream whose read can block and that
-// poll(2) does not wait for (readStream): a signal posted while the read
+// the Go runtime polls (readPolledStream): a signal posted while the read
 // waits — for its turn at the stream, or for input — ends it, with EINTR
 // when that happened before any byte arrived, and so does input a command
 // leaves meanwhile (giveAhead), which the read then returns. The read is
@@ -19721,22 +20202,9 @@ func (w *WasiStubs) readInterruptibly(m *Module, call string, op *wasiOpen, src 
 	defer op.watchAhead(nil)
 	// A signal ends the wait for input through a deadline the stream takes,
 	// and only the holder of the turn sets one: a deadline left now was
-	// left by a holder that was unwound. A stream that takes none (a FIFO
-	// with a name the Go runtime does not poll, a stream of a host without
-	// poll(2)) cannot be cut short: its read waits for input.
-	switch err := deadlineErr(src, src.SetReadDeadline(time.Time{})); {
-	case err == nil:
-	case !errors.Is(err, os.ErrNoDeadline):
+	// left by a holder that was unwound.
+	if err := deadlineErr(src, src.SetReadDeadline(time.Time{})); err != nil {
 		return 0, w.guestErrno(call, err)
-	default:
-		if n, errno, served := w.takeAhead(call, op, bufs); served {
-			return n, errno
-		}
-		n, err := readOnce(src, bufs)
-		if n > 0 {
-			op.inputReads.Add(1)
-		}
-		return w.readResult(call, n, err)
 	}
 	var n int
 	var err error
@@ -19894,6 +20362,7 @@ func (t *translator) emitWasip1Native() ([]ast.Decl, []string, error) {
 	}
 
 	imports := []string{
+		"bytes",
 		"cmp",
 		"context",
 		"crypto/rand",
