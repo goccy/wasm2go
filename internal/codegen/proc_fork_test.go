@@ -393,6 +393,9 @@ func TestWasi_CloseErrorsAreReported(t *testing.T) {
 	}
 }
 
+// spawnTestProc starts argv as a command of w and returns its pid token.
+// The command is started with the whole host filesystem, in which argv[0]
+// is a name, as w's FS; w's own FS is put back afterwards.
 func spawnTestProc(t *testing.T, w *WasiStubs, m *Module, argv ...string) int32 {
 	t.Helper()
 	if _, err := os.Stat(argv[0]); err != nil {
@@ -401,7 +404,11 @@ func spawnTestProc(t *testing.T, w *WasiStubs, m *Module, argv ...string) int32 
 	pathOff := writeCStr(m, 1000, argv[0])
 	argvOff := writeArgv(m, 2000, 3000, argv)
 	const pidOff int32 = 4000
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
+	fsys := w.cfg.FS
+	w.cfg.FS = osFS{}
+	rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff)
+	w.cfg.FS = fsys
+	if rc != _wasiESUCCESS {
 		t.Fatalf("Proc_spawn rc=%d", rc)
 	}
 	return int32(readU32(m.memory, int(pidOff)))

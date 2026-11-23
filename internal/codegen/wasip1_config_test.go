@@ -185,7 +185,7 @@ func TestWasi_HostWASIConfig(t *testing.T) {
 		t.Errorf("LocalZone = %v, want time.Local", cfg.LocalZone)
 	}
 	if !cfg.NetAccess("send") || !cfg.Dial("tcp", "example.com", "192.0.2.1", 80) ||
-		!cfg.Resolve("example.com") || !cfg.Exec("/bin/sh", []string{"sh"}) {
+		!cfg.Resolve("example.com") || !cfg.Exec(ExecRequest{Path: "/bin/sh", Argv: []string{"sh"}}) {
 		t.Error("a hook denies")
 	}
 
@@ -203,7 +203,7 @@ func TestWasi_HostWASIConfig(t *testing.T) {
 // The AllowAll hooks allow everything.
 func TestWasi_AllowAllHooks(t *testing.T) {
 	if !AllowAllNetAccess("accept") || !AllowAllDial("tcp", "", "127.0.0.1", 1) ||
-		!AllowAllResolve("localhost") || !AllowAllExec("/bin/true", nil) {
+		!AllowAllResolve("localhost") || !AllowAllExec(ExecRequest{Path: "/bin/true"}) {
 		t.Error("an AllowAll hook denies")
 	}
 }

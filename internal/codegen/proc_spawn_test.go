@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"testing"
 	"time"
 )
@@ -20,6 +22,7 @@ func writeCStr(m *Module, off int32, s string) int32 {
 // Proc_spawn64 reads its strings and string arrays with 64-bit pointers.
 func TestWasi_ProcSpawn64(t *testing.T) {
 	w, m := newProcTestStubs(t)
+	w.cfg.FS = osFS{}
 	argv := []string{"/bin/sh", "-c", "exit 3"}
 	if _, err := os.Stat(argv[0]); err != nil {
 		t.Skipf("%s not available", argv[0])
@@ -67,7 +70,7 @@ func TestWasi_ProcSpawnWait(t *testing.T) {
 	if _, err := os.Stat("/bin/echo"); err != nil {
 		t.Skip("/bin/echo not available")
 	}
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	var out bytes.Buffer
 	w.cfg.Stdout = &out
 	w.cfg.Stderr = &bytes.Buffer{}
@@ -100,7 +103,7 @@ func TestWasi_ProcSpawnExitCode(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("/bin/sh not available")
 	}
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 
 	pathOff := writeCStr(m, 1000, "/bin/sh")
@@ -121,23 +124,26 @@ func TestWasi_ProcSpawnExitCode(t *testing.T) {
 }
 
 func TestWasi_ProcSpawnExecHookDenies(t *testing.T) {
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
-	var seen string
-	w.cfg.Exec = func(path string, argv []string) bool { seen = path; return false }
+	var seen []ExecRequest
+	w.cfg.Exec = func(req ExecRequest) bool { seen = append(seen, req); return false }
 
 	pathOff := writeCStr(m, 1000, "/bin/echo")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "x"})
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != -_wasiEACCES {
+	envOff := writeArgv(m, 5000, 6000, []string{"LD_PRELOAD=/tmp/x.so"})
+	cwdOff := writeCStr(m, 7000, "/work")
+	if rc := w.Proc_spawn(m, pathOff, argvOff, envOff, -1, -1, -1, cwdOff, 4000); rc != -_wasiEACCES {
 		t.Fatalf("denied spawn rc=%d, want -EACCES", rc)
 	}
-	if seen != "/bin/echo" {
-		t.Errorf("exec hook saw %q", seen)
+	want := ExecRequest{Path: "/bin/echo", Argv: []string{"/bin/echo", "x"}, Env: []string{"LD_PRELOAD=/tmp/x.so"}, Dir: "/work"}
+	if len(seen) != 1 || !reflect.DeepEqual(seen[0], want) {
+		t.Errorf("exec hook saw %+v, want %+v", seen, want)
 	}
 }
 
 func TestWasi_ProcSpawnNotFound(t *testing.T) {
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	pathOff := writeCStr(m, 1000, "/no/such/binary-xyz")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/no/such/binary-xyz"})
@@ -146,12 +152,242 @@ func TestWasi_ProcSpawnNotFound(t *testing.T) {
 	}
 }
 
+// hostRootedFS is HostFS(root) as a HostRootFS: its names are the host's
+// paths under root.
+type hostRootedFS struct {
+	FS
+	root string
+}
+
+func (r hostRootedFS) HostRoot() string { return r.root }
+
+// newRootedSpawnStubs returns test stubs whose FS is the directory dir as
+// a HostRootFS, and whose Exec hook records each request it is asked about
+// in seen and refuses it when refuse is set.
+func newRootedSpawnStubs(t *testing.T, dir string, refuse bool) (*WasiStubs, *Module, *[]ExecRequest) {
+	t.Helper()
+	w, m := newProcTestStubs(t)
+	w.cfg.FS = hostRootedFS{newHostFS(t, dir), dir}
+	seen := &[]ExecRequest{}
+	w.cfg.Exec = func(req ExecRequest) bool { *seen = append(*seen, req); return !refuse }
+	return w, m, seen
+}
+
+// spawnIn calls Proc_spawn for the command name with the argv name and the
+// environment env, in the guest's working directory cwd.
+func spawnIn(w *WasiStubs, m *Module, name, cwd string, env ...string) int32 {
+	pathOff := writeCStr(m, 1000, name)
+	argvOff := writeArgv(m, 2000, 3000, []string{name})
+	envOff := writeArgv(m, 5000, 6000, env)
+	cwdOff := writeCStr(m, 7000, cwd)
+	return w.Proc_spawn(m, pathOff, argvOff, envOff, -1, -1, -1, cwdOff, 4000)
+}
+
+// The hook is told the host's paths of the names of the command and of the
+// working directory in a HostRootFS, a relative name taken from the
+// working directory and ".." resolved after the links before it, and a NULL
+// environment as an empty one: the command is started from that very
+// request, in that directory.
+func TestWasi_ProcSpawnExecRequestOfTheHostRoot(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh not available")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "work", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "work", "tool"), []byte("#!/bin/sh\npwd -P\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../work/bin", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	w, m, seen := newRootedSpawnStubs(t, dir, false)
+	var out bytes.Buffer
+	w.cfg.Stdout = &out
+	pathOff := writeCStr(m, 1000, "../link/../tool")
+	argvOff := writeArgv(m, 2000, 3000, nil)
+	cwdOff := writeCStr(m, 7000, "/work")
+	const pidOff, statusOff int32 = 4000, 4004
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, cwdOff, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, int32(binary.LittleEndian.Uint32(m.memory[pidOff:])), 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	want := ExecRequest{Path: filepath.Join(dir, "work", "tool"), Argv: []string{"../link/../tool"}, Env: []string{}, Dir: filepath.Join(dir, "work")}
+	if len(*seen) != 1 || !reflect.DeepEqual((*seen)[0], want) {
+		t.Errorf("exec hook saw %+v, want %+v", *seen, want)
+	}
+	real, err := filepath.EvalSymlinks(filepath.Join(dir, "work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != real+"\n" {
+		t.Errorf("the command ran in %q, want %q", got, real+"\n")
+	}
+
+	// An empty working directory (cwdPtr 0, a zero byte) is the root of the
+	// FS, not the host process's working directory.
+	*seen = nil
+	out.Reset()
+	pathOff = writeCStr(m, 1000, "/work/tool")
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn without a working directory rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, int32(binary.LittleEndian.Uint32(m.memory[pidOff:])), 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if len(*seen) != 1 || (*seen)[0].Dir != dir {
+		t.Errorf("exec hook saw %+v without a working directory, want the Dir %q", *seen, dir)
+	}
+	if real, err = filepath.EvalSymlinks(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != real+"\n" {
+		t.Errorf("the command without a working directory ran in %q, want %q", got, real+"\n")
+	}
+}
+
+// A relative HostRoot is taken from the host process's working directory
+// when the command is started: the hook is told absolute paths, and the
+// command runs in that directory.
+func TestWasi_ProcSpawnExecRequestOfARelativeHostRoot(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh not available")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "work", "tool"), []byte("#!/bin/sh\npwd -P\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w, m, seen := newRootedSpawnStubs(t, dir, false)
+	w.cfg.FS = hostRootedFS{w.cfg.FS.(hostRootedFS).FS, "."}
+	t.Chdir(dir)
+	abs, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	w.cfg.Stdout = &out
+	if rc := spawnIn(w, m, "tool", "/work", "PATH=/work"); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, int32(binary.LittleEndian.Uint32(m.memory[4000:])), 0, 4004); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	want := ExecRequest{Path: filepath.Join(abs, "work", "tool"), Argv: []string{"tool"}, Env: []string{"PATH=/work"}, Dir: filepath.Join(abs, "work")}
+	if len(*seen) != 1 || !reflect.DeepEqual((*seen)[0], want) {
+		t.Errorf("exec hook saw %+v, want %+v", *seen, want)
+	}
+	real, err := filepath.EvalSymlinks(filepath.Join(dir, "work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out.String(); got != real+"\n" {
+		t.Errorf("the command ran in %q, want %q", got, real+"\n")
+	}
+}
+
+// A command cannot be started from an FS that is no HostRootFS (ENOSYS):
+// its names are no paths of the host's. The hook is not asked.
+func TestWasi_ProcSpawnWithoutAHostRoot(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		fsys func(t *testing.T) FS
+	}{
+		{"HostFS of a directory", func(t *testing.T) FS { return newHostFS(t, t.TempDir()) }},
+		{"MemFS", func(*testing.T) FS { return NewMemFS() }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w, m := newProcTestStubs(t)
+			w.cfg.FS = c.fsys(t)
+			hooked := false
+			w.cfg.Exec = func(ExecRequest) bool { hooked = true; return true }
+			if rc := spawnIn(w, m, "/bin/sh", "/"); rc != -_wasiENOSYS || hooked {
+				t.Errorf("spawn rc=%d with the hook asked: %v; want -ENOSYS, not asked", rc, hooked)
+			}
+		})
+	}
+}
+
+// A name without a "/" is looked up as musl's execvp looks it up, in the
+// guest's FS: in the directories of the PATH of the environment the guest
+// gives the command, the first regular file it may execute, past ones it
+// may not (EACCES when there are only those) and ones that do not exist;
+// an empty directory is the working directory, and without a PATH the
+// directories are musl's. Any other error ends the lookup. A name with a
+// "/" is not looked up. The host's PATH is not looked in.
+func TestWasi_ProcSpawnLooksUpTheGuestsPath(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []struct {
+		name string
+		mode os.FileMode
+	}{{"plain/tool", 0o644}, {"exec/tool", 0o755}, {"usr/bin/tool", 0o755}, {"file", 0o644}} {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(f.name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, f.name), nil, f.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range []string{"plain/sub", "loop"} {
+		if err := os.Mkdir(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("tool", filepath.Join(dir, "loop", "tool")); err != nil {
+		t.Fatal(err)
+	}
+	w, m, seen := newRootedSpawnStubs(t, dir, true)
+	for _, c := range []struct {
+		name, cwd string
+		env       []string
+		rc        int32
+		path      string
+	}{
+		{"tool", "/", []string{"PATH=/none:/file:/plain:/exec"}, -_wasiEACCES, "exec/tool"},
+		{"tool", "/", []string{"PATH=/plain"}, -_wasiEACCES, ""},
+		{"sub", "/", []string{"PATH=/plain"}, -_wasiEACCES, ""},
+		{"tool", "/", []string{"PATH=/none"}, -_wasiENOENT, ""},
+		{"tool", "/exec", []string{"PATH="}, -_wasiEACCES, "exec/tool"},
+		{"tool", "/exec", []string{"PATH=/none::/plain"}, -_wasiEACCES, "exec/tool"},
+		{"tool", "/", []string{"PATH=exec"}, -_wasiEACCES, "exec/tool"},
+		{"tool", "/", []string{"HOME=/"}, -_wasiEACCES, "usr/bin/tool"},
+		{"tool", "/", []string{"PATH=/exec", "PATH=/plain"}, -_wasiEACCES, "exec/tool"},
+		{"sh", "/", []string{"PATH=/bin:/usr/bin"}, -_wasiENOENT, ""},
+		{"tool", "/", []string{"PATH=/loop:/exec"}, -_wasiELOOP, ""},
+		{"plain/tool", "/", []string{"PATH=/exec"}, -_wasiEACCES, "plain/tool"},
+	} {
+		*seen = nil
+		rc := spawnIn(w, m, c.name, c.cwd, c.env...)
+		var want []string
+		if c.path != "" {
+			want = []string{filepath.Join(dir, c.path)}
+		}
+		var got []string
+		for _, req := range *seen {
+			got = append(got, req.Path)
+		}
+		if rc != c.rc || !slices.Equal(got, want) {
+			t.Errorf("spawn of %q in %s with %q: rc=%d, the hook told %q; want rc=%d, %q", c.name, c.cwd, c.env, rc, got, c.rc, want)
+		}
+	}
+	// Without an Exec policy nothing is looked up or started.
+	w.cfg.Exec = nil
+	if rc := spawnIn(w, m, "tool", "/", "PATH=/none"); rc != -_wasiEACCES {
+		t.Errorf("spawn without an Exec policy rc=%d, want -EACCES", rc)
+	}
+}
+
 // A command the host cannot start fails with the host's errno: a file that
 // may be executed but is no program is ENOEXEC.
 func TestWasi_ProcSpawnNotAProgram(t *testing.T) {
 	const wasiENOEXEC = 45 // the runtime has no constant of its own for it
 	dir := t.TempDir()
-	w, m := newTestStubs(t, dir)
+	w, m := newTestStubs(t, "/")
 	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	prog := filepath.Join(dir, "prog")
 	if err := os.WriteFile(prog, []byte{0, 1, 2, 3}, 0o755); err != nil {
@@ -175,7 +411,7 @@ func TestWasi_ProcWaitWNOHANG(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("/bin/sh not available")
 	}
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &bytes.Buffer{}, &bytes.Buffer{}, bytes.NewReader(nil)
 	pathOff := writeCStr(m, 1000, "/bin/sh")
 	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "sleep 0.3; exit 3"})
@@ -213,7 +449,7 @@ func TestWasi_PipeCapture(t *testing.T) {
 	if _, err := os.Stat("/bin/echo"); err != nil {
 		t.Skip("/bin/echo not available")
 	}
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}
 
 	const pipeOut int32 = 5000

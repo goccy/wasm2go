@@ -97,8 +97,17 @@ socket), `Resolve` gates the name lookups (`sock_getaddrinfo`,
 `sock_reverse_addr` (with the address in text) — an address written
 in numbers, and the empty host of `sock_getaddrinfo` (`INADDR_ANY`),
 are no lookup and are not asked about; a signal ends a lookup with
-`EINTR` — and `Exec` gates `proc_spawn`; a nil
-one denies. A socket (`sock_open`, `sock_socketpair`, `sock_socket`)
+`EINTR` — and `Exec` gates `proc_spawn` and `proc_exec` with the
+`ExecRequest` the command is started from (its executable, a name
+without a `/` looked up in the guest's `FS` as musl's `execvp` does, but
+in the `PATH` of the envp the guest passes, not of the caller's
+`environ` (the two differ only when `posix_spawnp` is given an envp with
+another `PATH`), its arguments, its whole environment and its working
+directory, the root of the `FS` for an empty one); a nil
+one denies. A command is a process of the host: it sees the host's
+filesystem, not the `FS`, and is started only with an `FS` that is a
+`HostRootFS` (`HostFS("/")`), by the host's paths of its names
+(`ENOSYS` with any other `FS`). A socket (`sock_open`, `sock_socketpair`, `sock_socket`)
 is one socket of the host's from its making to its close; a
 Unix-domain socket's path is a file of the host only with an `FS` that
 is a `HostRootFS` (`HostFS("/")`), and `ENOTSUP` with any other `FS`. `sock_shutdown`, the

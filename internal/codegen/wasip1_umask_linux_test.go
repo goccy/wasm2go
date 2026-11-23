@@ -69,10 +69,9 @@ func TestCreationThreadHasTheInstancesUmask(t *testing.T) {
 	}
 }
 
-// A command started on the creation thread runs in the host process's
-// working directory as it is when the command starts, not in the one of
-// the thread's unshare; a relative directory is taken from it. After
-// CloseAll the instance makes no creation thread.
+// A command started on the creation thread runs in its directory, not in
+// the working directory of the thread's unshare. After CloseAll the
+// instance makes no creation thread.
 func TestCreationThreadStartsCommandsInTheHostsDirectory(t *testing.T) {
 	if !creationThreads(t) {
 		t.Skip("the system refuses a creation thread")
@@ -89,14 +88,12 @@ func TestCreationThreadStartsCommandsInTheHostsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(later)
-	for _, c := range []struct{ dir, want string }{{"", later}, {"sub", filepath.Join(later, "sub")}} {
+	w.cfg.FS = osFS{}
+	for _, c := range []struct{ dir, want string }{{later, later}, {filepath.Join(later, "sub"), filepath.Join(later, "sub")}} {
 		out.Reset()
 		pathOff := writeCStr(m, 1000, "/bin/sh")
 		argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "pwd -P"})
-		cwdOff := int32(0)
-		if c.dir != "" {
-			cwdOff = writeCStr(m, 3800, c.dir)
-		}
+		cwdOff := writeCStr(m, 3800, c.dir)
 		if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, cwdOff, 4000); rc != _wasiESUCCESS {
 			t.Fatalf("Proc_spawn rc=%d", rc)
 		}
@@ -149,17 +146,23 @@ func TestCreationThreadCloseWaitsForNoCall(t *testing.T) {
 }
 
 // A command is started on the creation thread whatever the instance's
-// filesystem: it inherits the instance's umask with MemFS too.
+// filesystem: it inherits the instance's umask with a HostRootFS of MemFS
+// too.
 func TestCreationThreadStartsCommandsOfAnyFilesystem(t *testing.T) {
 	if !creationThreads(t) {
 		t.Skip("the system refuses a creation thread")
 	}
-	w, m, _ := memTestStubs(t)
+	w, m, mem := memTestStubs(t)
+	w.cfg.FS = hostRootedFS{mem, "/"}
 	out := &bytes.Buffer{}
 	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = out, &bytes.Buffer{}, bytes.NewReader(nil)
 	w.Proc_umask(m, 0o077)
-	pid := spawnTestProc(t, w, m, "/bin/sh", "-c", "umask")
-	if rc := w.Proc_wait(m, pid, 0, 4004); rc != _wasiESUCCESS {
+	pathOff := writeCStr(m, 1000, "/bin/sh")
+	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "umask"})
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, 0, 4000); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, int32(readU32(m.memory, 4000)), 0, 4004); rc != _wasiESUCCESS {
 		t.Fatalf("Proc_wait rc=%d", rc)
 	}
 	if got := strings.TrimSpace(out.String()); got != "0077" {

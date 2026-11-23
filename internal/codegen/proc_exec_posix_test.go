@@ -12,12 +12,14 @@ import (
 
 // execIn runs the guest of w's exec of argv (Proc_exec) on another
 // goroutine. What it ended with arrives on the channel: its errno when it
-// returned, the value of its panic when the guest ended.
+// returned, the value of its panic when the guest ended. w's FS becomes the
+// whole host filesystem, in which argv[0] is a name.
 func execIn(t *testing.T, w *WasiStubs, m *Module, argv ...string) <-chan any {
 	t.Helper()
 	if _, err := os.Stat(argv[0]); err != nil {
 		t.Skipf("%s not available", argv[0])
 	}
+	w.cfg.FS = osFS{}
 	pathOff := writeCStr(m, 1000, argv[0])
 	argvOff := writeArgv(m, 2000, 3000, argv)
 	ended := make(chan any, 1)

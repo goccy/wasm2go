@@ -49,7 +49,7 @@ func TestSharedMemoryWasiBoundsAtMemorySize(t *testing.T) {
 				"proc_spawn of a path unterminated within the memory: -28 exec hook saw: []",
 				"grows from 1",
 				"random_get at the old end: 0",
-				"proc_spawn of the path: -2 exec hook saw: [path]",
+				"proc_spawn of the path: -2 exec hook saw: [/pth]",
 				"random_get at the new end: 21",
 			} {
 				if !strings.Contains(out, want) {
@@ -76,8 +76,8 @@ const page = 1 << 16
 
 func main() {
 	var seen []string
-	w := pkg.NewWASI(pkg.WASIConfig{Exec: func(path string, argv []string) bool {
-		seen = append(seen, path)
+	w := pkg.NewWASI(pkg.WASIConfig{FS: pkg.HostWASIConfig().FS, Exec: func(req pkg.ExecRequest) bool {
+		seen = append(seen, req.Path)
 		return false
 	}})
 	m := pkg.NewWithWASI(w)
@@ -88,8 +88,9 @@ func main() {
 	fmt.Println("random_get at the end:", m.Random(end, 1))
 	fmt.Println("random_get across the end:", m.Random(end-1, 2))
 
-	// "path" ends at memory.size; the array holds a zero right after it.
-	for i, c := range "path" {
+	// "/pth" ends at memory.size; the array holds a zero right after it. The
+	// path has a "/", so no lookup comes before the hook.
+	for i, c := range "/pth" {
 		m.Store(end-4+addr(i), int32(c))
 	}
 	fmt.Println("proc_spawn of a path unterminated within the memory:", m.Spawn(end-4), "exec hook saw:", seen)

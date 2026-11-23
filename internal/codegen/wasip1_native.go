@@ -2833,10 +2833,13 @@ type WASIConfig struct {
 	// numbers is no lookup and is not asked about, nor is an empty host of
 	// Sock_getaddrinfo, which resolves to INADDR_ANY.
 	Resolve func(host string) bool
-	// Exec is consulted before every Proc_spawn, which runs a host binary,
-	// with the executable path and argv. Returning false denies the spawn
-	// (EACCES). nil denies every one.
-	Exec func(path string, argv []string) bool
+	// Exec is consulted before every Proc_spawn and Proc_exec, which run a
+	// host binary, with what the command runs (ExecRequest): the command is
+	// started from that very value. Returning false denies the spawn
+	// (EACCES). nil denies every one. A command is a process of the host:
+	// it sees the host's filesystem, not FS, and only an FS that is a
+	// HostRootFS can start one (ENOSYS otherwise).
+	Exec func(req ExecRequest) bool
 	// Process supplies the guest's identity and accounting: what getpid,
 	// getppid, the getuid family and times report, the pid whose
 	// /proc/PID/fd lists the guest's descriptors, and the umask the guest
@@ -2980,7 +2983,30 @@ func AllowAllListen(network, address string) bool { return true }
 func AllowAllResolve(host string) bool { return true }
 
 // AllowAllExec is a WASIConfig.Exec that allows every process spawn.
-func AllowAllExec(path string, argv []string) bool { return true }
+func AllowAllExec(req ExecRequest) bool { return true }
+
+// ExecRequest is what a command the guest starts runs, as WASIConfig.Exec
+// is asked about it.
+type ExecRequest struct {
+	// Path is the host's absolute path of the executable: of its name in
+	// the FS (HostRootFS). A name without a "/" the guest gave is looked up
+	// first, in the directories of the PATH of Env, the envp the guest
+	// passes (or "/usr/local/bin:/bin:/usr/bin" without one), in the
+	// guest's FS, as musl's execvp looks one up: the first that is a
+	// regular file the guest may execute (access with X_OK, for its
+	// effective ids). musl's execvp reads the PATH of the caller's environ
+	// instead; the two differ only when posix_spawnp is given an envp with
+	// another PATH.
+	Path string
+	// Argv is the command's argument list, argv[0] included.
+	Argv []string
+	// Env is the command's whole environment, each "key=value": what the
+	// guest gave, none of the host process's.
+	Env []string
+	// Dir is the host's absolute path of the directory the command starts
+	// in, the guest's working directory.
+	Dir string
+}
 
 // HostWASIConfig returns the configuration of a guest that has what the host
 // process has: os.Args, os.Environ(), os.Stdin/Stdout/Stderr, the whole host
@@ -4626,8 +4652,11 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // HOST process: path is the executable, argv/envp are NUL-terminated char**
 // in linear memory. stdinFd, stdoutFd and stderrFd are the guest's
 // descriptors the child gets as its standard streams, -1 for the
-// instance's own (commandStreamLocked, startCommand). The new pid token is
-// written at pidOutPtr. Returns 0 or a negative errno.
+// instance's own (commandStreamLocked, startCommand). cwdPtr is the
+// guest's working directory, a guest path of the FS: the command starts in
+// its host path (ExecRequest.Dir), the root of the FS for an empty one, not
+// the host process's working directory. The new pid token is written at
+// pidOutPtr. Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
 }
@@ -4698,7 +4727,6 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 	}
 
 	w.mu.Lock()
-	hook := w.cfg.Exec
 	streams := [3]commandStream{
 		w.commandStreamLocked(fds[0], 1),
 		w.commandStreamLocked(fds[1], 2),
@@ -4709,28 +4737,10 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 	w.mu.Unlock()
 	inherit = append(inherit, w.inheritedOutside()...)
 	slices.SortFunc(inherit, func(a, b commandDescriptor) int { return cmp.Compare(a.at, b.at) })
-	if hook == nil || !hook(path, argv) {
-		return -_wasiEACCES
+	req, errno := w.commandRequest(op, path, argv, env, cwd)
+	if errno != _wasiESUCCESS {
+		return -errno
 	}
-
-	if len(argv) == 0 {
-		argv = []string{path}
-	}
-	if filepath.Base(path) == path {
-		// A name without a directory is looked up in the host's PATH, as
-		// exec.Command does.
-		found, err := exec.LookPath(path)
-		if err != nil {
-			return -w.guestErrno("proc_spawn", err)
-		}
-		path = found
-	}
-	// Sandbox: the child sees ONLY the guest-provided environment; a nil
-	// (NULL envp) must NOT fall through to the host process environment.
-	if env == nil {
-		env = []string{}
-	}
-	dir := cwd
 	// A process that has been killed, while the Exec hook ran too, starts
 	// nothing more.
 	w.endIfStopped()
@@ -4744,7 +4754,9 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 	job := pids.commandJob(ids.PID, execs)
 	var cmd *hostCommand
 	var startErr error
-	start := func() { cmd, startErr = w.startCommand(op, path, argv, env, dir, job.host, &streams, inherit, share) }
+	start := func() {
+		cmd, startErr = w.startCommand(op, req.Path, req.Argv, req.Env, req.Dir, job.host, &streams, inherit, share)
+	}
 	// The command inherits the umask of the thread that starts it: this
 	// one where the instance's mask is the host process's, the instance's
 	// creation thread otherwise.
@@ -4753,21 +4765,7 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 		start()
 	case withHostUmask(w.guestUmask(), start):
 	default:
-		t := w.creationThread()
-		if t != nil && !filepath.IsAbs(dir) {
-			// The creation thread's working directory is the one of its
-			// unshare: the command is given the host process's, read here,
-			// off that thread, with a relative directory taken from it.
-			// When it cannot be read, the command is started here, in it,
-			// with the host process's umask.
-			if wd, err := os.Getwd(); err != nil {
-				w.reportError(op, err)
-				t = nil
-			} else {
-				dir = filepath.Join(wd, dir)
-			}
-		}
-		if t == nil || t.run(start) != nil {
+		if t := w.creationThread(); t == nil || t.run(start) != nil {
 			start()
 		}
 	}
@@ -4777,6 +4775,136 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 	}
 	started(cmd, job, pids, ids)
 	return _wasiESUCCESS
+}
+
+// defaultCommandPath is the PATH a command name is looked up in when the
+// environment the guest gives the command has none: musl's (execvp.c).
+const defaultCommandPath = "/usr/local/bin:/bin:/usr/bin"
+
+// commandRequest returns what the command the guest asks op to start runs,
+// once the Exec policy allows it: file is the executable the guest names
+// (looked up by lookCommand when it has no "/"), argv and env the
+// command's, and cwd the guest's working directory, which a relative name
+// is taken from. The executable and the directory are the host's absolute
+// paths of their names in the FS (HostRootFS). It returns a wasi errno: EACCES
+// without a policy or when it refuses, ENOSYS when the FS is no
+// HostRootFS, guestName's and the lookup's.
+func (w *WasiStubs) commandRequest(op, file string, argv, env []string, cwd string) (ExecRequest, int32) {
+	w.mu.Lock()
+	hook := w.cfg.Exec
+	fsys, isHost := w.fs().(HostRootFS)
+	w.mu.Unlock()
+	switch {
+	case hook == nil:
+		return ExecRequest{}, _wasiEACCES
+	case !isHost:
+		return ExecRequest{}, _wasiENOSYS
+	}
+	if len(argv) == 0 {
+		argv = []string{file}
+	}
+	// Sandbox: the child sees ONLY the guest-provided environment; a nil
+	// (NULL envp) must NOT fall through to the host process environment.
+	if env == nil {
+		env = []string{}
+	}
+	dir, errno := w.guestName(cwd)
+	if errno != _wasiESUCCESS {
+		return ExecRequest{}, errno
+	}
+	var name string
+	if strings.Contains(file, "/") {
+		name, errno = w.guestName(guestPathFrom(cwd, file))
+	} else {
+		name, errno = w.lookCommand(op, file, env, cwd)
+	}
+	if errno != _wasiESUCCESS {
+		return ExecRequest{}, errno
+	}
+	// A relative HostRoot is taken from the host process's working
+	// directory as it is now.
+	root, err := filepath.Abs(fsys.HostRoot())
+	if err != nil {
+		return ExecRequest{}, w.guestErrno(op, err)
+	}
+	req := ExecRequest{Path: hostPathIn(root, name), Argv: argv, Env: env, Dir: hostPathIn(root, dir)}
+	if !hook(req) {
+		return ExecRequest{}, _wasiEACCES
+	}
+	return req, _wasiESUCCESS
+}
+
+// guestPathFrom returns the guest path name, taken from the directory cwd
+// when relative.
+func guestPathFrom(cwd, name string) string {
+	if path.IsAbs(name) {
+		return name
+	}
+	return cwd + "/" + name // not path.Join: guestName resolves ".." after symbolic links
+}
+
+// lookCommand returns the name in the FS of the executable the name file
+// (one without a "/") names, as musl's __execvpe looks it up: in each
+// directory of the PATH of env in turn (defaultCommandPath without one; an
+// empty directory is the working directory cwd), the first that is a
+// command the guest may run (commandRunnable). One it may not run (EACCES)
+// is remembered and the lookup goes on, as it does past one that does not
+// exist (ENOENT, ENOTDIR); any other errno ends it. It reports EACCES when
+// the lookup found only ones the guest may not run, ENOENT when it found
+// none.
+func (w *WasiStubs) lookCommand(op, file string, env []string, cwd string) (string, int32) {
+	dirs := defaultCommandPath
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
+			dirs = v
+			break
+		}
+	}
+	refused := false
+	// not filepath.SplitList: it splits by the host's separator, and gives
+	// no directory for an empty PATH, which is the working directory
+	for _, dir := range strings.Split(dirs, ":") {
+		candidate := file
+		if dir != "" {
+			candidate = dir + "/" + file
+		}
+		name, errno := w.commandRunnable(op, guestPathFrom(cwd, candidate))
+		switch errno {
+		case _wasiESUCCESS:
+			return name, _wasiESUCCESS
+		case _wasiEACCES:
+			refused = true
+		case _wasiENOENT, _wasiENOTDIR:
+		default:
+			return "", errno
+		}
+	}
+	if refused {
+		return "", _wasiEACCES
+	}
+	return "", _wasiENOENT
+}
+
+// commandRunnable returns the name in the FS of the guest path raw and
+// whether it is a command the guest may run, as execve(2) decides: 0 for a
+// regular file it may execute (Path_access with X_OK, for its effective
+// ids), EACCES for any other file, or the errno of finding it.
+func (w *WasiStubs) commandRunnable(op, raw string) (string, int32) {
+	name, errno := w.guestName(raw)
+	if errno != _wasiESUCCESS {
+		return "", errno
+	}
+	w.mu.Lock()
+	fsys := w.fs()
+	w.mu.Unlock()
+	fi, err := fsys.Stat(name)
+	switch {
+	case err != nil:
+		return "", w.guestErrno(op, err)
+	case !fi.Mode().IsRegular():
+		return "", _wasiEACCES
+	}
+	return name, w.accessName(op, name, nil, wasiAccessExec, true)
 }
 
 // awaitLeader waits for the end of cmd, the command of proc, which leads
@@ -11787,14 +11915,14 @@ func (w *WasiStubs) unixHostPath(a wasiSockAddr, path string) (string, int32) {
 	if errno != _wasiESUCCESS {
 		return "", errno
 	}
-	return hostPathIn(fsys, name), _wasiESUCCESS
+	return hostPathIn(fsys.HostRoot(), name), _wasiESUCCESS
 }
 
-// hostPathIn returns the host's path of name, a name guestName gave, in
-// fsys: under fsys.HostRoot(), with the trailing "/" of name, which
-// filepath.Join would drop.
-func hostPathIn(fsys HostRootFS, name string) string {
-	p := filepath.Join(fsys.HostRoot(), filepath.FromSlash(name))
+// hostPathIn returns the host's path of name, a name guestName gave, of a
+// HostRootFS whose HostRoot is root: under root, with the trailing "/" of
+// name, which filepath.Join would drop.
+func hostPathIn(root, name string) string {
+	p := filepath.Join(root, filepath.FromSlash(name))
 	if strings.HasSuffix(name, "/") {
 		p += string(filepath.Separator)
 	}
@@ -15788,19 +15916,29 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 		}
 		fi = info
 	}
-	effective := flags&wasiAccessEffective != 0
+	return -w.accessName("path_access", name, fi, amode, flags&wasiAccessEffective != 0)
+}
+
+// accessName is the decision of Path_access about the accesses of amode to
+// name, a name guestName gave, with the
+// effective ids when effective is set: of the file of the FS, or, when fi
+// is not nil, of what a name of the guest's own descriptors leads to, which
+// fi describes. Returns 0 or a wasi errno; op names the call to
+// WASIConfig.Errors.
+func (w *WasiStubs) accessName(op, name string, fi os.FileInfo, amode int32, effective bool) int32 {
+	own := fi != nil
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
 	if decides, ok := fsys.(AccessFS); ok && !own {
 		if err := decides.Access(name, uint32(amode), effective); !errors.Is(err, errors.ErrUnsupported) {
-			return -w.guestErrno("path_access", err)
+			return w.guestErrno(op, err)
 		}
 	}
 	if !own {
 		var err error
 		if fi, err = fsys.Stat(name); err != nil {
-			return -w.guestErrno("path_access", err)
+			return w.guestErrno(op, err)
 		}
 	}
 	if amode == 0 {
@@ -15813,10 +15951,10 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 	}
 	groups, err := w.guestGroups()
 	if err != nil {
-		return -w.guestErrno("path_access", err)
+		return w.guestErrno(op, err)
 	}
 	if !modeAllows(fi, fileStatOf(fi), uint32(amode), uint32(uid), uint32(gid), groups) {
-		return -_wasiEACCES
+		return _wasiEACCES
 	}
 	return _wasiESUCCESS
 }
