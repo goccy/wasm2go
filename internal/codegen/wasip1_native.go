@@ -3195,7 +3195,8 @@ func (op *wasiOpen) socket() bool {
 // discard what is written, no filesystem, no socket operation, outbound
 // connection, name lookup or process spawn, and the identity of an isolated
 // process. HostWASIConfig is the
-// configuration of a guest that has what the host process has.
+// configuration of a guest that has what the host process has and cannot
+// fail to give.
 //
 // Only the hooks below gate the network: Sock_socket, Sock_shutdown and
 // pipe consult none.
@@ -3328,6 +3329,11 @@ type WASIConfig struct {
 	// LocalZone is the time zone of a guest that names none (Clock_zone
 	// without TZ); nil is UTC.
 	LocalZone *time.Location
+	// ZoneInfo is the zone database of the zones the guest names (Clock_zone
+	// with a TZ such as "Europe/Paris"): the file of that name, a zone file
+	// as tzfile(5) has it. nil is the host's, which time.LoadLocation reads.
+	// A TZ that starts with '/' names a zone file of FS instead.
+	ZoneInfo fs.FS
 	// Errors is told the errors of operations whose caller cannot be given
 	// them (op names the operation), among them an error the guest's call
 	// fails with that has no errno of its own (the call fails with EIO); nil
@@ -3476,11 +3482,15 @@ type ExecRequest struct {
 }
 
 // HostWASIConfig returns the configuration of a guest that has what the host
-// process has: os.Args, os.Environ(), os.Stdin/Stdout/Stderr, the whole host
-// filesystem (what HostFS("/") returns), time.Local as its time zone, and every
-// socket operation, outbound connection, name lookup and process spawn allowed.
-// Its Process is nil, the isolated one: HostProcess may fail, so a guest has
-// the host process's identity only when the embedder sets it.
+// process has and cannot fail to give: os.Args, os.Environ(),
+// os.Stdin/Stdout/Stderr, the whole host filesystem (what HostFS("/")
+// returns), time.Local as its time zone, the host's user and group database
+// (HostUsers), system (HostSystem) and services database (HostServices),
+// whose skipped lines nobody is told, and every socket operation, outbound
+// connection, name lookup and process spawn allowed. Its other fields are
+// unset (Process the isolated one, no Signals, no Syslog, ...): a guest has
+// the host process's identity, its signals, the host's system logger and
+// the rest only when the embedder sets them.
 func HostWASIConfig() WASIConfig {
 	return WASIConfig{
 		Args:      os.Args,
@@ -3495,6 +3505,9 @@ func HostWASIConfig() WASIConfig {
 		Resolve:   AllowAllResolve,
 		Exec:      AllowAllExec,
 		LocalZone: time.Local,
+		Users:     HostUsers(nil),
+		System:    HostSystem(),
+		Services:  HostServices(nil),
 	}
 }
 
@@ -3573,6 +3586,19 @@ type WasiStubs struct {
 	// resolved (nil before the first); see zoneMoment. Guarded by mu.
 	zoneTZ string
 	zone   *wasiZone
+	// userWalk and groupWalk are the entries of the Users the guest goes
+	// through with getpwent and getgrent (procUserAt, procGroupAt), nil
+	// before its first walk. They are not changed once made, so a forked
+	// instance shares them. Guarded by mu.
+	userWalk  *[]User
+	groupWalk *[]Group
+	// syslog is what the fork family shares of its Syslogger (familySyslog).
+	// Like streams, it is created on first use (syslogFamilyLocked) and
+	// shared through Fork. Guarded by mu.
+	syslog *familySyslog
+	// syslogInUse records that the guest uses the Syslogger (familySyslog).
+	// Guarded by syslog.mu.
+	syslogInUse bool
 	// forked marks host state made by Fork: the instance it backs is a
 	// process of its own. Immutable.
 	forked bool
@@ -4263,8 +4289,9 @@ func (w *WasiStubs) guestPID() int32 { return w.guestProcess().IDs().PID }
 // semantics:
 //
 //   - the configuration is the same WASIConfig, its Process and Signals
-//     included, and the clock origin, the file mode creation mask and the
-//     zone of the last TZ value (see zoneMoment) are the same: the copy has
+//     included, and the clock origin, the file mode creation mask, the
+//     zone of the last TZ value (see zoneMoment) and the walks of the user
+//     and group databases (Users) are the same: the copy has
 //     the pid of w's Process as its own (ForkProc gives it a pid of its
 //     own);
 //   - the fd table has the same fd numbers — an fd closed in w, fd 0, 1 or
@@ -4330,6 +4357,9 @@ func (w *WasiStubs) forkHost() *WasiStubs {
 		hosts:     w.hostsLocked(),
 		zoneTZ:    w.zoneTZ,
 		zone:      w.zone,
+		userWalk:  w.userWalk,
+		groupWalk: w.groupWalk,
+		syslog:    w.syslogFamilyLocked(),
 		forked:    true,
 	}
 	child.preopenReplaced.Store(w.preopenReplaced.Load())
@@ -4373,7 +4403,8 @@ func (w *WasiStubs) forkHost() *WasiStubs {
 // V shared memory segments the guest has attached (Ipc_shmat), so the
 // guest's memory can be released afterwards. A call of IPC the guest is
 // waiting in (IPC.Semop, Msgsnd, Msgrcv) is not ended: it uses the guest's
-// memory until it returns.
+// memory until it returns. The instance stops using the Syslogger, as at a
+// closelog (Syslogger).
 // Calling it again is a no-op: a call made while another one closes the
 // descriptors returns without waiting for those closes. The close errors
 // are joined.
@@ -4389,7 +4420,7 @@ func (w *WasiStubs) CloseAll() error {
 	if leaves && share.live.Add(-1) == 0 {
 		share.stdin.stop()
 	}
-	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm())
+	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm(), w.stopSyslog())
 }
 
 // takeAll is CloseAll up to the closing of the descriptors, which it takes
@@ -14618,18 +14649,23 @@ func (w *WasiStubs) procSetenv(m *Module, namePtr uint64, nameLen int32, valuePt
 
 // Users is a user and group database (WASIConfig.Users): what the guest's
 // getpwuid, getpwnam and getpwent, and getgrgid, getgrnam and getgrent find.
-// UserAt and GroupAt return the i-th entry, from 0, as the guest goes
-// through the database. A lookup that finds nothing, and an At past the
-// last entry, returns an error that is fs.ErrNotExist: the guest's call
-// fails with ENOENT. Any other error fails it with the errno wasiErrnoOf
-// gives. Its methods are called without any lock of the WasiStubs held.
+// ListUsers and ListGroups return the entries in the order the guest goes
+// through them: an instance asks for them when its guest starts going
+// through the database (its first getpwent, or getgrent, after setpwent
+// or endpwent, or its first of all) and answers the
+// guest's next calls from what it got, so a walk sees the database as it
+// was at its start; a forked instance goes on with the walk of the instance
+// it was forked from. A lookup that finds nothing returns an error that is
+// fs.ErrNotExist: the guest's call fails with ENOENT. Any other error fails
+// it with the errno wasiErrnoOf gives. Its methods are called without any
+// lock of the WasiStubs held.
 type Users interface {
 	UserByID(uid int32) (User, error)
 	UserByName(name string) (User, error)
-	UserAt(i int) (User, error)
+	ListUsers() ([]User, error)
 	GroupByID(gid int32) (Group, error)
 	GroupByName(name string) (Group, error)
-	GroupAt(i int) (Group, error)
+	ListGroups() ([]Group, error)
 }
 
 // User is an entry of the user database, as passwd(5) has it.
@@ -14656,72 +14692,127 @@ type noUsers struct{}
 
 func (noUsers) UserByID(int32) (User, error)      { return User{}, fs.ErrNotExist }
 func (noUsers) UserByName(string) (User, error)   { return User{}, fs.ErrNotExist }
-func (noUsers) UserAt(int) (User, error)          { return User{}, fs.ErrNotExist }
+func (noUsers) ListUsers() ([]User, error)        { return nil, nil }
 func (noUsers) GroupByID(int32) (Group, error)    { return Group{}, fs.ErrNotExist }
 func (noUsers) GroupByName(string) (Group, error) { return Group{}, fs.ErrNotExist }
-func (noUsers) GroupAt(int) (Group, error)        { return Group{}, fs.ErrNotExist }
+func (noUsers) ListGroups() ([]Group, error)      { return nil, nil }
 
-// users returns the user and group database of the instance for the
-// import name: an empty one when the configuration names none. The host's
-// (HostUsers) tells WASIConfig.Errors the lines of its files it skips,
-// under name.
-func (w *WasiStubs) users(name string) Users {
-	switch users := w.cfg.Users.(type) {
-	case nil:
+// users returns the user and group database of the instance: an empty one
+// when the configuration names none.
+func (w *WasiStubs) users() Users {
+	if w.cfg.Users == nil {
 		return noUsers{}
-	case hostUsers:
-		users.report = func(err error) { w.reportError(name, err) }
-		return users
-	default:
-		return users
 	}
+	return w.cfg.Users
 }
 
 // HostUsers returns the user and group database of the host, for
-// WASIConfig.Users. A lookup by id or name is package os/user's, which
-// reports no shell: the Shell of the User is empty. UserAt and GroupAt go
-// through the files /etc/passwd and /etc/group, read anew for each call:
-// their entries in order, without the lines of the NIS compatibility syntax
-// (+ or - first). A line that is no entry (too few fields, an id that is
-// not a number) is skipped and its error told WASIConfig.Errors when the
-// runtime asks; called directly, UserAt and GroupAt return that error. A
-// user or group
-// os/user does not know, and an entry past the last, is fs.ErrNotExist.
-func HostUsers() Users { return hostUsers{} }
-
-// hostUsers is the Users HostUsers returns. report, when it is not nil, is
-// told why a line of /etc/passwd or /etc/group that is no entry was
-// skipped (see usersFor).
-type hostUsers struct{ report func(error) }
-
-func (hostUsers) UserByID(uid int32) (User, error) {
-	return hostUser(user.LookupId(strconv.FormatUint(uint64(uint32(uid)), 10)))
+// WASIConfig.Users: the files /etc/passwd and /etc/group, then package
+// os/user, as on a host whose name service switch reads its files first
+// (passwd: files ...). A lookup by id or name finds the first entry of the
+// file that matches, reading the file anew, and asks os/user only when the
+// file has none; ListUsers and ListGroups are the entries of the files
+// alone, in order, as os/user cannot go through a database. So a user or
+// group that only a directory service has (LDAP, the Directory Services of
+// darwin) is found by a lookup and not listed, as on a host whose service
+// does not list its entries (sssd by default), and its User has no Shell,
+// which os/user does not report. A file the host does not have has no
+// entries. The lines of the NIS compatibility syntax (+ or - first) are no
+// entries; a line that is no entry either (too few fields, an id that is
+// not a number) is skipped and its error told report, with the name of the
+// method as op; nil drops them. A user or group neither the files nor
+// os/user knows is fs.ErrNotExist.
+func HostUsers(report func(op string, err error)) Users {
+	return hostUsers{passwd: "/etc/passwd", group: "/etc/group", report: report}
 }
 
-func (hostUsers) UserByName(name string) (User, error) { return hostUser(user.Lookup(name)) }
+// hostUsers is the Users HostUsers returns: the files passwd and group,
+// then os/user, with report told the lines of the files that are skipped.
+type hostUsers struct {
+	passwd, group string
+	report        func(op string, err error)
+}
 
-func (u hostUsers) UserAt(i int) (User, error) {
-	// name:password:uid:gid:gecos:home:shell
-	e, err := hostDatabaseEntry("/etc/passwd", i, u.report, 7, 2, 3)
+func (u hostUsers) UserByID(uid int32) (User, error) {
+	users, err := u.fileUsers("UserByID")
 	if err != nil {
 		return User{}, err
 	}
-	return User{Name: e.fields[0], UID: e.ids[0], GID: e.ids[1], RealName: e.fields[4], Home: e.fields[5], Shell: e.fields[6]}, nil
+	if i := slices.IndexFunc(users, func(e User) bool { return e.UID == uid }); i >= 0 {
+		return users[i], nil
+	}
+	return hostUser(user.LookupId(strconv.FormatUint(uint64(uint32(uid)), 10)))
 }
 
-func (hostUsers) GroupByID(gid int32) (Group, error) {
-	return hostGroup(user.LookupGroupId(strconv.FormatUint(uint64(uint32(gid)), 10)))
+func (u hostUsers) UserByName(name string) (User, error) {
+	users, err := u.fileUsers("UserByName")
+	if err != nil {
+		return User{}, err
+	}
+	if i := slices.IndexFunc(users, func(e User) bool { return e.Name == name }); i >= 0 {
+		return users[i], nil
+	}
+	return hostUser(user.Lookup(name))
 }
 
-func (hostUsers) GroupByName(name string) (Group, error) { return hostGroup(user.LookupGroup(name)) }
+func (u hostUsers) ListUsers() ([]User, error) { return u.fileUsers("ListUsers") }
 
-func (u hostUsers) GroupAt(i int) (Group, error) {
-	// name:password:gid:members
-	e, err := hostDatabaseEntry("/etc/group", i, u.report, 3, 2)
+// fileUsers returns the entries of the file passwd; op is the method whose
+// skipped lines report is told.
+func (u hostUsers) fileUsers(op string) ([]User, error) {
+	// name:password:uid:gid:gecos:home:shell
+	entries, err := hostDatabaseEntries(u.passwd, skippedLine(u.report, op), 7, 2, 3)
+	users := make([]User, 0, len(entries))
+	for _, e := range entries {
+		users = append(users, User{Name: e.fields[0], UID: e.ids[0], GID: e.ids[1], RealName: e.fields[4], Home: e.fields[5], Shell: e.fields[6]})
+	}
+	return users, err
+}
+
+func (u hostUsers) GroupByID(gid int32) (Group, error) {
+	groups, err := u.fileGroups("GroupByID")
 	if err != nil {
 		return Group{}, err
 	}
-	return Group{Name: e.fields[0], GID: e.ids[0]}, nil
+	if i := slices.IndexFunc(groups, func(e Group) bool { return e.GID == gid }); i >= 0 {
+		return groups[i], nil
+	}
+	return hostGroup(user.LookupGroupId(strconv.FormatUint(uint64(uint32(gid)), 10)))
+}
+
+func (u hostUsers) GroupByName(name string) (Group, error) {
+	groups, err := u.fileGroups("GroupByName")
+	if err != nil {
+		return Group{}, err
+	}
+	if i := slices.IndexFunc(groups, func(e Group) bool { return e.Name == name }); i >= 0 {
+		return groups[i], nil
+	}
+	return hostGroup(user.LookupGroup(name))
+}
+
+func (u hostUsers) ListGroups() ([]Group, error) { return u.fileGroups("ListGroups") }
+
+// fileGroups returns the entries of the file group; op is the method whose
+// skipped lines report is told.
+func (u hostUsers) fileGroups(op string) ([]Group, error) {
+	// name:password:gid:members
+	entries, err := hostDatabaseEntries(u.group, skippedLine(u.report, op), 3, 2)
+	groups := make([]Group, 0, len(entries))
+	for _, e := range entries {
+		groups = append(groups, Group{Name: e.fields[0], GID: e.ids[0]})
+	}
+	return groups, err
+}
+
+// skippedLine returns what is told the error of a skipped line of a
+// database file of the host: report, with op, or nobody when report is nil.
+func skippedLine(report func(op string, err error), op string) func(error) {
+	return func(err error) {
+		if report != nil {
+			report(op, err)
+		}
+	}
 }
 
 // hostUser returns the User of an os/user lookup's result.
@@ -14796,43 +14887,38 @@ type hostDBEntry struct {
 	ids    []int32
 }
 
-// hostDatabaseEntry returns the entry at index of a database file of the
-// host in the files' format (passwd(5), group(5)): one entry a line, at
-// least minFields fields separated by colons, the fields idFields of which
-// are ids. A line that is empty, a comment, or an entry of the NIS
+// hostDatabaseEntries returns the entries of a database file of the host
+// in the files' format (passwd(5), group(5)), read once: one entry a line,
+// at least minFields fields separated by colons, the fields idFields of
+// which are ids. A line that is empty, a comment, or an entry of the NIS
 // compatibility syntax (+ or - first) is no entry; neither is one with too
-// few fields or an id that is not a number: its error is told report and
-// the line skipped, or, without a report, returned. Past the last entry
-// the error is fs.ErrNotExist; the file is read anew for each call.
-func hostDatabaseEntry(path string, index int, report func(error), minFields int, idFields ...int) (hostDBEntry, error) {
+// few fields or an id that is not a number: its error is told skipped and
+// the line passed over. A file that does not exist has no entries.
+func hostDatabaseEntries(path string, skipped func(error), minFields int, idFields ...int) ([]hostDBEntry, error) {
 	data, err := os.ReadFile(path)
-	if err != nil {
-		return hostDBEntry{}, err
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
 	}
-	i := index
+	if err != nil {
+		return nil, err
+	}
+	var entries []hostDBEntry
 	for n, line := range strings.Split(string(data), "\n") {
 		if line == "" || line[0] == '#' || line[0] == '+' || line[0] == '-' {
 			continue
 		}
 		e, err := parseHostDBEntry(line, minFields, idFields)
 		if err != nil {
-			err = fmt.Errorf("%s:%d: %w", path, n+1, err)
-			if report == nil {
-				return hostDBEntry{}, err
-			}
-			report(err)
+			skipped(fmt.Errorf("%s:%d: %w", path, n+1, err))
 			continue
 		}
-		if i == 0 {
-			return e, nil
-		}
-		i--
+		entries = append(entries, e)
 	}
-	return hostDBEntry{}, fmt.Errorf("%s has no entry %d: %w", path, index, fs.ErrNotExist)
+	return entries, nil
 }
 
 // parseHostDBEntry returns the entry of a line of a database file of the
-// host (see hostDatabaseEntry).
+// host (see hostDatabaseEntries).
 func parseHostDBEntry(line string, minFields int, idFields []int) (hostDBEntry, error) {
 	e := hostDBEntry{fields: strings.Split(line, ":")}
 	if len(e.fields) < minFields {
@@ -14899,7 +14985,7 @@ func (w *WasiStubs) Proc_user_by_id64(m *Module, uid int32, bufPtr int64, bufLen
 
 // procUserByID is the body of Proc_user_by_id and Proc_user_by_id64.
 func (w *WasiStubs) procUserByID(m *Module, uid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
-	u, err := w.users("proc_user_by_id").UserByID(uid)
+	u, err := w.users().UserByID(uid)
 	return w.writeUser(m, "proc_user_by_id", u, err, bufPtr, bufLen, neededPtr)
 }
 
@@ -14921,13 +15007,15 @@ func (w *WasiStubs) procUserByName(m *Module, namePtr uint64, nameLen int32, buf
 	if name == nil {
 		return -_wasiEFAULT
 	}
-	u, err := w.users("proc_user_by_name").UserByName(string(name))
+	u, err := w.users().UserByName(string(name))
 	return w.writeUser(m, "proc_user_by_name", u, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_user_at is a NON-STANDARD host import (module wasip1_posix_extension,
 // name "proc_user_at") backing getpwent: Proc_user_by_id for the index-th
-// entry of the Users, by UserAt. Returns ENOENT past the last entry.
+// entry of the instance's walk of the Users (userWalk): what their
+// ListUsers returned when the guest asked for index 0, or for any index
+// while the instance had no walk. Returns ENOENT past the last entry.
 func (w *WasiStubs) Proc_user_at(m *Module, index, bufPtr, bufLen, neededPtr int32) int32 {
 	return w.procUserAt(m, index, zext(bufPtr), bufLen, zext(neededPtr))
 }
@@ -14942,8 +15030,23 @@ func (w *WasiStubs) procUserAt(m *Module, index int32, bufPtr uint64, bufLen int
 	if index < 0 {
 		return -_wasiENOENT
 	}
-	u, err := w.users("proc_user_at").UserAt(int(index))
-	return w.writeUser(m, "proc_user_at", u, err, bufPtr, bufLen, neededPtr)
+	w.mu.Lock()
+	walk := w.userWalk
+	w.mu.Unlock()
+	if index == 0 || walk == nil {
+		users, err := w.users().ListUsers()
+		if err != nil {
+			return -w.guestErrno("proc_user_at", err)
+		}
+		walk = &users
+		w.mu.Lock()
+		w.userWalk = walk
+		w.mu.Unlock()
+	}
+	if int(index) >= len(*walk) {
+		return -_wasiENOENT
+	}
+	return w.writeUser(m, "proc_user_at", (*walk)[index], nil, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_group_by_id is a NON-STANDARD host import (module
@@ -14962,7 +15065,7 @@ func (w *WasiStubs) Proc_group_by_id64(m *Module, gid int32, bufPtr int64, bufLe
 
 // procGroupByID is the body of Proc_group_by_id and Proc_group_by_id64.
 func (w *WasiStubs) procGroupByID(m *Module, gid int32, bufPtr uint64, bufLen int32, neededPtr uint64) int32 {
-	g, err := w.users("proc_group_by_id").GroupByID(gid)
+	g, err := w.users().GroupByID(gid)
 	return w.writeGroup(m, "proc_group_by_id", g, err, bufPtr, bufLen, neededPtr)
 }
 
@@ -14984,14 +15087,14 @@ func (w *WasiStubs) procGroupByName(m *Module, namePtr uint64, nameLen int32, bu
 	if name == nil {
 		return -_wasiEFAULT
 	}
-	g, err := w.users("proc_group_by_name").GroupByName(string(name))
+	g, err := w.users().GroupByName(string(name))
 	return w.writeGroup(m, "proc_group_by_name", g, err, bufPtr, bufLen, neededPtr)
 }
 
 // Proc_group_at is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "proc_group_at") backing getgrent:
-// Proc_group_by_id for the index-th entry of the Users, by GroupAt.
-// Returns ENOENT past the last entry.
+// Proc_group_by_id for the index-th entry of the Users' ListGroups, as
+// Proc_user_at for the users. Returns ENOENT past the last entry.
 func (w *WasiStubs) Proc_group_at(m *Module, index, bufPtr, bufLen, neededPtr int32) int32 {
 	return w.procGroupAt(m, index, zext(bufPtr), bufLen, zext(neededPtr))
 }
@@ -15006,8 +15109,23 @@ func (w *WasiStubs) procGroupAt(m *Module, index int32, bufPtr uint64, bufLen in
 	if index < 0 {
 		return -_wasiENOENT
 	}
-	g, err := w.users("proc_group_at").GroupAt(int(index))
-	return w.writeGroup(m, "proc_group_at", g, err, bufPtr, bufLen, neededPtr)
+	w.mu.Lock()
+	walk := w.groupWalk
+	w.mu.Unlock()
+	if index == 0 || walk == nil {
+		groups, err := w.users().ListGroups()
+		if err != nil {
+			return -w.guestErrno("proc_group_at", err)
+		}
+		walk = &groups
+		w.mu.Lock()
+		w.groupWalk = walk
+		w.mu.Unlock()
+	}
+	if int(index) >= len(*walk) {
+		return -_wasiENOENT
+	}
+	return w.writeGroup(m, "proc_group_at", (*walk)[index], nil, bufPtr, bufLen, neededPtr)
 }
 
 // ----- the system --------------------------------------------------------------
@@ -15098,23 +15216,26 @@ type Service struct {
 // WASIConfig.Services: the file /etc/services, read anew for each lookup,
 // whose first entry that matches is the one found. An error reading the
 // file is returned; a line that is no entry is skipped and its error told
-// WASIConfig.Errors when the runtime asks, and returned when the lookup is
-// called directly.
-func HostServices() Services { return hostServices{} }
+// report, with the name of the method as op; nil drops them.
+func HostServices(report func(op string, err error)) Services {
+	return hostServices{path: hostServicesFile, report: report}
+}
 
-// hostServices is the Services HostServices returns. report, when it is
-// not nil, is told why a line of /etc/services that is no entry was skipped
-// (see Sock_service).
-type hostServices struct{ report func(error) }
+// hostServices is the Services HostServices returns: the file path, with
+// report told why a line that is no entry was skipped.
+type hostServices struct {
+	path   string
+	report func(op string, err error)
+}
 
 func (h hostServices) ServiceByName(name, proto string) (Service, error) {
-	return findHostService(hostServicesFile, h.report, func(s Service) bool {
+	return findHostService(h.path, skippedLine(h.report, "ServiceByName"), func(s Service) bool {
 		return (proto == "" || s.Proto == proto) && (s.Name == name || slices.Contains(s.Aliases, name))
 	})
 }
 
 func (h hostServices) ServiceByPort(port int, proto string) (Service, error) {
-	return findHostService(hostServicesFile, h.report, func(s Service) bool {
+	return findHostService(h.path, skippedLine(h.report, "ServiceByPort"), func(s Service) bool {
 		return (proto == "" || s.Proto == proto) && s.Port == port
 	})
 }
@@ -15125,9 +15246,8 @@ const hostServicesFile = "/etc/services"
 // findHostService returns the first entry of the services database at path,
 // services(5) — one service a line: its name, port/protocol, and aliases,
 // with comments from a # to the end of the line — that match accepts. A
-// line that is no entry is skipped and its error told report, or, without
-// a report, its error returned.
-func findHostService(path string, report func(error), match func(Service) bool) (Service, error) {
+// line that is no entry is skipped and its error told skipped.
+func findHostService(path string, skipped func(error), match func(Service) bool) (Service, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Service{}, err
@@ -15140,11 +15260,7 @@ func findHostService(path string, report func(error), match func(Service) bool) 
 		}
 		entry, err := parseHostService(fields)
 		if err != nil {
-			err = fmt.Errorf("%s:%d: %w", path, n+1, err)
-			if report == nil {
-				return Service{}, err
-			}
-			report(err)
+			skipped(fmt.Errorf("%s:%d: %w", path, n+1, err))
 			continue
 		}
 		if match(entry) {
@@ -15197,13 +15313,8 @@ func (w *WasiStubs) sockService(m *Module, namePtr uint64, nameLen, port, byPort
 		return -_wasiEFAULT
 	}
 	services := w.cfg.Services
-	switch host := services.(type) {
-	case nil:
+	if services == nil {
 		return -_wasiENOENT
-	case hostServices:
-		// The host's tells the lines of its file it skips.
-		host.report = func(err error) { w.reportError("sock_service", err) }
-		services = host
 	}
 	var (
 		entry Service
@@ -15727,8 +15838,10 @@ func (w *WasiStubs) hostNumberAt(m *Module, family, index int32, namePtr uint64,
 // ----- the system logger -------------------------------------------------------
 
 // Syslogger is a system logger as a guest's syslog(3) uses it
-// (WASIConfig.Syslog). An error of its methods fails the guest's call with
-// the errno wasiErrnoOf gives.
+// (WASIConfig.Syslog). An error of its methods in the guest's openlog,
+// syslog and closelog fails the guest's call with the errno wasiErrnoOf
+// gives, and is told WASIConfig.Errors, as those return nothing to the
+// guest's program; the error of a Close that CloseAll makes is CloseAll's.
 //
 // An instance and the instances forked from it share the Syslogger, each
 // calling it from its own goroutine, without any lock of the WasiStubs
@@ -15739,7 +15852,12 @@ type Syslogger interface {
 	Open(ident string, options, facility int32) error
 	// Log delivers one message.
 	Log(msg SyslogMessage) error
-	// Close is the guest's closelog.
+	// Close is called once no instance of the fork family uses the
+	// Syslogger: an instance uses it from its guest's first openlog or
+	// syslog until its closelog or the instance's CloseAll, and Close is
+	// called by the last of them to stop. A guest that uses it again
+	// afterwards makes Open and Log be called again. Given to more than one
+	// NewWASI, it is closed by each of their families.
 	Close() error
 }
 
@@ -15754,6 +15872,8 @@ type SyslogMessage struct {
 	Options int32
 	// Ident is the tag openlog set, "" when the guest set none.
 	Ident string
+	// PID is the guest's process id (getpid), which LOG_PID logs.
+	PID int32
 	// Message is the message text.
 	Message string
 }
@@ -15767,18 +15887,177 @@ const (
 	SyslogOptPerror int32 = 0x20 // LOG_PERROR: the guest also writes the message to its stderr
 )
 
-// HostSyslog returns the host's system logger, for WASIConfig.Syslog:
-// package log/syslog's connection to the local syslog daemon, at most one
-// for each facility the guest logs with: a message or an openlog with
-// another ident than the facility's connection was made for replaces it.
-// HostSyslog connects for the
-// facility LOG_USER without an ident, and returns the error of that; where
-// package log/syslog has no logger (windows, plan9) the error is
-// errors.ErrUnsupported. The messages are written as package log/syslog
-// writes them, which always tags them with the process id, LOG_PID or not;
-// LOG_CONS and LOG_NDELAY change nothing. An ident of "" is the name of the
-// program (os.Args[0]), as for syslog(3).
-func HostSyslog() (Syslogger, error) { return newHostSyslog() }
+// HostSyslog returns the host's system logger, for WASIConfig.Syslog: one
+// connection to the local syslog daemon, at the socket package log/syslog
+// connects to, made at the first message, or at an openlog with
+// LOG_NDELAY, and closed by Close. Every message is written over it with
+// its own facility, severity and ident, as a local syslog(3) writes it
+// ("<PRI>Mmm dd hh:mm:ss IDENT[PID]: MESSAGE"), the process id only with
+// LOG_PID; an ident of "" is the name of the program (os.Args[0]). A write
+// that fails over a connection made earlier is made again over a new one,
+// as syslog(3) does for a daemon that was restarted. The error of
+// connecting or writing is the call's; on a system other than darwin and
+// linux, where the runtime has no local syslog daemon to connect to, it is
+// errors.ErrUnsupported. LOG_CONS changes nothing.
+func HostSyslog() Syslogger { return &hostSyslogger{dial: dialHostSyslog} }
+
+// hostSyslogger is the Syslogger HostSyslog returns. conn is its
+// connection, nil while it has none, and dial makes one. Its lock is held
+// across every connection, write and close. Package log/syslog is not
+// used: its Writer gives each of its messages the tag it was made with
+// and the host process's id (os.Getpid).
+type hostSyslogger struct {
+	mu   sync.Mutex
+	conn net.Conn
+	dial func() (net.Conn, error)
+}
+
+func (l *hostSyslogger) Open(ident string, options, facility int32) error {
+	if facility < 0 || facility > 23 {
+		return syscall.EINVAL
+	}
+	if options&SyslogOptNDelay == 0 {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn != nil {
+		return nil
+	}
+	conn, err := l.dial()
+	l.conn = conn
+	return err
+}
+
+func (l *hostSyslogger) Log(msg SyslogMessage) error {
+	if msg.Severity < 0 || msg.Severity > 7 || msg.Facility < 0 || msg.Facility > 23 {
+		return syscall.EINVAL
+	}
+	line := hostSyslogLine(msg, time.Now())
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var stale error
+	if l.conn != nil {
+		_, err := io.WriteString(l.conn, line)
+		if err == nil {
+			return nil
+		}
+		// The connection made before the daemon was restarted fails; the
+		// write over a new one is the message's answer, as for glibc's
+		// __vsyslog_internal and package log/syslog's writeAndRetry, so the
+		// errors of the old one are the call's only when that fails too.
+		stale = errors.Join(err, l.conn.Close())
+		l.conn = nil
+	}
+	conn, err := l.dial()
+	if err != nil {
+		return errors.Join(stale, err)
+	}
+	l.conn = conn
+	if _, err := io.WriteString(conn, line); err != nil {
+		return errors.Join(stale, err)
+	}
+	return nil
+}
+
+// Close closes the connection; a message logged later connects again.
+func (l *hostSyslogger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn == nil {
+		return nil
+	}
+	err := l.conn.Close()
+	l.conn = nil
+	return err
+}
+
+// hostSyslogLine returns msg, logged at now, as the line package log/syslog
+// writes to a local daemon (with the ident and process id of msg's guest):
+// "<PRI>Mmm dd hh:mm:ss IDENT[PID]: MESSAGE" and a newline unless the
+// message ends with one, the [PID] only with LOG_PID.
+func hostSyslogLine(msg SyslogMessage, now time.Time) string {
+	tag := msg.Ident
+	if tag == "" {
+		tag = os.Args[0]
+	}
+	if msg.Options&SyslogOptPID != 0 {
+		tag += "[" + strconv.Itoa(int(msg.PID)) + "]"
+	}
+	nl := "\n"
+	if strings.HasSuffix(msg.Message, "\n") {
+		nl = ""
+	}
+	return fmt.Sprintf("<%d>%s %s: %s%s", msg.Facility<<3|msg.Severity, now.Format(time.Stamp), tag, msg.Message, nl)
+}
+
+// familySyslog is what the instances of a fork family share of their
+// Syslogger: how many of them use it (syslogInUse). Its lock is held
+// across the Close the last of them to stop makes (stopSyslog), so an
+// instance that starts to use the Syslogger then waits for that Close.
+type familySyslog struct {
+	mu    sync.Mutex
+	users int
+}
+
+// syslogFamilyLocked returns the family's familySyslog, made on first use.
+// Caller holds w.mu.
+func (w *WasiStubs) syslogFamilyLocked() *familySyslog {
+	if w.syslog == nil {
+		w.syslog = &familySyslog{}
+	}
+	return w.syslog
+}
+
+// useSyslog records that the instance's guest uses the Syslogger, which it
+// must have.
+func (w *WasiStubs) useSyslog() {
+	w.mu.Lock()
+	family := w.syslogFamilyLocked()
+	w.mu.Unlock()
+	family.mu.Lock()
+	defer family.mu.Unlock()
+	if !w.syslogInUse {
+		w.syslogInUse = true
+		family.users++
+	}
+}
+
+// stopSyslog records that the instance no longer uses the Syslogger, and
+// closes it when no instance of the family uses it any longer.
+func (w *WasiStubs) stopSyslog() error {
+	if w.cfg.Syslog == nil {
+		return nil
+	}
+	w.mu.Lock()
+	family := w.syslogFamilyLocked()
+	w.mu.Unlock()
+	family.mu.Lock()
+	defer family.mu.Unlock()
+	if !w.syslogInUse {
+		return nil
+	}
+	w.syslogInUse = false
+	family.users--
+	if family.users > 0 {
+		return nil
+	}
+	return w.cfg.Syslog.Close()
+}
+
+// syslogErrno returns the negative errno of err, an error of the Syslogger
+// for the import op, and tells WASIConfig.Errors of it: the guest's
+// openlog, syslog and closelog return nothing.
+func (w *WasiStubs) syslogErrno(op string, err error) int32 {
+	if err == nil {
+		return _wasiESUCCESS
+	}
+	w.reportError(op, err)
+	// Told Errors whether or not it has an errno of its own, so the bool
+	// that says so is not needed.
+	errno, _ := wasiErrnoOf(err)
+	return -errno
+}
 
 // Proc_syslog_open is a NON-STANDARD host import (module
 // wasip1_posix_extension, name "proc_syslog_open") backing openlog(): the
@@ -15808,10 +16087,8 @@ func (w *WasiStubs) procSyslogOpen(m *Module, identPtr uint64, identLen, options
 	if w.cfg.Syslog == nil {
 		return -_wasiENOSYS
 	}
-	if err := w.cfg.Syslog.Open(string(ident), options, facility); err != nil {
-		return -w.guestErrno("proc_syslog_open", err)
-	}
-	return _wasiESUCCESS
+	w.useSyslog()
+	return w.syslogErrno("proc_syslog_open", w.cfg.Syslog.Open(string(ident), options, facility))
 }
 
 // Proc_syslog is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -15843,30 +16120,27 @@ func (w *WasiStubs) procSyslog(m *Module, severity, facility, options int32, ide
 	if w.cfg.Syslog == nil {
 		return -_wasiENOSYS
 	}
-	err := w.cfg.Syslog.Log(SyslogMessage{
+	w.useSyslog()
+	return w.syslogErrno("proc_syslog", w.cfg.Syslog.Log(SyslogMessage{
 		Severity: severity,
 		Facility: facility,
 		Options:  options,
 		Ident:    string(ident),
+		PID:      w.guestPID(),
 		Message:  string(text),
-	})
-	if err != nil {
-		return -w.guestErrno("proc_syslog", err)
-	}
-	return _wasiESUCCESS
+	}))
 }
 
 // Proc_syslog_close is a NON-STANDARD host import (module
-// wasip1_posix_extension, name "proc_syslog_close") backing closelog().
-// Returns 0, or a negative errno as Proc_syslog_open.
+// wasip1_posix_extension, name "proc_syslog_close") backing closelog(): the
+// instance stops using the Syslogger, which is closed when no instance of
+// its fork family uses it (Syslogger.Close). Returns 0, or a negative errno
+// as Proc_syslog_open.
 func (w *WasiStubs) Proc_syslog_close(m *Module) int32 {
 	if w.cfg.Syslog == nil {
 		return -_wasiENOSYS
 	}
-	if err := w.cfg.Syslog.Close(); err != nil {
-		return -w.guestErrno("proc_syslog_close", err)
-	}
-	return _wasiESUCCESS
+	return w.syslogErrno("proc_syslog_close", w.stopSyslog())
 }
 
 // Proc_syslog_close64 is Proc_syslog_close for a memory64 guest.
@@ -18230,7 +18504,7 @@ func zoneReading(loc *time.Location, t int64) time.Time {
 	return fits[0]
 }
 
-// wasiZone is a zone a TZ value names, resolved: one of the host's zone
+// wasiZone is a zone a TZ value names, resolved: one of a zone
 // database or of a zone file (loc), or one a POSIX TZ string gives (posix).
 type wasiZone struct {
 	loc   *time.Location
@@ -18252,9 +18526,10 @@ const wasiZoneFileMax = 10 << 20
 
 // zoneMoment resolves the zone a guest named and answers for it. No name
 // (TZ not set) is the configuration's LocalZone, UTC when it has none. A
-// name, with the ':' it may start with dropped, is a zone of the host's zone
-// database ("Europe/Paris"), or, when it starts with '/', the zone file of
-// that path in the guest's filesystem ("/usr/share/zoneinfo/Europe/Paris")
+// name, with the ':' it may start with dropped, is a zone of the zone
+// database ("Europe/Paris"), the configuration's ZoneInfo or the host's, or,
+// when it starts with '/', the zone file of that path in the guest's
+// filesystem ("/usr/share/zoneinfo/Europe/Paris")
 // (see loadZone). As for a C library, a name that loads no zone, whatever
 // the reason, is read as a POSIX TZ string, and one that is not such a
 // string either is UTC, and the configuration's Errors is told the error of
@@ -18294,17 +18569,17 @@ func (w *WasiStubs) zoneMoment(tz string, named bool, t int64, local bool) wasiZ
 	return zone.moment(t, local)
 }
 
-// loadZone loads the zone of a name (see zoneMoment) from the host's zone
-// database or, for a path, from the guest's filesystem. "Local" names no
-// zone of the database; a path names one only when it is a regular file of
-// at most wasiZoneFileMax bytes. The file is opened without waiting where
+// loadZone loads the zone of a name (see zoneMoment) from the zone database
+// (loadZoneInfo) or, for a path, from the guest's filesystem. "Local" names
+// no zone of the database; a path names one only when it is a regular file
+// of at most wasiZoneFileMax bytes. The file is opened without waiting where
 // the host can (hostONonblock), and what it is is told by the open file.
 func (w *WasiStubs) loadZone(name string) (*time.Location, error) {
 	if name == "Local" {
 		return nil, fs.ErrNotExist
 	}
 	if !strings.HasPrefix(name, "/") {
-		return time.LoadLocation(name)
+		return w.loadZoneInfo(name)
 	}
 	rel, errno := w.guestName(name)
 	if errno != _wasiESUCCESS {
@@ -18314,6 +18589,33 @@ func (w *WasiStubs) loadZone(name string) (*time.Location, error) {
 	if err != nil {
 		return nil, err
 	}
+	return readZoneFile(name, f)
+}
+
+// loadZoneInfo loads the zone of a name of the zone database: the file of
+// that name in the configuration's ZoneInfo, which is a zone only when it is
+// a regular file of at most wasiZoneFileMax bytes, or, without a ZoneInfo,
+// the zone time.LoadLocation loads from the host's database. "" and "UTC"
+// are UTC, as for time.LoadLocation, and a name fs.ValidPath refuses (one
+// with a ".." or an empty element) names no file of ZoneInfo.
+func (w *WasiStubs) loadZoneInfo(name string) (*time.Location, error) {
+	if w.cfg.ZoneInfo == nil || name == "" || name == "UTC" {
+		return time.LoadLocation(name)
+	}
+	if !fs.ValidPath(name) {
+		return nil, fs.ErrNotExist
+	}
+	f, err := w.cfg.ZoneInfo.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return readZoneFile(name, f)
+}
+
+// readZoneFile loads the zone called name from f, an open zone file, which
+// it closes: a zone only when f is a regular file of at most
+// wasiZoneFileMax bytes.
+func readZoneFile(name string, f fs.File) (*time.Location, error) {
 	var data []byte
 	fi, err := f.Stat()
 	switch {

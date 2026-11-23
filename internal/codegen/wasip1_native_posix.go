@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/syslog"
 	"math"
 	"net"
 	"os"
@@ -847,89 +846,21 @@ func hostWaitRecordLock(waitFD int, via *os.File, lk *recordLock) error {
 	return hostRecordLock(via, recordLockWait, lk)
 }
 
-// hostSyslogger is the Syslogger HostSyslog returns: at most one connection
-// of package log/syslog for each facility, made for the ident it was last
-// used with. Its lock is held across every write, so a connection Close
-// has closed is never written to (package log/syslog would open it again).
-type hostSyslogger struct {
-	mu      sync.Mutex
-	writers map[int32]*hostSyslogWriter
-}
-
-// hostSyslogWriter is a connection of a hostSyslogger and the ident it was
-// made for.
-type hostSyslogWriter struct {
-	writer *syslog.Writer
-	ident  string
-}
-
-// syslogFacilityUser is the facility LOG_USER, syslog(3)'s default.
-const syslogFacilityUser int32 = 1
-
-// newHostSyslog returns the host's system logger (see HostSyslog).
-func newHostSyslog() (Syslogger, error) {
-	l := &hostSyslogger{writers: map[int32]*hostSyslogWriter{}}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if _, err := l.writerLocked("", syslogFacilityUser); err != nil {
-		return nil, err
-	}
-	return l, nil
-}
-
-// writerLocked returns the connection for facility made for ident. One
-// made for another ident is closed and replaced. Caller holds l.mu.
-func (l *hostSyslogger) writerLocked(ident string, facility int32) (*syslog.Writer, error) {
-	if facility < 0 || facility > 23 {
-		return nil, syscall.EINVAL
-	}
-	if wr := l.writers[facility]; wr != nil {
-		if wr.ident == ident {
-			return wr.writer, nil
-		}
-		delete(l.writers, facility)
-		if err := wr.writer.Close(); err != nil {
-			return nil, err
+// dialHostSyslog connects to the local syslog daemon at the first of the
+// sockets package log/syslog tries (unixSyslog) that takes a connection,
+// and returns the errors of every attempt when none does.
+func dialHostSyslog() (net.Conn, error) {
+	var errs error
+	for _, network := range []string{"unixgram", "unix"} {
+		for _, path := range []string{"/dev/log", "/var/run/syslog", "/var/run/log"} {
+			conn, err := net.Dial(network, path)
+			if err == nil {
+				return conn, nil
+			}
+			errs = errors.Join(errs, err)
 		}
 	}
-	wr, err := syslog.New(syslog.Priority(facility<<3)|syslog.LOG_INFO, ident)
-	if err != nil {
-		return nil, err
-	}
-	l.writers[facility] = &hostSyslogWriter{writer: wr, ident: ident}
-	return wr, nil
-}
-
-func (l *hostSyslogger) Open(ident string, options, facility int32) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	_, err := l.writerLocked(ident, facility)
-	return err
-}
-
-func (l *hostSyslogger) Log(msg SyslogMessage) error {
-	if msg.Severity < 0 || msg.Severity > 7 {
-		return syscall.EINVAL
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	wr, err := l.writerLocked(msg.Ident, msg.Facility)
-	if err != nil {
-		return err
-	}
-	return [...]func(string) error{wr.Emerg, wr.Alert, wr.Crit, wr.Err, wr.Warning, wr.Notice, wr.Info, wr.Debug}[msg.Severity](msg.Message)
-}
-
-// Close closes every connection; a message logged later connects again.
-func (l *hostSyslogger) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var err error
-	for facility, wr := range l.writers {
-		err = errors.Join(err, wr.writer.Close())
-		delete(l.writers, facility)
-	}
-	return err
+	return nil, errs
 }
 
 // setHostNonblock sets the O_NONBLOCK of the open file description of f, a

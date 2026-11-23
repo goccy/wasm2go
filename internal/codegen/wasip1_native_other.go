@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -356,9 +357,9 @@ func (file *lockedFile) closeHostLocked() error                         { return
 func (file *lockedFile) waitDescriptorLocked() (int, error)             { return -1, errors.ErrUnsupported }
 func hostWaitRecordLock(waitFD int, via *os.File, lk *recordLock) error { return errors.ErrUnsupported }
 
-// newHostSyslog would return the host's system logger, which package
+// dialHostSyslog would connect to the local syslog daemon, which package
 // log/syslog does not have on this platform.
-func newHostSyslog() (Syslogger, error) { return nil, errors.ErrUnsupported }
+func dialHostSyslog() (net.Conn, error) { return nil, errors.ErrUnsupported }
 
 // hostOpensSockets says that the runtime makes no sockets of the host's on
 // this platform: the socket imports are ENOTSUP, and the legacy ones serve

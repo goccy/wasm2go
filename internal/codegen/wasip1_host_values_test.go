@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // recordReader reads the fields of a record a host import hands back.
@@ -330,12 +331,99 @@ func (u fakeUsers) UserByID(uid int32) (User, error) { return u.user, u.find(uid
 func (u fakeUsers) UserByName(name string) (User, error) {
 	return u.user, u.find(name == u.user.Name)
 }
-func (u fakeUsers) UserAt(i int) (User, error)         { return u.user, u.find(i == 0) }
+func (u fakeUsers) ListUsers() ([]User, error)         { return []User{u.user}, u.err }
 func (u fakeUsers) GroupByID(gid int32) (Group, error) { return u.group, u.find(gid == u.group.GID) }
 func (u fakeUsers) GroupByName(name string) (Group, error) {
 	return u.group, u.find(name == u.group.Name)
 }
-func (u fakeUsers) GroupAt(i int) (Group, error) { return u.group, u.find(i == 0) }
+func (u fakeUsers) ListGroups() ([]Group, error) { return []Group{u.group}, u.err }
+
+// listedUsers is a Users whose lists are users and groups as they are at
+// the call, and which counts the calls.
+type listedUsers struct {
+	noUsers
+	users       []User
+	groups      []Group
+	usersLists  int
+	groupsLists int
+}
+
+func (u *listedUsers) ListUsers() ([]User, error) {
+	u.usersLists++
+	return slices.Clone(u.users), nil
+}
+
+func (u *listedUsers) ListGroups() ([]Group, error) {
+	u.groupsLists++
+	return slices.Clone(u.groups), nil
+}
+
+// A walk of the user or group database is the list the Users gave when the
+// guest asked for the first entry: a change of the database meanwhile is
+// not seen until the guest starts again, and a forked instance goes on with
+// the walk it was forked in.
+func TestUserWalksAreListsOfTheirStart(t *testing.T) {
+	const bufPtr, neededPtr = 1024, 512
+	w, m := newProcTestStubs(t)
+	alice, bob, carol := User{Name: "alice", UID: 1}, User{Name: "bob", UID: 2}, User{Name: "carol", UID: 3}
+	staff, wheel := Group{Name: "staff", GID: 20}, Group{Name: "wheel", GID: 0}
+	db := &listedUsers{users: []User{alice, bob}, groups: []Group{staff}}
+	w.cfg.Users = db
+	userAt := func(w *WasiStubs, i int32) (User, int32) {
+		rc := w.Proc_user_at(m, i, bufPtr, 4096, neededPtr)
+		if rc != _wasiESUCCESS {
+			return User{}, rc
+		}
+		return readUser(t, m, bufPtr, neededPtr), rc
+	}
+	// An instance without a walk starts one at any index.
+	if u, rc := userAt(w, 1); rc != _wasiESUCCESS || u != bob {
+		t.Fatalf("entry 1 of no walk = %+v rc=%d, want bob", u, rc)
+	}
+	if u, rc := userAt(w, 0); rc != _wasiESUCCESS || u != alice {
+		t.Fatalf("entry 0 = %+v rc=%d, want alice", u, rc)
+	}
+	db.users = []User{carol, alice, bob}
+	if u, rc := userAt(w, 1); rc != _wasiESUCCESS || u != bob {
+		t.Fatalf("entry 1 after a change = %+v rc=%d, want the bob of the walk's start", u, rc)
+	}
+	if _, rc := userAt(w, 2); rc != -_wasiENOENT {
+		t.Fatalf("entry 2 of a walk of two rc=%d, want -ENOENT", rc)
+	}
+	if db.usersLists != 2 {
+		t.Fatalf("ListUsers called %d times, want 2 (one for each walk)", db.usersLists)
+	}
+	child := w.Fork()
+	defer func() {
+		if err := child.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if u, rc := userAt(child, 1); rc != _wasiESUCCESS || u != bob || db.usersLists != 2 {
+		t.Fatalf("a forked instance's entry 1 = %+v rc=%d after %d lists, want the bob of its parent's walk", u, rc, db.usersLists)
+	}
+	if u, rc := userAt(w, 0); rc != _wasiESUCCESS || u != carol || db.usersLists != 3 {
+		t.Fatalf("entry 0 of a new walk = %+v rc=%d after %d lists, want carol of a third list", u, rc, db.usersLists)
+	}
+
+	groupAt := func(i int32) (Group, int32) {
+		rc := w.Proc_group_at(m, i, bufPtr, 4096, neededPtr)
+		if rc != _wasiESUCCESS {
+			return Group{}, rc
+		}
+		return readGroup(t, m, bufPtr, neededPtr), rc
+	}
+	if g, rc := groupAt(0); rc != _wasiESUCCESS || g != staff {
+		t.Fatalf("group 0 = %+v rc=%d, want staff", g, rc)
+	}
+	db.groups = []Group{wheel, staff}
+	if _, rc := groupAt(1); rc != -_wasiENOENT {
+		t.Fatalf("group 1 of a walk of one rc=%d, want -ENOENT", rc)
+	}
+	if g, rc := groupAt(0); rc != _wasiESUCCESS || g != wheel || db.groupsLists != 2 {
+		t.Fatalf("group 0 of a new walk = %+v rc=%d after %d lists, want wheel of a second list", g, rc, db.groupsLists)
+	}
+}
 
 // readUser decodes the user record a lookup wrote.
 func readUser(t *testing.T, m *Module, bufPtr, neededPtr int) User {
@@ -438,10 +526,10 @@ func TestUserAndGroupLookups(t *testing.T) {
 	}
 }
 
-// HostUsers finds what os/user finds, and goes through /etc/passwd and
-// /etc/group in their order.
+// HostUsers finds what os/user finds of a user the files do not have, and
+// lists the entries of /etc/passwd and /etc/group.
 func TestHostUsers(t *testing.T) {
-	users := HostUsers()
+	users := HostUsers(nil)
 	if _, err := users.UserByName("no-such-user-in-any-database"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("lookup of a missing user: %v, want fs.ErrNotExist", err)
 	}
@@ -460,7 +548,7 @@ func TestHostUsers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Name != host.Username || strconv.Itoa(int(u.GID)) != host.Gid || u.Home != host.HomeDir || u.Shell != "" {
+	if u.Name != host.Username || strconv.Itoa(int(u.GID)) != host.Gid || u.Home != host.HomeDir {
 		t.Fatalf("UserByID = %+v, want %+v", u, host)
 	}
 	if byName, err := users.UserByName(host.Username); err != nil || byName != u {
@@ -473,58 +561,165 @@ func TestHostUsers(t *testing.T) {
 	if byName, err := users.GroupByName(g.Name); err != nil || byName != g {
 		t.Fatalf("GroupByName = %+v, %v; want %+v", byName, err, g)
 	}
-	if _, err := os.Stat("/etc/passwd"); err != nil {
-		if _, err := users.UserAt(0); !errors.Is(err, fs.ErrNotExist) {
-			t.Fatalf("UserAt without /etc/passwd: %v", err)
-		}
-		return
-	}
-	first, err := users.UserAt(0)
+	list, err := users.ListUsers()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Name == "" {
-		t.Fatalf("UserAt(0) = %+v", first)
+	if _, err := os.Stat("/etc/passwd"); err != nil {
+		if len(list) != 0 {
+			t.Fatalf("ListUsers without /etc/passwd = %+v", list)
+		}
+		return
 	}
-	if _, err := users.GroupAt(0); err != nil {
+	if len(list) == 0 || list[0].Name == "" {
+		t.Fatalf("ListUsers = %+v", list)
+	}
+	if groups, err := users.ListGroups(); err != nil || len(groups) == 0 {
+		t.Fatalf("ListGroups = %+v, %v", groups, err)
+	}
+}
+
+// The host's database is its files, then os/user: an entry of a file is
+// found by a lookup as it is listed, the shell and the whole GECOS field
+// included, and a lookup the files have no entry for goes to os/user. The
+// lines skipped are told the report with the method's name.
+func TestHostUsersFilesFirst(t *testing.T) {
+	dir := t.TempDir()
+	passwd, group := filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
+	if err := os.WriteFile(passwd, []byte("short:x\nbob:x:7:8:Bob,Room 1:/home/bob:/bin/zsh\nroot:x:0:0:root:/root:/bin/sh\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := users.UserAt(1 << 30); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("UserAt past the last entry: %v, want fs.ErrNotExist", err)
+	if err := os.WriteFile(group, []byte("bad:x:abc\nstaff:x:8:bob\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	type told struct{ op, line string }
+	var reports []told
+	users := hostUsers{passwd: passwd, group: group, report: func(op string, err error) {
+		reports = append(reports, told{op, err.Error()})
+	}}
+	bob := User{Name: "bob", UID: 7, GID: 8, RealName: "Bob,Room 1", Home: "/home/bob", Shell: "/bin/zsh"}
+	for _, c := range []struct {
+		op   string
+		find func() (User, error)
+	}{
+		{"UserByName", func() (User, error) { return users.UserByName("bob") }},
+		{"UserByID", func() (User, error) { return users.UserByID(7) }},
+	} {
+		reports = nil
+		if got, err := c.find(); err != nil || got != bob {
+			t.Fatalf("%s = %+v, %v; want %+v", c.op, got, err, bob)
+		}
+		if len(reports) != 1 || reports[0].op != c.op || !strings.HasPrefix(reports[0].line, passwd+":1: ") {
+			t.Fatalf("%s told %+v, want line 1 under %s", c.op, reports, c.op)
+		}
+	}
+	reports = nil
+	list, err := users.ListUsers()
+	if err != nil || len(list) != 2 || list[0] != bob || list[1].Name != "root" {
+		t.Fatalf("ListUsers = %+v, %v; want bob and root", list, err)
+	}
+	if len(reports) != 1 || reports[0].op != "ListUsers" {
+		t.Fatalf("ListUsers told %+v", reports)
+	}
+	staff := Group{Name: "staff", GID: 8}
+	reports = nil
+	if got, err := users.GroupByName("staff"); err != nil || got != staff {
+		t.Fatalf("GroupByName = %+v, %v; want %+v", got, err, staff)
+	}
+	if got, err := users.GroupByID(8); err != nil || got != staff {
+		t.Fatalf("GroupByID = %+v, %v; want %+v", got, err, staff)
+	}
+	if groups, err := users.ListGroups(); err != nil || !slices.Equal(groups, []Group{staff}) {
+		t.Fatalf("ListGroups = %+v, %v", groups, err)
+	}
+	if ops := []string{"GroupByName", "GroupByID", "ListGroups"}; len(reports) != len(ops) || reports[0].op != ops[0] || reports[1].op != ops[1] || reports[2].op != ops[2] || !strings.HasPrefix(reports[0].line, group+":1: ") {
+		t.Fatalf("the group lookups told %+v, want line 1 under %q", reports, ops)
+	}
+	// What the files do not have is os/user's.
+	host, err := user.Current()
+	if err != nil {
+		t.Skipf("the host has no entry for the current user: %v", err)
+	}
+	if host.Username == "bob" || host.Username == "root" {
+		t.Skipf("the current user %s is one of the test's file", host.Username)
+	}
+	got, err := users.UserByName(host.Username)
+	if err != nil || got.Name != host.Username || got.Home != host.HomeDir || got.Shell != "" {
+		t.Fatalf("UserByName(%s) = %+v, %v; want os/user's %+v", host.Username, got, err, host)
+	}
+	if _, err := users.UserByName("no-such-user-in-any-database"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lookup of a missing user: %v, want fs.ErrNotExist", err)
+	}
+	// Files the host does not have have no entries, and no report drops
+	// what is skipped.
+	missing := hostUsers{passwd: filepath.Join(dir, "none"), group: group}
+	if list, err := missing.ListUsers(); err != nil || len(list) != 0 {
+		t.Fatalf("ListUsers of a missing file = %+v, %v", list, err)
+	}
+	if groups, err := missing.ListGroups(); err != nil || !slices.Equal(groups, []Group{staff}) {
+		t.Fatalf("ListGroups without a report = %+v, %v", groups, err)
+	}
+	// An error reading a file is the call's.
+	unreadable := hostUsers{passwd: dir}
+	if _, err := unreadable.UserByName("bob"); err == nil || errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("UserByName of a passwd that is a directory: %v, want its read error", err)
+	}
+}
+
+// A user database that wraps the host's still has the host's report told
+// the lines skipped, through the runtime's lookups.
+func TestHostUsersReportThroughAWrapper(t *testing.T) {
+	dir := t.TempDir()
+	passwd := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(passwd, []byte("short:x\nbob:x:7:8:Bob:/home/bob:/bin/zsh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var ops []string
+	host := hostUsers{passwd: passwd, group: filepath.Join(dir, "group"), report: func(op string, err error) { ops = append(ops, op) }}
+	w, m := newProcTestStubs(t)
+	w.cfg.Users = struct{ Users }{host}
+	if rc := w.Proc_user_at(m, 0, 1024, 4096, 512); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_user_at rc=%d", rc)
+	}
+	if !slices.Equal(ops, []string{"ListUsers"}) {
+		t.Fatalf("the wrapped host's report was told %q, want ListUsers", ops)
 	}
 }
 
 // A database file of the host has an entry a line, without the lines of
 // the NIS compatibility syntax, comments, short lines and entries whose
 // ids are not numbers.
-func TestHostDatabaseEntry(t *testing.T) {
+func TestHostDatabaseEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "passwd")
 	data := "# comment\n\n+nis\nshort:x\nbad:x:abc:1:Bad:/:/bin/sh\nroot:x:0:0:root:/root:/bin/sh\nbob:x:7:8:Bob:/home/bob:/bin/zsh\n"
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	var skipped []string
-	report := func(err error) { skipped = append(skipped, err.Error()) }
-	e, err := hostDatabaseEntry(path, 1, report, 7, 2, 3)
+	entries, err := hostDatabaseEntries(path, func(err error) { skipped = append(skipped, err.Error()) }, 7, 2, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.fields[0] != "bob" || !slices.Equal(e.ids, []int32{7, 8}) {
-		t.Fatalf("entry 1 = %+v, want bob 7 8", e)
+	if len(entries) != 2 || entries[0].fields[0] != "root" || entries[1].fields[0] != "bob" || !slices.Equal(entries[1].ids, []int32{7, 8}) {
+		t.Fatalf("entries = %+v, want root and bob 7 8", entries)
 	}
 	if len(skipped) != 2 || !strings.HasPrefix(skipped[0], path+":4: ") || !strings.HasPrefix(skipped[1], path+":5: ") {
 		t.Fatalf("skipped lines told %q, want lines 4 and 5", skipped)
 	}
-	if _, err := hostDatabaseEntry(path, 2, report, 7, 2, 3); !errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), "no entry 2") {
-		t.Fatalf("entry past the last: %v, want fs.ErrNotExist of entry 2", err)
+	if entries, err := hostDatabaseEntries(filepath.Join(t.TempDir(), "none"), nil, 7, 2, 3); err != nil || entries != nil {
+		t.Fatalf("a missing file: %+v, %v; want no entries", entries, err)
 	}
-	// Without a report, the line that is no entry is the caller's error.
-	if _, err := hostDatabaseEntry(path, 1, nil, 7, 2, 3); err == nil || !strings.HasPrefix(err.Error(), path+":4: ") {
-		t.Fatalf("a malformed line without a report: %v, want the error of line 4", err)
+}
+
+// skippedLine tells the report of a host database the line skipped with
+// the method's name, and nobody without a report.
+func TestSkippedLine(t *testing.T) {
+	var got []string
+	skippedLine(func(op string, err error) { got = append(got, op+": "+err.Error()) }, "ListUsers")(errors.New("line 1"))
+	if !slices.Equal(got, []string{"ListUsers: line 1"}) {
+		t.Fatalf("report told %q", got)
 	}
-	if _, err := hostDatabaseEntry(filepath.Join(t.TempDir(), "none"), 0, nil, 7, 2, 3); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("a missing file: %v, want fs.ErrNotExist", err)
-	}
+	skippedLine(nil, "ListUsers")(errors.New("dropped"))
 }
 
 // The ids of the host's databases are 32-bit ones, unsigned or signed.
@@ -667,8 +862,16 @@ func TestHostServices(t *testing.T) {
 	if len(skipped) != 2 || !strings.HasPrefix(skipped[0], path+":2: ") || !strings.HasPrefix(skipped[1], path+":3: ") {
 		t.Fatalf("skipped lines told %q, want lines 2 and 3", skipped)
 	}
-	if _, err := findHostService(path, nil, func(Service) bool { return true }); err == nil || !strings.HasPrefix(err.Error(), path+":2: ") {
-		t.Fatalf("a malformed line without a report: %v, want the error of line 2", err)
+	var ops []string
+	file := hostServices{path: path, report: func(op string, err error) { ops = append(ops, op) }}
+	if s, err := file.ServiceByName("www", "tcp"); err != nil || s.Port != 80 {
+		t.Fatalf("ServiceByName(www) = %+v, %v", s, err)
+	}
+	if s, err := file.ServiceByPort(7, "udp"); err != nil || s.Proto != "udp" {
+		t.Fatalf("ServiceByPort(7, udp) = %+v, %v", s, err)
+	}
+	if want := []string{"ServiceByName", "ServiceByName", "ServiceByPort", "ServiceByPort"}; !slices.Equal(ops, want) {
+		t.Fatalf("the report was told %q, want %q", ops, want)
 	}
 	if _, err := parseHostService([]string{"x", "80"}); err == nil {
 		t.Fatal("a port without a protocol parsed")
@@ -677,17 +880,16 @@ func TestHostServices(t *testing.T) {
 		t.Fatalf("a missing file: %v, want fs.ErrNotExist", err)
 	}
 	w, m := newProcTestStubs(t)
-	w.cfg.Services = HostServices()
-	w.cfg.Users = HostUsers()
-	w.cfg.Errors = func(op string, err error) {}
-	if host, ok := w.users("proc_user_at").(hostUsers); !ok || host.report == nil {
-		t.Fatal("the host's users are not given the instance's Errors")
-	}
+	w.cfg.Services = HostServices(nil)
 	copy(m.memory[64:], "no-such-service")
 	if rc := w.Sock_service(m, 64, 15, 0, 0, 64, 0, 1024, 1024, 512); rc != -_wasiENOENT {
 		t.Fatalf("Sock_service of a missing service rc=%d, want -ENOENT", rc)
 	}
-	services := HostServices()
+	services := HostServices(func(op string, err error) {
+		if op != "ServiceByName" && op != "ServiceByPort" {
+			t.Errorf("a skipped line of %s told under %q", hostServicesFile, op)
+		}
+	})
 	if _, err := os.Stat(hostServicesFile); err != nil {
 		if _, err := services.ServiceByName("echo", ""); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("ServiceByName without %s: %v", hostServicesFile, err)
@@ -796,7 +998,7 @@ func TestSyslogGoesToTheSyslogger(t *testing.T) {
 	if rc := w.Proc_syslog_close64(m); rc != _wasiESUCCESS {
 		t.Fatalf("closelog rc=%d", rc)
 	}
-	want := SyslogMessage{Severity: 6, Facility: 1, Options: SyslogOptPID, Ident: "prog", Message: "hello"}
+	want := SyslogMessage{Severity: 6, Facility: 1, Options: SyslogOptPID, Ident: "prog", PID: 42, Message: "hello"}
 	if !slices.Equal(l.opens, []string{"prog"}) || !slices.Equal(l.messages, []SyslogMessage{want}) || l.closes != 1 {
 		t.Fatalf("logger got opens %v messages %+v closes %d", l.opens, l.messages, l.closes)
 	}
@@ -816,6 +1018,12 @@ func TestSyslogGoesToTheSyslogger(t *testing.T) {
 	if rc := w.Proc_syslog_open(m, 1<<16-2, 4, 0, 1); rc != -_wasiEFAULT {
 		t.Fatalf("an ident past the memory rc=%d, want -EFAULT", rc)
 	}
+	var told []string
+	w.cfg.Errors = func(op string, err error) {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			told = append(told, op)
+		}
+	}
 	l.err = syscall.ECONNREFUSED
 	for i, rc := range []int32{
 		w.Proc_syslog_open(m, identPtr, 4, 0, 1),
@@ -826,25 +1034,119 @@ func TestSyslogGoesToTheSyslogger(t *testing.T) {
 			t.Fatalf("call %d of a failing logger rc=%d, want -ECONNREFUSED", i, rc)
 		}
 	}
+	if want := []string{"proc_syslog_open", "proc_syslog", "proc_syslog_close"}; !slices.Equal(told, want) {
+		t.Fatalf("Errors was told %q, want %q", told, want)
+	}
 }
 
-// HostSyslog connects to the local syslog daemon, where there is one.
+// The Syslogger is closed when no instance of the fork family uses it any
+// longer: an instance uses it from its first openlog or syslog to its
+// closelog or CloseAll.
+func TestSyslogClosesWithTheLastInstance(t *testing.T) {
+	const identPtr, msgPtr = 64, 128
+	w, m := newProcTestStubs(t)
+	copy(m.memory[identPtr:], "prog")
+	copy(m.memory[msgPtr:], "hello")
+	l := &recordingSyslog{}
+	w.cfg.Syslog = l
+	idle := w.Fork()
+	if err := idle.CloseAll(); err != nil || l.closes != 0 {
+		t.Fatalf("CloseAll of an instance that never logged: %v, %d closes", err, l.closes)
+	}
+	// An openlog starts the use, and a syslog after it is the same use.
+	alone := w.Fork()
+	for i, logs := range []bool{false, true} {
+		if rc := alone.Proc_syslog_open(m, identPtr, 4, 0, 1); rc != _wasiESUCCESS {
+			t.Fatalf("openlog rc=%d", rc)
+		}
+		if logs {
+			if rc := alone.Proc_syslog(m, 6, 1, 0, identPtr, 4, msgPtr, 5); rc != _wasiESUCCESS {
+				t.Fatalf("syslog rc=%d", rc)
+			}
+		}
+		if rc := alone.Proc_syslog_close(m); rc != _wasiESUCCESS || l.closes != i+1 {
+			t.Fatalf("the closelog of the only instance that uses it (syslog %v) rc=%d, %d closes; want %d", logs, rc, l.closes, i+1)
+		}
+	}
+	if err := alone.CloseAll(); err != nil || l.closes != 2 {
+		t.Fatalf("CloseAll after closelog: %v, %d closes; want 2", err, l.closes)
+	}
+	l.closes = 0
+	if rc := w.Proc_syslog_open(m, identPtr, 4, 0, 1); rc != _wasiESUCCESS {
+		t.Fatalf("openlog rc=%d", rc)
+	}
+	child := w.Fork()
+	if rc := child.Proc_syslog(m, 6, 1, 0, identPtr, 4, msgPtr, 5); rc != _wasiESUCCESS {
+		t.Fatalf("the child's syslog rc=%d", rc)
+	}
+	if rc := w.Proc_syslog_close(m); rc != _wasiESUCCESS || l.closes != 0 {
+		t.Fatalf("the parent's closelog rc=%d, %d closes; want none while the child logs", rc, l.closes)
+	}
+	if rc := w.Proc_syslog_close(m); rc != _wasiESUCCESS || l.closes != 0 {
+		t.Fatalf("a second closelog rc=%d, %d closes; want none", rc, l.closes)
+	}
+	if rc := child.Proc_syslog_close(m); rc != _wasiESUCCESS || l.closes != 1 {
+		t.Fatalf("the last closelog rc=%d, %d closes; want 1", rc, l.closes)
+	}
+	if rc := child.Proc_syslog(m, 6, 1, 0, identPtr, 4, msgPtr, 5); rc != _wasiESUCCESS {
+		t.Fatalf("a syslog after the close rc=%d", rc)
+	}
+	if err := child.CloseAll(); err != nil || l.closes != 2 {
+		t.Fatalf("CloseAll of the last instance that logs: %v, %d closes; want 2", err, l.closes)
+	}
+	if err := child.CloseAll(); err != nil || l.closes != 2 {
+		t.Fatalf("a second CloseAll: %v, %d closes; want 2", err, l.closes)
+	}
+}
+
+// The line of a message for the local syslog daemon has the message's own
+// facility, severity, ident and process id, the last only with LOG_PID.
+func TestHostSyslogLine(t *testing.T) {
+	at := time.Date(2024, 7, 5, 9, 8, 7, 0, time.Local)
+	for _, c := range []struct {
+		msg  SyslogMessage
+		want string
+	}{
+		{SyslogMessage{Severity: 6, Facility: 1, Options: SyslogOptPID, Ident: "prog", PID: 7, Message: "hello"}, "<14>Jul  5 09:08:07 prog[7]: hello\n"},
+		{SyslogMessage{Severity: 3, Facility: 16, Ident: "other", PID: 7, Message: "done\n"}, "<131>Jul  5 09:08:07 other: done\n"},
+		{SyslogMessage{Severity: 7, Facility: 1, Message: "x"}, "<15>Jul  5 09:08:07 " + os.Args[0] + ": x\n"},
+	} {
+		if got := hostSyslogLine(c.msg, at); got != c.want {
+			t.Errorf("hostSyslogLine(%+v) = %q, want %q", c.msg, got, c.want)
+		}
+	}
+}
+
+// HostSyslog connects to the local syslog daemon, where there is one, at
+// the first message.
 func TestHostSyslog(t *testing.T) {
-	l, err := HostSyslog()
+	l := HostSyslog()
+	if err := l.Open("wasm2go-test", SyslogOptPID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if l.(*hostSyslogger).conn != nil {
+		t.Fatal("an openlog without LOG_NDELAY connected")
+	}
+	err := l.Log(SyslogMessage{Severity: 7, Facility: 1, Ident: "wasm2go-test", Message: "a debug message of a test"})
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		if !errors.Is(err, errors.ErrUnsupported) {
-			t.Fatalf("HostSyslog on %s: %v, want ErrUnsupported", runtime.GOOS, err)
+			t.Fatalf("Log on %s: %v, want ErrUnsupported", runtime.GOOS, err)
 		}
 		return
 	}
 	if err != nil {
+		// A socket of a daemon that is not running refuses the connection;
+		// any other error with a socket there is the logger's.
+		for _, path := range []string{"/dev/log", "/var/run/syslog", "/var/run/log"} {
+			fi, statErr := os.Stat(path)
+			if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+				t.Fatal(statErr)
+			}
+			if statErr == nil && fi.Mode().Type() == fs.ModeSocket && !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Fatalf("Log with the daemon's socket %s there: %v", path, err)
+			}
+		}
 		t.Skipf("no syslog daemon to connect to: %v", err)
-	}
-	if err := l.Open("wasm2go-test", SyslogOptPID, 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Log(SyslogMessage{Severity: 7, Facility: 1, Ident: "wasm2go-test", Message: "a debug message of a test"}); err != nil {
-		t.Fatal(err)
 	}
 	if err := l.Log(SyslogMessage{Severity: 8, Facility: 1}); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("Log of severity 8: %v, want EINVAL", err)

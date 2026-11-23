@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -584,26 +586,155 @@ func TestHostPriorityOfEveryThread(t *testing.T) {
 	}
 }
 
-// The host's logger keeps one connection for a facility, made for the
-// ident used last.
-func TestHostSyslogConnections(t *testing.T) {
-	l, err := HostSyslog()
+// fakeSyslogDaemon is a datagram socket that stands for the local syslog
+// daemon: the lines written to it, one a datagram.
+type fakeSyslogDaemon struct {
+	t    *testing.T
+	path string
+	conn *net.UnixConn
+}
+
+// listenFakeSyslogDaemon starts a fakeSyslogDaemon at path, which ends
+// with the test.
+func listenFakeSyslogDaemon(t *testing.T, path string) *fakeSyslogDaemon {
+	t.Helper()
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
 	if err != nil {
-		t.Skipf("no syslog daemon to connect to: %v", err)
+		t.Fatal(err)
 	}
-	for _, ident := range []string{"wasm2go-test", "wasm2go-other"} {
-		if err := l.Log(SyslogMessage{Severity: 7, Facility: 1, Ident: ident, Message: "a debug message of a test"}); err != nil {
+	d := &fakeSyslogDaemon{t: t, path: path, conn: conn}
+	t.Cleanup(d.stop)
+	return d
+}
+
+// stop ends the daemon and removes its socket file.
+func (d *fakeSyslogDaemon) stop() {
+	if d.conn == nil {
+		return
+	}
+	if err := errors.Join(d.conn.Close(), os.Remove(d.path)); err != nil {
+		d.t.Error(err)
+	}
+	d.conn = nil
+}
+
+// line returns the next line written to the daemon.
+func (d *fakeSyslogDaemon) line() string {
+	d.t.Helper()
+	// The line was sent before line is called, so it is queued already:
+	// the deadline only makes a lost one fail the test instead of hanging.
+	if err := d.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		d.t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, err := d.conn.Read(buf)
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	return string(buf[:n])
+}
+
+// The host's logger makes one connection, at the first message or an
+// openlog with LOG_NDELAY, and writes every message over it with the
+// message's own ident and process id; a connection the daemon's restart
+// left behind is replaced, and Close closes it.
+func TestHostSyslogConnection(t *testing.T) {
+	// Not t.TempDir: its path can be too long for a socket's sun_path.
+	dir, err := os.MkdirTemp("", "syslog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	path := filepath.Join(dir, "log")
+	daemon := listenFakeSyslogDaemon(t, path)
+	dials := 0
+	var dialErr error
+	l := &hostSyslogger{dial: func() (net.Conn, error) {
+		dials++
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		return net.Dial("unixgram", path)
+	}}
+	if err := l.Open("prog", SyslogOptPID, 1); err != nil || dials != 0 {
+		t.Fatalf("openlog without LOG_NDELAY: %v, %d connections; want none", err, dials)
+	}
+	if err := l.Open("prog", SyslogOptNDelay, 1); err != nil || dials != 1 {
+		t.Fatalf("openlog with LOG_NDELAY: %v, %d connections; want 1", err, dials)
+	}
+	if err := l.Open("prog", SyslogOptNDelay, 1); err != nil || dials != 1 {
+		t.Fatalf("a second openlog with LOG_NDELAY: %v, %d connections; want 1", err, dials)
+	}
+	for _, msg := range []SyslogMessage{
+		{Severity: 6, Facility: 1, Options: SyslogOptPID, Ident: "master", PID: 7, Message: "one"},
+		{Severity: 6, Facility: 3, Ident: "worker", PID: 8, Message: "two"},
+	} {
+		if err := l.Log(msg); err != nil {
 			t.Fatal(err)
 		}
 	}
-	host := l.(*hostSyslogger)
-	host.mu.Lock()
-	n, ident := len(host.writers), host.writers[1].ident
-	host.mu.Unlock()
-	if n != 1 || ident != "wasm2go-other" {
-		t.Fatalf("%d connections, facility 1's for %q; want one for wasm2go-other", n, ident)
+	for _, want := range []string{"master[7]: one\n", "worker: two\n"} {
+		if got := daemon.line(); !strings.HasSuffix(got, " "+want) {
+			t.Fatalf("the daemon got %q, want a line that ends with %q", got, want)
+		}
+	}
+	if dials != 1 {
+		t.Fatalf("%d connections for two idents and two facilities, want 1", dials)
+	}
+	// The daemon restarts: the old connection fails, a new one takes the
+	// message.
+	daemon.stop()
+	daemon = listenFakeSyslogDaemon(t, path)
+	if err := l.Log(SyslogMessage{Severity: 6, Facility: 1, Ident: "master", Message: "three"}); err != nil {
+		t.Fatalf("a message after the daemon's restart: %v", err)
+	}
+	if got := daemon.line(); !strings.HasSuffix(got, " master: three\n") || dials != 2 {
+		t.Fatalf("after the restart the daemon got %q over %d connections, want three over 2", got, dials)
+	}
+	if err := l.Close(); err != nil || l.conn != nil {
+		t.Fatalf("Close: %v, connection %v", err, l.conn)
 	}
 	if err := l.Close(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("a second Close: %v", err)
+	}
+	dialErr = syscall.ENOENT
+	if err := l.Log(SyslogMessage{Severity: 6, Facility: 1, Message: "four"}); !errors.Is(err, syscall.ENOENT) || dials != 3 {
+		t.Fatalf("a message without a daemon: %v after %d connections, want ENOENT of a third", err, dials)
+	}
+	if err := l.Open("prog", SyslogOptNDelay, 1); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("openlog with LOG_NDELAY without a daemon: %v, want ENOENT", err)
+	}
+	// The errors of the old connection are the call's only when the new
+	// one fails too.
+	dialErr = nil
+	errStale := errors.New("close of the old connection")
+	for _, msg := range []string{"five", "six"} {
+		if err := l.Log(SyslogMessage{Severity: 6, Facility: 1, Ident: "master", Message: msg}); err != nil {
+			t.Fatalf("message %s: %v", msg, err)
+		}
+		if got := daemon.line(); !strings.HasSuffix(got, " master: "+msg+"\n") {
+			t.Fatalf("the daemon got %q, want %s", got, msg)
+		}
+		// The next message finds the connection left behind.
+		l.conn = staleSyslogConn{Conn: l.conn, closeErr: errStale}
+	}
+	dialErr = syscall.ENOENT
+	if err := l.Log(SyslogMessage{Severity: 6, Facility: 1, Message: "seven"}); !errors.Is(err, syscall.EPIPE) || !errors.Is(err, errStale) || !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("a message neither connection took: %v, want EPIPE, the close's error and ENOENT", err)
 	}
 }
+
+// staleSyslogConn is a connection the daemon's restart left behind: its
+// writes fail with EPIPE, and its close fails with closeErr.
+type staleSyslogConn struct {
+	net.Conn
+	closeErr error
+}
+
+func (c staleSyslogConn) Write([]byte) (int, error) { return 0, syscall.EPIPE }
+
+func (c staleSyslogConn) Close() error { return errors.Join(c.Conn.Close(), c.closeErr) }
