@@ -7060,12 +7060,12 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 // datagram socket the datagram whole, a terminal (a short write) no more
 // than PIPE_BUF.
 func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte) (int, bool, error) {
-	mode, named := op.statOf(file)
+	mode, _ := op.statOf(file)
 	if mode&os.ModeSocket != 0 && hostSendsWithoutWaiting {
 		return sendNow(fd, bufs)
 	}
 	if mode&os.ModeNamedPipe != 0 {
-		if n, again, done, err := hostPipeWriteNow(fd, bufs, named); done {
+		if n, again, done, err := hostPipeWriteNow(fd, bufs); done {
 			return n, again, err
 		}
 	}
@@ -11077,8 +11077,8 @@ func (op *wasiOpen) hostSocket() *os.File {
 }
 
 // whenReady returns an attempt of socketWait for call, a call on a socket
-// that is not to wait in the kernel (accept, a send darwin waits in whatever
-// MSG_DONTWAIT says). Where the guest's descriptors are the host's
+// that is not to wait in the kernel (accept, a send that is not to wait,
+// which darwin makes wait whatever MSG_DONTWAIT says). Where the guest's descriptors are the host's
 // (hostFamily), the open file description of the socket is in the guest's
 // mode, or in one code outside the guest set (hostMayBlock): in blocking
 // mode, call (blocking true) is made by the holder of turn (awaitTurn) once
@@ -11579,8 +11579,11 @@ func (w *WasiStubs) socketSend(m *Module, call string, op *wasiOpen, host *os.Fi
 		return !op.dgram && sent < size, nil
 	}
 	attempt := func(fd int) (bool, error) { return send(fd, false) }
-	if !hostSendsWithoutWaiting {
-		// MSG_DONTWAIT does not keep the send from waiting here.
+	if !hostSendsWithoutWaiting && nonblocking {
+		// MSG_DONTWAIT does not keep the send from waiting here: a send that
+		// is not to wait is made once poll(2) has found room. One that waits
+		// is made as it is, and waits in the kernel on a description in
+		// blocking mode, where a signal does not end it.
 		attempt = w.whenReady(m, op.outputTurn(), hostWantRoom, send)
 	}
 	errno := w.socketWait(m, call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, attempt)

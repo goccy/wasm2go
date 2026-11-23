@@ -134,7 +134,7 @@ const hostWritesWithoutWaiting = false
 
 // hostPipeWriteNow: the host does not tell here how to write to a pipe
 // without waiting whatever its mode.
-func hostPipeWriteNow(fd uintptr, bufs [][]byte, named bool) (n int, again, done bool, err error) {
+func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err error) {
 	return 0, false, false, nil
 }
 

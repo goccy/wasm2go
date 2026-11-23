@@ -76,7 +76,7 @@ func hostSysPwritev2() (nr uintptr, ok bool) {
 // for and nothing (again) when there is none, as a write in non-blocking
 // mode does, and keeps a write of no more than PIPE_BUF whole. Once the host
 // refuses it (hostPipeNowaitRefused), done is false.
-func hostPipeWriteNow(fd uintptr, bufs [][]byte, named bool) (n int, again, done bool, err error) {
+func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err error) {
 	nr, known := hostSysPwritev2()
 	if !known || hostPipeNowaitRefused.Load() {
 		return 0, false, false, nil

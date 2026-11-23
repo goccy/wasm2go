@@ -63,7 +63,7 @@ func TestHostPipeWriteNowTakesTheRoom(t *testing.T) {
 		var again, done bool
 		var writeErr error
 		if err := rc.Control(func(fd uintptr) {
-			n, again, done, writeErr = hostPipeWriteNow(fd, [][]byte{make([]byte, size)}, false)
+			n, again, done, writeErr = hostPipeWriteNow(fd, [][]byte{make([]byte, size)})
 		}); err != nil || writeErr != nil {
 			t.Fatal(err, writeErr)
 		}

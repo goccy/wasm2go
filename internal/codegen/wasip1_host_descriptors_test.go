@@ -648,11 +648,15 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		if rc := w.Fd_fdstat_set_flags(m, pa, 0); rc != _wasiESUCCESS {
 			t.Fatalf("clearing NONBLOCK rc=%d", rc)
 		}
-		postWhenBlocked(w, wasiSIGUSR1)
-		if rc := fdWriteString(w, m, pa, chunk); rc != _wasiEINTR {
-			t.Fatalf("write to a full blocking socket with a signal rc=%d, want EINTR", rc)
+		// (darwin's send that waits waits in the kernel, as MSG_DONTWAIT
+		// does not keep it from waiting there)
+		if hostSendsWithoutWaiting {
+			postWhenBlocked(w, wasiSIGUSR1)
+			if rc := fdWriteString(w, m, pa, chunk); rc != _wasiEINTR {
+				t.Fatalf("write to a full blocking socket with a signal rc=%d, want EINTR", rc)
+			}
+			takeSignals(t, w, m)
 		}
-		takeSignals(t, w, m)
 		listener, port := newIPListener(t, w, m)
 		if !blocks(listener) {
 			t.Fatal("a listening socket of the guest's is not in blocking mode")
@@ -710,8 +714,8 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 	// ends it: where the host has a write that does not wait in one call
 	// (Linux), a write to a full pipe in blocking mode, which reports what
 	// it wrote once it wrote something; an accept and, where MSG_DONTWAIT
-	// does not keep a send from waiting, a send, each made by the holder of
-	// a turn; and on Linux, a read of a FIFO the guest put in blocking mode
+	// does not keep a send from waiting, a send that is not to wait, each
+	// made by the holder of a turn; a send with room for it whole; and on Linux, a read of a FIFO the guest put in blocking mode
 	// after the Go runtime's poller took it, and a connect the host waits
 	// in, which goes on in the host.
 	t.Run("WaitsInTheRuntime", func(t *testing.T) {
@@ -790,11 +794,43 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			t.Fatalf("accept rc=%d", rc)
 		}
 
+		// a send to a socket in blocking mode with room for it whole goes
+		// through, however little room it has
+		if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 5000); rc != _wasiESUCCESS {
+			t.Fatalf("Sock_socketpair rc=%d", rc)
+		}
+		qa, qb := int32(readU32(m.memory, 5000)), int32(readU32(m.memory, 5004))
+		for _, size := range []int{6500, 500} {
+			var rc int32
+			returnsWithin(t, "fd_write", func() { rc = fdWriteString(w, m, qa, string(make([]byte, size))) })
+			if rc != _wasiESUCCESS {
+				t.Fatalf("send of %d bytes rc=%d", size, rc)
+			}
+		}
+		for got := 0; got < 7000; {
+			s, rc := fdReadString(w, m, qb, 8192)
+			if rc != _wasiESUCCESS || s == "" {
+				t.Fatalf("receive after %d bytes rc=%d", got, rc)
+			}
+			got += len(s)
+		}
+
+		// where MSG_DONTWAIT does not keep a send from waiting (darwin), a
+		// send that is not to wait to a description in blocking mode (the
+		// guest's NONBLOCK, the description put back in blocking mode by
+		// code outside the guest) is made by the holder of the turn once
+		// poll(2) has found room, no more than the low-water mark at a time
 		if !hostSendsWithoutWaiting {
 			if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 5000); rc != _wasiESUCCESS {
 				t.Fatalf("Sock_socketpair rc=%d", rc)
 			}
-			pa := int32(readU32(m.memory, 5000))
+			pa, pb := int32(readU32(m.memory, 5000)), int32(readU32(m.memory, 5004))
+			if rc := w.Fd_fdstat_set_flags(m, pa, wasiFdflagNonblock); rc != _wasiESUCCESS {
+				t.Fatalf("NONBLOCK rc=%d", rc)
+			}
+			if err := syscall.SetNonblock(int(pa), false); err != nil {
+				t.Fatal(err)
+			}
 			turn := entryOf(t, w, pa).outputTurn()
 			turn <- struct{}{} // another send of the guest's is being made
 			sent := make(chan int32, 1)
@@ -806,9 +842,6 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			if rc := within(t, "fd_write", sent); rc != _wasiESUCCESS {
 				t.Fatalf("send rc=%d", rc)
 			}
-			// a send with room for part of it sends that part, and waits
-			// for room for the rest in the runtime, where a signal ends it
-			pb := int32(readU32(m.memory, 5004))
 			if err := syscall.SetNonblock(int(pa), true); err != nil {
 				t.Fatal(err)
 			}
@@ -825,11 +858,9 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			if _, err := syscall.Read(int(pb), make([]byte, 8192)); err != nil {
 				t.Fatal(err)
 			}
-			postWhenBlocked(w, wasiSIGUSR1)
 			if n, rc := writeChunk(t, w, m, pa); rc != _wasiESUCCESS || n == 0 || n >= uint32(wsChunk) {
-				t.Fatalf("interrupted send: %d bytes rc=%d, want part of %d", n, rc, wsChunk)
+				t.Fatalf("send that is not to wait with room for part of it: %d bytes rc=%d, want part of %d", n, rc, wsChunk)
 			}
-			takeSignals(t, w, m)
 		}
 
 		if runtime.GOOS != "linux" {
