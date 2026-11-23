@@ -1305,19 +1305,22 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 	})
 
 	// A standard descriptor the guest closed is closed in a command it
-	// starts with it, as exec(2) leaves it: not the null device.
+	// starts with it, as exec(2) leaves it: not the null device. The shell
+	// duplicates descriptor 0, which fails only where it is closed; a
+	// command whose runtime opens the null device for a closed standard
+	// descriptor at its start (one written in Rust) cannot tell.
 	t.Run("CommandsHaveClosedStandardDescriptorsClosed", func(t *testing.T) {
 		w, m := newHostNumberedStubs(t, nil, nil)
 		w.cfg.Exec = AllowAllExec
 		closeTestFd(t, w, m, 0)
 		r, wr := newTestPipe(t, w, m)
-		pid := spawnWithStreams(t, w, m, 0, wr, wr, "/bin/cat", "/dev/fd/0")
+		pid := spawnWithStreams(t, w, m, 0, wr, wr, "/bin/sh", "-c", "exec 3<&0")
 		closeTestFd(t, w, m, wr)
 		status := waitStatus(t, w, m, pid)
 		out := readToEnd(t, w, m, r)
 		closeTestFd(t, w, m, r)
 		if status == 0 {
-			t.Fatalf("cat read the command's descriptor 0 (output %q), want it closed", out)
+			t.Fatalf("the shell duplicated the command's descriptor 0 (output %q), want it closed", out)
 		}
 	})
 
