@@ -629,6 +629,17 @@ func withHostTerminal(f *os.File, use func(fd int) error) error {
 	})
 }
 
+// hostFileTerminal reports whether f is a terminal of the host
+// (hostTerminal), asked of f's own descriptor: the request does not wait.
+func hostFileTerminal(f *os.File) (bool, error) {
+	var terminal bool
+	err := withHostDescriptor(f, func(fd uintptr) error {
+		terminal = hostTerminal(int(fd))
+		return nil
+	})
+	return terminal, err
+}
+
 // hostIoctlPointer is ioctl(2) with the address of what the request takes.
 // A call the delivery of a signal to the host process interrupts (EINTR) is
 // made again.

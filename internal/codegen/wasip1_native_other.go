@@ -30,6 +30,9 @@ func hostUnshareFS() error { return errors.ErrUnsupported }
 // withHostTerminal: no file is a terminal of the host's here.
 func withHostTerminal(f *os.File, use func(fd int) error) error { return syscall.ENOTTY }
 
+// hostFileTerminal: no file is a terminal of the host's here.
+func hostFileTerminal(f *os.File) (bool, error) { return false, nil }
+
 // hostTerminalIoctl: no request of a terminal is made here
 // (withHostTerminal).
 func hostTerminalIoctl(fd int, request uint32, arg *terminalArg) (int, error) {
