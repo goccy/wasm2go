@@ -651,31 +651,3 @@ func TestWasi_AnEmbeddersPolledStreamWaitsInTheGoRuntimesPoller(t *testing.T) {
 		t.Fatalf("read = %q rc=%d, want %q", res.got, res.rc, "x")
 	}
 }
-
-// A descriptor the guest is given (WASIConfig.Files) shares its open file
-// description with the host's descriptor: it is not waited for in the Go
-// runtime's poller, and its read still waits for input.
-func TestWasi_AGivenDescriptorIsNotWaitedForInTheGoRuntimesPoller(t *testing.T) {
-	r, wr, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	closeAtEnd(t, wr)
-	w := NewWASI(WASIConfig{Files: map[int32]*os.File{5: r}})
-	closeAllAtCleanup(t, w)
-	op := entryOf(t, w, 5)
-	if !op.shared.Load() || w.netpolled(op, op.f) {
-		t.Fatalf("a given descriptor: shared %v, waited for in the Go runtime's poller %v", op.shared.Load(), w.netpolled(op, op.f))
-	}
-	// A file of Files starts with the guest's O_NONBLOCK set.
-	m := newForkTestModule()
-	if rc := w.Fd_fdstat_set_flags(m, 5, 0); rc != _wasiESUCCESS {
-		t.Fatalf("clear O_NONBLOCK rc=%d", rc)
-	}
-	read := readAsync(w, m, 5)
-	awaitBlockedCalls(w, 1)
-	write(t, wr, "x")
-	if res := within(t, "fd_read", read); res.rc != _wasiESUCCESS || res.got != "x" {
-		t.Fatalf("read = %q rc=%d, want %q", res.got, res.rc, "x")
-	}
-}

@@ -703,19 +703,14 @@ func hostDescriptorEntry(fd int, name string, nonblock bool) (*wasiOpen, error) 
 		return op, nil
 	}
 	mode := st.Mode & syscall.S_IFMT
-	op := &wasiOpen{
+	return &wasiOpen{
 		f:       os.NewFile(uintptr(dup), name),
 		isDir:   mode == syscall.S_IFDIR,
 		regular: mode == syscall.S_IFREG,
 		fdflags: fdflags,
 		noRead:  flags&syscall.O_ACCMODE == syscall.O_WRONLY,
 		noWrite: flags&syscall.O_ACCMODE == syscall.O_RDONLY,
-	}
-	// The open file description is the host's descriptor fd's as well,
-	// which code outside the runtime holds: its mode can change, so the
-	// entry is never waited for in the Go runtime's poller (netpolled).
-	op.shared.Store(true)
-	return op, nil
+	}, nil
 }
 
 // hostSocketEntry returns the socket entry of fd, a socket of the host's

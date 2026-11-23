@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // hostDescriptorsEnv marks the process TestHostDescriptors starts to run
@@ -865,6 +867,81 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			t.Fatal("the parent's descriptor is not its file")
 		}
 		closeTestFd(t, w, m, fd)
+	})
+
+	// A FIFO opened without waiting, whose file is made anew when it is
+	// moved up: where poll(2) reports the end of a FIFO's input the Go
+	// runtime polls it in non-blocking mode; elsewhere it is in blocking
+	// mode and not polled. Either way the close of the FIFO while a read
+	// waits for it returns.
+	t.Run("FIFOOpenedWithoutWaiting", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "fifo")
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w := NewWASI(WASIConfig{
+			FS:              newHostFS(t, dir),
+			Stdin:           bytes.NewReader(nil),
+			Stdout:          &bytes.Buffer{},
+			Stderr:          &bytes.Buffer{},
+			HostDescriptors: true,
+			Errors:          func(op string, err error) { t.Errorf("%s: %v", op, err) },
+		})
+		t.Cleanup(func() {
+			if err := w.CloseAll(); err != nil {
+				t.Errorf("CloseAll: %v", err)
+			}
+		})
+		m := newGuestModule(1 << 16)
+		fd, errno := w.pathOpen(m, "fifo", 0, 0, 1<<1, wasiFdflagNonblock)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("open errno=%d", errno)
+		}
+		writer, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAtEnd(t, writer)
+		op := entryOf(t, w, fd)
+		polled := true
+		switch err := op.f.(*os.File).SetReadDeadline(time.Time{}); {
+		case errors.Is(err, os.ErrNoDeadline):
+			polled = false
+		case err != nil:
+			t.Fatal(err)
+		}
+		nonblocking := openFileFlags(t, w, fd)&syscall.O_NONBLOCK != 0
+		if polled != hostPollReportsFIFOEnd || op.polled != polled || nonblocking != polled {
+			t.Fatalf("the FIFO's file is polled %v (entry %v), non-blocking %v; want all %v", polled, op.polled, nonblocking, hostPollReportsFIFOEnd)
+		}
+		if rc := w.Fd_fdstat_set_flags(m, fd, 0); rc != _wasiESUCCESS {
+			t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+		}
+		read := readAsync(w, newForkTestModule(), fd)
+		// The read waits: in the Go runtime's poller as a blocking call, or
+		// in the read itself, holding the turn at the input.
+		waiting := make(chan struct{})
+		go func() {
+			defer close(waiting)
+			if polled {
+				awaitBlockedCalls(w, 1)
+				return
+			}
+			for len(op.inputTurn()) == 0 {
+				runtime.Gosched()
+			}
+		}()
+		within(t, "the read's wait", waiting)
+		closed := make(chan int32, 1)
+		go func() { closed <- w.Fd_close(m, fd) }()
+		if rc := within(t, "fd_close while a read waits", closed); rc != _wasiESUCCESS {
+			t.Fatalf("close rc=%d", rc)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		within(t, "the read", read)
 	})
 }
 

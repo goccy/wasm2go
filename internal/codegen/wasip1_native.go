@@ -1982,12 +1982,24 @@ func readOnce(src io.Reader, bufs [][]byte) (int, error) {
 		n, again, readErr = readvRaw(fd, bufs)
 		return !again
 	}); err != nil {
-		return 0, err
+		return 0, rawCallErr(rc, err)
 	}
 	if readErr != nil {
 		return n, os.NewSyscallError("readv", readErr)
 	}
 	return n, nil
+}
+
+// rawCallErr returns err, the failure of a Read or Write of rc, as
+// fs.ErrClosed when the file is being closed, as os.File's own Read and
+// Write report it; RawConn's report the poller's error of a closing file,
+// which fs.ErrClosed does not match. The file is being closed when
+// Control fails as well: Control fails for nothing else.
+func rawCallErr(rc syscall.RawConn, err error) error {
+	if rc.Control(func(uintptr) {}) != nil {
+		return fmt.Errorf("%w: %w", fs.ErrClosed, err)
+	}
+	return err
 }
 
 // readResult is what the guest's read of a stream returns for a read that
@@ -6779,7 +6791,7 @@ func (w *WasiStubs) writeInterruptibly(m *Module, call string, op *wasiOpen, dst
 			w.keepInterrupt(m)
 		}
 		if waitErr != nil && failure == nil {
-			failure = waitErr
+			failure = rawCallErr(rc, waitErr)
 		}
 		if failure != nil {
 			break
@@ -9229,11 +9241,20 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
 	// the other end (openFIFO) is moved up once it is made. fsOpen is the FS's
 	// open, or its open that does not follow a link (noFollowOpener, below).
+	// inBlockingMode puts the file in blocking mode before it is moved up:
+	// the file of the moved descriptor is then one the Go runtime does not
+	// poll.
 	fsOpen := fsys.OpenFile
+	inBlockingMode := false
 	openFile := func(name string, flag int, perm os.FileMode) (f File, err error) {
 		err = makeRuntimeDescriptors(func() error {
 			if f, err = fsOpen(name, flag, perm); err != nil {
 				return err
+			}
+			if inBlockingMode {
+				if err := setHostNonblock(f, false); err != nil {
+					return errors.Join(err, f.Close())
+				}
 			}
 			f, err = keepRuntimeOpened(f)
 			return err
@@ -9329,7 +9350,12 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	case isFIFO && fdflags&0x4 != 0: // NONBLOCK
 		// The host's open that does not wait: a reader gets the FIFO
 		// whether or not anyone writes to it, a writer is refused (ENXIO)
-		// while nobody reads.
+		// while nobody reads. Where poll(2) does not report the end of a
+		// FIFO's input (darwin, whose kqueue does not report the close of
+		// the last writer either), the Go runtime does not poll a FIFO: the
+		// descriptor waits as any other does, and its file is not polled
+		// once it is moved up (keepRuntimeOpened) either.
+		inBlockingMode = !hostPollReportsFIFOEnd
 		if f, err = openFile(rel, flag|hostONonblock, w.createMode(mode)); err != nil {
 			return -1, w.guestErrno("path_open", err)
 		}
@@ -9359,13 +9385,6 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	if pollErr != nil {
 		return -1, w.guestErrno("path_open", errors.Join(pollErr, f.Close()))
 	}
-	// A FIFO is not waited for in the Go runtime's poller where poll(2)
-	// does not report the end of its input (darwin, whose kqueue does not
-	// report the close of the last writer either): the Go runtime polls
-	// one that was moved up for an instance whose descriptors are the
-	// host's (keepRuntimeOpened), as a file of a descriptor in non-blocking
-	// mode.
-	polled = polled && (!isFIFO || hostPollReportsFIFOEnd)
 	// The guest's NONBLOCK is its fdflags. A FIFO opened without waiting
 	// that is waited for in the Go runtime's poller (polled) is left in the
 	// non-blocking mode its poller takes (netpolled). Any other is put in
