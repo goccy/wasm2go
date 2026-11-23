@@ -1560,20 +1560,6 @@ func sameDestination(a, b *commandStream) bool {
 	return false
 }
 
-// interfaceEqual is a == b, and false where a and b hold values of one
-// type that is not comparable, whose comparison panics: as os/exec's
-// interfaceEqual, which decides that Stdout is Stderr so.
-func interfaceEqual(a, b any) (equal bool) {
-	defer func() {
-		// The panic of the comparison says only that the values cannot be
-		// compared: they are taken for different ones.
-		if recover() != nil {
-			equal = false
-		}
-	}()
-	return a == b
-}
-
 // commandSetup is what startCommand prepares for a command: conns are the
 // host descriptors it gets, by stream; owned the files opened for it, which
 // are closed once it has started; outputs and input the copies to make
@@ -1611,17 +1597,28 @@ func (c *commandSetup) add(i int, s *commandStream, share *familyStreams, report
 		}
 		// A pipe or FIFO the host gives no description of its own of.
 		return c.copyHost(i, f, f.Name(), s, report)
+	case s.input != nil:
+		// A stream the guest reads through a reader: the copy takes from
+		// the reader, and what the command does not read goes back to it.
+		in := newReaderInput(s.input)
+		copied, err := c.copyInput(in, nil, s, s.input.unread, report)
+		if err != nil {
+			in.stop()
+			return err
+		}
+		copied.cancel = in.stop
+		return nil
 	case s.reader != nil:
 		// A stream of the embedder's or of a filesystem of its own: what
 		// the command does not read of it is lost, as with os/exec.
 		_, err := c.copyInput(s.reader, nil, s, nil, report)
 		return err
 	case s.writer != nil:
-		var lock *sync.Mutex
+		var turn *streamTurn
 		if s.stdio >= 2 {
-			lock = &share.output
+			turn = share.turn(s.stdio)
 		}
-		return c.copyOutput(i, s.writer, nil, s, lock, report)
+		return c.copyOutput(i, s.writer, nil, s, turn, report)
 	}
 	flag := os.O_WRONLY
 	if i == 0 {
@@ -1687,15 +1684,15 @@ func (c *commandSetup) give(i int, f *os.File) {
 }
 
 // copyOutput makes the command's stream i the write end of a pipe whose
-// read end the runtime copies to dst (outputCopy), under lock when it is
+// read end the runtime copies to dst (outputCopy), with turn when it is
 // not nil; owned, when it is not nil, is closed once the copy ends.
-func (c *commandSetup) copyOutput(i int, dst io.Writer, owned io.Closer, s *commandStream, lock *sync.Mutex, report func(error)) error {
+func (c *commandSetup) copyOutput(i int, dst io.Writer, owned io.Closer, s *commandStream, turn *streamTurn, report func(error)) error {
 	r, wr, err := runtimePipe()
 	if err != nil {
 		return errors.Join(err, closeIfAny(owned))
 	}
 	c.give(i, wr)
-	c.outputs = append(c.outputs, &outputCopy{src: r, dst: dst, owned: owned, lock: lock, report: report, done: make(chan struct{})})
+	c.outputs = append(c.outputs, &outputCopy{src: r, dst: dst, owned: owned, turn: turn, wake: newChannelWake(), report: report, done: make(chan struct{})})
 	return setHostNonblock(wr, s.nonblock)
 }
 
@@ -1747,6 +1744,9 @@ func (c *commandSetup) abandon() error {
 		err = errors.Join(err, o.src.Close(), closeIfAny(o.owned))
 	}
 	if in := c.input; in != nil {
+		if in.cancel != nil {
+			in.cancel()
+		}
 		err = errors.Join(err, in.dst.Close(), closeIfAny(in.owned))
 		if in.keep != nil {
 			err = errors.Join(err, in.keep.Close())
@@ -1898,16 +1898,18 @@ func hostIoctl(fd, req uintptr, arg unsafe.Pointer) error {
 }
 
 // outputCopy copies what a command writes to a pipe of the runtime's, read
-// from src, to dst, under lock when it is not nil (familyStreams.output),
+// from src, to dst, with turn when it is not nil (familyStreams),
 // until the pipe ends or finish asks it to stop. Its wait is the command's:
 // once the command has ended, what is in the pipe is delivered without
 // waiting for the writers it left behind (Go's os/exec waits for them, up
 // to Cmd.WaitDelay).
 type outputCopy struct {
-	src    *os.File
-	dst    io.Writer
-	owned  io.Closer
-	lock   *sync.Mutex
+	src   *os.File
+	dst   io.Writer
+	owned io.Closer
+	turn  *streamTurn
+	// wake is what the copy waits for turn with.
+	wake   *wasiWake
 	report func(error)
 	// ended records that the copy has stopped reading src. Guarded by mu.
 	mu    sync.Mutex
@@ -1945,9 +1947,9 @@ func (c *outputCopy) deliver(b []byte) bool {
 	if len(b) == 0 {
 		return true
 	}
-	if c.lock != nil {
-		c.lock.Lock()
-		defer c.lock.Unlock()
+	if c.turn != nil {
+		c.turn.take(c.wake)
+		defer func() { c.report(c.turn.give()) }()
 	}
 	if _, err := c.dst.Write(b); err != nil {
 		c.report(err)
@@ -2021,6 +2023,9 @@ type inputCopy struct {
 	owned   io.Closer
 	back    func([]byte) error
 	report  func(error)
+	// cancel, when it is not nil, ends a read of src in progress
+	// (readerInput.stop).
+	cancel func()
 	// reading records that the copy is in a read of src; stopping that
 	// finish asks it to stop; settled that finish has given back what the
 	// command left, after which the copy gives back what it has itself;
@@ -2113,6 +2118,10 @@ func (c *inputCopy) finish() {
 		case !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrNoDeadline):
 			c.report(err)
 		}
+	}
+	if c.cancel != nil {
+		c.cancel()
+		reading = false
 	}
 	if !reading {
 		<-c.done

@@ -123,14 +123,14 @@ func TestWaitStatusOfReports(t *testing.T) {
 
 // Errors is told an error without an errno with no lock of the instance or
 // of the descriptor held: of the priority a forked instance starts from, and
-// of the failure a readiness probe left behind.
+// of the failure a stream's reader ran into.
 func TestGuestErrnoReportsWithoutLocks(t *testing.T) {
-	w, _ := newTestStubs(t, t.TempDir())
-	op := &wasiOpen{}
+	w, m := newTestStubs(t, t.TempDir())
+	op := &wasiOpen{reader: newStreamReader(nil, func(error) {})}
 	var told []string
 	w.cfg.Errors = func(name string, err error) {
 		told = append(told, name)
-		for _, mu := range []*sync.Mutex{&w.mu.Mutex, &op.mu} {
+		for _, mu := range []*sync.Mutex{&w.mu.Mutex, &op.mu, &op.reader.mu} {
 			if !mu.TryLock() {
 				t.Errorf("%s: Errors told with a lock held", name)
 				continue
@@ -144,9 +144,9 @@ func TestGuestErrnoReportsWithoutLocks(t *testing.T) {
 	if errno := w.setOwnNice(true, 0); errno != _wasiEIO {
 		t.Errorf("setOwnNice errno=%d, want EIO", errno)
 	}
-	op.aheadEnd = errors.New("probe failed")
-	if _, errno, served := w.takeAhead("fd_read", op, nil); !served || errno != _wasiEIO {
-		t.Errorf("takeAhead served=%v errno=%d, want EIO", served, errno)
+	op.reader.end = errors.New("read failed")
+	if _, errno := w.readThroughReader(m, "fd_read", op, op.reader, nil, true); errno != _wasiEIO {
+		t.Errorf("readThroughReader errno=%d, want EIO", errno)
 	}
 	if len(told) != 2 || told[0] != "proc_priority" || told[1] != "fd_read" {
 		t.Errorf("Errors was told %q, want proc_priority and fd_read", told)

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -193,7 +192,7 @@ func writevRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 func openForWriting(fd uintptr) bool { return true }
 
 // hostPolls says that the runtime cannot wait for a descriptor in poll(2) on
-// this platform: a readiness probe reads the stream instead.
+// this platform: a stream is read by its reader instead (streamReader).
 const hostPolls = false
 
 // hostPollReportsFIFOEnd says nothing on this platform, which has no
@@ -423,7 +422,7 @@ func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, 
 // process's directory when it is empty), its standard streams those of
 // streams, with os/exec: a file or socket of the host is the command's as
 // it is, and os/exec copies any other stream, to the instance's stdout and
-// stderr under the family's output lock (familyStreams). Its wait waits for
+// stderr with the family's turn at it (familyStreams). Its wait waits for
 // the copies, as Cmd.Wait does.
 func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, inherit []commandDescriptor, share *familyStreams) (*hostCommand, error) {
 	cmd := &exec.Cmd{Path: path, Args: argv, Env: env, Dir: dir}
@@ -438,7 +437,7 @@ func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string
 		case s.host != nil:
 			*out[i] = s.host.(io.Writer)
 		case s.writer != nil && s.stdio >= 2:
-			*out[i] = lockedWriter{&share.output, s.writer}
+			*out[i] = turnWriter{share.turn(s.stdio), s.writer}
 		case s.writer != nil:
 			*out[i] = s.writer
 		}
@@ -452,16 +451,16 @@ func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string
 	}}, nil
 }
 
-// lockedWriter writes to w under mu.
-type lockedWriter struct {
-	mu *sync.Mutex
-	w  io.Writer
+// turnWriter writes to w with the turn t.
+type turnWriter struct {
+	t *streamTurn
+	w io.Writer
 }
 
-func (l lockedWriter) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
+func (l turnWriter) Write(p []byte) (int, error) {
+	l.t.take(newChannelWake())
+	n, err := l.w.Write(p)
+	return n, errors.Join(err, l.t.give())
 }
 
 // This platform has no process groups or sessions the runtime can change

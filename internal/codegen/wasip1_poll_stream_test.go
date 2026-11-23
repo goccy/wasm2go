@@ -241,10 +241,16 @@ func TestWasi_EndOfInputAPollFoundIsReadOnce(t *testing.T) {
 	if got, rc := readWithin(t, w, m, 0, 16); rc != _wasiESUCCESS || got != "more" {
 		t.Fatalf("read after the end of input = %q rc=%d, want %q", got, rc, "more")
 	}
-	// A non-blocking read of such a stream takes what a probe finds.
+	// A non-blocking read of such a stream that finds nothing read asks
+	// for a read, which a poll then waits for, and the next read takes.
 	if rc := w.Fd_fdstat_set_flags(m, 0, wasiFdflagNonblock); rc != _wasiESUCCESS {
 		t.Fatalf("set O_NONBLOCK rc=%d", rc)
 	}
+	if got, rc := readWithin(t, w, m, 0, 16); rc != _wasiEAGAIN {
+		t.Fatalf("non-blocking read before the stream was read = %q rc=%d, want EAGAIN", got, rc)
+	}
+	writeSubFd(m, pollSubsOff, 7, 1, 0)
+	wantUserdata(t, pollUserdata(t, w, m, 1), 7)
 	if got, rc := readWithin(t, w, m, 0, 16); rc != _wasiESUCCESS || got != "late" {
 		t.Fatalf("non-blocking read = %q rc=%d, want %q", got, rc, "late")
 	}
