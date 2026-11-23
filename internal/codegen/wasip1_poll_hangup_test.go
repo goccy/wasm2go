@@ -111,3 +111,24 @@ func TestWasi_PollReportsThatAConnectionWasHungUpOn(t *testing.T) {
 	}
 	wantHangup(t, w, m, 0, true)
 }
+
+// A socket of the host's the runtime made, whose peer has closed it: the
+// host says whether that is a hang-up (an AF_UNIX stream's is).
+func TestWasi_PollReportsThatASocketPeerHungUp(t *testing.T) {
+	w, m, _ := newSocketStubs(t)
+	if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, sockFdsOff); rc != _wasiESUCCESS {
+		t.Fatalf("Sock_socketpair rc=%d", rc)
+	}
+	a, b := int32(readU32(m.memory, int(sockFdsOff))), int32(readU32(m.memory, int(sockFdsOff)+4))
+	if rc := sockSend(w, m, b, "x"); rc != _wasiESUCCESS {
+		t.Fatalf("send rc=%d", rc)
+	}
+	wantHangup(t, w, m, a, false)
+	if got, rc := sockRecv(w, m, a); rc != _wasiESUCCESS || got != "x" {
+		t.Fatalf("recv = %q rc=%d", got, rc)
+	}
+	if rc := w.Fd_close(m, b); rc != _wasiESUCCESS {
+		t.Fatalf("close rc=%d", rc)
+	}
+	wantHangup(t, w, m, a, true)
+}

@@ -65,7 +65,7 @@ func hostSettings(t *testing.T, f *os.File) syscall.Termios {
 func waitInput(t *testing.T, f *os.File) {
 	t.Helper()
 	if err := withHostDescriptor(f, func(fd uintptr) error {
-		return hostWaitReady([]uintptr{fd}, []int{hostWantInput}, make([]bool, 1), time.Time{}, -1)
+		return hostWaitReady([]uintptr{fd}, []int{hostWantInput}, make([]bool, 1), nil, time.Time{}, -1)
 	}); err != nil {
 		t.Fatal(err)
 	}

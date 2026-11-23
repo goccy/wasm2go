@@ -1248,13 +1248,13 @@ func TestWasi_SendOfMoreBuffersThanOneCallTakes(t *testing.T) {
 func TestWasi_PollNvalIsNoFailure(t *testing.T) {
 	const notOpen = 1 << 20 // beyond any descriptor the process has
 	ready := []bool{false}
-	if err := hostWaitReady([]uintptr{notOpen}, []int{hostWantFailure}, ready, time.Now().Add(50*time.Millisecond), -1); err != nil {
+	if err := hostWaitReady([]uintptr{notOpen}, []int{hostWantFailure}, ready, nil, time.Now().Add(50*time.Millisecond), -1); err != nil {
 		t.Fatal(err)
 	}
 	if ready[0] {
 		t.Fatal("POLLNVAL made a subscription for failure ready")
 	}
-	if err := hostWaitReady([]uintptr{notOpen}, []int{hostWantInput}, ready, time.Now(), -1); err != nil {
+	if err := hostWaitReady([]uintptr{notOpen}, []int{hostWantInput}, ready, nil, time.Now(), -1); err != nil {
 		t.Fatal(err)
 	}
 	if !ready[0] {

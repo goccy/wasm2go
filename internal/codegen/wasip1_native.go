@@ -2439,11 +2439,12 @@ const (
 
 // hostWaitFD is a stream of the host's that a wait in poll(2) asks about
 // (waitHostReady), what it is asked about (hostWant...), and whether it is
-// ready.
+// ready, and hung up on (POLLHUP) as poll(2) said when it was.
 type hostWaitFD struct {
 	stream any
 	want   int
 	ready  bool
+	hungUp bool
 	// op is the entry the stream is behind: the close of its last slot
 	// wakes the wait (closeWasiOpen).
 	op *wasiOpen
@@ -2686,10 +2687,11 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake *wasiWake) error {
 	if wake != nil {
 		wakeFD = wake.r
 	}
-	ready := make([]bool, len(fds))
-	err := hostWaitReady(fds, wants, ready, until, wakeFD)
+	got := make([]bool, 2*len(fds))
+	ready, hungUp := got[:len(fds)], got[len(fds):]
+	err := hostWaitReady(fds, wants, ready, hungUp, until, wakeFD)
 	for k, r := range ready {
-		set[at[k]].ready = r
+		set[at[k]].ready, set[at[k]].hungUp = r, hungUp[k]
 	}
 	return errors.Join(err, closeDups())
 }
@@ -8364,7 +8366,7 @@ func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte
 		}
 	}
 	ready := []bool{false}
-	if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, time.Now(), -1); err != nil {
+	if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, nil, time.Now(), -1); err != nil {
 		return 0, false, err
 	}
 	if !ready[0] {
@@ -11697,7 +11699,9 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		// what happened.
 		var flags uint16
 		if errnos[i] == 0 && ev.isRead {
-			if stream := hangStreams[i]; stream != nil && streamHungUp(stream) {
+			if at := hostIndex[i]; at >= 0 && hostSet[at].hungUp {
+				flags = wasiEventHangup
+			} else if stream := hangStreams[i]; stream != nil && streamHungUp(stream) {
 				flags = wasiEventHangup
 			}
 		}
@@ -12346,7 +12350,7 @@ func (w *WasiStubs) whenReady(m *Module, turn chan struct{}, want int, call func
 		}
 		defer func() { <-turn }()
 		ready := []bool{false}
-		if err := hostWaitReady([]uintptr{uintptr(fd)}, []int{want}, ready, time.Now(), -1); err != nil {
+		if err := hostWaitReady([]uintptr{uintptr(fd)}, []int{want}, ready, nil, time.Now(), -1); err != nil {
 			return false, err
 		}
 		if !ready[0] {
@@ -20600,7 +20604,7 @@ func (w *WasiStubs) readHostAttempt(m *Module, call string, op *wasiOpen, src sy
 			return recvNow(fd, bufs)
 		case look:
 			ready := []bool{false}
-			if err := hostWaitReady([]uintptr{fd}, []int{hostWantInput}, ready, time.Now(), -1); err != nil {
+			if err := hostWaitReady([]uintptr{fd}, []int{hostWantInput}, ready, nil, time.Now(), -1); err != nil {
 				return 0, false, err
 			}
 			if !ready[0] {

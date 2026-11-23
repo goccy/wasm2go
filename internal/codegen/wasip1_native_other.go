@@ -205,7 +205,7 @@ const hostPollReportsFIFOEnd = false
 
 // hostWaitReady would wait in poll(2) for descriptors to be ready, which
 // the runtime cannot do on this platform.
-func hostWaitReady(fds []uintptr, wants []int, ready []bool, until time.Time, wake int) error {
+func hostWaitReady(fds []uintptr, wants []int, ready, hungUp []bool, until time.Time, wake int) error {
 	return errors.ErrUnsupported
 }
 

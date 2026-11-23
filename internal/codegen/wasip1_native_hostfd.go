@@ -139,8 +139,9 @@ const hostPolls = true
 // (POLLHUP), an error (POLLERR), or a device poll(2) does not support
 // (POLLNVAL, which darwin reports of /dev/null, and poll(2) of a number
 // closed meanwhile). One asked about failure is ready on POLLERR or POLLHUP
-// only.
-func hostWaitReady(fds []uintptr, wants []int, ready []bool, until time.Time, wake int) error {
+// only. hungUp, when not nil, records which of the ready ones poll(2)
+// reported hung up on (POLLHUP).
+func hostWaitReady(fds []uintptr, wants []int, ready, hungUp []bool, until time.Time, wake int) error {
 	set := make([]hostPoll, len(fds), len(fds)+1)
 	for i, fd := range fds {
 		set[i] = hostPoll{fd: int32(fd), events: hostPollIn}
@@ -173,6 +174,9 @@ func hostWaitReady(fds []uintptr, wants []int, ready []bool, until time.Time, wa
 				set[i].fd = -1
 			} else if set[i].revents != 0 {
 				ready[i], found = true, true
+				if hungUp != nil {
+					hungUp[i] = set[i].revents&hostPollHup != 0
+				}
 			}
 		}
 		if found || wake >= 0 && set[len(fds)].revents != 0 || timeout == 0 || !until.IsZero() && !time.Now().Before(until) {
