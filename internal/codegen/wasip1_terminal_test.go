@@ -5,6 +5,7 @@ package codegen
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"maps"
 	"os"
 	"os/exec"
@@ -590,29 +591,111 @@ func TestFdstatOfATerminalHasNoSeek(t *testing.T) {
 	closeTestFd(t, w, m, tty)
 }
 
+// A standard stream that is a closed host file is a stream to
+// fd_fdstat_get, which succeeds: its read or write reports the failure.
+func TestFdstatOfAClosedStream(t *testing.T) {
+	r, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(r.Close(), wr.Close()); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newProcTestStubs(t)
+	w.cfg.Stdin = r
+	closeAllAtCleanup(t, w)
+	if filetype, _, _ := fdstatOf(t, w, m, 0); filetype != 2 {
+		t.Errorf("fdstat of a closed stream: filetype %d, want 2", filetype)
+	}
+}
+
 // hostTerminalEnv holds the name of the terminal that is the standard
-// input of the process TestHostDescriptorsOnATerminal starts to run
-// TestHostDescriptorsOnATerminalInAProcess in.
+// input of the process runOnATerminal starts.
 const hostTerminalEnv = "WASM2GO_HOST_TERMINAL"
 
-// TestHostDescriptorsOnATerminal runs
-// TestHostDescriptorsOnATerminalInAProcess in a process of its own, with
-// the slave of a pseudo-terminal as its standard input.
-func TestHostDescriptorsOnATerminal(t *testing.T) {
+// runOnATerminal runs the test named test in a process of its own, with the
+// slave of a pseudo-terminal as its standard input, and fails unless it
+// passes there.
+func runOnATerminal(t *testing.T, test string) {
+	t.Helper()
 	if os.Getenv(hostTerminalEnv) != "" {
 		t.Skip("this is the process of the tests")
 	}
 	_, slave := openTestPty(t)
-	cmd := exec.Command(os.Args[0], "-test.run=^TestHostDescriptorsOnATerminalInAProcess$", "-test.v")
+	cmd := exec.Command(os.Args[0], "-test.run=^"+test+"$", "-test.v")
 	cmd.Env = append(os.Environ(), hostTerminalEnv+"="+slave.Name())
 	cmd.Stdin = slave
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("the process of the tests: %v\n%s", err, out)
 	}
-	if !bytes.Contains(out, []byte("--- PASS: TestHostDescriptorsOnATerminalInAProcess")) {
+	if !bytes.Contains(out, []byte("--- PASS: "+test)) {
 		t.Fatalf("the process of the tests ran no test:\n%s", out)
 	}
+}
+
+// TestFdstatWithoutAFreeDescriptor runs
+// TestFdstatWithoutAFreeDescriptorInAProcess on a terminal.
+func TestFdstatWithoutAFreeDescriptor(t *testing.T) {
+	runOnATerminal(t, "TestFdstatWithoutAFreeDescriptorInAProcess")
+}
+
+// fd_fdstat_get takes no descriptor of the host's: it succeeds for a
+// terminal and a regular file while the process has no number free.
+func TestFdstatWithoutAFreeDescriptorInAProcess(t *testing.T) {
+	if os.Getenv(hostTerminalEnv) == "" {
+		t.Skip("run by TestFdstatWithoutAFreeDescriptor")
+	}
+	w, m := newProcTestStubs(t)
+	w.cfg.Stdin = os.Stdin
+	closeAllAtCleanup(t, w)
+	file := createTestFile(t, w, "a.txt")
+
+	var limit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+		t.Fatal(err)
+	}
+	low := limit
+	low.Cur = 256
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &low); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
+			t.Error(err)
+		}
+	})
+	var fill []int
+	t.Cleanup(func() {
+		for _, fd := range fill {
+			if err := syscall.Close(fd); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	for {
+		fd, err := syscall.Open(os.DevNull, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+		if errors.Is(err, syscall.EMFILE) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		fill = append(fill, fd)
+	}
+
+	for fd, want := range map[int32]byte{0: 2, file: 4} {
+		const out int32 = 5200
+		if rc := w.Fd_fdstat_get(m, fd, out); rc != _wasiESUCCESS || m.memory[out] != want {
+			t.Errorf("Fd_fdstat_get(%d) without a free descriptor rc=%d filetype %d, want filetype %d", fd, rc, m.memory[out], want)
+		}
+	}
+}
+
+// TestHostDescriptorsOnATerminal runs
+// TestHostDescriptorsOnATerminalInAProcess on a terminal.
+func TestHostDescriptorsOnATerminal(t *testing.T) {
+	runOnATerminal(t, "TestHostDescriptorsOnATerminalInAProcess")
 }
 
 // The standard input an instance whose descriptors are the host's takes
@@ -651,16 +734,37 @@ func guestReadlink(w *WasiStubs, m *Module, name string) (string, int32) {
 
 // On the whole host filesystem the link of a standard stream that is a
 // terminal leads to the terminal's name, as ttyname reads it; that of a
-// file path_open opened to the path it was opened under.
+// regular file of Files to the host's link for it (none on darwin); that of
+// a file path_open opened to the path it was opened under.
 func TestLinkOfATerminalIsItsName(t *testing.T) {
 	_, slave := openTestPty(t)
+	given, err := os.Create(filepath.Join(t.TempDir(), "given"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPath, err := filepath.EvalSymlinks(given.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
 	w, m := newProcTestStubs(t)
 	w.cfg.FS = osFS{}
 	w.cfg.Stdin = slave
+	w.cfg.Files = map[int32]*os.File{7: given}
 	closeAllAtCleanup(t, w)
 	for _, name := range []string{"dev/fd/0", "proc/self/fd/0"} {
 		if target, rc := guestReadlink(w, m, name); rc != _wasiESUCCESS || target != slave.Name() {
 			t.Errorf("readlink %s of a terminal = %q rc=%d, want %q", name, target, rc, slave.Name())
+		}
+	}
+	target, rc := guestReadlink(w, m, "proc/self/fd/7")
+	switch runtime.GOOS {
+	case "linux":
+		if rc != _wasiESUCCESS || target != hostPath {
+			t.Errorf("readlink proc/self/fd/7 of a regular file of Files = %q rc=%d, want %q", target, rc, hostPath)
+		}
+	case "darwin":
+		if rc != _wasiEINVAL {
+			t.Errorf("readlink proc/self/fd/7 of a regular file of Files = %q rc=%d, want EINVAL: no link", target, rc)
 		}
 	}
 	path := filepath.Join(t.TempDir(), "a.txt")

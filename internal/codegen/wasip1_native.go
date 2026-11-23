@@ -3016,16 +3016,25 @@ func (op *wasiOpen) statOf(file *os.File) (mode os.FileMode, namedFIFO bool) {
 }
 
 // terminalOf reports whether file, the host file behind this entry, is a
-// terminal of the host (withHostTerminal). The host is asked once per file.
+// terminal of the host (hostFileTerminal). The host is asked once per file,
+// and not for an entry made as a regular file's or a directory's. A file
+// that has been closed is no terminal, and is asked about again, as in
+// statOf: its read or write fails the same way, and reports the failure.
 func (op *wasiOpen) terminalOf(file *os.File) (bool, error) {
+	if op.regular || op.isDir {
+		return false, nil
+	}
 	op.mu.Lock()
 	defer op.mu.Unlock()
 	if op.terminalFile != file {
-		err := withHostTerminal(file, func(int) error { return nil })
-		if err != nil && !errors.Is(err, syscall.ENOTTY) {
+		terminal, err := hostFileTerminal(file)
+		if errors.Is(err, fs.ErrClosed) {
+			return false, nil
+		}
+		if err != nil {
 			return false, err
 		}
-		op.terminalFile, op.terminal = file, err == nil
+		op.terminalFile, op.terminal = file, terminal
 	}
 	return op.terminal, nil
 }
@@ -10192,11 +10201,10 @@ func (w *WasiStubs) aliasInfo(name string, n int32, ids ProcessIDs, target strin
 // under, absolute in the guest's filesystem ("/" for the root); for a
 // host file without that path (a standard stream, a descriptor the host
 // gave), the target of the host's own link for it where the host has one
-// (hostFDLink), when the FS is a HostRootFS
-// and the target is a name in it or names no file; pipe:[N] or socket:[N] for a
-// pipe or a socket, N the inode number fstat gives it. It is "" for a
-// descriptor that is none of them, which then has no link. errno is a wasi
-// errno.
+// (hostFDLink), when the FS is a HostRootFS and the target is a name in it
+// or names no file; pipe:[N] or socket:[N] for a pipe or a socket, N the
+// inode number fstat gives it. It is "" for a descriptor that is none of
+// them, which then has no link. errno is a wasi errno.
 func (w *WasiStubs) ownLinkTarget(op *wasiOpen, root bool) (string, int32) {
 	switch {
 	case root:
