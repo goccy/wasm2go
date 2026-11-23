@@ -147,6 +147,82 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The directories of the FS tests below: d, with a link out of it to a
+	// file of the root beside it.
+	rootDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(rootDir, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "f"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../f", filepath.Join(rootDir, "d", "up")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Once an instance has the host's descriptors, the descriptors of the
+	// FSes of directories of HostFS's, and of a HostFS of a directory, are
+	// open above the guests' numbers, and work as they do before.
+	t.Run("DirectoryFSes", func(t *testing.T) {
+		newHostNumberedStubs(t, nil, nil)
+		closeFS := func(fsys FS) {
+			t.Cleanup(func() {
+				if err := fsys.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		whole, err := osFS{}.OpenRoot(hostRelative(t, rootDir) + "/d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeFS(whole)
+		hostFS, err := HostFS(rootDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeFS(hostFS)
+		confined, err := hostFS.(OpenRootFS).OpenRoot("d")
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeFS(confined)
+		for name, f := range map[string]*os.File{"the whole host's directory FS": whole.(osDir).f, "a HostFS of a directory's root": hostFS.(rootFS).at, "its directory FS": confined.(hostDir).f} {
+			if n := entryHostNumberOf(t, f); n < hostDescriptorFloor {
+				t.Errorf("%s is at %d, below the floor", name, n)
+			}
+		}
+		if _, err := confined.Stat("up"); err != nil {
+			t.Errorf("Stat(up) of a HostFS of a directory's directory FS: %v", err)
+		}
+		// Without the os.Root of the directory, whose descriptor cannot be
+		// moved above them, its names are found from the root as the name
+		// the directory has now: renamed, another directory taking its old
+		// name, a file it makes is made in it.
+		if confined.(hostDir).in != nil {
+			t.Error("a HostFS of a directory's directory FS holds an os.Root of it")
+		}
+		if err := os.Rename(filepath.Join(rootDir, "d"), filepath.Join(rootDir, "moved")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(rootDir, "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		f, err := confined.OpenFile("x", os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(rootDir, "moved", "x")); err != nil {
+			t.Errorf("x is not in the directory the FS is of: %v", err)
+		}
+		if err := errors.Join(os.Remove(filepath.Join(rootDir, "d")), os.Rename(filepath.Join(rootDir, "moved"), filepath.Join(rootDir, "d")), os.Remove(filepath.Join(rootDir, "d", "x"))); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	// The end of an instance leaves the process's standard descriptors.
 	t.Run("EndLeavesStandardStreams", func(t *testing.T) {
 		w, _ := newHostNumberedStubs(t, nil, os.Stdin)

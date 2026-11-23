@@ -117,7 +117,7 @@ func TestWasi_MemFSTrailingSlash(t *testing.T) {
 	for name, err := range map[string]error{
 		"Stat":         statErr,
 		"OpenFile":     openErr,
-		"Remove":       mem.Remove("f/"),
+		"Unlink":       mem.Unlink("f/"),
 		"Chmod":        mem.Chmod("f/", 0o600),
 		"create there": createErr,
 	} {

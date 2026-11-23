@@ -103,7 +103,7 @@ func newHostFS(t *testing.T, dir string) FS {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := fsys.(io.Closer).Close(); err != nil {
+		if err := fsys.Close(); err != nil {
 			t.Errorf("close HostFS(%q): %v", dir, err)
 		}
 	})
@@ -1325,7 +1325,7 @@ func TestMemFS(t *testing.T) {
 	}
 
 	// Remove.
-	if err := a.Remove("dir/hello.txt"); err != nil {
+	if err := a.Unlink("dir/hello.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.Stat("dir/hello.txt"); !os.IsNotExist(err) {

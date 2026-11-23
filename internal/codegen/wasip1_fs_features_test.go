@@ -15,9 +15,6 @@ import (
 // implementing its optional interfaces and calling its methods.
 type wrappedFS struct{ FS }
 
-func (f wrappedFS) Chown(name string, uid, gid int, follow bool) error {
-	return f.FS.(ChownFS).Chown(name, uid, gid, follow)
-}
 func (f wrappedFS) Mkfifo(name string, perm os.FileMode) error {
 	return f.FS.(MkfifoFS).Mkfifo(name, perm)
 }
@@ -58,7 +55,10 @@ func TestWasi_OptionalFSInterfacesOfAWrapper(t *testing.T) {
 				}
 			}
 			off, n := putPath(m, 200, rel+"/f")
-			want("chown", w.Path_chown(m, off, n, -1, -1, 1), _wasiESUCCESS, -_wasiENOSYS)
+			// chown is FS's own: a wrapper keeps it whatever else it has
+			if rc := w.Path_chown(m, off, n, -1, -1, 1); rc != _wasiESUCCESS {
+				t.Errorf("chown rc=%d", rc)
+			}
 			fifo, fifon := putPath(m, 400, rel+"/q-"+tc.name)
 			want("mkfifo", w.Path_mkfifo(m, fifo, fifon, 0o600), _wasiESUCCESS, -_wasiENOSYS)
 			fd, errno := w.pathOpen(m, rel+"/f", 0, 0, 1<<1, 0)
@@ -126,8 +126,8 @@ func (f chownFilesFS) OpenFile(name string, flag int, perm os.FileMode) (File, e
 	return chownFile{file, f.changes}, nil
 }
 
-// fchown changes the owner of a file that is a ChownFile through it.
-func TestWasi_FchownOfAChownFile(t *testing.T) {
+// fchown changes the owner of a file through it (File.Chown).
+func TestWasi_FchownOfAFile(t *testing.T) {
 	mem := NewMemFS()
 	if err := mem.WriteFile("f", nil, 0o644); err != nil {
 		t.Fatal(err)

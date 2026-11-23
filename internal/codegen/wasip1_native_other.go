@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"runtime"
@@ -73,6 +74,37 @@ func setHostNonblock(f File, nonblock bool) error { return nil }
 // waiting. This platform's opens wait as they will: the syscall package of
 // some (js, wasip1) has no such flag.
 const hostONonblock = 0
+
+// hostONofollow is O_NOFOLLOW, which this platform has none of: the
+// runtime asks Lstat before an open that does not follow.
+const hostONofollow = 0
+
+// Unlink and Rmdir remove a file and an empty directory of the host's after
+// Lstat finds the name is that kind (lstatRemove): this platform has no
+// call that removes one kind only.
+func (o osFS) Unlink(name string) error { return lstatRemove(os.Lstat, os.Remove, o.join(name), false) }
+func (o osFS) Rmdir(name string) error  { return lstatRemove(os.Lstat, os.Remove, o.join(name), true) }
+
+// The calls of rootFS relative to a directory, for a platform without
+// them: as darwin's.
+func (r rootFS) unlinkAt(name string) error {
+	return lstatRemove(r.root.Lstat, r.root.Remove, name, false)
+}
+func (r rootFS) rmdirAt(name string) error {
+	return lstatRemove(r.root.Lstat, r.root.Remove, name, true)
+}
+func (r rootFS) lchtimesAt(name string, atime, mtime time.Time) error {
+	return lstatChtimes(r.root.Lstat, r.root.Chtimes, name, atime, mtime)
+}
+func (r rootFS) openNoFollow(name string, flag int, perm os.FileMode) (File, error) {
+	return lstatOpen(r.root.Lstat, r.OpenFile, name, flag, perm)
+}
+
+// hostLchtimes sets the times of the file at path, which is no symbolic
+// link (lstatChtimes).
+func hostLchtimes(path string, atime, mtime time.Time) error {
+	return lstatChtimes(os.Lstat, os.Chtimes, path, atime, mtime)
+}
 
 // osFileStat reads the POSIX metadata out of the Sys value of a FileInfo the
 // os package returned. This platform's carries none the runtime knows how to
@@ -278,10 +310,23 @@ func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
 	return errors.ErrUnsupported
 }
 
+// hostDirOpen is the open of a directory an FS of it holds (the file of a
+// hostDir, a rootFS's at).
+const hostDirOpen = os.O_RDONLY
+
+// hostDirAt and hostFDName would tell where a directory, or a file, open is
+// now, which the runtime cannot learn on this platform:
+// errors.ErrUnsupported (osFS.OpenRoot is, and a HostFS of a directory's
+// FS of one of its directories has none either).
+func hostDirAt(f *os.File) (string, error) { return "", errors.ErrUnsupported }
+func hostFDName(f *os.File) (string, error) {
+	return "", &fs.PathError{Op: "fdname", Path: f.Name(), Err: errors.ErrUnsupported}
+}
+
 // hostFutimens would set the times of the file open as f through its
 // descriptor, which the runtime cannot do on this platform:
 // errors.ErrUnsupported, and the times are set by the file's name.
-func hostFutimens(f *os.File, atime, mtime time.Time) error { return errors.ErrUnsupported }
+func hostFutimens(FS, *os.File, time.Time, time.Time) error { return errors.ErrUnsupported }
 
 // flockOSFile would apply flock(2) to a file of the host process, which the
 // runtime cannot do on this platform.
@@ -445,6 +490,10 @@ type hostIdentity struct{}
 
 // makeRuntimeDescriptors runs make: no guest takes a descriptor in here.
 func makeRuntimeDescriptors(make func() error) error { return make() }
+
+// runtimeFloor is 0: the runtime's descriptors are where the host puts
+// them.
+func runtimeFloor() int { return 0 }
 
 // runtimeFile is make: the runtime's descriptors are where the host puts
 // them.

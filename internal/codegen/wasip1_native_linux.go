@@ -449,30 +449,115 @@ func unlinkDirAt(dirFd int, elem string) error {
 	return nil
 }
 
-// removeFile removes the name of a file that is not a directory, as
+// unlinkAt removes the name of a file that is not a directory, as
 // unlink(2) does, through one unlinkat(2) relative to its directory
 // (inRootDir): a name that is a directory is refused (EISDIR), even one
 // that became one since the guest looked.
-func (r rootFS) removeFile(name string) error {
-	return r.refused(inRootDir(r.root, name, "unlinkat", func(dirFd int, elem string) error {
+func (r rootFS) unlinkAt(name string) error {
+	return inRootDir(r.root, name, "unlinkat", func(dirFd int, elem string) error {
 		return syscall.Unlinkat(dirFd, elem)
-	}))
+	})
 }
 
-// removeDir removes an empty directory, as rmdir(2) does, through one
+// rmdirAt removes an empty directory, as rmdir(2) does, through one
 // unlinkat(2) with AT_REMOVEDIR relative to its directory (inRootDir): a
 // name that is no directory is refused (ENOTDIR).
-func (r rootFS) removeDir(name string) error {
-	return r.refused(inRootDir(r.root, name, "unlinkat", unlinkDirAt))
+func (r rootFS) rmdirAt(name string) error {
+	return inRootDir(r.root, name, "unlinkat", unlinkDirAt)
 }
 
-// openNoFollow opens name as OpenFile does, except that a symbolic link at
-// its end is not followed (ELOOP): through one openat(2) with O_NOFOLLOW
-// relative to its directory (inRootDir). os.Root's OpenFile, which follows
-// a link inside the root whatever flag says, is not used for it. A name
-// with a trailing "/" asks for the directory a link at its end leads to,
-// which the kernel follows whatever O_NOFOLLOW says: it is opened through
-// os.Root, which refuses a link that leads out of the root.
+// lchtimesAt sets the times of name, a symbolic link itself where it is
+// one, through one utimensat(2) with AT_SYMLINK_NOFOLLOW relative to its
+// directory (inRootDir). A name with a trailing "/" asks for the directory
+// a link leads to, which the kernel would follow out of r: os.Root's
+// Chtimes sets its times.
+func (r rootFS) lchtimesAt(name string, atime, mtime time.Time) error {
+	if strings.HasSuffix(name, "/") {
+		return r.root.Chtimes(name, atime, mtime)
+	}
+	return inRootDir(r.root, name, "utimensat", func(dirFd int, elem string) error {
+		return utimensatNoFollow(dirFd, elem, atime, mtime)
+	})
+}
+
+// hostLchtimes sets the times of the file at path, a symbolic link itself
+// where it is one: utimensat(2) with AT_SYMLINK_NOFOLLOW.
+func hostLchtimes(path string, atime, mtime time.Time) error {
+	if err := utimensatNoFollow(hostAtFDCWD, path, atime, mtime); err != nil {
+		return &fs.PathError{Op: "utimensat", Path: path, Err: err}
+	}
+	return nil
+}
+
+// utimensatNoFollow is utimensat(2) of name relative to dirFd with
+// AT_SYMLINK_NOFOLLOW, which package syscall does not call here.
+func utimensatNoFollow(dirFd int, name string, atime, mtime time.Time) error {
+	p, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	times := [2]syscall.Timespec{utimensatTime(atime), utimensatTime(mtime)}
+	if _, _, errno := syscall.Syscall6(syscall.SYS_UTIMENSAT, uintptr(dirFd), uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&times[0])), hostAtSymlinkNofollow, 0, 0); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// utimensatTime is t as utimensat(2) takes it: the zero time leaves the
+// time as it is (UTIME_OMIT), as os.Chtimes has it.
+func utimensatTime(t time.Time) syscall.Timespec {
+	if t.IsZero() {
+		return syscall.Timespec{Nsec: hostUtimeOmit}
+	}
+	return syscall.NsecToTimespec(t.UnixNano())
+}
+
+// hostUtimeOmit is UTIME_OMIT of utimensat(2), which package syscall does
+// not name.
+const hostUtimeOmit = (1 << 30) - 2
+
+// hostDirOpen is the open of a directory an FS of it holds (osDir, the
+// file of a hostDir, a rootFS's at): O_PATH, which needs no permission to
+// read it.
+const hostDirOpen = openPath | syscall.O_DIRECTORY
+
+// hostDirAt returns /proc/self/fd/N for the directory open as f: a path
+// that leads to the directory itself wherever it is now, which a name of
+// it follows as the system's call relative to f does. A system without
+// /proc has none (errors.ErrUnsupported).
+func hostDirAt(f *os.File) (string, error) {
+	var at string
+	if !hostDescriptor(f, func(fd uintptr) { at = hostFDPath(fd) }) {
+		return "", &fs.PathError{Op: "openroot", Path: f.Name(), Err: errors.ErrUnsupported}
+	}
+	if err := sameFileAt(f, at); err != nil {
+		return "", &fs.PathError{Op: "openroot", Path: f.Name(), Err: errors.Join(errors.ErrUnsupported, err)}
+	}
+	return at, nil
+}
+
+// hostFDName returns the name the file open as f has now, the link of
+// /proc/self/fd/N, once a Stat of it finds that file there (sameFileAt).
+func hostFDName(f *os.File) (string, error) {
+	var name string
+	var err error
+	if !hostDescriptor(f, func(fd uintptr) { name, err = os.Readlink(hostFDPath(fd)) }) {
+		return "", &fs.PathError{Op: "readlink", Path: f.Name(), Err: errors.ErrUnsupported}
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, sameFileAt(f, name)
+}
+
+// openNoFollow opens name as OpenFile does with O_NOFOLLOW, which flag has
+// not: a symbolic link at its end is not followed (ELOOP), through one
+// openat(2) with O_NOFOLLOW relative to its directory (inRootDir).
+// os.Root's OpenFile, which follows a link inside the root whatever flag
+// says, is not used for it. A name with a trailing "/" asks for the
+// directory a link at its end leads to, which the kernel follows whatever
+// O_NOFOLLOW says: it is opened through os.Root, which refuses a link that
+// leads out of the root.
 func (r rootFS) openNoFollow(name string, flag int, perm os.FileMode) (File, error) {
 	if strings.HasSuffix(name, "/") {
 		return r.OpenFile(name, flag, perm)
@@ -498,7 +583,7 @@ func (r rootFS) openNoFollow(name string, flag int, perm os.FileMode) (File, err
 
 // hostFutimens sets the access and modification times of the file open as
 // f through its descriptor: utimensat(2) with no path.
-func hostFutimens(f *os.File, atime, mtime time.Time) error {
+func hostFutimens(_ FS, f *os.File, atime, mtime time.Time) error {
 	times := [2]syscall.Timespec{syscall.NsecToTimespec(atime.UnixNano()), syscall.NsecToTimespec(mtime.UnixNano())}
 	return atDirFile(f, f.Name(), "futimens", func(fd int) error {
 		if _, _, errno := syscall.Syscall6(syscall.SYS_UTIMENSAT, uintptr(fd), 0, uintptr(unsafe.Pointer(&times[0])), 0, 0, 0); errno != 0 {
