@@ -15,12 +15,14 @@ import (
 
 // spawnWithStreams starts argv with the guest's descriptors stdin, stdout
 // and stderr as its standard streams (-1 for the instance's) and returns
-// its pid token.
+// its pid token. w's FS becomes the whole host filesystem, in which argv[0]
+// is a name.
 func spawnWithStreams(t *testing.T, w *WasiStubs, m *Module, stdin, stdout, stderr int32, argv ...string) int32 {
 	t.Helper()
 	if _, err := os.Stat(argv[0]); err != nil {
 		t.Skipf("%s not available", argv[0])
 	}
+	w.cfg.FS = osFS{}
 	pathOff := writeCStr(m, 1000, argv[0])
 	argvOff := writeArgv(m, 2000, 3000, argv)
 	const pidOff int32 = 4000

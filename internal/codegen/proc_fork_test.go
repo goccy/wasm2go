@@ -393,11 +393,14 @@ func TestWasi_CloseErrorsAreReported(t *testing.T) {
 	}
 }
 
+// spawnTestProc starts argv as a command of w and returns its pid token.
+// w's FS becomes the whole host filesystem, in which argv[0] is a name.
 func spawnTestProc(t *testing.T, w *WasiStubs, m *Module, argv ...string) int32 {
 	t.Helper()
 	if _, err := os.Stat(argv[0]); err != nil {
 		t.Skipf("%s not available", argv[0])
 	}
+	w.cfg.FS = osFS{}
 	pathOff := writeCStr(m, 1000, argv[0])
 	argvOff := writeArgv(m, 2000, 3000, argv)
 	const pidOff int32 = 4000

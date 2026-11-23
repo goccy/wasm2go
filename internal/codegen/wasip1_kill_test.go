@@ -51,6 +51,7 @@ func TestKill_SIGKILLEndsTheWaitOfARegisteredGuest(t *testing.T) {
 
 func TestKill_AKilledProcessStartsNoCommand(t *testing.T) {
 	w, _ := newProcTestStubs(t)
+	w.cfg.FS = osFS{}
 	child, cm := killedInstance(t, w)
 	pathOff := writeCStr(cm, 1000, "/bin/sh")
 	argvOff := writeArgv(cm, 2000, 3000, []string{"/bin/sh", "-c", "exit 0"})
@@ -62,8 +63,9 @@ func TestKill_AKilledProcessStartsNoCommand(t *testing.T) {
 // A spawn that a SIGKILL reaches while the Exec hook runs starts nothing.
 func TestKill_ASpawnKilledInTheExecHookStartsNothing(t *testing.T) {
 	w, m := newSignalGuest(t)
+	w.cfg.FS = osFS{}
 	hooked := 0
-	w.cfg.Exec = func(string, []string) bool {
+	w.cfg.Exec = func(ExecRequest) bool {
 		hooked++
 		w.PostSignal(wasiSIGKILL)
 		return true

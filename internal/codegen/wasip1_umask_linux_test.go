@@ -69,10 +69,9 @@ func TestCreationThreadHasTheInstancesUmask(t *testing.T) {
 	}
 }
 
-// A command started on the creation thread runs in the host process's
-// working directory as it is when the command starts, not in the one of
-// the thread's unshare; a relative directory is taken from it. After
-// CloseAll the instance makes no creation thread.
+// A command started on the creation thread runs in its directory, not in
+// the working directory of the thread's unshare. After CloseAll the
+// instance makes no creation thread.
 func TestCreationThreadStartsCommandsInTheHostsDirectory(t *testing.T) {
 	if !creationThreads(t) {
 		t.Skip("the system refuses a creation thread")
@@ -89,14 +88,12 @@ func TestCreationThreadStartsCommandsInTheHostsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(later)
-	for _, c := range []struct{ dir, want string }{{"", later}, {"sub", filepath.Join(later, "sub")}} {
+	w.cfg.FS = osFS{}
+	for _, c := range []struct{ dir, want string }{{later, later}, {filepath.Join(later, "sub"), filepath.Join(later, "sub")}} {
 		out.Reset()
 		pathOff := writeCStr(m, 1000, "/bin/sh")
 		argvOff := writeArgv(m, 2000, 3000, []string{"/bin/sh", "-c", "pwd -P"})
-		cwdOff := int32(0)
-		if c.dir != "" {
-			cwdOff = writeCStr(m, 3800, c.dir)
-		}
+		cwdOff := writeCStr(m, 3800, c.dir)
 		if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, cwdOff, 4000); rc != _wasiESUCCESS {
 			t.Fatalf("Proc_spawn rc=%d", rc)
 		}

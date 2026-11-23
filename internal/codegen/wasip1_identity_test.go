@@ -246,7 +246,7 @@ func TestProcKillMapsTheSignalForASpawnedProcess(t *testing.T) {
 	if err != nil {
 		t.Skip("no sleep command on this host")
 	}
-	w := NewWASI(WASIConfig{Exec: AllowAllExec})
+	w := NewWASI(WASIConfig{FS: osFS{}, Exec: AllowAllExec})
 	m := newForkTestModule()
 	const pathPtr, argvPtr, arg0Ptr, arg1Ptr, pidPtr, statusPtr = 1024, 2048, 2100, 2200, 3000, 3008
 	copy(m.memory[pathPtr:], path+"\x00")

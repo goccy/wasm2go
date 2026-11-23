@@ -325,7 +325,7 @@ func TestWasi_SpawnWithClosedStandardOutput(t *testing.T) {
 	if _, err := os.Stat("/bin/echo"); err != nil {
 		t.Skip("/bin/echo not available")
 	}
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	var out bytes.Buffer
 	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
 	closeTestFd(t, w, m, 1)
@@ -355,7 +355,7 @@ func TestWasi_SpawnWithSocketAsStandardStream(t *testing.T) {
 	if _, err := os.Stat("/bin/echo"); err != nil {
 		t.Skip("/bin/echo not available")
 	}
-	w, m := newTestStubs(t, t.TempDir())
+	w, m := newTestStubs(t, "/")
 	var out bytes.Buffer
 	w.cfg.Stdin, w.cfg.Stdout, w.cfg.Stderr = bytes.NewReader(nil), &out, &bytes.Buffer{}
 	local, peer := net.Pipe()
