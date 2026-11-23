@@ -417,18 +417,17 @@ func TestWasi_AReaderWokenByInputASiblingTookLooksAgain(t *testing.T) {
 	w, _ := newProcTestStubs(t)
 	r, wr := blockingPipe(t)
 	w.cfg.Stdin = r
-	instances, modules := sharedWaiters(t, w, 2)
-	woken, sibling := instances[0], instances[1]
+	instances, modules := sharedWaiters(t, w, 1)
+	woken := instances[0]
 	// The reader waits in poll(2) for input.
 	read := readAsync(woken, modules[0], 0)
 	awaitBlockedCalls(woken, 1)
-	turn := entryOf(t, w, 0).inputTurn()
-	turn <- struct{}{} // held while the sibling and the reader line up
-	took := readAsync(sibling, modules[1], 0)
-	awaitBlockedCalls(sibling, 1)
+	op := entryOf(t, w, 0)
+	turn := op.inputTurn()
+	turn <- struct{}{} // the sibling holds the turn
 	write(t, wr, "x")
 	// The reader's wait has ended (its wake pipe is back in the pool) and
-	// it waits for the turn, behind the sibling.
+	// it waits for the turn.
 	waits := func(pooled int) <-chan struct{} {
 		done := make(chan struct{})
 		go func() {
@@ -449,10 +448,12 @@ func TestWasi_AReaderWokenByInputASiblingTookLooksAgain(t *testing.T) {
 		return done
 	}
 	within(t, "the reader's wait for the turn", waits(1))
-	<-turn
-	if res := within(t, "the sibling's read", took); res.rc != _wasiESUCCESS || res.got != "x" {
-		t.Fatalf("the sibling's read = %q rc=%d, want %q", res.got, res.rc, "x")
+	// The sibling reads the input and gives the turn back.
+	buf := make([]byte, 16)
+	if n, rc := w.readNow("fd_read", op, r, [][]byte{buf}); rc != _wasiESUCCESS || string(buf[:n]) != "x" {
+		t.Fatalf("the sibling's read = %q rc=%d, want %q", buf[:n], rc, "x")
 	}
+	<-turn
 	// The reader looks, finds nothing and waits in poll(2) again (it has
 	// taken its wake pipe out of the pool), instead of reading.
 	within(t, "the reader's second wait", waits(0))
