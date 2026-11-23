@@ -506,8 +506,14 @@ func TestSocket_UnixPaths(t *testing.T) {
 // Two connected sockets of a pair; datagrams keep their boundaries.
 func TestSocket_Pairs(t *testing.T) {
 	w, m, _ := newSocketStubs(t)
-	if rc := w.Sock_socketpair(m, wasiSockFamilyIPv4, wasiSockTypeStream, sockFdsOff); rc != -_wasiEAFNOSUPPORT {
-		t.Fatalf("pair of IPv4 sockets rc=%d, want -EAFNOSUPPORT", rc)
+	// An IP family has no pairs (EOPNOTSUPP), as socketpair(2) has it.
+	for _, family := range []int32{wasiSockFamilyIPv4, wasiSockFamilyIPv6} {
+		if rc := w.Sock_socketpair(m, family, wasiSockTypeStream, sockFdsOff); rc != -_wasiENOTSUP {
+			t.Fatalf("pair of family %d rc=%d, want -ENOTSUP", family, rc)
+		}
+	}
+	if rc := w.Sock_socketpair(m, 99, wasiSockTypeStream, sockFdsOff); rc != -_wasiEAFNOSUPPORT {
+		t.Fatalf("pair of family 99 rc=%d, want -EAFNOSUPPORT", rc)
 	}
 	for _, typ := range []int32{wasiSockTypeStream, wasiSockTypeDgram} {
 		if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, typ, sockFdsOff); rc != _wasiESUCCESS {

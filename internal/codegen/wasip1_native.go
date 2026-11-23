@@ -13411,8 +13411,10 @@ func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen,
 // wasip1_posix_extension, name "sock_socketpair") backing socketpair(): two
 // Unix-domain sockets of the type (wasiSockType*) connected to each other,
 // whose fds it writes (two u32) at fdsOutPtr. Returns 0 or a negative
-// errno: EAFNOSUPPORT for a family other than Unix, ENOTSUP on a host whose
-// sockets the runtime does not make, and the host's.
+// errno: ENOTSUP (EOPNOTSUPP) for an IP family, which has no pairs, as
+// socketpair(2) has it, EAFNOSUPPORT for a family other than those and
+// Unix, ENOTSUP on a host whose sockets the runtime does not make, and the
+// host's.
 func (w *WasiStubs) Sock_socketpair(m *Module, family, typ, fdsOutPtr int32) int32 {
 	return w.sockSocketpair(m, family, typ, zext(fdsOutPtr))
 }
@@ -13428,6 +13430,8 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 	switch {
 	case out == nil:
 		return -_wasiEFAULT
+	case family == wasiSockFamilyIPv4, family == wasiSockFamilyIPv6:
+		return -_wasiENOTSUP
 	case family != wasiSockFamilyUnix:
 		return -_wasiEAFNOSUPPORT
 	case typ != wasiSockTypeStream && typ != wasiSockTypeDgram:
