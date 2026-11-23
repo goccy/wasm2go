@@ -236,7 +236,12 @@ signals the runtime raises for a guest itself (the interval timer's
 `SIGALRM`, a child's `SIGCHLD` once its status can be waited for, a
 `kill` of its own pid, a raise, the `SIGPIPE` of a write that fails
 with `EPIPE`) before the guest is given them; one it takes is not the
-guest's. `ForkProc` forks an instance that its
+guest's. `SignalIgnored` is asked of a signal the guest leaves at its
+default action whether the process the guest runs as ignores it by an
+action the guest did not set (inherited when the process started, or
+set by code outside the guest); the guest then takes `SIG_IGN` as its
+own action. A nil one is an isolated guest, which starts with every
+signal at its default action. `ForkProc` forks an instance that its
 parent waits for, under a pid token the fork knows as its own. The
 pid tokens of the forks and the commands a guest starts are numbers
 from 4194304 up, above every pid Linux and darwin hand out, so a token

@@ -3399,6 +3399,18 @@ type WASIConfig struct {
 	// must not wait for another thread's write to the guest's standard
 	// output or error. nil gives every such signal to the guest.
 	TakeSignal func(target SignalTarget, sig int32) (taken bool, err error)
+	// SignalIgnored is asked whether sig, the guest's number for a signal
+	// the guest leaves at its default action, is ignored by the process the
+	// guest runs as, by an action the guest did not set: inherited when the
+	// process started (nohup), or set by code outside the guest that shares
+	// the process (Proc_signal_ignored). target is the instance that asks;
+	// a forked instance has its parent's SignalIgnored. When it reports
+	// true, the guest takes SIG_IGN as its own action of the signal. Its
+	// error is told Errors (op "signal_ignored"), and the guest keeps the
+	// default action. It is called with no lock of the instance's state or
+	// signals held. nil is an isolated guest: it starts with every signal at
+	// its default action.
+	SignalIgnored func(target SignalTarget, sig int32) (ignored bool, err error)
 	// Users is the user and group database of getpwnam, getgrgid and the
 	// like. nil is an empty one: every lookup fails with ENOENT. HostUsers
 	// gives the host's.
@@ -20038,6 +20050,33 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 // Proc_signal_dispositions64 is Proc_signal_dispositions for a memory64 guest.
 func (w *WasiStubs) Proc_signal_dispositions64(m *Module, handled, ignored, blocked int64) int32 {
 	return w.Proc_signal_dispositions(m, handled, ignored, blocked)
+}
+
+// Proc_signal_ignored is a NON-STANDARD host import (name
+// "proc_signal_ignored"), which the guest asks of a signal it leaves at its
+// default action: 1 when the process it runs as ignores sig by an action
+// the guest did not set (WASIConfig.SignalIgnored), and the guest takes
+// SIG_IGN as its own action; 0 otherwise — without a SignalIgnored, for
+// SIGKILL, SIGSTOP or a number that is no signal's, and when SignalIgnored
+// fails (told Errors).
+func (w *WasiStubs) Proc_signal_ignored(m *Module, sig int32) int32 {
+	if w.cfg.SignalIgnored == nil || wasiSignalBit(sig) == 0 || sig == wasiSIGKILL || sig == wasiSIGSTOP {
+		return 0
+	}
+	ignored, err := w.cfg.SignalIgnored(w, sig)
+	if err != nil {
+		w.reportError("signal_ignored", err)
+		return 0
+	}
+	if ignored {
+		return 1
+	}
+	return 0
+}
+
+// Proc_signal_ignored64 is Proc_signal_ignored for a memory64 guest.
+func (w *WasiStubs) Proc_signal_ignored64(m *Module, sig int32) int32 {
+	return w.Proc_signal_ignored(m, sig)
 }
 
 // Proc_signal_take is a NON-STANDARD host import (name "proc_signal_take").
