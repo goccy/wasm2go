@@ -14616,8 +14616,8 @@ func (w *WasiStubs) procSetenv(m *Module, namePtr uint64, nameLen int32, valuePt
 // getpwuid, getpwnam and getpwent, and getgrgid, getgrnam and getgrent find.
 // ListUsers and ListGroups return the entries in the order the guest goes
 // through them: an instance asks for them when its guest starts going
-// through the database (its first getpwent, or getgrent, after setpwent,
-// endpwent or the end of a walk, or its first of all) and answers the
+// through the database (its first getpwent, or getgrent, after setpwent
+// or endpwent, or its first of all) and answers the
 // guest's next calls from what it got, so a walk sees the database as it
 // was at its start; a forked instance goes on with the walk of the instance
 // it was forked from. A lookup that finds nothing returns an error that is
@@ -15803,9 +15803,10 @@ func (w *WasiStubs) hostNumberAt(m *Module, family, index int32, namePtr uint64,
 // ----- the system logger -------------------------------------------------------
 
 // Syslogger is a system logger as a guest's syslog(3) uses it
-// (WASIConfig.Syslog). An error of its methods fails the guest's call with
-// the errno wasiErrnoOf gives, and is told WASIConfig.Errors: the guest's
-// openlog, syslog and closelog return nothing.
+// (WASIConfig.Syslog). An error of its methods in the guest's openlog,
+// syslog and closelog fails the guest's call with the errno wasiErrnoOf
+// gives, and is told WASIConfig.Errors, as those return nothing to the
+// guest's program; the error of a Close that CloseAll makes is CloseAll's.
 //
 // An instance and the instances forked from it share the Syslogger, each
 // calling it from its own goroutine, without any lock of the WasiStubs
@@ -15860,9 +15861,9 @@ const (
 // LOG_PID; an ident of "" is the name of the program (os.Args[0]). A write
 // that fails over a connection made earlier is made again over a new one,
 // as syslog(3) does for a daemon that was restarted. The error of
-// connecting or writing is the call's; where the runtime has no local
-// syslog daemon to connect to (windows, plan9) it is errors.ErrUnsupported.
-// LOG_CONS changes nothing.
+// connecting or writing is the call's; on a system other than darwin and
+// linux, where the runtime has no local syslog daemon to connect to, it is
+// errors.ErrUnsupported. LOG_CONS changes nothing.
 func HostSyslog() Syslogger { return &hostSyslogger{dial: dialHostSyslog} }
 
 // hostSyslogger is the Syslogger HostSyslog returns. conn is its
@@ -15902,13 +15903,15 @@ func (l *hostSyslogger) Log(msg SyslogMessage) error {
 	defer l.mu.Unlock()
 	var stale error
 	if l.conn != nil {
-		if _, err := io.WriteString(l.conn, line); err == nil {
+		_, err := io.WriteString(l.conn, line)
+		if err == nil {
 			return nil
 		}
 		// The connection made before the daemon was restarted fails; the
 		// write over a new one is the message's answer, as for glibc's
-		// __vsyslog_internal and package log/syslog's writeAndRetry.
-		stale = l.conn.Close()
+		// __vsyslog_internal and package log/syslog's writeAndRetry, so the
+		// errors of the old one are the call's only when that fails too.
+		stale = errors.Join(err, l.conn.Close())
 		l.conn = nil
 	}
 	conn, err := l.dial()
@@ -15916,8 +15919,10 @@ func (l *hostSyslogger) Log(msg SyslogMessage) error {
 		return errors.Join(stale, err)
 	}
 	l.conn = conn
-	_, err = io.WriteString(conn, line)
-	return errors.Join(stale, err)
+	if _, err := io.WriteString(conn, line); err != nil {
+		return errors.Join(stale, err)
+	}
+	return nil
 }
 
 // Close closes the connection; a message logged later connects again.

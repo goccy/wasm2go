@@ -621,6 +621,11 @@ func (d *fakeSyslogDaemon) stop() {
 // line returns the next line written to the daemon.
 func (d *fakeSyslogDaemon) line() string {
 	d.t.Helper()
+	// The line was sent before line is called, so it is queued already:
+	// the deadline only makes a lost one fail the test instead of hanging.
+	if err := d.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		d.t.Fatal(err)
+	}
 	buf := make([]byte, 4096)
 	n, err := d.conn.Read(buf)
 	if err != nil {
@@ -634,6 +639,7 @@ func (d *fakeSyslogDaemon) line() string {
 // message's own ident and process id; a connection the daemon's restart
 // left behind is replaced, and Close closes it.
 func TestHostSyslogConnection(t *testing.T) {
+	// Not t.TempDir: its path can be too long for a socket's sun_path.
 	dir, err := os.MkdirTemp("", "syslog")
 	if err != nil {
 		t.Fatal(err)
@@ -702,4 +708,33 @@ func TestHostSyslogConnection(t *testing.T) {
 	if err := l.Open("prog", SyslogOptNDelay, 1); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("openlog with LOG_NDELAY without a daemon: %v, want ENOENT", err)
 	}
+	// The errors of the old connection are the call's only when the new
+	// one fails too.
+	dialErr = nil
+	errStale := errors.New("close of the old connection")
+	for _, msg := range []string{"five", "six"} {
+		if err := l.Log(SyslogMessage{Severity: 6, Facility: 1, Ident: "master", Message: msg}); err != nil {
+			t.Fatalf("message %s: %v", msg, err)
+		}
+		if got := daemon.line(); !strings.HasSuffix(got, " master: "+msg+"\n") {
+			t.Fatalf("the daemon got %q, want %s", got, msg)
+		}
+		// The next message finds the connection left behind.
+		l.conn = staleSyslogConn{Conn: l.conn, closeErr: errStale}
+	}
+	dialErr = syscall.ENOENT
+	if err := l.Log(SyslogMessage{Severity: 6, Facility: 1, Message: "seven"}); !errors.Is(err, syscall.EPIPE) || !errors.Is(err, errStale) || !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("a message neither connection took: %v, want EPIPE, the close's error and ENOENT", err)
+	}
 }
+
+// staleSyslogConn is a connection the daemon's restart left behind: its
+// writes fail with EPIPE, and its close fails with closeErr.
+type staleSyslogConn struct {
+	net.Conn
+	closeErr error
+}
+
+func (c staleSyslogConn) Write([]byte) (int, error) { return 0, syscall.EPIPE }
+
+func (c staleSyslogConn) Close() error { return errors.Join(c.Conn.Close(), c.closeErr) }
