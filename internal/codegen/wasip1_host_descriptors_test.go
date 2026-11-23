@@ -1805,3 +1805,94 @@ func TestHostDescriptorsPollerInAProcess(t *testing.T) {
 		t.Fatalf("descriptors before a pipe %v, after %v: the poller was made later", before, after)
 	}
 }
+
+// hostUnlistedEnv marks the process TestHostDescriptorsUnlisted starts.
+const hostUnlistedEnv = "WASM2GO_HOST_DESCRIPTORS_UNLISTED"
+
+// When the descriptors the process has open cannot be listed, every open
+// one is the process's but those the runtime has: the guest's dup2 onto
+// one is refused, while a file of Files at its own number and a dup2 onto
+// a free number are the guest's. It runs in a process of its own, whose
+// first instance with the host's descriptors finds no list.
+func TestHostDescriptorsUnlisted(t *testing.T) {
+	if os.Getenv(hostUnlistedEnv) != "" {
+		t.Skip("this is the process of the test")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHostDescriptorsUnlistedInAProcess$", "-test.v")
+	cmd.Env = append(os.Environ(), hostUnlistedEnv+"=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the process of the test: %v\n%s", err, out)
+	}
+}
+
+// TestHostDescriptorsUnlistedInAProcess is the process of
+// TestHostDescriptorsUnlisted.
+func TestHostDescriptorsUnlistedInAProcess(t *testing.T) {
+	if os.Getenv(hostUnlistedEnv) == "" {
+		t.Skip("run by TestHostDescriptorsUnlisted")
+	}
+	hostDescriptorsDir = filepath.Join(t.TempDir(), "missing")
+	own, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, own)
+	given, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	givenFD := int32(entryHostNumberOf(t, given))
+	var listErr error
+	w := NewWASI(WASIConfig{
+		FS:              newHostFS(t, t.TempDir()),
+		Stdin:           bytes.NewReader(nil),
+		Stdout:          &bytes.Buffer{},
+		Stderr:          &bytes.Buffer{},
+		Files:           map[int32]*os.File{givenFD: given},
+		HostDescriptors: true,
+		Errors: func(op string, err error) {
+			if op == "host_descriptors" && listErr == nil && errors.Is(err, os.ErrNotExist) {
+				listErr = err
+				return
+			}
+			t.Errorf("%s: %v", op, err)
+		},
+	})
+	t.Cleanup(func() {
+		if err := w.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	if listErr == nil {
+		t.Fatal("the failure to list the descriptors was not told")
+	}
+	m := newGuestModule(1 << 16)
+	fd := createTestFile(t, w, "a.txt")
+	if !w.hostSlotHeld(givenFD) {
+		t.Fatalf("the given %d is not the guest's slot", givenFD)
+	}
+	ownFD := entryHostNumberOf(t, own)
+	if rc := w.Fd_dup2(m, fd, int32(ownFD)); rc != _wasiEBUSY {
+		t.Fatalf("dup2 onto the process's %d rc=%d, want EBUSY", ownFD, rc)
+	}
+	if !sameHostFile(t, ownFD, int(givenFD)) {
+		t.Fatalf("the process's %d is not %s any more", ownFD, os.DevNull)
+	}
+	free := lowestFreeHost(t)
+	if rc := w.Fd_dup2(m, fd, free); rc != _wasiESUCCESS {
+		t.Fatalf("dup2 onto the free %d rc=%d", free, rc)
+	}
+	if !sameHostFile(t, int(free), int(fd)) {
+		t.Fatalf("host's %d is not the file", free)
+	}
+	// the number of the file of Files, once the guest closed it, is the
+	// process's when code outside the guest opens something there
+	closeTestFd(t, w, m, givenFD)
+	if err := hostDupTo(ownFD, int(givenFD)); err != nil {
+		t.Fatal(err)
+	}
+	closeFDAtEnd(t, int(givenFD))
+	if rc := w.Fd_dup2(m, fd, givenFD); rc != _wasiEBUSY {
+		t.Fatalf("dup2 onto the process's %d, closed by the guest and opened again, rc=%d, want EBUSY", givenFD, rc)
+	}
+}
