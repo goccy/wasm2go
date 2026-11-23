@@ -139,15 +139,52 @@ const hostSendsWithoutWaiting = false
 const hostPipeBuf = 512
 
 // hostWritesWithoutWaiting says that a write that waits to a descriptor in
-// blocking mode is not made in steps here (writeHostStream): darwin has no
-// write that does not wait in one call on such a descriptor, so the write is
-// one writev(2), which waits in the kernel, and a signal does not end it.
+// blocking mode is not made in steps here (writeHostStream), but to a pipe
+// (writesInSteps): darwin has no write that does not wait in one call on
+// such a descriptor, so the write is one writev(2), which waits in the
+// kernel, and a signal does not end it.
 const hostWritesWithoutWaiting = false
 
-// hostPipeWriteNow: darwin does not tell how to write to a pipe without
-// waiting whatever its mode.
+// hostPipeMaxSize is the largest buffer darwin gives a pipe (the last of
+// XNU's pipesize_blocks, BIG_PIPE_SIZE): a write that does not fit grows
+// the buffer up to that size before it takes anything.
+const hostPipeMaxSize = 65536
+
+// hostPipeWriteNow writes bufs to fd, a pipe, once without waiting whatever
+// the mode of its open file description (done): one writev(2) of no more
+// than the room its buffer has or grows to, hostPipeMaxSize less what it
+// holds (st_size of fstat(2)), and nothing (again) without room for bufs
+// whole when they are no more than PIPE_BUF, which a write takes at once,
+// or without any room, unless poll(2) reports it writable, which it then
+// is only for its reader having gone, and a write fails at once (EPIPE).
+// Where the system has no memory left to grow the buffer with, the write
+// waits in the kernel for the rest. A FIFO with a name, which darwin makes
+// no pipe of, is not written (not done).
 func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err error) {
-	return 0, false, false, nil
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(fd), &st); err != nil {
+		return 0, false, true, os.NewSyscallError("fstat", err)
+	}
+	if st.Nlink > 0 {
+		return 0, false, false, nil
+	}
+	total := 0
+	for _, buf := range bufs {
+		total += len(buf)
+	}
+	room := hostPipeMaxSize - int(st.Size)
+	if room <= 0 || total <= hostPipeBuf && room < total {
+		ready := []bool{false}
+		if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, nil, time.Now(), -1); err != nil {
+			return 0, false, true, err
+		}
+		if !ready[0] {
+			return 0, true, true, nil
+		}
+		room = total
+	}
+	n, again, err = writevRaw(fd, leadingBytes(bufs, room))
+	return n, again, true, err
 }
 
 // The numbers of recvmsg(2) and sendmsg(2).

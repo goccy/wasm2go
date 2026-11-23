@@ -11,6 +11,10 @@ import (
 // dupTo makes descriptor to a duplicate of from, closing what it was.
 func dupTo(from, to int) error { return syscall.Dup2(from, to) }
 
+// hostTellsPipeRoom reports whether the host tells how to write to a pipe
+// without waiting whatever its mode (hostPipeWriteNow): fstat(2) does.
+func hostTellsPipeRoom() bool { return true }
+
 // darwin makes getrandom by getentropy, 256 bytes a call, and refuses what
 // Linux refuses.
 func TestHostSyscalls_GetrandomOfDarwin(t *testing.T) {

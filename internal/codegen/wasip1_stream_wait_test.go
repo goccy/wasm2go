@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -693,15 +694,12 @@ func TestWasi_AnEmbeddersPolledStreamWaitsInTheGoRuntimesPoller(t *testing.T) {
 	}
 }
 
-// A write that waits to a descriptor in blocking mode (a pipe the process
-// inherited) is made in steps that do not wait in the kernel where the host
-// has such a write (hostWritesWithoutWaiting): a signal ends its wait for
-// room, with EINTR when it wrote nothing and the count otherwise.
+// A write that waits to a pipe in blocking mode (one the process
+// inherited) is made in steps that do not wait in the kernel
+// (writesInSteps): a signal ends its wait for room, with EINTR when it
+// wrote nothing and the count otherwise.
 func TestWasi_AWriteToABlockingPipeTakesASignal(t *testing.T) {
 	skipWithoutStreamWrites(t)
-	if !hostWritesWithoutWaiting {
-		t.Skip("a write that waits is one writev(2) here, which a signal does not end")
-	}
 	w, m := newSignalGuest(t, wasiSIGUSR1)
 	r, wr := blockingPipe(t)
 	w.cfg.Stdout = wr
@@ -722,6 +720,59 @@ func TestWasi_AWriteToABlockingPipeTakesASignal(t *testing.T) {
 		t.Fatalf("the next call that waits rc=%d, want EINTR", rc)
 	}
 	takeSignals(t, w, m)
+}
+
+// A write that does not wait to a pipe in blocking mode takes nothing from
+// a full pipe, from one with room the room the host has, more than
+// PIPE_BUF, in one call, and fails once the reader is gone
+// (hostPipeWriteNow).
+func TestHostPipeWriteNowTakesTheRoom(t *testing.T) {
+	r, wr := blockingPipe(t)
+	fillBlockingPipe(t, wr)
+	rc, err := wr.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write := func(size int) (int, bool) {
+		t.Helper()
+		var n int
+		var again, done bool
+		var writeErr error
+		if err := rc.Control(func(fd uintptr) {
+			n, again, done, writeErr = hostPipeWriteNow(fd, [][]byte{make([]byte, size)})
+		}); err != nil || writeErr != nil {
+			t.Fatal(err, writeErr)
+		}
+		if !done {
+			if hostTellsPipeRoom() {
+				t.Fatal("the host tells the room in a pipe, and the write did not use it")
+			}
+			t.Skip("the host does not tell the room in a pipe")
+		}
+		return n, again
+	}
+	if n, again := write(1); !again || n != 0 {
+		t.Fatalf("write to a full pipe = %d, again %v; want nothing, again", n, again)
+	}
+	if _, err := io.ReadFull(r, make([]byte, 4*hostPipeBuf)); err != nil {
+		t.Fatal(err)
+	}
+	if n, again := write(1 << 20); again || n <= hostPipeBuf {
+		t.Fatalf("write to a pipe with room = %d, again %v; want more than PIPE_BUF (%d)", n, again, hostPipeBuf)
+	}
+	// a full pipe whose reader is gone fails the write at once
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var writeErr error
+	if err := rc.Control(func(fd uintptr) {
+		_, _, _, writeErr = hostPipeWriteNow(fd, [][]byte{make([]byte, 1)})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(writeErr, syscall.EPIPE) {
+		t.Fatalf("write to a pipe without a reader: %v, want EPIPE", writeErr)
+	}
 }
 
 // fillBlockingPipe fills the pipe whose write end in blocking mode is wr,
