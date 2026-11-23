@@ -16429,7 +16429,12 @@ const (
 // HostIPC returns an IPC that reaches the System V IPC objects of the host,
 // which other processes of the system share, for WASIConfig.IPC. It has
 // them on Linux on amd64, arm64, riscv64 and loong64, whose structures are
-// the guest's; elsewhere every call fails with errors.ErrUnsupported. A
+// the guest's, and on darwin, whose structures it lays out as the guest's;
+// elsewhere every call fails with errors.ErrUnsupported. darwin has no
+// shmctl SHM_LOCK and SHM_UNLOCK (EINVAL), and no msgrcv MSG_EXCEPT and
+// MSG_COPY (errors.ErrUnsupported), and attaches a segment only where
+// nothing is mapped, which the guest's memory never is: ShmAttach and
+// ShmDetach fail with errors.ErrUnsupported there. A
 // call that the host process is interrupted in (EINTR) is made again. The
 // operations made with SEM_UNDO are undone when the host process ends, not
 // when the instance does. A store into a segment the guest attached
@@ -21046,8 +21051,12 @@ var (
 	//go:embed wasip1_native_terminal_darwin.go
 	wasip1NativeTerminalDarwinRaw []byte
 
+	//go:embed wasip1_native_ipc.go
+	wasip1NativeIPCRaw []byte
 	//go:embed wasip1_native_ipc_linux.go
 	wasip1NativeIPCLinuxRaw []byte
+	//go:embed wasip1_native_ipc_darwin.go
+	wasip1NativeIPCDarwinRaw []byte
 	//go:embed wasip1_native_ipc_other.go
 	wasip1NativeIPCOtherRaw []byte
 
@@ -21089,8 +21098,10 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
 		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
 
-		"wasip1_native_ipc_linux.go": wasip1NativeIPCLinuxRaw,
-		"wasip1_native_ipc_other.go": wasip1NativeIPCOtherRaw,
+		"wasip1_native_ipc.go":        wasip1NativeIPCRaw,
+		"wasip1_native_ipc_linux.go":  wasip1NativeIPCLinuxRaw,
+		"wasip1_native_ipc_darwin.go": wasip1NativeIPCDarwinRaw,
+		"wasip1_native_ipc_other.go":  wasip1NativeIPCOtherRaw,
 
 		"wasip1_syscalls_linux.go": wasip1SyscallsLinuxRaw,
 	} {
