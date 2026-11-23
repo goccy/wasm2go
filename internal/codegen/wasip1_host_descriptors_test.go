@@ -908,6 +908,11 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		if rc := w.Sock_connect_addr(m, first, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS {
 			t.Fatalf("first connect rc=%d", rc)
 		}
+		// the connect that waited reported the connection: none is left to
+		// report
+		if fop := entryOf(t, w, first); fop.sock.connecting != nil {
+			t.Fatal("a connection a connect waited for and reported is still to be reported")
+		}
 		next := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
 		postWhenBlocked(w, wasiSIGUSR1)
 		if rc := w.Sock_connect_addr(m, next, sockAddrOff, sockPathOff, n); rc != -_wasiEINTR {
@@ -917,10 +922,35 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		if _, rc := acceptOn(w, m, server); rc != _wasiESUCCESS {
 			t.Fatalf("accept rc=%d", rc)
 		}
-		// the connect that went on in the host is made once there is room:
-		// a connect waits for it, or finds it made
-		if rc := w.Sock_connect_addr(m, next, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS && rc != -_wasiEISCONN {
-			t.Fatalf("connect after the room was made rc=%d", rc)
+		// the connect that went on in the host makes the connection once
+		// there is room, and the next connect reports it made, without a
+		// connect of its own, which would wait for the listener's room
+		op := entryOf(t, w, next)
+		op.mu.Lock()
+		c := op.sock.connecting
+		op.mu.Unlock()
+		if c == nil {
+			t.Fatal("no connect under way in the host after the interrupted one")
+		}
+		within(t, "the connect in the host", c.done)
+		// (the guest's NONBLOCK on a description code outside the guest put
+		// back in blocking mode: the report does not wait either way)
+		if rc := w.Fd_fdstat_set_flags(m, next, wasiFdflagNonblock); rc != _wasiESUCCESS {
+			t.Fatalf("NONBLOCK rc=%d", rc)
+		}
+		if err := syscall.SetNonblock(int(next), false); err != nil {
+			t.Fatal(err)
+		}
+		var rc int32
+		returnsWithin(t, "sock_connect_addr", func() { rc = w.Sock_connect_addr(m, next, sockAddrOff, sockPathOff, n) })
+		if rc != _wasiESUCCESS {
+			t.Fatalf("connect after the connection was made in the host rc=%d", rc)
+		}
+		op.mu.Lock()
+		reported := op.sock.connecting == nil
+		op.mu.Unlock()
+		if !reported {
+			t.Fatal("the connection made in the host is still to be reported after a connect reported it")
 		}
 		if _, rc := acceptOn(w, m, server); rc != _wasiESUCCESS {
 			t.Fatalf("accept of the connection made in the host rc=%d", rc)

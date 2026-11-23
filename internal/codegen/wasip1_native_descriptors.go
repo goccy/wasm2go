@@ -644,8 +644,11 @@ func (w *WasiStubs) inheritedOutside() []commandDescriptor {
 	defer hostTable.mu.Unlock()
 	var out []commandDescriptor
 	for _, fd := range open {
+		if fd <= 2 || fd >= hostDescriptorFloor {
+			continue
+		}
 		n := int32(fd)
-		if n <= 2 || fd >= hostDescriptorFloor || w.fdTable[n] != nil || hostTable.held[fd] != nil || reservedLocked(fd) {
+		if w.fdTable[n] != nil || hostTable.held[fd] != nil || reservedLocked(fd) {
 			continue
 		}
 		if hostCloseOnExec(fd) {

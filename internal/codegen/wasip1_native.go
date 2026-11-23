@@ -11047,8 +11047,10 @@ type wasiSocket struct {
 	// its peer as the guest gave them (bind, connect), which getsockname
 	// and getpeername give back; empty for none given.
 	unixLocal, unixPeer string
-	// connecting is the connect(2) under way in the host of a socket in
-	// blocking mode (connectInTheHost), nil for none.
+	// connecting is the connect(2) a goroutine makes in the host of a
+	// socket in blocking mode (connectInTheHost), under way, or one that
+	// made the connection that no connect of the guest's has reported yet;
+	// nil for none.
 	connecting *hostConnecting
 }
 
@@ -11890,7 +11892,10 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 // (blockingAttempt). A signal posted to the guest meanwhile ends the call
 // with EINTR while the connect goes on in the host, as one interrupted by a
 // signal does; a connect of the socket while it is under way waits for it
-// too, or is EALREADY for a socket the guest set non-blocking. *started is
+// too, or is EALREADY for a socket the guest set non-blocking; one after
+// it made the connection reports that, once, as the connect that waited
+// would have (the host's connect of a connected socket can wait for the
+// listener's room before it tells EISCONN, Linux's AF_UNIX). *started is
 // what the guest's connect reports: the connect's result, EINPROGRESS for
 // a socket the guest set non-blocking, or EINTR. The host closes a socket
 // the guest closes meanwhile once the connect has returned.
@@ -11898,13 +11903,23 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 	op.mu.Lock()
 	c := op.sock.connecting
 	nonblocking := op.fdflags&wasiFdflagNonblock != 0
+	if c != nil && closed(c.done) {
+		// made the connection, which no connect has reported yet
+		op.sock.connecting = nil
+		op.mu.Unlock()
+		*started = nil
+		return _wasiESUCCESS
+	}
 	if c == nil {
 		c = &hostConnecting{done: make(chan struct{})}
 		op.sock.connecting = c
 		go func() {
 			c.errno = w.socketCall(call, host, func(fd int) { c.err = hostConnect(fd, a, hostPath) })
 			op.mu.Lock()
-			op.sock.connecting = nil
+			if c.errno != _wasiESUCCESS || c.err != nil {
+				// failed: a later connect makes an attempt of its own
+				op.sock.connecting = nil
+			}
 			op.mu.Unlock()
 			close(c.done)
 		}()
@@ -11928,8 +11943,23 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 		*started = syscall.EINTR
 		return _wasiESUCCESS
 	}
+	op.mu.Lock()
+	if op.sock.connecting == c {
+		op.sock.connecting = nil // reported
+	}
+	op.mu.Unlock()
 	*started = c.err
 	return c.errno
+}
+
+// closed reports whether done has been closed.
+func closed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
 }
 
 // Sock_name is a NON-STANDARD host import (module wasip1_posix_extension,
