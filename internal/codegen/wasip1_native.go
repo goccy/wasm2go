@@ -159,15 +159,19 @@ func (e *WasiExitError) endsInstance() {}
 
 func (e *WasiSignalError) endsInstance() {}
 
-// FS is the read/write filesystem backend the WASI host opens files through.
-// It abstracts the default os-backed filesystem so an embedder can supply an
-// alternative — an in-memory FS, an overlay, a read-only bundle, ... — and
-// have every guest path operation (open, stat, mkdir, readdir, write, ...)
-// routed to it. It is a write-capable superset of io/fs.FS.
+// FS is the read/write filesystem backend the WASI host opens files through:
+// a directory tree, whose methods are those of *os.Root with the names and
+// signatures os.Root gives them, so that an FS is written as code against
+// os.Root is. It abstracts the default os-backed filesystem so an embedder
+// can supply an alternative — an in-memory FS, an overlay, a read-only
+// bundle, ... — and have every guest path operation (open, stat, mkdir,
+// readdir, write, ...) routed to it. Where WASI needs what os.Root has no
+// method for, FS has one more: Unlink and Rmdir in place of Remove,
+// Lchtimes, and an OpenFile that honours syscall.O_NOFOLLOW.
 //
-// Names are GUEST paths relative to the preopen root, in the one form
+// Names are GUEST paths relative to the FS, in the one form
 // io/fs.ValidPath accepts: slash-separated, with no leading slash and no
-// empty, "." or ".." element, and "." for the root itself (e.g.
+// empty, "." or ".." element, and "." for the FS's directory itself (e.g.
 // "etc/app.conf"). A name the guest wrote with a trailing "/" (or "/.") is
 // given with one trailing "/", which asks for a directory: an operation on
 // a name that is not one fails with syscall.ENOTDIR (as a host's does), and
@@ -176,40 +180,64 @@ func (e *WasiSignalError) endsInstance() {}
 // does, through Lstat and Readlink: ".." of the root is the root, and a
 // link's absolute target leads from the root. Methods
 // should return the standard fs errors (fs.ErrNotExist, fs.ErrExist,
-// fs.ErrPermission) so the host maps them to the right wasi errno.
+// fs.ErrPermission) so the host maps them to the right wasi errno; an FS
+// that cannot do what a method asks returns errors.ErrUnsupported (ENOSYS).
 //
 // What an FS can do beyond these methods it says by the optional
 // interfaces it implements, which the runtime asks for and nothing else:
-// ChownFS, MkfifoFS, LockFS, AccessFS and HostRootFS, and of its files
-// ChtimesFile and ChownFile (HostFS's FS also is an io.Closer). An FS that
-// wraps another keeps what the other can do by implementing the same
-// interfaces and calling the other's methods, but for one thing: on Linux
+// OpenRootFS, MkfifoFS, LockFS, AccessFS and HostRootFS, and of its files
+// ChtimesFile. Go's package os has none of them but OpenRootFS, whose OpenRoot
+// is os.Root's. An FS that wraps another keeps what the
+// other does by calling the other's methods, each of which is one
+// operation of the other, and keeps what the other can do beyond them by
+// implementing the same optional interfaces; but for one thing: on Linux
 // the files, directories and FIFOs HostFS's FS creates get the instance's
 // umask taken out by the host's kernel, which a default ACL of their
 // directory may stand in for, and those a wrapper of it creates get the
 // requested mode less the umask (see create).
 type FS interface {
-	// OpenFile mirrors os.OpenFile: flag is O_RDONLY/O_WRONLY/O_RDWR optionally
-	// OR'd with O_CREATE/O_EXCL/O_TRUNC/O_APPEND. The returned File must
-	// support the operations the mode implies.
+	// OpenFile opens name as os.Root.OpenFile does: flag is
+	// O_RDONLY/O_WRONLY/O_RDWR optionally OR'd with
+	// O_CREATE/O_EXCL/O_TRUNC/O_APPEND, and perm may carry the setuid,
+	// setgid and sticky bits. A symbolic link at the end of name is not
+	// followed when flag has syscall.O_NOFOLLOW, as with os.OpenFile (an
+	// open of one fails, ELOOP). The returned File must support the
+	// operations the mode implies.
 	OpenFile(name string, flag int, perm os.FileMode) (File, error)
 	Mkdir(name string, perm os.FileMode) error
 	// Chmod sets the permission bits of name, and its setuid, setgid and
 	// sticky bits from the corresponding os.FileMode flags.
 	Chmod(name string, mode os.FileMode) error
-	// Chtimes sets the access and modification times of name.
+	// Chown and Lchown change the owner and group of name, as
+	// os.Root.Chown and os.Root.Lchown do: Lchown a symbolic link itself.
+	// An id of -1 is left as it is.
+	Chown(name string, uid, gid int) error
+	Lchown(name string, uid, gid int) error
+	// Chtimes sets the access and modification times of name; Lchtimes
+	// those of a symbolic link itself, which os.Root has no method for
+	// (utimensat(2) with AT_SYMLINK_NOFOLLOW).
 	Chtimes(name string, atime, mtime time.Time) error
-	Remove(name string) error
+	Lchtimes(name string, atime, mtime time.Time) error
+	// Unlink removes the name of a file that is not a directory, as
+	// unlink(2) does (a directory: syscall.EISDIR), and Rmdir an empty
+	// directory, as rmdir(2) does (no directory: syscall.ENOTDIR).
+	// os.Root's Remove, which tries both, is not among them: what a name
+	// is may change between the guest's look and the removal.
+	Unlink(name string) error
+	Rmdir(name string) error
 	Rename(oldName, newName string) error
 	Stat(name string) (os.FileInfo, error)
 	Lstat(name string) (os.FileInfo, error)
 	Symlink(oldName, newName string) error
 	Readlink(name string) (string, error)
 	Link(oldName, newName string) error
+	// Close releases what the FS holds, as os.Root.Close does.
+	Close() error
 }
 
-// File is an open file handle returned by FS.OpenFile. *os.File satisfies it,
-// so the default os backend needs no wrapper.
+// File is an open file handle returned by FS.OpenFile, with the methods of
+// *os.File of the same names: *os.File satisfies it, so the default os
+// backend needs no wrapper.
 type File interface {
 	Read(p []byte) (int, error)
 	ReadAt(p []byte, off int64) (int, error)
@@ -223,17 +251,24 @@ type File interface {
 	Truncate(size int64) error
 	// Chmod sets the mode of the open file, as FS.Chmod does by name.
 	Chmod(mode os.FileMode) error
+	// Chown changes the owner and group of the open file (fchown).
+	Chown(uid, gid int) error
 	Name() string
 }
 
-// ChownFS is an FS whose files have owners the guest can change (chown,
-// lchown). The guest of an FS that is not a ChownFS fails them with ENOSYS.
-type ChownFS interface {
+// OpenRootFS is an FS that opens a directory of its own as an FS, as
+// os.Root.OpenRoot does: the names of the FS OpenRoot returns are relative
+// to that directory, which it finds wherever it is now, across renames.
+// Its Close releases what it holds. HostFS's do so but where an FS of a
+// directory of HostFS(dir) cannot hold the directory itself (an instance
+// whose descriptors are the host process's, a directory that may not be
+// searched, or one whose name another took while it was opened) and on
+// darwin for HostFS("/"): there a name is looked up from the name the
+// directory has now, so a rename between the look and the call can make
+// it act on another directory (inside the root, for HostFS(dir)).
+type OpenRootFS interface {
 	FS
-	// Chown changes the owner and group of name; -1 leaves an id as it is.
-	// With follow false a symbolic link itself is changed, not the file it
-	// names. errors.ErrUnsupported is ENOSYS to the guest.
-	Chown(name string, uid, gid int, follow bool) error
+	OpenRoot(name string) (FS, error)
 }
 
 // MkfifoFS is an FS that makes FIFOs (mkfifo). The guest of an FS that is
@@ -275,14 +310,6 @@ type HostRootFS interface {
 type ChtimesFile interface {
 	File
 	Chtimes(atime, mtime time.Time) error
-}
-
-// ChownFile is a File whose owner and group are changed through it
-// (fchown), as *os.File's are. The guest's fchown of a file that is not a
-// ChownFile fails with ENOSYS.
-type ChownFile interface {
-	File
-	Chown(uid, gid int) error
 }
 
 // fileStat is what POSIX stat reports about a file beyond os.FileInfo. A
@@ -381,8 +408,10 @@ func unixModeBits(mode os.FileMode) uint32 {
 }
 
 // osFS is the FS HostFS returns for the whole host filesystem: a thin
-// pass-through, where the guest path name is the host path "/"+name.
-type osFS struct{}
+// pass-through, where the guest path name is the host path dir+"/"+name.
+// dir is empty for the root ("/"), and the path an FS of one of its
+// directories (osDir) finds the directory by.
+type osFS struct{ dir string }
 
 // HostFS returns the host filesystem under the host directory root as an FS:
 // the guest's "/" is root. An empty root is an error: it names no
@@ -415,10 +444,7 @@ type osFS struct{}
 // the guest ends — the open is made to return by opening the FIFO for
 // reading and writing, and both ends are closed again: a process that opens
 // the FIFO meanwhile finds that end, which goes away at once.
-func HostFS(root string) (interface {
-	FS
-	io.Closer
-}, error) {
+func HostFS(root string) (FS, error) {
 	switch {
 	case root == "":
 		return nil, errors.New("HostFS: empty root")
@@ -433,7 +459,11 @@ func HostFS(root string) (interface {
 	if err != nil {
 		return nil, errors.Join(err, r.Close())
 	}
-	return rootFS{root: r, escape: escape}, nil
+	at, err := runtimeFile(func() (*os.File, error) { return r.OpenFile(".", hostDirOpen, 0) })
+	if err != nil {
+		return nil, errors.Join(err, r.Close())
+	}
+	return rootFS{root: r, escape: escape, at: at}, nil
 }
 
 // rootEscapeOf returns the error r gives for a path that escapes it, which
@@ -455,17 +485,155 @@ func rootEscapeOf(r *os.Root) (error, error) {
 // Close does nothing: the whole host filesystem holds nothing open.
 func (osFS) Close() error { return nil }
 
-// HostRoot returns "/": a name of the whole host filesystem is the host's
-// path "/"+name.
-func (osFS) HostRoot() string { return "/" }
+// HostRoot returns the host directory a name is the path in: "/" for the
+// whole host filesystem.
+func (o osFS) HostRoot() string { return cmp.Or(o.dir, "/") }
 
 func (o osFS) join(name string) string {
-	// "." is the root itself: a call on "/" is the host's call on "/"
-	// (rmdir of it is EBUSY; of "/." it would be EINVAL).
+	// "." is the directory itself: a call on "/" is the host's call on
+	// "/" (rmdir of it is EBUSY; of "/." it would be EINVAL), and one of
+	// a directory's FS (osDir) the call relative to it on "." (dir is
+	// /proc/self/fd/N there, a link to the directory, which "." is not).
 	if name == "." {
-		return "/"
+		if o.dir == "" {
+			return "/"
+		}
+		return o.dir + "/."
 	}
-	return "/" + name // not path.Join, which would drop a trailing "/"
+	return o.dir + "/" + name // not path.Join, which would drop a trailing "/"
+}
+
+// OpenRoot returns the directory name as an FS of its own (osDir), whose
+// names are those of the whole host filesystem from the directory, as the
+// system's calls relative to a directory descriptor find them. Where the
+// system does not tell where a directory open is now (hostDirAt) it is
+// errors.ErrUnsupported. The directory's descriptor is one the runtime
+// makes for itself (runtimeFile).
+func (o osFS) OpenRoot(name string) (FS, error) {
+	f, err := runtimeFile(func() (*os.File, error) { return os.OpenFile(o.join(name), hostDirOpen, 0) })
+	if err != nil {
+		return nil, err
+	}
+	at, err := hostDirAt(f)
+	if err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return osDir{f: f, at: at}, nil
+}
+
+// osDir is an FS of a directory of the whole host filesystem
+// (osFS.OpenRoot): the directory open as f, whose names are the whole host
+// filesystem's from where it is now, so that a call through it does what
+// the system's call relative to its descriptor does. at is a path of the
+// host that leads to the directory itself wherever it is (/proc/self/fd/N
+// on Linux); where the system has none, the name the directory has now is
+// asked for on every call (hostFDName).
+type osDir struct {
+	f  *os.File
+	at string
+}
+
+// host returns the whole host filesystem from the directory. Where it is
+// found by the name the directory has now (darwin), a rename between that
+// look and the call makes the call by the old name.
+func (d osDir) host() (osFS, error) {
+	if d.at != "" {
+		return osFS{dir: d.at}, nil
+	}
+	dir, err := hostFDName(d.f)
+	if err != nil {
+		return osFS{}, err
+	}
+	return osFS{dir: dir}, nil
+}
+
+// do runs call on the whole host filesystem from the directory.
+func (d osDir) do(call func(o osFS) error) error {
+	o, err := d.host()
+	if err != nil {
+		return err
+	}
+	return call(o)
+}
+
+func (d osDir) OpenFile(name string, flag int, perm os.FileMode) (f File, err error) {
+	err = d.do(func(o osFS) error { f, err = o.OpenFile(name, flag, perm); return err })
+	return f, err
+}
+func (d osDir) OpenRoot(name string) (sub FS, err error) {
+	err = d.do(func(o osFS) error { sub, err = o.OpenRoot(name); return err })
+	return sub, err
+}
+func (d osDir) Mkdir(name string, perm os.FileMode) error {
+	return d.do(func(o osFS) error { return o.Mkdir(name, perm) })
+}
+func (d osDir) Chmod(name string, mode os.FileMode) error {
+	return d.do(func(o osFS) error { return o.Chmod(name, mode) })
+}
+func (d osDir) Chown(name string, uid, gid int) error {
+	return d.do(func(o osFS) error { return o.Chown(name, uid, gid) })
+}
+func (d osDir) Lchown(name string, uid, gid int) error {
+	return d.do(func(o osFS) error { return o.Lchown(name, uid, gid) })
+}
+func (d osDir) Chtimes(name string, atime, mtime time.Time) error {
+	return d.do(func(o osFS) error { return o.Chtimes(name, atime, mtime) })
+}
+func (d osDir) Lchtimes(name string, atime, mtime time.Time) error {
+	return d.do(func(o osFS) error { return o.Lchtimes(name, atime, mtime) })
+}
+func (d osDir) Unlink(name string) error { return d.do(func(o osFS) error { return o.Unlink(name) }) }
+func (d osDir) Rmdir(name string) error  { return d.do(func(o osFS) error { return o.Rmdir(name) }) }
+func (d osDir) Rename(a, b string) error { return d.do(func(o osFS) error { return o.Rename(a, b) }) }
+func (d osDir) Link(a, b string) error   { return d.do(func(o osFS) error { return o.Link(a, b) }) }
+func (d osDir) Symlink(target, name string) error {
+	return d.do(func(o osFS) error { return o.Symlink(target, name) })
+}
+func (d osDir) Stat(name string) (fi os.FileInfo, err error) {
+	err = d.do(func(o osFS) error { fi, err = o.Stat(name); return err })
+	return fi, err
+}
+func (d osDir) Lstat(name string) (fi os.FileInfo, err error) {
+	err = d.do(func(o osFS) error { fi, err = o.Lstat(name); return err })
+	return fi, err
+}
+func (d osDir) Readlink(name string) (target string, err error) {
+	err = d.do(func(o osFS) error { target, err = o.Readlink(name); return err })
+	return target, err
+}
+
+// Close closes the directory.
+func (d osDir) Close() error { return d.f.Close() }
+
+// sameFileAt returns nil when name is where the file open as f is: a Stat
+// of name finds that file. A name that leads elsewhere, or to nothing, is
+// ENOENT: the file has no name there now.
+func sameFileAt(f *os.File, name string) error {
+	at, err := os.Stat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return &fs.PathError{Op: "stat", Path: name, Err: syscall.ENOENT}
+	}
+	if err != nil {
+		return err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(at, fi) {
+		return &fs.PathError{Op: "stat", Path: name, Err: syscall.ENOENT}
+	}
+	return nil
+}
+
+// Chown changes the owner and group of a file of the host filesystem;
+// Lchown those of a symbolic link itself. -1 leaves an id as it is.
+func (o osFS) Chown(name string, uid, gid int) error  { return os.Chown(o.join(name), uid, gid) }
+func (o osFS) Lchown(name string, uid, gid int) error { return os.Lchown(o.join(name), uid, gid) }
+
+// Lchtimes sets the times of a symbolic link itself (hostLchtimes).
+func (o osFS) Lchtimes(name string, atime, mtime time.Time) error {
+	return hostLchtimes(o.join(name), atime, mtime)
 }
 func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	f, err := os.OpenFile(o.join(name), flag, perm)
@@ -476,7 +644,6 @@ func (o osFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 }
 func (o osFS) Mkdir(name string, perm os.FileMode) error { return os.Mkdir(o.join(name), perm) }
 func (o osFS) Chmod(name string, mode os.FileMode) error { return os.Chmod(o.join(name), mode) }
-func (o osFS) Remove(name string) error                  { return os.Remove(o.join(name)) }
 func (o osFS) Rename(a, b string) error                  { return hostRename(o.join(a), o.join(b)) }
 func (o osFS) Stat(name string) (os.FileInfo, error)     { return os.Stat(o.join(name)) }
 func (o osFS) Lstat(name string) (os.FileInfo, error)    { return os.Lstat(o.join(name)) }
@@ -484,12 +651,220 @@ func (o osFS) Symlink(target, name string) error         { return os.Symlink(tar
 func (o osFS) Readlink(name string) (string, error)      { return os.Readlink(o.join(name)) }
 func (o osFS) Link(a, b string) error                    { return os.Link(o.join(a), o.join(b)) }
 
+// hostDir is an FS of a directory of a HostFS of a directory
+// (rootFS.OpenRoot): a name is found from the directory os.Root holds (in),
+// which keeps track of it across renames, and a name os.Root refuses,
+// because a symbolic link leads it out of the directory, from the root, as
+// the name the directory has there now followed by the name (rootName), so
+// that the link leads where it points inside the root and the root refuses
+// what leads out of it. f is the directory open as a file, which tells
+// where it is (hostFDName). Where in is nil (openHostDir: an instance whose
+// descriptors are the host process's, a directory that may not be searched
+// when it is opened, or one whose name another took between the two
+// opens), every name is found from the root so; a rename between that look
+// and the call makes the call by the old name, one of the root's still.
+type hostDir struct {
+	in   *rootFS
+	f    *os.File
+	root rootFS
+}
+
+// openHostDir opens the directory name of at, a directory of root or root
+// itself, as an FS of root's (hostDir): its file through os.Root as a
+// descriptor the runtime makes for itself (runtimeFile), and the os.Root
+// of it (in) once it is found to be the same directory (sameRootDir: not
+// so for one that may not be searched, or whose name another took between
+// the two opens) and the runtime does not keep its descriptors above the
+// guests' numbers (runtimeFloor), as os.Root's descriptor cannot be moved
+// there; without in, names are found from the root, which is
+// errors.ErrUnsupported where the system does not tell where a directory
+// is (no /proc, a name longer than it tells).
+func openHostDir(at rootFS, name string, root rootFS) (FS, error) {
+	f, err := runtimeFile(func() (*os.File, error) { return at.root.OpenFile(at.name(name), hostDirOpen, 0) })
+	if err != nil {
+		return nil, at.refused(err)
+	}
+	var in *rootFS
+	if err := makeRuntimeDescriptors(func() error {
+		sub, err := at.root.OpenRoot(at.name(name))
+		if err != nil {
+			return err
+		}
+		if runtimeFloor() != 0 || !sameRootDir(sub, f) {
+			return sub.Close()
+		}
+		in = &rootFS{root: sub, escape: root.escape}
+		return nil
+	}); err != nil {
+		return nil, errors.Join(at.refused(err), f.Close())
+	}
+	if in == nil {
+		if _, err := rootRelName(root, f); err != nil {
+			return nil, &fs.PathError{Op: "openroot", Path: name, Err: errors.Join(errors.ErrUnsupported, err, f.Close())}
+		}
+	}
+	return hostDir{in: in, f: f, root: root}, nil
+}
+
+// sameRootDir reports whether the directory r holds is the one open as f.
+// One r may not search ("." is looked up) is taken for another.
+func sameRootDir(r *os.Root, f *os.File) bool {
+	a, err := r.Stat(".")
+	if err != nil {
+		return false
+	}
+	b, err := f.Stat()
+	return err == nil && os.SameFile(a, b)
+}
+
+// rootName is the root's name for name, a name of the directory, from
+// where the directory is now in the root (rootRelName).
+func (d hostDir) rootName(name string) (string, error) {
+	rel, err := rootRelName(d.root, d.f)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case rel == ".":
+		return name, nil
+	case name == ".":
+		return rel, nil
+	}
+	return rel + "/" + name, nil // not path.Join, which would drop a trailing "/"
+}
+
+// rootRelName returns r's name for the file open as f, from where both are
+// now (hostFDName): one outside r begins with "..", which r refuses as a
+// name that leads out of it.
+func rootRelName(r rootFS, f *os.File) (string, error) {
+	file, err := hostFDName(f)
+	if err != nil {
+		return "", err
+	}
+	root, err := hostFDName(r.at)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, file)
+	if err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// escaped reports whether err is in's refusal of a name that leads out of
+// the directory.
+func (d hostDir) escaped(err error) bool { return err != nil && errors.Is(err, d.root.escape) }
+
+// do runs call on in with name, and on the root with its name for name
+// where there is no in or in refuses the name for leading out. Where the
+// root has no name for it (rootName), in's refusal stands.
+func (d hostDir) do(name string, call func(r rootFS, name string) error) error {
+	var inErr error
+	if d.in != nil {
+		if inErr = call(*d.in, name); !d.escaped(inErr) {
+			return inErr
+		}
+	}
+	n, err := d.rootName(name)
+	if err != nil {
+		return cmp.Or(inErr, err)
+	}
+	return call(d.root, n)
+}
+
+// do2 is do for a call of two names.
+func (d hostDir) do2(a, b string, call func(r rootFS, a, b string) error) error {
+	var inErr error
+	if d.in != nil {
+		if inErr = call(*d.in, a, b); !d.escaped(inErr) {
+			return inErr
+		}
+	}
+	na, err := d.rootName(a)
+	if err != nil {
+		return cmp.Or(inErr, err)
+	}
+	nb, err := d.rootName(b)
+	if err != nil {
+		return cmp.Or(inErr, err)
+	}
+	return call(d.root, na, nb)
+}
+
+func (d hostDir) OpenFile(name string, flag int, perm os.FileMode) (f File, err error) {
+	err = d.do(name, func(r rootFS, name string) error { f, err = r.OpenFile(name, flag, perm); return err })
+	return f, err
+}
+
+// OpenRoot opens a directory of the directory as an FS of the root's, from
+// in or from the root as do finds names.
+func (d hostDir) OpenRoot(name string) (sub FS, err error) {
+	err = d.do(name, func(r rootFS, name string) error { sub, err = openHostDir(r, name, d.root); return err })
+	return sub, err
+}
+func (d hostDir) Mkdir(name string, perm os.FileMode) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Mkdir(name, perm) })
+}
+func (d hostDir) Chmod(name string, mode os.FileMode) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Chmod(name, mode) })
+}
+func (d hostDir) Chown(name string, uid, gid int) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Chown(name, uid, gid) })
+}
+func (d hostDir) Lchown(name string, uid, gid int) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Lchown(name, uid, gid) })
+}
+func (d hostDir) Chtimes(name string, atime, mtime time.Time) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Chtimes(name, atime, mtime) })
+}
+func (d hostDir) Lchtimes(name string, atime, mtime time.Time) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Lchtimes(name, atime, mtime) })
+}
+func (d hostDir) Unlink(name string) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Unlink(name) })
+}
+func (d hostDir) Rmdir(name string) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Rmdir(name) })
+}
+func (d hostDir) Rename(a, b string) error {
+	return d.do2(a, b, func(r rootFS, a, b string) error { return r.Rename(a, b) })
+}
+func (d hostDir) Link(a, b string) error {
+	return d.do2(a, b, func(r rootFS, a, b string) error { return r.Link(a, b) })
+}
+func (d hostDir) Symlink(target, name string) error {
+	return d.do(name, func(r rootFS, name string) error { return r.Symlink(target, name) })
+}
+func (d hostDir) Stat(name string) (fi os.FileInfo, err error) {
+	err = d.do(name, func(r rootFS, name string) error { fi, err = r.Stat(name); return err })
+	return fi, err
+}
+func (d hostDir) Lstat(name string) (fi os.FileInfo, err error) {
+	err = d.do(name, func(r rootFS, name string) error { fi, err = r.Lstat(name); return err })
+	return fi, err
+}
+func (d hostDir) Readlink(name string) (target string, err error) {
+	err = d.do(name, func(r rootFS, name string) error { target, err = r.Readlink(name); return err })
+	return target, err
+}
+
+// Close closes the directory, and the os.Root of it.
+func (d hostDir) Close() error {
+	if d.in == nil {
+		return d.f.Close()
+	}
+	return errors.Join(d.in.root.Close(), d.f.Close())
+}
+
 // rootFS is the FS HostFS returns for a root other than the whole host
 // filesystem: the host directory os.Root holds, which refuses every path
-// that escapes it with escape.
+// that escapes it with escape, and at, the same directory open as a file,
+// which tells where the root is now (hostFDName).
 type rootFS struct {
 	root   *os.Root
 	escape error
+	at     *os.File
 }
 
 // name is the guest path name as os.Root takes it: "." for the root itself.
@@ -516,6 +891,9 @@ func (r rootFS) refused(err error) error {
 const specialModeBits = os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 
 func (r rootFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	if hostONofollow != 0 && flag&hostONofollow != 0 {
+		return r.openNoFollow(name, flag&^hostONofollow, perm)
+	}
 	special := perm & specialModeBits
 	if special == 0 || flag&os.O_CREATE == 0 {
 		f, err := r.root.OpenFile(r.name(name), flag, perm.Perm())
@@ -616,7 +994,20 @@ func (r rootFS) Chmod(name string, mode os.FileMode) error {
 func (r rootFS) Chtimes(name string, atime, mtime time.Time) error {
 	return r.refused(r.root.Chtimes(r.name(name), atime, mtime))
 }
-func (r rootFS) Remove(name string) error { return r.refused(r.root.Remove(r.name(name))) }
+
+// Unlink and Rmdir remove a file and an empty directory, each refusing the
+// other kind, through one call relative to the name's directory where the
+// host has one (unlinkAt, rmdirAt).
+func (r rootFS) Unlink(name string) error { return r.refused(r.unlinkAt(r.name(name))) }
+func (r rootFS) Rmdir(name string) error  { return r.refused(r.rmdirAt(r.name(name))) }
+
+// Lchtimes sets the times of a symbolic link itself (lchtimesAt).
+func (r rootFS) Lchtimes(name string, atime, mtime time.Time) error {
+	return r.refused(r.lchtimesAt(r.name(name), atime, mtime))
+}
+
+// OpenRoot returns the directory name as an FS of its own (openHostDir).
+func (r rootFS) OpenRoot(name string) (FS, error) { return openHostDir(r, name, r) }
 
 // Rename renames as os.Root.Rename does, which (unlike rename(2)) may
 // refuse a rename onto an existing directory with EEXIST, as os.Rename
@@ -639,16 +1030,16 @@ func (r rootFS) Symlink(target, name string) error {
 	return r.refused(r.root.Symlink(target, r.name(name)))
 }
 
-// Chown changes the owner and group of a file, as osFS.Chown does.
-func (r rootFS) Chown(name string, uid, gid int, follow bool) error {
-	if follow {
-		return r.refused(r.root.Chown(r.name(name), uid, gid))
-	}
+// Chown and Lchown change the owner and group of a file, as osFS's do.
+func (r rootFS) Chown(name string, uid, gid int) error {
+	return r.refused(r.root.Chown(r.name(name), uid, gid))
+}
+func (r rootFS) Lchown(name string, uid, gid int) error {
 	return r.refused(r.root.Lchown(r.name(name), uid, gid))
 }
 
 // Close closes the root directory.
-func (r rootFS) Close() error { return r.root.Close() }
+func (r rootFS) Close() error { return errors.Join(r.at.Close(), r.root.Close()) }
 
 // noFS is the FS of a WASIConfig that names none: it has no file, so every
 // operation fails with fs.ErrNotExist (ENOENT).
@@ -658,8 +1049,12 @@ func (noFS) OpenFile(string, int, os.FileMode) (File, error) { return nil, fs.Er
 func (noFS) Mkdir(string, os.FileMode) error                 { return fs.ErrNotExist }
 func (noFS) Chmod(string, os.FileMode) error                 { return fs.ErrNotExist }
 func (noFS) Chtimes(string, time.Time, time.Time) error      { return fs.ErrNotExist }
-func (noFS) Chown(string, int, int, bool) error              { return fs.ErrNotExist }
-func (noFS) Remove(string) error                             { return fs.ErrNotExist }
+func (noFS) Lchtimes(string, time.Time, time.Time) error     { return fs.ErrNotExist }
+func (noFS) Chown(string, int, int) error                    { return fs.ErrNotExist }
+func (noFS) Lchown(string, int, int) error                   { return fs.ErrNotExist }
+func (noFS) Unlink(string) error                             { return fs.ErrNotExist }
+func (noFS) Rmdir(string) error                              { return fs.ErrNotExist }
+func (noFS) Close() error                                    { return nil }
 func (noFS) Rename(string, string) error                     { return fs.ErrNotExist }
 func (noFS) Stat(string) (os.FileInfo, error)                { return nil, fs.ErrNotExist }
 func (noFS) Lstat(string) (os.FileInfo, error)               { return nil, fs.ErrNotExist }
@@ -674,8 +1069,16 @@ func (noFS) Link(string, string) error                       { return fs.ErrNotE
 // for a lock of a file of it is called off when the guest stops waiting
 // (see LockFS): nothing of it is left to run.
 type MemFS struct {
-	mu   sync.Mutex
+	*memTree
+	// root is the directory the names are relative to: the tree's root,
+	// or the directory of a MemFS OpenRoot returned.
 	root *memNode
+}
+
+// memTree is what the MemFS values of one tree share: the one returned by
+// NewMemFS and those OpenRoot returns for its directories.
+type memTree struct {
+	mu sync.Mutex
 	// maxFileSize is the size a write or a truncation can make a file;
 	// NewMemFS sets it to memMaxFileSize.
 	maxFileSize int64
@@ -690,7 +1093,7 @@ type MemFS struct {
 // NewMemFS returns an empty in-memory filesystem with a root directory.
 func NewMemFS() *MemFS {
 	return &MemFS{root: &memNode{ino: 1, dir: true, mode: os.ModeDir | 0o755, modTime: time.Unix(0, 0), children: map[string]*memNode{}},
-		maxFileSize: memMaxFileSize, lastIno: 1}
+		memTree: &memTree{maxFileSize: memMaxFileSize, lastIno: 1}}
 }
 
 // newIno returns an inode number no other node of fsys has. Caller holds
@@ -738,6 +1141,9 @@ func memSplit(name string) []string {
 // lookup resolves name to a node. Caller holds fsys.mu.
 func (fsys *MemFS) lookup(name string) (*memNode, error) {
 	n := fsys.root
+	if n.unlinked {
+		return nil, fs.ErrNotExist // the directory of a view (OpenRoot) was removed
+	}
 	for _, part := range memSplit(name) {
 		if !n.dir {
 			return nil, syscall.ENOTDIR
@@ -761,6 +1167,9 @@ func (fsys *MemFS) lookupParent(name string) (*memNode, string, error) {
 		return nil, "", fs.ErrInvalid
 	}
 	n := fsys.root
+	if n.unlinked {
+		return nil, "", fs.ErrNotExist // the directory of a view (OpenRoot) was removed
+	}
 	for _, part := range parts[:len(parts)-1] {
 		c, ok := n.children[part]
 		if !ok {
@@ -825,27 +1234,71 @@ func (fsys *MemFS) Mkdir(name string, perm os.FileMode) error {
 	return nil
 }
 
-func (fsys *MemFS) Remove(name string) error {
+// Unlink removes the name of a file that is not a directory (EISDIR).
+func (fsys *MemFS) Unlink(name string) error { return fsys.remove("unlink", name, false) }
+
+// Rmdir removes an empty directory (ENOTDIR for a file, ENOTEMPTY).
+func (fsys *MemFS) Rmdir(name string) error { return fsys.remove("rmdir", name, true) }
+
+// remove removes name, a directory when dir is true and a file otherwise.
+func (fsys *MemFS) remove(op, name string, dir bool) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	parent, base, err := fsys.lookupParent(name)
 	if err != nil {
-		return &fs.PathError{Op: "remove", Path: name, Err: err}
+		return &fs.PathError{Op: op, Path: name, Err: err}
 	}
 	n, ok := parent.children[base]
 	switch {
 	case !ok:
-		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
-	case !n.dir && strings.HasSuffix(name, "/"):
-		return &fs.PathError{Op: "remove", Path: name, Err: syscall.ENOTDIR}
+		err = fs.ErrNotExist
+	case n.dir && !dir:
+		err = syscall.EISDIR
+	case !n.dir && (dir || strings.HasSuffix(name, "/")):
+		err = syscall.ENOTDIR
+	case n.dir && len(n.children) > 0:
+		err = syscall.ENOTEMPTY
 	}
-	if n.dir && len(n.children) > 0 {
-		return &fs.PathError{Op: "remove", Path: name, Err: syscall.ENOTEMPTY}
+	if err != nil {
+		return &fs.PathError{Op: op, Path: name, Err: err}
 	}
 	delete(parent.children, base)
 	n.unlinked = true
 	return nil
 }
+
+// OpenRoot returns the directory name as a MemFS of its own, which keeps
+// track of it across renames: it shares the tree.
+func (fsys *MemFS) OpenRoot(name string) (FS, error) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	n, err := fsys.lookup(name)
+	switch {
+	case err != nil:
+	case !n.dir:
+		err = syscall.ENOTDIR
+	}
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: name, Err: err}
+	}
+	return &MemFS{memTree: fsys.memTree, root: n}, nil
+}
+
+// Chown and Lchown fail: a MemFS keeps no owners (errors.ErrUnsupported).
+func (fsys *MemFS) Chown(name string, uid, gid int) error {
+	return &fs.PathError{Op: "chown", Path: name, Err: errors.ErrUnsupported}
+}
+func (fsys *MemFS) Lchown(name string, uid, gid int) error {
+	return &fs.PathError{Op: "lchown", Path: name, Err: errors.ErrUnsupported}
+}
+
+// Lchtimes is Chtimes: a MemFS has no symbolic links.
+func (fsys *MemFS) Lchtimes(name string, atime, mtime time.Time) error {
+	return fsys.Chtimes(name, atime, mtime)
+}
+
+// Close does nothing: a MemFS holds nothing of the host's.
+func (fsys *MemFS) Close() error { return nil }
 
 func (fsys *MemFS) Rename(oldName, newName string) error {
 	fsys.mu.Lock()
@@ -1087,6 +1540,11 @@ func (f *memFile) Close() error {
 	return nil
 }
 func (f *memFile) Sync() error { return nil }
+
+// Chown fails: a MemFS keeps no owners (errors.ErrUnsupported).
+func (f *memFile) Chown(uid, gid int) error {
+	return &fs.PathError{Op: "fchown", Path: f.node.name, Err: errors.ErrUnsupported}
+}
 
 // Chmod sets the permission bits of the open file.
 func (f *memFile) Chmod(mode os.FileMode) error {
@@ -5641,25 +6099,6 @@ func (w *WasiStubs) guestLstat(name string) (dir bool, target string, link bool,
 	return false, target, true, _wasiESUCCESS
 }
 
-// entryRemover is an FS that removes a name of a file, or of a directory,
-// in one call, so that a name that was another kind of file when the guest
-// looked is refused, not removed: removeFile as unlink(2) does, removeDir
-// as rmdir(2) does. The whole host filesystem is one, and HostFS of a
-// directory where the host has calls relative to a directory descriptor.
-type entryRemover interface {
-	removeFile(name string) error
-	removeDir(name string) error
-}
-
-// noFollowOpener is an FS that opens a name without following a symbolic
-// link at its end in one call (O_NOFOLLOW: ELOOP for a link), where an FS
-// that is not one is asked first whether the name is a link. The whole host
-// filesystem is one, and HostFS of a directory where the host has calls
-// relative to a directory descriptor.
-type noFollowOpener interface {
-	openNoFollow(name string, flag int, perm os.FileMode) (File, error)
-}
-
 // rootRelative returns the guest path name cleaned as chroot(2) sees it,
 // lexically: relative to the root, which ".." of the root is, and "." for
 // the root itself. Only the target of a symbolic link, which names nothing
@@ -6422,7 +6861,7 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 		return w.guestErrno("fd_filestat_set_times", f.Chtimes(atime, mtime))
 	}
 	if f, ok := op.f.(*os.File); ok {
-		if err := hostFutimens(f, atime, mtime); !errors.Is(err, errors.ErrUnsupported) {
+		if err := hostFutimens(fsys, f, atime, mtime); !errors.Is(err, errors.ErrUnsupported) {
 			return w.guestErrno("fd_filestat_set_times", err)
 		}
 	}
@@ -8656,6 +9095,7 @@ func (d *descriptorListing) Stat() (os.FileInfo, error) {
 func (d *descriptorListing) Sync() error                  { return nil }
 func (d *descriptorListing) Truncate(size int64) error    { return syscall.EISDIR }
 func (d *descriptorListing) Chmod(mode os.FileMode) error { return syscall.EPERM }
+func (d *descriptorListing) Chown(uid, gid int) error     { return syscall.EPERM }
 func (d *descriptorListing) Name() string                 { return d.info.name }
 
 // ReadDir returns every entry, whatever n is: the runtime reads a directory
@@ -9254,16 +9694,14 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	w.mu.Unlock()
 	// An open that does not wait is made as the runtime makes its own
 	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
-	// the other end (openFIFO) is moved up once it is made. fsOpen is the FS's
-	// open, or its open that does not follow a link (noFollowOpener, below).
+	// the other end (openFIFO) is moved up once it is made.
 	// inBlockingMode puts the file in blocking mode before it is moved up:
 	// the file of the moved descriptor is then one the Go runtime does not
 	// poll.
-	fsOpen := fsys.OpenFile
 	inBlockingMode := false
 	openFile := func(name string, flag int, perm os.FileMode) (f File, err error) {
 		err = makeRuntimeDescriptors(func() error {
-			if f, err = fsOpen(name, flag, perm); err != nil {
+			if f, err = fsys.OpenFile(name, flag, perm); err != nil {
 				return err
 			}
 			if inBlockingMode {
@@ -9324,19 +9762,23 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		flag = os.O_RDONLY
 	}
 
-	// When the guest opted out of symlink-follow, an FS that opens a name
-	// so in one call does (noFollowOpener); of any other the open is
-	// refused up-front if Lstat says the name is a symbolic link, which
-	// leaves a window between the two for the name to change. What the
-	// name is (a FIFO) is told by Lstat then, so the open does not wait for
-	// the other end of a FIFO a link leads to.
+	// When the guest opted out of symlink-follow, the FS is asked to open
+	// with O_NOFOLLOW (FS.OpenFile); where the host has no such flag the
+	// open is refused up-front if Lstat says the name is a symbolic link,
+	// which leaves a window between the two for the name to change. What
+	// the name is (a FIFO) is told by Lstat then, so the open does not wait
+	// for the other end of a FIFO a link leads to.
 	stat := fsys.Stat
 	if noFollow {
 		stat = fsys.Lstat
 	}
-	if opener, ok := fsys.(noFollowOpener); ok && noFollow {
-		fsOpen = opener.openNoFollow
-	} else if noFollow {
+	// O_CREAT|O_EXCL follows no link and refuses one (EEXIST), which
+	// O_NOFOLLOW would make ELOOP on darwin: the flag goes only to the opens
+	// that may follow.
+	exclusive := flag&(os.O_CREATE|os.O_EXCL) == os.O_CREATE|os.O_EXCL
+	if noFollow && hostONofollow != 0 && !exclusive {
+		flag |= hostONofollow
+	} else if noFollow && hostONofollow == 0 {
 		if li, lerr := fsys.Lstat(rel); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
 			// open(2)'s errnos for a symbolic link: EEXIST with
 			// O_CREAT|O_EXCL, ELOOP with O_NOFOLLOW otherwise
@@ -9486,21 +9928,7 @@ func (w *WasiStubs) pathUnlinkFile(m *Module, dirFd int32, pathPtr, pathLen uint
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	rel := name
-	if remover, ok := fsys.(entryRemover); ok {
-		return w.guestErrno("path_unlink_file", remover.removeFile(rel))
-	}
-	st, err := fsys.Lstat(rel)
-	if err != nil {
-		return w.guestErrno("path_unlink_file", err)
-	}
-	if st.IsDir() {
-		return _wasiEISDIR
-	}
-	if err := fsys.Remove(rel); err != nil {
-		return w.guestErrno("path_unlink_file", err)
-	}
-	return _wasiESUCCESS
+	return w.guestErrno("path_unlink_file", fsys.Unlink(name))
 }
 
 func (w *WasiStubs) Path_remove_directory(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -9529,21 +9957,7 @@ func (w *WasiStubs) pathRemoveDirectory(m *Module, dirFd int32, pathPtr, pathLen
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	rel := name
-	if remover, ok := fsys.(entryRemover); ok {
-		return w.guestErrno("path_remove_directory", remover.removeDir(rel))
-	}
-	st, err := fsys.Lstat(rel)
-	if err != nil {
-		return w.guestErrno("path_remove_directory", err)
-	}
-	if !st.IsDir() {
-		return _wasiENOTDIR
-	}
-	if err := fsys.Remove(rel); err != nil {
-		return w.guestErrno("path_remove_directory", err)
-	}
-	return _wasiESUCCESS
+	return w.guestErrno("path_remove_directory", fsys.Rmdir(name))
 }
 
 func (w *WasiStubs) Path_rename(m *Module, oldFd, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen int32) int32 {
@@ -9674,10 +10088,11 @@ func (w *WasiStubs) pathFilestatSetTimes(m *Module, dirFd, flags int32, pathPtr,
 		return w.guestErrno("path_filestat_set_times", statErr)
 	}
 	atime, mtime := resolveFiletimes(uint64(atim), uint64(mtim), fstFlags, st)
-	if err := fsys.Chtimes(rel, atime, mtime); err != nil {
-		return w.guestErrno("path_filestat_set_times", err)
+	chtimes := fsys.Chtimes
+	if !follow {
+		chtimes = fsys.Lchtimes
 	}
-	return _wasiESUCCESS
+	return w.guestErrno("path_filestat_set_times", chtimes(rel, atime, mtime))
 }
 
 func (o osFS) Chtimes(name string, atime, mtime time.Time) error {
@@ -16344,20 +16759,10 @@ func (w *WasiStubs) absoluteRecordLock(f *os.File, lk *recordLock) int32 {
 	return _wasiESUCCESS
 }
 
-// Chown changes the owner and group of a file of the host filesystem; -1
-// leaves an id as it is. With follow false a symbolic link itself is
-// changed, not the file it names.
-func (o osFS) Chown(name string, uid, gid int, follow bool) error {
-	if follow {
-		return os.Chown(o.join(name), uid, gid)
-	}
-	return os.Lchown(o.join(name), uid, gid)
-}
-
 // Path_chown is a NON-STANDARD host import (name "path_chown") backing
 // chown and lchown (follow 0) for the preopen-relative path; an id of -1
-// is left as it is. Returns 0, or a negative errno: ENOSYS when the
-// filesystem of the instance is no ChownFS.
+// is left as it is (FS.Chown, FS.Lchown). Returns 0, or a negative errno:
+// ENOSYS when the filesystem of the instance keeps no owners.
 func (w *WasiStubs) Path_chown(m *Module, pathPtr, pathLen, uid, gid, follow int32) int32 {
 	return w.pathChown(m, zext(pathPtr), pathLen, uid, gid, follow)
 }
@@ -16383,19 +16788,16 @@ func (w *WasiStubs) pathChown(m *Module, pathPtr uint64, pathLen, uid, gid, foll
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
-	owner, can := fsys.(ChownFS)
-	if !can {
-		return -_wasiENOSYS
+	chown := fsys.Chown
+	if follow == 0 {
+		chown = fsys.Lchown
 	}
-	if err := owner.Chown(path, int(uid), int(gid), follow != 0); err != nil {
-		return -w.guestErrno("path_chown", err)
-	}
-	return _wasiESUCCESS
+	return -w.guestErrno("path_chown", chown(path, int(uid), int(gid)))
 }
 
 // Fd_chown is a NON-STANDARD host import (name "fd_chown") backing fchown.
-// Returns 0, or a negative errno: ENOSYS for a descriptor whose file is no
-// ChownFile.
+// Returns 0, or a negative errno: ENOSYS for a descriptor whose file keeps
+// no owner, or that has no file.
 func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 	w.mu.Lock()
 	op := w.openLocked(fd)
@@ -16403,14 +16805,10 @@ func (w *WasiStubs) Fd_chown(m *Module, fd, uid, gid int32) int32 {
 	if op == nil {
 		return -_wasiEBADF
 	}
-	file, can := op.f.(ChownFile)
-	if !can {
+	if op.f == nil {
 		return -_wasiENOSYS
 	}
-	if err := file.Chown(int(uid), int(gid)); err != nil {
-		return -w.guestErrno("fd_chown", err)
-	}
-	return _wasiESUCCESS
+	return -w.guestErrno("fd_chown", op.f.Chown(int(uid), int(gid)))
 }
 
 // Fd_chown64 is Fd_chown for a memory64 guest.
@@ -19054,6 +19452,8 @@ var (
 	wasip1NativeOtherRaw []byte
 	//go:embed wasip1_native_hostfd.go
 	wasip1NativeHostFDRaw []byte
+	//go:embed wasip1_native_nolinux.go
+	wasip1NativeNoLinuxRaw []byte
 	//go:embed wasip1_native_descriptors.go
 	wasip1NativeDescriptorsRaw []byte
 	//go:embed wasip1_native_linux_msg.go
@@ -19098,11 +19498,12 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 	}
 	out := map[string][]byte{}
 	for name, raw := range map[string][]byte{
-		"wasip1_native_posix.go":  wasip1NativePosixRaw,
-		"wasip1_native_linux.go":  wasip1NativeLinuxRaw,
-		"wasip1_native_darwin.go": wasip1NativeDarwinRaw,
-		"wasip1_native_other.go":  wasip1NativeOtherRaw,
-		"wasip1_native_hostfd.go": wasip1NativeHostFDRaw,
+		"wasip1_native_posix.go":   wasip1NativePosixRaw,
+		"wasip1_native_linux.go":   wasip1NativeLinuxRaw,
+		"wasip1_native_darwin.go":  wasip1NativeDarwinRaw,
+		"wasip1_native_other.go":   wasip1NativeOtherRaw,
+		"wasip1_native_hostfd.go":  wasip1NativeHostFDRaw,
+		"wasip1_native_nolinux.go": wasip1NativeNoLinuxRaw,
 
 		"wasip1_native_descriptors.go": wasip1NativeDescriptorsRaw,
 

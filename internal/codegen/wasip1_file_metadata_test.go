@@ -279,7 +279,8 @@ func TestWasi_ChmodByPathAndDescriptor(t *testing.T) {
 // noOwnerFS is a filesystem whose Chown reports that it keeps no owners.
 type noOwnerFS struct{ FS }
 
-func (noOwnerFS) Chown(string, int, int, bool) error { return errors.ErrUnsupported }
+func (noOwnerFS) Chown(string, int, int) error  { return errors.ErrUnsupported }
+func (noOwnerFS) Lchown(string, int, int) error { return errors.ErrUnsupported }
 
 // A file's owner is changed by path, a symbolic link's own with follow 0,
 // and by descriptor. Giving a file to the user it belongs to is allowed to
@@ -883,8 +884,8 @@ func TestMemFS_RenameOntoAnExistingName(t *testing.T) {
 			t.Errorf("rename %s onto %s: %v (errno %d), want errno %d", c.from, c.to, err, errnoOfError(err), c.want)
 		}
 	}
-	if err := fsys.Remove("full"); errnoOfError(err) != _wasiENOTEMPTY {
-		t.Errorf("remove full: %v (errno %d), want ENOTEMPTY", err, errnoOfError(err))
+	if err := fsys.Rmdir("full"); errnoOfError(err) != _wasiENOTEMPTY {
+		t.Errorf("rmdir full: %v (errno %d), want ENOTEMPTY", err, errnoOfError(err))
 	}
 	for _, name := range []string{"file", "full/x", "dir/sub", "empty"} {
 		if _, err := fsys.Stat(name); err != nil {

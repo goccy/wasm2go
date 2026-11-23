@@ -381,15 +381,18 @@ func TestWasi_HostFSEscapeIsPermission(t *testing.T) {
 	_, statErr := fsys.Stat("../x")
 	_, lstatErr := fsys.Lstat("../x")
 	_, readlinkErr := fsys.Readlink("../x")
+	_, openRootErr := fsys.(OpenRootFS).OpenRoot("../x")
 	for name, err := range map[string]error{
 		"OpenFile": openErr,
+		"OpenRoot": openRootErr,
 		"Mkdir":    fsys.Mkdir("../x", 0o755),
 		"Chmod":    fsys.Chmod("../x", 0o644),
 		"Chtimes":  fsys.Chtimes("../x", time.Time{}, time.Time{}),
-		"Chown": fsys.(interface {
-			Chown(string, int, int, bool) error
-		}).Chown("../x", -1, -1, false),
-		"Remove":   fsys.Remove("../x"),
+		"Lchtimes": fsys.Lchtimes("../x", time.Time{}, time.Time{}),
+		"Chown":    fsys.Chown("../x", -1, -1),
+		"Lchown":   fsys.Lchown("../x", -1, -1),
+		"Unlink":   fsys.Unlink("../x"),
+		"Rmdir":    fsys.Rmdir("../x"),
 		"Rename":   fsys.Rename("../x", "y"),
 		"Stat":     statErr,
 		"Lstat":    lstatErr,

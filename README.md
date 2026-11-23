@@ -114,16 +114,28 @@ lexically); a nil one allows every access to the configured `FS`. The
 names of the guest's own descriptors (`/dev/fd/N`, `/proc/self/fd/N`,
 `/dev/stdin`, ...) are resolved without the `FS` by every path
 operation, and by those that take no directory descriptor even when
-there is no `FS`. What an `FS` can do beyond `FS`'s methods it says by the
-optional interfaces it implements, which the runtime asks for and
-nothing else: `ChownFS`, `MkfifoFS`, `LockFS`, `AccessFS` (`access`:
+there is no `FS`. `FS` has the methods of `*os.Root`, with the names
+and signatures `os.Root` gives them (`OpenFile`, `Mkdir`, `Chmod`,
+`Chown`, `Lchown`, `Chtimes`, `Rename`, `Stat`, `Lstat`,
+`Readlink`, `Link`, `Symlink`, `Close`), and `File` those of `*os.File`;
+where WASI needs what `os.Root` has no method for, `FS` has one more:
+`Unlink` and `Rmdir` in place of `Remove` (each refuses the other kind
+of file), `Lchtimes`, and an `OpenFile` that honours `syscall.O_NOFOLLOW`
+as `os.OpenFile` does. What an `FS` can do beyond `FS`'s methods it says
+by the optional interfaces it implements, which the runtime asks for
+and nothing else: `OpenRootFS` (`OpenRoot`, as `os.Root`'s: a directory
+as an `FS` of its own, which finds the directory wherever it is now;
+`HostFS`'s and `NewMemFS`'s are; the whole host filesystem's
+`OpenRoot` is `errors.ErrUnsupported` but on Linux and darwin),
+`MkfifoFS`, `LockFS`, `AccessFS` (`access`:
 `HostFS`'s ask the host, for the host process's ids, but for a
 `HostFS` of a directory on darwin and a name that is a symbolic link of
 one on Linux, answered by the mode bits; `NewMemFS`'s allows what its
 `open` allows; any other `FS` is answered by the mode bits, for the ids
-of `Process`) and `HostRootFS`, and of its files `ChtimesFile`
-and `ChownFile`; an `FS` that wraps another keeps them by implementing
-them and calling the other's. `Errors` is told the errors the guest cannot be given (nil drops them). Host
+of `Process`) and `HostRootFS`, and of its files `ChtimesFile`; an
+`FS` that wraps another keeps what the other does by calling its
+methods, and what it can do beyond them by implementing the same
+interfaces. `Errors` is told the errors the guest cannot be given (nil drops them). Host
 access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
 `AllowAllListen`, `AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
 host process has (its args, environment, stdio, the whole host

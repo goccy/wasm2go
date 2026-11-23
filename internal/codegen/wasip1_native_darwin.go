@@ -3,6 +3,7 @@
 package codegen
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -241,16 +242,102 @@ func hostAccess(path string, amode uint32, effective bool) (asked bool, err erro
 // rootAccess would be hostAccess for name in r; package syscall has no
 // call relative to a directory descriptor on this system, and a path of
 // the host is not looked up instead: errors.ErrUnsupported. For the same
-// reason a rootFS here removes and opens names through os.Root alone (it
-// has no removeFile, removeDir or openNoFollow).
+// reason a rootFS here removes, opens without following and sets the times
+// of a link after a look at the name (unlinkAt, rmdirAt, openNoFollow,
+// lchtimesAt).
 func rootAccess(r *os.Root, name string, amode uint32, effective bool) error {
 	return errors.ErrUnsupported
 }
 
-// hostFutimens would set the times of the file open as f through its
-// descriptor; package syscall has no such call with times in nanoseconds
-// here: errors.ErrUnsupported, and the times are set by the file's name.
-func hostFutimens(f *os.File, atime, mtime time.Time) error { return errors.ErrUnsupported }
+// unlinkAt and rmdirAt remove a file and an empty directory of r, after
+// Lstat finds the name is that kind (lstatRemove): package syscall has no
+// unlinkat here.
+func (r rootFS) unlinkAt(name string) error {
+	return lstatRemove(r.root.Lstat, r.root.Remove, name, false)
+}
+func (r rootFS) rmdirAt(name string) error {
+	return lstatRemove(r.root.Lstat, r.root.Remove, name, true)
+}
+
+// lchtimesAt sets the times of name of r, which is no symbolic link
+// (lstatChtimes): package syscall has no utimensat here.
+func (r rootFS) lchtimesAt(name string, atime, mtime time.Time) error {
+	return lstatChtimes(r.root.Lstat, r.root.Chtimes, name, atime, mtime)
+}
+
+// openNoFollow opens name of r, which is no symbolic link (lstatOpen):
+// package syscall has no openat here.
+func (r rootFS) openNoFollow(name string, flag int, perm os.FileMode) (File, error) {
+	return lstatOpen(r.root.Lstat, r.OpenFile, name, flag, perm)
+}
+
+// hostLchtimes sets the times of the file at path, which is no symbolic
+// link (lstatChtimes): package syscall has no lutimes here.
+func hostLchtimes(path string, atime, mtime time.Time) error {
+	return lstatChtimes(os.Lstat, os.Chtimes, path, atime, mtime)
+}
+
+// hostFutimens sets the times of the file open as f by the name it has now
+// in fsys (hostFDName): package syscall has no call through a descriptor
+// with times in nanoseconds here. Of the whole host filesystem that is the
+// host's name; of a HostFS of a directory the root's name for it, through
+// os.Root, which refuses a file that is no longer in the root
+// (rootRelName); of any other FS errors.ErrUnsupported, and the times are
+// set by the name the descriptor was opened under. A file that has no
+// name now (removed) is ENOENT.
+func hostFutimens(fsys FS, f *os.File, atime, mtime time.Time) error {
+	switch fsys := fsys.(type) {
+	case osFS:
+		name, err := hostFDName(f)
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(name, atime, mtime)
+	case rootFS:
+		name, err := rootRelName(fsys, f)
+		if err != nil {
+			return err
+		}
+		return fsys.Chtimes(name, atime, mtime)
+	}
+	return errors.ErrUnsupported
+}
+
+// hostDirOpen is the open of a directory an FS of it holds (osDir, the
+// file of a hostDir, a rootFS's at).
+const hostDirOpen = syscall.O_RDONLY | syscall.O_DIRECTORY
+
+// hostDirAt returns "" for the directory open as f, once it finds where
+// the directory is (hostFDName): darwin has no path that leads to a
+// directory wherever it is, so its name is asked for on every call.
+func hostDirAt(f *os.File) (string, error) {
+	_, err := hostFDName(f)
+	return "", err
+}
+
+// hostMaxPathLen is MAXPATHLEN of <sys/param.h>, the most F_GETPATH writes.
+const hostMaxPathLen = 1024
+
+// hostFDName returns the name the file open as f has now (fcntl F_GETPATH),
+// once a Stat of it finds that file there (sameFileAt).
+func hostFDName(f *os.File) (string, error) {
+	var buf [hostMaxPathLen]byte
+	var errno syscall.Errno
+	if !hostDescriptor(f, func(fd uintptr) {
+		_, _, errno = syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_GETPATH, uintptr(unsafe.Pointer(&buf[0])))
+	}) {
+		return "", &fs.PathError{Op: "fcntl", Path: f.Name(), Err: errors.ErrUnsupported}
+	}
+	if errno != 0 {
+		return "", &fs.PathError{Op: "fcntl", Path: f.Name(), Err: errno}
+	}
+	end := bytes.IndexByte(buf[:], 0)
+	if end < 0 {
+		return "", &fs.PathError{Op: "fcntl", Path: f.Name(), Err: syscall.ENAMETOOLONG}
+	}
+	name := string(buf[:end])
+	return name, sameFileAt(f, name)
+}
 
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,
 // recordLockSet and recordLockWait: fcntl's F_GETLK, F_SETLK and F_SETLKW,

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -103,7 +104,7 @@ func exerciseFS(t *testing.T, fsys FS, wantSymlinks bool) {
 		if _, err := fsys.Stat("d/c.txt"); err != nil {
 			t.Fatalf("Stat after Link: %v", err)
 		}
-		if err := fsys.Remove("d/c.txt"); err != nil {
+		if err := fsys.Unlink("d/c.txt"); err != nil {
 			t.Fatalf("Remove link: %v", err)
 		}
 	}
@@ -121,7 +122,7 @@ func exerciseFS(t *testing.T, fsys FS, wantSymlinks bool) {
 		if _, err := fsys.Lstat("d/s.txt"); err != nil {
 			t.Fatalf("Lstat symlink: %v", err)
 		}
-		if err := fsys.Remove("d/s.txt"); err != nil {
+		if err := fsys.Unlink("d/s.txt"); err != nil {
 			t.Fatalf("Remove symlink: %v", err)
 		}
 	} else {
@@ -151,11 +152,20 @@ func exerciseFS(t *testing.T, fsys FS, wantSymlinks bool) {
 	if err := dir.Close(); err != nil {
 		t.Fatalf("Close dir: %v", err)
 	}
-	if err := fsys.Remove("d/b.txt"); err != nil {
-		t.Fatalf("Remove: %v", err)
+	if err := fsys.Rmdir("d"); !errors.Is(err, syscall.ENOTEMPTY) && !errors.Is(err, syscall.EEXIST) {
+		t.Fatalf("Rmdir of a directory with a file: %v, want ENOTEMPTY", err)
 	}
-	if err := fsys.Remove("d"); err != nil {
-		t.Fatalf("Remove dir: %v", err)
+	if err := fsys.Rmdir("d/b.txt"); !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("Rmdir of a file: %v, want ENOTDIR", err)
+	}
+	if err := fsys.Unlink("d"); !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("Unlink of a directory: %v, want EISDIR", err)
+	}
+	if err := fsys.Unlink("d/b.txt"); err != nil {
+		t.Fatalf("Unlink: %v", err)
+	}
+	if err := fsys.Rmdir("d"); err != nil {
+		t.Fatalf("Rmdir: %v", err)
 	}
 }
 

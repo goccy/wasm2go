@@ -189,7 +189,7 @@ type unsupportedFS struct{ *MemFS }
 func (unsupportedFS) OpenFile(string, int, os.FileMode) (File, error) {
 	return nil, fmt.Errorf("open: %w", errors.ErrUnsupported)
 }
-func (unsupportedFS) Chown(string, int, int, bool) error { return syscall.ENOTSUP }
+func (unsupportedFS) Chown(string, int, int) error { return syscall.ENOTSUP }
 
 // An FS's errors.ErrUnsupported is ENOSYS, as a configured value's is; a
 // number of the host's is its own errno.

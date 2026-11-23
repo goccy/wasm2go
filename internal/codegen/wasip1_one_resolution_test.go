@@ -84,7 +84,7 @@ func TestWasi_UnlinkAndRmdirAreOneCall(t *testing.T) {
 	call("rmdir d", w.Path_remove_directory(m, 3, d, dn), _wasiESUCCESS)
 }
 
-// A HostFS of a directory removes a name in one call where the host has
+// A HostFS of a directory removes a name, in one call where the host has
 // calls relative to a directory descriptor, and refuses the other kind of
 // file.
 func TestWasi_HostFSRemovesInOneCall(t *testing.T) {
@@ -95,27 +95,17 @@ func TestWasi_HostFSRemovesInOneCall(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fsys := newHostFS(t, dir).(rootFS)
-	remover, ok := any(fsys).(entryRemover)
-	if runtime.GOOS != "linux" {
-		if ok {
-			t.Fatal("a HostFS of a directory removes in one call where the host has no call for it")
-		}
-		return
+	fsys := newHostFS(t, dir)
+	if err := fsys.Unlink("d"); !errors.Is(err, syscall.EISDIR) {
+		t.Errorf("Unlink of a directory: %v, want EISDIR", err)
 	}
-	if !ok {
-		t.Fatal("a HostFS of a directory does not remove in one call")
+	if err := fsys.Rmdir("f"); !errors.Is(err, syscall.ENOTDIR) {
+		t.Errorf("Rmdir of a file: %v, want ENOTDIR", err)
 	}
-	if err := remover.removeFile("d"); !errors.Is(err, syscall.EISDIR) {
-		t.Errorf("removeFile of a directory: %v, want EISDIR", err)
+	if err := fsys.Unlink("../f"); err == nil {
+		t.Error("Unlink of a name outside the root succeeded")
 	}
-	if err := remover.removeDir("f"); !errors.Is(err, syscall.ENOTDIR) {
-		t.Errorf("removeDir of a file: %v, want ENOTDIR", err)
-	}
-	if err := remover.removeFile("../f"); err == nil {
-		t.Error("removeFile of a name outside the root succeeded")
-	}
-	if err := errors.Join(remover.removeFile("f"), remover.removeDir("d/")); err != nil {
+	if err := errors.Join(fsys.Unlink("f"), fsys.Rmdir("d/")); err != nil {
 		t.Fatal(err)
 	}
 	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
@@ -155,23 +145,18 @@ func TestWasi_OpenWithoutFollowingIsOneCall(t *testing.T) {
 	if _, errno := w.pathOpen(nil, rel+"/n", 1 /* follow */, 0, 1<<1, 0); errno != _wasiESUCCESS {
 		t.Errorf("open of a link, following it, errno=%d", errno)
 	}
-	// An FS that cannot open so asks first, and refuses a link alike.
+	// An FS that wraps it passes O_NOFOLLOW on, and refuses a link alike.
 	w.cfg.FS = bareFS{osFS{}}
 	if _, errno := w.pathOpen(nil, rel+"/n", 0, 0, 1<<1, 0); errno != _wasiELOOP {
-		t.Errorf("open of a link without following it, asking first, errno=%d, want ELOOP", errno)
+		t.Errorf("open of a link without following it, through a wrapper, errno=%d, want ELOOP", errno)
 	}
-	// A HostFS of a directory, where the host has the calls for it.
-	hostFS := newHostFS(t, dir)
-	if _, ok := hostFS.(noFollowOpener); ok {
-		w.cfg.FS = hostFS
-		if _, errno := w.pathOpen(nil, "n", 0, 0, 1<<1, 0); errno != _wasiELOOP {
-			t.Errorf("HostFS(dir): open of a link without following it errno=%d, want ELOOP", errno)
-		}
-		if _, errno := w.pathOpen(nil, "target", 0, 0, 1<<1, 0); errno != _wasiESUCCESS {
-			t.Errorf("HostFS(dir): open of a file without following errno=%d", errno)
-		}
-	} else if runtime.GOOS == "linux" {
-		t.Error("HostFS(dir) does not open without following in one call")
+	// A HostFS of a directory.
+	w.cfg.FS = newHostFS(t, dir)
+	if _, errno := w.pathOpen(nil, "n", 0, 0, 1<<1, 0); errno != _wasiELOOP {
+		t.Errorf("HostFS(dir): open of a link without following it errno=%d, want ELOOP", errno)
+	}
+	if _, errno := w.pathOpen(nil, "target", 0, 0, 1<<1, 0); errno != _wasiESUCCESS {
+		t.Errorf("HostFS(dir): open of a file without following errno=%d", errno)
 	}
 }
 
@@ -221,11 +206,9 @@ func TestWasi_HostFSOpenWithoutFollowingStaysInTheRoot(t *testing.T) {
 }
 
 // fd_filestat_set_times of a host file changes the file the descriptor is
-// open on, not the file its name is given to since, where the host can.
+// open on, not the file its name is given to since: through the
+// descriptor on Linux, by the name the file has now on darwin.
 func TestWasi_FdTimesOfTheDescriptor(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the host has no call that sets the times of a descriptor in nanoseconds")
-	}
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a"), nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -258,5 +241,69 @@ func TestWasi_FdTimesOfTheDescriptor(t *testing.T) {
 	}
 	if a.ModTime().UnixNano() == mtime {
 		t.Error("the times were set on the file the name was given to")
+	}
+}
+
+// fd_filestat_set_times of a host file that was removed, and whose name
+// another file took since, leaves that other file as it is.
+func TestWasi_FdTimesOfARemovedFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "c"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fd, errno := w.pathOpen(m, "c", 0, 0, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open errno=%d", errno)
+	}
+	if err := os.Remove(filepath.Join(dir, "c")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "c"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const mtime = int64(1_000_000_000_000_000_000)
+	w.Fd_filestat_set_times(m, fd, 0, mtime, 0x4)
+	c, err := os.Stat(filepath.Join(dir, "c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ModTime().UnixNano() == mtime {
+		t.Error("the times were set on the file that took the removed file's name")
+	}
+}
+
+// fd_filestat_set_times of a file of a HostFS of a directory that was moved
+// out of the root: through the descriptor where the host can (Linux), and
+// where the times are set by the file's name (darwin) refused, the root
+// having no name for it, rather than set outside the root.
+func TestWasi_FdTimesOfAFileMovedOutOfTheRoot(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, m := newTestStubs(t, dir)
+	fd, errno := w.pathOpen(m, "a", 0, 0, 1<<1, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open errno=%d", errno)
+	}
+	if err := os.Rename(filepath.Join(dir, "a"), filepath.Join(outside, "a")); err != nil {
+		t.Fatal(err)
+	}
+	const mtime = int64(1_000_000_000_000_000_000)
+	rc := w.Fd_filestat_set_times(m, fd, 0, mtime, 0x4)
+	a, err := os.Stat(filepath.Join(outside, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch runtime.GOOS {
+	case "linux":
+		if rc != _wasiESUCCESS || a.ModTime().UnixNano() != mtime {
+			t.Errorf("rc=%d, mtime %v; want the descriptor's file set", rc, a.ModTime())
+		}
+	default:
+		if rc != _wasiEACCES || a.ModTime().UnixNano() == mtime {
+			t.Errorf("rc=%d, mtime %v; want EACCES and the file outside the root as it was", rc, a.ModTime())
+		}
 	}
 }
