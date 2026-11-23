@@ -213,8 +213,9 @@ on other systems, the runtime takes the instance's umask out of the
 mode of what it makes, and the host process's umask applies as well
 (on darwin the runtime puts back what that takes out); a command the
 instance starts gets the host process's umask only. The
-thread ends with `CloseAll`, or when the garbage collector collects an
-instance dropped without it.
+thread is never ended: once the instance is closed (`CloseAll`, or the
+garbage collector collecting an instance dropped without it), it is kept
+for the next instance that needs one.
 
 `Signals` connects the guest's signals with what is outside it: its
 `Kill` is given the guest's `kill` of a process that is not the

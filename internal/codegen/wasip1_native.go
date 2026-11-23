@@ -3623,7 +3623,7 @@ type WasiStubs struct {
 	// creations is the thread the instance makes the files of the host's
 	// filesystem on, with its umask (creationThread), once it has needed
 	// one; creationsFailed records that none could be made, and
-	// creationsClosed that CloseAll ended it (the runtime then takes the
+	// creationsClosed that CloseAll closed it (the runtime then takes the
 	// mask out itself). Guarded by mu; made and set under umaskCalls.
 	creations       *creationThread
 	creationsFailed bool
@@ -9157,7 +9157,8 @@ func withHostUmask(mask os.FileMode, f func()) bool {
 
 // creationThreadsRefused is why the host process may make no creation
 // thread (unshare(2) refused, as Docker's default seccomp profile refuses
-// it), nil when it may: asked once a process, by making one.
+// it), nil when it may: asked once a process, by making one, whose thread
+// is then the first of unsharedThreads.
 var creationThreadsRefused = sync.OnceValue(func() error {
 	t, err := newCreationThread(0)
 	if err != nil {
@@ -9182,42 +9183,79 @@ var reportCreationThreadsRefused sync.Once
 // started there is given the host process's working directory
 // (Proc_spawn).
 //
-// The goroutine that holds the thread locks it and never unlocks it:
-// when the goroutine returns (close), the thread ends with it, as
-// runtime.LockOSThread does to a thread whose goroutine exits locked. The
-// main thread, which the runtime keeps when its goroutine so exits, is
-// never one (newCreationThread). The runtime starts no thread from a
-// locked one (runtime.newm hands the start to its template thread), so no
-// other thread gets its attributes; a process the thread starts (fork from
-// it) does, as the kernel copies the starting thread's (copy_fs). The
-// thread lasts until CloseAll, or, for an instance dropped without it,
-// until the garbage collector collects the instance (runtime.AddCleanup).
+// The thread is one of unsharedThreads, which the instance has from
+// newCreationThread to close; only its umask is the instance's, as the
+// runtime changes no other attribute of it.
 type creationThread struct {
+	// thread runs the calls given to it, one at a time.
+	thread chan<- func()
+	// quit is closed by close: a call not yet given to the thread is not.
+	quit chan struct{}
+
 	mu     sync.Mutex
 	closed bool
-	calls  chan func()
-	// quit is closed by close: the thread ends once the call it runs, if
-	// any, has returned.
-	quit chan struct{}
+	// running counts the runs that have not returned. The thread goes
+	// back to unsharedThreads once the instance has closed it and none is
+	// left.
+	running int
 }
 
-// newCreationThread starts a creation thread with umask mask. A goroutine
+// unsharedThreads are the locked OS threads whose file system attributes
+// are their own (startUnsharedThread) that no instance has: a thread never
+// ends, as a thread whose goroutine exits locked would, and goes from
+// instance to instance, so there are as many as were ever in use at once.
+// The main thread is never one (startUnsharedThread). The runtime starts
+// no thread from a locked one (runtime.newm hands the start to its
+// template thread), so no other thread gets their attributes; a process
+// one of them starts (fork from it) does, as the kernel copies the
+// starting thread's (copy_fs).
+var unsharedThreads struct {
+	mu   sync.Mutex
+	idle []chan<- func()
+}
+
+// newCreationThread returns a creation thread with umask mask: an idle one
+// of unsharedThreads, or a new one.
+func newCreationThread(mask os.FileMode) (*creationThread, error) {
+	unsharedThreads.mu.Lock()
+	var thread chan<- func()
+	if n := len(unsharedThreads.idle); n > 0 {
+		thread = unsharedThreads.idle[n-1]
+		unsharedThreads.idle = unsharedThreads.idle[:n-1]
+	}
+	unsharedThreads.mu.Unlock()
+	if thread == nil {
+		var err error
+		if thread, err = startUnsharedThread(); err != nil {
+			return nil, err
+		}
+	}
+	ran := make(chan struct{})
+	thread <- func() {
+		defer close(ran)
+		hostSetThreadUmask(mask)
+	}
+	<-ran
+	return &creationThread{thread: thread, quit: make(chan struct{})}, nil
+}
+
+// startUnsharedThread starts a thread for unsharedThreads. A goroutine
 // that locks the main thread (hostOnMainThread) starts another and lets
 // the main thread go once that one has locked a thread of its own, which
 // is then not the main thread, which the first holds.
-func newCreationThread(mask os.FileMode) (*creationThread, error) {
-	t := &creationThread{calls: make(chan func()), quit: make(chan struct{})}
+func startUnsharedThread() (chan<- func(), error) {
+	thread := make(chan func())
 	started := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
 		if !hostOnMainThread() {
-			t.serve(mask, started, nil)
+			serveUnshared(thread, started, nil)
 			return
 		}
 		locked := make(chan struct{})
 		go func() {
 			runtime.LockOSThread()
-			t.serve(mask, started, locked)
+			serveUnshared(thread, started, locked)
 		}()
 		<-locked
 		runtime.UnlockOSThread()
@@ -9225,15 +9263,14 @@ func newCreationThread(mask os.FileMode) (*creationThread, error) {
 	if err := <-started; err != nil {
 		return nil, err
 	}
-	return t, nil
+	return thread, nil
 }
 
-// serve makes the locked thread it runs on a creation thread with umask
-// mask, tells started whether it did, and runs the calls given until close.
-// locked, when it is not nil, is closed once the thread is known not to be
-// the main thread. It returns with the thread locked, but for the main
-// thread.
-func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked chan<- struct{}) {
+// serveUnshared gives the locked thread it runs on file system attributes
+// of its own, tells started whether it did, and runs the calls given for
+// good. locked, when it is not nil, is closed once the thread is known not
+// to be the main thread. A thread it could not change is let go.
+func serveUnshared(calls <-chan func(), started chan<- error, locked chan<- struct{}) {
 	onMain := hostOnMainThread()
 	if locked != nil {
 		close(locked)
@@ -9246,18 +9283,13 @@ func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked ch
 		return
 	}
 	if err := hostUnshareFS(); err != nil {
+		runtime.UnlockOSThread()
 		started <- err
 		return
 	}
-	hostSetThreadUmask(mask)
 	started <- nil
-	for {
-		select {
-		case call := <-t.calls:
-			call()
-		case <-t.quit:
-			return
-		}
+	for call := range calls {
+		call()
 	}
 }
 
@@ -9265,14 +9297,16 @@ func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked ch
 // it runs nothing and returns fs.ErrClosed.
 func (t *creationThread) run(call func()) error {
 	t.mu.Lock()
-	closed := t.closed
-	t.mu.Unlock()
-	if closed {
+	if t.closed {
+		t.mu.Unlock()
 		return fs.ErrClosed
 	}
+	t.running++
+	t.mu.Unlock()
+	defer t.returned()
 	ran := make(chan struct{})
 	select {
-	case t.calls <- func() {
+	case t.thread <- func() {
 		defer close(ran)
 		call()
 	}:
@@ -9283,15 +9317,41 @@ func (t *creationThread) run(call func()) error {
 	}
 }
 
-// close ends the thread without waiting for it: a call it runs returns
-// first, and no call is run after.
+// returned is told that a run has returned.
+func (t *creationThread) returned() {
+	t.mu.Lock()
+	t.running--
+	idle := t.closed && t.running == 0
+	t.mu.Unlock()
+	if idle {
+		t.release()
+	}
+}
+
+// close lets the thread go without waiting for it: a call it runs returns
+// first, no call is run after, and the thread then goes back to
+// unsharedThreads.
 func (t *creationThread) close() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if !t.closed {
-		t.closed = true
-		close(t.quit)
+	if t.closed {
+		t.mu.Unlock()
+		return
 	}
+	t.closed = true
+	close(t.quit)
+	idle := t.running == 0
+	t.mu.Unlock()
+	if idle {
+		t.release()
+	}
+}
+
+// release puts the thread back to unsharedThreads, once the instance has
+// closed it and no run of it is left.
+func (t *creationThread) release() {
+	unsharedThreads.mu.Lock()
+	unsharedThreads.idle = append(unsharedThreads.idle, t.thread)
+	unsharedThreads.mu.Unlock()
 }
 
 // Path_open_mode is a NON-STANDARD host import (module
