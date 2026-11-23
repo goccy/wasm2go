@@ -219,8 +219,8 @@ func TestTerminal_SessionOfTheFamilyTakesATerminal(t *testing.T) {
 	if got, want := testDevice(t, child.opHostFile(op)), testDevice(t, slave); got != want {
 		t.Errorf("/dev/tty is device %#x, want the terminal's %#x", got, want)
 	}
-	if got, _ := child.ownLinkTarget(op, false); got != slave.Name() {
-		t.Errorf("the link of /dev/tty leads to %q, want the terminal's name %q", got, slave.Name())
+	if got, errno := child.ownLinkTarget(op, false); errno != _wasiESUCCESS || got != slave.Name() {
+		t.Errorf("the link of /dev/tty leads to %q (errno %d), want the terminal's name %q", got, errno, slave.Name())
 	}
 	closeFd(t, child, cm, fd)
 	other, _, oexited := root.ForkProc()
