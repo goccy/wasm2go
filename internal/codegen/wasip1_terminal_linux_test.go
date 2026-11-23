@@ -98,3 +98,16 @@ func TestFdIoctlPseudoTerminalMaster(t *testing.T) {
 		closeAtEnd(t, slave)
 	}
 }
+
+// On a host that numbers the requests of a terminal as asm-generic does,
+// the host's numbering gives each the number fd_ioctl takes.
+func TestHostNumberingOfTerminalRequestsIsLinuxs(t *testing.T) {
+	if !hostGenericTerminal {
+		t.Skip("this host numbers the requests of a terminal otherwise than asm-generic")
+	}
+	for _, n := range hostNumberTable(hostNumberFamilyIoctl) {
+		if want, ok := terminalRequestsByName[n.name]; ok && n.value != int64(want) {
+			t.Errorf("%s = %#x, want %#x", n.name, n.value, want)
+		}
+	}
+}

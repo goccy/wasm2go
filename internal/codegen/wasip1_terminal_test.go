@@ -5,9 +5,12 @@ package codegen
 import (
 	"bytes"
 	"encoding/binary"
+	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -264,6 +267,62 @@ func TestFdIoctlWindowSize(t *testing.T) {
 	// A memory64 guest's address keeps its 64 bits.
 	if rc := w.Fd_ioctl64(m, 0, linuxTIOCGWINSZ, 1<<32|termiosOff); rc != -_wasiEFAULT {
 		t.Fatalf("TIOCGWINSZ at 1<<32|%d rc=%d, want -EFAULT", termiosOff, rc)
+	}
+}
+
+// hostNumberFamilyIoctl is the family of the requests of ioctl.
+const hostNumberFamilyIoctl int32 = 21
+
+// terminalRequestsByName holds the requests of a terminal fd_ioctl takes
+// that package syscall names on every architecture of linux, at their
+// names, in Linux's (asm-generic) numbers.
+var terminalRequestsByName = map[string]uint32{
+	"TCGETS": linuxTCGETS, "TCSETS": linuxTCSETS,
+	"TIOCEXCL": linuxTIOCEXCL, "TIOCNXCL": linuxTIOCNXCL,
+	"TIOCSCTTY": linuxTIOCSCTTY, "TIOCNOTTY": linuxTIOCNOTTY,
+	"TIOCGPGRP": linuxTIOCGPGRP, "TIOCSPGRP": linuxTIOCSPGRP,
+	"TIOCOUTQ": linuxTIOCOUTQ, "TIOCGSID": linuxTIOCGSID,
+	"TIOCGWINSZ": linuxTIOCGWINSZ, "TIOCSWINSZ": linuxTIOCSWINSZ,
+	"TIOCGPTN": linuxTIOCGPTN, "TIOCSPTLCK": linuxTIOCSPTLCK,
+}
+
+// The host's numbering has those of the requests of a terminal fd_ioctl
+// takes that the host's C names, and the host's TIOCGWINSZ is, by its
+// name, the request fd_ioctl takes for the window size.
+func TestHostNumberingOfTerminalRequests(t *testing.T) {
+	want := slices.Sorted(maps.Keys(terminalRequestsByName))
+	if runtime.GOOS == "darwin" {
+		// darwin's C has no TCGETS, TCSETS, TIOCGSID, TIOCGPTN or TIOCSPTLCK.
+		want = []string{"TIOCEXCL", "TIOCGPGRP", "TIOCGWINSZ", "TIOCNOTTY", "TIOCNXCL", "TIOCOUTQ", "TIOCSCTTY", "TIOCSPGRP", "TIOCSWINSZ"}
+	}
+	var got []string
+	nameOf := make(map[int64]string)
+	for _, n := range hostNumberTable(hostNumberFamilyIoctl) {
+		if _, ok := terminalRequestsByName[n.name]; ok {
+			got = append(got, n.name)
+			nameOf[n.value] = n.name
+		}
+	}
+	if slices.Sort(got); !slices.Equal(got, want) {
+		t.Fatalf("the requests of a terminal %v, want %v", got, want)
+	}
+	name := nameOf[syscall.TIOCGWINSZ]
+	if name != "TIOCGWINSZ" {
+		t.Fatalf("the host's TIOCGWINSZ (%#x) is named %q", syscall.TIOCGWINSZ, name)
+	}
+
+	_, slave := openTestPty(t)
+	w, m := newProcTestStubs(t)
+	w.cfg.Stdin = slave
+	host := [4]uint16{30, 100, 800, 600}
+	hostIoctlOf(t, slave, syscall.TIOCSWINSZ, unsafe.Pointer(&host))
+	if rc := guestIoctl(w, m, 0, terminalRequestsByName[name], termiosOff); rc != _wasiESUCCESS {
+		t.Fatalf("%s rc=%d", name, rc)
+	}
+	for i, v := range host {
+		if got := binary.LittleEndian.Uint16(m.memory[termiosOff+2*i:]); got != v {
+			t.Fatalf("struct winsize field %d is %d, want %d", i, got, v)
+		}
 	}
 }
 
