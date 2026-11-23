@@ -750,3 +750,81 @@ func fillBlockingPipe(t *testing.T, wr *os.File) {
 		t.Fatal(err, fillErr)
 	}
 }
+
+// The reader of a descriptor whose open file description is put in
+// non-blocking mode after a Read is asked for keeps nothing of the EAGAIN
+// the Read finds: it is no input and no end.
+func TestStreamReaderKeepsNoEAGAIN(t *testing.T) {
+	fds := make([]int, 2)
+	if err := syscall.Pipe(fds); err != nil {
+		t.Fatal(err)
+	}
+	// Made in blocking mode, the file is one the Go runtime does not poll.
+	in, out := os.NewFile(uintptr(fds[0]), "in"), os.NewFile(uintptr(fds[1]), "out")
+	closeAtEnd(t, in)
+	closeAtEnd(t, out)
+	if err := syscall.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+	r := newStreamReader(in, func(err error) {
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	t.Cleanup(r.stop)
+	wk := newChannelWake()
+	r.addWaiter(wk)
+	r.request()
+	within(t, "the reader's Read", wk.ch)
+	if n, err, ok := r.take([][]byte{make([]byte, 4)}); ok {
+		t.Fatalf("the reader keeps %d bytes, %v", n, err)
+	}
+}
+
+// A poll of a FIFO read through its reader ends with input the reader
+// does not take: its Read asked for by the poll ended with nothing, as one
+// does when the description is put in non-blocking mode meanwhile.
+func TestWasi_PollOfAFIFOWhoseReadEndedWithNothing(t *testing.T) {
+	if hostPollReportsFIFOEnd {
+		t.Skip("a FIFO is waited for in poll(2) here")
+	}
+	dir := t.TempDir()
+	path := makeFIFO(t, dir)
+	w, m := newTestStubs(t, dir)
+	closeAllAtCleanup(t, w)
+	fd, errno := w.pathOpen(m, "fifo", 0, 0, 1<<1, wasiFdflagNonblock)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open errno=%d", errno)
+	}
+	writer, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, writer)
+	// A reader whose goroutine is taken as started: the Read the poll asks
+	// for is the test's to end.
+	op := entryOf(t, w, fd)
+	r := newStreamReader(op.f.(*os.File), func(err error) {
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	r.started = true
+	op.mu.Lock()
+	op.reader = r
+	op.mu.Unlock()
+	written := make(chan error, 1)
+	whenBlocked(w, func() {
+		r.mu.Lock()
+		r.reading = false
+		err := r.wakeLocked()
+		r.mu.Unlock()
+		_, werr := writer.WriteString("q")
+		written <- errors.Join(err, werr)
+	})
+	writeSubFd(m, pollSubsOff, 7, 1, fd)
+	wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+	if err := within(t, "the write", written); err != nil {
+		t.Fatal(err)
+	}
+}

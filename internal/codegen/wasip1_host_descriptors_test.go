@@ -1647,6 +1647,162 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 		within(t, "the read", read)
 	})
+
+	// A FIFO opened without waiting is read in the guest's mode,
+	// non-blocking: the end while nobody writes, EAGAIN while a writer
+	// writes nothing, what it writes, and a poll waits for that. A blocking
+	// read of the description another process put in non-blocking mode
+	// waits for input, and a signal ends the wait.
+	t.Run("FIFOInNonBlockingMode", func(t *testing.T) {
+		t.Run("NoWriter", func(t *testing.T) {
+			w, m, fd, _ := openNonBlockingFIFO(t)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "" {
+				t.Fatalf("read with no writer = %q rc=%d, want the end", got, rc)
+			}
+		})
+		t.Run("Input", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			write(t, writer, "x")
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "x" {
+				t.Fatalf("read = %q rc=%d, want %q", got, rc, "x")
+			}
+		})
+		t.Run("NoInput", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEAGAIN {
+				t.Fatalf("read with a writer and no input = %q rc=%d, want EAGAIN", got, rc)
+			}
+			write(t, writer, "x")
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "x" {
+				t.Fatalf("read after EAGAIN = %q rc=%d, want %q", got, rc, "x")
+			}
+		})
+		t.Run("Poll", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			written := writeWhenBlocked(w, writer, "y")
+			writeSubFd(m, pollSubsOff, 7, 1, fd)
+			wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+			if err := within(t, "the write", written); err != nil {
+				t.Fatal(err)
+			}
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "y" {
+				t.Fatalf("read after the poll = %q rc=%d, want %q", got, rc, "y")
+			}
+		})
+		t.Run("BlockingRead", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			if rc := w.Fd_fdstat_set_flags(m, fd, 0); rc != _wasiESUCCESS {
+				t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+			}
+			if err := setHostNonblock(entryOf(t, w, fd).f, true); err != nil {
+				t.Fatal(err)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEINTR {
+				t.Fatalf("blocking read of an empty FIFO = %q rc=%d, want EINTR", got, rc)
+			}
+			takeSignals(t, w, m)
+			written := writeWhenBlocked(w, writer, "z")
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "z" {
+				t.Fatalf("blocking read = %q rc=%d, want %q", got, rc, "z")
+			}
+			if err := within(t, "the write", written); err != nil {
+				t.Fatal(err)
+			}
+		})
+		// A Read of the FIFO's reader asked for in blocking mode, which a
+		// signal left waiting in the kernel, takes the input written once
+		// the guest puts the FIFO in non-blocking mode: the polls and the
+		// read wait for the reader.
+		t.Run("ReadInProgress", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			if rc := w.Fd_fdstat_set_flags(m, fd, 0); rc != _wasiESUCCESS {
+				t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEINTR {
+				t.Fatalf("blocking read of an empty FIFO = %q rc=%d, want EINTR", got, rc)
+			}
+			takeSignals(t, w, m)
+			if rc := w.Fd_fdstat_set_flags(m, fd, wasiFdflagNonblock); rc != _wasiESUCCESS {
+				t.Fatalf("set O_NONBLOCK rc=%d", rc)
+			}
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEAGAIN {
+				t.Fatalf("read with no input = %q rc=%d, want EAGAIN", got, rc)
+			}
+			written := writeWhenBlocked(w, writer, "y")
+			writeSubFd(m, pollSubsOff, 7, 1, fd)
+			wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+			if err := within(t, "the write", written); err != nil {
+				t.Fatal(err)
+			}
+			// What the reader keeps is ready to a poll again.
+			wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "y" {
+				t.Fatalf("read after the polls = %q rc=%d, want %q", got, rc, "y")
+			}
+		})
+	})
+}
+
+// openNonBlockingFIFO opens a FIFO named fifo for reading without waiting
+// (O_NONBLOCK) in an instance with the host's descriptors whose guest
+// handles SIGUSR1, and returns the instance, its thread, the guest's
+// descriptor and the FIFO's name.
+func openNonBlockingFIFO(t *testing.T) (*WasiStubs, *Module, int32, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWASI(WASIConfig{
+		FS:              newHostFS(t, dir),
+		Stdin:           bytes.NewReader(nil),
+		Stdout:          &bytes.Buffer{},
+		Stderr:          &bytes.Buffer{},
+		HostDescriptors: true,
+		Errors:          func(op string, err error) { t.Errorf("%s: %v", op, err) },
+	})
+	t.Cleanup(func() {
+		if err := w.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	m := newGuestModule(1 << 16)
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, 0)
+	fd, errno := w.pathOpen(m, "fifo", 0, 0, 1<<1, wasiFdflagNonblock)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open errno=%d", errno)
+	}
+	return w, m, fd, path
+}
+
+// openNonBlockingFIFOWithWriter is openNonBlockingFIFO with a writer of
+// the FIFO's, which it returns in place of the name.
+func openNonBlockingFIFOWithWriter(t *testing.T) (*WasiStubs, *Module, int32, *os.File) {
+	t.Helper()
+	w, m, fd, path := openNonBlockingFIFO(t)
+	writer, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, writer)
+	return w, m, fd, writer
+}
+
+// writeWhenBlocked writes s to f once a blocking call of w's guest is
+// waiting, and sends the write's failure.
+func writeWhenBlocked(w *WasiStubs, f *os.File, s string) <-chan error {
+	written := make(chan error, 1)
+	whenBlocked(w, func() {
+		_, err := f.WriteString(s)
+		written <- err
+	})
+	return written
 }
 
 // mustOpenTestFile opens name for reading through pathOpen and returns the

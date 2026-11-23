@@ -1988,8 +1988,9 @@ func (op *wasiOpen) passInputTurn() { <-op.inputTurn() }
 
 // streamReader is the reader of an input stream that poll(2) does not wait
 // for (inputPolled): a stream of the embedder's that is no descriptor of
-// the host's, a FIFO whose end poll(2) does not report, any stream where
-// the host has no poll(2). One goroutine of its own calls the stream's
+// the host's, a FIFO whose end poll(2) does not report while its open file
+// description is in blocking mode (directFile), any stream where the
+// host has no poll(2). One goroutine of its own calls the stream's
 // Read, once each time it is asked to (request), and keeps what it returns
 // until a read takes it (take). Nothing else of the runtime's calls Read
 // (package os/exec does, for the stdin of a command where the host has no
@@ -2054,7 +2055,10 @@ func (r *streamReader) run() {
 		n, err := r.src.Read(buf)
 		r.mu.Lock()
 		r.buf = append(r.buf, buf[:n]...)
-		if err != nil {
+		// A descriptor put in non-blocking mode since the Read was asked for
+		// has nothing right now (EAGAIN), which is no end: the reads woken
+		// read it without the reader (readThroughReader).
+		if _, isFile := r.src.(*os.File); err != nil && (!isFile || !errors.Is(err, syscall.EAGAIN)) {
 			r.end = err
 		}
 		r.reading = false
@@ -2151,6 +2155,14 @@ func (r *streamReader) ready() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.buf) > 0 || r.end != nil || r.stopped
+}
+
+// busy reports whether a read takes something without waiting (ready), or
+// a Read is in progress.
+func (r *streamReader) busy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reading || len(r.buf) > 0 || r.end != nil || r.stopped
 }
 
 // pending returns how many bytes the reader keeps.
@@ -2452,6 +2464,7 @@ type hostWaitFD struct {
 	// source, in place of a stream, is what the wait is for that poll(2)
 	// is not asked about: the reader of a stream poll(2) does not wait for
 	// (streamReader), the turn at a Writer of the embedder's (streamTurn).
+	// One with a stream as well is ready when either is.
 	source waitSource
 }
 
@@ -2505,7 +2518,7 @@ func (wk *wasiWake) drain() error {
 // (takeWake), or one without a pipe for a wait for no descriptor of the
 // host's (only sources), which poll(2) is not asked about.
 func (w *WasiStubs) wakeFor(set []hostWaitFD) (*wasiWake, error) {
-	if !slices.ContainsFunc(set, func(e hostWaitFD) bool { return e.source == nil }) {
+	if !slices.ContainsFunc(set, func(e hostWaitFD) bool { return e.stream != nil }) {
 		return newChannelWake(), nil
 	}
 	return w.takeWake()
@@ -2624,7 +2637,8 @@ func streamPolled(stream any) bool {
 // waitHostReady asks poll(2) about the streams of set and records which are
 // ready: at once when until has passed, otherwise waiting until one is,
 // until passes (the zero time is no limit) or wake (nil for none) is woken.
-// What poll(2) is not asked about (source) is ready as it says. poll(2) is
+// What poll(2) is not asked about (source) is ready as it says, and poll(2)
+// is asked about the stream of one that is not and has one. poll(2) is
 // asked about the descriptor numbers, which nothing holds open meanwhile:
 // the guest's close of an entry's last slot wakes the wait (closeWasiOpen).
 // A stream of the
@@ -2651,7 +2665,9 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake *wasiWake) error {
 		if e.source != nil {
 			set[i].ready = e.source.ready()
 			found = found || set[i].ready
-			continue
+			if set[i].ready || e.stream == nil {
+				continue
+			}
 		}
 		if e.want == hostWantInput && e.op != nil {
 			if ahead, _ := e.op.aheadReady(); ahead {
@@ -11029,7 +11045,8 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 	// runtime's poller cannot wait for one it does not poll, and would
 	// report EAGAIN in that mode.
 	// (Where the guest's mode is the description's, it is the guest's
-	// already: guestOpened.)
+	// already: guestOpened. It is read without the reader in non-blocking
+	// mode, readThroughReader.)
 	if isFIFO && fdflags&0x4 != 0 && !polled && !w.hostFamily() {
 		if err := setHostNonblock(f, false); err != nil {
 			return -1, w.guestErrno("path_open", errors.Join(err, f.Close()))
@@ -11691,10 +11708,21 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			addHost(i, probeKey{op: op}, src, hostWantInput)
 			continue
 		}
-		// Asked for input from here on: what it reads ends the wait.
 		reader := w.inputReader(op, src)
-		reader.request()
-		addEntry(i, probeKey{op: op}, hostWaitFD{source: reader})
+		// Ready when the reader keeps something or, for a descriptor of the
+		// host's, poll(2) finds input: in non-blocking mode it is read
+		// without the reader once a Read it has in progress ends
+		// (readThroughReader), and the mode can change while a Read waits,
+		// which then ends with nothing.
+		e := hostWaitFD{source: reader}
+		if file, isFile := reader.hostFile(); isFile {
+			e.stream, e.want = file, hostWantInput
+		}
+		if _, nonblocking := reader.nonblockingFile(); !nonblocking {
+			// Asked for input from here on: what it reads ends the wait.
+			reader.request()
+		}
+		addEntry(i, probeKey{op: op}, e)
 	}
 	// hostErr is why poll(2) could not be asked: every descriptor it was
 	// to be asked about is ready with that error.
@@ -20558,8 +20586,8 @@ func (w *WasiStubs) detachSignals() {
 // input is there, a blocking one waits and reports EINTR when a signal is
 // posted to the guest meanwhile. A stream of the entry's own that the Go
 // runtime polls is read by readPolledStream, any other descriptor of the
-// host's that poll(2) waits for by readHostStream, any other stream through
-// its reader (readThroughReader).
+// host's that poll(2) waits for by readHostStream, any other stream by
+// readThroughReader.
 func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src io.Reader, bufs [][]byte) (uint64, int32) {
 	switch {
 	case w.netpolled(op, src):
@@ -20567,26 +20595,51 @@ func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src io.Read
 	case op.inputPolled(src):
 		return w.readHostStream(m, call, op, src.(syscall.Conn), bufs, op.nonblocking())
 	}
-	return w.readThroughReader(m, call, op, w.inputReader(op, src), bufs, op.nonblocking())
+	return w.readThroughReader(m, call, op, src, bufs, op.nonblocking())
 }
 
-// readThroughReader reads the stream behind the entry op through its reader
-// r, as the guest asked for it: what the reader keeps, or else a Read it is
-// asked for. A non-blocking read (nonblocking) reports EAGAIN when the
-// reader keeps nothing, which the Read it asks for ends the wait of a poll
-// for; a blocking one waits for it, and a signal posted to the guest
-// meanwhile ends the wait with EINTR. What the reader has when the signal
-// ends the wait is read all the same, as read(2) returns the input there to
-// a process with a signal pending; a Read that returns later keeps its
-// input for the next read. The wait holds no turn: the reads it wakes each
-// take what there is, and one that finds nothing waits again.
-func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, r *streamReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
-	set := []hostWaitFD{{source: r, op: op}}
-	for {
-		if n, err, ok := r.take(bufs); ok {
-			return w.readResult(call, n, err)
+// readThroughReader reads src, the stream behind the entry op, as the guest
+// asked for it: what its reader r keeps, or else a Read r is asked for. A
+// descriptor of the host's whose open file description is in non-blocking
+// mode, which r does not read, is read with one readv(2) instead (readNow)
+// once a Read r has in progress ends (directFile), and waited for in
+// poll(2), whose wait for a FIFO does
+// not end at the close of its last writer where poll(2) does not report the
+// end of its input (hostPollReportsFIFOEnd). A non-blocking read
+// (nonblocking) reports EAGAIN when there is nothing, which the Read r is
+// asked for, or the input poll(2) finds, ends the wait of a poll for; a
+// blocking one waits for it, and a signal posted to the guest meanwhile
+// ends the wait with EINTR. What there is when the signal ends the wait is
+// read all the same, as read(2) returns the input there to a process with a
+// signal pending; a Read that returns later keeps its input for the next
+// read. The wait holds no turn: the reads it wakes each take what there is,
+// and one that finds nothing waits again. The mode is asked again each
+// time, since whoever shares the description can change it.
+func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, src io.Reader, bufs [][]byte, nonblocking bool) (uint64, int32) {
+	r := w.inputReader(op, src)
+	// now reads what there is without waiting; served is false when there
+	// is nothing.
+	now := func() (n uint64, errno int32, served bool) {
+		if k, err, ok := r.take(bufs); ok {
+			n, errno = w.readResult(call, k, err)
+			return n, errno, true
 		}
-		r.request()
+		if file, direct := r.directFile(); direct {
+			n, errno = w.readNow(call, op, file, bufs)
+			return n, errno, errno != _wasiEAGAIN
+		}
+		return 0, _wasiESUCCESS, false
+	}
+	for {
+		if n, errno, served := now(); served {
+			return n, errno
+		}
+		set := []hostWaitFD{{source: r, op: op}}
+		if file, direct := r.directFile(); direct {
+			set = append(set, hostWaitFD{stream: file, want: hostWantInput, op: op})
+		} else {
+			r.request()
+		}
 		if nonblocking {
 			return 0, _wasiEAGAIN
 		}
@@ -20597,15 +20650,49 @@ func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, r *s
 		if !interrupted {
 			continue
 		}
-		n, err, ok := r.take(bufs)
-		if !ok {
+		n, errno, served := now()
+		if !served {
 			return 0, _wasiEINTR
 		}
 		// The read went through: the next call that waits reports the
 		// signal.
 		w.keepInterrupt(m)
-		return w.readResult(call, n, err)
+		return n, errno
 	}
+}
+
+// directFile returns the reader's stream when it is read and waited for
+// without the reader (nonblockingFile) and the reader has no Read in
+// progress and keeps nothing: a Read asked for in blocking mode can be
+// waiting in the kernel still and take the input that comes first, and the
+// reads take what it read first.
+func (r *streamReader) directFile() (*os.File, bool) {
+	if r.busy() {
+		return nil, false
+	}
+	return r.nonblockingFile()
+}
+
+// nonblockingFile returns the reader's stream when it is a descriptor of
+// the host's whose open file description is in non-blocking mode, in which
+// the reader's Read would not wait for input and report EAGAIN, neither
+// input nor its end. Not for a file that cannot be asked (closed), whose
+// Read reports the closing.
+func (r *streamReader) nonblockingFile() (*os.File, bool) {
+	file, isFile := r.hostFile()
+	if !isFile {
+		return nil, false
+	}
+	mayBlock := true
+	hostDescriptor(file, func(fd uintptr) { mayBlock = hostMayBlock(fd) })
+	return file, !mayBlock
+}
+
+// hostFile returns the reader's stream when it is a descriptor of the
+// host's that poll(2) can be asked about: not where the host has none.
+func (r *streamReader) hostFile() (*os.File, bool) {
+	file, isFile := r.src.(*os.File)
+	return file, isFile && hostPolls
 }
 
 // inputReader returns the reader of src, the stream behind the entry op
