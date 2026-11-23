@@ -149,7 +149,6 @@ func TestWasi_ForkSharesDescriptors(t *testing.T) {
 
 func TestWasi_ForkConfiguration(t *testing.T) {
 	w, m := newProcTestStubs(t)
-	w.cfg.FSAccess = func(string, bool) bool { return true }
 	w.recordResolvedHost("127.0.0.1", "localhost")
 	w.procs = map[int32]*wasiProc{1000: {done: make(chan struct{})}}
 	if rc := w.Fd_cloexec(m, 2, 1, 1, 5300); rc != _wasiESUCCESS {
@@ -166,7 +165,7 @@ func TestWasi_ForkConfiguration(t *testing.T) {
 	if child.cfg.FS != w.cfg.FS || !child.monoStart.Equal(w.monoStart) {
 		t.Error("filesystem or clock configuration not inherited")
 	}
-	if child.cfg.FSAccess == nil || child.cfg.NetAccess == nil || child.cfg.Dial == nil ||
+	if child.cfg.NetAccess == nil || child.cfg.Dial == nil ||
 		child.cfg.Resolve == nil || child.cfg.Exec == nil {
 		t.Error("hooks not inherited")
 	}

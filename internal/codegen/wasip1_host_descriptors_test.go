@@ -225,6 +225,40 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// A directory the guest opens of HostFS's has its FS (OpenRootFS) above
+	// the guests' numbers, and a name relative to it is found through it.
+	t.Run("DirectoryDescriptorFSes", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		for name, c := range map[string]struct {
+			fsys FS
+			dir  string
+		}{"HostFS(/)": {osFS{}, hostRelative(t, rootDir) + "/d"}, "HostFS(dir)": {newHostFS(t, rootDir), "d"}} {
+			w.cfg.FS = c.fsys
+			d := openTestDir(t, w, c.dir)
+			w.mu.Lock()
+			op := w.openLocked(d)
+			w.mu.Unlock()
+			var f *os.File
+			switch root := op.root.(type) {
+			case osDir:
+				f = root.f
+			case hostDir:
+				f = root.f
+			default:
+				t.Fatalf("%s: the directory's FS is %T", name, op.root)
+			}
+			if n := entryHostNumberOf(t, f); n < hostDescriptorFloor {
+				t.Errorf("%s: the directory's FS is at %d, below the floor", name, n)
+			}
+			if rc := pathOpenAt(w, m, d, "../f"); rc != _wasiESUCCESS {
+				t.Errorf("%s: open of ../f relative to d rc=%d", name, rc)
+			}
+			if rc := w.Fd_close(m, d); rc != _wasiESUCCESS {
+				t.Fatalf("%s: close rc=%d", name, rc)
+			}
+		}
+	})
+
 	// The end of an instance leaves the process's standard descriptors.
 	t.Run("EndLeavesStandardStreams", func(t *testing.T) {
 		w, _ := newHostNumberedStubs(t, nil, os.Stdin)

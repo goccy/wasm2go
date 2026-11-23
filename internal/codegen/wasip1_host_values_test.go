@@ -923,19 +923,10 @@ func TestPathAccessByTheModeBits(t *testing.T) {
 	if rc := w.Path_access64(m, 1<<16, pathLen, rOK, 0); rc != -_wasiEFAULT {
 		t.Errorf("a path past the memory rc=%d, want -EFAULT", rc)
 	}
-	var writes []bool
-	w.cfg.FSAccess = func(_ string, write bool) bool {
-		writes = append(writes, write)
-		return false
-	}
+	var seen []string
+	w.cfg.FS = policyFS{FS: fsys, allow: func(string, bool) bool { return false }, seen: &seen}
 	if rc := w.Path_access(m, path, pathLen, rOK, 0); rc != -_wasiEACCES {
-		t.Errorf("access the policy refuses rc=%d, want -EACCES", rc)
-	}
-	if rc := w.Path_access(m, path, pathLen, wOK, 0); rc != -_wasiEACCES {
-		t.Errorf("write access the policy refuses rc=%d, want -EACCES", rc)
-	}
-	if !slices.Equal(writes, []bool{false, true}) {
-		t.Errorf("the policy was asked writes %v, want [false true]", writes)
+		t.Errorf("access of a file a policy refuses rc=%d, want -EACCES", rc)
 	}
 }
 
@@ -1266,10 +1257,6 @@ func TestPathMkfifoWithoutFIFOs(t *testing.T) {
 	}
 	if rc := w.Path_mkfifo64(m, 1<<16, pathLen, 0o600); rc != -_wasiEFAULT {
 		t.Fatalf("a path past the memory rc=%d, want -EFAULT", rc)
-	}
-	w.cfg.FSAccess = func(string, bool) bool { return false }
-	if rc := w.Path_mkfifo(m, path, pathLen, 0o600); rc != -_wasiEACCES {
-		t.Fatalf("Path_mkfifo the policy refuses rc=%d, want -EACCES", rc)
 	}
 }
 

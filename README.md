@@ -107,10 +107,22 @@ socket options and timeouts (`sock_setopt`, `sock_getopt`,
 guest path in one form, the one `io/fs.ValidPath` accepts (`.` for the
 root), with a trailing `/` when the guest asks for a directory: the
 runtime resolves `..` itself, after the symbolic links before it as the
-system does (`..` of the root is the root). `FSAccess` is consulted on
-every path operation with that name (`FSAccess` is a policy on path
-names; a symbolic link's target, which names nothing yet, is cleaned
-lexically); a nil one allows every access to the configured `FS`. The
+system does (`..` of the root is the root). A policy on files is an
+`FS` that wraps another and refuses what the policy refuses with
+`fs.ErrPermission`, which the guest sees as `EACCES` (an example
+follows). A path call takes any directory descriptor: of an `FS` that
+is an `OpenRootFS`, a directory the guest opens is also opened as an `FS` of
+its own (`OpenRoot`), and a name relative to its descriptor without
+`..` is given to that `FS`, which finds the directory wherever it is
+now; a name with `..`, and every name of an `FS` that is no `OpenRootFS` or
+whose `OpenRoot` is `errors.ErrUnsupported`, is found from the path the
+directory was opened under, and given to the `FS` itself. A wrapper is a
+`OpenRootFS` only by implementing `OpenRoot` and wrapping the `FS` it
+returns, as the example below does: one that does not still sees every
+name. A wrapper that is no `AccessFS` has `access` answered by the mode
+bits its `Stat` reports (`W_OK` of a file a policy refuses to write may
+be allowed), and one that is no `HostRootFS` has no Unix-domain socket
+paths. The
 names of the guest's own descriptors (`/dev/fd/N`, `/proc/self/fd/N`,
 `/dev/stdin`, ...) are resolved without the `FS` by every path
 operation, and by those that take no directory descriptor even when
@@ -320,6 +332,54 @@ m := mymodule.NewWithWASI(mymodule.NewWASI(mymodule.WASIConfig{
 	Stdout: os.Stdout,
 	FS:     fsys,
 }))
+```
+
+A policy is an `FS` that wraps another, as one wraps an `*os.Root`:
+this one lets the guest change nothing, in the directories it opens too
+(it is an `OpenRootFS` that wraps the `FS` of each of them). A call on a
+descriptor (`fd_filestat_set_times`, `fd_chmod`, `fd_chown`, ...) goes to
+the `File` the `FS` returned, so it wraps those too.
+
+```go
+type readOnly struct{ mymodule.FS }
+
+func (r readOnly) OpenFile(name string, flag int, perm os.FileMode) (mymodule.File, error) {
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
+		return nil, fs.ErrPermission
+	}
+	f, err := r.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return readOnlyFile{f}, nil
+}
+func (r readOnly) OpenRoot(name string) (mymodule.FS, error) {
+	inner, ok := r.FS.(mymodule.OpenRootFS)
+	if !ok {
+		return nil, errors.ErrUnsupported
+	}
+	dir, err := inner.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	return readOnly{dir}, nil
+}
+func (readOnly) Mkdir(string, os.FileMode) error              { return fs.ErrPermission }
+func (readOnly) Chmod(string, os.FileMode) error              { return fs.ErrPermission }
+func (readOnly) Chown(string, int, int) error                 { return fs.ErrPermission }
+func (readOnly) Lchown(string, int, int) error                { return fs.ErrPermission }
+func (readOnly) Chtimes(string, time.Time, time.Time) error   { return fs.ErrPermission }
+func (readOnly) Lchtimes(string, time.Time, time.Time) error  { return fs.ErrPermission }
+func (readOnly) Unlink(string) error                          { return fs.ErrPermission }
+func (readOnly) Rmdir(string) error                           { return fs.ErrPermission }
+func (readOnly) Rename(string, string) error                  { return fs.ErrPermission }
+func (readOnly) Symlink(string, string) error                 { return fs.ErrPermission }
+func (readOnly) Link(string, string) error                    { return fs.ErrPermission }
+
+type readOnlyFile struct{ mymodule.File }
+
+func (readOnlyFile) Chmod(os.FileMode) error { return fs.ErrPermission }
+func (readOnlyFile) Chown(int, int) error    { return fs.ErrPermission }
 ```
 
 For multi-package output these names live in the `base` package

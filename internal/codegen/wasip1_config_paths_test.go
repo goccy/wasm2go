@@ -2,7 +2,6 @@ package codegen
 
 import (
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,9 +10,9 @@ import (
 	"time"
 )
 
-// FSAccess is given the name the FS is given: ".." of the root is the root,
-// and the directory a ".." takes back is looked up, as a read.
-func TestWasi_FSAccessSeesTheCleanedPath(t *testing.T) {
+// The FS is given the cleaned name: ".." of the root is the root, the
+// directory a ".." takes back is looked up, and a trailing "/" stays.
+func TestWasi_FSIsGivenTheCleanedName(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "secret"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -23,30 +22,26 @@ func TestWasi_FSAccessSeesTheCleanedPath(t *testing.T) {
 	}
 	w, m := newTestStubs(t, dir)
 	var seen []string
-	w.cfg.FSAccess = func(path string, write bool) bool {
-		seen = append(seen, path)
-		return path != "secret"
-	}
+	w.cfg.FS = policyFS{FS: w.cfg.FS, seen: &seen, allow: func(name string, _ bool) bool { return name != "secret" }}
 	for _, tc := range []struct {
 		path string
 		rc   int32
 		seen []string
 	}{
-		{"pub/../secret", _wasiEACCES, []string{"pub", "secret"}},
-		{"./secret/", _wasiEACCES, []string{"secret"}},
-		{"/secret", _wasiEACCES, []string{"secret"}},
-		{"../secret", _wasiEACCES, []string{"secret"}},
-		{"pub/../../secret", _wasiEACCES, []string{"pub", "secret"}},
+		{"pub/../secret", _wasiEACCES, []string{"pub:false", "secret:false"}},
+		{"./secret/", _wasiEACCES, []string{"secret/:false"}},
+		{"/secret", _wasiEACCES, []string{"secret:false"}},
+		{"../secret", _wasiEACCES, []string{"secret:false"}},
+		{"pub/../../secret", _wasiEACCES, []string{"pub:false", "secret:false"}},
 		// what does not lead to a directory fails before the name is asked about
-		{"none/../secret", _wasiENOENT, []string{"none"}},
-		{"", _wasiESUCCESS, []string{"."}},
-		// The FS is given what the hook approved: the root.
-		{"..", _wasiESUCCESS, []string{"."}},
+		{"none/../secret", _wasiENOENT, []string{"none:false"}},
+		{"", _wasiESUCCESS, []string{".:false"}},
+		{"..", _wasiESUCCESS, []string{".:false"}},
 	} {
 		seen = nil
 		off, n := putPath(m, 128, tc.path)
 		if rc := w.Path_filestat_get(m, 3, 0, off, n, 300); rc != tc.rc || !slices.Equal(seen, tc.seen) {
-			t.Errorf("Path_filestat_get(%q) rc=%d, hook saw %v; want %d after %v", tc.path, rc, seen, tc.rc, tc.seen)
+			t.Errorf("Path_filestat_get(%q) rc=%d, the FS saw %v; want %d after %v", tc.path, rc, seen, tc.rc, tc.seen)
 		}
 	}
 }
@@ -73,9 +68,9 @@ func pathWalkDir(t *testing.T) string {
 	return dir
 }
 
-// testGuestPathWalk checks, under prefix, what the FS is given, the same
-// with FSAccess or without: ".." after a symbolic link as the system
-// resolves it, and a trailing "/" that asks for a directory.
+// testGuestPathWalk checks, under prefix, what the FS is given: ".." after
+// a symbolic link as the system resolves it, and a trailing "/" or "/."
+// that asks for a directory.
 func testGuestPathWalk(t *testing.T, w *WasiStubs, m *Module, prefix string) {
 	t.Helper()
 	off, n := putPath(m, 128, prefix+"a/link/../f")
@@ -86,18 +81,9 @@ func testGuestPathWalk(t *testing.T, w *WasiStubs, m *Module, prefix string) {
 	if rc := w.Path_unlink_file(m, 3, slash, slashLen); rc != _wasiENOTDIR {
 		t.Errorf("unlink(file/) rc=%d, want ENOTDIR", rc)
 	}
-
-	w.cfg.FSAccess = func(string, bool) bool { return true }
-	defer func() { w.cfg.FSAccess = nil }()
-	if rc := w.Path_open(m, 3, 0, off, n, 0, 1<<1, 0, 0, 300); rc != _wasiESUCCESS {
-		t.Errorf("with FSAccess, open(a/link/../f) rc=%d, want it to reach b/f", rc)
-	}
-	if rc := w.Path_unlink_file(m, 3, slash, slashLen); rc != _wasiENOTDIR {
-		t.Errorf("with FSAccess, unlink(file/) rc=%d, want ENOTDIR", rc)
-	}
 	dot, dotLen := putPath(m, 512, prefix+"file/.")
 	if rc := w.Path_unlink_file(m, 3, dot, dotLen); rc != _wasiENOTDIR {
-		t.Errorf("with FSAccess, unlink(file/.) rc=%d, want ENOTDIR", rc)
+		t.Errorf("unlink(file/.) rc=%d, want ENOTDIR", rc)
 	}
 }
 
@@ -107,10 +93,9 @@ func TestWasi_WholeHostGuestPaths(t *testing.T) {
 	dir := pathWalkDir(t)
 	m := newGuestModule(1 << 16)
 	var seen []string
-	w := NewWASI(WASIConfig{FS: newHostFS(t, "/"), FSAccess: func(path string, write bool) bool {
-		seen = append(seen, fmt.Sprintf("%s:%v", path, write))
+	w := NewWASI(WASIConfig{FS: policyFS{FS: newHostFS(t, "/"), seen: &seen, allow: func(path string, write bool) bool {
 		return filepath.Base(path) != "lnk"
-	}})
+	}}})
 
 	// stat("/..") and chdir("..") at "/" are the root.
 	off, n := putPath(m, 128, "..")
@@ -120,23 +105,22 @@ func TestWasi_WholeHostGuestPaths(t *testing.T) {
 	if rc := w.Path_open(m, 3, 0, off, n, 0x2, 1<<1, 0, 0, 300); rc != _wasiESUCCESS {
 		t.Errorf(`open("..", O_DIRECTORY) at "/" rc=%d`, rc)
 	}
-	if !slices.Equal(seen, []string{".:false", ".:false"}) {
-		t.Errorf("the hook saw %v, want the root twice", seen)
+	if slices.ContainsFunc(seen, func(s string) bool { return s != ".:false" }) {
+		t.Errorf("the FS saw %v, want the root only", seen)
 	}
 
-	// symlink("../x", "lnk") at the root: the hook sees the target
-	// resolved against the root, where ".." is the root.
+	// symlink("../x", "lnk") at the root: the FS is given the link's name
+	// and the target as it is.
 	seen = nil
 	toff, tn := putPath(m, 128, "../x")
 	loff, ln := putPath(m, 256, "lnk")
 	if rc := w.Path_symlink(m, toff, tn, 3, loff, ln); rc != _wasiEACCES {
-		t.Errorf("symlink rc=%d, want the hook's EACCES", rc)
+		t.Errorf("symlink rc=%d, want the policy's EACCES", rc)
 	}
-	if !slices.Equal(seen, []string{"lnk:true", "x:false", "x:true"}) {
-		t.Errorf("the hook saw %v, want the link and the target x", seen)
+	if !slices.Equal(seen, []string{"lnk:true"}) {
+		t.Errorf("the FS saw %v, want the link", seen)
 	}
 
-	w.cfg.FSAccess = nil
 	testGuestPathWalk(t, w, m, hostRelative(t, dir)+"/") // a prefix of raw names: not path.Join, which would fold their ".."
 }
 
@@ -253,10 +237,10 @@ func TestWasi_HostFSRootItself(t *testing.T) {
 	}
 }
 
-// fd_filestat_set_times sets the times by the descriptor's path, which
-// FSAccess is asked about as a write, whatever the descriptor is open for:
-// a read-only one and a directory one work. A pipe end has no path, and
-// the root descriptor has no file: neither has the right.
+// fd_filestat_set_times sets the times of the descriptor's file, whatever
+// the descriptor is open for: a read-only one and a directory one work. A
+// pipe end has no path, and the root descriptor has no file: neither has
+// the right.
 func TestWasi_FdFilestatSetTimesByPath(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o644); err != nil {
@@ -289,15 +273,6 @@ func TestWasi_FdFilestatSetTimesByPath(t *testing.T) {
 			t.Errorf("mtime of %s = %v (%v), want %d", name, st.ModTime(), err, mtime)
 		}
 	}
-	var seen []string
-	w.cfg.FSAccess = func(path string, write bool) bool {
-		seen = append(seen, fmt.Sprintf("%s:%v", path, write))
-		return !write
-	}
-	if rc := setTimes(open("f", 0)); rc != _wasiEACCES || !slices.Equal(seen, []string{"f:false", "f:true"}) {
-		t.Errorf("writes denied rc=%d, hook saw %v; want EACCES after the open and f as a write", rc, seen)
-	}
-	w.cfg.FSAccess = nil
 	r, wr := newTestPipe(t, w, m)
 	for _, fd := range []int32{r, wr} {
 		if rc := setTimes(fd); rc != _wasiEBADF {
@@ -311,18 +286,13 @@ func TestWasi_FdFilestatSetTimesByPath(t *testing.T) {
 		t.Errorf("root rights rc=%d = %#x, want %#x", rc, readU64(m.memory, 408), wasiRootRights)
 	}
 
-	// A MemFS file sets its own times, once the hook allows the write.
+	// A MemFS file sets its own times.
 	mem := NewMemFS()
 	if err := mem.WriteFile("f", []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	w.cfg.FS = mem
 	memFd := open("f", 0)
-	w.cfg.FSAccess = func(_ string, write bool) bool { return !write }
-	if rc := setTimes(memFd); rc != _wasiEACCES {
-		t.Errorf("MemFS descriptor, writes denied rc=%d, want EACCES", rc)
-	}
-	w.cfg.FSAccess = nil
 	if rc := setTimes(memFd); rc != _wasiESUCCESS {
 		t.Fatalf("MemFS descriptor rc=%d", rc)
 	}
@@ -351,8 +321,8 @@ func TestWasi_Dup2OntoTheRootDescriptor(t *testing.T) {
 					t.Errorf("fd 3 rc=%d type=%d, want the standard output", rc, m.memory[400])
 				}
 				off, n := putPath(m, 128, ".")
-				if rc := s.Path_filestat_get(m, wasiPreopenFD, 0, off, n, 300); rc != _wasiEBADF {
-					t.Errorf("a path call on fd 3 rc=%d, want EBADF", rc)
+				if rc := s.Path_filestat_get(m, wasiPreopenFD, 0, off, n, 300); rc != _wasiENOTDIR {
+					t.Errorf("a path call on fd 3, now no directory, rc=%d, want ENOTDIR", rc)
 				}
 				if rc := s.Path_filestat_get(m, wasiRootFD, 0, off, n, 300); rc != _wasiESUCCESS {
 					t.Errorf("a path call on the root number rc=%d", rc)

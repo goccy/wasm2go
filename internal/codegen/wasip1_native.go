@@ -20,8 +20,8 @@
 // Security model: the guest has what its WASIConfig gives it and nothing
 // else (see WASIConfig). HostFS("/") is the whole host filesystem, a
 // Go-syscall passthrough; HostFS(dir) keeps every path inside dir through
-// os.Root. FSAccess is a policy on path names, and the hooks are the only
-// allow-lists. Out-of-range linear-memory accesses are reported back to the
+// os.Root. A policy on files is an FS that wraps another, and the hooks are
+// the only allow-lists. Out-of-range linear-memory accesses are reported back to the
 // guest as EFAULT (rather than being allowed to panic the host) because
 // wasm itself traps on OOB.
 //
@@ -265,7 +265,17 @@ type File interface {
 // searched, or one whose name another took while it was opened) and on
 // darwin for HostFS("/"): there a name is looked up from the name the
 // directory has now, so a rename between the look and the call can make
-// it act on another directory (inside the root, for HostFS(dir)).
+// it act on another directory (inside the root, for HostFS(dir)). The runtime opens each directory the
+// guest opens so, and gives that FS the names relative to the directory's
+// descriptor; of an FS that is no OpenRootFS, or whose OpenRoot returns
+// errors.ErrUnsupported, those names are found from the path the
+// directory was opened under. An FS that wraps another to keep a policy
+// is an OpenRootFS only by implementing OpenRoot and wrapping the FS it
+// returns (README); one that does not keeps the policy on those names too,
+// as they are given to it by path. The descriptors an OpenRootFS of the
+// embedder's holds are not moved above the guests' numbers
+// (WASIConfig.HostDescriptors), as those of a File that is no *os.File are
+// not.
 type OpenRootFS interface {
 	FS
 	OpenRoot(name string) (FS, error)
@@ -1777,6 +1787,11 @@ type wasiOpen struct {
 	path            string        // guest path relative to the preopen root
 	fdflags         int32         // last fdflags set via Path_open or Fd_fdstat_set_flags; guarded by mu
 	dirCache        []os.DirEntry // guarded by mu
+	// root is the directory as an FS of its own (FS.OpenRoot), which the
+	// names relative to the descriptor are given to (atName): for a
+	// directory path_open opened of an FS that has it; nil otherwise.
+	// Immutable; closed with the descriptor.
+	root FS
 	// stdio marks an entry that refers to a standard stream of the
 	// instance (1/2/3 = the configured stdin/stdout/stderr; 0 = not one).
 	// Fds 0/1/2 start out with such entries; closing one never touches the
@@ -2754,8 +2769,9 @@ type WASIConfig struct {
 	Stdout, Stderr io.Writer
 	// FS is the filesystem every guest path operation is routed through,
 	// preopened as the guest's "/" (fd 3): HostFS for the host's, NewMemFS
-	// for one in memory. It is given the names FS's doc describes, the
-	// same with FSAccess or without. With nil no directory is preopened: neither fd 3
+	// for one in memory, or an FS that wraps one of them to keep a policy
+	// on its files. It is given the names FS's doc describes. With nil no
+	// directory is preopened: neither fd 3
 	// nor the root directory's second number is open, so every call on
 	// them, path calls included, fails with EBADF, and fd 3 is handed out
 	// like any free number; the guest's C library, finding no preopen,
@@ -2778,30 +2794,6 @@ type WASIConfig struct {
 	// rename or link between such a name and one of the FS fails with
 	// EXDEV.
 	FS FS
-	// FSAccess is a policy on path names. It is consulted before every
-	// path operation, with each name the operation gives the FS, as FS's
-	// doc describes it but without a trailing "/" (e.g. "a.txt",
-	// "sub/a.txt", "." for the root), and with the names the runtime looks
-	// up to resolve a ".." (reads), and
-	// whether the operation writes: path_open and path_open_mode (a write
-	// when it creates, truncates or opens for writing),
-	// path_create_directory, path_create_directory_mode, path_unlink_file,
-	// path_remove_directory, path_rename and path_link (both paths),
-	// path_filestat_set_times, path_chmod and path_chown are writes;
-	// path_filestat_get, path_filestat_ext, path_filestat_mode and
-	// path_readlink are reads; path_symlink writes the new link and reads
-	// and writes its target, resolved lexically against the link's
-	// directory (an absolute target against the root), as it names nothing
-	// yet; fd_filestat_set_times writes the
-	// path its descriptor was opened under. Returning false denies the
-	// operation (EACCES). The FS is given the approved name; a symbolic
-	// link inside the FS still leads where it points, and keeping the
-	// guest inside a directory against symbolic links is HostFS(dir)'s
-	// (os.Root's) job.
-	// Other operations on an open descriptor (fd_*) and the names of the
-	// guest's own descriptors (see FS) are not checked. nil allows every
-	// access to FS. It is called without the WasiStubs lock held.
-	FSAccess func(path string, write bool) bool
 	// NetAccess is consulted before Sock_accept, Sock_recv and Sock_send
 	// with "accept", "recv" or "send". Returning false denies the operation
 	// (EACCES). nil denies every one.
@@ -5995,28 +5987,6 @@ func (w *WasiStubs) dialAllowed(network, ip string, port int) bool {
 	return false
 }
 
-// allowedPath returns the name the FS is given for the guest path name
-// (guestName) once the FS policy hook allows it, which is asked about that
-// name without its trailing "/". It returns a wasi errno: guestName's, or
-// EACCES when the hook refuses. Callers must NOT hold w.mu.
-func (w *WasiStubs) allowedPath(name string, write bool) (string, int32) {
-	clean, errno := w.guestName(name)
-	if errno != _wasiESUCCESS {
-		return "", errno
-	}
-	return clean, w.allowName(clean, write)
-}
-
-// allowName asks the FS policy hook about name, a name guestName gave: 0,
-// or EACCES when it refuses. Without a hook every name is allowed. Callers
-// must NOT hold w.mu.
-func (w *WasiStubs) allowName(name string, write bool) int32 {
-	if hook := w.cfg.FSAccess; hook != nil && !hook(strings.TrimSuffix(name, "/"), write) {
-		return _wasiEACCES
-	}
-	return _wasiESUCCESS
-}
-
 // guestLookup is the operation, of every path import, of looking up the
 // names guestName resolves a ".." by, for WASIConfig.Errors.
 const guestLookup = "path lookup"
@@ -6037,8 +6007,8 @@ const guestMaxSymlinks = 40
 // before it, once that is known to be a directory and not a symbolic link,
 // whose target is put in its place (from the root for an absolute one).
 // Only those elements are looked up (guestLstat), so a name without ".."
-// is not. It returns a wasi errno: that of the lookup (ENOENT, EACCES of
-// the policy hook, ...), ENOTDIR for an element before ".." that is no
+// is not. It returns a wasi errno: that of the lookup (ENOENT, EACCES,
+// ...), ENOTDIR for an element before ".." that is no
 // directory, ELOOP past guestMaxSymlinks links. Callers must NOT hold w.mu.
 func (w *WasiStubs) guestName(raw string) (string, int32) {
 	elems := func(name string) []string {
@@ -6086,6 +6056,97 @@ func (w *WasiStubs) guestName(raw string) (string, int32) {
 	return strings.Join(parts, "/"), _wasiESUCCESS
 }
 
+// atDir returns the entry of dirFd, the directory descriptor of a path call,
+// whose names are relative to it: nil for the preopened root, whose names
+// are the FS's own. errno: EBADF for a dirFd that is not open, ENOTDIR for
+// one that is no directory, as openat(2) has them.
+func (w *WasiStubs) atDir(dirFd int32) (*wasiOpen, int32) {
+	if w.preopened(dirFd) {
+		return nil, _wasiESUCCESS
+	}
+	w.mu.Lock()
+	op := w.openLocked(dirFd)
+	w.mu.Unlock()
+	switch {
+	case op == nil:
+		return nil, _wasiEBADF
+	case !op.isDir:
+		return nil, _wasiENOTDIR
+	}
+	return op, _wasiESUCCESS
+}
+
+// atPath returns the guest path that raw, a path relative to from (atDir),
+// names: raw itself for the preopened root and for an absolute raw, which
+// openat(2) takes from the root, and for another directory the path it was
+// opened under followed by raw, as wazero's atPath has it (not path.Join,
+// which would fold a ".." that guestName resolves after links). An empty
+// raw relative to another directory names nothing (ENOENT), as for
+// openat(2); the preopened root's is raw itself, which guestName makes
+// the root.
+func atPath(from *wasiOpen, raw string) (string, int32) {
+	switch {
+	case from == nil || path.IsAbs(raw):
+		return raw, _wasiESUCCESS
+	case raw == "":
+		return "", _wasiENOENT
+	}
+	return guestPath(from.path) + "/" + raw, _wasiESUCCESS
+}
+
+// atName returns from's directory as an FS (wasiOpen.root) and the name in
+// it that raw, relative to from (atDir), is: for a directory that has one,
+// and a relative raw that names something in it without a ".." element,
+// whose resolution starts above it. ok is false otherwise, and the name is
+// found by atPath's path. The caller has found raw is no name of the
+// guest's own descriptors.
+func atName(from *wasiOpen, raw string) (root FS, name string, ok bool) {
+	if from == nil || from.root == nil || path.IsAbs(raw) {
+		return nil, "", false
+	}
+	// not path.Clean, which would fold the ".." that leaves the directory
+	elems := slices.DeleteFunc(strings.Split(raw, "/"), func(e string) bool { return e == "" || e == "." })
+	switch {
+	case slices.Contains(elems, ".."):
+		return nil, "", false
+	case len(elems) == 0:
+		return from.root, ".", true // the directory itself
+	}
+	name = strings.Join(elems, "/")
+	if strings.HasSuffix(raw, "/") || path.Base(raw) == "." {
+		name += "/"
+	}
+	return from.root, name, true
+}
+
+// atFS returns the FS a path call gives its name to, and that name, for
+// raw, relative to from (atDir), whose name in the instance's FS is name:
+// from's directory and the name in it where atName finds one, the
+// instance's FS and name otherwise. Callers must NOT hold w.mu.
+func (w *WasiStubs) atFS(from *wasiOpen, raw, name string) (FS, string) {
+	if root, rel, ok := atName(from, raw); ok {
+		return root, rel
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.fs(), name
+}
+
+// atFS2 is atFS for the two names of a rename or a link: one directory's
+// when both are relative to it and found in it, the instance's FS's
+// otherwise.
+func (w *WasiStubs) atFS2(oldFrom *wasiOpen, oldRaw, oldName string, newFrom *wasiOpen, newRaw, newName string) (FS, string, string) {
+	if oldFrom == newFrom {
+		root, a, ok := atName(oldFrom, oldRaw)
+		if _, b, bok := atName(newFrom, newRaw); ok && bok {
+			return root, a, b
+		}
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.fs(), oldName, newName
+}
+
 // The kinds of the last element of a guest path, Linux's last_type (LAST_NORM,
 // LAST_DOT, LAST_DOTDOT), which a call that makes, removes or renames the
 // name refuses but the first of.
@@ -6126,8 +6187,7 @@ func (w *WasiStubs) guestDirectory(name string) int32 {
 
 // guestLstat tells what name, a name of guestName's form that a ".."
 // follows, is without following it: a directory, or a symbolic link and
-// its target. A name of the FS is asked about once the policy hook allows
-// reading it. A directory that lists the guest's own descriptors is a
+// its target. A directory that lists the guest's own descriptors is a
 // directory; a descriptor's name is, as on Linux, a link that leads to the
 // descriptor itself and not to its target: ENOTDIR for one that is no
 // directory's, ENOTSUP for a directory's, from which no name is resolved
@@ -6148,9 +6208,6 @@ func (w *WasiStubs) guestLstat(name string) (dir bool, target string, link bool,
 		}
 		return false, "", false, _wasiENOTDIR
 	}
-	if errno := w.allowName(name, false); errno != _wasiESUCCESS {
-		return false, "", false, errno
-	}
 	w.mu.Lock()
 	fsys := w.fs()
 	w.mu.Unlock()
@@ -6166,12 +6223,6 @@ func (w *WasiStubs) guestLstat(name string) (dir bool, target string, link bool,
 	}
 	return false, target, true, _wasiESUCCESS
 }
-
-// rootRelative returns the guest path name cleaned as chroot(2) sees it,
-// lexically: relative to the root, which ".." of the root is, and "." for
-// the root itself. Only the target of a symbolic link, which names nothing
-// yet, is cleaned so (pathSymlink).
-func rootRelative(name string) string { return path.Join(".", path.Clean("/"+name)) }
 
 // checkNet consults the network policy hook; without one every operation
 // is denied. Returns true when the operation is permitted. Callers must
@@ -6602,7 +6653,7 @@ func closeWasiOpens(ops []*wasiOpen) error {
 // descriptor of the host's waits for the calls that use it meanwhile.
 func closeWasiOpen(op *wasiOpen) error {
 	op.mu.Lock()
-	f, conn, listener := op.f, op.conn, op.listener
+	f, conn, listener, root := op.f, op.conn, op.listener, op.root
 	var host *os.File
 	if op.sock != nil {
 		host = op.sock.host
@@ -6613,6 +6664,9 @@ func closeWasiOpen(op *wasiOpen) error {
 	var err error
 	if f != nil {
 		err = errors.Join(err, f.Close())
+	}
+	if root != nil {
+		err = errors.Join(err, root.Close())
 	}
 	if host != nil {
 		err = errors.Join(err, host.Close())
@@ -6924,10 +6978,7 @@ func (w *WasiStubs) Fd_filestat_set_times(m *Module, fd int32, atim, mtim int64,
 	if op == nil || op.f == nil || op.path == "" && !op.isDir {
 		return _wasiEBADF
 	}
-	name, errno := w.allowedPath(op.path, true)
-	if errno != _wasiESUCCESS {
-		return errno
-	}
+	name := op.path
 	var current os.FileInfo
 	if filetimesNeedCurrent(fstFlags) {
 		st, err := op.f.Stat()
@@ -8072,10 +8123,19 @@ func (w *WasiStubs) guestUmask() os.FileMode {
 // mode, the kernel taking the mask out (creationThread); for another
 // filesystem, elsewhere and without a creation thread, given the mode less
 // the mask (createMode).
-func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode) error) error {
+// hostFiles reports whether fsys is one of HostFS's, or an FS of one of
+// their directories (OpenRootFS): its calls are the host's own, made in the
+// host process (the kernel's umask, the FIFO opens the host tells of).
+func hostFiles(fsys FS) bool {
 	switch fsys.(type) {
-	case osFS, rootFS:
-	default:
+	case osFS, rootFS, osDir, hostDir:
+		return true
+	}
+	return false
+}
+
+func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode) error) error {
+	if !hostFiles(fsys) {
 		return make(w.createMode(requested))
 	}
 	if !hostThreadUmask {
@@ -8367,19 +8427,22 @@ func (w *WasiStubs) pathCreateDirectoryMode(m *Module, pathPtr uint64, pathLen, 
 	if pathSlice == nil {
 		return -_wasiEFAULT
 	}
-	return -w.pathCreateDirectory(string(pathSlice), unixFileMode(uint32(mode)))
+	return -w.pathCreateDirectory(nil, string(pathSlice), unixFileMode(uint32(mode)))
 }
 
-// pathCreateDirectory creates the directory rel with the requested mode,
-// less the instance's umask, and returns a wasi errno.
-func (w *WasiStubs) pathCreateDirectory(rel string, mode os.FileMode) int32 {
-	name, errno := w.changedName(rel, nameMake)
+// pathCreateDirectory creates the directory raw, relative to from (atDir),
+// with the requested mode, less the instance's umask, and returns a wasi
+// errno.
+func (w *WasiStubs) pathCreateDirectory(from *wasiOpen, raw string, mode os.FileMode) int32 {
+	full, errno := atPath(from, raw)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	name, errno := w.changedName(full, nameMake)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	fsys, name := w.atFS(from, raw, name)
 	if err := w.create(fsys, mode, func(perm os.FileMode) error { return fsys.Mkdir(name, perm) }); err != nil {
 		return w.guestErrno("path_create_directory", err)
 	}
@@ -8423,9 +8486,6 @@ func (w *WasiStubs) pathFilestatExt(m *Module, pathPtr uint64, pathLen, follow i
 		}
 		writeFilestatExt(out, fi)
 		return _wasiESUCCESS
-	}
-	if errno := w.allowName(name, false); errno != _wasiESUCCESS {
-		return -errno
 	}
 	w.mu.Lock()
 	fsys := w.fs()
@@ -8672,9 +8732,6 @@ func (w *WasiStubs) pathFilestatMode(m *Module, pathPtr uint64, pathLen, follow 
 		}
 		binary.LittleEndian.PutUint32(out, unixModeBits(fi.Mode()))
 		return _wasiESUCCESS
-	}
-	if errno := w.allowName(name, false); errno != _wasiESUCCESS {
-		return -errno
 	}
 	w.mu.Lock()
 	fsys := w.fs()
@@ -9058,10 +9115,10 @@ func (w *WasiStubs) fillDirents(fd int32, bufSlice []byte, cookie int64) (int, i
 }
 
 // Path_open opens a wasm-supplied path and registers it in the fd
-// table. The path is relative to the preopened root (dirFd 3, the
-// "preopen /" convention wasi-libc requires for its directory
-// enumeration) and is opened through the configured FS, once the
-// configured FSAccess allows it.
+// table. The path is relative to the directory descriptor dirFd (atDir):
+// the preopened root (fd 3, the "preopen /" convention wasi-libc requires
+// for its directory enumeration) or any other directory; it is opened
+// through the configured FS.
 func (w *WasiStubs) Path_open(m *Module, dirFd, dirflags, pathPtr, pathLen, oflags int32, fsRightsBase, fsRightsInherit int64, fdflags, openedFdPtr int32) int32 {
 	return w.openGuestPath(m, dirFd, dirflags, zext(pathPtr), zext(pathLen), oflags, fsRightsBase, fsRightsInherit, fdflags, zext(openedFdPtr))
 }
@@ -9073,15 +9130,16 @@ func (w *WasiStubs) Path_open64(m *Module, dirFd, dirflags, pathPtr, pathLen, of
 
 // openGuestPath is the body of Path_open and Path_open64.
 func (w *WasiStubs) openGuestPath(m *Module, dirFd, dirflags int32, pathPtr, pathLen uint64, oflags int32, fsRightsBase, fsRightsInherit int64, fdflags int32, openedFdPtr uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	outSlice := w.memBytes(m, openedFdPtr, 4)
 	if pathSlice == nil || outSlice == nil {
 		return _wasiEFAULT
 	}
-	fd, errno := w.pathOpen(m, string(pathSlice), dirflags, oflags, fsRightsBase, fdflags)
+	fd, errno := w.pathOpenAt(m, from, string(pathSlice), dirflags, oflags, fsRightsBase, fdflags, wasiDefaultFileMode)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
@@ -9394,7 +9452,7 @@ func (w *WasiStubs) opFileInfo(op *wasiOpen) (os.FileInfo, error) {
 // process's). The new descriptor shares the open file, as /dev/fd/N does on
 // darwin and the BSDs, so the access asked for has to be one it was opened
 // with; the preopened root, which has no open file to share, is opened
-// anew as the root of the FS, without FSAccess (openRoot). As on Linux the
+// anew as the root of the FS (openRoot). As on Linux the
 // name is a link (/dev/stdin, /dev/stdout and /dev/stderr always, as links
 // to /proc/self/fd/N): ELOOP without the follow flag (dirflags bit 0) when
 // the name ends with it, EEXIST for O_CREAT|O_EXCL. O_DIRECTORY asks for a
@@ -9445,8 +9503,7 @@ func (w *WasiStubs) openOwnDescriptor(n int32, rest string, alias bool, dirflags
 }
 
 // openRoot opens the preopened root anew for a name of the guest's own
-// descriptors, which FSAccess is not asked about: the root of the FS, as a
-// directory open for reading. O_TRUNC of a directory is EISDIR.
+// descriptors: the root of the FS, as a directory open for reading. O_TRUNC of a directory is EISDIR.
 func (w *WasiStubs) openRoot(oflags, fdflags int32) (int32, int32) {
 	if oflags&0x8 != 0 { // O_TRUNC
 		return -1, _wasiEISDIR
@@ -9601,11 +9658,11 @@ func (w *WasiStubs) ownFile(name string, follow bool) (fsName string, fd int32, 
 
 // changedFile resolves the guest path raw for a call that changes what the
 // name leads to, following a symbolic link at its end or not (chmod,
-// chown, the times): the name the FS is given, once the policy hook allows
-// writing it, or (own) the descriptor fd that a name of the guest's own
-// descriptors leads to (ownFile), whose call the caller makes instead.
-// errno is a wasi errno: guestName's or the hook's, or EPERM for a link of
-// the guest's own descriptors itself and for a listing directory.
+// chown, the times): the name the FS is given, or (own) the descriptor fd
+// that a name of the guest's own descriptors leads to (ownFile), whose
+// call the caller makes instead. errno is a wasi errno: guestName's, or
+// EPERM for a link of the guest's own descriptors itself and for a listing
+// directory.
 func (w *WasiStubs) changedFile(raw string, follow bool) (name string, fd int32, own bool, errno int32) {
 	if name, errno = w.guestName(raw); errno != _wasiESUCCESS {
 		return "", -1, false, errno
@@ -9619,7 +9676,7 @@ func (w *WasiStubs) changedFile(raw string, follow bool) (name string, fd int32,
 	case own:
 		return "", fd, true, _wasiESUCCESS
 	}
-	return name, -1, false, w.allowName(name, true)
+	return name, -1, false, _wasiESUCCESS
 }
 
 // The calls that change a name: one that makes it (mkdir, mkfifo, symlink,
@@ -9652,10 +9709,9 @@ func (w *WasiStubs) lastErrno(name string, call, last int) int32 {
 }
 
 // changedName resolves the guest path raw for call, which makes or removes
-// the name: the name the FS is given, once the policy hook allows writing
-// it. errno is a wasi errno: guestName's, lastErrno's for a name that ends
-// in "." or "..", ownChange's for a name of the guest's own descriptors, or
-// the hook's.
+// the name: the name the FS is given. errno is a wasi errno: guestName's,
+// lastErrno's for a name that ends in "." or "..", or ownChange's for a
+// name of the guest's own descriptors.
 func (w *WasiStubs) changedName(raw string, call int) (string, int32) {
 	name, errno := w.guestName(raw)
 	if errno != _wasiESUCCESS {
@@ -9667,15 +9723,14 @@ func (w *WasiStubs) changedName(raw string, call int) (string, int32) {
 	if own, errno := w.ownChange(name, call == nameMake); own {
 		return "", errno
 	}
-	return name, w.allowName(name, true)
+	return name, _wasiESUCCESS
 }
 
 // changedNames resolves the guest paths oldRaw and newRaw of a rename, or
-// of a link (link): the names the FS is given, once the policy hook allows
-// writing both. errno is a wasi errno: guestName's; as on Linux, for a
-// rename of a name, or to one, that ends in "." or "..", EBUSY, and for a
-// link to one EEXIST; ownRename's when either is a name of the guest's own
-// descriptors; or the hook's.
+// of a link (link): the names the FS is given. errno is a wasi errno:
+// guestName's; as on Linux, for a rename of a name, or to one, that ends in
+// "." or "..", EBUSY, and for a link to one EEXIST; or ownRename's when
+// either is a name of the guest's own descriptors.
 func (w *WasiStubs) changedNames(oldRaw, newRaw string, link bool) (oldName, newName string, errno int32) {
 	if oldName, errno = w.guestName(oldRaw); errno != _wasiESUCCESS {
 		return "", "", errno
@@ -9699,9 +9754,6 @@ func (w *WasiStubs) changedNames(oldRaw, newRaw string, link bool) (oldName, new
 		return "", "", errno
 	}
 	if own, errno := w.ownRename(oldName, newName, link); own {
-		return "", "", errno
-	}
-	if errno = cmp.Or(w.allowName(oldName, true), w.allowName(newName, true)); errno != _wasiESUCCESS {
 		return "", "", errno
 	}
 	return oldName, newName, _wasiESUCCESS
@@ -9783,13 +9835,23 @@ func (w *WasiStubs) ownDescriptorsLocked() []int32 {
 // pathOpenMode is pathOpen with the mode of open(2): a file the call
 // creates gets mode, less the instance's umask.
 func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
+	return w.pathOpenAt(m, nil, rel, dirflags, oflags, fsRightsBase, fdflags, mode)
+}
+
+// pathOpenAt is pathOpenMode for raw, a path relative to the directory
+// descriptor from (atDir), opened through the FS atFS gives it to.
+func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, oflags int32, fsRightsBase int64, fdflags int32, mode os.FileMode) (int32, int32) {
 	// Decode rights into access mode. WASI rights bits: 0=FD_DATASYNC,
 	// 1=FD_READ, 6=FD_WRITE. We treat absent rights as the closest fit:
 	// without FD_WRITE the open is one for reading.
 	canWrite := fsRightsBase&(1<<6) != 0
 	canRead := fsRightsBase&(1<<1) != 0 || !canWrite
 
-	rel, errno := w.guestName(rel)
+	full, errno := atPath(from, raw)
+	if errno != _wasiESUCCESS {
+		return -1, errno
+	}
+	rel, errno := w.guestName(full)
 	if errno != _wasiESUCCESS {
 		return -1, errno
 	}
@@ -9800,9 +9862,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	if dir != "" {
 		return w.openDescriptorListing(dir, oflags, canWrite)
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	fsys, name := w.atFS(from, raw, rel)
 	// An open that does not wait is made as the runtime makes its own
 	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
 	// the other end (openFIFO) is moved up once it is made.
@@ -9865,14 +9925,6 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	// NONBLOCK (0x4) doesn't translate directly via os.OpenFile; we
 	// store it on the wasiOpen so Fd_fdstat_get reflects it.
 
-	// Consult the host filesystem policy before touching the disk. An
-	// open counts as a write when it requests write access or asks to
-	// create/truncate the target.
-	writeAccess := flag&(os.O_WRONLY|os.O_RDWR) != 0 || flag&(os.O_CREATE|os.O_TRUNC) != 0
-	if errno := w.allowName(rel, writeAccess); errno != _wasiESUCCESS {
-		return -1, errno
-	}
-
 	requireDir := oflags&0x2 != 0
 	noFollow := dirflags&0x1 == 0
 
@@ -9898,7 +9950,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	if noFollow && hostONofollow != 0 && !exclusive {
 		flag |= hostONofollow
 	} else if noFollow && hostONofollow == 0 {
-		if li, lerr := fsys.Lstat(rel); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
+		if li, lerr := fsys.Lstat(name); lerr == nil && (li.Mode()&os.ModeSymlink) != 0 {
 			// open(2)'s errnos for a symbolic link: EEXIST with
 			// O_CREAT|O_EXCL, ELOOP with O_NOFOLLOW otherwise
 			if oflags&0x5 == 0x5 {
@@ -9912,7 +9964,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	// A file the open creates gets the mode less the instance's umask
 	// (create).
 	isFIFO := false
-	fi, err := stat(rel)
+	fi, err := stat(name)
 	if err == nil {
 		isFIFO = fi.Mode()&os.ModeNamedPipe != 0
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -9932,13 +9984,13 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		// descriptor waits as any other does, and its file is not polled
 		// once it is moved up (keepRuntimeOpened) either.
 		inBlockingMode = !hostPollReportsFIFOEnd
-		if f, err = openFile(rel, flag|hostONonblock, w.createMode(mode)); err != nil {
+		if f, err = openFile(name, flag|hostONonblock, w.createMode(mode)); err != nil {
 			return -1, w.guestErrno("path_open", err)
 		}
 	case isFIFO && flag&os.O_RDWR == 0:
 		// An open of one end waits for the other.
 		var errno int32
-		if f, errno = w.openFIFO(m, fsys, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
+		if f, errno = w.openFIFO(m, fsys, name, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
 		if f, err = w.guestOpened(f, false); err != nil {
@@ -9947,13 +9999,13 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	case flag&os.O_CREATE != 0:
 		if err = w.create(fsys, mode, func(perm os.FileMode) error {
 			var err error
-			f, err = openFile(rel, flag, perm)
+			f, err = openFile(name, flag, perm)
 			return err
 		}); err != nil {
 			return -1, w.guestErrno("path_open", err)
 		}
 	default:
-		if f, err = openFile(rel, flag, mode); err != nil {
+		if f, err = openFile(name, flag, mode); err != nil {
 			return -1, w.guestErrno("path_open", err)
 		}
 	}
@@ -9985,8 +10037,21 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		}
 		return -1, _wasiENOTDIR
 	}
+	// A directory is also opened as an FS of its own (OpenRootFS), which the
+	// names relative to its descriptor are given to: by name, a second
+	// time, so a name that changes between the two opens leaves the
+	// descriptor with the names of the directory it names now. An FS that
+	// cannot (no OpenRootFS, errors.ErrUnsupported) has the names found by the
+	// path. The FS's handle is opened with the directory, not on the first
+	// call relative to it: by then the path may name another directory.
+	var root FS
+	if opener, ok := fsys.(OpenRootFS); ok && isDir {
+		if root, err = opener.OpenRoot(name); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+			return -1, w.guestErrno("path_open", errors.Join(err, f.Close()))
+		}
+	}
 	op := &wasiOpen{
-		f: f, isDir: isDir, regular: st.Mode().IsRegular(), path: rel, fdflags: fdflags,
+		f: f, root: root, isDir: isDir, regular: st.Mode().IsRegular(), path: rel, fdflags: fdflags,
 		polled:  polled,
 		noRead:  flag&os.O_WRONLY != 0,
 		noWrite: flag&(os.O_WRONLY|os.O_RDWR) == 0,
@@ -10012,16 +10077,17 @@ func (w *WasiStubs) Path_create_directory64(m *Module, dirFd, pathPtr, pathLen i
 
 // pathCreateDirectoryAt is the body of Path_create_directory and
 // Path_create_directory64: the directory at the path, relative to the
-// preopened directory dirFd, with the default mode.
+// directory descriptor dirFd (atDir), with the default mode.
 func (w *WasiStubs) pathCreateDirectoryAt(m *Module, dirFd int32, pathPtr, pathLen uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
-	return w.pathCreateDirectory(string(pathSlice), wasiDefaultDirMode)
+	return w.pathCreateDirectory(from, string(pathSlice), wasiDefaultDirMode)
 }
 
 func (w *WasiStubs) Path_unlink_file(m *Module, dirFd, pathPtr, pathLen int32) int32 {
@@ -10035,20 +10101,23 @@ func (w *WasiStubs) Path_unlink_file64(m *Module, dirFd, pathPtr, pathLen int64)
 
 // pathUnlinkFile is the body of Path_unlink_file and Path_unlink_file64.
 func (w *WasiStubs) pathUnlinkFile(m *Module, dirFd int32, pathPtr, pathLen uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
-	name, errno := w.changedName(string(pathSlice), nameUnlink)
+	full, errno := atPath(from, string(pathSlice))
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	name, errno := w.changedName(full, nameUnlink)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	fsys, name := w.atFS(from, string(pathSlice), name)
 	return w.guestErrno("path_unlink_file", fsys.Unlink(name))
 }
 
@@ -10064,20 +10133,23 @@ func (w *WasiStubs) Path_remove_directory64(m *Module, dirFd, pathPtr, pathLen i
 // pathRemoveDirectory is the body of Path_remove_directory and
 // Path_remove_directory64.
 func (w *WasiStubs) pathRemoveDirectory(m *Module, dirFd int32, pathPtr, pathLen uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
-	name, errno := w.changedName(string(pathSlice), nameRmdir)
+	full, errno := atPath(from, string(pathSlice))
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	name, errno := w.changedName(full, nameRmdir)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	fsys, name := w.atFS(from, string(pathSlice), name)
 	return w.guestErrno("path_remove_directory", fsys.Rmdir(name))
 }
 
@@ -10092,21 +10164,29 @@ func (w *WasiStubs) Path_rename64(m *Module, oldFd, oldPathPtr, oldPathLen, newF
 
 // pathRename is the body of Path_rename and Path_rename64.
 func (w *WasiStubs) pathRename(m *Module, oldFd int32, oldPathPtr, oldPathLen uint64, newFd int32, newPathPtr, newPathLen uint64) int32 {
-	if !w.preopened(oldFd) || !w.preopened(newFd) {
-		return _wasiEBADF
+	oldFrom, errno := w.atDir(oldFd)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	newFrom, errno := w.atDir(newFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	oldSlice := w.memBytes(m, oldPathPtr, oldPathLen)
 	newSlice := w.memBytes(m, newPathPtr, newPathLen)
 	if oldSlice == nil || newSlice == nil {
 		return _wasiEFAULT
 	}
-	oldName, newName, errno := w.changedNames(string(oldSlice), string(newSlice), false)
+	oldFull, oldErrno := atPath(oldFrom, string(oldSlice))
+	newFull, newErrno := atPath(newFrom, string(newSlice))
+	if errno := cmp.Or(oldErrno, newErrno); errno != _wasiESUCCESS {
+		return errno
+	}
+	oldName, newName, errno := w.changedNames(oldFull, newFull, false)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	fsys, oldName, newName := w.atFS2(oldFrom, string(oldSlice), oldName, newFrom, string(newSlice), newName)
 	if err := fsys.Rename(oldName, newName); err != nil {
 		return w.guestErrno("path_rename", err)
 	}
@@ -10124,15 +10204,20 @@ func (w *WasiStubs) Path_filestat_get64(m *Module, dirFd, flags, pathPtr, pathLe
 
 // pathFilestatGet is the body of Path_filestat_get and Path_filestat_get64.
 func (w *WasiStubs) pathFilestatGet(m *Module, dirFd, flags int32, pathPtr, pathLen, outPtr uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	out := w.memBytes(m, outPtr, 64)
 	if pathSlice == nil || out == nil {
 		return _wasiEFAULT
 	}
-	name, errno := w.guestName(string(pathSlice))
+	full, errno := atPath(from, string(pathSlice))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	name, errno := w.guestName(full)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
@@ -10146,13 +10231,7 @@ func (w *WasiStubs) pathFilestatGet(m *Module, dirFd, flags int32, pathPtr, path
 		writeFilestat(out, fi)
 		return _wasiESUCCESS
 	}
-	if errno := w.allowName(name, false); errno != _wasiESUCCESS {
-		return errno
-	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
-	rel := name
+	fsys, rel := w.atFS(from, string(pathSlice), name)
 	var st os.FileInfo
 	var err error
 	if flags&0x1 != 0 {
@@ -10179,25 +10258,27 @@ func (w *WasiStubs) Path_filestat_set_times64(m *Module, dirFd, flags, pathPtr, 
 // pathFilestatSetTimes is the body of Path_filestat_set_times and
 // Path_filestat_set_times64.
 func (w *WasiStubs) pathFilestatSetTimes(m *Module, dirFd, flags int32, pathPtr, pathLen uint64, atim, mtim int64, fstFlags int32) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	if pathSlice == nil {
 		return _wasiEFAULT
 	}
 	follow := flags&0x1 != 0
-	name, fd, own, errno := w.changedFile(string(pathSlice), follow)
+	full, errno := atPath(from, string(pathSlice))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	name, fd, own, errno := w.changedFile(full, follow)
 	switch {
 	case errno != _wasiESUCCESS:
 		return errno
 	case own:
 		return w.Fd_filestat_set_times(m, fd, atim, mtim, fstFlags)
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
-	rel := name
+	fsys, rel := w.atFS(from, string(pathSlice), name)
 	var st os.FileInfo
 	var statErr error
 	if follow {
@@ -10231,21 +10312,29 @@ func (w *WasiStubs) Path_link64(m *Module, oldFd, oldFlags, oldPathPtr, oldPathL
 
 // pathLink is the body of Path_link and Path_link64.
 func (w *WasiStubs) pathLink(m *Module, oldFd, oldFlags int32, oldPathPtr, oldPathLen uint64, newFd int32, newPathPtr, newPathLen uint64) int32 {
-	if !w.preopened(oldFd) || !w.preopened(newFd) {
-		return _wasiEBADF
+	oldFrom, errno := w.atDir(oldFd)
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	newFrom, errno := w.atDir(newFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	oldSlice := w.memBytes(m, oldPathPtr, oldPathLen)
 	newSlice := w.memBytes(m, newPathPtr, newPathLen)
 	if oldSlice == nil || newSlice == nil {
 		return _wasiEFAULT
 	}
-	oldName, newName, errno := w.changedNames(string(oldSlice), string(newSlice), true)
+	oldFull, oldErrno := atPath(oldFrom, string(oldSlice))
+	newFull, newErrno := atPath(newFrom, string(newSlice))
+	if errno := cmp.Or(oldErrno, newErrno); errno != _wasiESUCCESS {
+		return errno
+	}
+	oldName, newName, errno := w.changedNames(oldFull, newFull, true)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	fsys, oldName, newName := w.atFS2(oldFrom, string(oldSlice), oldName, newFrom, string(newSlice), newName)
 	if err := fsys.Link(oldName, newName); err != nil {
 		return w.guestErrno("path_link", err)
 	}
@@ -10263,38 +10352,24 @@ func (w *WasiStubs) Path_symlink64(m *Module, targetPtr, targetLen, dirFd, linkP
 
 // pathSymlink is the body of Path_symlink and Path_symlink64.
 func (w *WasiStubs) pathSymlink(m *Module, targetPtr, targetLen uint64, dirFd int32, linkPathPtr, linkPathLen uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	targetSlice := w.memBytes(m, targetPtr, targetLen)
 	linkSlice := w.memBytes(m, linkPathPtr, linkPathLen)
 	if targetSlice == nil || linkSlice == nil {
 		return _wasiEFAULT
 	}
-	// The link is written; what it names, the target resolved against the
-	// link's directory (an absolute one against the root), can be read
-	// and written through it. The target names nothing yet: it is cleaned
-	// lexically.
-	link, errno := w.guestName(string(linkSlice))
+	full, errno := atPath(from, string(linkSlice))
 	if errno != _wasiESUCCESS {
 		return errno
 	}
-	if last := guestLast(string(linkSlice)); last != lastName {
-		return w.lastErrno(link, nameMake, last)
-	}
-	if own, errno := w.ownChange(link, true); own {
+	link, errno := w.changedName(full, nameMake)
+	if errno != _wasiESUCCESS {
 		return errno
 	}
-	target := string(targetSlice)
-	if !path.IsAbs(target) {
-		target = path.Join(path.Dir(rootRelative(link)), target)
-	}
-	if errno := cmp.Or(w.allowName(link, true), w.allowName(rootRelative(target), false), w.allowName(rootRelative(target), true)); errno != _wasiESUCCESS {
-		return errno
-	}
-	w.mu.Lock()
-	fsys := w.fs()
-	w.mu.Unlock()
+	fsys, link := w.atFS(from, string(linkSlice), link)
 	if err := fsys.Symlink(string(targetSlice), link); err != nil {
 		return w.guestErrno("path_symlink", err)
 	}
@@ -10312,8 +10387,9 @@ func (w *WasiStubs) Path_readlink64(m *Module, dirFd, pathPtr, pathLen, buf, buf
 
 // pathReadlink is the body of Path_readlink and Path_readlink64.
 func (w *WasiStubs) pathReadlink(m *Module, abi wasiABI, dirFd int32, pathPtr, pathLen, buf, buflen, bufusedPtr uint64) int32 {
-	if !w.preopened(dirFd) {
-		return _wasiEBADF
+	from, errno := w.atDir(dirFd)
+	if errno != _wasiESUCCESS {
+		return errno
 	}
 	pathSlice := w.memBytes(m, pathPtr, pathLen)
 	bufSlice := w.memBytes(m, buf, buflen)
@@ -10322,7 +10398,11 @@ func (w *WasiStubs) pathReadlink(m *Module, abi wasiABI, dirFd int32, pathPtr, p
 	if pathSlice == nil || bufSlice == nil || bufused == nil {
 		return _wasiEFAULT
 	}
-	name, errno := w.guestName(string(pathSlice))
+	full, errno := atPath(from, string(pathSlice))
+	if errno != _wasiESUCCESS {
+		return errno
+	}
+	name, errno := w.guestName(full)
 	if errno != _wasiESUCCESS {
 		return errno
 	}
@@ -10337,12 +10417,7 @@ func (w *WasiStubs) pathReadlink(m *Module, abi wasiABI, dirFd int32, pathPtr, p
 		}
 		target = link
 	} else {
-		if errno := w.allowName(name, false); errno != _wasiESUCCESS {
-			return errno
-		}
-		w.mu.Lock()
-		fsys := w.fs()
-		w.mu.Unlock()
+		fsys, name := w.atFS(from, string(pathSlice), name)
 		var err error
 		if target, err = fsys.Readlink(name); err != nil {
 			return w.guestErrno("path_readlink", err)
@@ -11688,9 +11763,8 @@ func (a wasiSockAddr) hostPort() string {
 
 // unixHostPath returns the host's name for the Unix-domain address a, whose
 // name is path relative to the preopened root: the path of its file in the
-// whole host filesystem, after asking the filesystem policy about writing it
-// (binding creates the file, connecting or sending to it takes write access),
-// or an abstract name as package syscall writes it ("@name"). It reports an
+// whole host filesystem, or an abstract name as package syscall writes it
+// ("@name"). It reports an
 // errno: ENOTSUP when the instance's FS is no HostRootFS (of HostFS's, only
 // the whole host filesystem's, HostFS("/"), is one), whose files alone the
 // host can bind sockets in by their names, and for an abstract name on a
@@ -11709,7 +11783,7 @@ func (w *WasiStubs) unixHostPath(a wasiSockAddr, path string) (string, int32) {
 	if !isHost {
 		return "", _wasiENOTSUP
 	}
-	name, errno := w.allowedPath(path, true)
+	name, errno := w.guestName(path)
 	if errno != _wasiESUCCESS {
 		return "", errno
 	}
@@ -15713,10 +15787,6 @@ func (w *WasiStubs) pathAccess(m *Module, pathPtr uint64, pathLen, amode, flags 
 			info.mode |= os.ModeDir
 		}
 		fi = info
-	case !own:
-		if errno := w.allowName(name, amode&wasiAccessWrite != 0); errno != _wasiESUCCESS {
-			return -errno
-		}
 	}
 	effective := flags&wasiAccessEffective != 0
 	w.mu.Lock()
@@ -15858,12 +15928,9 @@ func (o osFS) Mkfifo(name string, perm os.FileMode) error {
 // the FIFO (openFIFOWatched).
 func (w *WasiStubs) openFIFO(m *Module, fsys FS, name string, fi os.FileInfo, flag int, perm os.FileMode) (File, int32) {
 	openFile := fsys.OpenFile
-	switch fsys.(type) {
-	case osFS, rootFS:
-		if flag&os.O_WRONLY == 0 {
-			if f, errno, watched := w.openFIFOWatched(m, openFile, name, flag, perm); watched {
-				return f, errno
-			}
+	if hostFiles(fsys) && flag&os.O_WRONLY == 0 {
+		if f, errno, watched := w.openFIFOWatched(m, openFile, name, flag, perm); watched {
+			return f, errno
 		}
 	}
 	var f File
@@ -17561,7 +17628,7 @@ func (w *WasiStubs) loadZone(name string) (*time.Location, error) {
 	if !strings.HasPrefix(name, "/") {
 		return time.LoadLocation(name)
 	}
-	rel, errno := w.allowedPath(name, false)
+	rel, errno := w.guestName(name)
 	if errno != _wasiESUCCESS {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: hostErrnoOf(errno)}
 	}
@@ -17694,8 +17761,8 @@ var ErrSyscallNotMade = errors.New("system call not made for a forked process")
 //
 // HostSyscalls gives the guest of the root instance everything the host
 // process can do: it can read and write any memory of the host process and
-// use any descriptor of it, and FSAccess, NetAccess, Dial, Listen, Resolve
-// and Exec do not apply to its calls.
+// use any descriptor of it, its FS does not see its calls, and NetAccess,
+// Dial, Listen, Resolve and Exec do not apply to them.
 //
 // The call is made with the arguments as they are, in the order the host's
 // call takes them (clone's on amd64 is not arm64's), but for one whose bit
