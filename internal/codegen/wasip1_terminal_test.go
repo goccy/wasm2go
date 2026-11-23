@@ -778,3 +778,73 @@ func TestLinkOfATerminalIsItsName(t *testing.T) {
 	}
 	closeTestFd(t, w, m, file)
 }
+
+// A write that waits to a terminal nobody reads, on either side of a
+// pseudo-terminal, takes what there is room for and waits for room for the
+// rest; a signal ends the wait, and the write returns what it wrote.
+func TestWasi_BlockingWriteToATerminalIsEndedByASignal(t *testing.T) {
+	skipWithoutStreamWrites(t)
+	if !hostWritesWithoutWaiting {
+		t.Skipf("a write that waits is one writev(2) on %s, which a signal does not end", runtime.GOOS)
+	}
+	// 64 buffers of the same memory: more than a terminal keeps.
+	const iovOff, countOff, iovs int32 = 40000, 40600, 64
+	for _, side := range []string{"master", "slave"} {
+		t.Run(side, func(t *testing.T) {
+			master, slave := openTestPty(t)
+			// The terminal keeps what it is sent until it is read.
+			settings := hostSettings(t, slave)
+			settings.Lflag &^= syscall.ICANON | syscall.ECHO
+			hostIoctlOf(t, slave, hostSetSettings, unsafe.Pointer(&settings))
+			file := master
+			if side == "slave" {
+				file = slave
+			}
+			w, m := newSignalGuest(t, wasiSIGUSR1)
+			w.mu.Lock()
+			fd := addTestFD(w, &wasiOpen{f: file})
+			w.mu.Unlock()
+			for i := range iovs {
+				makeIovec(m, iovOff+i*8, wsBufOff, wsChunk)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			var rc int32
+			returnsWithin(t, "Fd_write", func() { rc = w.Fd_write(m, fd, iovOff, iovs, countOff) })
+			if n := readU32(m.memory, int(countOff)); rc != _wasiESUCCESS || n == 0 || n >= uint32(iovs*wsChunk) {
+				t.Fatalf("blocking write of %d bytes to the %s nobody reads: %d bytes rc=%d, want a part of it", iovs*wsChunk, side, n, rc)
+			}
+			if got := takeSignals(t, w, m); got&signalMask(wasiSIGUSR1) == 0 {
+				t.Fatalf("pending signals %#x after the write, want SIGUSR1", got)
+			}
+		})
+	}
+}
+
+// What the runtime opens of a terminal for its writes is closed with the
+// guest's descriptor: once the guest closes the slave side of a
+// pseudo-terminal it wrote to, nothing has it open, and a read of the
+// master side finds it hung up (EIO).
+func TestWasi_TerminalWrittenToIsClosedWithTheDescriptor(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("the runtime opens no terminal again on %s (hostReopen)", runtime.GOOS)
+	}
+	master, slave := openTestPty(t)
+	w, m := newProcTestStubs(t)
+	w.mu.Lock()
+	fd := addTestFD(w, &wasiOpen{f: slave})
+	w.mu.Unlock()
+	if rc := fdWriteString(w, m, fd, "x"); rc != _wasiESUCCESS {
+		t.Fatalf("write to the terminal rc=%d", rc)
+	}
+	closeTestFd(t, w, m, fd)
+	buf := make([]byte, 16)
+	var err error
+	returnsWithin(t, "read of the master", func() {
+		for err == nil {
+			_, err = master.Read(buf)
+		}
+	})
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("read of the master once the guest closed the slave: %v, want EIO", err)
+	}
+}

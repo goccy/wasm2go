@@ -1847,6 +1847,14 @@ type wasiOpen struct {
 	// terminal what it learnt. Guarded by mu.
 	terminalFile *os.File
 	terminal     bool
+	// nowaitFile is the terminal file nowaitOf last asked about, and nowait
+	// the open file description of that terminal's own it opened
+	// (hostNowaitTerminal), nil for a terminal that is not opened so;
+	// nowaitEnded records that the entry is closed (closeWasiOpen), which
+	// closed nowait. Guarded by mu.
+	nowaitFile  *os.File
+	nowait      *os.File
+	nowaitEnded bool
 	// lowatFile is the socket file streamSendLowat last asked about, and
 	// lowat what it learnt. Guarded by mu.
 	lowatFile *os.File
@@ -3056,6 +3064,39 @@ func (op *wasiOpen) terminalOf(file *os.File) (bool, error) {
 		op.terminalFile, op.terminal = file, terminal
 	}
 	return op.terminal, nil
+}
+
+// nowaitOf returns an open file description of its own of the terminal
+// file, the terminal behind this entry, whose descriptor is fd, for writes
+// that do not wait (hostNowaitTerminal): opened once per file, and closed
+// with the entry or once another file is asked about. It is nil for a
+// terminal that is not opened so, and once the entry is closed. It is
+// opened without mu, a leaf lock: the runtime makes its descriptors under
+// locks taken before it (makeRuntimeDescriptors).
+func (op *wasiOpen) nowaitOf(file *os.File, fd uintptr) (*os.File, error) {
+	op.mu.Lock()
+	nowait, known := op.nowait, op.nowaitFile == file || op.nowaitEnded
+	op.mu.Unlock()
+	if known {
+		return nowait, nil
+	}
+	nowait, err := hostNowaitTerminal(fd, file.Name())
+	if err != nil {
+		return nil, err
+	}
+	op.mu.Lock()
+	ended, was := op.nowaitEnded, op.nowait
+	if !ended {
+		op.nowaitFile, op.nowait = file, nowait
+	}
+	op.mu.Unlock()
+	switch {
+	case ended && nowait != nil:
+		return nil, nowait.Close()
+	case !ended && was != nil:
+		return nowait, was.Close()
+	}
+	return nowait, nil
 }
 
 // streamSendLowat is hostStreamSendLowat for file, the socket behind this
@@ -7568,10 +7609,15 @@ func closeWasiOpen(op *wasiOpen) error {
 	}
 	locked := op.lockedFile
 	op.lockedFile = nil
+	nowait := op.nowait
+	op.nowaitFile, op.nowait, op.nowaitEnded = nil, nil, true
 	op.mu.Unlock()
 	var err error
 	if f != nil {
 		err = errors.Join(err, f.Close())
+	}
+	if nowait != nil {
+		err = errors.Join(err, nowait.Close())
 	}
 	if root != nil {
 		err = errors.Join(err, root.Close())
@@ -8470,11 +8516,14 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 // stream's output, so that no other write of the runtime's takes the room
 // it finds. To a socket it is a send that does not wait (MSG_DONTWAIT) where
 // the host honours it; to a pipe what the host tells it takes without
-// waiting, where it tells (hostPipeWriteNow); to anything else, once
-// poll(2) has found room, a write of what it takes without waiting: a pipe
-// no more than PIPE_BUF, a stream socket no more than its low-water mark, a
-// datagram socket the datagram whole, a terminal (a short write) no more
-// than PIPE_BUF.
+// waiting, where it tells (hostPipeWriteNow); to a terminal a write of an
+// open file description of its own in non-blocking mode, where it has one
+// (nowaitOf); to anything else, once poll(2) has found room, a write of
+// what it takes without waiting: a pipe no more than PIPE_BUF, a stream
+// socket no more than its low-water mark, a datagram socket the datagram
+// whole, a terminal one byte (it takes what it has room for and waits in
+// the kernel for room for the rest, and tells nobody how much room it
+// has), another character device no more than PIPE_BUF.
 func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte) (int, bool, error) {
 	mode, _ := op.statOf(file)
 	if mode&os.ModeSocket != 0 && hostSendsWithoutWaiting {
@@ -8485,6 +8534,32 @@ func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte
 			return n, again, err
 		}
 	}
+	terminal := false
+	if mode&os.ModeCharDevice != 0 {
+		var err error
+		if terminal, err = op.terminalOf(file); err != nil {
+			return 0, false, err
+		}
+	}
+	if terminal {
+		nowait, err := op.nowaitOf(file, fd)
+		if err != nil {
+			return 0, false, err
+		}
+		if nowait != nil {
+			rc, err := nowait.SyscallConn()
+			if err != nil {
+				return 0, false, err
+			}
+			var n int
+			var again bool
+			var writeErr error
+			if err := rc.Control(func(own uintptr) { n, again, writeErr = writevRaw(own, bufs) }); err != nil {
+				return 0, false, err
+			}
+			return n, again, writeErr
+		}
+	}
 	ready := []bool{false}
 	if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, nil, time.Now(), -1); err != nil {
 		return 0, false, err
@@ -8493,6 +8568,8 @@ func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte
 		return 0, true, nil
 	}
 	switch {
+	case terminal:
+		bufs = leadingBytes(bufs, 1)
 	case mode&(os.ModeNamedPipe|os.ModeCharDevice) != 0:
 		bufs = leadingBytes(bufs, hostPipeBuf)
 	case mode&os.ModeSocket != 0:

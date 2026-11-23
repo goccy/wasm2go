@@ -177,6 +177,9 @@ func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err e
 	return 0, false, false, nil
 }
 
+// hostNowaitTerminal: no terminal is opened again here.
+func hostNowaitTerminal(fd uintptr, name string) (*os.File, error) { return nil, nil }
+
 // hostStreamSendLowat would ask a socket for its low-water mark, which the
 // runtime cannot do on this platform.
 func hostStreamSendLowat(fd uintptr) (int, error) { return 0, errors.ErrUnsupported }

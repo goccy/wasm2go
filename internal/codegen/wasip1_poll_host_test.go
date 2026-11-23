@@ -1388,8 +1388,9 @@ func TestWasi_CloseEndsAPollThatWaits(t *testing.T) {
 	}
 }
 
-// A write that does not wait to a terminal in blocking mode takes no more
-// than PIPE_BUF once poll(2) reports room: it does not wait for the rest.
+// A write that does not wait to a terminal in blocking mode takes what the
+// terminal has room for, less than it is given: it does not wait for the
+// rest.
 func TestWasi_NonBlockingWriteToATerminalIsShort(t *testing.T) {
 	_, slave := openTestPty(t)
 	w, _ := newProcTestStubs(t)
@@ -1401,7 +1402,7 @@ func TestWasi_NonBlockingWriteToATerminalIsShort(t *testing.T) {
 	makeIovec(m, 0, 4096, 64<<10)
 	var rc int32
 	returnsWithin(t, "Fd_write", func() { rc = w.Fd_write(m, 1, 0, 1, 16) })
-	if n := readU32(m.memory, 16); rc != _wasiEAGAIN && (rc != _wasiESUCCESS || n == 0 || n > hostPipeBuf) {
+	if n := readU32(m.memory, 16); rc != _wasiEAGAIN && (rc != _wasiESUCCESS || n == 0 || n >= 64<<10) {
 		t.Fatalf("write = %d bytes rc=%d", n, rc)
 	}
 }

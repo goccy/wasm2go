@@ -270,6 +270,42 @@ func writevRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 	})
 }
 
+// hostNowaitTerminal returns a file, under name, of an open file
+// description of the terminal fd's own, open for what fd is open for and in
+// non-blocking mode, made as the runtime makes its own descriptors
+// (hostReopen): a write of it takes what the terminal has room for and does
+// not wait for the rest, whatever the mode of fd's description. It is nil
+// for a terminal that is not opened so: the master side of a
+// pseudo-terminal, whose open makes a new one (hostReopensTerminal), a
+// terminal of a host without /proc, one the process may not open (EACCES,
+// EPERM) or that is in exclusive use (EBUSY).
+func hostNowaitTerminal(fd uintptr, name string) (*os.File, error) {
+	reopens, err := hostReopensTerminal(fd)
+	if err != nil || !reopens {
+		return nil, err
+	}
+	flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
+	if err != nil {
+		return nil, os.NewSyscallError("fcntl", err)
+	}
+	own := -1
+	err = makeRuntimeDescriptors(func() error {
+		var err error
+		if own, err = hostReopen(fd, flags&syscall.O_ACCMODE|syscall.O_NONBLOCK|syscall.O_NOCTTY); err != nil {
+			return err
+		}
+		own, err = keepRuntimeFD(own)
+		return err
+	})
+	switch {
+	case err == nil:
+		return os.NewFile(uintptr(own), name), nil
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission), errors.Is(err, syscall.EBUSY):
+		return nil, nil
+	}
+	return nil, err
+}
+
 // messageIO makes system call trap, recvmsg(2) or sendmsg(2)
 // (hostSysRecvmsg, hostSysSendmsg), on socket fd over iov once, with flags
 // (MSG_*): see hostIO. msgFlags are the flags the host gives back (a
