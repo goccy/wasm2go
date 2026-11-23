@@ -466,6 +466,39 @@ func (w *WasiStubs) shareStandardLocked(fd int32) {
 	delete(hostTable.reserved, int(fd))
 }
 
+// standardNumber is the process's standard descriptor at its number, which a
+// slot of the guest's shares (standardNumberLocked): a call made on it is
+// made on the number itself, on whatever code outside the runtime has put
+// there since (native code's dup2 onto it).
+type standardNumber int
+
+func (n standardNumber) SyscallConn() (syscall.RawConn, error) { return n, nil }
+
+func (n standardNumber) Control(f func(fd uintptr)) error {
+	f(uintptr(n))
+	return nil
+}
+
+// Read and Write: the runtime waits for a number in poll(2), not in the
+// poller of the Go runtime.
+func (n standardNumber) Read(f func(fd uintptr) bool) error  { return errors.ErrUnsupported }
+func (n standardNumber) Write(f func(fd uintptr) bool) error { return errors.ErrUnsupported }
+
+// standardNumberLocked returns the process's standard descriptor fd at its
+// number (standardNumber) when w's slot fd shares it (hostTable.standard), and
+// nil otherwise. Caller holds w.mu.
+func (w *WasiStubs) standardNumberLocked(fd int32) syscall.Conn {
+	if fd < 0 || fd > 2 || !w.hostFamily() {
+		return nil
+	}
+	hostTable.mu.Lock()
+	defer hostTable.mu.Unlock()
+	if !hostTable.standard[fd][w] {
+		return nil
+	}
+	return standardNumber(fd)
+}
+
 // hostSlotHeld reports whether w's slot fd has the host's descriptor fd.
 func (w *WasiStubs) hostSlotHeld(fd int32) bool {
 	hostTable.mu.Lock()

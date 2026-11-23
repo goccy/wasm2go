@@ -571,6 +571,9 @@ func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
 	return errors.Join(errors.ErrUnsupported, f.Close())
 }
 
+// standardNumberLocked: no slot has a descriptor of the host's here.
+func (w *WasiStubs) standardNumberLocked(fd int32) syscall.Conn { return nil }
+
 // hostSlotHeld: no slot has a descriptor of the host's here.
 func (w *WasiStubs) hostSlotHeld(fd int32) bool { return false }
 

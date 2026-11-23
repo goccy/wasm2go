@@ -406,6 +406,46 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// The guest's writes to the process's standard error go to what is at
+	// descriptor 2 now: a pipe code outside the runtime put there (native
+	// code's dup2), until it puts the old one back.
+	t.Run("StandardNumberRenumberedOutside", func(t *testing.T) {
+		saved, err := dupFrom(2, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, saved)
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.Stderr = os.Stderr
+		if host, ok := w.HostDescriptor(2); !ok || host != 2 {
+			t.Fatalf("HostDescriptor(2) = %d, %v", host, ok)
+		}
+		var p [2]int
+		if err := syscall.Pipe(p[:]); err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, p[0])
+		if err := errors.Join(hostDupTo(p[1], 2), syscall.Close(p[1])); err != nil {
+			t.Fatal(err)
+		}
+		rc := fdWriteString(w, m, 2, "caught")
+		if err := hostDupTo(saved, 2); err != nil {
+			t.Fatal(err)
+		}
+		if rc != _wasiESUCCESS {
+			t.Fatalf("write to fd 2 rc=%d", rc)
+		}
+		buf := make([]byte, 16)
+		n, err := syscall.Read(p[0], buf)
+		if err != nil || string(buf[:n]) != "caught" {
+			t.Fatalf("the pipe at 2 got %q, %v; want the guest's write", buf[:max(n, 0)], err)
+		}
+		// both write ends are closed: the end of the pipe's input
+		if n, err := syscall.Read(p[0], buf); n != 0 || err != nil {
+			t.Fatalf("read after the end %d, %v; want 0", n, err)
+		}
+	})
+
 	t.Run("NewDescriptors", func(t *testing.T) {
 		w, m := newHostNumberedStubs(t, nil, nil)
 		want := lowestFreeHost(t)

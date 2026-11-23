@@ -8597,7 +8597,7 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 	}
 	rest := append([][]byte(nil), bufs...)
 	var total uint64
-	file, _ := dst.(*os.File)
+	file := op.streamFile(dst)
 	// write writes rest once. With wait, which holds the turn, the mode is
 	// not asked: in steps the write does not wait in either, and otherwise
 	// the writev(2) waits in blocking mode and takes what fits in
@@ -8680,7 +8680,7 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 		return 0, _wasiEAGAIN
 	}
 	defer op.passOutputTurn()
-	file, _ := dst.(*os.File)
+	file := op.streamFile(dst)
 	n, again, errno := w.tryStream(call, dst, func(fd uintptr) (int, bool, error) {
 		return op.writeWithoutWaiting(file, fd, bufs)
 	})
@@ -8688,6 +8688,17 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 		errno = _wasiEAGAIN
 	}
 	return uint64(n), errno
+}
+
+// streamFile returns the host file dst is, or, for a standard descriptor at
+// its number (writeStandardNumber), the entry's file, which tells what it is
+// open on; nil for any other stream.
+func (op *wasiOpen) streamFile(dst syscall.Conn) *os.File {
+	if file, isFile := dst.(*os.File); isFile {
+		return file
+	}
+	file, _ := op.f.(*os.File)
+	return file
 }
 
 // writeWithoutWaiting writes bufs once to fd, the descriptor of file, the
@@ -9008,6 +9019,7 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	w.endUnregistered()
 	w.mu.Lock()
 	dst, op := w.fdDstLocked(fd)
+	number := w.standardNumberLocked(fd)
 	turn := w.outputTurnLocked(op, dst)
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
@@ -9055,9 +9067,31 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 		}
 		defer func() { w.reportError("fd_write", turn.give()) }()
 	}
-	n, errno := w.writeFd(m, "fd_write", op, dst, bufs, 0)
+	var n uint64
+	var errno int32
+	if number != nil {
+		n, errno = w.writeStandardNumber(m, op, dst, number, bufs)
+	} else {
+		n, errno = w.writeFd(m, "fd_write", op, dst, bufs, 0)
+	}
 	abi.putWord(nwrittenSlice, n)
 	return w.signalBrokenPipe(m, op.afterShutdown(errno, true), 0)
+}
+
+// writeStandardNumber is writeFd for a slot that shares the process's
+// standard descriptor (standardNumberLocked): the write is made on number,
+// the descriptor at its number, so that it follows a renumbering done
+// outside the runtime; what dst, the entry op's file, is open on decides
+// how it is made.
+func (w *WasiStubs) writeStandardNumber(m *Module, op *wasiOpen, dst io.Writer, number syscall.Conn, bufs [][]byte) (uint64, int32) {
+	if _, blocks := op.writeBlocks(dst); blocks {
+		return w.writeHostStream(m, "fd_write", op, number, bufs, 0)
+	}
+	n, again, errno := w.tryStream("fd_write", number, func(fd uintptr) (int, bool, error) { return writevRaw(fd, bufs) })
+	if errno == _wasiESUCCESS && again {
+		errno = _wasiEAGAIN
+	}
+	return uint64(n), errno
 }
 
 // socketConn returns the entry of the socket fd and its connection, or
