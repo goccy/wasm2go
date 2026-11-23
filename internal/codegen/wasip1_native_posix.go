@@ -1919,6 +1919,35 @@ func (c *outputCopy) drain() {
 	c.deliver(data)
 }
 
+// unlessOtherKind returns err of an ioctl, but nil for its refusal by a
+// descriptor of another kind than the request is for (ENOTTY, EINVAL).
+func unlessOtherKind(err error) error {
+	if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
+		return nil
+	}
+	return err
+}
+
+// hostPending returns the number of bytes that can be read from fd, a
+// descriptor of the host's, without waiting, as FIONREAD counts them for its
+// kind: of a datagram socket, the next datagram on linux, its whole receive
+// buffer (datagrams and their addresses) on darwin. It is 0 where the host
+// has no count to give, and the call on fd tells what it holds: a kind
+// FIONREAD counts nothing of (unlessOtherKind: a listening socket on
+// linux), a device of darwin's that is no stream (ENODEV: /dev/null,
+// /dev/zero, /dev/random), a terminal that has been hung up on (EIO on
+// linux; hungUp is whether poll(2) says fd was).
+func hostPending(fd uintptr, hungUp bool) (uint64, error) {
+	n, err := hostReadable(fd)
+	switch {
+	case err == nil:
+		return uint64(n), nil
+	case errors.Is(err, syscall.ENODEV), hungUp && errors.Is(err, syscall.EIO):
+		return 0, nil
+	}
+	return 0, unlessOtherKind(err)
+}
+
 // readAvailable reads what is in the pipe whose read end f is now: as much
 // as FIONREAD counts (hostReadable), which a writer still writing cannot
 // make longer, and which a read in either mode returns without waiting.

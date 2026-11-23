@@ -1743,6 +1743,21 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			}
 		})
 	})
+
+	// The event for reading of a pipe or socket counts the bytes it holds.
+	t.Run("PollCountsBytes", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.NetAccess = AllowAllNetAccess
+		r, wr := newTestPipe(t, w, m)
+		wantWritten(t, w, m, wr, "hello")
+		wantPollCounts(t, w, m, r, 5)
+		if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 5000); rc != _wasiESUCCESS {
+			t.Fatalf("Sock_socketpair rc=%d", rc)
+		}
+		a, b := int32(readU32(m.memory, 5000)), int32(readU32(m.memory, 5004))
+		wantWritten(t, w, m, a, "hello")
+		wantPollCounts(t, w, m, b, 5)
+	})
 }
 
 // openNonBlockingFIFO opens a FIFO named fifo for reading without waiting

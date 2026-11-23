@@ -87,8 +87,8 @@ func (w *WasiStubs) openFIFOWatched(m *Module, openFile func(name string, flag i
 // for no darwin architecture.
 const hostFIONREAD = 0x4004667f
 
-// hostReadable returns the number of bytes that can be read from fd, a
-// pipe, without waiting (FIONREAD).
+// hostReadable returns the number of bytes that can be read from fd without
+// waiting (FIONREAD).
 func hostReadable(fd uintptr) (int, error) {
 	var n int32
 	err := hostIoctl(fd, hostFIONREAD, unsafe.Pointer(&n))

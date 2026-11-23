@@ -12001,6 +12001,14 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 						nbytes = uint64(st.Size() - cur)
 					}
 				}
+			} else if at := hostIndex[i]; at >= 0 && hostSet[at].stream != nil {
+				// A descriptor of the host's, which poll(2) found ready:
+				// the bytes it holds, which the guest's ioctl(FIONREAD)
+				// takes from this event. A count that fails leaves the
+				// event as poll(2) reported it.
+				n, err := streamPending(hostSet[at].stream, hostSet[at].hungUp)
+				w.reportError("poll_oneoff", err)
+				nbytes = n
 			}
 		}
 		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(errnos[i]), nbytes, flags)
@@ -12025,6 +12033,19 @@ func streamHungUp(stream any) bool {
 	var hup bool
 	hostDescriptor(stream, func(fd uintptr) { hup = hostHungUp(fd) })
 	return hup
+}
+
+// streamPending returns the bytes FIONREAD counts of stream, a descriptor
+// of the host's that poll(2) found ready for reading and hung up on or not
+// (hostPending). Nothing is counted of a stream closed meanwhile, of which
+// hostDescriptor runs nothing: the call on it reports the closing.
+func streamPending(stream any, hungUp bool) (uint64, error) {
+	var count struct {
+		n   uint64
+		err error
+	}
+	hostDescriptor(stream, func(fd uintptr) { count.n, count.err = hostPending(fd, hungUp) })
+	return count.n, count.err
 }
 
 func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64, flags uint16) {

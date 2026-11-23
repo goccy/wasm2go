@@ -269,6 +269,10 @@ func wasiErrno(e syscall.Errno) (int32, bool) {
 // hung up on, which the runtime cannot do on this platform.
 func hostHungUp(fd uintptr) bool { return false }
 
+// hostPending would count the bytes that can be read from a descriptor of
+// the host's (FIONREAD), which the runtime cannot do on this platform: 0.
+func hostPending(fd uintptr, hungUp bool) (uint64, error) { return 0, nil }
+
 // hostDirListing lists a directory of the host's file system (an *os.File,
 // which HostFS opens) in the order the system gives its names, which Go's
 // ReadDir keeps. ReadDir leaves "." and ".." out, and they come first. ok
