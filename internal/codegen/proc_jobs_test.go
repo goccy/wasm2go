@@ -258,3 +258,80 @@ func TestJobs_KillOfGroupOne(t *testing.T) {
 		t.Fatalf("the Signals was given %v", s.kills)
 	}
 }
+
+// A wait for a process group reaps the processes of that group only, the
+// lowest pid first of those that have finished, and is refused for a group
+// the guest has no process in and for a pgid that is not positive.
+func TestJobs_WaitGroupReapsTheGroupsProcessesOnly(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	const pidOut, statusOut = jobOutOff + 8, jobOutOff + 12
+	waitGroup := func(pgid, options int32) (rc, pid, status int32) {
+		rc = root.Proc_wait_group(m, pgid, options, pidOut, statusOut)
+		return rc, int32(readU32(m.memory, int(pidOut))), int32(readU32(m.memory, int(statusOut)))
+	}
+	own := getpgid(t, root, m, 0)
+	child, moved, movedExited := root.ForkProc()
+	registeredFork(t, child)
+	if rc := root.Proc_setpgid(m, moved, 0); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_setpgid(child, 0) rc=%d", rc)
+	}
+	first, firstExited := root.NewProc(nil)
+	second, secondExited := root.NewProc(nil)
+	for _, pgid := range []int32{0, -own} {
+		if rc, _, _ := waitGroup(pgid, 0); rc != -_wasiEINVAL {
+			t.Fatalf("wait for group %d rc=%d, want -EINVAL", pgid, rc)
+		}
+	}
+	if rc, _, _ := waitGroup(77777, 0); rc != -_wasiECHILD {
+		t.Fatalf("wait for a group of no process rc=%d, want -ECHILD", rc)
+	}
+	if rc, _, _ := waitGroup(moved, 1); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG with the group's process running rc=%d, want -EAGAIN", rc)
+	}
+	secondExited(2 << 8)
+	firstExited(1 << 8)
+	if rc, _, _ := waitGroup(moved, 1); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG with processes of another group finished rc=%d, want -EAGAIN", rc)
+	}
+	go movedExited(3 << 8)
+	if rc, pid, status := waitGroup(moved, 0); rc != _wasiESUCCESS || pid != moved || status != 3<<8 {
+		t.Fatalf("wait for the child's group = rc %d pid %d status %#x, want pid %d status %#x", rc, pid, status, moved, 3<<8)
+	}
+	if rc, _, _ := waitGroup(moved, 0); rc != -_wasiECHILD {
+		t.Fatalf("wait for the reaped child's group rc=%d, want -ECHILD", rc)
+	}
+	if rc, pid, status := waitGroup(own, 0); rc != _wasiESUCCESS || pid != first || status != 1<<8 {
+		t.Fatalf("first of the own group = rc %d pid %d status %#x, want pid %d status %#x", rc, pid, status, first, 1<<8)
+	}
+	if rc, pid, status := waitGroup(own, 0); rc != _wasiESUCCESS || pid != second || status != 2<<8 {
+		t.Fatalf("second of the own group = rc %d pid %d status %#x, want pid %d status %#x", rc, pid, status, second, 2<<8)
+	}
+	if rc, _, _ := waitGroup(own, 1); rc != -_wasiECHILD {
+		t.Fatalf("own group all reaped rc=%d, want -ECHILD", rc)
+	}
+}
+
+// Proc_wait_group64 is Proc_wait_group with the pointers of a memory64
+// guest.
+func TestJobs_WaitGroup64(t *testing.T) {
+	root, m := newProcTestStubs(t)
+	const pidOut, statusOut = int64(jobOutOff) + 8, int64(jobOutOff) + 12
+	own := getpgid(t, root, m, 0)
+	if rc := root.Proc_wait_group64(m, 0, 1, pidOut, statusOut); rc != -_wasiEINVAL {
+		t.Fatalf("wait for group 0 rc=%d, want -EINVAL", rc)
+	}
+	if rc := root.Proc_wait_group64(m, own, 1, pidOut, statusOut); rc != -_wasiECHILD {
+		t.Fatalf("wait with no process rc=%d, want -ECHILD", rc)
+	}
+	pid, exited := root.NewProc(nil)
+	if rc := root.Proc_wait_group64(m, own, 1, pidOut, statusOut); rc != -_wasiEAGAIN {
+		t.Fatalf("WNOHANG with the process running rc=%d, want -EAGAIN", rc)
+	}
+	exited(4 << 8)
+	if rc := root.Proc_wait_group64(m, own, 1, pidOut, statusOut); rc != _wasiESUCCESS {
+		t.Fatalf("wait for the finished process rc=%d", rc)
+	}
+	if got, status := int32(readU32(m.memory, int(pidOut))), int32(readU32(m.memory, int(statusOut))); got != pid || status != 4<<8 {
+		t.Fatalf("reaped pid %d status %#x, want pid %d status %#x", got, status, pid, 4<<8)
+	}
+}

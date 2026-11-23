@@ -468,6 +468,11 @@ func TestSignal_InterruptsWaitForAProcess(t *testing.T) {
 	if rc := w.Proc_wait_any(m, 0, sigValueOff, sigValueOff+4); rc != -_wasiEINTR {
 		t.Fatalf("Proc_wait_any rc=%d, want -EINTR", rc)
 	}
+	pgid := getpgid(t, w, m, 0)
+	postWhenBlocked(w, wasiSIGUSR1)
+	if rc := w.Proc_wait_group(m, pgid, 0, sigValueOff, sigValueOff+4); rc != -_wasiEINTR {
+		t.Fatalf("Proc_wait_group rc=%d, want -EINTR", rc)
+	}
 	// A process that has finished is reported, signal waiting or not.
 	exited(3 << 8)
 	w.PostSignal(wasiSIGUSR1)

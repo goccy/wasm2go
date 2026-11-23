@@ -5898,16 +5898,44 @@ func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64)
 // none of them has finished yet, EINTR when a signal was posted to the guest
 // before one finished.
 func (w *WasiStubs) Proc_wait_any(m *Module, options, pidOutPtr, statusOutPtr int32) int32 {
-	return w.procWaitAny(m, options, zext(pidOutPtr), zext(statusOutPtr))
+	return w.procWaitAny(m, 0, options, zext(pidOutPtr), zext(statusOutPtr))
 }
 
 // Proc_wait_any64 is Proc_wait_any for a memory64 guest.
 func (w *WasiStubs) Proc_wait_any64(m *Module, options int32, pidOutPtr, statusOutPtr int64) int32 {
-	return w.procWaitAny(m, options, uint64(pidOutPtr), uint64(statusOutPtr))
+	return w.procWaitAny(m, 0, options, uint64(pidOutPtr), uint64(statusOutPtr))
 }
 
-// procWaitAny is the body of Proc_wait_any and Proc_wait_any64.
-func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPtr uint64) int32 {
+// Proc_wait_group is a NON-STANDARD host import (module
+// wasip1_posix_extension, name "proc_wait_group") backing waitpid(-pgid)
+// and waitpid(0): it is Proc_wait_any for the processes of this instance
+// whose process group is pgid, the group as Proc_getpgid and Proc_setpgid
+// number it. pgid must be positive: for waitpid(0) the guest passes its own
+// group (Proc_getpgid of pid 0). Returns 0, or a negative errno: EINVAL for
+// a pgid that is not positive, ECHILD when the instance has no process in
+// the group, and the others as Proc_wait_any.
+func (w *WasiStubs) Proc_wait_group(m *Module, pgid, options, pidOutPtr, statusOutPtr int32) int32 {
+	return w.procWaitGroup(m, pgid, options, zext(pidOutPtr), zext(statusOutPtr))
+}
+
+// Proc_wait_group64 is Proc_wait_group for a memory64 guest.
+func (w *WasiStubs) Proc_wait_group64(m *Module, pgid, options int32, pidOutPtr, statusOutPtr int64) int32 {
+	return w.procWaitGroup(m, pgid, options, uint64(pidOutPtr), uint64(statusOutPtr))
+}
+
+// procWaitGroup is the body of Proc_wait_group and Proc_wait_group64.
+func (w *WasiStubs) procWaitGroup(m *Module, pgid, options int32, pidOutPtr, statusOutPtr uint64) int32 {
+	if pgid <= 0 {
+		w.endUnregistered()
+		return -_wasiEINVAL
+	}
+	return w.procWaitAny(m, pgid, options, pidOutPtr, statusOutPtr)
+}
+
+// procWaitAny is the body of Proc_wait_any and Proc_wait_any64, which pass
+// pgid 0 to wait for any process of the instance, and of procWaitGroup,
+// which passes the process group whose processes it waits for.
+func (w *WasiStubs) procWaitAny(m *Module, pgid, options int32, pidOutPtr, statusOutPtr uint64) int32 {
 	w.endUnregistered()
 	pidOut := w.memBytes(m, pidOutPtr, 4)
 	statusOut := w.memBytes(m, statusOutPtr, 4)
@@ -5920,15 +5948,22 @@ func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPt
 		if w.sig.reapsChildren() {
 			w.reapFinishedLocked()
 		}
-		if len(w.procs) == 0 {
-			w.mu.Unlock()
-			return -_wasiECHILD
-		}
 		var (
-			pid  int32
-			proc *wasiProc
+			pid     int32
+			proc    *wasiProc
+			members bool
+			pids    *wasiPIDs
 		)
+		if pgid != 0 {
+			// The group of a process is guarded by the family's lock.
+			pids = w.pidsLocked()
+			pids.mu.Lock()
+		}
 		for p, pr := range w.procs {
+			if pids != nil && pr.pgid != pgid {
+				continue
+			}
+			members = true
 			select {
 			case <-pr.done:
 				if proc == nil || p < pid {
@@ -5936,6 +5971,13 @@ func (w *WasiStubs) procWaitAny(m *Module, options int32, pidOutPtr, statusOutPt
 				}
 			default:
 			}
+		}
+		if pids != nil {
+			pids.mu.Unlock()
+		}
+		if !members {
+			w.mu.Unlock()
+			return -_wasiECHILD
 		}
 		if proc != nil {
 			w.dropProcLocked(pid)
