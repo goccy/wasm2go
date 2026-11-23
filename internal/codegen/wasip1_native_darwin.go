@@ -123,6 +123,18 @@ const hostSendsWithoutWaiting = false
 // much without waiting.
 const hostPipeBuf = 512
 
+// hostWritesWithoutWaiting says that a write that waits to a descriptor in
+// blocking mode is not made in steps here (writeHostStream): darwin has no
+// write that does not wait in one call on such a descriptor, so the write is
+// one writev(2), which waits in the kernel, and a signal does not end it.
+const hostWritesWithoutWaiting = false
+
+// hostPipeWriteNow: darwin does not tell how to write to a pipe without
+// waiting whatever its mode.
+func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err error) {
+	return 0, false, false, nil
+}
+
 // The numbers of recvmsg(2) and sendmsg(2).
 const (
 	hostSysRecvmsg = syscall.SYS_RECVMSG

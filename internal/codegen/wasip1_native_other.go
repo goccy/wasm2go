@@ -161,6 +161,15 @@ func sendNow(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 // without waiting.
 const hostSendsWithoutWaiting = false
 
+// hostWritesWithoutWaiting: a write that waits is one writev(2) here.
+const hostWritesWithoutWaiting = false
+
+// hostPipeWriteNow: the host does not tell here how to write to a pipe
+// without waiting whatever its mode.
+func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err error) {
+	return 0, false, false, nil
+}
+
 // hostStreamSendLowat would ask a socket for its low-water mark, which the
 // runtime cannot do on this platform.
 func hostStreamSendLowat(fd uintptr) (int, error) { return 0, errors.ErrUnsupported }
@@ -416,7 +425,7 @@ func hostSyscall(number int64, args [6]uint64, ptrs uint32, mem []byte) (int64, 
 // it is, and os/exec copies any other stream, to the instance's stdout and
 // stderr under the family's output lock (familyStreams). Its wait waits for
 // the copies, as Cmd.Wait does.
-func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, inherit []commandDescriptor, share *familyStreams) (*hostCommand, error) {
 	cmd := &exec.Cmd{Path: path, Args: argv, Env: env, Dir: dir}
 	if s := streams[0]; s.host != nil {
 		cmd.Stdin = s.host.(io.Reader)
@@ -508,6 +517,25 @@ func keepRuntimeFile(f *os.File) (*os.File, error) { return f, nil }
 // keepRuntimeOpened: the runtime's descriptors are where the host puts them.
 func keepRuntimeOpened(f File) (File, error) { return f, nil }
 
+// guestFile: no instance's descriptors are the host process's here, and the
+// runtime's descriptors are where the host puts them.
+func (w *WasiStubs) guestFile(f *os.File, nonblock bool) (*os.File, error) { return f, nil }
+
+// acceptedMode: an accepted connection keeps the mode accept made it in.
+func (w *WasiStubs) acceptedMode(conn int, fdflags int32) error { return nil }
+
+// guestOpened is guestFile for a file a FS opened.
+func (w *WasiStubs) guestOpened(f File, nonblock bool) (File, error) { return f, nil }
+
+// hostCloseOnExec: no descriptor of the host's is taken in here.
+func hostCloseOnExec(fd int) bool { return true }
+
+// hostCloseOnExecMark: no descriptor of the host's is taken in here.
+func hostCloseOnExecMark(fd int, set, value bool) (uint32, error) { return 0, errors.ErrUnsupported }
+
+// inheritedOutside: no instance's descriptors are the host's here.
+func (w *WasiStubs) inheritedOutside() []commandDescriptor { return nil }
+
 // currentLocked: every slot is what it was made for here.
 func (w *WasiStubs) currentLocked(fd int32) bool { return true }
 
@@ -547,7 +575,7 @@ func (w *WasiStubs) takeStandardLocked(fd int32) bool { return false }
 // fileEntry returns the entry of f, a file of the configuration's Files,
 // which it takes over: f itself, a directory or a regular file as its Stat
 // says. On failure f is closed.
-func fileEntry(f *os.File) (*wasiOpen, error) {
+func fileEntry(f *os.File, nonblock bool) (*wasiOpen, error) {
 	st, err := f.Stat()
 	if err != nil {
 		return nil, errors.Join(err, f.Close())

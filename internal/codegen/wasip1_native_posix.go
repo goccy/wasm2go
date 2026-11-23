@@ -1420,7 +1420,7 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (in
 // command writes to either keeps its order. The command's wait delivers
 // what it wrote before it returns, and gives the input the runtime took for
 // it and it did not read back.
-func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, share *familyStreams) (*hostCommand, error) {
+func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string, job hostJob, streams *[3]commandStream, inherit []commandDescriptor, share *familyStreams) (*hostCommand, error) {
 	report := func(err error) { w.reportError(op, err) }
 	var setup commandSetup
 	var pid int
@@ -1438,9 +1438,11 @@ func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string
 			}
 		}
 		return withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
-			var err error
-			pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: fds, Sys: hostJobAttr(job)})
-			return err
+			return withCommandFiles(fds, inherit, func(files []uintptr) error {
+				var err error
+				pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: files, Sys: hostJobAttr(job)})
+				return err
+			})
 		})
 	})
 	if err != nil {
@@ -1759,6 +1761,48 @@ func closeIfAny(c io.Closer) error {
 		return nil
 	}
 	return c.Close()
+}
+
+// withCommandFiles calls use with the descriptors a command is started
+// with (syscall.ProcAttr.Files): its standard streams' (std), and the
+// descriptors of inherit at their numbers, each borrowed as
+// withHostDescriptor borrows it — the host's descriptor behind a conn, the
+// number itself for one without. A number that inherits nothing is closed
+// in the command (-1), and so is one whose entry was closed since it was
+// collected, as exec(2) passes nothing under a number closed before it.
+func withCommandFiles(std []uintptr, inherit []commandDescriptor, use func(files []uintptr) error) error {
+	if len(inherit) == 0 {
+		return use(std)
+	}
+	files := slices.Repeat([]uintptr{^uintptr(0)}, int(inherit[len(inherit)-1].at)+1)
+	copy(files, std)
+	var from func(i int) error
+	from = func(i int) error {
+		if i == len(inherit) {
+			return use(files)
+		}
+		d := inherit[i]
+		if d.conn == nil {
+			files[d.at] = uintptr(d.at)
+			return from(i + 1)
+		}
+		rc, err := d.conn.SyscallConn()
+		if err != nil {
+			return err
+		}
+		called := false
+		var inner error
+		if err := rc.Control(func(fd uintptr) {
+			called = true
+			files[d.at] = fd
+			inner = from(i + 1)
+		}); err != nil && !called {
+			// closed since it was collected (Control's one failure)
+			return from(i + 1)
+		}
+		return inner
+	}
+	return from(0)
 }
 
 // withHostDescriptors calls use with the descriptors of conns, each

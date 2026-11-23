@@ -9,8 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -40,6 +42,62 @@ const hostSendsWithoutWaiting = true
 // hostPipeBuf is PIPE_BUF: a pipe that poll(2) reports writable takes that
 // much without waiting.
 const hostPipeBuf = 4096
+
+// hostWritesWithoutWaiting says that a write that waits to a descriptor in
+// blocking mode is made in steps that do not wait in the kernel here
+// (writeHostStream).
+const hostWritesWithoutWaiting = true
+
+// hostPipeNowaitRefused is set once the host has refused a write that does
+// not wait (RWF_NOWAIT) to a pipe: a kernel without pwritev2 (ENOSYS), or
+// without RWF_NOWAIT (EINVAL), or whose pipes do not take it (EOPNOTSUPP).
+var hostPipeNowaitRefused atomic.Bool
+
+// hostSysPwritev2 is the number of pwritev2(2), which package syscall does
+// not name, on the architectures whose number is known here (ok): x86-64's,
+// i386's, arm's, and asm-generic's.
+func hostSysPwritev2() (nr uintptr, ok bool) {
+	switch runtime.GOARCH {
+	case "amd64":
+		return 328, true
+	case "386":
+		return 379, true
+	case "arm":
+		return 393, true
+	case "arm64", "riscv64", "loong64":
+		return 287, true
+	}
+	return 0, false
+}
+
+// hostPipeWriteNow writes bufs to fd, a pipe or a FIFO, once without waiting
+// whatever the mode of its open file description, where the host tells how
+// (done): one pwritev2(2) with RWF_NOWAIT, which takes what there is room
+// for and nothing (again) when there is none, as a write in non-blocking
+// mode does, and keeps a write of no more than PIPE_BUF whole. Once the host
+// refuses it (hostPipeNowaitRefused), done is false.
+func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err error) {
+	nr, known := hostSysPwritev2()
+	if !known || hostPipeNowaitRefused.Load() {
+		return 0, false, false, nil
+	}
+	iov, _ := hostIovecs(bufs)
+	if len(iov) == 0 {
+		return 0, false, true, nil
+	}
+	const rwfNowait = 0x8
+	// The offset -1, in its low and high words, is the descriptor's own.
+	n, again, err = hostIO(func() (uintptr, syscall.Errno) {
+		r, _, errno := syscall.Syscall6(nr, fd, uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)), ^uintptr(0), ^uintptr(0), rwfNowait)
+		runtime.KeepAlive(iov)
+		return r, errno
+	})
+	if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EOPNOTSUPP) {
+		hostPipeNowaitRefused.Store(true)
+		return 0, false, false, nil
+	}
+	return n, again, true, err
+}
 
 // hostWakePipe makes a pipe whose ends do not wait and are closed on exec:
 // a wait in poll(2) watches its read end, and a byte written to the other

@@ -691,3 +691,61 @@ func TestWasi_AnEmbeddersPolledStreamWaitsInTheGoRuntimesPoller(t *testing.T) {
 		t.Fatalf("read = %q rc=%d, want %q", res.got, res.rc, "x")
 	}
 }
+
+// A write that waits to a descriptor in blocking mode (a pipe the process
+// inherited) is made in steps that do not wait in the kernel where the host
+// has such a write (hostWritesWithoutWaiting): a signal ends its wait for
+// room, with EINTR when it wrote nothing and the count otherwise.
+func TestWasi_AWriteToABlockingPipeTakesASignal(t *testing.T) {
+	skipWithoutStreamWrites(t)
+	if !hostWritesWithoutWaiting {
+		t.Skip("a write that waits is one writev(2) here, which a signal does not end")
+	}
+	w, m := newSignalGuest(t, wasiSIGUSR1)
+	r, wr := blockingPipe(t)
+	w.cfg.Stdout = wr
+	fillBlockingPipe(t, wr)
+	postWhenBlocked(w, wasiSIGUSR1)
+	if rc := fdWriteString(w, m, 1, "x"); rc != _wasiEINTR {
+		t.Fatalf("write to a full blocking pipe with a signal rc=%d, want EINTR", rc)
+	}
+	takeSignals(t, w, m)
+	if _, err := r.Read(make([]byte, 8192)); err != nil {
+		t.Fatal(err)
+	}
+	postWhenBlocked(w, wasiSIGUSR1)
+	if n, rc := writeChunk(t, w, m, 1); rc != _wasiESUCCESS || n == 0 || n >= uint32(wsChunk) {
+		t.Fatalf("interrupted write: %d bytes rc=%d, want part of %d", n, rc, wsChunk)
+	}
+	if rc := sleepPoll(t, w, m, time.Hour); rc != _wasiEINTR {
+		t.Fatalf("the next call that waits rc=%d, want EINTR", rc)
+	}
+	takeSignals(t, w, m)
+}
+
+// fillBlockingPipe fills the pipe whose write end in blocking mode is wr,
+// in non-blocking mode for the fill only.
+func fillBlockingPipe(t *testing.T, wr *os.File) {
+	t.Helper()
+	rc, err := wr.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fillErr error
+	if err := rc.Control(func(fd uintptr) {
+		if fillErr = syscall.SetNonblock(int(fd), true); fillErr != nil {
+			return
+		}
+		for {
+			if _, err := syscall.Write(int(fd), []byte{0}); err != nil {
+				if !errors.Is(err, syscall.EAGAIN) {
+					fillErr = err
+				}
+				break
+			}
+		}
+		fillErr = errors.Join(fillErr, syscall.SetNonblock(int(fd), false))
+	}); err != nil || fillErr != nil {
+		t.Fatal(err, fillErr)
+	}
+}
