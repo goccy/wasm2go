@@ -604,16 +604,7 @@ func Transform(fn *Fn, opts TransformOptions) (string, error) {
 	if hasDuffPseudo(fn.Insns) {
 		return "", errUnsupportedDuff
 	}
-	// Directive pseudo-instructions confuse positional prologue
-	// detection and are re-derived by the assembler anyway.
-	var meat []Insn
-	for _, in := range fn.Insns {
-		if strings.HasPrefix(in.Text, "FUNCDATA") || strings.HasPrefix(in.Text, "PCDATA") {
-			continue
-		}
-		meat = append(meat, in)
-	}
-	insns, err := stripPrologueEpilogue(meat)
+	insns, err := capturedBody(fn)
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", fn.Name, err)
 	}
@@ -1067,6 +1058,21 @@ func rewriteSPOffsets(txt string, capturedFrame, delta int, args []RegAssignment
 		}
 		return fmt.Sprintf("%s%d(SP)", sub[1], n+delta)
 	})
+}
+
+// capturedBody is the part of fn's instructions Transform rewrites:
+// directive pseudo-instructions dropped (they confuse positional prologue
+// detection and are re-derived by the assembler anyway) and gc's
+// prologue/epilogues stripped.
+func capturedBody(fn *Fn) ([]Insn, error) {
+	var meat []Insn
+	for _, in := range fn.Insns {
+		if strings.HasPrefix(in.Text, "FUNCDATA") || strings.HasPrefix(in.Text, "PCDATA") {
+			continue
+		}
+		meat = append(meat, in)
+	}
+	return stripPrologueEpilogue(meat)
 }
 
 // stripPrologueEpilogue removes the captured stacksplit block, the

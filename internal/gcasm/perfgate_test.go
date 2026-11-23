@@ -6,26 +6,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// TestPerfGate quantifies the transform's cost against the SAME code
-// compiled natively by gc:
+// TestPerfGate pins the transform's cost against the SAME code
+// compiled natively by gc, in the instructions it emits:
 //
 //   - fib: call-dominated worst case. Every internal call boundary
-//     pays the ABI0 marshal (register→stack stores before the CALL,
-//     result load after), so this measures the ceiling of the
-//     boundary tax.
-//   - kern: loop-dominated best case. No internal calls — the body
-//     should be byte-for-byte the gc loop, and the ratio ~1.0.
+//     pays the ABI0 marshal, and nothing else may be added: the body
+//     is gc's instructions plus one FP load of its parameter at entry,
+//     one store per argument before and one load per result after
+//     each internal CALL, and the result store before each RET.
+//   - kern: loop-dominated best case. No internal calls — the loop is
+//     gc's loop instruction for instruction (branch targets only
+//     become pcN labels).
 //
-// The gate only asserts sanity bounds (transform not catastrophically
-// slower); the measured ratios go to the log for bench-metrics.md.
+// On an amd64 host both bodies are then built and run against the pure
+// functions.
 func TestPerfGate(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
-	}
 	if testing.Short() {
 		t.Skip("perf gate skipped in -short")
 	}
@@ -86,7 +87,7 @@ func Kern(n int32, seed int32) int32 {
 	}
 	var asmB strings.Builder
 	asmB.WriteString("#include \"textflag.h\"\n#include \"funcdata.h\"\n\n")
-	transform := func(suffix, sym string, params []ArgKind, names []string) {
+	transform := func(suffix, sym string, params []ArgKind, names []string) (*Fn, string) {
 		t.Helper()
 		var fn *Fn
 		for _, f := range fns {
@@ -113,46 +114,87 @@ func Kern(n int32, seed int32) int32 {
 		}
 		asmB.WriteString(body)
 		asmB.WriteString("\n")
+		return fn, body
 	}
-	transform(".Fib", "fibAsm", []ArgKind{ArgI32}, []string{"n"})
-	transform(".Kern", "kernAsm", []ArgKind{ArgI32, ArgI32}, []string{"n", "seed"})
+	fib, fibBody := transform(".Fib", "fibAsm", []ArgKind{ArgI32}, []string{"n"})
+	kern, kernBody := transform(".Kern", "kernAsm", []ArgKind{ArgI32, ArgI32}, []string{"n", "seed"})
 	asmB.WriteString(pool.Emit())
 	if len(types.Names) > 0 {
 		t.Fatalf("unexpected type refs: %v", types.Names)
 	}
 
+	// fib: gc's instructions plus exactly the ABI0 marshal.
+	fibGC, err := capturedBody(fib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := len(fibGC) + 1 // the entry load of n
+	for _, in := range fibGC {
+		if m := callRe.FindStringSubmatch(in.Text); m != nil && strings.HasSuffix(m[1], ".Fib") {
+			want += 2 // store of the argument, load of the result
+		}
+		if strings.HasPrefix(in.Text, "RET") {
+			want++ // store of the result
+		}
+	}
+	if got := len(asmInsns(strings.Split(fibBody, "\n"))); got != want {
+		t.Errorf("fib: %d instructions, want %d (gc's %d plus the ABI0 marshal)\n--- asm ---\n%s", got, want, len(fibGC), fibBody)
+	}
+
+	// kern: the loop (from the backward branch's target to the branch)
+	// is gc's.
+	kernGC, err := capturedBody(kern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loop []string
+	var head int
+	for i, in := range kernGC {
+		m := branchNumRe.FindStringSubmatch(in.Text)
+		if m == nil {
+			continue
+		}
+		target, err := strconv.Atoi(m[2])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target > in.Off {
+			continue
+		}
+		head = target
+		for _, l := range kernGC[:i+1] {
+			if l.Off >= target {
+				loop = append(loop, branchNumRe.ReplaceAllString(l.Text, "$1\tpc$2"))
+			}
+		}
+		break
+	}
+	if loop == nil {
+		t.Fatalf("captured Kern has no backward branch: %v", kernGC)
+	}
+	lines := strings.Split(kernBody, "\n")
+	start := slices.Index(lines, fmt.Sprintf("pc%d:", head))
+	if start < 0 {
+		t.Fatalf("kern: no label pc%d\n--- asm ---\n%s", head, kernBody)
+	}
+	got := asmInsns(lines[start+1:])
+	if got = got[:min(len(got), len(loop))]; !slices.Equal(got, loop) {
+		t.Errorf("kern: the transform changed gc's loop\n got %q\nwant %q", got, loop)
+	}
+
+	if runtime.GOARCH != "amd64" {
+		t.Skip("fixture emits amd64-only asm; the harness builds and runs it on the host")
+	}
 	run := t.TempDir()
 	files := map[string]string{
 		"go.mod":       "module perfrun\n\ngo 1.25.0\n",
 		"lib.go":       strings.Replace(strings.Replace(libSrc, "package lib", "package perfrun", 1), "//go:noinline\n", "//go:noinline\n", 2),
 		"decl.go":      "package perfrun\n\nfunc fibAsm(n int32) (r0 int32)\nfunc kernAsm(n int32, seed int32) (r0 int32)\n",
 		"body_amd64.s": asmB.String(),
-		"bench_test.go": `package perfrun
+		"parity_test.go": `package perfrun
 
 import "testing"
 
-var sink int32
-
-func BenchmarkFibPure(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		sink = Fib(25)
-	}
-}
-func BenchmarkFibAsm(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		sink = fibAsm(25)
-	}
-}
-func BenchmarkKernPure(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		sink = Kern(1000000, 42)
-	}
-}
-func BenchmarkKernAsm(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		sink = kernAsm(1000000, 42)
-	}
-}
 func TestParity(t *testing.T) {
 	if Fib(20) != fibAsm(20) {
 		t.Fatalf("fib mismatch: %d vs %d", Fib(20), fibAsm(20))
@@ -168,41 +210,24 @@ func TestParity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cmd := exec.Command("go", "test", "-run", "TestParity", "-bench", ".", "-benchtime", "2s", ".")
+	cmd := exec.Command("go", "test", "-run", "TestParity", ".")
 	cmd.Dir = run
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("perf gate failed: %v\n%s\n--- asm ---\n%s", err, out, asmB.String())
 	}
-	var fibPure, fibAsm, kernPure, kernAsm float64
-	for _, ln := range strings.Split(string(out), "\n") {
-		f := strings.Fields(ln)
-		if len(f) >= 3 && strings.HasSuffix(f[len(f)-1], "ns/op") || len(f) >= 4 && f[len(f)-1] == "ns/op" {
-			var v float64
-			if _, err := fmt.Sscanf(f[len(f)-2], "%f", &v); err != nil {
-				continue
-			}
-			switch {
-			case strings.HasPrefix(ln, "BenchmarkFibPure"):
-				fibPure = v
-			case strings.HasPrefix(ln, "BenchmarkFibAsm"):
-				fibAsm = v
-			case strings.HasPrefix(ln, "BenchmarkKernPure"):
-				kernPure = v
-			case strings.HasPrefix(ln, "BenchmarkKernAsm"):
-				kernAsm = v
-			}
+}
+
+// asmInsns lists the instructions among lines of transformed asm: the
+// TEXT line, NO_LOCAL_POINTERS and labels are not instructions.
+func asmInsns(lines []string) []string {
+	var insns []string
+	for _, ln := range lines {
+		ln = strings.TrimPrefix(ln, "\t")
+		if ln == "" || ln == "NO_LOCAL_POINTERS" || strings.HasPrefix(ln, "TEXT ") || strings.HasSuffix(ln, ":") {
+			continue
 		}
+		insns = append(insns, ln)
 	}
-	if fibPure == 0 || fibAsm == 0 || kernPure == 0 || kernAsm == 0 {
-		t.Fatalf("bench parse failed:\n%s", out)
-	}
-	t.Logf("fib  pure=%.0fns asm=%.0fns ratio=%.3f (call-dominated: ABI0 marshal ceiling)", fibPure, fibAsm, fibAsm/fibPure)
-	t.Logf("kern pure=%.0fns asm=%.0fns ratio=%.3f (loop-dominated: should be ~1.0)", kernPure, kernAsm, kernAsm/kernPure)
-	if kernAsm/kernPure > 1.15 {
-		t.Errorf("loop kernel ratio %.3f exceeds 1.15 — transform is damaging straight-line code", kernAsm/kernPure)
-	}
-	if fibAsm/fibPure > 3.0 {
-		t.Errorf("fib ratio %.3f exceeds 3.0 — boundary marshal cost out of expected range", fibAsm/fibPure)
-	}
+	return insns
 }
