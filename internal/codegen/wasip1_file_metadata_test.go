@@ -1327,9 +1327,11 @@ func TestWasi_CreationModeAppliesUmask(t *testing.T) {
 
 // hostTakesOut returns the mask the host's filesystem takes out of a mode
 // besides the instance's umask: none where the instance's creation thread
-// has the umask (creationThreads), the host process's elsewhere.
+// has the umask (creationThreads) or the runtime puts back what the host
+// process's takes out (hostHasUmask without hostThreadUmask), the host
+// process's elsewhere.
 func hostTakesOut(t *testing.T) os.FileMode {
-	if creationThreads(t) {
+	if creationThreads(t) || hostHasUmask && !hostThreadUmask {
 		return 0
 	}
 	return hostUmask(t)
@@ -1387,14 +1389,19 @@ func TestWasi_CreationModeKeepsSpecialBits(t *testing.T) {
 		t.Error("chmodRefused does not tell EPERM from another error")
 	}
 	// A symbolic link to no file: the file it leads to is created, with the
-	// bits.
+	// bits, less the host process's umask as well without a creation thread
+	// (openExactly).
 	if err := os.Symlink("target", filepath.Join(dir, "dangling")); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := createWithMode(t, w, m, "dangling", 0o2775), 0o2775&^less; got != want {
+	throughLink := less
+	if !creationThreads(t) {
+		throughLink |= uint32(hostUmask(t))
+	}
+	if got, want := createWithMode(t, w, m, "dangling", 0o2775), 0o2775&^throughLink; got != want {
 		t.Errorf("file 02775 through a dangling link = %o, want %o", got, want)
 	}
-	if got, want := pathFilestatExt(t, w, m, "target").mode, 0o2775&^less; got != want {
+	if got, want := pathFilestatExt(t, w, m, "target").mode, 0o2775&^throughLink; got != want {
 		t.Errorf("the file the link leads to = %o, want %o", got, want)
 	}
 }
@@ -1425,6 +1432,135 @@ func hostUmask(t *testing.T) os.FileMode {
 		t.Fatal(err)
 	}
 	return 0o777 &^ fi.Mode().Perm()
+}
+
+// What an instance creates on the host's filesystem has its own umask
+// taken out alone where the host process has another — the root's, given
+// to HostProcessChanges — looser or stricter: files, directories and FIFOs,
+// those its owner may not read and those with a sticky or setgid bit too,
+// of the whole host filesystem and of HostFS(dir). A file that is there
+// keeps its mode.
+func TestWasi_CreationModeIsTheInstancesUnderAnotherHostUmask(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	if hostThreadUmask && !creationThreads(t) {
+		t.Skip("the system refuses a creation thread")
+	}
+	host := hostUmask(t)
+	t.Cleanup(func() {
+		if _, err := hostSetUmask(host); err != nil {
+			t.Error(err)
+		}
+	})
+	w, m := newTestStubs(t, t.TempDir())
+	w.cfg.ProcessChanges = HostProcessChanges()
+	w.Proc_umask(m, 0o077)
+	if got := hostUmask(t); got != 0o077 {
+		t.Fatalf("the host process's umask is %o, want the root's 077", got)
+	}
+	child := w.Fork()
+	t.Cleanup(func() {
+		if err := child.CloseAll(); err != nil {
+			t.Error(err)
+		}
+	})
+	cm := newForkTestModule()
+	mkfifo := func(t *testing.T, w *WasiStubs, m *Module, name string, mode int32) uint32 {
+		t.Helper()
+		off, n := putPath(m, metaPathOff, name)
+		if rc := w.Path_mkfifo(m, off, n, mode); rc != _wasiESUCCESS {
+			t.Fatalf("Path_mkfifo(%s, %o) rc=%d", name, mode, rc)
+		}
+		return pathFilestatExt(t, w, m, name).mode
+	}
+	type creation struct {
+		root  bool
+		umask int32
+		name  string
+		make  func(*testing.T, *WasiStubs, *Module, string, int32) uint32
+		mode  int32
+		want  uint32
+	}
+	both := []creation{
+		{true, 0o077, "root", createWithMode, 0o666, 0o600},
+		{false, 0o002, "file", createWithMode, 0o666, 0o664},
+		{false, 0o002, "dir", mkdirWithMode, 0o777, 0o775},
+		{false, 0o002, "unreadable", mkdirWithMode, 0o333, 0o331},
+		{false, 0o002, "slashed/", mkdirWithMode, 0o777, 0o775},
+		{false, 0o002, "sticky", mkdirWithMode, 0o1777, 0o1775},
+		{false, 0, "root", createWithMode, 0o666, 0o600},
+		{false, 0o177, "strict", createWithMode, 0o666, 0o600},
+	}
+	for _, c := range []struct {
+		fsys      FS
+		dir       string
+		creations []creation
+	}{
+		{osFS{}, hostRelative(t, t.TempDir()) + "/", append(both,
+			creation{false, 0o002, "fifo", mkfifo, 0o666, 0o664},
+			creation{false, 0o002, "writeonly", mkfifo, 0o222, 0o220})},
+		{newHostFS(t, t.TempDir()), "", append(both,
+			creation{false, 0o002, "setgid", createWithMode, 0o2775, 0o2775})},
+	} {
+		w.cfg.FS, child.cfg.FS = c.fsys, c.fsys
+		for _, cr := range c.creations {
+			in, im := child, cm
+			if cr.root {
+				in, im = w, m
+			}
+			in.Proc_umask(im, cr.umask)
+			if got := cr.make(t, in, im, c.dir+cr.name, cr.mode); got != cr.want {
+				t.Errorf("%T: %s %o under umask %03o, the host process's 077: %o, want %o", c.fsys, cr.name, cr.mode, cr.umask, got, cr.want)
+			}
+		}
+	}
+}
+
+// makeExactly leaves alone what is at the name once it is no longer what
+// the call made: a symbolic link put there, whose target keeps its mode,
+// nothing, or a file of another kind.
+func TestMakeExactlyLeavesWhatReplacedTheMadeFile(t *testing.T) {
+	skipWithoutPOSIXFiles(t)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fsys := osFS{dir: dir}
+	for name, replace := range map[string]func(path string) error{
+		"link": func(path string) error {
+			return errors.Join(os.Remove(path), os.Symlink(target, path))
+		},
+		"link/": func(path string) error {
+			return errors.Join(os.Remove(path), os.Symlink(target, strings.TrimSuffix(path, "/")))
+		},
+		"gone": os.Remove,
+		"file": func(path string) error {
+			return errors.Join(os.Remove(path), os.WriteFile(path, nil, 0o600))
+		},
+	} {
+		err := makeExactly(fsys, name, os.ModeDir, 0o777, func(name string, perm os.FileMode) error {
+			if err := fsys.Mkdir(name, perm); err != nil {
+				return err
+			}
+			return replace(fsys.join(name))
+		})
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+		if fi, err := os.Lstat(fsys.join(name)); err == nil && fi.Mode().Type() == 0 && fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s: the file put at the name has mode %o, want it kept at 600", name, fi.Mode().Perm())
+		}
+		if err := os.RemoveAll(fsys.join(strings.TrimSuffix(name, "/"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fi, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Errorf("the link's target has mode %o, want it kept at 700", fi.Mode().Perm())
+	}
 }
 
 // The file mode creation mask a guest sets is its instance's: the mask of

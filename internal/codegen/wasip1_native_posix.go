@@ -129,6 +129,10 @@ func hostSetUmask(mask os.FileMode) (os.FileMode, error) {
 	return prev, nil
 }
 
+// hostHasUmask says that the system takes the host process's umask out of
+// the mode of what it creates (create).
+const hostHasUmask = true
+
 // hostSetThreadUmask sets the umask of a creation thread (umask(2) on it,
 // whose file system attributes are its own).
 func hostSetThreadUmask(mask os.FileMode) { syscall.Umask(int(mask.Perm())) }

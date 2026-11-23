@@ -273,7 +273,7 @@ func TestWasi_DirectoryFSOfTheHost(t *testing.T) {
 		// and the mode less the umask for any other FS.
 		asked := func(fsys FS) os.FileMode {
 			var perm os.FileMode
-			if err := w.create(fsys, 0o777, func(p os.FileMode) error { perm = p; return nil }); err != nil {
+			if err := w.create(fsys, 0o777, func(p os.FileMode, _ bool) error { perm = p; return nil }); err != nil {
 				t.Fatal(err)
 			}
 			return perm

@@ -193,8 +193,9 @@ func (e *WasiSignalError) endsInstance() {}
 // implementing the same optional interfaces; but for one thing: on Linux
 // the files, directories and FIFOs HostFS's FS creates get the instance's
 // umask taken out by the host's kernel, which a default ACL of their
-// directory may stand in for, and those a wrapper of it creates get the
-// requested mode less the umask (see create).
+// directory may stand in for, on darwin the requested mode less the umask
+// whatever the host process's umask is, and those a wrapper of it creates
+// get the requested mode less the umask (see create).
 type FS interface {
 	// OpenFile opens name as os.Root.OpenFile does: flag is
 	// O_RDONLY/O_WRONLY/O_RDWR optionally OR'd with
@@ -8894,8 +8895,9 @@ func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
 // (posix_acl_create) — and a command the instance starts (Proc_spawn) is
 // started there and inherits it. Elsewhere, and for any other filesystem,
 // the runtime takes the mask out of the mode it asks the filesystem for; on
-// another system than Linux the host's filesystem takes the host process's
-// umask out as well, and a command inherits the host process's umask.
+// darwin the host's filesystem takes the host process's umask out as well,
+// which the runtime puts back on what the instance creates (openExactly,
+// makeExactly), and a command inherits the host process's umask.
 //
 // The mask the guest of the family's root instance sets is given to the
 // ProcessChanges as well (WASIConfig.ProcessChanges): HostProcessChanges
@@ -8949,14 +8951,6 @@ func (w *WasiStubs) guestUmask() os.FileMode {
 	return w.guestProcess().Umask().Perm()
 }
 
-// create runs make, which creates a file, directory or FIFO in fsys with the
-// mode it is given, so that the instance's umask is taken out of the
-// requested mode: for a filesystem of the host's on Linux, where the
-// instance's mask is the host process's umask, on the calling goroutine,
-// and otherwise on the instance's creation thread, given the requested
-// mode, the kernel taking the mask out (creationThread); for another
-// filesystem, elsewhere and without a creation thread, given the mode less
-// the mask (createMode).
 // hostFiles reports whether fsys is one of HostFS's, or an FS of one of
 // their directories (OpenRootFS): its calls are the host's own, made in the
 // host process (the kernel's umask, the FIFO opens the host tells of).
@@ -8968,29 +8962,109 @@ func hostFiles(fsys FS) bool {
 	return false
 }
 
-func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode) error) error {
+// create runs make, which creates a file, directory or FIFO in fsys with the
+// mode it is given, so that the instance's umask is taken out of the
+// requested mode: for a filesystem of the host's, where the instance's
+// mask is the host process's umask, on the calling goroutine, given the
+// requested mode; otherwise on Linux on the instance's creation thread,
+// given the requested mode, the kernel taking the mask out
+// (creationThread); on another system with a umask (hostHasUmask), given
+// the mode less the mask and exact, which has make give what it creates
+// that mode, the host process's umask the system takes out as well put
+// back (openExactly, makeExactly); for another filesystem, elsewhere and
+// without a creation thread, given the mode less the mask (createMode).
+func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode, exact bool) error) error {
 	if !hostFiles(fsys) {
-		return make(w.createMode(requested))
-	}
-	if !hostThreadUmask {
-		return make(w.createMode(requested))
+		return make(w.createMode(requested), false)
 	}
 	// Where the instance's mask is the host process's, the kernel takes it
 	// out on any thread, or lets a default ACL decide: the creation is
 	// made here, given the requested mode.
 	var err error
-	if withHostUmask(w.guestUmask(), func() { err = make(requested) }) {
+	if withHostUmask(w.guestUmask(), func() { err = make(requested, false) }) {
 		return err
+	}
+	if !hostThreadUmask {
+		return make(w.createMode(requested), hostHasUmask)
 	}
 	if t := w.creationThread(); t != nil {
 		var err error
-		if rerr := t.run(func() { err = make(requested) }); rerr == nil {
+		if rerr := t.run(func() { err = make(requested, false) }); rerr == nil {
 			return err
 		}
 		// The instance is being closed (CloseAll): the mask is taken out
 		// here.
 	}
-	return make(w.createMode(requested))
+	return make(w.createMode(requested), false)
+}
+
+// openExactly opens name with open, flag having O_CREATE, so that a file
+// the open creates has exactly perm's permission bits, which the system's
+// umask may have taken some of: the file is created exclusively, which
+// tells it from one that is there, and its mode is set through the
+// descriptor (setCreatedPerm). A name that is there is opened with flag; a
+// file that open creates after all — the name is a symbolic link to no
+// file, or was removed between the two opens — keeps the mode the system
+// gave it.
+func openExactly(open func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, error) {
+	f, err := open(name, flag|os.O_EXCL, perm)
+	if errors.Is(err, fs.ErrExist) && flag&os.O_EXCL == 0 {
+		return open(name, flag, perm)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := setCreatedPerm(f, 0, perm); err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
+}
+
+// makeExactly creates name, a directory or FIFO (kind), in fsys with make,
+// so that it has exactly perm's permission bits, which the system's umask
+// may have taken some of: it is made readable by its owner, and is then
+// opened without following a symbolic link at its end (FS.OpenFile with
+// O_NOFOLLOW), to set its mode through the descriptor (setCreatedPerm), as
+// no call here sets the mode of a name without following one. A name that
+// is gone, or is a symbolic link, by then, or a file of another kind, is
+// no longer what the call created, and is left as it is. The open of a
+// FIFO is one for reading that does not wait, which a writer that opens
+// the FIFO at that moment takes for a reader.
+func makeExactly(fsys FS, name string, kind, perm os.FileMode, make func(name string, perm os.FileMode) error) error {
+	if err := make(name, perm|0o400); err != nil {
+		return err
+	}
+	return makeRuntimeDescriptors(func() error {
+		// A trailing "/" would have the open follow a link at the end.
+		f, err := fsys.OpenFile(strings.TrimRight(name, "/"), os.O_RDONLY|hostONonblock|hostONofollow, 0)
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return errors.Join(setCreatedPerm(f, kind, perm), f.Close())
+	})
+}
+
+// setCreatedPerm gives the file open as f, which the call created, of kind
+// (os.FileMode.Type), the permission bits of perm, keeping its setuid,
+// setgid and sticky bits. A file of another kind is not what the call
+// created, and is left as it is. A mode the system refuses this user or
+// this file (chmodRefused) is left as the system made it, as open(2)
+// leaves out a bit it refuses.
+func setCreatedPerm(f File, kind, perm os.FileMode) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Type() != kind || fi.Mode().Perm() == perm.Perm() {
+		return nil
+	}
+	if err := f.Chmod(fi.Mode()&specialModeBits | perm.Perm()); err != nil && !chmodRefused(err) {
+		return err
+	}
+	return nil
 }
 
 // creationThread returns the instance's creation thread, made with the
@@ -9277,7 +9351,12 @@ func (w *WasiStubs) pathCreateDirectory(from *wasiOpen, raw string, mode os.File
 		return errno
 	}
 	fsys, name := w.atFS(from, raw, name)
-	if err := w.create(fsys, mode, func(perm os.FileMode) error { return fsys.Mkdir(name, perm) }); err != nil {
+	if err := w.create(fsys, mode, func(perm os.FileMode, exact bool) error {
+		if exact {
+			return makeExactly(fsys, name, os.ModeDir, perm, fsys.Mkdir)
+		}
+		return fsys.Mkdir(name, perm)
+	}); err != nil {
 		return w.guestErrno("path_create_directory", err)
 	}
 	return _wasiESUCCESS
@@ -10854,9 +10933,13 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 			return -1, w.guestErrno("path_open", err)
 		}
 	case flag&os.O_CREATE != 0:
-		if err = w.create(fsys, mode, func(perm os.FileMode) error {
+		if err = w.create(fsys, mode, func(perm os.FileMode, exact bool) error {
 			var err error
-			f, err = openFile(name, flag, perm)
+			if exact {
+				f, err = openExactly(openFile, name, flag, perm)
+			} else {
+				f, err = openFile(name, flag, perm)
+			}
 			return err
 		}); err != nil {
 			return -1, w.guestErrno("path_open", err)
@@ -16934,7 +17017,12 @@ func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) i
 	if !can {
 		return -_wasiENOSYS
 	}
-	if err := w.create(fsys, unixFileMode(uint32(mode)).Perm(), func(perm os.FileMode) error { return maker.Mkfifo(name, perm) }); err != nil {
+	if err := w.create(fsys, unixFileMode(uint32(mode)).Perm(), func(perm os.FileMode, exact bool) error {
+		if exact {
+			return makeExactly(fsys, name, os.ModeNamedPipe, perm, maker.Mkfifo)
+		}
+		return maker.Mkfifo(name, perm)
+	}); err != nil {
 		return -w.guestErrno("path_mkfifo", err)
 	}
 	return _wasiESUCCESS

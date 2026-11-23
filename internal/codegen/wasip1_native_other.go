@@ -21,6 +21,10 @@ func hostSetUmask(mask os.FileMode) (os.FileMode, error) { return 0, errors.ErrU
 // hostThreadUmask says that no thread here has a umask of its own.
 const hostThreadUmask = false
 
+// hostHasUmask says that no umask of the host process is known to be taken
+// out of the mode of what the system creates here (create).
+const hostHasUmask = false
+
 // hostOnMainThread: no creation thread is made here.
 func hostOnMainThread() bool { return false }
 

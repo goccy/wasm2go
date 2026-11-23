@@ -210,8 +210,9 @@ starts, are made on an OS thread of the instance's whose umask is the
 instance's (`unshare(CLONE_FS)`), so that the kernel takes it out.
 Where `unshare(2)` is refused (Docker's default seccomp profile), and
 on other systems, the runtime takes the instance's umask out of the
-mode of what it makes, and the host process's umask applies as well;
-a command the instance starts gets the host process's umask only. The
+mode of what it makes, and the host process's umask applies as well
+(on darwin the runtime puts back what that takes out); a command the
+instance starts gets the host process's umask only. The
 thread ends with `CloseAll`, or when the garbage collector collects an
 instance dropped without it.
 
