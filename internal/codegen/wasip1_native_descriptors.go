@@ -254,9 +254,58 @@ func keepRuntimeFile(f *os.File) (*os.File, error) {
 	if !hostTable.active.Load() {
 		return f, nil
 	}
+	return moveFile(f, nil)
+}
+
+// guestFile is keepRuntimeFile for f, a file of the host's the runtime made
+// or opened for the guest. Where the guest's descriptors are the host's
+// (hostFamily), the guest's mode is the open file description's, which code
+// outside the guest shares: the description is put in it, non-blocking when
+// nonblock asks, and package os is given the descriptor anew, as it polls
+// one only in non-blocking mode (os.NewFile), so that the Go runtime's
+// poller has the descriptor only in the mode it takes. On failure f is
+// closed.
+func (w *WasiStubs) guestFile(f *os.File, nonblock bool) (*os.File, error) {
+	if !w.hostFamily() {
+		return keepRuntimeFile(f)
+	}
+	return moveFile(f, func(fd int) error {
+		return os.NewSyscallError("fcntl", syscall.SetNonblock(fd, nonblock))
+	})
+}
+
+// acceptedMode puts conn, a connection accepted for the guest, in the
+// guest's mode, fdflags', where the guest's mode is the description's
+// (hostFamily); elsewhere it is left non-blocking, as accept made it.
+func (w *WasiStubs) acceptedMode(conn int, fdflags int32) error {
+	if !w.hostFamily() {
+		return nil
+	}
+	return os.NewSyscallError("fcntl", syscall.SetNonblock(conn, fdflags&wasiFdflagNonblock != 0))
+}
+
+// guestOpened is guestFile for a file a FS opened for the guest: a file of
+// the host's is moved and put in the guest's mode, any other is f itself.
+func (w *WasiStubs) guestOpened(f File, nonblock bool) (File, error) {
+	if file, ok := f.(*os.File); ok {
+		return w.guestFile(file, nonblock)
+	}
+	return f, nil
+}
+
+// moveFile returns a file of a duplicate of f's descriptor at runtimeFloor
+// or above, under f's name, f being closed, or f itself when its descriptor
+// is there already. setMode, when it is not nil, is run on the descriptor
+// first, and the file is then always one of a duplicate. On failure f is
+// closed.
+func moveFile(f *os.File, setMode func(fd int) error) (*os.File, error) {
 	moved := -1
 	err := withHostDescriptor(f, func(fd uintptr) error {
-		if fd >= hostDescriptorFloor {
+		if setMode != nil {
+			if err := setMode(int(fd)); err != nil {
+				return err
+			}
+		} else if fd >= hostDescriptorFloor {
 			return nil // moved already
 		}
 		var err error
@@ -546,6 +595,67 @@ func (w *WasiStubs) adoptHostLocked(fd int32) *wasiOpen {
 	return op
 }
 
+// hostCloseOnExec reports whether the host's descriptor fd is not passed
+// on to a command: it is close-on-exec, or not open.
+func hostCloseOnExec(fd int) bool {
+	flags, err := descriptorFlags(fd, syscall.F_GETFD)
+	return err != nil || flags&syscall.FD_CLOEXEC != 0
+}
+
+// hostCloseOnExecMark returns the close-on-exec mark of the host's
+// descriptor fd (1 for close-on-exec), as F_GETFD gives it, and with set
+// sets it to value (F_SETFD).
+func hostCloseOnExecMark(fd int, set, value bool) (uint32, error) {
+	flags, err := descriptorFlags(fd, syscall.F_GETFD)
+	if err != nil {
+		return 0, os.NewSyscallError("fcntl", err)
+	}
+	old := uint32(flags & syscall.FD_CLOEXEC)
+	if set {
+		flags &^= syscall.FD_CLOEXEC
+		if value {
+			flags |= syscall.FD_CLOEXEC
+		}
+		if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_SETFD, uintptr(flags)); errno != 0 {
+			return 0, os.NewSyscallError("fcntl", errno)
+		}
+	}
+	return old, nil
+}
+
+// inheritedOutside returns the descriptors of the host process that a
+// command of w's inherits besides its slots (inheritedLocked), where
+// w's descriptors are the host's: the open ones below hostDescriptorFloor
+// that are not close-on-exec and are w's to have (adoptHostLocked), as
+// exec(2) passes the descriptors code outside the guest made. A failure to
+// list them is told Errors, and none is passed.
+func (w *WasiStubs) inheritedOutside() []commandDescriptor {
+	if !w.hostNumbered() {
+		return nil
+	}
+	open, err := openHostDescriptors()
+	if err != nil {
+		w.reportError("proc_spawn", err)
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	hostTable.mu.Lock()
+	defer hostTable.mu.Unlock()
+	var out []commandDescriptor
+	for _, fd := range open {
+		n := int32(fd)
+		if n <= 2 || fd >= hostDescriptorFloor || w.fdTable[n] != nil || hostTable.held[fd] != nil || reservedLocked(fd) {
+			continue
+		}
+		if hostCloseOnExec(fd) {
+			continue
+		}
+		out = append(out, commandDescriptor{at: n})
+	}
+	return out
+}
+
 // currentLocked reports whether w's slot fd, which has an entry, is still
 // what the host has under the number: always for a descriptor the runtime
 // made or was given, and for one taken in from outside the guest
@@ -609,12 +719,13 @@ func (w *WasiStubs) takeStandardLocked(fd int32) bool {
 
 // fileEntry returns the entry of f, a file of the configuration's Files,
 // which it takes over: an entry of a duplicate of its descriptor
-// (hostDescriptorEntry), f being closed. On failure f is closed.
-func fileEntry(f *os.File) (*wasiOpen, error) {
+// (hostDescriptorEntry), a socket put in non-blocking mode when nonblock
+// asks, f being closed. On failure f is closed.
+func fileEntry(f *os.File, nonblock bool) (*wasiOpen, error) {
 	var op *wasiOpen
 	err := withHostDescriptor(f, func(fd uintptr) error {
 		var err error
-		op, err = hostDescriptorEntry(int(fd), f.Name(), true)
+		op, err = hostDescriptorEntry(int(fd), f.Name(), nonblock)
 		return err
 	})
 	if err = errors.Join(err, f.Close()); err != nil {
@@ -643,7 +754,8 @@ func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
 	if err := withHostDescriptor(f, func(d uintptr) error {
 		at = int(d)
 		var err error
-		op, err = hostDescriptorEntry(at, f.Name(), true)
+		// The guest's mode is the description's here (hostFamily).
+		op, err = hostDescriptorEntry(at, f.Name(), false)
 		return err
 	}); err != nil {
 		return errors.Join(err, f.Close())
@@ -671,9 +783,9 @@ func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
 // named name. A socket is a socket entry, of the family getsockname tells
 // and the type SO_TYPE tells, reachable at its address as it is bound
 // already, its open file description put in non-blocking mode when nonblock
-// asks (a socket of Files, as net.FileConn does); any other is a file entry
-// open for what F_GETFL says. Its O_APPEND and O_NONBLOCK are the guest's
-// flags.
+// asks (a socket of Files where the guest's mode is not the description's,
+// as net.FileConn does); any other is a file entry open for what F_GETFL
+// says. Its O_APPEND and O_NONBLOCK are the guest's flags.
 func hostDescriptorEntry(fd int, name string, nonblock bool) (*wasiOpen, error) {
 	var st syscall.Stat_t
 	if err := syscall.Fstat(fd, &st); err != nil {
@@ -691,10 +803,11 @@ func hostDescriptorEntry(fd int, name string, nonblock bool) (*wasiOpen, error) 
 	if flags&syscall.O_APPEND != 0 {
 		fdflags |= 0x1
 	}
-	if flags&syscall.O_NONBLOCK != 0 || nonblock {
+	socket := st.Mode&syscall.S_IFMT == syscall.S_IFSOCK
+	if flags&syscall.O_NONBLOCK != 0 || nonblock && socket {
 		fdflags |= 0x4
 	}
-	if st.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
+	if socket {
 		op, err := hostSocketEntry(dup, nonblock)
 		if err != nil {
 			return nil, errors.Join(err, hostCloseFD(dup))

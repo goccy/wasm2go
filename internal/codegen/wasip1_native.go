@@ -1348,7 +1348,8 @@ type wasiOpen struct {
 	// while there is none. Guarded by mu.
 	inputWake func()
 	// shared is set once the entry's open file description is given to a
-	// command (commandSetup.add): whoever holds it outside the runtime can
+	// command (commandSetup.add, inheritedLocked) or the guest has set its
+	// mode (Fd_fdstat_set_flags): whoever holds it outside the runtime can
 	// change its mode, so its stream is no longer one the runtime waits for
 	// in the Go runtime's poller (netpolled).
 	shared atomic.Bool
@@ -3104,7 +3105,7 @@ func (w *WasiStubs) enterFileLocked(fd int32, f *os.File) error {
 	case w.hostNumbered():
 		return w.placeFileLocked(fd, f)
 	}
-	op, err := fileEntry(f)
+	op, err := fileEntry(f, !w.hostFamily())
 	if err != nil {
 		return err
 	}
@@ -3356,10 +3357,17 @@ func (w *WasiStubs) forkHost() *WasiStubs {
 	for fd, op := range w.fdsLocked() {
 		child.setSlotLocked(fd, op)
 	}
-	if len(w.cloexec) > 0 {
+	if len(w.cloexec) > 0 || len(w.adopted) > 0 {
 		child.cloexec = make(map[int32]bool, len(w.cloexec))
 		for fd := range w.cloexec {
 			child.cloexec[fd] = true
+		}
+		// A slot taken in from outside the guest has the host's mark, which
+		// the child gets as fork(2) copies it.
+		for fd := range w.adopted {
+			if hostCloseOnExec(int(fd)) {
+				child.cloexec[fd] = true
+			}
 		}
 	}
 	if w.umask != nil {
@@ -4247,7 +4255,10 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 		w.commandStreamLocked(fds[2], 3),
 	}
 	share := w.streamsLocked()
+	inherit := w.inheritedLocked()
 	w.mu.Unlock()
+	inherit = append(inherit, w.inheritedOutside()...)
+	slices.SortFunc(inherit, func(a, b commandDescriptor) int { return cmp.Compare(a.at, b.at) })
 	if hook == nil || !hook(path, argv) {
 		return -_wasiEACCES
 	}
@@ -4283,7 +4294,7 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 	job := pids.commandJob(ids.PID, execs)
 	var cmd *hostCommand
 	var startErr error
-	start := func() { cmd, startErr = w.startCommand(op, path, argv, env, dir, job.host, &streams, share) }
+	start := func() { cmd, startErr = w.startCommand(op, path, argv, env, dir, job.host, &streams, inherit, share) }
 	// The command inherits the umask of the thread that starts it: this
 	// one where the instance's mask is the host process's, the instance's
 	// creation thread otherwise.
@@ -4511,6 +4522,16 @@ func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) in
 	if op == nil {
 		return -_wasiEBADF
 	}
+	if _, adopted := w.adopted[fd]; adopted {
+		// The slot is the host's descriptor taken in from outside the
+		// guest (adoptHostLocked), whose mark is the host's.
+		old, err := hostCloseOnExecMark(int(fd), set != 0, value != 0)
+		if err != nil {
+			return -w.errnoLater("fd_cloexec", err)
+		}
+		binary.LittleEndian.PutUint32(out, old)
+		return _wasiESUCCESS
+	}
 	old := uint32(0)
 	if w.cloexec[fd] {
 		old = 1
@@ -4552,6 +4573,45 @@ type commandStream struct {
 	// stdio is the instance's standard stream (1/2/3, as wasiOpen.stdio)
 	// the stream is, 0 for none.
 	stdio int8
+}
+
+// commandDescriptor is a descriptor of the guest's above its standard
+// streams that a command inherits, under the number at: the host's
+// descriptor behind conn, or, for conn nil, the host's descriptor at that
+// number itself (inheritedOutside).
+type commandDescriptor struct {
+	at   int32
+	conn syscall.Conn
+}
+
+// inheritedLocked returns the descriptors above 2 a command of the guest
+// inherits where the instance is of a family whose descriptors are the
+// host's (hostFamily), as exec(2) passes them: the slots that are not
+// close-on-exec, the guest's mark for one the runtime made or was given,
+// the host's own for one taken in from outside the guest (adoptHostLocked).
+// Elsewhere a command gets its standard streams only. Caller holds w.mu.
+func (w *WasiStubs) inheritedLocked() []commandDescriptor {
+	if !w.hostFamily() {
+		return nil
+	}
+	var out []commandDescriptor
+	for _, fd := range slices.Sorted(maps.Keys(w.fdsLocked())) {
+		if fd <= 2 || !w.currentLocked(fd) {
+			continue
+		}
+		op := w.fdTable[fd]
+		conn := w.entryHostConnLocked(op)
+		if conn == nil {
+			continue
+		}
+		if _, adopted := w.adopted[fd]; adopted && hostCloseOnExec(int(fd)) || !adopted && w.cloexec[fd] {
+			continue
+		}
+		// The command shares the open file description (netpolled).
+		op.shared.Store(true)
+		out = append(out, commandDescriptor{at: fd, conn: conn})
+	}
+	return out
 }
 
 // commandStreamLocked resolves the descriptor fd the guest gives a command
@@ -4622,8 +4682,16 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 	var r, wr *os.File
 	if err := makeRuntimeDescriptors(func() error {
 		var err error
-		r, wr, err = runtimePipe()
-		return err
+		if r, wr, err = os.Pipe(); err != nil {
+			return err
+		}
+		if r, err = w.guestFile(r, false); err != nil {
+			return errors.Join(err, wr.Close())
+		}
+		if wr, err = w.guestFile(wr, false); err != nil {
+			return errors.Join(err, r.Close())
+		}
+		return nil
 	}); err != nil {
 		return -w.guestErrno("pipe", err)
 	}
@@ -6256,15 +6324,30 @@ func (w *WasiStubs) Fd_fdstat_set_flags(m *Module, fd, flags int32) int32 {
 	if op == nil {
 		return _wasiEBADF
 	}
+	// Where the guest's mode is the description's (hostFamily), NONBLOCK is
+	// set on the description of a descriptor of the guest's own, which code
+	// outside the guest shares (one of the process's 0–2 the instance whose
+	// numbers are the host's has is the process's own, as a fcntl of a
+	// program's is); the entry is then waited for in poll(2), as one whose
+	// mode is no longer the one the Go runtime's poller took (shared). An
+	// embedder's stream keeps its mode.
+	if w.hostFamily() && op.stdio == 0 {
+		w.mu.Lock()
+		conn := w.entryHostConnLocked(op)
+		w.mu.Unlock()
+		if f, ok := conn.(*os.File); ok {
+			op.shared.Store(true)
+			if err := setHostNonblock(f, flags&wasiFdflagNonblock != 0); err != nil {
+				return w.guestErrno("fd_fdstat_set_flags", err)
+			}
+		}
+	}
 	op.mu.Lock()
 	op.fdflags = flags
 	op.mu.Unlock()
-	// Go's stdlib does not expose a portable equivalent of fcntl
-	// F_SETFL; treat the call as accepted-but-no-op so wasi-libc
-	// callers (which typically set NONBLOCK before a poll loop) still
-	// progress without surfacing a spurious error.
-	_ = op
-	_ = flags
+	// Elsewhere the call is accepted and changes no description, so that
+	// wasi-libc callers (which typically set NONBLOCK before a poll loop)
+	// still progress without surfacing a spurious error.
 	return _wasiESUCCESS
 }
 
@@ -6851,13 +6934,16 @@ func (w *WasiStubs) writeInterruptibly(m *Module, call string, op *wasiOpen, dst
 // EAGAIN when that is nothing, without the turn at the stream's output.
 //
 // A write that waits takes that turn before it writes anything and holds it
-// until all is written, as writeInterruptibly does. It waits for room in
-// poll(2), and a signal posted to the guest meanwhile ends the wait, with
+// until all is written, as writeInterruptibly does. Where the host has a
+// write that does not wait in one call (hostWritesWithoutWaiting), it
+// writes in steps that do not wait in the kernel whatever the mode of the
+// open file description (writeWithoutWaiting), and waits for room in poll(2)
+// between them: a signal posted to the guest meanwhile ends the wait, with
 // EINTR when nothing was written and the count otherwise; what there is
 // room for then is written all the same, as write(2) takes it from a
-// process with a signal pending. To a descriptor that can wait in the
-// kernel (hostMayBlock: a terminal, an inherited pipe) it is one writev(2)
-// that waits there until all is written, which a signal does not end.
+// process with a signal pending. Elsewhere (darwin) each writev(2) is one,
+// which to a descriptor in blocking mode waits in the kernel until all is
+// written, and a signal does not end it.
 func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst syscall.Conn, bufs [][]byte, flags int32) (uint64, int32) {
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0
 	if !nonblocking {
@@ -6868,17 +6954,23 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 	}
 	rest := append([][]byte(nil), bufs...)
 	var total uint64
-	// write writes rest once. With wait the mode is not asked: in blocking
-	// mode the writev(2) waits there, in non-blocking mode it takes what
-	// fits. Without wait it does not write to a descriptor that can wait in
-	// the kernel, which it reports as again.
+	file, _ := dst.(*os.File)
+	// write writes rest once. With wait, which holds the turn, the mode is
+	// not asked: in steps the write does not wait in either, and otherwise
+	// the writev(2) waits in blocking mode and takes what fits in
+	// non-blocking mode. Without wait it does not write to a descriptor that
+	// can wait in the kernel, which it reports as again.
 	write := func(wait bool) (again, mayBlock bool, errno int32) {
 		var n int
 		n, again, errno = w.tryStream(call, dst, func(fd uintptr) (int, bool, error) {
-			if !wait {
-				if mayBlock = hostMayBlock(fd); mayBlock {
-					return 0, true, nil
-				}
+			if wait && hostWritesWithoutWaiting {
+				return op.writeWithoutWaiting(file, fd, rest)
+			}
+			if wait {
+				return writevRaw(fd, rest)
+			}
+			if mayBlock = hostMayBlock(fd); mayBlock {
+				return 0, true, nil
 			}
 			return writevRaw(fd, rest)
 		})
@@ -6920,7 +7012,10 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 			return written(w.guestErrno(call, err))
 		}
 		if interrupted {
-			if again, _, errno := write(false); !again || total > 0 {
+			// What there is room for is written in a step, where writes are
+			// made in steps, and elsewhere only to a descriptor that does
+			// not wait in the kernel.
+			if again, _, errno := write(hostWritesWithoutWaiting); !again || total > 0 {
 				w.keepInterrupt(m)
 				return written(errno)
 			}
@@ -6932,14 +7027,9 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 
 // writeHostOnce is a write that does not wait to dst, a descriptor that can
 // wait in the kernel (hostMayBlock), the destination of the entry op: one
-// call, made by the holder of the turn at the stream's output, which it does
-// not wait for (EAGAIN while a write that waits holds it). To a socket it is
-// a send that does not wait (MSG_DONTWAIT) where the host honours it; to
-// anything else, once poll(2) has found room, a write of what it takes
-// without waiting: a pipe no more than PIPE_BUF, a stream socket no more
-// than its low-water mark, a datagram socket the datagram whole, a terminal
-// (a short write) no more than PIPE_BUF. That is a write that does not wait
-// in non-blocking mode as well, should the mode have changed.
+// call that does not wait in the kernel (writeWithoutWaiting), made by the
+// holder of the turn at the stream's output, which it does not wait for
+// (EAGAIN while a write that waits holds it).
 func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, bufs [][]byte) (uint64, int32) {
 	select {
 	case op.outputTurn() <- struct{}{}:
@@ -6948,36 +7038,57 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 	}
 	defer op.passOutputTurn()
 	file, _ := dst.(*os.File)
-	mode, _ := op.statOf(file)
 	n, again, errno := w.tryStream(call, dst, func(fd uintptr) (int, bool, error) {
-		if mode&os.ModeSocket != 0 && hostSendsWithoutWaiting {
-			return sendNow(fd, bufs)
-		}
-		ready := []bool{false}
-		if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, time.Now(), -1); err != nil {
-			return 0, false, err
-		}
-		if !ready[0] {
-			return 0, true, nil
-		}
-		switch {
-		case mode&(os.ModeNamedPipe|os.ModeCharDevice) != 0:
-			bufs = leadingBytes(bufs, hostPipeBuf)
-		case mode&os.ModeSocket != 0:
-			lowat, err := op.streamSendLowat(file, fd)
-			if err != nil {
-				return 0, false, err
-			}
-			if lowat > 0 {
-				bufs = leadingBytes(bufs, lowat)
-			}
-		}
-		return writevRaw(fd, bufs)
+		return op.writeWithoutWaiting(file, fd, bufs)
 	})
 	if errno == _wasiESUCCESS && again {
 		errno = _wasiEAGAIN
 	}
 	return uint64(n), errno
+}
+
+// writeWithoutWaiting writes bufs once to fd, the descriptor of file, the
+// stream of the entry op, without waiting in the kernel whatever the mode of
+// its open file description, which whoever shares it can change: again
+// reports that it takes nothing right now. The caller holds the turn at the
+// stream's output, so that no other write of the runtime's takes the room
+// it finds. To a socket it is a send that does not wait (MSG_DONTWAIT) where
+// the host honours it; to a pipe what the host tells it takes without
+// waiting, where it tells (hostPipeWriteNow); to anything else, once
+// poll(2) has found room, a write of what it takes without waiting: a pipe
+// no more than PIPE_BUF, a stream socket no more than its low-water mark, a
+// datagram socket the datagram whole, a terminal (a short write) no more
+// than PIPE_BUF.
+func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte) (int, bool, error) {
+	mode, named := op.statOf(file)
+	if mode&os.ModeSocket != 0 && hostSendsWithoutWaiting {
+		return sendNow(fd, bufs)
+	}
+	if mode&os.ModeNamedPipe != 0 {
+		if n, again, done, err := hostPipeWriteNow(fd, bufs, named); done {
+			return n, again, err
+		}
+	}
+	ready := []bool{false}
+	if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, time.Now(), -1); err != nil {
+		return 0, false, err
+	}
+	if !ready[0] {
+		return 0, true, nil
+	}
+	switch {
+	case mode&(os.ModeNamedPipe|os.ModeCharDevice) != 0:
+		bufs = leadingBytes(bufs, hostPipeBuf)
+	case mode&os.ModeSocket != 0:
+		lowat, err := op.streamSendLowat(file, fd)
+		if err != nil {
+			return 0, false, err
+		}
+		if lowat > 0 {
+			bufs = leadingBytes(bufs, lowat)
+		}
+	}
+	return writevRaw(fd, bufs)
 }
 
 // The ways poll_oneoff learns whether a descriptor can be written.
@@ -9261,6 +9372,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	// poll.
 	fsOpen := fsys.OpenFile
 	inBlockingMode := false
+	nonblock := fdflags&wasiFdflagNonblock != 0
 	openFile := func(name string, flag int, perm os.FileMode) (f File, err error) {
 		err = makeRuntimeDescriptors(func() error {
 			if f, err = fsOpen(name, flag, perm); err != nil {
@@ -9271,7 +9383,14 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 					return errors.Join(err, f.Close())
 				}
 			}
-			f, err = keepRuntimeOpened(f)
+			if f, err = w.guestOpened(f, nonblock && !inBlockingMode); err == nil && inBlockingMode && nonblock && w.hostFamily() {
+				// Where the guest's mode is the description's (hostFamily),
+				// the file the Go runtime does not poll is put in it once
+				// it is made.
+				if err = setHostNonblock(f, true); err != nil {
+					err = errors.Join(err, f.Close())
+				}
+			}
 			return err
 		})
 		return f, err
@@ -9380,7 +9499,7 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 		if f, errno = w.openFIFO(m, fsys, rel, fi, flag, w.createMode(mode)); errno != _wasiESUCCESS {
 			return -1, errno
 		}
-		if f, err = keepRuntimeOpened(f); err != nil {
+		if f, err = w.guestOpened(f, false); err != nil {
 			return -1, w.guestErrno("path_open", err)
 		}
 	case flag&os.O_CREATE != 0:
@@ -9406,7 +9525,9 @@ func (w *WasiStubs) pathOpenMode(m *Module, rel string, dirflags, oflags int32, 
 	// blocking mode, as its read waits in the read (readStreamAs): the Go
 	// runtime's poller cannot wait for one it does not poll, and would
 	// report EAGAIN in that mode.
-	if isFIFO && fdflags&0x4 != 0 && !polled {
+	// (Where the guest's mode is the description's, it is the guest's
+	// already: guestOpened.)
+	if isFIFO && fdflags&0x4 != 0 && !polled && !w.hostFamily() {
 		if err := setHostNonblock(f, false); err != nil {
 			return -1, w.guestErrno("path_open", errors.Join(err, f.Close()))
 		}
@@ -10926,6 +11047,19 @@ type wasiSocket struct {
 	// its peer as the guest gave them (bind, connect), which getsockname
 	// and getpeername give back; empty for none given.
 	unixLocal, unixPeer string
+	// connecting is the connect(2) under way in the host of a socket in
+	// blocking mode (connectInTheHost), nil for none.
+	connecting *hostConnecting
+}
+
+// hostConnecting is a connect(2) a goroutine makes in the host
+// (connectInTheHost): done is closed once it has returned, with errno that
+// of the socket's Control (EBADF for a socket closed first) and err the
+// connect's.
+type hostConnecting struct {
+	done  chan struct{}
+	errno int32
+	err   error
 }
 
 // hostSocket returns the host socket of the entry op, or nil for an entry
@@ -10940,6 +11074,38 @@ func (op *wasiOpen) hostSocket() *os.File {
 		return nil
 	}
 	return op.sock.host
+}
+
+// whenReady returns an attempt of socketWait for call, a call on a socket
+// that is not to wait in the kernel (accept, a send darwin waits in whatever
+// MSG_DONTWAIT says). Where the guest's descriptors are the host's
+// (hostFamily), the open file description of the socket is in the guest's
+// mode, or in one code outside the guest set (hostMayBlock): in blocking
+// mode, call (blocking true) is made by the holder of turn (awaitTurn) once
+// poll(2) has found the socket ready for want, and is reported again
+// otherwise, which socketWait then waits for without the turn. A signal
+// posted to the guest while the call waits for the turn ends it with EINTR.
+// A connection another process takes between the poll and the accept leaves
+// the accept waiting in the kernel. Elsewhere, and in non-blocking mode,
+// call is made as it is.
+func (w *WasiStubs) whenReady(m *Module, turn chan struct{}, want int, call func(fd int, blocking bool) (bool, error)) func(fd int) (bool, error) {
+	return func(fd int) (bool, error) {
+		if !w.hostFamily() || !hostMayBlock(uintptr(fd)) {
+			return call(fd, false)
+		}
+		if !w.awaitTurn(m, turn) {
+			return false, syscall.EINTR
+		}
+		defer func() { <-turn }()
+		ready := []bool{false}
+		if err := hostWaitReady([]uintptr{uintptr(fd)}, []int{want}, ready, time.Now(), -1); err != nil {
+			return false, err
+		}
+		if !ready[0] {
+			return true, nil
+		}
+		return call(fd, true)
+	}
 }
 
 // socketCall runs call on the descriptor of the host socket host. It
@@ -11394,15 +11560,30 @@ func (w *WasiStubs) socketSend(m *Module, call string, op *wasiOpen, host *os.Fi
 	// a send does not wait, where Linux would.
 	nonblocking := op.nonblocking() || flags&wasiMsgDontWait != 0 || op.family == wasiSockFamilyUnix && op.dgram && to != nil
 	sent := 0
-	errno := w.socketWait(m, call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, func(fd int) (bool, error) {
-		k, again, err := hostSend(fd, leadingFrom(bufs, sent), to, hostPath)
+	send := func(fd int, blocking bool) (bool, error) {
+		rest := leadingFrom(bufs, sent)
+		if blocking && !op.dgram {
+			// what a stream socket poll(2) reports writable takes
+			lowat, err := op.streamSendLowat(host, uintptr(fd))
+			if err != nil {
+				return false, err
+			}
+			rest = leadingBytes(rest, lowat)
+		}
+		k, again, err := hostSend(fd, rest, to, hostPath)
 		if err != nil || again {
 			return again, err
 		}
 		sent += k
 		// A stream socket that waits sends the rest once there is room.
 		return !op.dgram && sent < size, nil
-	})
+	}
+	attempt := func(fd int) (bool, error) { return send(fd, false) }
+	if !hostSendsWithoutWaiting {
+		// MSG_DONTWAIT does not keep the send from waiting here.
+		attempt = w.whenReady(m, op.outputTurn(), hostWantRoom, send)
+	}
+	errno := w.socketWait(m, call, op, host, hostWantRoom, nonblocking, _wasiEAGAIN, attempt)
 	if sent > 0 && errno != _wasiESUCCESS {
 		if errno == _wasiEINTR {
 			w.keepInterrupt(m)
@@ -11452,7 +11633,13 @@ func (w *WasiStubs) Sock_open64(m *Module, family, typ int32) int32 {
 // openSocketEntry makes a socket of the host's of the family and type and
 // gives the guest a slot for it. Returns the fd, or a negative errno.
 func (w *WasiStubs) openSocketEntry(family int32, dgram bool) int32 {
-	host, err := runtimeFile(func() (*os.File, error) { return openHostSocket(family, dgram) })
+	host, err := runtimeFile(func() (*os.File, error) {
+		f, err := openHostSocket(family, dgram)
+		if err != nil {
+			return nil, err
+		}
+		return w.guestFile(f, false)
+	})
 	if err != nil {
 		return -w.guestErrno("sock_open", err)
 	}
@@ -11559,12 +11746,12 @@ func (w *WasiStubs) acceptSocket(m *Module, op *wasiOpen, host *os.File, fdflags
 		return 0, _wasiEACCES
 	}
 	conn := -1
-	errno := w.socketWait(m, "sock_accept", op, host, hostWantInput, op.nonblocking(), _wasiEAGAIN, func(fd int) (bool, error) {
+	errno := w.socketWait(m, "sock_accept", op, host, hostWantInput, op.nonblocking(), _wasiEAGAIN, w.whenReady(m, op.inputTurn(), hostWantInput, func(fd int, blocking bool) (bool, error) {
 		var again bool
 		var err error
 		conn, again, err = hostAccept(fd)
 		return again, err
-	})
+	}))
 	if errno != _wasiESUCCESS {
 		return 0, errno
 	}
@@ -11574,6 +11761,9 @@ func (w *WasiStubs) acceptSocket(m *Module, op *wasiOpen, host *os.File, fdflags
 // addAccepted gives conn, a connection accepted on the socket op, a slot
 // with fdflags. Returns the new fd and an errno.
 func (w *WasiStubs) addAccepted(op *wasiOpen, conn int, fdflags int32) (int32, int32) {
+	if err := w.acceptedMode(conn, fdflags); err != nil {
+		return 0, w.guestErrno("sock_accept", errors.Join(err, hostCloseFD(conn)))
+	}
 	host := os.NewFile(uintptr(conn), "socket")
 	op.mu.Lock()
 	accepted := &wasiOpen{isSocket: true, family: op.family, dgram: op.dgram, fdflags: fdflags, sock: &wasiSocket{
@@ -11645,8 +11835,18 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 		}
 	}
 	var started error
-	if errno := w.socketCall(call, host, func(fd int) { started = hostConnect(fd, a, hostPath) }); errno != _wasiESUCCESS {
+	var blocking bool
+	if errno := w.socketCall(call, host, func(fd int) {
+		if blocking = w.hostFamily() && !op.dgram && hostMayBlock(uintptr(fd)); !blocking {
+			started = hostConnect(fd, a, hostPath)
+		}
+	}); errno != _wasiESUCCESS {
 		return errno
+	}
+	if blocking {
+		if errno := w.connectInTheHost(m, call, op, host, a, hostPath, &started); errno != _wasiESUCCESS {
+			return errno
+		}
 	}
 	// One the host goes on with: not made at once (EINPROGRESS), or
 	// interrupted in the host (EINTR) or under way already (EALREADY).
@@ -11658,7 +11858,7 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 		op.sock.unixPeer = a.name
 		op.mu.Unlock()
 	}
-	if !underWay || op.nonblocking() {
+	if !underWay || op.nonblocking() || blocking {
 		return w.guestErrno(call, started)
 	}
 	if errno := w.socketWait(m, call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
@@ -11677,6 +11877,56 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 		return _wasiESUCCESS
 	}
 	return w.guestErrno(call, made)
+}
+
+// connectInTheHost is the connect(2) of a stream socket whose open file
+// description is in blocking mode, which waits in the host until the
+// connection is made or fails, where the guest's descriptors are the host's
+// (hostFamily): a goroutine of its own makes it, holding the socket until it
+// returns (socketCall), and the guest's call waits for it as a blocking call
+// (blockingAttempt). A signal posted to the guest meanwhile ends the call
+// with EINTR while the connect goes on in the host, as one interrupted by a
+// signal does; a connect of the socket while it is under way waits for it
+// too, or is EALREADY for a socket the guest set non-blocking. *started is
+// what the guest's connect reports: the connect's result, EINPROGRESS for
+// a socket the guest set non-blocking, or EINTR. The host closes a socket
+// the guest closes meanwhile once the connect has returned.
+func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host *os.File, a wasiSockAddr, hostPath string, started *error) int32 {
+	op.mu.Lock()
+	c := op.sock.connecting
+	nonblocking := op.fdflags&wasiFdflagNonblock != 0
+	if c == nil {
+		c = &hostConnecting{done: make(chan struct{})}
+		op.sock.connecting = c
+		go func() {
+			c.errno = w.socketCall(call, host, func(fd int) { c.err = hostConnect(fd, a, hostPath) })
+			op.mu.Lock()
+			op.sock.connecting = nil
+			op.mu.Unlock()
+			close(c.done)
+		}()
+	} else if nonblocking {
+		op.mu.Unlock()
+		*started = syscall.EALREADY
+		return _wasiESUCCESS
+	}
+	op.mu.Unlock()
+	if nonblocking {
+		*started = syscall.EINPROGRESS
+		return _wasiESUCCESS
+	}
+	interrupted, _, refused := w.blockingAttempt(m, func() {}, nil, func(stop <-chan struct{}) {
+		select {
+		case <-c.done:
+		case <-stop:
+		}
+	})
+	if interrupted || refused {
+		*started = syscall.EINTR
+		return _wasiESUCCESS
+	}
+	*started = c.err
+	return c.errno
 }
 
 // Sock_name is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -11885,10 +12135,10 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 		if a, b, err = hostSocketPair(dgram); err != nil {
 			return err
 		}
-		if a, err = keepRuntimeFile(a); err != nil {
+		if a, err = w.guestFile(a, false); err != nil {
 			return errors.Join(err, b.Close())
 		}
-		if b, err = keepRuntimeFile(b); err != nil {
+		if b, err = w.guestFile(b, false); err != nil {
 			return errors.Join(err, a.Close())
 		}
 		return nil

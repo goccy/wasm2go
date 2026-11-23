@@ -4,6 +4,7 @@ package codegen
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -501,6 +503,10 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		if err := listener.Close(); err != nil {
 			t.Fatal(err)
 		}
+		// given in blocking mode, which the guest keeps
+		if err := syscall.SetNonblock(entryHostNumberOf(t, lf), false); err != nil {
+			t.Fatal(err)
+		}
 		w, m := newHostNumberedStubs(t, map[int32]*os.File{40: lf}, nil)
 		w.cfg.NetAccess = AllowAllNetAccess
 		s := w.Sock_open(m, wasiSockFamilyIPv4, wasiSockTypeStream)
@@ -520,6 +526,9 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 				t.Error(err)
 			}
 		})
+		if blocking, err := descriptorBlocks(40); err != nil || !blocking {
+			t.Fatalf("the listening socket of Files is not in blocking mode (%v)", err)
+		}
 		if rc := w.Sock_accept(m, 40, 0, 5100); rc != _wasiESUCCESS {
 			t.Fatalf("Sock_accept rc=%d", rc)
 		}
@@ -539,6 +548,10 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		w.cfg.Exec = AllowAllExec
 		r, wr := newTestPipe(t, w, m)
 		_, out := newTestPipe(t, w, m)
+		// the command is not to have the input's other end
+		if rc := w.Fd_cloexec(m, wr, 1, 1, 6200); rc != _wasiESUCCESS {
+			t.Fatalf("Fd_cloexec rc=%d", rc)
+		}
 		before, err := openHostDescriptors()
 		if err != nil {
 			t.Fatal(err)
@@ -565,6 +578,467 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 		if status := readU32(m.memory, int(statusOff)); status != 7<<8 {
 			t.Fatalf("wait status = %#x, want an exit of 7", status)
+		}
+	})
+
+	// The guest's mode is its descriptions': what it makes is in blocking
+	// mode until it asks for non-blocking, and code outside the guest finds
+	// the mode the guest set. A call that waits on a description in
+	// blocking mode waits in the runtime, where a signal ends it.
+	t.Run("GuestModes", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.NetAccess, w.cfg.Listen, w.cfg.Dial = AllowAllNetAccess, AllowAllListen, AllowAllDial
+		if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+			t.Fatalf("Proc_signal_register rc=%d", rc)
+		}
+		setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, 0)
+		blocks := func(fd int32) bool {
+			t.Helper()
+			blocking, err := descriptorBlocks(int(fd))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return blocking
+		}
+		r, wr := newTestPipe(t, w, m)
+		if !blocks(r) || !blocks(wr) {
+			t.Fatal("a pipe of the guest's is not in blocking mode")
+		}
+		if rc := w.Fd_fdstat_set_flags(m, r, wasiFdflagNonblock); rc != _wasiESUCCESS || blocks(r) {
+			t.Fatalf("NONBLOCK rc=%d: the description is not non-blocking", rc)
+		}
+		if _, rc := fdReadString(w, m, r, 8); rc != _wasiEAGAIN {
+			t.Fatalf("read of an empty non-blocking pipe rc=%d, want EAGAIN", rc)
+		}
+		if rc := w.Fd_fdstat_set_flags(m, r, 0); rc != _wasiESUCCESS || !blocks(r) {
+			t.Fatalf("clearing NONBLOCK rc=%d: the description is not blocking", rc)
+		}
+		postWhenBlocked(w, wasiSIGUSR1)
+		if _, rc := fdReadString(w, m, r, 8); rc != _wasiEINTR {
+			t.Fatalf("read of an empty blocking pipe with a signal rc=%d, want EINTR", rc)
+		}
+		takeSignals(t, w, m)
+		if _, err := syscall.Write(int(wr), []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		if got, rc := fdReadString(w, m, r, 8); rc != _wasiESUCCESS || got != "data" {
+			t.Fatalf("read = %q, rc %d", got, rc)
+		}
+		if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 5000); rc != _wasiESUCCESS {
+			t.Fatalf("Sock_socketpair rc=%d", rc)
+		}
+		pa := int32(readU32(m.memory, 5000))
+		if !blocks(pa) || !blocks(int32(readU32(m.memory, 5004))) {
+			t.Fatal("a socket pair of the guest's is not in blocking mode")
+		}
+		// a send that finds no room waits in the runtime
+		if rc := w.Fd_fdstat_set_flags(m, pa, wasiFdflagNonblock); rc != _wasiESUCCESS {
+			t.Fatalf("NONBLOCK rc=%d", rc)
+		}
+		chunk := string(make([]byte, 4096))
+		for {
+			rc := fdWriteString(w, m, pa, chunk)
+			if rc == _wasiEAGAIN {
+				break
+			}
+			if rc != _wasiESUCCESS {
+				t.Fatalf("write rc=%d", rc)
+			}
+		}
+		if rc := w.Fd_fdstat_set_flags(m, pa, 0); rc != _wasiESUCCESS {
+			t.Fatalf("clearing NONBLOCK rc=%d", rc)
+		}
+		postWhenBlocked(w, wasiSIGUSR1)
+		if rc := fdWriteString(w, m, pa, chunk); rc != _wasiEINTR {
+			t.Fatalf("write to a full blocking socket with a signal rc=%d, want EINTR", rc)
+		}
+		takeSignals(t, w, m)
+		listener, port := newIPListener(t, w, m)
+		if !blocks(listener) {
+			t.Fatal("a listening socket of the guest's is not in blocking mode")
+		}
+		postWhenBlocked(w, wasiSIGUSR1)
+		if rc := w.Sock_accept(m, listener, 0, 5100); rc != _wasiEINTR {
+			t.Fatalf("accept with nobody connecting and a signal rc=%d, want EINTR", rc)
+		}
+		takeSignals(t, w, m)
+		client := connectTo(t, w, m, port)
+		if !blocks(client) {
+			t.Fatal("the connected socket is not in blocking mode")
+		}
+		if rc := w.Sock_accept(m, listener, 0, 5100); rc != _wasiESUCCESS {
+			t.Fatalf("accept rc=%d", rc)
+		}
+		if !blocks(listener) || !blocks(int32(readU32(m.memory, 5100))) {
+			t.Fatal("the listening or the accepted socket is not in blocking mode")
+		}
+		fd, errno := w.pathOpen(nil, "plain.txt", 0, 0x1 /* O_CREAT */, 1<<6, wasiFdflagNonblock)
+		if errno != _wasiESUCCESS || blocks(fd) {
+			t.Fatalf("open with NONBLOCK errno=%d: the description is not non-blocking", errno)
+		}
+		// A file whose descriptor is above the guests' numbers already is
+		// given to package os anew all the same, once in the guest's mode.
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAtEnd(t, pw)
+		high := -1
+		rc, err := pr.SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var dupErr error
+		if err := rc.Control(func(d uintptr) { high, dupErr = dupFrom(int(d), hostDescriptorFloor+100) }); err != nil || dupErr != nil {
+			t.Fatal(err, dupErr)
+		}
+		if err := pr.Close(); err != nil {
+			t.Fatal(err)
+		}
+		gf, err := w.guestFile(os.NewFile(uintptr(high), "high"), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAtEnd(t, gf)
+		if err := gf.SetReadDeadline(time.Time{}); !errors.Is(err, os.ErrNoDeadline) {
+			t.Fatalf("a file put in blocking mode is still polled by the Go runtime (%v)", err)
+		}
+	})
+
+	// A call of the guest's that waits does so in the runtime, never in
+	// the kernel, whatever the mode of the description, so that a signal
+	// ends it: where the host has a write that does not wait in one call
+	// (Linux), a write to a full pipe in blocking mode, which reports what
+	// it wrote once it wrote something; an accept and, where MSG_DONTWAIT
+	// does not keep a send from waiting, a send, each made by the holder of
+	// a turn; and on Linux, a read of a FIFO the guest put in blocking mode
+	// after the Go runtime's poller took it, and a connect the host waits
+	// in, which goes on in the host.
+	t.Run("WaitsInTheRuntime", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.FS, w.cfg.NetAccess, w.cfg.Listen, w.cfg.Dial = osFS{}, AllowAllNetAccess, AllowAllListen, AllowAllDial
+		if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+			t.Fatalf("Proc_signal_register rc=%d", rc)
+		}
+		setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, 0)
+
+		// writes of more than the pipe's buffer holds at first, which the
+		// host grows for them, go through before anything is read, and are
+		// read whole
+		big0, big1 := newTestPipe(t, w, m)
+		const big, piece = 20000, 1000
+		chunk := string(make([]byte, piece))
+		for written := 0; written < big; written += piece {
+			var rc int32
+			returnsWithin(t, "Fd_write", func() { rc = fdWriteString(w, m, big1, chunk) })
+			if rc != _wasiESUCCESS {
+				t.Fatalf("write after %d bytes to a blocking pipe rc=%d", written, rc)
+			}
+		}
+		for got := 0; got < big; {
+			s, rc := fdReadString(w, m, big0, 8192)
+			if rc != _wasiESUCCESS || s == "" {
+				t.Fatalf("read after %d bytes rc=%d", got, rc)
+			}
+			got += len(s)
+		}
+
+		// where a write that waits is made in steps (hostWritesWithoutWaiting)
+		if hostWritesWithoutWaiting {
+			r, wr := newTestPipe(t, w, m)
+			// filled through the host's descriptor (the guest's number), in
+			// non-blocking mode for the fill only
+			if err := syscall.SetNonblock(int(wr), true); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				if _, err := syscall.Write(int(wr), []byte{0}); errors.Is(err, syscall.EAGAIN) {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := syscall.SetNonblock(int(wr), false); err != nil {
+				t.Fatal(err)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if rc := fdWriteString(w, m, wr, "x"); rc != _wasiEINTR {
+				t.Fatalf("write to a full blocking pipe with a signal rc=%d, want EINTR", rc)
+			}
+			takeSignals(t, w, m)
+			if _, err := syscall.Read(int(r), make([]byte, 8192)); err != nil {
+				t.Fatal(err)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if n, rc := writeChunk(t, w, m, wr); rc != _wasiESUCCESS || n == 0 || n >= uint32(wsChunk) {
+				t.Fatalf("interrupted write to a blocking pipe: %d bytes rc=%d, want part of %d", n, rc, wsChunk)
+			}
+			takeSignals(t, w, m)
+		}
+
+		listener, port := newIPListener(t, w, m)
+		connectTo(t, w, m, port)
+		turn := entryOf(t, w, listener).inputTurn()
+		turn <- struct{}{} // another accept of the guest's is being made
+		accepted := make(chan int32, 1)
+		go func() { accepted <- w.Sock_accept(newForkTestModule(), listener, 0, 5100) }()
+		if blocked, rc := blockedOrDone(t, w, accepted); !blocked {
+			t.Fatalf("the accept went through (rc=%d) while another held the turn", rc)
+		}
+		<-turn
+		if rc := within(t, "sock_accept", accepted); rc != _wasiESUCCESS {
+			t.Fatalf("accept rc=%d", rc)
+		}
+
+		if !hostSendsWithoutWaiting {
+			if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 5000); rc != _wasiESUCCESS {
+				t.Fatalf("Sock_socketpair rc=%d", rc)
+			}
+			pa := int32(readU32(m.memory, 5000))
+			turn := entryOf(t, w, pa).outputTurn()
+			turn <- struct{}{} // another send of the guest's is being made
+			sent := make(chan int32, 1)
+			go func() { sent <- fdWriteString(w, newForkTestModule(), pa, "x") }()
+			if blocked, rc := blockedOrDone(t, w, sent); !blocked {
+				t.Fatalf("the send went through (rc=%d) while another held the turn", rc)
+			}
+			<-turn
+			if rc := within(t, "fd_write", sent); rc != _wasiESUCCESS {
+				t.Fatalf("send rc=%d", rc)
+			}
+			// a send with room for part of it sends that part, and waits
+			// for room for the rest in the runtime, where a signal ends it
+			pb := int32(readU32(m.memory, 5004))
+			if err := syscall.SetNonblock(int(pa), true); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				if _, err := syscall.Write(int(pa), make([]byte, 512)); errors.Is(err, syscall.EAGAIN) {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := syscall.SetNonblock(int(pa), false); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := syscall.Read(int(pb), make([]byte, 8192)); err != nil {
+				t.Fatal(err)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if n, rc := writeChunk(t, w, m, pa); rc != _wasiESUCCESS || n == 0 || n >= uint32(wsChunk) {
+				t.Fatalf("interrupted send: %d bytes rc=%d, want part of %d", n, rc, wsChunk)
+			}
+			takeSignals(t, w, m)
+		}
+
+		if runtime.GOOS != "linux" {
+			// darwin's FIFO with a name is read as M5 has it, and darwin
+			// refuses a connect to a full backlog at once
+			return
+		}
+		fifo := filepath.Join(t.TempDir(), "fifo")
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rfifo, errno := w.pathOpen(nil, fifo[1:], 0, 0, 1<<1, wasiFdflagNonblock)
+		if errno != _wasiESUCCESS {
+			t.Fatalf("open of a FIFO with NONBLOCK errno=%d", errno)
+		}
+		writer, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeAtEnd(t, writer)
+		if rc := w.Fd_fdstat_set_flags(m, rfifo, 0); rc != _wasiESUCCESS {
+			t.Fatalf("clearing NONBLOCK rc=%d", rc)
+		}
+		if op := entryOf(t, w, rfifo); w.netpolled(op, op.f) {
+			t.Fatal("a description the guest put in blocking mode is waited for in the Go runtime's poller")
+		}
+		postWhenBlocked(w, wasiSIGUSR1)
+		if got, rc := readWithin(t, w, m, rfifo, 16); rc != _wasiEINTR {
+			t.Fatalf("read of an empty FIFO the guest put in blocking mode = %q rc=%d, want EINTR", got, rc)
+		}
+		takeSignals(t, w, m)
+
+		path := filepath.Join(t.TempDir(), "s")
+		server := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+		n := putUnixAddr(m, sockAddrOff, path)
+		if rc := w.Sock_bind_addr(m, server, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS {
+			t.Fatalf("bind rc=%d", rc)
+		}
+		// a backlog of none: the first connection waits, the next connect
+		// waits for room
+		if rc := w.Sock_listen(m, server, 0); rc != _wasiESUCCESS {
+			t.Fatalf("Sock_listen rc=%d", rc)
+		}
+		first := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+		if rc := w.Sock_connect_addr(m, first, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS {
+			t.Fatalf("first connect rc=%d", rc)
+		}
+		next := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+		postWhenBlocked(w, wasiSIGUSR1)
+		if rc := w.Sock_connect_addr(m, next, sockAddrOff, sockPathOff, n); rc != -_wasiEINTR {
+			t.Fatalf("connect to a full backlog with a signal rc=%d, want -EINTR", rc)
+		}
+		takeSignals(t, w, m)
+		if _, rc := acceptOn(w, m, server); rc != _wasiESUCCESS {
+			t.Fatalf("accept rc=%d", rc)
+		}
+		// the connect that went on in the host is made once there is room:
+		// a connect waits for it, or finds it made
+		if rc := w.Sock_connect_addr(m, next, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS && rc != -_wasiEISCONN {
+			t.Fatalf("connect after the room was made rc=%d", rc)
+		}
+		if _, rc := acceptOn(w, m, server); rc != _wasiESUCCESS {
+			t.Fatalf("accept of the connection made in the host rc=%d", rc)
+		}
+	})
+
+	// A command gets the guest's descriptors above 2 that are not
+	// close-on-exec under their numbers, as exec(2) passes them: of Files,
+	// of the guest's own, taken in from outside the guest or not, in a
+	// forked instance under its own numbers.
+	t.Run("CommandsInherit", func(t *testing.T) {
+		var given [2]int
+		if err := syscall.Pipe(given[:]); err != nil {
+			t.Fatal(err)
+		}
+		at := int32(70)
+		if err := errors.Join(hostDupTo(given[0], int(at)), syscall.Close(given[0])); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := syscall.Write(given[1], []byte("given")); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Close(given[1]); err != nil {
+			t.Fatal(err)
+		}
+		w, m := newHostNumberedStubs(t, map[int32]*os.File{at: os.NewFile(uintptr(at), "given")}, nil)
+		w.cfg.Exec = AllowAllExec
+		// what a command finds under a number: the input there, or
+		// "closed"
+		probe := func(t *testing.T, w *WasiStubs, m *Module, fd int32) string {
+			t.Helper()
+			r, wr := newTestPipe(t, w, m)
+			// (by name: dash takes no descriptor above 9 in a redirection)
+			script := fmt.Sprintf("cat /dev/fd/%d 2>/dev/null || echo closed", fd)
+			pid := spawnWithStreams(t, w, m, wr, wr, wr, "/bin/sh", "-c", script)
+			closeTestFd(t, w, m, wr)
+			waitExitsZero(t, w, m, pid)
+			got := readToEnd(t, w, m, r)
+			closeTestFd(t, w, m, r)
+			// the last line: what the shell says of a closed number before
+			// it is its own error output
+			lines := strings.Split(strings.TrimSpace(got), "\n")
+			return lines[len(lines)-1]
+		}
+		if got := probe(t, w, m, at); got != "given" {
+			t.Fatalf("the command finds %q under the descriptor of Files", got)
+		}
+		r, wr := newTestPipe(t, w, m)
+		if rc := w.Fd_dup2(m, r, 71); rc != _wasiESUCCESS {
+			t.Fatalf("dup2 rc=%d", rc)
+		}
+		if rc := w.Fd_dup2(m, r, 72); rc != _wasiESUCCESS {
+			t.Fatalf("dup2 rc=%d", rc)
+		}
+		if rc := w.Fd_cloexec(m, 72, 1, 1, 6200); rc != _wasiESUCCESS {
+			t.Fatalf("Fd_cloexec rc=%d", rc)
+		}
+		closeTestFd(t, w, m, wr)
+		if got := probe(t, w, m, 71); got != "" {
+			t.Fatalf("the command finds %q under the guest's 71, want its (empty) input", got)
+		}
+		if !entryOf(t, w, 71).shared.Load() {
+			t.Fatal("an entry a command inherited is not marked shared")
+		}
+		if got := probe(t, w, m, 72); got != "closed" {
+			t.Fatalf("the command finds %q under the guest's close-on-exec 72", got)
+		}
+		var native, marked [2]int
+		if err := errors.Join(syscall.Pipe(native[:]), syscall.Pipe(marked[:])); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Close(native[1]); err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, native[0])
+		closeFDAtEnd(t, marked[0])
+		if _, err := syscall.Write(marked[1], []byte("marked")); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Close(marked[1]); err != nil {
+			t.Fatal(err)
+		}
+		syscall.CloseOnExec(marked[0])
+		if got := probe(t, w, m, int32(native[0])); got != "" {
+			t.Fatalf("the command finds %q under native code's %d", got, native[0])
+		}
+		// one the guest has not taken in is passed by the host's mark too
+		var outside [2]int
+		if err := syscall.Pipe(outside[:]); err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, outside[0])
+		closeFDAtEnd(t, outside[1])
+		syscall.CloseOnExec(outside[0])
+		if got := probe(t, w, m, int32(outside[0])); got != "closed" {
+			t.Fatalf("the command finds %q under native code's close-on-exec %d", got, outside[0])
+		}
+		// one the guest has taken in keeps the host's mark
+		if ft := fdFiletype(t, w, m, int32(marked[0])); ft == 0 {
+			t.Fatal("native code's descriptor was not taken in")
+		}
+		if got := probe(t, w, m, int32(marked[0])); got != "closed" {
+			t.Fatalf("the command finds %q under native code's close-on-exec %d", got, marked[0])
+		}
+		// the guest's F_GETFD of it is the host's mark
+		if rc := w.Fd_cloexec(m, int32(marked[0]), 0, 0, 6200); rc != _wasiESUCCESS || readU32(m.memory, 6200) != 1 {
+			t.Fatalf("Fd_cloexec of a close-on-exec descriptor taken in rc=%d, mark %d", rc, readU32(m.memory, 6200))
+		}
+		// a forked instance has the mark the host had at the fork
+		child := w.Fork()
+		t.Cleanup(func() {
+			if err := child.CloseAll(); err != nil {
+				t.Errorf("child CloseAll: %v", err)
+			}
+		})
+		if got := probe(t, child, newForkTestModule(), 71); got != "" {
+			t.Fatalf("the forked instance's command finds %q under 71", got)
+		}
+		if got := probe(t, child, newForkTestModule(), int32(marked[0])); got != "closed" {
+			t.Fatalf("the forked instance's command finds %q under the close-on-exec %d it was taken in with", got, marked[0])
+		}
+		// and the guest's F_SETFD of it is the host's
+		if rc := w.Fd_cloexec(m, int32(marked[0]), 1, 0, 6200); rc != _wasiESUCCESS || hostCloseOnExec(marked[0]) {
+			t.Fatalf("Fd_cloexec clearing the mark rc=%d, the host's mark kept %v", rc, hostCloseOnExec(marked[0]))
+		}
+		if got := probe(t, w, m, int32(marked[0])); got != "marked" {
+			t.Fatalf("the command finds %q under %d, whose mark the guest cleared", got, marked[0])
+		}
+		// one taken in that code outside the guest closed and put another
+		// file under the number is that file's
+		var stale, fresh [2]int
+		if err := errors.Join(syscall.Pipe(stale[:]), syscall.Pipe(fresh[:])); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := syscall.Write(fresh[1], []byte("fresh")); err != nil {
+			t.Fatal(err)
+		}
+		if err := errors.Join(syscall.Close(stale[1]), syscall.Close(fresh[1])); err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, stale[0])
+		if ft := fdFiletype(t, w, m, int32(stale[0])); ft == 0 {
+			t.Fatal("native code's descriptor was not taken in")
+		}
+		if err := errors.Join(dupTo(fresh[0], stale[0]), syscall.Close(fresh[0])); err != nil {
+			t.Fatal(err)
+		}
+		if got := probe(t, w, m, int32(stale[0])); got != "fresh" {
+			t.Fatalf("the command finds %q under %d, which code outside the guest reopened", got, stale[0])
 		}
 	})
 
@@ -867,10 +1341,10 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 	})
 
 	// A FIFO opened without waiting, whose file is made anew when it is
-	// moved up: where poll(2) reports the end of a FIFO's input the Go
-	// runtime polls it in non-blocking mode; elsewhere it is in blocking
-	// mode and not polled. Either way the close of the FIFO while a read
-	// waits for it returns.
+	// moved up, is in the guest's mode, non-blocking: where poll(2) reports
+	// the end of a FIFO's input the Go runtime polls it; elsewhere it does
+	// not. Either way the close of the FIFO while a read waits for it
+	// returns.
 	t.Run("FIFOOpenedWithoutWaiting", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "fifo")
@@ -909,8 +1383,8 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 			t.Fatal(err)
 		}
 		nonblocking := openFileFlags(t, w, fd)&syscall.O_NONBLOCK != 0
-		if polled != hostPollReportsFIFOEnd || op.polled != polled || nonblocking != polled {
-			t.Fatalf("the FIFO's file is polled %v (entry %v), non-blocking %v; want all %v", polled, op.polled, nonblocking, hostPollReportsFIFOEnd)
+		if polled != hostPollReportsFIFOEnd || op.polled != polled || !nonblocking {
+			t.Fatalf("the FIFO's file is polled %v (entry %v), non-blocking %v; want polled %v, non-blocking", polled, op.polled, nonblocking, hostPollReportsFIFOEnd)
 		}
 		if rc := w.Fd_fdstat_set_flags(m, fd, 0); rc != _wasiESUCCESS {
 			t.Fatalf("clear O_NONBLOCK rc=%d", rc)
@@ -1019,6 +1493,65 @@ func TestFilesAreTheGuests(t *testing.T) {
 	closeTestFd(t, w, m, 7)
 	if hostOpen(int32(host)) {
 		t.Fatal("the guest's close left the socket open")
+	}
+}
+
+// A file of Files that is no socket keeps the mode it was given in, which
+// is the guest's: a pipe in blocking mode is not one the guest set
+// non-blocking.
+func TestFilesKeepTheirMode(t *testing.T) {
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatal(err)
+	}
+	closeFDAtEnd(t, p[1])
+	w, m := newProcTestStubs(t)
+	w.cfg.Files = map[int32]*os.File{7: os.NewFile(uintptr(p[0]), "pipe")}
+	t.Cleanup(func() {
+		if err := w.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	const out int32 = 5200
+	if rc := w.Fd_fdstat_get(m, 7, out); rc != _wasiESUCCESS {
+		t.Fatalf("Fd_fdstat_get(7) rc=%d", rc)
+	}
+	if flags := int32(binary.LittleEndian.Uint16(m.memory[out+2:])); flags&wasiFdflagNonblock != 0 {
+		t.Fatalf("the fdflags of a pipe in blocking mode are %#x: NONBLOCK", flags)
+	}
+	host, ok := w.HostDescriptor(7)
+	if !ok {
+		t.Fatal("HostDescriptor(7) is none")
+	}
+	if flags, err := descriptorFlags(int(host), syscall.F_GETFL); err != nil || flags&syscall.O_NONBLOCK != 0 {
+		t.Fatalf("the pipe's flags %#x, %v: not in blocking mode", flags, err)
+	}
+}
+
+// A descriptor of the guest's whose entry was closed after it was collected
+// for a command is closed in the command, as one closed before exec(2) is.
+func TestCommandFilesOfAClosedEntry(t *testing.T) {
+	closed, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	open, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, open)
+	std := []uintptr{0, 1, 2}
+	inherit := []commandDescriptor{{at: 4, conn: closed}, {at: 5, conn: open}, {at: 6}}
+	if err := withCommandFiles(std, inherit, func(files []uintptr) error {
+		if want := []uintptr{0, 1, 2, ^uintptr(0), ^uintptr(0), files[5], 6}; !slices.Equal(files, want) || files[5] == ^uintptr(0) {
+			t.Errorf("files %v, want %v with the open entry's descriptor at 5", files, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

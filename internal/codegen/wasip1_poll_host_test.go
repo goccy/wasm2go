@@ -375,33 +375,11 @@ func TestWasi_WriteToAStreamThatTakesNoDeadline(t *testing.T) {
 	}
 }
 
-// writeSyscalls returns how many write system calls the process has made
-// (Linux's /proc/self/io).
-func writeSyscalls(t *testing.T) int {
-	t.Helper()
-	b, err := os.ReadFile("/proc/self/io")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "syscw: "); ok {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return n
-		}
-	}
-	t.Fatal("no syscw in /proc/self/io")
-	return 0
-}
-
-// A large write to a descriptor in blocking mode is one write(2), however
-// little room the pipe has at a time.
-func TestWasi_LargeWriteToABlockingPipeIsOneCall(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skipf("%s does not count a process's write system calls", runtime.GOOS)
-	}
+// A large write to a descriptor in blocking mode is written whole, in
+// steps that do not wait in the kernel, however little room the pipe has
+// at a time (a signal meanwhile ends it with what it wrote:
+// TestWasi_AWriteToABlockingPipeTakesASignal).
+func TestWasi_LargeWriteToABlockingPipeIsWrittenWhole(t *testing.T) {
 	const size = 10 << 20
 	r, wr := blockingPipe(t)
 	w, _ := newProcTestStubs(t)
@@ -416,15 +394,10 @@ func TestWasi_LargeWriteToABlockingPipeIsOneCall(t *testing.T) {
 		drained <- n
 	}()
 	makeIovec(m, 0, 4096, size)
-	before := writeSyscalls(t)
 	var rc int32
 	returnsWithin(t, "Fd_write", func() { rc = w.Fd_write(m, 1, 0, 1, 16) })
-	calls := writeSyscalls(t) - before
 	if n := readU32(m.memory, 16); rc != _wasiESUCCESS || n != size {
 		t.Fatalf("write of %d bytes: %d rc=%d", size, n, rc)
-	}
-	if calls > 8 {
-		t.Fatalf("the write took %d write system calls", calls)
 	}
 	if err := wr.Close(); err != nil {
 		t.Fatal(err)
@@ -1034,8 +1007,9 @@ func TestWasi_CloseOfAConnectionAPollWaitsFor(t *testing.T) {
 }
 
 // A write that does not wait to a full descriptor in blocking mode takes no
-// more than there is room for: a pipe no more than PIPE_BUF once poll(2)
-// reports room, a socket what it takes without waiting.
+// more than there is room for, without waiting: a pipe what the host
+// reports room for (hostPipeWriteNow), or no more than PIPE_BUF once
+// poll(2) reports room, a socket what it takes without waiting.
 func TestWasi_NonBlockingWriteToAFullStreamThatTakesNoDeadline(t *testing.T) {
 	const size = 64 << 10
 	m := newGuestModule(size + 4096)
@@ -1063,14 +1037,16 @@ func TestWasi_NonBlockingWriteToAFullStreamThatTakesNoDeadline(t *testing.T) {
 		if err := syscall.SetNonblock(fd, false); err != nil {
 			t.Fatal(err)
 		}
-		// Some room, less than the write.
+		// Some room, less than the write: what was read, and less than a
+		// chunk of the fill besides.
+		const room = 16<<10 + 4096
 		if _, err := io.ReadFull(r, make([]byte, 16<<10)); err != nil {
 			t.Fatal(err)
 		}
 		if rc := w.Fd_fdstat_set_flags(m, 1, wasiFdflagNonblock); rc != _wasiESUCCESS {
 			t.Fatalf("set O_NONBLOCK rc=%d", rc)
 		}
-		if n, rc := write64K(t, w); rc == _wasiESUCCESS && (n == 0 || n > hostPipeBuf) || rc != _wasiESUCCESS && rc != _wasiEAGAIN {
+		if n, rc := write64K(t, w); rc == _wasiESUCCESS && (n == 0 || n >= room) || rc != _wasiESUCCESS && rc != _wasiEAGAIN {
 			t.Fatalf("write = %d bytes rc=%d", n, rc)
 		}
 	})
