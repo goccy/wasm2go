@@ -602,7 +602,7 @@ func TestSignal_TimerRepeatsAtItsInterval(t *testing.T) {
 func TestSignal_TimerDueBeforeAWaitEndsIsPostedFirst(t *testing.T) {
 	overdue := func(w *WasiStubs) {
 		w.sig.mu.Lock()
-		w.sig.timerAt = time.Now().Add(-time.Millisecond)
+		w.sig.timerAt = 0
 		w.sig.mu.Unlock()
 	}
 
@@ -751,7 +751,7 @@ func TestSignal_SIGKILLIsAlwaysDelivered(t *testing.T) {
 func TestSignal_DueTimerInterruptsTheGuestsOwnWait(t *testing.T) {
 	overdue := func(w *WasiStubs) {
 		w.sig.mu.Lock()
-		w.sig.timerAt = time.Now().Add(-time.Millisecond)
+		w.sig.timerAt = 0
 		w.sig.mu.Unlock()
 	}
 	w, m := newSignalGuest(t, wasiSIGALRM)
@@ -827,7 +827,7 @@ func TestSignal_TimerOverdueWhenAskedFires(t *testing.T) {
 	w, m := newSignalGuest(t, wasiSIGALRM)
 	setTimer(t, w, m, time.Hour, 0)
 	w.sig.mu.Lock()
-	w.sig.timerAt = time.Now().Add(-time.Millisecond)
+	w.sig.timerAt = 0
 	w.sig.mu.Unlock()
 	if left, every := setTimer(t, w, m, 0, 0); left != 0 || every != 0 {
 		t.Fatalf("an overdue one-shot timer reported %v left (every %v), want none", left, every)
@@ -955,7 +955,7 @@ func TestSignal_OwnPostsAreLeftForTheGuest(t *testing.T) {
 
 	setTimer(t, w, m, time.Hour, 0)
 	w.sig.mu.Lock()
-	w.sig.timerAt = time.Now().Add(-time.Millisecond)
+	w.sig.timerAt = 0
 	w.sig.mu.Unlock()
 	timerState(t, w, m)
 	if rc := wait(); rc != -_wasiEINTR {

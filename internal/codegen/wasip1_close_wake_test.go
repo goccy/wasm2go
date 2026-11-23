@@ -52,7 +52,7 @@ func closeAllAtCleanup(t *testing.T, w *WasiStubs) {
 func woken(t *testing.T, wk *wasiWake) bool {
 	t.Helper()
 	ready := []bool{false}
-	if err := hostWaitReady([]uintptr{uintptr(wk.r)}, []int{hostWantInput}, ready, time.Now(), -1); err != nil {
+	if err := hostWaitReady([]uintptr{uintptr(wk.r)}, []int{hostWantInput}, ready, nil, time.Now(), -1); err != nil {
 		t.Fatal(err)
 	}
 	return ready[0]

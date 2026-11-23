@@ -102,7 +102,7 @@ func TestTakeSignal_TimerAlarm(t *testing.T) {
 func TestTakeSignal_DueTimerInAGuestsCall(t *testing.T) {
 	overdue := func(w *WasiStubs) {
 		w.sig.mu.Lock()
-		w.sig.timerAt = time.Now().Add(-time.Millisecond)
+		w.sig.timerAt = 0
 		w.sig.mu.Unlock()
 	}
 	for _, take := range []bool{true, false} {
@@ -149,6 +149,35 @@ func TestTakeSignal_DueTimerInAGuestsCall(t *testing.T) {
 		t.Fatalf("the timer not taken has not interrupted the code outside after %v", waitLimit)
 	}
 	c.End()
+	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
+		t.Fatalf("taken = %#x, want SIGALRM (%#x)", got, want)
+	}
+}
+
+// A blocking call of the guest's that ends while the host's timer is
+// offering its firing to TakeSignal ends once the offer has: the firing
+// came first, so the call reports the signal not taken.
+func TestTakeSignal_WaitEndsAfterTheTimersOffer(t *testing.T) {
+	w, m, r := newTakingGuest(t, false, wasiSIGALRM)
+	offering, release := make(chan struct{}), make(chan struct{})
+	r.during = func(SignalTarget, int32) {
+		close(offering)
+		<-release
+	}
+	key, ok := w.beginBlocking(m, func() {})
+	if !ok {
+		t.Fatal("a wait before the timer is set did not begin")
+	}
+	setTimer(t, w, m, time.Nanosecond, 0)
+	<-offering
+	ended := make(chan bool, 1)
+	go func() { ended <- w.endBlocking(key) }()
+	// The call has ended its wait and decided, or waits for the offer.
+	awaitBlockedCalls(w, 0)
+	close(release)
+	if interrupted := <-ended; !interrupted {
+		t.Fatal("the wait that ended during the timer's offer did not report the signal")
+	}
 	if got, want := takeSignals(t, w, m), signalMask(wasiSIGALRM); got != want {
 		t.Fatalf("taken = %#x, want SIGALRM (%#x)", got, want)
 	}

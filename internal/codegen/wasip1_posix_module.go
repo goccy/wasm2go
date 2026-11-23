@@ -63,6 +63,7 @@ var posixImports = map[string]bool{
 	"proc_setpgid":               true,
 	"proc_setsid":                true,
 	"proc_signal_dispositions":   true,
+	"proc_signal_ignored":        true,
 	"proc_signal_register":       true,
 	"proc_signal_take":           true,
 	"proc_spawn":                 true,

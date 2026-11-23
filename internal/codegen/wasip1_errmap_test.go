@@ -145,7 +145,7 @@ func TestGuestErrnoReportsWithoutLocks(t *testing.T) {
 		t.Errorf("setOwnNice errno=%d, want EIO", errno)
 	}
 	op.reader.end = errors.New("read failed")
-	if _, errno := w.readThroughReader(m, "fd_read", op, op.reader, nil, true); errno != _wasiEIO {
+	if _, errno := w.readThroughReader(m, "fd_read", op, nil, nil, true); errno != _wasiEIO {
 		t.Errorf("readThroughReader errno=%d, want EIO", errno)
 	}
 	if len(told) != 2 || told[0] != "proc_priority" || told[1] != "fd_read" {

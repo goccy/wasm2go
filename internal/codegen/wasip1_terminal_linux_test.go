@@ -97,6 +97,11 @@ func TestFdIoctlPseudoTerminalMaster(t *testing.T) {
 		}
 		closeAtEnd(t, slave)
 	}
+	for _, request := range []uint32{darwinTIOCPTYGRANT, darwinTIOCPTYUNLK, darwinTIOCPTYGNAME} {
+		if rc := guestIoctl(w, m, fd, request, termiosOff); rc != -_wasiENOTTY {
+			t.Fatalf("darwin's ioctl %#x rc=%d, want -ENOTTY", request, rc)
+		}
+	}
 }
 
 // On a host that numbers the requests of a terminal as asm-generic does,

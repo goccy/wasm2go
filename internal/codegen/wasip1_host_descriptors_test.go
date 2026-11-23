@@ -406,6 +406,46 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// The guest's writes to the process's standard error go to what is at
+	// descriptor 2 now: a pipe code outside the runtime put there (native
+	// code's dup2), until it puts the old one back.
+	t.Run("StandardNumberRenumberedOutside", func(t *testing.T) {
+		saved, err := dupFrom(2, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, saved)
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.Stderr = os.Stderr
+		if host, ok := w.HostDescriptor(2); !ok || host != 2 {
+			t.Fatalf("HostDescriptor(2) = %d, %v", host, ok)
+		}
+		var p [2]int
+		if err := syscall.Pipe(p[:]); err != nil {
+			t.Fatal(err)
+		}
+		closeFDAtEnd(t, p[0])
+		if err := errors.Join(hostDupTo(p[1], 2), syscall.Close(p[1])); err != nil {
+			t.Fatal(err)
+		}
+		rc := fdWriteString(w, m, 2, "caught")
+		if err := hostDupTo(saved, 2); err != nil {
+			t.Fatal(err)
+		}
+		if rc != _wasiESUCCESS {
+			t.Fatalf("write to fd 2 rc=%d", rc)
+		}
+		buf := make([]byte, 16)
+		n, err := syscall.Read(p[0], buf)
+		if err != nil || string(buf[:n]) != "caught" {
+			t.Fatalf("the pipe at 2 got %q, %v; want the guest's write", buf[:max(n, 0)], err)
+		}
+		// both write ends are closed: the end of the pipe's input
+		if n, err := syscall.Read(p[0], buf); n != 0 || err != nil {
+			t.Fatalf("read after the end %d, %v; want 0", n, err)
+		}
+	})
+
 	t.Run("NewDescriptors", func(t *testing.T) {
 		w, m := newHostNumberedStubs(t, nil, nil)
 		want := lowestFreeHost(t)
@@ -1264,6 +1304,26 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// A standard descriptor the guest closed is closed in a command it
+	// starts with it, as exec(2) leaves it: not the null device. The shell
+	// duplicates descriptor 0, which fails only where it is closed; a
+	// command whose runtime opens the null device for a closed standard
+	// descriptor at its start (one written in Rust) cannot tell.
+	t.Run("CommandsHaveClosedStandardDescriptorsClosed", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.Exec = AllowAllExec
+		closeTestFd(t, w, m, 0)
+		r, wr := newTestPipe(t, w, m)
+		pid := spawnWithStreams(t, w, m, 0, wr, wr, "/bin/sh", "-c", "exec 3<&0")
+		closeTestFd(t, w, m, wr)
+		status := waitStatus(t, w, m, pid)
+		out := readToEnd(t, w, m, r)
+		closeTestFd(t, w, m, r)
+		if status == 0 {
+			t.Fatalf("the shell duplicated the command's descriptor 0 (output %q), want it closed", out)
+		}
+	})
+
 	// A descriptor made outside the guest after the instance is the
 	// guest's by its number; one the process had before is not.
 	t.Run("Adopt", func(t *testing.T) {
@@ -1630,6 +1690,177 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 		within(t, "the read", read)
 	})
+
+	// A FIFO opened without waiting is read in the guest's mode,
+	// non-blocking: the end while nobody writes, EAGAIN while a writer
+	// writes nothing, what it writes, and a poll waits for that. A blocking
+	// read of the description another process put in non-blocking mode
+	// waits for input, and a signal ends the wait.
+	t.Run("FIFOInNonBlockingMode", func(t *testing.T) {
+		t.Run("NoWriter", func(t *testing.T) {
+			w, m, fd, _ := openNonBlockingFIFO(t)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "" {
+				t.Fatalf("read with no writer = %q rc=%d, want the end", got, rc)
+			}
+		})
+		t.Run("Input", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			write(t, writer, "x")
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "x" {
+				t.Fatalf("read = %q rc=%d, want %q", got, rc, "x")
+			}
+		})
+		t.Run("NoInput", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEAGAIN {
+				t.Fatalf("read with a writer and no input = %q rc=%d, want EAGAIN", got, rc)
+			}
+			write(t, writer, "x")
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "x" {
+				t.Fatalf("read after EAGAIN = %q rc=%d, want %q", got, rc, "x")
+			}
+		})
+		t.Run("Poll", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			written := writeWhenBlocked(w, writer, "y")
+			writeSubFd(m, pollSubsOff, 7, 1, fd)
+			wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+			if err := within(t, "the write", written); err != nil {
+				t.Fatal(err)
+			}
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "y" {
+				t.Fatalf("read after the poll = %q rc=%d, want %q", got, rc, "y")
+			}
+		})
+		t.Run("BlockingRead", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			if rc := w.Fd_fdstat_set_flags(m, fd, 0); rc != _wasiESUCCESS {
+				t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+			}
+			if err := setHostNonblock(entryOf(t, w, fd).f, true); err != nil {
+				t.Fatal(err)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEINTR {
+				t.Fatalf("blocking read of an empty FIFO = %q rc=%d, want EINTR", got, rc)
+			}
+			takeSignals(t, w, m)
+			written := writeWhenBlocked(w, writer, "z")
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "z" {
+				t.Fatalf("blocking read = %q rc=%d, want %q", got, rc, "z")
+			}
+			if err := within(t, "the write", written); err != nil {
+				t.Fatal(err)
+			}
+		})
+		// A Read of the FIFO's reader asked for in blocking mode, which a
+		// signal left waiting in the kernel, takes the input written once
+		// the guest puts the FIFO in non-blocking mode: the polls and the
+		// read wait for the reader.
+		t.Run("ReadInProgress", func(t *testing.T) {
+			w, m, fd, writer := openNonBlockingFIFOWithWriter(t)
+			if rc := w.Fd_fdstat_set_flags(m, fd, 0); rc != _wasiESUCCESS {
+				t.Fatalf("clear O_NONBLOCK rc=%d", rc)
+			}
+			postWhenBlocked(w, wasiSIGUSR1)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEINTR {
+				t.Fatalf("blocking read of an empty FIFO = %q rc=%d, want EINTR", got, rc)
+			}
+			takeSignals(t, w, m)
+			if rc := w.Fd_fdstat_set_flags(m, fd, wasiFdflagNonblock); rc != _wasiESUCCESS {
+				t.Fatalf("set O_NONBLOCK rc=%d", rc)
+			}
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiEAGAIN {
+				t.Fatalf("read with no input = %q rc=%d, want EAGAIN", got, rc)
+			}
+			written := writeWhenBlocked(w, writer, "y")
+			writeSubFd(m, pollSubsOff, 7, 1, fd)
+			wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+			if err := within(t, "the write", written); err != nil {
+				t.Fatal(err)
+			}
+			// What the reader keeps is ready to a poll again.
+			wantUserdata(t, pollUserdata(t, w, m, 1), 7)
+			if got, rc := readWithin(t, w, m, fd, 16); rc != _wasiESUCCESS || got != "y" {
+				t.Fatalf("read after the polls = %q rc=%d, want %q", got, rc, "y")
+			}
+		})
+	})
+
+	// The event for reading of a pipe or socket counts the bytes it holds.
+	t.Run("PollCountsBytes", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.NetAccess = AllowAllNetAccess
+		r, wr := newTestPipe(t, w, m)
+		wantWritten(t, w, m, wr, "hello")
+		wantPollCounts(t, w, m, r, 5)
+		if rc := w.Sock_socketpair(m, wasiSockFamilyUnix, wasiSockTypeStream, 5000); rc != _wasiESUCCESS {
+			t.Fatalf("Sock_socketpair rc=%d", rc)
+		}
+		a, b := int32(readU32(m.memory, 5000)), int32(readU32(m.memory, 5004))
+		wantWritten(t, w, m, a, "hello")
+		wantPollCounts(t, w, m, b, 5)
+	})
+}
+
+// openNonBlockingFIFO opens a FIFO named fifo for reading without waiting
+// (O_NONBLOCK) in an instance with the host's descriptors whose guest
+// handles SIGUSR1, and returns the instance, its thread, the guest's
+// descriptor and the FIFO's name.
+func openNonBlockingFIFO(t *testing.T) (*WasiStubs, *Module, int32, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := NewWASI(WASIConfig{
+		FS:              newHostFS(t, dir),
+		Stdin:           bytes.NewReader(nil),
+		Stdout:          &bytes.Buffer{},
+		Stderr:          &bytes.Buffer{},
+		HostDescriptors: true,
+		Errors:          func(op string, err error) { t.Errorf("%s: %v", op, err) },
+	})
+	t.Cleanup(func() {
+		if err := w.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	m := newGuestModule(1 << 16)
+	if rc := w.Proc_signal_register(m, sigFlagOff); rc != 0 {
+		t.Fatalf("Proc_signal_register rc=%d", rc)
+	}
+	setDispositions(t, w, m, signalMask(wasiSIGUSR1), 0, 0)
+	fd, errno := w.pathOpen(m, "fifo", 0, 0, 1<<1, wasiFdflagNonblock)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open errno=%d", errno)
+	}
+	return w, m, fd, path
+}
+
+// openNonBlockingFIFOWithWriter is openNonBlockingFIFO with a writer of
+// the FIFO's, which it returns in place of the name.
+func openNonBlockingFIFOWithWriter(t *testing.T) (*WasiStubs, *Module, int32, *os.File) {
+	t.Helper()
+	w, m, fd, path := openNonBlockingFIFO(t)
+	writer, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, writer)
+	return w, m, fd, writer
+}
+
+// writeWhenBlocked writes s to f once a blocking call of w's guest is
+// waiting, and sends the write's failure.
+func writeWhenBlocked(w *WasiStubs, f *os.File, s string) <-chan error {
+	written := make(chan error, 1)
+	whenBlocked(w, func() {
+		_, err := f.WriteString(s)
+		written <- err
+	})
+	return written
 }
 
 // mustOpenTestFile opens name for reading through pathOpen and returns the

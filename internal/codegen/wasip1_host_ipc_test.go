@@ -3,6 +3,7 @@ package codegen
 import (
 	"encoding/binary"
 	"errors"
+	"os"
 	"runtime"
 	"syscall"
 	"testing"
@@ -11,7 +12,9 @@ import (
 // hostIPCAvailable reports whether HostIPC reaches the host's objects here.
 func hostIPCAvailable() bool {
 	switch runtime.GOARCH {
-	case "amd64", "arm64", "riscv64", "loong64":
+	case "amd64", "arm64":
+		return runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+	case "riscv64", "loong64":
 		return runtime.GOOS == "linux"
 	}
 	return false
@@ -96,6 +99,9 @@ func TestHostIPC_MessageQueue(t *testing.T) {
 	}
 	if qnum := binary.LittleEndian.Uint64(st[80:]); qnum != 1 {
 		t.Fatalf("msg_qnum %d, want 1", qnum)
+	}
+	if lspid := binary.LittleEndian.Uint32(st[96:]); int(lspid) != os.Getpid() {
+		t.Fatalf("msg_lspid %d, want %d", lspid, os.Getpid())
 	}
 	got := make([]byte, 8+16)
 	if n, err := ipc.Msgrcv(id, got, 0, guestIPCNowait); err != nil || n != 5 {
@@ -212,10 +218,20 @@ func TestHostIPC_SharedMemory(t *testing.T) {
 	if segsz := binary.LittleEndian.Uint64(st[48:]); segsz != 4096 {
 		t.Fatalf("shm_segsz %d, want 4096", segsz)
 	}
+	if cpid := binary.LittleEndian.Uint32(st[80:]); int(cpid) != os.Getpid() {
+		t.Fatalf("shm_cpid %d, want %d", cpid, os.Getpid())
+	}
 	// SHM_LOCK and SHM_UNLOCK reach the kernel, which may refuse a user
-	// that may lock no memory.
+	// that may lock no memory; darwin has neither.
 	for _, cmd := range []int32{11, 12} {
-		if _, err := ipc.Control(IPCSharedMemory, id, 0, cmd, 0, nil); err != nil && !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.ENOMEM) {
+		_, err := ipc.Control(IPCSharedMemory, id, 0, cmd, 0, nil)
+		if runtime.GOOS == "darwin" {
+			if !errors.Is(err, syscall.EINVAL) {
+				t.Errorf("shmctl %d: %v, want EINVAL", cmd, err)
+			}
+			continue
+		}
+		if err != nil && !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.ENOMEM) {
 			t.Errorf("shmctl %d: %v", cmd, err)
 		}
 	}

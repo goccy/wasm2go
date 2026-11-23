@@ -217,6 +217,25 @@ func TestConfigProcess(t *testing.T) {
 	}
 }
 
+// A copy ForkProc made whose parent, itself such a copy, has ended is
+// adopted by process 1: its ppid is 1 from then on.
+func TestForkProcOrphanIsAdoptedByProcessOne(t *testing.T) {
+	root, _ := newProcTestStubs(t)
+	middle, mpid, mexited := root.ForkProc()
+	grand, gpid, gexited := middle.ForkProc()
+	defer gexited(0)
+	if got := procIDs(t, grand); got[0] != uint32(gpid) || got[1] != uint32(mpid) {
+		t.Fatalf("ids of the child = %v, want pid %d ppid %d", got, gpid, mpid)
+	}
+	mexited(0)
+	if got := procIDs(t, grand); got[0] != uint32(gpid) || got[1] != 1 {
+		t.Fatalf("ids of the orphan = %v, want pid %d ppid 1", got, gpid)
+	}
+	if got := procIDs(t, middle); got[1] != uint32(root.guestPID()) {
+		t.Fatalf("ppid of the ended parent = %d, want the root's pid %d", got[1], root.guestPID())
+	}
+}
+
 // A pid token is never the pid or the ppid the Process reports.
 func TestPIDTokensAvoidTheProcessIDs(t *testing.T) {
 	w, _ := newProcTestStubs(t)

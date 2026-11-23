@@ -1,12 +1,13 @@
-//go:build !linux || 386 || arm || mips || mipsle || mips64 || mips64le || ppc64 || ppc64le || s390x
+//go:build (!linux && !darwin) || 386 || arm || mips || mipsle || mips64 || mips64le || ppc64 || ppc64le || s390x
 
 package codegen
 
 import "errors"
 
 // The System V IPC of HostIPC where the runtime does not reach the host's
-// (another system, or an architecture of Linux whose structures are not
-// the guest's): every call fails with errors.ErrUnsupported.
+// (a system other than Linux and darwin, or an architecture of Linux whose
+// structures are not the guest's): every call fails with
+// errors.ErrUnsupported.
 
 func (hostIPC) Get(kind IPCKind, key int32, arg uint64, flags int32) (int32, error) {
 	return -1, errors.ErrUnsupported

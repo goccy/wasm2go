@@ -30,7 +30,12 @@ func hostTerminal(fd int) bool {
 // hostTerminalIoctl makes the request of the terminal fd with arg. The
 // host's numbers and layouts are the guest's here (hostGenericTerminal):
 // the request is made as it is, with the int or the record it takes.
+// darwin's requests of a pseudo-terminal are none of Linux's.
 func hostTerminalIoctl(fd int, request uint32, arg *terminalArg) (int, error) {
+	switch request {
+	case darwinTIOCPTYGRANT, darwinTIOCPTYUNLK, darwinTIOCPTYGNAME:
+		return 0, syscall.ENOTTY
+	}
 	switch arg.what {
 	case terminalTakesValue:
 		return hostIoctlValue(fd, request, uintptr(arg.value))

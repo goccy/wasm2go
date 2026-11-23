@@ -21,6 +21,10 @@ func hostSetUmask(mask os.FileMode) (os.FileMode, error) { return 0, errors.ErrU
 // hostThreadUmask says that no thread here has a umask of its own.
 const hostThreadUmask = false
 
+// hostHasUmask says that no umask of the host process is known to be taken
+// out of the mode of what the system creates here (create).
+const hostHasUmask = false
+
 // hostOnMainThread: no creation thread is made here.
 func hostOnMainThread() bool { return false }
 
@@ -173,6 +177,9 @@ func hostPipeWriteNow(fd uintptr, bufs [][]byte) (n int, again, done bool, err e
 	return 0, false, false, nil
 }
 
+// hostNowaitTerminal: no terminal is opened again here.
+func hostNowaitTerminal(fd uintptr, name string) (*os.File, error) { return nil, nil }
+
 // hostStreamSendLowat would ask a socket for its low-water mark, which the
 // runtime cannot do on this platform.
 func hostStreamSendLowat(fd uintptr) (int, error) { return 0, errors.ErrUnsupported }
@@ -205,7 +212,7 @@ const hostPollReportsFIFOEnd = false
 
 // hostWaitReady would wait in poll(2) for descriptors to be ready, which
 // the runtime cannot do on this platform.
-func hostWaitReady(fds []uintptr, wants []int, ready []bool, until time.Time, wake int) error {
+func hostWaitReady(fds []uintptr, wants []int, ready, hungUp []bool, until time.Time, wake int) error {
 	return errors.ErrUnsupported
 }
 
@@ -264,6 +271,10 @@ func wasiErrno(e syscall.Errno) (int32, bool) {
 // hostHungUp would ask the host whether a descriptor of its own has been
 // hung up on, which the runtime cannot do on this platform.
 func hostHungUp(fd uintptr) bool { return false }
+
+// hostPending would count the bytes that can be read from a descriptor of
+// the host's (FIONREAD), which the runtime cannot do on this platform: 0.
+func hostPending(fd uintptr, hungUp bool) (uint64, error) { return 0, nil }
 
 // hostDirListing lists a directory of the host's file system (an *os.File,
 // which HostFS opens) in the order the system gives its names, which Go's
@@ -469,12 +480,11 @@ func (l turnWriter) Write(p []byte) (int, error) {
 
 // This platform has no process groups or sessions the runtime can change
 // or put a command in: every command is in the host process's.
-func hostGetpgid(pid int32) (int32, error)         { return 0, errors.ErrUnsupported }
-func hostSetpgid(pid, pgid int32) error            { return errors.ErrUnsupported }
-func hostSetsid() (int32, error)                   { return 0, errors.ErrUnsupported }
-func hostJobAttr(job hostJob) *syscall.SysProcAttr { return nil }
-func killHostGroup(pgid int, sig int32) error      { return errors.ErrUnsupported }
-func hostWaitExited(pid int) (int32, error)        { return 0, errors.ErrUnsupported }
+func hostGetpgid(pid int32) (int32, error)    { return 0, errors.ErrUnsupported }
+func hostSetpgid(pid, pgid int32) error       { return errors.ErrUnsupported }
+func hostSetsid() (int32, error)              { return 0, errors.ErrUnsupported }
+func killHostGroup(pgid int, sig int32) error { return errors.ErrUnsupported }
+func hostWaitExited(pid int) (int32, error)   { return 0, errors.ErrUnsupported }
 
 const hostJobControl = false
 
@@ -483,6 +493,7 @@ func hostProcessGroup() int                { return 0 }
 func hostForeground(fd int) (int, error)   { return 0, syscall.ENOTTY }
 func hostSetForeground(fd, pgid int) error { return syscall.ENOTTY }
 func dupHostFD(fd uintptr) (int, error)    { return -1, errors.ErrUnsupported }
+func hostDevice(fd int) (uint64, error)    { return 0, errors.ErrUnsupported }
 
 // commandProcess is a command of the host's the runtime started: package
 // os's process here.
@@ -559,6 +570,9 @@ func (w *WasiStubs) placeHostSlotLocked(to int32, src *wasiOpen) error {
 func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
 	return errors.Join(errors.ErrUnsupported, f.Close())
 }
+
+// standardNumberLocked: no slot has a descriptor of the host's here.
+func (w *WasiStubs) standardNumberLocked(fd int32) syscall.Conn { return nil }
 
 // hostSlotHeld: no slot has a descriptor of the host's here.
 func (w *WasiStubs) hostSlotHeld(fd int32) bool { return false }

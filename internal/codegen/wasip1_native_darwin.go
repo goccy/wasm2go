@@ -87,8 +87,8 @@ func (w *WasiStubs) openFIFOWatched(m *Module, openFile func(name string, flag i
 // for no darwin architecture.
 const hostFIONREAD = 0x4004667f
 
-// hostReadable returns the number of bytes that can be read from fd, a
-// pipe, without waiting (FIONREAD).
+// hostReadable returns the number of bytes that can be read from fd without
+// waiting (FIONREAD).
 func hostReadable(fd uintptr) (int, error) {
 	var n int32
 	err := hostIoctl(fd, hostFIONREAD, unsafe.Pointer(&n))
@@ -203,7 +203,7 @@ func hostPollCall(fds []hostPoll, timeout time.Duration) (int, syscall.Errno) {
 	if timeout >= 0 {
 		// poll(2) takes an int of milliseconds; a longer wait ends early,
 		// and the caller waits again.
-		ms = int(min((timeout+time.Millisecond-1)/time.Millisecond, math.MaxInt32))
+		ms = int((min(timeout, math.MaxInt32*time.Millisecond) + time.Millisecond - 1) / time.Millisecond)
 	}
 	var first *hostPoll
 	if len(fds) > 0 {

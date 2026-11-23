@@ -8,7 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -197,5 +199,144 @@ func TestCreationThreadOnlyForAnotherMask(t *testing.T) {
 	createWithMode(t, w, m, "other", 0o666)
 	if creations() == nil {
 		t.Fatal("no creation thread was made for another mask")
+	}
+}
+
+// threadState returns the thread of th, its umask and its working
+// directory, read on it.
+func threadState(t *testing.T, th *creationThread) (tid int, mask os.FileMode, dir string) {
+	t.Helper()
+	var err error
+	if rerr := th.run(func() {
+		tid = syscall.Gettid()
+		mask = os.FileMode(syscall.Umask(0))
+		syscall.Umask(int(mask))
+		dir, err = os.Getwd()
+	}); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tid, mask, dir
+}
+
+// idleUnshared reports whether thread is one of the idle unsharedThreads.
+func idleUnshared(thread chan<- func()) bool {
+	unsharedThreads.mu.Lock()
+	defer unsharedThreads.mu.Unlock()
+	return slices.Contains(unsharedThreads.idle, thread)
+}
+
+// A closed creation thread does not end: the next instance that needs one
+// gets it, with its own umask and nothing else changed.
+func TestCreationThreadGoesToTheNextInstance(t *testing.T) {
+	if !creationThreads(t) {
+		t.Skip("the system refuses a creation thread")
+	}
+	first, err := newCreationThread(0o077)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tid, mask, dir := threadState(t, first)
+	if mask != 0o077 {
+		t.Errorf("umask of a new creation thread: %o, want 077", mask)
+	}
+	// The instance changes its mask meanwhile (Proc_umask).
+	if err := first.run(func() { hostSetThreadUmask(0o027) }); err != nil {
+		t.Fatal(err)
+	}
+	first.close()
+	if !idleUnshared(first.thread) {
+		t.Fatal("a closed creation thread is not idle")
+	}
+	next, err := newCreationThread(0o002)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.close()
+	nextTid, nextMask, nextDir := threadState(t, next)
+	if nextTid != tid {
+		t.Errorf("the next creation thread is thread %d, want %d, the idle one", nextTid, tid)
+	}
+	if nextMask != 0o002 {
+		t.Errorf("umask of the creation thread of the next instance: %o, want 002", nextMask)
+	}
+	if nextDir != dir {
+		t.Errorf("working directory of the creation thread of the next instance: %q, want %q", nextDir, dir)
+	}
+	if idleUnshared(next.thread) {
+		t.Error("a creation thread in use is idle")
+	}
+	if err := first.run(func() { t.Error("a call of a closed creation thread ran") }); !errors.Is(err, fs.ErrClosed) {
+		t.Errorf("run of a closed creation thread: %v, want ErrClosed", err)
+	}
+}
+
+// A creation thread closed while it runs a call is idle once the call has
+// returned, not before.
+func TestCreationThreadIsIdleAfterItsCall(t *testing.T) {
+	if !creationThreads(t) {
+		t.Skip("the system refuses a creation thread")
+	}
+	th, err := newCreationThread(0o022)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	ran := make(chan error, 1)
+	go func() {
+		ran <- th.run(func() {
+			close(entered)
+			<-release
+		})
+	}()
+	<-entered
+	th.close()
+	if idleUnshared(th.thread) {
+		t.Fatal("a creation thread is idle while it runs a call")
+	}
+	close(release)
+	if err := <-ran; err != nil {
+		t.Fatalf("the call in progress: %v", err)
+	}
+	if !idleUnshared(th.thread) {
+		t.Fatal("a closed creation thread is not idle once its call has returned")
+	}
+}
+
+// CloseAll lets the instance's creation thread go to the next instance,
+// which creates there with its own mask.
+func TestCreationThreadOfAClosedInstance(t *testing.T) {
+	if !creationThreads(t) {
+		t.Skip("the system refuses a creation thread")
+	}
+	creations := func(w *WasiStubs) *creationThread {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.creations
+	}
+	host := hostUmask(t)
+	w, m := newProcTestStubs(t)
+	w.Proc_umask(m, int32(host^0o077))
+	createWithMode(t, w, m, "first", 0o666)
+	first := creations(w)
+	if first == nil {
+		t.Fatal("no creation thread was made for another mask")
+	}
+	if err := w.CloseAll(); err != nil {
+		t.Fatal(err)
+	}
+	if !idleUnshared(first.thread) {
+		t.Fatal("the creation thread of a closed instance is not idle")
+	}
+	next, nm := newProcTestStubs(t)
+	mask := host ^ 0o070
+	next.Proc_umask(nm, int32(mask))
+	if got, want := createWithMode(t, next, nm, "next", 0o666), uint32(0o666&^mask); got != want {
+		t.Errorf("file 0666 of the next instance under umask %o: %o, want %o", mask, got, want)
+	}
+	if th := creations(next); th == nil || th.thread != first.thread {
+		t.Error("the next instance did not get the idle creation thread")
 	}
 }

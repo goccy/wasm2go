@@ -193,8 +193,9 @@ func (e *WasiSignalError) endsInstance() {}
 // implementing the same optional interfaces; but for one thing: on Linux
 // the files, directories and FIFOs HostFS's FS creates get the instance's
 // umask taken out by the host's kernel, which a default ACL of their
-// directory may stand in for, and those a wrapper of it creates get the
-// requested mode less the umask (see create).
+// directory may stand in for, on darwin the requested mode less the umask
+// whatever the host process's umask is, and those a wrapper of it creates
+// get the requested mode less the umask (see create).
 type FS interface {
 	// OpenFile opens name as os.Root.OpenFile does: flag is
 	// O_RDONLY/O_WRONLY/O_RDWR optionally OR'd with
@@ -1846,6 +1847,14 @@ type wasiOpen struct {
 	// terminal what it learnt. Guarded by mu.
 	terminalFile *os.File
 	terminal     bool
+	// nowaitFile is the terminal file nowaitOf last asked about, and nowait
+	// the open file description of that terminal's own it opened
+	// (hostNowaitTerminal), nil for a terminal that is not opened so;
+	// nowaitEnded records that the entry is closed (closeWasiOpen), which
+	// closed nowait. Guarded by mu.
+	nowaitFile  *os.File
+	nowait      *os.File
+	nowaitEnded bool
 	// lowatFile is the socket file streamSendLowat last asked about, and
 	// lowat what it learnt. Guarded by mu.
 	lowatFile *os.File
@@ -1987,8 +1996,9 @@ func (op *wasiOpen) passInputTurn() { <-op.inputTurn() }
 
 // streamReader is the reader of an input stream that poll(2) does not wait
 // for (inputPolled): a stream of the embedder's that is no descriptor of
-// the host's, a FIFO whose end poll(2) does not report, any stream where
-// the host has no poll(2). One goroutine of its own calls the stream's
+// the host's, a FIFO whose end poll(2) does not report while its open file
+// description is in blocking mode (directFile), any stream where the
+// host has no poll(2). One goroutine of its own calls the stream's
 // Read, once each time it is asked to (request), and keeps what it returns
 // until a read takes it (take). Nothing else of the runtime's calls Read
 // (package os/exec does, for the stdin of a command where the host has no
@@ -2053,7 +2063,10 @@ func (r *streamReader) run() {
 		n, err := r.src.Read(buf)
 		r.mu.Lock()
 		r.buf = append(r.buf, buf[:n]...)
-		if err != nil {
+		// A descriptor put in non-blocking mode since the Read was asked for
+		// has nothing right now (EAGAIN), which is no end: the reads woken
+		// read it without the reader (readThroughReader).
+		if _, isFile := r.src.(*os.File); err != nil && (!isFile || !errors.Is(err, syscall.EAGAIN)) {
 			r.end = err
 		}
 		r.reading = false
@@ -2150,6 +2163,14 @@ func (r *streamReader) ready() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.buf) > 0 || r.end != nil || r.stopped
+}
+
+// busy reports whether a read takes something without waiting (ready), or
+// a Read is in progress.
+func (r *streamReader) busy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reading || len(r.buf) > 0 || r.end != nil || r.stopped
 }
 
 // pending returns how many bytes the reader keeps.
@@ -2439,17 +2460,19 @@ const (
 
 // hostWaitFD is a stream of the host's that a wait in poll(2) asks about
 // (waitHostReady), what it is asked about (hostWant...), and whether it is
-// ready.
+// ready, and hung up on (POLLHUP) as poll(2) said when it was.
 type hostWaitFD struct {
 	stream any
 	want   int
 	ready  bool
+	hungUp bool
 	// op is the entry the stream is behind: the close of its last slot
 	// wakes the wait (closeWasiOpen).
 	op *wasiOpen
 	// source, in place of a stream, is what the wait is for that poll(2)
 	// is not asked about: the reader of a stream poll(2) does not wait for
 	// (streamReader), the turn at a Writer of the embedder's (streamTurn).
+	// One with a stream as well is ready when either is.
 	source waitSource
 }
 
@@ -2503,7 +2526,7 @@ func (wk *wasiWake) drain() error {
 // (takeWake), or one without a pipe for a wait for no descriptor of the
 // host's (only sources), which poll(2) is not asked about.
 func (w *WasiStubs) wakeFor(set []hostWaitFD) (*wasiWake, error) {
-	if !slices.ContainsFunc(set, func(e hostWaitFD) bool { return e.source == nil }) {
+	if !slices.ContainsFunc(set, func(e hostWaitFD) bool { return e.stream != nil }) {
 		return newChannelWake(), nil
 	}
 	return w.takeWake()
@@ -2622,7 +2645,8 @@ func streamPolled(stream any) bool {
 // waitHostReady asks poll(2) about the streams of set and records which are
 // ready: at once when until has passed, otherwise waiting until one is,
 // until passes (the zero time is no limit) or wake (nil for none) is woken.
-// What poll(2) is not asked about (source) is ready as it says. poll(2) is
+// What poll(2) is not asked about (source) is ready as it says, and poll(2)
+// is asked about the stream of one that is not and has one. poll(2) is
 // asked about the descriptor numbers, which nothing holds open meanwhile:
 // the guest's close of an entry's last slot wakes the wait (closeWasiOpen).
 // A stream of the
@@ -2649,7 +2673,9 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake *wasiWake) error {
 		if e.source != nil {
 			set[i].ready = e.source.ready()
 			found = found || set[i].ready
-			continue
+			if set[i].ready || e.stream == nil {
+				continue
+			}
 		}
 		if e.want == hostWantInput && e.op != nil {
 			if ahead, _ := e.op.aheadReady(); ahead {
@@ -2686,10 +2712,11 @@ func waitHostReady(set []hostWaitFD, until time.Time, wake *wasiWake) error {
 	if wake != nil {
 		wakeFD = wake.r
 	}
-	ready := make([]bool, len(fds))
-	err := hostWaitReady(fds, wants, ready, until, wakeFD)
+	got := make([]bool, 2*len(fds))
+	ready, hungUp := got[:len(fds)], got[len(fds):]
+	err := hostWaitReady(fds, wants, ready, hungUp, until, wakeFD)
 	for k, r := range ready {
-		set[at[k]].ready = r
+		set[at[k]].ready, set[at[k]].hungUp = r, hungUp[k]
 	}
 	return errors.Join(err, closeDups())
 }
@@ -3039,6 +3066,39 @@ func (op *wasiOpen) terminalOf(file *os.File) (bool, error) {
 	return op.terminal, nil
 }
 
+// nowaitOf returns an open file description of its own of the terminal
+// file, the terminal behind this entry, whose descriptor is fd, for writes
+// that do not wait (hostNowaitTerminal): opened once per file, and closed
+// with the entry or once another file is asked about. It is nil for a
+// terminal that is not opened so, and once the entry is closed. It is
+// opened without mu, a leaf lock: the runtime makes its descriptors under
+// locks taken before it (makeRuntimeDescriptors).
+func (op *wasiOpen) nowaitOf(file *os.File, fd uintptr) (*os.File, error) {
+	op.mu.Lock()
+	nowait, known := op.nowait, op.nowaitFile == file || op.nowaitEnded
+	op.mu.Unlock()
+	if known {
+		return nowait, nil
+	}
+	nowait, err := hostNowaitTerminal(fd, file.Name())
+	if err != nil {
+		return nil, err
+	}
+	op.mu.Lock()
+	ended, was := op.nowaitEnded, op.nowait
+	if !ended {
+		op.nowaitFile, op.nowait = file, nowait
+	}
+	op.mu.Unlock()
+	switch {
+	case ended && nowait != nil:
+		return nil, nowait.Close()
+	case !ended && was != nil:
+		return nowait, was.Close()
+	}
+	return nowait, nil
+}
+
 // streamSendLowat is hostStreamSendLowat for file, the socket behind this
 // entry, whose descriptor is fd; the host is asked once per file.
 func (op *wasiOpen) streamSendLowat(file *os.File, fd uintptr) (int, error) {
@@ -3331,11 +3391,18 @@ type WASIConfig struct {
 	Resolve func(host string) bool
 	// Exec is consulted before every Proc_spawn and Proc_exec, which run a
 	// host binary, with what the command runs (ExecRequest): the command is
-	// started from that very value. Returning false denies the spawn
-	// (EACCES). nil denies every one. A command is a process of the host:
-	// it sees the host's filesystem, not FS, and only an FS that is a
-	// HostRootFS can start one (ENOSYS otherwise).
+	// started from that very value, in the directory CommandDir gives for
+	// its Dir. Returning false denies the spawn (EACCES). nil denies every
+	// one. A command is a process of the host: it sees the host's
+	// filesystem, not FS, and only an FS that is a HostRootFS can start one
+	// (ENOSYS otherwise).
 	Exec func(req ExecRequest) bool
+	// CommandDir returns the host directory a command the guest starts runs
+	// in, given dir, the host path of the guest's working directory
+	// (ExecRequest.Dir, after Exec allowed the command): "" starts it in the
+	// host process's working directory, which it inherits without changing
+	// into it. Its error is the guest's spawn's errno. nil starts it in dir.
+	CommandDir func(dir string) (string, error)
 	// Process supplies the guest's identity and accounting: what getpid,
 	// getppid, the getuid family and times report, the pid whose
 	// /proc/PID/fd lists the guest's descriptors, and the umask the guest
@@ -3362,6 +3429,21 @@ type WASIConfig struct {
 	// as tzfile(5) has it. nil is the host's, which time.LoadLocation reads.
 	// A TZ that starts with '/' names a zone file of FS instead.
 	ZoneInfo fs.FS
+	// MonotonicClock reads the guest's monotonic clock (CLOCK_MONOTONIC), in
+	// nanoseconds, whose readings never decrease: what clock_time_get
+	// reports, what a clock subscription of poll_oneoff on it waits for
+	// (relative or absolute), and what the interval timer (setitimer, alarm)
+	// counts. Such a wait never ends before the clock reads its end: the
+	// runtime has the host's timers count the time left at the last
+	// reading, then reads the clock again and, while it has not come to the
+	// end, waits again for what is left. With a clock faster than the host's
+	// timers, a wait ends when they have counted what was left; with one
+	// that is slower, coarser or stands still, it waits again each time
+	// until the clock moves on to the end. It is called from any goroutine,
+	// with the instance's locks held, and does not call the instance. nil
+	// counts from NewWASI; HostMonotonicClock is the clock the host's timers
+	// count. A forked instance reads its parent's.
+	MonotonicClock func() uint64
 	// Errors is told the errors of operations whose caller cannot be given
 	// them (op names the operation), among them an error the guest's call
 	// fails with that has no errno of its own (the call fails with EIO); nil
@@ -3390,6 +3472,18 @@ type WASIConfig struct {
 	// must not wait for another thread's write to the guest's standard
 	// output or error. nil gives every such signal to the guest.
 	TakeSignal func(target SignalTarget, sig int32) (taken bool, err error)
+	// SignalIgnored is asked whether sig, the guest's number for a signal
+	// the guest leaves at its default action, is ignored by the process the
+	// guest runs as, by an action the guest did not set: inherited when the
+	// process started (nohup), or set by code outside the guest that shares
+	// the process (Proc_signal_ignored). target is the instance that asks;
+	// a forked instance has its parent's SignalIgnored. When it reports
+	// true, the guest takes SIG_IGN as its own action of the signal. Its
+	// error is told Errors (op "signal_ignored"), and the guest keeps the
+	// default action. It is called with no lock of the instance's state or
+	// signals held. nil is an isolated guest: it starts with every signal at
+	// its default action.
+	SignalIgnored func(target SignalTarget, sig int32) (ignored bool, err error)
 	// Users is the user and group database of getpwnam, getgrgid and the
 	// like. nil is an empty one: every lookup fails with ENOENT. HostUsers
 	// gives the host's.
@@ -3435,6 +3529,12 @@ type WASIConfig struct {
 	// (Proc_fork). nil denies every fork: it fails with ENOSYS.
 	// CopyForker makes a copy of the forking instance.
 	Fork Forker
+
+	// Children connects the guest's children with the processes of the
+	// host process (Children). nil keeps them the runtime's own: a command
+	// the guest starts is known by a pid token, and its wait reaches only
+	// the processes the runtime made.
+	Children Children
 
 	// Files are descriptors the guest has from its start, under the numbers
 	// they are given at (inherited ones, a listening socket of a
@@ -3601,7 +3701,7 @@ type WasiStubs struct {
 	// creations is the thread the instance makes the files of the host's
 	// filesystem on, with its umask (creationThread), once it has needed
 	// one; creationsFailed records that none could be made, and
-	// creationsClosed that CloseAll ended it (the runtime then takes the
+	// creationsClosed that CloseAll closed it (the runtime then takes the
 	// mask out itself). Guarded by mu; made and set under umaskCalls.
 	creations       *creationThread
 	creationsFailed bool
@@ -3706,6 +3806,15 @@ type wasiProc struct {
 	// guest has become a command or is becoming one (Proc_exec). Guarded by
 	// wasiPIDs.mu; set before the wait for the command begins.
 	inHostGroup, leads, execed bool
+	// byHostPID records that the guest knows the process by the host's pid
+	// of it: a command Children.CommandPID named so, or a child Children
+	// adopted. Set before the process is entered in the family's table.
+	byHostPID bool
+	// release lets go of the host's process once the family has forgotten
+	// it (wasiPIDs.removeLocked): the process of a command known by its
+	// host pid is reaped, an adopted child is the embedder's to reap. nil
+	// for any other process. Set before the family can forget it.
+	release func() error
 }
 
 // jobGroup is what the family knows of one of its process groups besides
@@ -3771,6 +3880,22 @@ type wasiPIDs struct {
 	// foreground (hostJob). 0 when there is none.
 	foreground int32
 	terminal   int
+	// terminals holds the controlling terminal each session of the family
+	// that is not the host process's took (TIOCSCTTY), by the session's
+	// id, while the session has a process.
+	terminals map[int32]sessionTerminal
+	// releases are the releases of the processes the family has forgotten
+	// (removeLocked), to be made once no lock is held (releaseForgotten).
+	releases []func() error
+}
+
+// sessionTerminal is the controlling terminal of a session of the family
+// (wasiPIDs.terminals): its name on the host, which /dev/tty of the
+// session's processes opens, and the device it is (st_rdev), which the
+// command the session's leader becomes takes for its own (hostJob).
+type sessionTerminal struct {
+	path   string
+	device uint64
 }
 
 // enter makes proc reachable by pid for every instance of the family.
@@ -3806,12 +3931,32 @@ func (p *wasiPIDs) hasGroupLocked(pgid, sid int32) bool {
 	return false
 }
 
-// removeLocked forgets the process known by pid. Caller holds p.mu.
+// removeLocked forgets the process known by pid, whose release is then to
+// be made (releaseForgotten). Caller holds p.mu.
 func (p *wasiPIDs) removeLocked(pid int32) {
 	if proc := p.procs[pid]; proc != nil {
 		delete(p.procs, pid)
+		if proc.release != nil {
+			p.releases = append(p.releases, proc.release)
+		}
 		p.leftGroupLocked(proc.pgid)
+		p.leftSessionLocked(proc.sid)
 	}
+}
+
+// leftSessionLocked is told that a process has left the session sid: the
+// session's controlling terminal is let go once it has no process left.
+// Caller holds p.mu.
+func (p *wasiPIDs) leftSessionLocked(sid int32) {
+	if _, ok := p.terminals[sid]; !ok {
+		return
+	}
+	for _, proc := range p.procs {
+		if proc.sid == sid {
+			return
+		}
+	}
+	delete(p.terminals, sid)
 }
 
 // leftGroupLocked is told that a process has left the group pgid. Once
@@ -3878,10 +4023,14 @@ type commandJob struct {
 // (setpgid with pgid 0), the host's group pgid (setpgid), or, with
 // neither, the host process's. With foreground its group of its own is
 // made the foreground one of the terminal ctty, a descriptor of the host
-// process's, before the command runs.
+// process's, before the command runs. A command in a session of its own
+// takes for its controlling terminal the one of its descriptors open on
+// the terminal device terminal (st_rdev), when it is not 0 and the command
+// has one.
 type hostJob struct {
 	setsid, setpgid, foreground bool
 	pgid, ctty                  int
+	terminal                    uint64
 }
 
 // commandJob decides where a command the family's process pid starts is
@@ -3900,7 +4049,9 @@ type hostJob struct {
 // (hostJobControl) every command is in the host process's group and
 // session. With execs the command is pid's process (Proc_exec), which is
 // becoming it from here on (wasiProc.execed): its group cannot be changed
-// any more. Caller holds p.starts, until started.
+// any more; when pid leads its session, the command takes the session's
+// controlling terminal (wasiPIDs.terminals). Caller holds p.starts, until
+// started.
 func (p *wasiPIDs) commandJob(pid int32, execs bool) commandJob {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3919,6 +4070,9 @@ func (p *wasiPIDs) commandJob(pid int32, execs bool) commandJob {
 	case job.sid != p.hostSession:
 		job.host.setsid = true
 		job.inHostGroup, job.leads = g == nil, g == nil
+		if execs && pid == job.sid {
+			job.host.terminal = p.terminals[job.sid].device
+		}
 	case job.pgid == p.hostGroup:
 	case g != nil:
 		job.host = hostJob{setpgid: true, pgid: g.host}
@@ -4448,7 +4602,7 @@ func (w *WasiStubs) CloseAll() error {
 	if leaves && share.live.Add(-1) == 0 {
 		share.stdin.stop()
 	}
-	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm(), w.stopSyslog())
+	return errors.Join(err, w.releaseForgotten(), w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm(), w.stopSyslog())
 }
 
 // takeAll is CloseAll up to the closing of the descriptors, which it takes
@@ -4878,10 +5032,32 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 		pids.mu.Unlock()
 	}
 	w.mu.Unlock()
+	w.reportError("proc_wait", w.releaseForgotten())
 	// The parent is told, as the kernel tells a process whose child ended.
 	if !taken {
 		w.PostSignal(wasiSIGCHLD)
 	}
+}
+
+// releaseForgotten makes the releases of the processes the family has
+// forgotten (wasiProc.release, wasiPIDs.removeLocked) and returns their
+// errors. Caller holds no lock of the instance.
+func (w *WasiStubs) releaseForgotten() error {
+	w.mu.Lock()
+	pids := w.pids
+	w.mu.Unlock()
+	if pids == nil {
+		return nil
+	}
+	pids.mu.Lock()
+	releases := pids.releases
+	pids.releases = nil
+	pids.mu.Unlock()
+	var err error
+	for _, release := range releases {
+		err = errors.Join(err, release())
+	}
+	return err
 }
 
 // reapFinishedLocked forgets every process of this instance that has ended:
@@ -4920,7 +5096,8 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 // calls with the POSIX wait status when the copy ends. A signal for the
 // token (Proc_kill) is posted to the copy (PostSignal), and the copy knows
 // the token as its own pid: its Process reports the token as the pid and
-// the pid of w's Process as the ppid, and the rest as w's Process does. Its
+// the pid of w's Process as the ppid (1 once w's process has ended, when w
+// is itself a copy ForkProc made), and the rest as w's Process does. Its
 // kill of the token is a raise, its kill of its ppid reaches the instance
 // that pid names, and its kill of its process group reaches it once.
 // ForkProc is the way to give a copy a pid of its own: a copy made by Fork
@@ -4942,8 +5119,13 @@ func (w *WasiStubs) forkProc(from *Module) (*WasiStubs, int32, *wasiProc) {
 	w.mu.Lock()
 	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
 	pgid, sid := w.pidsLocked().jobOf(ids.PID)
+	self, _ := w.pidsLocked().find(ids.PID)
 	w.mu.Unlock()
-	child.cfg.Process = forkedProcess{Process: parent, pid: pid, ppid: ids.PID}
+	forked := forkedProcess{Process: parent, pid: pid, ppid: ids.PID}
+	if self != nil {
+		forked.parentDone = self.done
+	}
+	child.cfg.Process = forked
 	return child, pid, &wasiProc{done: make(chan struct{}), instance: child, pgid: pgid, sid: sid}
 }
 
@@ -4957,15 +5139,24 @@ func (w *WasiStubs) enterChild(pid int32, proc *wasiProc) {
 }
 
 // forkedProcess is the Process of a copy made by ForkProc: its pid is its
-// token and its ppid its parent's pid; the rest is its parent's Process.
+// token and its ppid its parent's pid, 1 once the parent has ended
+// (parentDone, its wasiProc's done, which the root's never is; nil when
+// the parent's pid was no longer in the family's table); the rest is its
+// parent's Process.
 type forkedProcess struct {
 	Process
-	pid, ppid int32
+	pid, ppid  int32
+	parentDone <-chan struct{}
 }
 
 func (p forkedProcess) IDs() ProcessIDs {
 	ids := p.Process.IDs()
 	ids.PID, ids.PPID = p.pid, p.ppid
+	select {
+	case <-p.parentDone:
+		ids.PPID = 1
+	default:
+	}
 	return ids
 }
 
@@ -4988,6 +5179,37 @@ func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
 	return func(status int32) {
 		once.Do(func() { w.finishProc(proc, status) })
 	}
+}
+
+// Children is asked about the guest's children besides the processes the
+// runtime makes itself (WASIConfig.Children). A forked instance has its
+// parent's. Its methods are called without the lock of any instance held.
+type Children interface {
+	// CommandPID reports whether the command a guest started (Proc_spawn),
+	// which runs req and is the host's process hostPID, is known to the
+	// guest by hostPID instead of a pid token. Such a command is not
+	// reaped on the host before the guest has waited for it, or nobody is
+	// left to (SIGCHLD ignored, CloseAll): its pid names no other process
+	// meanwhile. Asked once per command, after it has started, while
+	// the family starts no other command, on linux and darwin only:
+	// elsewhere every command gets a pid token.
+	CommandPID(req ExecRequest, hostPID int) bool
+	// Adopt is asked by a guest's wait for pid (Proc_wait) when pid names
+	// no process of the fork family. target is the instance whose guest
+	// waits. ok reports that pid is a child the guest may wait for: it
+	// becomes a process of target under pid, as one NewProc registers, and
+	// the wait goes on as
+	// for any of them. exited is to be called with its wait status (as
+	// NewProc's exited takes it) when it ends, from any goroutine, before
+	// Adopt returns as well; only its first call has an effect. kill
+	// signals it (Proc_kill), as NewProc's kill does; nil when it cannot be
+	// signalled. release is called once, after the guest has collected
+	// its status or nobody is left to (SIGCHLD ignored, CloseAll), without
+	// any lock of an instance held: the embedder reaps it then; nil when
+	// there is nothing to do. Its error is told WASIConfig.Errors. An error
+	// of Adopt fails the wait with its errno (wasiErrnoOf); ok false fails
+	// it with ECHILD.
+	Adopt(target SignalTarget, pid int32, exited func(status int32)) (kill func(sig int32) error, release func() error, ok bool, err error)
 }
 
 // Forker makes the instance the child of a guest's fork runs in
@@ -5229,8 +5451,8 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // instance's own (commandStreamLocked, startCommand). cwdPtr is the
 // guest's working directory, a guest path of the FS: the command starts in
 // its host path (ExecRequest.Dir), the root of the FS for an empty one, not
-// the host process's working directory. The new pid token is written at
-// pidOutPtr. Returns 0 or a negative errno.
+// the host process's working directory, unless CommandDir says otherwise.
+// The new pid token is written at pidOutPtr. Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
 }
@@ -5247,14 +5469,27 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	return w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{stdinFd, stdoutFd, stderrFd}, false, func(cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs) {
+	return w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{stdinFd, stdoutFd, stderrFd}, false, func(req ExecRequest, cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs) {
 		proc := &wasiProc{host: cmd.process, done: make(chan struct{}), pgid: job.pgid, sid: job.sid, inHostGroup: job.inHostGroup, leads: job.leads}
+		// Only a command whose end is learnt apart from its reap (finish)
+		// can keep its host pid until the family has forgotten it.
+		named := cmd.finish != nil && w.cfg.Children != nil && w.cfg.Children.CommandPID(req, cmd.process.Pid)
 		w.mu.Lock()
-		pid := w.addProcLocked(proc, ids)
+		var pid int32
+		if named {
+			pid, proc.byHostPID = int32(cmd.process.Pid), true
+			w.putProcLocked(pid, proc)
+		} else {
+			pid = w.addProcLocked(proc, ids)
+		}
 		w.enterProcLocked(pid)
 		w.mu.Unlock()
 		w.reportError("proc_spawn", pids.started(job, proc, cmd.process.Pid))
 		go func() {
+			if proc.byHostPID {
+				w.awaitByHostPID(pids, proc, cmd)
+				return
+			}
 			if proc.leads {
 				if status, reap := w.awaitLeader(pids, proc, cmd); reap != nil {
 					w.finishProc(proc, status)
@@ -5273,9 +5508,10 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 // fds the guest's descriptors of its standard streams, -1 for the
 // instance's. The command is started where commandJob puts it, as the
 // process of the guest when execs is set, and started is then called with
-// it, while the family's command starts are held (wasiPIDs.starts).
+// what it runs and it, while the family's command starts are held
+// (wasiPIDs.starts).
 // Returns 0, or a negative errno: the command has not started.
-func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, cwdPtr uint64, fds [3]int32, execs bool, started func(cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs)) int32 {
+func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, cwdPtr uint64, fds [3]int32, execs bool, started func(req ExecRequest, cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs)) int32 {
 	op := "proc_spawn"
 	if execs {
 		op = "proc_exec"
@@ -5358,7 +5594,7 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 		w.reportError(op, pids.started(job, nil, 0))
 		return -w.guestErrno(op, startErr)
 	}
-	started(cmd, job, pids, ids)
+	started(req, cmd, job, pids, ids)
 	return _wasiESUCCESS
 }
 
@@ -5371,12 +5607,13 @@ const defaultCommandPath = "/usr/local/bin:/bin:/usr/bin"
 // (looked up by lookCommand when it has no "/"), argv and env the
 // command's, and cwd the guest's working directory, which a relative name
 // is taken from. The executable and the directory are the host's absolute
-// paths of their names in the FS (HostRootFS). It returns a wasi errno: EACCES
-// without a policy or when it refuses, ENOSYS when the FS is no
-// HostRootFS, guestName's and the lookup's.
+// paths of their names in the FS (HostRootFS), the directory then as
+// CommandDir gives it. It returns a wasi errno: EACCES without a policy or
+// when it refuses, ENOSYS when the FS is no HostRootFS, guestName's, the
+// lookup's and CommandDir's.
 func (w *WasiStubs) commandRequest(op, file string, argv, env []string, cwd string) (ExecRequest, int32) {
 	w.mu.Lock()
-	hook := w.cfg.Exec
+	hook, commandDir := w.cfg.Exec, w.cfg.CommandDir
 	fsys, isHost := w.fs().(HostRootFS)
 	w.mu.Unlock()
 	switch {
@@ -5415,6 +5652,11 @@ func (w *WasiStubs) commandRequest(op, file string, argv, env []string, cwd stri
 	req := ExecRequest{Path: hostPathIn(root, name), Argv: argv, Env: env, Dir: hostPathIn(root, dir)}
 	if !hook(req) {
 		return ExecRequest{}, _wasiEACCES
+	}
+	if commandDir != nil {
+		if req.Dir, err = commandDir(req.Dir); err != nil {
+			return ExecRequest{}, w.guestErrno(op, err)
+		}
 	}
 	return req, _wasiESUCCESS
 }
@@ -5519,6 +5761,49 @@ func (w *WasiStubs) awaitLeader(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand
 	}
 }
 
+// awaitByHostPID waits for the end of cmd, the command of proc that the
+// guest knows by its host pid, without reaping it (hostWaitExited),
+// delivers what the runtime copies from it (hostCommand.finish) and
+// publishes its wait status. The command is reaped once the family has
+// forgotten it (wasiProc.release) and, when it leads the host's process
+// group of its group, the group has let it go (leaderEnded), whichever
+// comes last. One that cannot be waited for unreaped is waited for as any
+// other.
+func (w *WasiStubs) awaitByHostPID(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand) {
+	status, err := hostWaitExited(cmd.process.Pid)
+	if err != nil {
+		w.reportError("proc_wait", err)
+		if proc.leads {
+			pids.leaderEnded(proc, false)
+		}
+		w.finishProc(proc, cmd.wait())
+		return
+	}
+	var held <-chan struct{}
+	if proc.leads {
+		held = pids.leaderEnded(proc, true)
+	}
+	var left atomic.Int32
+	left.Store(1)
+	if held != nil {
+		left.Store(2)
+	}
+	letGo := func() error {
+		if left.Add(-1) != 0 {
+			return nil
+		}
+		_, err := cmd.process.Wait()
+		return err
+	}
+	proc.release = letGo
+	cmd.finish()
+	w.finishProc(proc, status)
+	if held != nil {
+		<-held
+		w.reportError("proc_wait", letGo())
+	}
+}
+
 // Proc_exec is a NON-STANDARD host import (module wasip1_posix_extension,
 // name "proc_exec") backing execve and the exec family: the guest becomes
 // the command path, with the arguments argv, the environment envp and the
@@ -5563,7 +5848,7 @@ func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, 
 		pids   *wasiPIDs
 		execed *execedCommand
 	)
-	if rc := w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{0, 1, 2}, true, func(c *hostCommand, job commandJob, p *wasiPIDs, _ ProcessIDs) {
+	if rc := w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{0, 1, 2}, true, func(_ ExecRequest, c *hostCommand, job commandJob, p *wasiPIDs, _ ProcessIDs) {
 		cmd, self, pids = c, job.self, p
 		w.reportError("proc_exec", pids.started(job, self, cmd.process.Pid))
 		execed = w.becomeCommand(m, cmd.process)
@@ -5717,8 +6002,8 @@ func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) in
 // guest's descriptor for it resolves (commandStreamLocked): a descriptor
 // of the host (host), which the command is given its own open file
 // description of or shares (startCommand); a stream the runtime copies to
-// or from (reader for the stdin, writer for the stdout and stderr); or
-// none of them, the null device.
+// or from (reader for the stdin, writer for the stdout and stderr); a
+// closed number (closed); or none of them, the null device.
 type commandStream struct {
 	host   syscall.Conn
 	reader io.Reader
@@ -5739,6 +6024,10 @@ type commandStream struct {
 	// stdio is the instance's standard stream (1/2/3, as wasiOpen.stdio)
 	// the stream is, 0 for none.
 	stdio int8
+	// closed marks a descriptor the guest has closed where its descriptors
+	// are the host's (hostFamily): the command has the number closed, as
+	// exec(2) leaves it.
+	closed bool
 }
 
 // commandDescriptor is a descriptor of the guest's above its standard
@@ -5785,7 +6074,9 @@ func (w *WasiStubs) inheritedLocked() []commandDescriptor {
 // the stderr). A negative fd asks for the instance's stream. Any other fd
 // is resolved through the fd table like a read (slot 1) or a write of it:
 // the standard stream, file, pipe end or socket it refers to, and none —
-// the null device — when the fd is closed or not open that way. A socket
+// the null device — when the fd is closed or not open that way (a closed
+// one is closed in the command where the instance's descriptors are the
+// host's, hostFamily). A socket
 // is the host's socket (wasiSocket), or the connection of package net's
 // that has a descriptor of the host; any other socket stands for the
 // instance's stream. Caller holds w.mu.
@@ -5798,6 +6089,9 @@ func (w *WasiStubs) commandStreamLocked(fd int32, slot int8) commandStream {
 		stream, op = w.fdSrcLocked(fd)
 	default:
 		stream, op = w.fdDstLocked(fd)
+	}
+	if fd >= 0 && op == nil && w.hostFamily() {
+		return commandStream{closed: true}
 	}
 	if host := op.hostSocket(); host != nil {
 		return commandStream{host: host, socket: true, op: op}
@@ -5891,10 +6185,11 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 // POSIX wait status at statusOutPtr. options is the waitpid() options mask;
 // bit 0 (WNOHANG) makes it return without blocking when the child is still
 // running (the guest sees the documented "0 means no child ready" result,
-// signalled by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a
-// negative errno: ECHILD for an unknown pid — and, when the guest ignores
-// SIGCHLD, once the process has finished — EINTR when a signal was posted
-// to the guest before the process finished.
+// signalled by writing pid 0 — encoded by returning EAGAIN). A pid that
+// names no process of the instance is offered to Children.Adopt
+// (adoptChild). Returns 0, or a negative errno: ECHILD for an unknown pid
+// — and, when the guest ignores SIGCHLD, once the process has finished —
+// EINTR when a signal was posted to the guest before the process finished.
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
 	return w.procWait(m, pid, options, zext(statusOutPtr))
 }
@@ -5915,7 +6210,13 @@ func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64)
 	proc := w.procs[pid]
 	w.mu.Unlock()
 	if proc == nil {
-		return -_wasiECHILD
+		if w.cfg.Children == nil || pid <= 0 {
+			return -_wasiECHILD
+		}
+		var errno int32
+		if proc, errno = w.adoptChild(pid); proc == nil {
+			return -errno
+		}
 	}
 	const wnohang = 1
 	if options&wnohang != 0 {
@@ -5937,12 +6238,52 @@ func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64)
 	w.dropProcLocked(pid)
 	reaped := w.sig.reapsChildren()
 	w.mu.Unlock()
+	w.reportError("proc_wait", w.releaseForgotten())
 	if reaped {
 		// The child of a process that ignores SIGCHLD left no status.
 		return -_wasiECHILD
 	}
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
+}
+
+// adoptChild asks Children.Adopt about pid, a pid that names no process of
+// the instance, for its guest's wait: it returns the process pid became,
+// or nil and the wait's errno. A pid of the fork family is no child to
+// adopt (ECHILD).
+func (w *WasiStubs) adoptChild(pid int32) (*wasiProc, int32) {
+	w.enterRoot()
+	ids := w.guestProcess().IDs()
+	w.mu.Lock()
+	pids := w.pidsLocked()
+	w.mu.Unlock()
+	if member, ours := pids.find(pid); member != nil || ours {
+		return nil, _wasiECHILD
+	}
+	pgid, sid := pids.jobOf(ids.PID)
+	proc := &wasiProc{done: make(chan struct{}), pgid: pgid, sid: sid, byHostPID: true}
+	kill, release, ok, err := w.cfg.Children.Adopt(w, pid, w.procExitFunc(proc))
+	switch {
+	case err != nil:
+		return nil, w.guestErrno("proc_wait", err)
+	case !ok:
+		return nil, _wasiECHILD
+	}
+	proc.kill, proc.release = kill, release
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.putProcLocked(pid, proc)
+	w.enterProcLocked(pid)
+	select {
+	case <-proc.done:
+		// It ended before it was entered, when no waiter could see it.
+		if w.procFinished != nil {
+			close(w.procFinished)
+			w.procFinished = nil
+		}
+	default:
+	}
+	return proc, _wasiESUCCESS
 }
 
 // Proc_wait_any is a NON-STANDARD host import (module
@@ -6001,6 +6342,7 @@ func (w *WasiStubs) procWaitAny(m *Module, pgid, options int32, pidOutPtr, statu
 	if pidOut == nil || statusOut == nil {
 		return -_wasiEFAULT
 	}
+	defer func() { w.reportError("proc_wait", w.releaseForgotten()) }()
 	const wnohang = 1
 	for {
 		w.mu.Lock()
@@ -6056,6 +6398,7 @@ func (w *WasiStubs) procWaitAny(m *Module, pgid, options int32, pidOutPtr, statu
 		}
 		finished := w.procFinished
 		w.mu.Unlock()
+		w.reportError("proc_wait", w.releaseForgotten())
 		if !w.awaitInterruptibly(m, finished) {
 			return -_wasiEINTR
 		}
@@ -6588,9 +6931,10 @@ func (p *wasiPIDs) setsid(pid int32) int32 {
 			return _wasiEPERM
 		}
 	}
-	was := proc.pgid
+	was, wasSid := proc.pgid, proc.sid
 	proc.pgid, proc.sid = pid, pid
 	p.leftGroupLocked(was)
+	p.leftSessionLocked(wasSid)
 	return _wasiESUCCESS
 }
 
@@ -7388,10 +7732,38 @@ func (w *WasiStubs) clockNanos(clockID int32) (uint64, int32) {
 	case 0: // CLOCK_REALTIME
 		return uint64(time.Now().UnixNano()), _wasiESUCCESS
 	case 1: // CLOCK_MONOTONIC
-		return uint64(time.Since(w.monoStart).Nanoseconds()), _wasiESUCCESS
+		return w.monotonicNanos(), _wasiESUCCESS
 	default:
 		return 0, _wasiEINVAL
 	}
+}
+
+// monotonicNanos reads the guest's monotonic clock
+// (WASIConfig.MonotonicClock).
+func (w *WasiStubs) monotonicNanos() uint64 {
+	if w.cfg.MonotonicClock != nil {
+		return w.cfg.MonotonicClock()
+	}
+	return uint64(time.Since(w.monoStart).Nanoseconds())
+}
+
+// monotonicAfter returns the reading of the monotonic clock d after
+// reading, the largest reading for one beyond it.
+func monotonicAfter(reading uint64, d time.Duration) uint64 {
+	at, carry := bits.Add64(reading, uint64(d), 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return at
+}
+
+// readingsApart returns the time from reading until a clock reads at: 0
+// once it has, and at most the longest time.Duration.
+func readingsApart(reading, at uint64) time.Duration {
+	if at <= reading {
+		return 0
+	}
+	return time.Duration(min(at-reading, math.MaxInt64))
 }
 
 // closeWasiOpens closes the descriptors of ops (closeWasiOpen), which have
@@ -7418,10 +7790,15 @@ func closeWasiOpen(op *wasiOpen) error {
 	}
 	locked := op.lockedFile
 	op.lockedFile = nil
+	nowait := op.nowait
+	op.nowaitFile, op.nowait, op.nowaitEnded = nil, nil, true
 	op.mu.Unlock()
 	var err error
 	if f != nil {
 		err = errors.Join(err, f.Close())
+	}
+	if nowait != nil {
+		err = errors.Join(err, nowait.Close())
 	}
 	if root != nil {
 		err = errors.Join(err, root.Close())
@@ -8220,7 +8597,7 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 	}
 	rest := append([][]byte(nil), bufs...)
 	var total uint64
-	file, _ := dst.(*os.File)
+	file := op.streamFile(dst)
 	// write writes rest once. With wait, which holds the turn, the mode is
 	// not asked: in steps the write does not wait in either, and otherwise
 	// the writev(2) waits in blocking mode and takes what fits in
@@ -8303,7 +8680,7 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 		return 0, _wasiEAGAIN
 	}
 	defer op.passOutputTurn()
-	file, _ := dst.(*os.File)
+	file := op.streamFile(dst)
 	n, again, errno := w.tryStream(call, dst, func(fd uintptr) (int, bool, error) {
 		return op.writeWithoutWaiting(file, fd, bufs)
 	})
@@ -8313,6 +8690,17 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 	return uint64(n), errno
 }
 
+// streamFile returns the host file dst is, or, for a standard descriptor at
+// its number (writeStandardNumber), the entry's file, which tells what it is
+// open on; nil for any other stream.
+func (op *wasiOpen) streamFile(dst syscall.Conn) *os.File {
+	if file, isFile := dst.(*os.File); isFile {
+		return file
+	}
+	file, _ := op.f.(*os.File)
+	return file
+}
+
 // writeWithoutWaiting writes bufs once to fd, the descriptor of file, the
 // stream of the entry op, without waiting in the kernel whatever the mode of
 // its open file description, which whoever shares it can change: again
@@ -8320,11 +8708,14 @@ func (w *WasiStubs) writeHostOnce(call string, op *wasiOpen, dst syscall.Conn, b
 // stream's output, so that no other write of the runtime's takes the room
 // it finds. To a socket it is a send that does not wait (MSG_DONTWAIT) where
 // the host honours it; to a pipe what the host tells it takes without
-// waiting, where it tells (hostPipeWriteNow); to anything else, once
-// poll(2) has found room, a write of what it takes without waiting: a pipe
-// no more than PIPE_BUF, a stream socket no more than its low-water mark, a
-// datagram socket the datagram whole, a terminal (a short write) no more
-// than PIPE_BUF.
+// waiting, where it tells (hostPipeWriteNow); to a terminal a write of an
+// open file description of its own in non-blocking mode, where it has one
+// (nowaitOf); to anything else, once poll(2) has found room, a write of
+// what it takes without waiting: a pipe no more than PIPE_BUF, a stream
+// socket no more than its low-water mark, a datagram socket the datagram
+// whole, a terminal one byte (it takes what it has room for and waits in
+// the kernel for room for the rest, and tells nobody how much room it
+// has), another character device no more than PIPE_BUF.
 func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte) (int, bool, error) {
 	mode, _ := op.statOf(file)
 	if mode&os.ModeSocket != 0 && hostSendsWithoutWaiting {
@@ -8335,14 +8726,42 @@ func (op *wasiOpen) writeWithoutWaiting(file *os.File, fd uintptr, bufs [][]byte
 			return n, again, err
 		}
 	}
+	terminal := false
+	if mode&os.ModeCharDevice != 0 {
+		var err error
+		if terminal, err = op.terminalOf(file); err != nil {
+			return 0, false, err
+		}
+	}
+	if terminal {
+		nowait, err := op.nowaitOf(file, fd)
+		if err != nil {
+			return 0, false, err
+		}
+		if nowait != nil {
+			rc, err := nowait.SyscallConn()
+			if err != nil {
+				return 0, false, err
+			}
+			var n int
+			var again bool
+			var writeErr error
+			if err := rc.Control(func(own uintptr) { n, again, writeErr = writevRaw(own, bufs) }); err != nil {
+				return 0, false, err
+			}
+			return n, again, writeErr
+		}
+	}
 	ready := []bool{false}
-	if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, time.Now(), -1); err != nil {
+	if err := hostWaitReady([]uintptr{fd}, []int{hostWantRoom}, ready, nil, time.Now(), -1); err != nil {
 		return 0, false, err
 	}
 	if !ready[0] {
 		return 0, true, nil
 	}
 	switch {
+	case terminal:
+		bufs = leadingBytes(bufs, 1)
 	case mode&(os.ModeNamedPipe|os.ModeCharDevice) != 0:
 		bufs = leadingBytes(bufs, hostPipeBuf)
 	case mode&os.ModeSocket != 0:
@@ -8600,6 +9019,7 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 	w.endUnregistered()
 	w.mu.Lock()
 	dst, op := w.fdDstLocked(fd)
+	number := w.standardNumberLocked(fd)
 	turn := w.outputTurnLocked(op, dst)
 	w.mu.Unlock()
 	bufs, ok := w.iovecSlices(m, abi, iovs, iovsLen)
@@ -8647,9 +9067,31 @@ func (w *WasiStubs) fdWrite(m *Module, abi wasiABI, fd int32, iovs, iovsLen, nwr
 		}
 		defer func() { w.reportError("fd_write", turn.give()) }()
 	}
-	n, errno := w.writeFd(m, "fd_write", op, dst, bufs, 0)
+	var n uint64
+	var errno int32
+	if number != nil {
+		n, errno = w.writeStandardNumber(m, op, dst, number, bufs)
+	} else {
+		n, errno = w.writeFd(m, "fd_write", op, dst, bufs, 0)
+	}
 	abi.putWord(nwrittenSlice, n)
 	return w.signalBrokenPipe(m, op.afterShutdown(errno, true), 0)
+}
+
+// writeStandardNumber is writeFd for a slot that shares the process's
+// standard descriptor (standardNumberLocked): the write is made on number,
+// the descriptor at its number, so that it follows a renumbering done
+// outside the runtime; what dst, the entry op's file, is open on decides
+// how it is made.
+func (w *WasiStubs) writeStandardNumber(m *Module, op *wasiOpen, dst io.Writer, number syscall.Conn, bufs [][]byte) (uint64, int32) {
+	if _, blocks := op.writeBlocks(dst); blocks {
+		return w.writeHostStream(m, "fd_write", op, number, bufs, 0)
+	}
+	n, again, errno := w.tryStream("fd_write", number, func(fd uintptr) (int, bool, error) { return writevRaw(fd, bufs) })
+	if errno == _wasiESUCCESS && again {
+		errno = _wasiEAGAIN
+	}
+	return uint64(n), errno
 }
 
 // socketConn returns the entry of the socket fd and its connection, or
@@ -8852,8 +9294,9 @@ func (w *WasiStubs) Fd_chmod64(m *Module, fd, mode int32) int32 {
 // (posix_acl_create) — and a command the instance starts (Proc_spawn) is
 // started there and inherits it. Elsewhere, and for any other filesystem,
 // the runtime takes the mask out of the mode it asks the filesystem for; on
-// another system than Linux the host's filesystem takes the host process's
-// umask out as well, and a command inherits the host process's umask.
+// darwin the host's filesystem takes the host process's umask out as well,
+// which the runtime puts back on what the instance creates (openExactly,
+// makeExactly), and a command inherits the host process's umask.
 //
 // The mask the guest of the family's root instance sets is given to the
 // ProcessChanges as well (WASIConfig.ProcessChanges): HostProcessChanges
@@ -8907,14 +9350,6 @@ func (w *WasiStubs) guestUmask() os.FileMode {
 	return w.guestProcess().Umask().Perm()
 }
 
-// create runs make, which creates a file, directory or FIFO in fsys with the
-// mode it is given, so that the instance's umask is taken out of the
-// requested mode: for a filesystem of the host's on Linux, where the
-// instance's mask is the host process's umask, on the calling goroutine,
-// and otherwise on the instance's creation thread, given the requested
-// mode, the kernel taking the mask out (creationThread); for another
-// filesystem, elsewhere and without a creation thread, given the mode less
-// the mask (createMode).
 // hostFiles reports whether fsys is one of HostFS's, or an FS of one of
 // their directories (OpenRootFS): its calls are the host's own, made in the
 // host process (the kernel's umask, the FIFO opens the host tells of).
@@ -8926,29 +9361,109 @@ func hostFiles(fsys FS) bool {
 	return false
 }
 
-func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode) error) error {
+// create runs make, which creates a file, directory or FIFO in fsys with the
+// mode it is given, so that the instance's umask is taken out of the
+// requested mode: for a filesystem of the host's, where the instance's
+// mask is the host process's umask, on the calling goroutine, given the
+// requested mode; otherwise on Linux on the instance's creation thread,
+// given the requested mode, the kernel taking the mask out
+// (creationThread); on another system with a umask (hostHasUmask), given
+// the mode less the mask and exact, which has make give what it creates
+// that mode, the host process's umask the system takes out as well put
+// back (openExactly, makeExactly); for another filesystem, elsewhere and
+// without a creation thread, given the mode less the mask (createMode).
+func (w *WasiStubs) create(fsys FS, requested os.FileMode, make func(perm os.FileMode, exact bool) error) error {
 	if !hostFiles(fsys) {
-		return make(w.createMode(requested))
-	}
-	if !hostThreadUmask {
-		return make(w.createMode(requested))
+		return make(w.createMode(requested), false)
 	}
 	// Where the instance's mask is the host process's, the kernel takes it
 	// out on any thread, or lets a default ACL decide: the creation is
 	// made here, given the requested mode.
 	var err error
-	if withHostUmask(w.guestUmask(), func() { err = make(requested) }) {
+	if withHostUmask(w.guestUmask(), func() { err = make(requested, false) }) {
 		return err
+	}
+	if !hostThreadUmask {
+		return make(w.createMode(requested), hostHasUmask)
 	}
 	if t := w.creationThread(); t != nil {
 		var err error
-		if rerr := t.run(func() { err = make(requested) }); rerr == nil {
+		if rerr := t.run(func() { err = make(requested, false) }); rerr == nil {
 			return err
 		}
 		// The instance is being closed (CloseAll): the mask is taken out
 		// here.
 	}
-	return make(w.createMode(requested))
+	return make(w.createMode(requested), false)
+}
+
+// openExactly opens name with open, flag having O_CREATE, so that a file
+// the open creates has exactly perm's permission bits, which the system's
+// umask may have taken some of: the file is created exclusively, which
+// tells it from one that is there, and its mode is set through the
+// descriptor (setCreatedPerm). A name that is there is opened with flag; a
+// file that open creates after all — the name is a symbolic link to no
+// file, or was removed between the two opens — keeps the mode the system
+// gave it.
+func openExactly(open func(name string, flag int, perm os.FileMode) (File, error), name string, flag int, perm os.FileMode) (File, error) {
+	f, err := open(name, flag|os.O_EXCL, perm)
+	if errors.Is(err, fs.ErrExist) && flag&os.O_EXCL == 0 {
+		return open(name, flag, perm)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := setCreatedPerm(f, 0, perm); err != nil {
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
+}
+
+// makeExactly creates name, a directory or FIFO (kind), in fsys with make,
+// so that it has exactly perm's permission bits, which the system's umask
+// may have taken some of: it is made readable by its owner, and is then
+// opened without following a symbolic link at its end (FS.OpenFile with
+// O_NOFOLLOW), to set its mode through the descriptor (setCreatedPerm), as
+// no call here sets the mode of a name without following one. A name that
+// is gone, or is a symbolic link, by then, or a file of another kind, is
+// no longer what the call created, and is left as it is. The open of a
+// FIFO is one for reading that does not wait, which a writer that opens
+// the FIFO at that moment takes for a reader.
+func makeExactly(fsys FS, name string, kind, perm os.FileMode, make func(name string, perm os.FileMode) error) error {
+	if err := make(name, perm|0o400); err != nil {
+		return err
+	}
+	return makeRuntimeDescriptors(func() error {
+		// A trailing "/" would have the open follow a link at the end.
+		f, err := fsys.OpenFile(strings.TrimRight(name, "/"), os.O_RDONLY|hostONonblock|hostONofollow, 0)
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return errors.Join(setCreatedPerm(f, kind, perm), f.Close())
+	})
+}
+
+// setCreatedPerm gives the file open as f, which the call created, of kind
+// (os.FileMode.Type), the permission bits of perm, keeping its setuid,
+// setgid and sticky bits. A file of another kind is not what the call
+// created, and is left as it is. A mode the system refuses this user or
+// this file (chmodRefused) is left as the system made it, as open(2)
+// leaves out a bit it refuses.
+func setCreatedPerm(f File, kind, perm os.FileMode) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Type() != kind || fi.Mode().Perm() == perm.Perm() {
+		return nil
+	}
+	if err := f.Chmod(fi.Mode()&specialModeBits | perm.Perm()); err != nil && !chmodRefused(err) {
+		return err
+	}
+	return nil
 }
 
 // creationThread returns the instance's creation thread, made with the
@@ -9032,7 +9547,8 @@ func withHostUmask(mask os.FileMode, f func()) bool {
 
 // creationThreadsRefused is why the host process may make no creation
 // thread (unshare(2) refused, as Docker's default seccomp profile refuses
-// it), nil when it may: asked once a process, by making one.
+// it), nil when it may: asked once a process, by making one, whose thread
+// is then the first of unsharedThreads.
 var creationThreadsRefused = sync.OnceValue(func() error {
 	t, err := newCreationThread(0)
 	if err != nil {
@@ -9057,42 +9573,79 @@ var reportCreationThreadsRefused sync.Once
 // started there is given the host process's working directory
 // (Proc_spawn).
 //
-// The goroutine that holds the thread locks it and never unlocks it:
-// when the goroutine returns (close), the thread ends with it, as
-// runtime.LockOSThread does to a thread whose goroutine exits locked. The
-// main thread, which the runtime keeps when its goroutine so exits, is
-// never one (newCreationThread). The runtime starts no thread from a
-// locked one (runtime.newm hands the start to its template thread), so no
-// other thread gets its attributes; a process the thread starts (fork from
-// it) does, as the kernel copies the starting thread's (copy_fs). The
-// thread lasts until CloseAll, or, for an instance dropped without it,
-// until the garbage collector collects the instance (runtime.AddCleanup).
+// The thread is one of unsharedThreads, which the instance has from
+// newCreationThread to close; only its umask is the instance's, as the
+// runtime changes no other attribute of it.
 type creationThread struct {
+	// thread runs the calls given to it, one at a time.
+	thread chan<- func()
+	// quit is closed by close: a call not yet given to the thread is not.
+	quit chan struct{}
+
 	mu     sync.Mutex
 	closed bool
-	calls  chan func()
-	// quit is closed by close: the thread ends once the call it runs, if
-	// any, has returned.
-	quit chan struct{}
+	// running counts the runs that have not returned. The thread goes
+	// back to unsharedThreads once the instance has closed it and none is
+	// left.
+	running int
 }
 
-// newCreationThread starts a creation thread with umask mask. A goroutine
+// unsharedThreads are the locked OS threads whose file system attributes
+// are their own (startUnsharedThread) that no instance has: a thread never
+// ends, as a thread whose goroutine exits locked would, and goes from
+// instance to instance, so there are as many as were ever in use at once.
+// The main thread is never one (startUnsharedThread). The runtime starts
+// no thread from a locked one (runtime.newm hands the start to its
+// template thread), so no other thread gets their attributes; a process
+// one of them starts (fork from it) does, as the kernel copies the
+// starting thread's (copy_fs).
+var unsharedThreads struct {
+	mu   sync.Mutex
+	idle []chan<- func()
+}
+
+// newCreationThread returns a creation thread with umask mask: an idle one
+// of unsharedThreads, or a new one.
+func newCreationThread(mask os.FileMode) (*creationThread, error) {
+	unsharedThreads.mu.Lock()
+	var thread chan<- func()
+	if n := len(unsharedThreads.idle); n > 0 {
+		thread = unsharedThreads.idle[n-1]
+		unsharedThreads.idle = unsharedThreads.idle[:n-1]
+	}
+	unsharedThreads.mu.Unlock()
+	if thread == nil {
+		var err error
+		if thread, err = startUnsharedThread(); err != nil {
+			return nil, err
+		}
+	}
+	ran := make(chan struct{})
+	thread <- func() {
+		defer close(ran)
+		hostSetThreadUmask(mask)
+	}
+	<-ran
+	return &creationThread{thread: thread, quit: make(chan struct{})}, nil
+}
+
+// startUnsharedThread starts a thread for unsharedThreads. A goroutine
 // that locks the main thread (hostOnMainThread) starts another and lets
 // the main thread go once that one has locked a thread of its own, which
 // is then not the main thread, which the first holds.
-func newCreationThread(mask os.FileMode) (*creationThread, error) {
-	t := &creationThread{calls: make(chan func()), quit: make(chan struct{})}
+func startUnsharedThread() (chan<- func(), error) {
+	thread := make(chan func())
 	started := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
 		if !hostOnMainThread() {
-			t.serve(mask, started, nil)
+			serveUnshared(thread, started, nil)
 			return
 		}
 		locked := make(chan struct{})
 		go func() {
 			runtime.LockOSThread()
-			t.serve(mask, started, locked)
+			serveUnshared(thread, started, locked)
 		}()
 		<-locked
 		runtime.UnlockOSThread()
@@ -9100,15 +9653,14 @@ func newCreationThread(mask os.FileMode) (*creationThread, error) {
 	if err := <-started; err != nil {
 		return nil, err
 	}
-	return t, nil
+	return thread, nil
 }
 
-// serve makes the locked thread it runs on a creation thread with umask
-// mask, tells started whether it did, and runs the calls given until close.
-// locked, when it is not nil, is closed once the thread is known not to be
-// the main thread. It returns with the thread locked, but for the main
-// thread.
-func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked chan<- struct{}) {
+// serveUnshared gives the locked thread it runs on file system attributes
+// of its own, tells started whether it did, and runs the calls given for
+// good. locked, when it is not nil, is closed once the thread is known not
+// to be the main thread. A thread it could not change is let go.
+func serveUnshared(calls <-chan func(), started chan<- error, locked chan<- struct{}) {
 	onMain := hostOnMainThread()
 	if locked != nil {
 		close(locked)
@@ -9121,18 +9673,13 @@ func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked ch
 		return
 	}
 	if err := hostUnshareFS(); err != nil {
+		runtime.UnlockOSThread()
 		started <- err
 		return
 	}
-	hostSetThreadUmask(mask)
 	started <- nil
-	for {
-		select {
-		case call := <-t.calls:
-			call()
-		case <-t.quit:
-			return
-		}
+	for call := range calls {
+		call()
 	}
 }
 
@@ -9140,14 +9687,16 @@ func (t *creationThread) serve(mask os.FileMode, started chan<- error, locked ch
 // it runs nothing and returns fs.ErrClosed.
 func (t *creationThread) run(call func()) error {
 	t.mu.Lock()
-	closed := t.closed
-	t.mu.Unlock()
-	if closed {
+	if t.closed {
+		t.mu.Unlock()
 		return fs.ErrClosed
 	}
+	t.running++
+	t.mu.Unlock()
+	defer t.returned()
 	ran := make(chan struct{})
 	select {
-	case t.calls <- func() {
+	case t.thread <- func() {
 		defer close(ran)
 		call()
 	}:
@@ -9158,15 +9707,41 @@ func (t *creationThread) run(call func()) error {
 	}
 }
 
-// close ends the thread without waiting for it: a call it runs returns
-// first, and no call is run after.
+// returned is told that a run has returned.
+func (t *creationThread) returned() {
+	t.mu.Lock()
+	t.running--
+	idle := t.closed && t.running == 0
+	t.mu.Unlock()
+	if idle {
+		t.release()
+	}
+}
+
+// close lets the thread go without waiting for it: a call it runs returns
+// first, no call is run after, and the thread then goes back to
+// unsharedThreads.
 func (t *creationThread) close() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if !t.closed {
-		t.closed = true
-		close(t.quit)
+	if t.closed {
+		t.mu.Unlock()
+		return
 	}
+	t.closed = true
+	close(t.quit)
+	idle := t.running == 0
+	t.mu.Unlock()
+	if idle {
+		t.release()
+	}
+}
+
+// release puts the thread back to unsharedThreads, once the instance has
+// closed it and no run of it is left.
+func (t *creationThread) release() {
+	unsharedThreads.mu.Lock()
+	unsharedThreads.idle = append(unsharedThreads.idle, t.thread)
+	unsharedThreads.mu.Unlock()
 }
 
 // Path_open_mode is a NON-STANDARD host import (module
@@ -9235,7 +9810,12 @@ func (w *WasiStubs) pathCreateDirectory(from *wasiOpen, raw string, mode os.File
 		return errno
 	}
 	fsys, name := w.atFS(from, raw, name)
-	if err := w.create(fsys, mode, func(perm os.FileMode) error { return fsys.Mkdir(name, perm) }); err != nil {
+	if err := w.create(fsys, mode, func(perm os.FileMode, exact bool) error {
+		if exact {
+			return makeExactly(fsys, name, os.ModeDir, perm, fsys.Mkdir)
+		}
+		return fsys.Mkdir(name, perm)
+	}); err != nil {
 		return w.guestErrno("path_create_directory", err)
 	}
 	return _wasiESUCCESS
@@ -10678,6 +11258,20 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 		return w.openDescriptorListing(dir, oflags, canWrite)
 	}
 	fsys, name := w.atFS(from, raw, rel)
+	if rel == "dev/tty" {
+		w.mu.Lock()
+		pids := w.pidsLocked()
+		w.mu.Unlock()
+		if path, own := pids.sessionTerminal(w.guestPID()); own {
+			// The controlling terminal of a session of the family's own,
+			// whose name the descriptor has.
+			if path == "" {
+				return -1, _wasiENXIO
+			}
+			rel = strings.TrimPrefix(path, "/")
+			fsys, name = osFS{}, rel
+		}
+	}
 	// An open that does not wait is made as the runtime makes its own
 	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
 	// the other end (openFIFO) is moved up once it is made.
@@ -10812,9 +11406,13 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 			return -1, w.guestErrno("path_open", err)
 		}
 	case flag&os.O_CREATE != 0:
-		if err = w.create(fsys, mode, func(perm os.FileMode) error {
+		if err = w.create(fsys, mode, func(perm os.FileMode, exact bool) error {
 			var err error
-			f, err = openFile(name, flag, perm)
+			if exact {
+				f, err = openExactly(openFile, name, flag, perm)
+			} else {
+				f, err = openFile(name, flag, perm)
+			}
 			return err
 		}); err != nil {
 			return -1, w.guestErrno("path_open", err)
@@ -10835,7 +11433,8 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 	// runtime's poller cannot wait for one it does not poll, and would
 	// report EAGAIN in that mode.
 	// (Where the guest's mode is the description's, it is the guest's
-	// already: guestOpened.)
+	// already: guestOpened. It is read without the reader in non-blocking
+	// mode, readThroughReader.)
 	if isFIFO && fdflags&0x4 != 0 && !polled && !w.hostFamily() {
 		if err := setHostNonblock(f, false); err != nil {
 			return -1, w.guestErrno("path_open", errors.Join(err, f.Close()))
@@ -11329,7 +11928,12 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		isRead   bool
 		errno    int32
 	}
-	var minClockNs int64 = -1
+	// The first clock subscription on the guest's monotonic clock is due
+	// once that clock reads monoAt (monoWaits), the first on any other at
+	// endAt, a time of the host's timers (endWaits).
+	var monoAt uint64
+	var endAt time.Time
+	monoWaits, endWaits := false, false
 	var clockEvents []pollItem
 	var fdEvents []pollItem
 	for i := uint64(0); i < nsubs; i++ {
@@ -11339,23 +11943,33 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		switch etype {
 		case 0: // clock
 			clockID := int32(binary.LittleEndian.Uint32(subs[base+16:]))
-			timeout := int64(binary.LittleEndian.Uint64(subs[base+24:]))
-			flags := binary.LittleEndian.Uint16(subs[base+40:])
-			ns := timeout
+			timeout := binary.LittleEndian.Uint64(subs[base+24:])
+			abs := binary.LittleEndian.Uint16(subs[base+40:])&0x1 != 0
 			var errno int32
-			if flags&0x1 != 0 {
-				// Absolute timeout in nanoseconds of the subscription's
-				// clock: the time left until it. A clock there is none of
-				// has its event at once, carrying the error.
-				var now uint64
-				now, errno = w.clockNanos(clockID)
-				ns = 0
-				if at := uint64(timeout); errno == _wasiESUCCESS && at > now {
-					ns = int64(min(at-now, 1<<63-1))
+			if clockID == 1 { // CLOCK_MONOTONIC
+				at := timeout
+				if !abs {
+					at = monotonicAfter(w.monotonicNanos(), readingsApart(0, timeout))
 				}
-			}
-			if minClockNs < 0 || ns < minClockNs {
-				minClockNs = ns
+				if !monoWaits || at < monoAt {
+					monoAt, monoWaits = at, true
+				}
+			} else {
+				left := readingsApart(0, timeout)
+				if abs {
+					// Absolute timeout in nanoseconds of the subscription's
+					// clock: the time left until it. A clock there is none
+					// of has its event at once, carrying the error.
+					var reading uint64
+					reading, errno = w.clockNanos(clockID)
+					left = 0
+					if errno == _wasiESUCCESS {
+						left = readingsApart(reading, timeout)
+					}
+				}
+				if end := time.Now().Add(left); !endWaits || end.Before(endAt) {
+					endAt, endWaits = end, true
+				}
 			}
 			clockEvents = append(clockEvents, pollItem{userdata: userdata, etype: 0, errno: errno})
 		case 1, 2: // fd_read / fd_write
@@ -11366,6 +11980,21 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			clockEvents = append(clockEvents, pollItem{userdata: userdata, etype: etype})
 		}
 	}
+	// clockDue returns the time in nanoseconds until the first clock
+	// subscription is due, -1 for none.
+	clockDue := func() int64 {
+		due := int64(-1)
+		if endWaits {
+			due = int64(max(time.Until(endAt), 0))
+		}
+		if monoWaits {
+			if left := int64(readingsApart(w.monotonicNanos(), monoAt)); due < 0 || left < due {
+				due = left
+			}
+		}
+		return due
+	}
+	minClockNs := clockDue()
 
 	// Decide which fd subscriptions are ready. A descriptor whose read or
 	// write cannot block — a regular file, a Writer of the embedder's no
@@ -11497,10 +12126,21 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			addHost(i, probeKey{op: op}, src, hostWantInput)
 			continue
 		}
-		// Asked for input from here on: what it reads ends the wait.
 		reader := w.inputReader(op, src)
-		reader.request()
-		addEntry(i, probeKey{op: op}, hostWaitFD{source: reader})
+		// Ready when the reader keeps something or, for a descriptor of the
+		// host's, poll(2) finds input: in non-blocking mode it is read
+		// without the reader once a Read it has in progress ends
+		// (readThroughReader), and the mode can change while a Read waits,
+		// which then ends with nothing.
+		e := hostWaitFD{source: reader}
+		if file, isFile := reader.hostFile(); isFile {
+			e.stream, e.want = file, hostWantInput
+		}
+		if _, nonblocking := reader.nonblockingFile(); !nonblocking {
+			// Asked for input from here on: what it reads ends the wait.
+			reader.request()
+		}
+		addEntry(i, probeKey{op: op}, e)
 	}
 	// hostErr is why poll(2) could not be asked: every descriptor it was
 	// to be asked about is ready with that error.
@@ -11526,11 +12166,11 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 	// and no timeout, a signal is all there is to wait for, as for poll(2).
 	onlySignal := !anyReady && len(hostSet) == 0 && minClockNs < 0 && len(fdEvents) > 0
 	waits := !anyReady && minClockNs != 0 && (len(hostSet) > 0 || minClockNs > 0 || onlySignal)
-	// How long the descriptors may be waited for: until the timeout when
-	// there is one, otherwise until one is ready.
-	var hostDeadline time.Time
+	// How long the call waits: until the first clock subscription is due
+	// when there is one, otherwise until a descriptor is ready.
+	var clockEnd time.Time
 	if minClockNs >= 0 {
-		hostDeadline = time.Now().Add(time.Duration(minClockNs))
+		clockEnd = time.Now().Add(time.Duration(minClockNs))
 	}
 	// The wake of this call, which a signal, a reader that has input or a
 	// close of a descriptor waited for wakes.
@@ -11596,14 +12236,13 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		given = false
 		defer w.giveWakeOnUnwind("poll_oneoff", &given, wk, hostSet)
 	}
-	clockEnd := time.Now().Add(time.Duration(minClockNs))
 	// wait waits once for what the call waits for, until stop (nil for
 	// none) is closed.
 	wait := func(stop <-chan struct{}) {
 		switch {
 		case !waits:
 		case len(hostSet) > 0:
-			waitHostWoken(hostDeadline, stop)
+			waitHostWoken(clockEnd, stop)
 		case minClockNs > 0:
 			// The clock paces the call only when nothing else can end it.
 			timer := time.NewTimer(time.Until(clockEnd))
@@ -11635,9 +12274,23 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 			}
 			return _wasiEINTR
 		}
+		if interrupted || anyReady {
+			break
+		}
+		// Once the host's timers reach the end of the wait, the call ends
+		// if a clock subscription is due, and waits on for the time the
+		// guest's monotonic clock still has to go.
+		if minClockNs >= 0 && !time.Now().Before(clockEnd) {
+			left := clockDue()
+			if left == 0 {
+				break
+			}
+			clockEnd = time.Now().Add(time.Duration(left))
+			continue
+		}
 		// A signal another blocking call reports leaves the wait on while
 		// nothing is ready and time remains.
-		if !woken || interrupted || anyReady || minClockNs >= 0 && !time.Now().Before(clockEnd) {
+		if !woken {
 			break
 		}
 	}
@@ -11669,7 +12322,9 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 		// what happened.
 		var flags uint16
 		if errnos[i] == 0 && ev.isRead {
-			if stream := hangStreams[i]; stream != nil && streamHungUp(stream) {
+			if at := hostIndex[i]; at >= 0 && hostSet[at].hungUp {
+				flags = wasiEventHangup
+			} else if stream := hangStreams[i]; stream != nil && streamHungUp(stream) {
 				flags = wasiEventHangup
 			}
 		}
@@ -11691,6 +12346,14 @@ func (w *WasiStubs) pollOneoff(m *Module, abi wasiABI, inPtr, outPtr, nsubs, nev
 						nbytes = uint64(st.Size() - cur)
 					}
 				}
+			} else if at := hostIndex[i]; at >= 0 && hostSet[at].stream != nil {
+				// A descriptor of the host's, which poll(2) found ready:
+				// the bytes it holds, which the guest's ioctl(FIONREAD)
+				// takes from this event. A count that fails leaves the
+				// event as poll(2) reported it.
+				n, err := streamPending(hostSet[at].stream, hostSet[at].hungUp)
+				w.reportError("poll_oneoff", err)
+				nbytes = n
 			}
 		}
 		writeEvent(events[written:written+32], ev.userdata, ev.etype, uint16(errnos[i]), nbytes, flags)
@@ -11715,6 +12378,19 @@ func streamHungUp(stream any) bool {
 	var hup bool
 	hostDescriptor(stream, func(fd uintptr) { hup = hostHungUp(fd) })
 	return hup
+}
+
+// streamPending returns the bytes FIONREAD counts of stream, a descriptor
+// of the host's that poll(2) found ready for reading and hung up on or not
+// (hostPending). Nothing is counted of a stream closed meanwhile, of which
+// hostDescriptor runs nothing: the call on it reports the closing.
+func streamPending(stream any, hungUp bool) (uint64, error) {
+	var count struct {
+		n   uint64
+		err error
+	}
+	hostDescriptor(stream, func(fd uintptr) { count.n, count.err = hostPending(fd, hungUp) })
+	return count.n, count.err
 }
 
 func writeEvent(dst []byte, userdata uint64, etype byte, errno uint16, nbytes uint64, flags uint16) {
@@ -12318,7 +12994,7 @@ func (w *WasiStubs) whenReady(m *Module, turn chan struct{}, want int, call func
 		}
 		defer func() { <-turn }()
 		ready := []bool{false}
-		if err := hostWaitReady([]uintptr{uintptr(fd)}, []int{want}, ready, time.Now(), -1); err != nil {
+		if err := hostWaitReady([]uintptr{uintptr(fd)}, []int{want}, ready, nil, time.Now(), -1); err != nil {
 			return false, err
 		}
 		if !ready[0] {
@@ -13383,8 +14059,10 @@ func (w *WasiStubs) sockRecvfromAddr(m *Module, fd int32, bufPtr uint64, bufLen,
 // wasip1_posix_extension, name "sock_socketpair") backing socketpair(): two
 // Unix-domain sockets of the type (wasiSockType*) connected to each other,
 // whose fds it writes (two u32) at fdsOutPtr. Returns 0 or a negative
-// errno: EAFNOSUPPORT for a family other than Unix, ENOTSUP on a host whose
-// sockets the runtime does not make, and the host's.
+// errno: ENOTSUP (EOPNOTSUPP) for an IP family, which has no pairs, as
+// socketpair(2) has it, EAFNOSUPPORT for a family other than those and
+// Unix, ENOTSUP on a host whose sockets the runtime does not make, and the
+// host's.
 func (w *WasiStubs) Sock_socketpair(m *Module, family, typ, fdsOutPtr int32) int32 {
 	return w.sockSocketpair(m, family, typ, zext(fdsOutPtr))
 }
@@ -13400,6 +14078,8 @@ func (w *WasiStubs) sockSocketpair(m *Module, family, typ int32, fdsOutPtr uint6
 	switch {
 	case out == nil:
 		return -_wasiEFAULT
+	case family == wasiSockFamilyIPv4, family == wasiSockFamilyIPv6:
+		return -_wasiENOTSUP
 	case family != wasiSockFamilyUnix:
 		return -_wasiEAFNOSUPPORT
 	case typ != wasiSockTypeStream && typ != wasiSockTypeDgram:
@@ -14543,7 +15223,8 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 // PRIO_USER (2) and who the id it applies to, 0 for the caller's own; the
 // guest's own pid is passed on as 0, and the pid token of another process
 // of the fork family or of a process the guest spawned is no process of
-// the host: ESRCH. With set non-zero value becomes the nice value first: by
+// the host: ESRCH, but for the host pid a process is known by (Children),
+// which is passed on. With set non-zero value becomes the nice value first: by
 // the SetPriority of the ProcessChanges (WASIConfig.ProcessChanges) for the
 // family's root instance; a forked instance's guest sets its own nice value
 // alone (PRIO_PROCESS of itself; EPERM for another), and a lower one than it
@@ -14576,7 +15257,7 @@ func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr
 			// The guest's own pid is always the guest itself, as for
 			// kill.
 			who = 0
-		} else if member, ours := pids.find(who); member != nil || ours {
+		} else if member, ours := pids.find(who); member != nil && !member.byHostPID || member == nil && ours {
 			// A process of the fork family, or one the guest spawned,
 			// whose token names no process of the host.
 			return -_wasiESRCH
@@ -15443,13 +16124,26 @@ const (
 	linuxTIOCSPTLCK = 0x40045431
 )
 
+// The requests of a pseudo-terminal's master side darwin makes and Linux
+// has none of (grantpt, unlockpt and ptsname of darwin's C library), as
+// darwin's sys/ttycom.h numbers them: no request of asm-generic has these
+// numbers. TIOCPTYGNAME writes the name of the slave side, a string of
+// darwinPtyNameSize bytes.
+const (
+	darwinTIOCPTYGRANT = 0x20007454
+	darwinTIOCPTYUNLK  = 0x20007452
+	darwinTIOCPTYGNAME = 0x40807453
+	darwinPtyNameSize  = 128
+)
+
 // linuxNCCS is the number of control characters of the kernel's struct
 // termios.
 const linuxNCCS = 19
 
 // What a request of a terminal takes (terminalArg.what): nothing, an int
 // as it is, or the address of an int, of a struct termios, of a struct
-// termios2 or of a struct winsize.
+// termios2, of a struct winsize or of the name of a pseudo-terminal's
+// slave side.
 const (
 	terminalTakesNothing = iota
 	terminalTakesValue
@@ -15457,6 +16151,7 @@ const (
 	terminalTakesTermios
 	terminalTakesTermios2
 	terminalTakesWinsize
+	terminalTakesName
 )
 
 // linuxTermios is the kernel's struct termios2 (asm-generic): struct
@@ -15514,14 +16209,17 @@ type terminalArg struct {
 	value   int32
 	termios linuxTermios
 	winsize linuxWinsize
+	name    [darwinPtyNameSize]byte
 }
 
 // of sets what request takes, and reports whether it is one of the
 // requests of a terminal the runtime makes.
 func (a *terminalArg) of(request uint32) bool {
 	switch request {
-	case linuxTIOCEXCL, linuxTIOCNXCL, linuxTIOCNOTTY:
+	case linuxTIOCEXCL, linuxTIOCNXCL, linuxTIOCNOTTY, darwinTIOCPTYGRANT, darwinTIOCPTYUNLK:
 		a.what = terminalTakesNothing
+	case darwinTIOCPTYGNAME:
+		a.what, a.out = terminalTakesName, true
 	case linuxTCSBRK, linuxTCXONC, linuxTCFLSH, linuxTIOCSCTTY:
 		a.what = terminalTakesValue
 	case linuxTIOCSPGRP, linuxTIOCSPTLCK:
@@ -15558,6 +16256,8 @@ func (a *terminalArg) size() uint64 {
 		return 44
 	case terminalTakesWinsize:
 		return 8
+	case terminalTakesName:
+		return darwinPtyNameSize
 	}
 	return 0
 }
@@ -15591,6 +16291,8 @@ func (a *terminalArg) encode(mem []byte) {
 		binary.LittleEndian.PutUint16(mem[2:], a.winsize.Col)
 		binary.LittleEndian.PutUint16(mem[4:], a.winsize.Xpixel)
 		binary.LittleEndian.PutUint16(mem[6:], a.winsize.Ypixel)
+	case terminalTakesName:
+		copy(mem, a.name[:])
 	}
 }
 
@@ -15601,7 +16303,8 @@ func (a *terminalArg) encode(mem []byte) {
 // TIOCSWINSZ), the line (TCSBRK, TCXONC, TCFLSH), exclusive use
 // (TIOCEXCL, TIOCNXCL), the output queue (TIOCOUTQ), the foreground
 // process group and the session (TIOCGPGRP, TIOCGSID), and a
-// pseudo-terminal's master side (TIOCGPTN, TIOCSPTLCK). arg is the int the
+// pseudo-terminal's master side (TIOCGPTN, TIOCSPTLCK, and darwin's
+// TIOCPTYGRANT, TIOCPTYUNLK, TIOCPTYGNAME on darwin). arg is the int the
 // request takes, or the address of what it takes. A descriptor is a
 // terminal when it is a terminal of the host: a standard stream of the
 // instance or a file of the FS that is a file of the host (*os.File). The
@@ -15613,10 +16316,13 @@ func (a *terminalArg) encode(mem []byte) {
 // process group or controlling terminal but through TIOCSPGRP
 // (terminalGroup): TIOCGPGRP and TIOCSPGRP read and set the foreground
 // group of the controlling terminal of the guest's session as the family's.
-// Returns what the call returned, or a negative errno: EBADF, ENOTTY for a
-// request it does not make and for a descriptor that is no terminal or not
-// the controlling terminal, EPERM for a group of another session, ENOSYS
-// for TIOCSCTTY and TIOCNOTTY.
+// A session of the family's own takes its controlling terminal with
+// TIOCSCTTY (takeTerminal). Returns what the call returned, or a negative
+// errno: EBADF, ENOTTY for a request it does not make and for a descriptor
+// that is no terminal or not the controlling terminal, EPERM for a group
+// of another session, ENOSYS for TIOCNOTTY, for TIOCSCTTY of the session
+// the host process is in, and for the foreground group of the controlling
+// terminal of a session of the family's own.
 func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, arg int32) int32 {
 	return w.fdIoctl(m, fd, uint32(request), zext(arg), arg)
 }
@@ -15667,7 +16373,9 @@ func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, va
 			if w.cfg.Process == nil {
 				return syscall.ENOTTY
 			}
-		case linuxTIOCSCTTY, linuxTIOCNOTTY:
+		case linuxTIOCSCTTY:
+			return w.takeTerminal(hostFD)
+		case linuxTIOCNOTTY:
 			return syscall.ENOSYS
 		}
 		var err error
@@ -15731,6 +16439,17 @@ func (p *wasiPIDs) terminalGroup(pid int32, fd int, set bool, pgrp int32) (was i
 		sid = proc.sid
 	}
 	if sid != p.hostSession {
+		// The runtime keeps no foreground group for the controlling
+		// terminal of a session of the family's own.
+		if t, ok := p.terminals[sid]; ok {
+			device, err := hostDevice(fd)
+			if err != nil {
+				return 0, -1, err
+			}
+			if device == t.device {
+				return 0, -1, syscall.ENOSYS
+			}
+		}
 		return 0, -1, syscall.ENOTTY
 	}
 	current, err := hostForeground(fd)
@@ -15788,6 +16507,93 @@ func (p *wasiPIDs) terminalGroup(pid int32, fd int, set bool, pgrp int32) (was i
 	}
 	p.foreground = 0
 	return was, closing, nil
+}
+
+// takeTerminal is TIOCSCTTY of the guest on the host's terminal fd: the
+// terminal becomes the controlling terminal of the guest's session
+// (wasiPIDs.takeTerminal). Whether it is the controlling terminal of a
+// session of the host's already is asked of the host (TIOCGSID).
+func (w *WasiStubs) takeTerminal(fd int) error {
+	device, err := hostDevice(fd)
+	if err != nil {
+		return err
+	}
+	path, named, err := hostFDLink(uintptr(fd))
+	switch {
+	case err != nil:
+		return err
+	case !named:
+		return syscall.ENOTTY
+	}
+	var session terminalArg
+	session.of(linuxTIOCGSID)
+	_, err = hostTerminalIoctl(fd, linuxTIOCGSID, &session)
+	if err != nil && !errors.Is(err, syscall.ENOTTY) {
+		return err
+	}
+	w.enterRoot()
+	self := w.guestPID()
+	w.mu.Lock()
+	pids := w.pidsLocked()
+	w.mu.Unlock()
+	return pids.takeTerminal(self, w.forked, sessionTerminal{path: path, device: device}, err == nil)
+}
+
+// takeTerminal makes t the controlling terminal of the session of the
+// family's process pid, as TIOCSCTTY without stealing does (tiocsctty of
+// Linux's drivers/tty/tty_jobctrl.c): for a process that leads a session of
+// the family's own without one, when t is the controlling terminal of no
+// other session, the family's or, by taken, the host's. The session the
+// host process is in is the host process's: a process forked within the
+// runtime does not lead it (EPERM), and the root instance's request is not
+// made (ENOSYS).
+func (p *wasiPIDs) takeTerminal(pid int32, forked bool, t sessionTerminal, taken bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sid := p.hostSession
+	if proc := p.procs[pid]; proc != nil {
+		sid = proc.sid
+	}
+	switch {
+	case sid == p.hostSession && !forked:
+		return syscall.ENOSYS
+	case sid != pid || sid == p.hostSession:
+		return syscall.EPERM
+	}
+	if have, ok := p.terminals[sid]; ok {
+		if have.device == t.device {
+			return nil
+		}
+		return syscall.EPERM
+	}
+	if taken {
+		return syscall.EPERM
+	}
+	for _, other := range p.terminals {
+		if other.device == t.device {
+			return syscall.EPERM
+		}
+	}
+	if p.terminals == nil {
+		p.terminals = map[int32]sessionTerminal{}
+	}
+	p.terminals[sid] = t
+	return nil
+}
+
+// sessionTerminal returns the name on the host of the controlling
+// terminal of the session of the family's process pid, which /dev/tty
+// opens, when the session is one of the family's own: own is false for
+// the session the host process is in, whose /dev/tty is the host's, and
+// name is empty for a session without one.
+func (p *wasiPIDs) sessionTerminal(pid int32) (name string, own bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	proc := p.procs[pid]
+	if proc == nil || proc.sid == p.hostSession {
+		return "", false
+	}
+	return p.terminals[proc.sid].path, true
 }
 
 // ----- numbers of another system -----------------------------------------------
@@ -16289,7 +17095,12 @@ const (
 // HostIPC returns an IPC that reaches the System V IPC objects of the host,
 // which other processes of the system share, for WASIConfig.IPC. It has
 // them on Linux on amd64, arm64, riscv64 and loong64, whose structures are
-// the guest's; elsewhere every call fails with errors.ErrUnsupported. A
+// the guest's, and on darwin, whose structures it lays out as the guest's;
+// elsewhere every call fails with errors.ErrUnsupported. darwin has no
+// shmctl SHM_LOCK and SHM_UNLOCK (EINVAL), and no msgrcv MSG_EXCEPT and
+// MSG_COPY (errors.ErrUnsupported), and attaches a segment only where
+// nothing is mapped, which the guest's memory never is: ShmAttach and
+// ShmDetach fail with errors.ErrUnsupported there. A
 // call that the host process is interrupted in (EINTR) is made again. The
 // operations made with SEM_UNDO are undone when the host process ends, not
 // when the instance does. A store into a segment the guest attached
@@ -16886,7 +17697,12 @@ func (w *WasiStubs) pathMkfifo(m *Module, pathPtr uint64, pathLen, mode int32) i
 	if !can {
 		return -_wasiENOSYS
 	}
-	if err := w.create(fsys, unixFileMode(uint32(mode)).Perm(), func(perm os.FileMode) error { return maker.Mkfifo(name, perm) }); err != nil {
+	if err := w.create(fsys, unixFileMode(uint32(mode)).Perm(), func(perm os.FileMode, exact bool) error {
+		if exact {
+			return makeExactly(fsys, name, os.ModeNamedPipe, perm, maker.Mkfifo)
+		}
+		return maker.Mkfifo(name, perm)
+	}); err != nil {
 		return -w.guestErrno("path_mkfifo", err)
 	}
 	return _wasiESUCCESS
@@ -19166,11 +19982,12 @@ type wasiSignals struct {
 	// due is what the changes made under mu leave to do once it is let go.
 	due wasiSignalsDue
 	// timer is the running real-time interval timer (setitimer's
-	// ITIMER_REAL, which alarm and ualarm set as well), timerAt the time it
-	// fires next, and timerEvery the interval at which it fires again after
-	// that: 0 for a timer that fires once.
+	// ITIMER_REAL, which alarm and ualarm set as well), timerAt the reading
+	// of the guest's monotonic clock it fires next at, and timerEvery the
+	// interval at which it fires again after that: 0 for a timer that fires
+	// once.
 	timer      *time.Timer
-	timerAt    time.Time
+	timerAt    uint64
 	timerEvery time.Duration
 	// detached records that delivery has ended (detachSignals): what is
 	// posted from then on is dropped, for a forked instance too.
@@ -19182,6 +19999,11 @@ type wasiSignals struct {
 	// execed is the command the guest has become (Proc_exec) while it
 	// runs: a signal for the process is the command's (signalProcess).
 	execed *execedCommand
+	// offers are the firings of the interval timer being offered
+	// WASIConfig.TakeSignal (offerAlarm), each closed once it has been
+	// taken or posted. A blocking call that begins or ends waits for the
+	// ones in progress (postDueTimerLocked): their moment came first.
+	offers []chan struct{}
 }
 
 // wasiSignalThread is the signal state of one thread of the guest.
@@ -19263,12 +20085,12 @@ type wasiSignalsDue struct {
 	// alarm is the command the guest has become (Proc_exec), to be sent
 	// the interval timer's SIGALRM (fireDueTimerLocked).
 	alarm *commandProcess
-	// alarmToOffer records a firing of the interval timer to offer
-	// WASIConfig.TakeSignal (fireDueTimerLocked); alarmFor, the thread whose
-	// own host call it came due in, to post it for if not taken
-	// (postForGuestLocked), nil for the host's timer.
-	alarmToOffer bool
-	alarmFor     *wasiSignalThread
+	// alarmOffer is a firing of the interval timer to offer
+	// WASIConfig.TakeSignal (fireDueTimerLocked), one of wasiSignals.offers;
+	// alarmFor, the thread whose own host call it came due in, to post it
+	// for if not taken (postForGuestLocked), nil for the host's timer.
+	alarmOffer chan struct{}
+	alarmFor   *wasiSignalThread
 }
 
 // wasiRaise is a flag word to raise for the signals of bits, posted for
@@ -19624,8 +20446,8 @@ func (w *WasiStubs) unlockSignals() {
 	if due.alarm != nil {
 		w.reportError("proc_itimer", signalHostProc(due.alarm, wasiSIGALRM))
 	}
-	if due.alarmToOffer {
-		w.offerAlarm(due.alarmFor)
+	if due.alarmOffer != nil {
+		w.offerAlarm(due.alarmFor, due.alarmOffer)
 	}
 	// The flags are raised first: a blocking call that a signal interrupts
 	// ends with its thread's flag up, for the guest to find the signal.
@@ -19861,12 +20683,22 @@ func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 // postDueTimerLocked posts the firing of the interval timer whose time has
 // come for the guest, from the host call of the thread t
 // (postForGuestLocked), as a blocking call does when it begins and when it
-// ends, and has the guest interrupted by it before the call goes on. Caller
-// holds w.sig.mu, which it holds again on return.
+// ends, and has the guest interrupted by it before the call goes on. A
+// firing the host's timer is offering WASIConfig.TakeSignal meanwhile is
+// waited for until it has been taken or posted. Caller holds w.sig.mu,
+// which it holds again on return.
 func (w *WasiStubs) postDueTimerLocked(t *wasiSignalThread) {
 	w.postForGuestLocked(t, w.fireDueTimerLocked)
-	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil || w.sig.due.alarmToOffer {
+	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil || w.sig.due.alarmOffer != nil {
 		w.unlockSignals()
+		w.sig.mu.Lock()
+	}
+	if len(w.sig.offers) > 0 {
+		offers := slices.Clone(w.sig.offers)
+		w.unlockSignals()
+		for _, offer := range offers {
+			<-offer
+		}
 		w.sig.mu.Lock()
 	}
 }
@@ -19992,6 +20824,7 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 		w.mu.Lock()
 		w.reapFinishedLocked()
 		w.mu.Unlock()
+		w.reportError("proc_signal_dispositions", w.releaseForgotten())
 	}
 	if w.cfg.Signals != nil {
 		w.cfg.Signals.Dispositions(w, handledNow, ignoredNow, blockedNow)
@@ -20002,6 +20835,33 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 // Proc_signal_dispositions64 is Proc_signal_dispositions for a memory64 guest.
 func (w *WasiStubs) Proc_signal_dispositions64(m *Module, handled, ignored, blocked int64) int32 {
 	return w.Proc_signal_dispositions(m, handled, ignored, blocked)
+}
+
+// Proc_signal_ignored is a NON-STANDARD host import (name
+// "proc_signal_ignored"), which the guest asks of a signal it leaves at its
+// default action: 1 when the process it runs as ignores sig by an action
+// the guest did not set (WASIConfig.SignalIgnored), and the guest takes
+// SIG_IGN as its own action; 0 otherwise — without a SignalIgnored, for
+// SIGKILL, SIGSTOP or a number that is no signal's, and when SignalIgnored
+// fails (told Errors).
+func (w *WasiStubs) Proc_signal_ignored(m *Module, sig int32) int32 {
+	if w.cfg.SignalIgnored == nil || wasiSignalBit(sig) == 0 || sig == wasiSIGKILL || sig == wasiSIGSTOP {
+		return 0
+	}
+	ignored, err := w.cfg.SignalIgnored(w, sig)
+	if err != nil {
+		w.reportError("signal_ignored", err)
+		return 0
+	}
+	if ignored {
+		return 1
+	}
+	return 0
+}
+
+// Proc_signal_ignored64 is Proc_signal_ignored for a memory64 guest.
+func (w *WasiStubs) Proc_signal_ignored64(m *Module, sig int32) int32 {
+	return w.Proc_signal_ignored(m, sig)
 }
 
 // Proc_signal_take is a NON-STANDARD host import (name "proc_signal_take").
@@ -20097,7 +20957,7 @@ func (w *WasiStubs) timerStateLocked() (left, every time.Duration) {
 	if s.timer == nil {
 		return 0, 0
 	}
-	left = time.Until(s.timerAt)
+	left = readingsApart(w.monotonicNanos(), s.timerAt)
 	if left <= 0 {
 		// It is about to fire; a set timer never reports that it is not.
 		left = 1
@@ -20113,14 +20973,21 @@ func (w *WasiStubs) timerStateLocked() (left, every time.Duration) {
 func (w *WasiStubs) startTimerLocked(value, every time.Duration) {
 	// The moment is taken before the host's timer is set, so that the
 	// host's timer never runs ahead of it.
-	at := time.Now().Add(value)
+	at := monotonicAfter(w.monotonicNanos(), value)
 	var timer *time.Timer
 	timer = time.AfterFunc(value, func() {
 		w.sig.mu.Lock()
 		defer w.unlockSignals()
-		if w.sig.timer == timer {
-			w.fireDueTimerLocked()
+		if w.sig.timer != timer {
+			return
 		}
+		// The guest's monotonic clock may not have come to the time yet:
+		// the host's timer is set for what it has left.
+		if left := readingsApart(w.monotonicNanos(), w.sig.timerAt); left > 0 {
+			timer.Reset(left)
+			return
+		}
+		w.fireDueTimerLocked()
 	})
 	w.sig.timer, w.sig.timerAt, w.sig.timerEvery = timer, at, every
 }
@@ -20140,17 +21007,17 @@ func (w *WasiStubs) fireDueTimerLocked() {
 	if s.timer == nil {
 		return
 	}
-	now := time.Now()
-	if s.timerAt.After(now) {
+	now := w.monotonicNanos()
+	if s.timerAt > now {
 		return
 	}
 	if s.timerEvery > 0 {
-		next := s.timerAt.Add(s.timerEvery)
-		if !next.After(now) {
-			next = now.Add(s.timerEvery)
+		next := monotonicAfter(s.timerAt, s.timerEvery)
+		if next <= now {
+			next = monotonicAfter(now, s.timerEvery)
 		}
 		s.timerAt = next
-		s.timer.Reset(next.Sub(now))
+		s.timer.Reset(readingsApart(now, next))
 	} else {
 		s.timer.Stop()
 		s.timer = nil
@@ -20166,7 +21033,11 @@ func (w *WasiStubs) fireDueTimerLocked() {
 	}
 	if w.cfg.TakeSignal != nil {
 		// Offered once w.sig.mu is let go (unlockSignals).
-		s.due.alarmToOffer, s.due.alarmFor = true, s.quiet
+		if s.due.alarmOffer == nil {
+			s.due.alarmOffer = make(chan struct{})
+			s.offers = append(s.offers, s.due.alarmOffer)
+		}
+		s.due.alarmFor = s.quiet
 		return
 	}
 	w.postSignalLocked(wasiSIGALRM)
@@ -20174,15 +21045,19 @@ func (w *WasiStubs) fireDueTimerLocked() {
 
 // offerAlarm offers SIGALRM, the firing of the interval timer, to
 // WASIConfig.TakeSignal, and posts it when it is not taken, from the host
-// call of the thread t (postForGuestLocked) when t is not nil. Caller holds
-// neither w.mu nor w.sig.mu; a stream's write lock may be held.
-func (w *WasiStubs) offerAlarm(t *wasiSignalThread) {
-	if w.takeSignal(wasiSIGALRM) {
-		return
+// call of the thread t (postForGuestLocked) when t is not nil; then offer,
+// the firing's in wasiSignals.offers, is closed. Caller holds neither w.mu
+// nor w.sig.mu; a stream's write lock may be held.
+func (w *WasiStubs) offerAlarm(t *wasiSignalThread, offer chan struct{}) {
+	if !w.takeSignal(wasiSIGALRM) {
+		w.sig.mu.Lock()
+		w.postForGuestLocked(t, func() { w.postSignalLocked(wasiSIGALRM) })
+		w.unlockSignals()
 	}
 	w.sig.mu.Lock()
-	w.postForGuestLocked(t, func() { w.postSignalLocked(wasiSIGALRM) })
+	w.sig.offers = slices.DeleteFunc(w.sig.offers, func(c chan struct{}) bool { return c == offer })
 	w.unlockSignals()
+	close(offer)
 }
 
 // postForGuestLocked runs post, which posts signals while the guest's own
@@ -20321,8 +21196,8 @@ func (w *WasiStubs) detachSignals() {
 // input is there, a blocking one waits and reports EINTR when a signal is
 // posted to the guest meanwhile. A stream of the entry's own that the Go
 // runtime polls is read by readPolledStream, any other descriptor of the
-// host's that poll(2) waits for by readHostStream, any other stream through
-// its reader (readThroughReader).
+// host's that poll(2) waits for by readHostStream, any other stream by
+// readThroughReader.
 func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src io.Reader, bufs [][]byte) (uint64, int32) {
 	switch {
 	case w.netpolled(op, src):
@@ -20330,26 +21205,51 @@ func (w *WasiStubs) readStream(m *Module, call string, op *wasiOpen, src io.Read
 	case op.inputPolled(src):
 		return w.readHostStream(m, call, op, src.(syscall.Conn), bufs, op.nonblocking())
 	}
-	return w.readThroughReader(m, call, op, w.inputReader(op, src), bufs, op.nonblocking())
+	return w.readThroughReader(m, call, op, src, bufs, op.nonblocking())
 }
 
-// readThroughReader reads the stream behind the entry op through its reader
-// r, as the guest asked for it: what the reader keeps, or else a Read it is
-// asked for. A non-blocking read (nonblocking) reports EAGAIN when the
-// reader keeps nothing, which the Read it asks for ends the wait of a poll
-// for; a blocking one waits for it, and a signal posted to the guest
-// meanwhile ends the wait with EINTR. What the reader has when the signal
-// ends the wait is read all the same, as read(2) returns the input there to
-// a process with a signal pending; a Read that returns later keeps its
-// input for the next read. The wait holds no turn: the reads it wakes each
-// take what there is, and one that finds nothing waits again.
-func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, r *streamReader, bufs [][]byte, nonblocking bool) (uint64, int32) {
-	set := []hostWaitFD{{source: r, op: op}}
-	for {
-		if n, err, ok := r.take(bufs); ok {
-			return w.readResult(call, n, err)
+// readThroughReader reads src, the stream behind the entry op, as the guest
+// asked for it: what its reader r keeps, or else a Read r is asked for. A
+// descriptor of the host's whose open file description is in non-blocking
+// mode, which r does not read, is read with one readv(2) instead (readNow)
+// once a Read r has in progress ends (directFile), and waited for in
+// poll(2), whose wait for a FIFO does
+// not end at the close of its last writer where poll(2) does not report the
+// end of its input (hostPollReportsFIFOEnd). A non-blocking read
+// (nonblocking) reports EAGAIN when there is nothing, which the Read r is
+// asked for, or the input poll(2) finds, ends the wait of a poll for; a
+// blocking one waits for it, and a signal posted to the guest meanwhile
+// ends the wait with EINTR. What there is when the signal ends the wait is
+// read all the same, as read(2) returns the input there to a process with a
+// signal pending; a Read that returns later keeps its input for the next
+// read. The wait holds no turn: the reads it wakes each take what there is,
+// and one that finds nothing waits again. The mode is asked again each
+// time, since whoever shares the description can change it.
+func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, src io.Reader, bufs [][]byte, nonblocking bool) (uint64, int32) {
+	r := w.inputReader(op, src)
+	// now reads what there is without waiting; served is false when there
+	// is nothing.
+	now := func() (n uint64, errno int32, served bool) {
+		if k, err, ok := r.take(bufs); ok {
+			n, errno = w.readResult(call, k, err)
+			return n, errno, true
 		}
-		r.request()
+		if file, direct := r.directFile(); direct {
+			n, errno = w.readNow(call, op, file, bufs)
+			return n, errno, errno != _wasiEAGAIN
+		}
+		return 0, _wasiESUCCESS, false
+	}
+	for {
+		if n, errno, served := now(); served {
+			return n, errno
+		}
+		set := []hostWaitFD{{source: r, op: op}}
+		if file, direct := r.directFile(); direct {
+			set = append(set, hostWaitFD{stream: file, want: hostWantInput, op: op})
+		} else {
+			r.request()
+		}
 		if nonblocking {
 			return 0, _wasiEAGAIN
 		}
@@ -20360,15 +21260,49 @@ func (w *WasiStubs) readThroughReader(m *Module, call string, op *wasiOpen, r *s
 		if !interrupted {
 			continue
 		}
-		n, err, ok := r.take(bufs)
-		if !ok {
+		n, errno, served := now()
+		if !served {
 			return 0, _wasiEINTR
 		}
 		// The read went through: the next call that waits reports the
 		// signal.
 		w.keepInterrupt(m)
-		return w.readResult(call, n, err)
+		return n, errno
 	}
+}
+
+// directFile returns the reader's stream when it is read and waited for
+// without the reader (nonblockingFile) and the reader has no Read in
+// progress and keeps nothing: a Read asked for in blocking mode can be
+// waiting in the kernel still and take the input that comes first, and the
+// reads take what it read first.
+func (r *streamReader) directFile() (*os.File, bool) {
+	if r.busy() {
+		return nil, false
+	}
+	return r.nonblockingFile()
+}
+
+// nonblockingFile returns the reader's stream when it is a descriptor of
+// the host's whose open file description is in non-blocking mode, in which
+// the reader's Read would not wait for input and report EAGAIN, neither
+// input nor its end. Not for a file that cannot be asked (closed), whose
+// Read reports the closing.
+func (r *streamReader) nonblockingFile() (*os.File, bool) {
+	file, isFile := r.hostFile()
+	if !isFile {
+		return nil, false
+	}
+	mayBlock := true
+	hostDescriptor(file, func(fd uintptr) { mayBlock = hostMayBlock(fd) })
+	return file, !mayBlock
+}
+
+// hostFile returns the reader's stream when it is a descriptor of the
+// host's that poll(2) can be asked about: not where the host has none.
+func (r *streamReader) hostFile() (*os.File, bool) {
+	file, isFile := r.src.(*os.File)
+	return file, isFile && hostPolls
 }
 
 // inputReader returns the reader of src, the stream behind the entry op
@@ -20568,7 +21502,7 @@ func (w *WasiStubs) readHostAttempt(m *Module, call string, op *wasiOpen, src sy
 			return recvNow(fd, bufs)
 		case look:
 			ready := []bool{false}
-			if err := hostWaitReady([]uintptr{fd}, []int{hostWantInput}, ready, time.Now(), -1); err != nil {
+			if err := hostWaitReady([]uintptr{fd}, []int{hostWantInput}, ready, nil, time.Now(), -1); err != nil {
 				return 0, false, err
 			}
 			if !ready[0] {
@@ -20850,6 +21784,8 @@ var (
 	wasip1NativeHostFDRaw []byte
 	//go:embed wasip1_native_nolinux.go
 	wasip1NativeNoLinuxRaw []byte
+	//go:embed wasip1_native_clock.go
+	wasip1NativeClockRaw []byte
 	//go:embed wasip1_native_descriptors.go
 	wasip1NativeDescriptorsRaw []byte
 	//go:embed wasip1_native_linux_msg.go
@@ -20874,8 +21810,12 @@ var (
 	//go:embed wasip1_native_terminal_darwin.go
 	wasip1NativeTerminalDarwinRaw []byte
 
+	//go:embed wasip1_native_ipc.go
+	wasip1NativeIPCRaw []byte
 	//go:embed wasip1_native_ipc_linux.go
 	wasip1NativeIPCLinuxRaw []byte
+	//go:embed wasip1_native_ipc_darwin.go
+	wasip1NativeIPCDarwinRaw []byte
 	//go:embed wasip1_native_ipc_other.go
 	wasip1NativeIPCOtherRaw []byte
 
@@ -20900,6 +21840,7 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_other.go":   wasip1NativeOtherRaw,
 		"wasip1_native_hostfd.go":  wasip1NativeHostFDRaw,
 		"wasip1_native_nolinux.go": wasip1NativeNoLinuxRaw,
+		"wasip1_native_clock.go":   wasip1NativeClockRaw,
 
 		"wasip1_native_descriptors.go": wasip1NativeDescriptorsRaw,
 
@@ -20917,8 +21858,10 @@ func (t *translator) emitWasip1Platform(pkg string) (map[string][]byte, error) {
 		"wasip1_native_terminal_linux.go":  wasip1NativeTerminalLinuxRaw,
 		"wasip1_native_terminal_darwin.go": wasip1NativeTerminalDarwinRaw,
 
-		"wasip1_native_ipc_linux.go": wasip1NativeIPCLinuxRaw,
-		"wasip1_native_ipc_other.go": wasip1NativeIPCOtherRaw,
+		"wasip1_native_ipc.go":        wasip1NativeIPCRaw,
+		"wasip1_native_ipc_linux.go":  wasip1NativeIPCLinuxRaw,
+		"wasip1_native_ipc_darwin.go": wasip1NativeIPCDarwinRaw,
+		"wasip1_native_ipc_other.go":  wasip1NativeIPCOtherRaw,
 
 		"wasip1_syscalls_linux.go": wasip1SyscallsLinuxRaw,
 	} {

@@ -129,6 +129,10 @@ func hostSetUmask(mask os.FileMode) (os.FileMode, error) {
 	return prev, nil
 }
 
+// hostHasUmask says that the system takes the host process's umask out of
+// the mode of what it creates (create).
+const hostHasUmask = true
+
 // hostSetThreadUmask sets the umask of a creation thread (umask(2) on it,
 // whose file system attributes are its own).
 func hostSetThreadUmask(mask os.FileMode) { syscall.Umask(int(mask.Perm())) }
@@ -264,6 +268,42 @@ func writevRaw(fd uintptr, bufs [][]byte) (n int, again bool, err error) {
 		runtime.KeepAlive(iov)
 		return r, errno
 	})
+}
+
+// hostNowaitTerminal returns a file, under name, of an open file
+// description of the terminal fd's own, open for what fd is open for and in
+// non-blocking mode, made as the runtime makes its own descriptors
+// (hostReopen): a write of it takes what the terminal has room for and does
+// not wait for the rest, whatever the mode of fd's description. It is nil
+// for a terminal that is not opened so: the master side of a
+// pseudo-terminal, whose open makes a new one (hostReopensTerminal), a
+// terminal of a host without /proc, one the process may not open (EACCES,
+// EPERM) or that is in exclusive use (EBUSY).
+func hostNowaitTerminal(fd uintptr, name string) (*os.File, error) {
+	reopens, err := hostReopensTerminal(fd)
+	if err != nil || !reopens {
+		return nil, err
+	}
+	flags, err := descriptorFlags(int(fd), syscall.F_GETFL)
+	if err != nil {
+		return nil, os.NewSyscallError("fcntl", err)
+	}
+	own := -1
+	err = makeRuntimeDescriptors(func() error {
+		var err error
+		if own, err = hostReopen(fd, flags&syscall.O_ACCMODE|syscall.O_NONBLOCK|syscall.O_NOCTTY); err != nil {
+			return err
+		}
+		own, err = keepRuntimeFD(own)
+		return err
+	})
+	switch {
+	case err == nil:
+		return os.NewFile(uintptr(own), name), nil
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, fs.ErrPermission), errors.Is(err, syscall.EBUSY):
+		return nil, nil
+	}
+	return nil, err
 }
 
 // messageIO makes system call trap, recvmsg(2) or sendmsg(2)
@@ -474,13 +514,46 @@ func hostSetsid() (int32, error) {
 // and a session of its own or in a group given (hostJobAttr).
 const hostJobControl = true
 
-// hostJobAttr returns the attributes that start a command in the host's
-// process group and session job names, nil for the host process's.
-func hostJobAttr(job hostJob) *syscall.SysProcAttr {
+// hostJobAttr returns the attributes that start a command whose
+// descriptors are files (^uintptr(0) for one it does not get) in the host's
+// process group and session job names, nil for the host process's: with
+// the terminal of job, the first of files open on it is the controlling
+// terminal of the command's session.
+func hostJobAttr(job hostJob, files []uintptr) (*syscall.SysProcAttr, error) {
 	if !job.setsid && !job.setpgid {
-		return nil
+		return nil, nil
 	}
-	return &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid, Foreground: job.foreground, Ctty: job.ctty}
+	attr := &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid, Foreground: job.foreground, Ctty: job.ctty}
+	if job.terminal == 0 {
+		return attr, nil
+	}
+	for i, fd := range files {
+		if fd == ^uintptr(0) {
+			continue
+		}
+		device, err := hostDevice(int(fd))
+		if err != nil {
+			return nil, err
+		}
+		if device == job.terminal {
+			attr.Setctty, attr.Ctty = true, i
+			break
+		}
+	}
+	return attr, nil
+}
+
+// hostDevice returns the device the special file open as descriptor fd
+// stands for (st_rdev), 0 for a file of another kind.
+func hostDevice(fd int) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return 0, os.NewSyscallError("fstat", err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		return 0, nil
+	}
+	return uint64(st.Rdev), nil
 }
 
 // hostProcessGroup returns the host process's process group (getpgrp(2)).
@@ -1355,6 +1428,7 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (in
 //     a pipe or FIFO to or from, and the terminal itself;
 //   - for a stream that is no file of the host, the end of a pipe of the
 //     runtime's that it copies the stream to or from (outputCopy, inputCopy);
+//   - the number closed for a closed one (commandStream.closed);
 //   - the null device for none.
 //
 // A stdout and a stderr with one destination (sameDestination) are one
@@ -1381,8 +1455,11 @@ func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string
 		}
 		return withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
 			return withCommandFiles(fds, inherit, func(files []uintptr) error {
-				var err error
-				pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: files, Sys: hostJobAttr(job)})
+				sys, err := hostJobAttr(job, files)
+				if err != nil {
+					return err
+				}
+				pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: files, Sys: sys})
 				return err
 			})
 		})
@@ -1517,6 +1594,8 @@ type commandSetup struct {
 // the command; see startCommand.
 func (c *commandSetup) add(i int, s *commandStream, share *familyStreams, report func(error)) error {
 	switch {
+	case s.closed:
+		return nil // no conn: closed in the command (withHostDescriptors)
 	case s.socket:
 		return c.copyHost(i, s.host, "socket", s, report)
 	case s.host != nil:
@@ -1748,13 +1827,18 @@ func withCommandFiles(std []uintptr, inherit []commandDescriptor, use func(files
 }
 
 // withHostDescriptors calls use with the descriptors of conns, each
-// borrowed as withHostDescriptor borrows it, all at once.
+// borrowed as withHostDescriptor borrows it, all at once; a nil conn is
+// ^uintptr(0), a number syscall.StartProcess closes in the command.
 func withHostDescriptors(conns []syscall.Conn, use func(fds []uintptr) error) error {
 	fds := make([]uintptr, 0, len(conns))
 	var from func(i int) error
 	from = func(i int) error {
 		if i == len(conns) {
 			return use(fds)
+		}
+		if conns[i] == nil {
+			fds = append(fds, ^uintptr(0))
+			return from(i + 1)
 		}
 		return withHostDescriptor(conns[i], func(fd uintptr) error {
 			fds = append(fds, fd)
@@ -1905,6 +1989,35 @@ func (c *outputCopy) drain() {
 	data, err := readAvailable(c.src)
 	c.report(err)
 	c.deliver(data)
+}
+
+// unlessOtherKind returns err of an ioctl, but nil for its refusal by a
+// descriptor of another kind than the request is for (ENOTTY, EINVAL).
+func unlessOtherKind(err error) error {
+	if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
+		return nil
+	}
+	return err
+}
+
+// hostPending returns the number of bytes that can be read from fd, a
+// descriptor of the host's, without waiting, as FIONREAD counts them for its
+// kind: of a datagram socket, the next datagram on linux, its whole receive
+// buffer (datagrams and their addresses) on darwin. It is 0 where the host
+// has no count to give, and the call on fd tells what it holds: a kind
+// FIONREAD counts nothing of (unlessOtherKind: a listening socket on
+// linux), a device of darwin's that is no stream (ENODEV: /dev/null,
+// /dev/zero, /dev/random), a terminal that has been hung up on (EIO on
+// linux; hungUp is whether poll(2) says fd was).
+func hostPending(fd uintptr, hungUp bool) (uint64, error) {
+	n, err := hostReadable(fd)
+	switch {
+	case err == nil:
+		return uint64(n), nil
+	case errors.Is(err, syscall.ENODEV), hungUp && errors.Is(err, syscall.EIO):
+		return 0, nil
+	}
+	return 0, unlessOtherKind(err)
 }
 
 // readAvailable reads what is in the pipe whose read end f is now: as much

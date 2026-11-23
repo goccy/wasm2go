@@ -283,7 +283,7 @@ func TestExec_IgnoredTimerIsNotTheCommands(t *testing.T) {
 	w.becomeCommand(m, &commandProcess{Pid: p.Pid})
 	w.sig.mu.Lock()
 	w.sig.timer = time.AfterFunc(time.Hour, func() {})
-	w.sig.timerAt = time.Now()
+	w.sig.timerAt = 0
 	w.fireDueTimerLocked()
 	w.unlockSignals()
 	// What the timer sent, it sent before unlockSignals returned.

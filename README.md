@@ -210,10 +210,35 @@ starts, are made on an OS thread of the instance's whose umask is the
 instance's (`unshare(CLONE_FS)`), so that the kernel takes it out.
 Where `unshare(2)` is refused (Docker's default seccomp profile), and
 on other systems, the runtime takes the instance's umask out of the
-mode of what it makes, and the host process's umask applies as well;
-a command the instance starts gets the host process's umask only. The
-thread ends with `CloseAll`, or when the garbage collector collects an
-instance dropped without it.
+mode of what it makes, and the host process's umask applies as well
+(on darwin the runtime puts back what that takes out); a command the
+instance starts gets the host process's umask only. The
+thread is never ended: once the instance is closed (`CloseAll`, or the
+garbage collector collecting an instance dropped without it), it is kept
+for the next instance that needs one.
+
+`MonotonicClock` reads the guest's monotonic clock (`CLOCK_MONOTONIC`),
+in nanoseconds: what `clock_time_get` reports, what a clock
+subscription of `poll_oneoff` on it waits for (relative or absolute),
+and what the interval timer (`setitimer`, `alarm`) counts. Such a wait
+never ends before the clock reads its end, so that a guest's sleeps and
+timeouts agree with the clock it reads: the host's timers count the
+time left at the last reading, and the clock is read again, the wait
+going on for what is still left. With a clock faster than the host's
+timers, a wait ends when they have counted what was left; with one
+that is slower, coarser or stands still, it waits again each time
+until the clock moves on to the end. A nil one counts from `NewWASI`.
+A forked instance reads its parent's clock.
+
+`HostMonotonicClock()` returns a reader of the clock the Go runtime's
+timers count, by which the guest's waits then end: `CLOCK_MONOTONIC`
+on Linux, the BSDs, Solaris and illumos; `mach_absolute_time` on macOS,
+which is `CLOCK_UPTIME_RAW` and not `CLOCK_MONOTONIC` (it stands still
+while the system sleeps, and the two part by the time the system has
+slept: an embedder whose guest is to read macOS's `CLOCK_MONOTONIC`
+supplies a `MonotonicClock` of its own that reads it); the interrupt
+time (`QueryInterruptTime`) on Windows; and `CLOCK_REALTIME`, the one
+the Go runtime counts by there, on AIX.
 
 `Signals` connects the guest's signals with what is outside it: its
 `Kill` is given the guest's `kill` of a process that is not the
@@ -236,11 +261,29 @@ signals the runtime raises for a guest itself (the interval timer's
 `SIGALRM`, a child's `SIGCHLD` once its status can be waited for, a
 `kill` of its own pid, a raise, the `SIGPIPE` of a write that fails
 with `EPIPE`) before the guest is given them; one it takes is not the
-guest's. `ForkProc` forks an instance that its
+guest's. `SignalIgnored` is asked of a signal the guest leaves at its
+default action whether the process the guest runs as ignores it by an
+action the guest did not set (inherited when the process started, or
+set by code outside the guest); the guest then takes `SIG_IGN` as its
+own action. A nil one is an isolated guest, which starts with every
+signal at its default action. `ForkProc` forks an instance that its
 parent waits for, under a pid token the fork knows as its own. The
 pid tokens of the forks and the commands a guest starts are numbers
 from 4194304 up, above every pid Linux and darwin hand out, so a token
 passed outside the guest names no process of the host.
+
+`Children` relates the guest's children to the host process's: its
+`CommandPID` decides, for each command a guest starts on Linux and
+darwin, whether the guest knows it by its host pid instead of a token;
+such a command is reaped on the host only once the guest has waited
+for it (or nobody is left to), so its pid names no other process
+meanwhile. Its `Adopt` is asked by a guest's `waitpid` for a pid that
+is no process of the fork family nor a command the runtime started,
+and makes a child of the host process that the runtime did not start
+(one native code spawned) a child the guest waits for, signals and
+gets `SIGCHLD` for; its `release` is called once the guest has
+collected the status, for the embedder to reap it. A nil `Children`
+gives every command a token and adopts nothing.
 
 `Fork` makes the instance the child of the guest's `fork`
 (`proc_fork`) runs in; a nil one fails it with `ENOSYS`. `CopyForker`

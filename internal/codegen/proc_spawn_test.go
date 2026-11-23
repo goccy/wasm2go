@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -139,6 +141,103 @@ func TestWasi_ProcSpawnExecHookDenies(t *testing.T) {
 	want := ExecRequest{Path: "/bin/echo", Argv: []string{"/bin/echo", "x"}, Env: []string{"LD_PRELOAD=/tmp/x.so"}, Dir: "/work"}
 	if len(seen) != 1 || !reflect.DeepEqual(seen[0], want) {
 		t.Errorf("exec hook saw %+v, want %+v", seen, want)
+	}
+}
+
+// CommandDir is asked, after Exec, where a command starts, with the host
+// path of the guest's working directory: "" starts it in the host
+// process's working directory, inherited without changing into it, another
+// directory starts it there, and an error fails the spawn with its errno.
+func TestWasi_ProcSpawnCommandDir(t *testing.T) {
+	if _, err := os.Stat("/bin/pwd"); err != nil {
+		t.Skip("/bin/pwd not available")
+	}
+	host, guest := t.TempDir(), t.TempDir()
+	t.Chdir(host)
+	w, m := newTestStubs(t, "/")
+	var out bytes.Buffer
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &out, &bytes.Buffer{}, bytes.NewReader(nil)
+	var seen []ExecRequest
+	w.cfg.Exec = func(req ExecRequest) bool { seen = append(seen, req); return true }
+	var asked []string
+	var dir string
+	var dirErr error
+	w.cfg.CommandDir = func(d string) (string, error) { asked = append(asked, d); return dir, dirErr }
+	pathOff := writeCStr(m, 1000, "/bin/pwd")
+	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/pwd", "-P"})
+	cwdOff := writeCStr(m, 7000, guest)
+	const pidOff, statusOff int32 = 4000, 4004
+	pwd := func() string {
+		t.Helper()
+		out.Reset()
+		if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, cwdOff, pidOff); rc != _wasiESUCCESS {
+			t.Fatalf("Proc_spawn rc=%d", rc)
+		}
+		if rc := w.Proc_wait(m, int32(binary.LittleEndian.Uint32(m.memory[pidOff:])), 0, statusOff); rc != _wasiESUCCESS {
+			t.Fatalf("Proc_wait rc=%d", rc)
+		}
+		return strings.TrimSuffix(out.String(), "\n")
+	}
+	physical := func(p string) string {
+		t.Helper()
+		r, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	if got, want := pwd(), physical(host); got != want {
+		t.Errorf("command for \"\" started in %q, want the host process's %q", got, want)
+	}
+	if len(asked) != 1 || len(seen) != 1 || asked[0] != seen[0].Dir {
+		t.Errorf("CommandDir was asked %q, Exec %+v; want it asked the Dir Exec saw", asked, seen)
+	}
+	dir = guest
+	if got, want := pwd(), physical(guest); got != want {
+		t.Errorf("command for %q started in %q, want %q", guest, got, want)
+	}
+	dir, dirErr = "", syscall.EPERM
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, cwdOff, pidOff); rc != -_wasiEPERM {
+		t.Errorf("Proc_spawn when CommandDir fails with EPERM rc=%d, want -EPERM", rc)
+	}
+}
+
+// A command started in the host process's working directory runs though
+// the directory may no longer be searched: it is inherited, not changed
+// into.
+func TestWasi_ProcSpawnInheritsAnUnsearchableDirectory(t *testing.T) {
+	if _, err := os.Stat("/bin/echo"); err != nil {
+		t.Skip("/bin/echo not available")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root may search any directory")
+	}
+	here := t.TempDir()
+	t.Chdir(here)
+	if err := os.Chmod(here, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(here, 0o755); err != nil {
+			t.Error(err)
+		}
+	})
+	w, m := newTestStubs(t, "/")
+	var out bytes.Buffer
+	w.cfg.Stdout, w.cfg.Stderr, w.cfg.Stdin = &out, &bytes.Buffer{}, bytes.NewReader(nil)
+	w.cfg.CommandDir = func(string) (string, error) { return "", nil }
+	pathOff := writeCStr(m, 1000, "/bin/echo")
+	argvOff := writeArgv(m, 2000, 3000, []string{"/bin/echo", "started"})
+	cwdOff := writeCStr(m, 7000, here)
+	const pidOff, statusOff int32 = 4000, 4004
+	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, -1, -1, -1, cwdOff, pidOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_spawn rc=%d", rc)
+	}
+	if rc := w.Proc_wait(m, int32(binary.LittleEndian.Uint32(m.memory[pidOff:])), 0, statusOff); rc != _wasiESUCCESS {
+		t.Fatalf("Proc_wait rc=%d", rc)
+	}
+	if got := out.String(); got != "started\n" {
+		t.Errorf("output %q, want %q", got, "started\n")
 	}
 }
 

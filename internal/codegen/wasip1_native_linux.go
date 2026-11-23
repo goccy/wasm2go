@@ -235,17 +235,8 @@ func hostReopensTerminal(fd uintptr) (bool, error) {
 	return false, nil
 }
 
-// unlessOtherKind returns err of an ioctl, but nil for its refusal by a
-// descriptor of another kind than the request is for (ENOTTY, EINVAL).
-func unlessOtherKind(err error) error {
-	if errors.Is(err, syscall.ENOTTY) || errors.Is(err, syscall.EINVAL) {
-		return nil
-	}
-	return err
-}
-
-// hostReadable returns the number of bytes that can be read from fd, a
-// pipe, without waiting (FIONREAD).
+// hostReadable returns the number of bytes that can be read from fd without
+// waiting (FIONREAD).
 func hostReadable(fd uintptr) (int, error) {
 	var n int32
 	err := hostIoctl(fd, syscall.TIOCINQ, unsafe.Pointer(&n))
