@@ -1065,6 +1065,57 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		if _, rc := acceptOn(w, m, server); rc != _wasiESUCCESS {
 			t.Fatalf("accept of the connection made in the host rc=%d", rc)
 		}
+
+		// A connect that went on in the host and failed reports the failure
+		// once, as Linux does: to getsockopt(SO_ERROR), or to the next
+		// connect, blocking or not.
+		filler := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+		if rc := w.Sock_connect_addr(m, filler, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS {
+			t.Fatalf("connect filling the backlog rc=%d", rc)
+		}
+		var late [3]int32
+		for i := range late {
+			late[i] = openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+			postWhenBlocked(w, wasiSIGUSR1)
+			if rc := w.Sock_connect_addr(m, late[i], sockAddrOff, sockPathOff, n); rc != -_wasiEINTR {
+				t.Fatalf("connect %d to a full backlog with a signal rc=%d, want -EINTR", i, rc)
+			}
+			takeSignals(t, w, m)
+		}
+		// the listener's close refuses the connects waiting for its room
+		closeTestFd(t, w, m, server)
+		for _, fd := range late {
+			op := entryOf(t, w, fd)
+			op.mu.Lock()
+			c := op.sock.connecting
+			op.mu.Unlock()
+			if c == nil {
+				t.Fatalf("no connect of %d under way in the host after the interrupted one", fd)
+			}
+			within(t, "the connect in the host", c.done)
+		}
+		// a connect of its own now fails otherwise
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if v, rc := getOpt(w, m, late[0], wasiSockOptError); rc != _wasiESUCCESS || v != _wasiECONNREFUSED {
+			t.Fatalf("SO_ERROR after the connect in the host was refused = %d rc=%d, want ECONNREFUSED", v, rc)
+		}
+		if v, rc := getOpt(w, m, late[0], wasiSockOptError); rc != _wasiESUCCESS || v != 0 {
+			t.Fatalf("SO_ERROR read again = %d rc=%d, want 0", v, rc)
+		}
+		if rc := w.Sock_connect_addr(m, late[1], sockAddrOff, sockPathOff, n); rc != -_wasiECONNREFUSED {
+			t.Fatalf("connect after the connect in the host was refused rc=%d, want -ECONNREFUSED", rc)
+		}
+		if rc := w.Sock_connect_addr(m, late[1], sockAddrOff, sockPathOff, n); rc != -_wasiENOENT {
+			t.Fatalf("connect after the refusal was reported rc=%d, want -ENOENT", rc)
+		}
+		if rc := w.Fd_fdstat_set_flags(m, late[2], wasiFdflagNonblock); rc != _wasiESUCCESS {
+			t.Fatalf("NONBLOCK rc=%d", rc)
+		}
+		if rc := w.Sock_connect_addr(m, late[2], sockAddrOff, sockPathOff, n); rc != -_wasiECONNREFUSED {
+			t.Fatalf("non-blocking connect after the connect in the host was refused rc=%d, want -ECONNREFUSED", rc)
+		}
 	})
 
 	// A command gets the guest's descriptors above 2 that are not
