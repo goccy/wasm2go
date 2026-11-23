@@ -3824,6 +3824,19 @@ type wasiPIDs struct {
 	// foreground (hostJob). 0 when there is none.
 	foreground int32
 	terminal   int
+	// terminals holds the controlling terminal each session of the family
+	// that is not the host process's took (TIOCSCTTY), by the session's
+	// id, while the session has a process.
+	terminals map[int32]sessionTerminal
+}
+
+// sessionTerminal is the controlling terminal of a session of the family
+// (wasiPIDs.terminals): its name on the host, which /dev/tty of the
+// session's processes opens, and the device it is (st_rdev), which the
+// command the session's leader becomes takes for its own (hostJob).
+type sessionTerminal struct {
+	path   string
+	device uint64
 }
 
 // enter makes proc reachable by pid for every instance of the family.
@@ -3864,7 +3877,23 @@ func (p *wasiPIDs) removeLocked(pid int32) {
 	if proc := p.procs[pid]; proc != nil {
 		delete(p.procs, pid)
 		p.leftGroupLocked(proc.pgid)
+		p.leftSessionLocked(proc.sid)
 	}
+}
+
+// leftSessionLocked is told that a process has left the session sid: the
+// session's controlling terminal is let go once it has no process left.
+// Caller holds p.mu.
+func (p *wasiPIDs) leftSessionLocked(sid int32) {
+	if _, ok := p.terminals[sid]; !ok {
+		return
+	}
+	for _, proc := range p.procs {
+		if proc.sid == sid {
+			return
+		}
+	}
+	delete(p.terminals, sid)
 }
 
 // leftGroupLocked is told that a process has left the group pgid. Once
@@ -3931,10 +3960,14 @@ type commandJob struct {
 // (setpgid with pgid 0), the host's group pgid (setpgid), or, with
 // neither, the host process's. With foreground its group of its own is
 // made the foreground one of the terminal ctty, a descriptor of the host
-// process's, before the command runs.
+// process's, before the command runs. A command in a session of its own
+// takes for its controlling terminal the one of its descriptors open on
+// the terminal device terminal (st_rdev), when it is not 0 and the command
+// has one.
 type hostJob struct {
 	setsid, setpgid, foreground bool
 	pgid, ctty                  int
+	terminal                    uint64
 }
 
 // commandJob decides where a command the family's process pid starts is
@@ -3953,7 +3986,9 @@ type hostJob struct {
 // (hostJobControl) every command is in the host process's group and
 // session. With execs the command is pid's process (Proc_exec), which is
 // becoming it from here on (wasiProc.execed): its group cannot be changed
-// any more. Caller holds p.starts, until started.
+// any more; when pid leads its session, the command takes the session's
+// controlling terminal (wasiPIDs.terminals). Caller holds p.starts, until
+// started.
 func (p *wasiPIDs) commandJob(pid int32, execs bool) commandJob {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3972,6 +4007,9 @@ func (p *wasiPIDs) commandJob(pid int32, execs bool) commandJob {
 	case job.sid != p.hostSession:
 		job.host.setsid = true
 		job.inHostGroup, job.leads = g == nil, g == nil
+		if execs && pid == job.sid {
+			job.host.terminal = p.terminals[job.sid].device
+		}
 	case job.pgid == p.hostGroup:
 	case g != nil:
 		job.host = hostJob{setpgid: true, pgid: g.host}
@@ -6671,9 +6709,10 @@ func (p *wasiPIDs) setsid(pid int32) int32 {
 			return _wasiEPERM
 		}
 	}
-	was := proc.pgid
+	was, wasSid := proc.pgid, proc.sid
 	proc.pgid, proc.sid = pid, pid
 	p.leftGroupLocked(was)
+	p.leftSessionLocked(wasSid)
 	return _wasiESUCCESS
 }
 
@@ -10927,6 +10966,20 @@ func (w *WasiStubs) pathOpenAt(m *Module, from *wasiOpen, raw string, dirflags, 
 		return w.openDescriptorListing(dir, oflags, canWrite)
 	}
 	fsys, name := w.atFS(from, raw, rel)
+	if rel == "dev/tty" {
+		w.mu.Lock()
+		pids := w.pidsLocked()
+		w.mu.Unlock()
+		if path, own := pids.sessionTerminal(w.guestPID()); own {
+			// The controlling terminal of a session of the family's own,
+			// whose name the descriptor has.
+			if path == "" {
+				return -1, _wasiENXIO
+			}
+			rel = strings.TrimPrefix(path, "/")
+			fsys, name = osFS{}, rel
+		}
+	}
 	// An open that does not wait is made as the runtime makes its own
 	// descriptors (makeRuntimeDescriptors); one of a FIFO that waits for
 	// the other end (openFIFO) is moved up once it is made.
@@ -15948,10 +16001,13 @@ func (a *terminalArg) encode(mem []byte) {
 // process group or controlling terminal but through TIOCSPGRP
 // (terminalGroup): TIOCGPGRP and TIOCSPGRP read and set the foreground
 // group of the controlling terminal of the guest's session as the family's.
-// Returns what the call returned, or a negative errno: EBADF, ENOTTY for a
-// request it does not make and for a descriptor that is no terminal or not
-// the controlling terminal, EPERM for a group of another session, ENOSYS
-// for TIOCSCTTY and TIOCNOTTY.
+// A session of the family's own takes its controlling terminal with
+// TIOCSCTTY (takeTerminal). Returns what the call returned, or a negative
+// errno: EBADF, ENOTTY for a request it does not make and for a descriptor
+// that is no terminal or not the controlling terminal, EPERM for a group
+// of another session, ENOSYS for TIOCNOTTY, for TIOCSCTTY of the session
+// the host process is in, and for the foreground group of the controlling
+// terminal of a session of the family's own.
 func (w *WasiStubs) Fd_ioctl(m *Module, fd, request, arg int32) int32 {
 	return w.fdIoctl(m, fd, uint32(request), zext(arg), arg)
 }
@@ -16002,7 +16058,9 @@ func (w *WasiStubs) fdIoctl(m *Module, fd int32, request uint32, addr uint64, va
 			if w.cfg.Process == nil {
 				return syscall.ENOTTY
 			}
-		case linuxTIOCSCTTY, linuxTIOCNOTTY:
+		case linuxTIOCSCTTY:
+			return w.takeTerminal(hostFD)
+		case linuxTIOCNOTTY:
 			return syscall.ENOSYS
 		}
 		var err error
@@ -16066,6 +16124,17 @@ func (p *wasiPIDs) terminalGroup(pid int32, fd int, set bool, pgrp int32) (was i
 		sid = proc.sid
 	}
 	if sid != p.hostSession {
+		// The runtime keeps no foreground group for the controlling
+		// terminal of a session of the family's own.
+		if t, ok := p.terminals[sid]; ok {
+			device, err := hostDevice(fd)
+			if err != nil {
+				return 0, -1, err
+			}
+			if device == t.device {
+				return 0, -1, syscall.ENOSYS
+			}
+		}
 		return 0, -1, syscall.ENOTTY
 	}
 	current, err := hostForeground(fd)
@@ -16123,6 +16192,93 @@ func (p *wasiPIDs) terminalGroup(pid int32, fd int, set bool, pgrp int32) (was i
 	}
 	p.foreground = 0
 	return was, closing, nil
+}
+
+// takeTerminal is TIOCSCTTY of the guest on the host's terminal fd: the
+// terminal becomes the controlling terminal of the guest's session
+// (wasiPIDs.takeTerminal). Whether it is the controlling terminal of a
+// session of the host's already is asked of the host (TIOCGSID).
+func (w *WasiStubs) takeTerminal(fd int) error {
+	device, err := hostDevice(fd)
+	if err != nil {
+		return err
+	}
+	path, named, err := hostFDLink(uintptr(fd))
+	switch {
+	case err != nil:
+		return err
+	case !named:
+		return syscall.ENOTTY
+	}
+	var session terminalArg
+	session.of(linuxTIOCGSID)
+	_, err = hostTerminalIoctl(fd, linuxTIOCGSID, &session)
+	if err != nil && !errors.Is(err, syscall.ENOTTY) {
+		return err
+	}
+	w.enterRoot()
+	self := w.guestPID()
+	w.mu.Lock()
+	pids := w.pidsLocked()
+	w.mu.Unlock()
+	return pids.takeTerminal(self, w.forked, sessionTerminal{path: path, device: device}, err == nil)
+}
+
+// takeTerminal makes t the controlling terminal of the session of the
+// family's process pid, as TIOCSCTTY without stealing does (tiocsctty of
+// Linux's drivers/tty/tty_jobctrl.c): for a process that leads a session of
+// the family's own without one, when t is the controlling terminal of no
+// other session, the family's or, by taken, the host's. The session the
+// host process is in is the host process's: a process forked within the
+// runtime does not lead it (EPERM), and the root instance's request is not
+// made (ENOSYS).
+func (p *wasiPIDs) takeTerminal(pid int32, forked bool, t sessionTerminal, taken bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sid := p.hostSession
+	if proc := p.procs[pid]; proc != nil {
+		sid = proc.sid
+	}
+	switch {
+	case sid == p.hostSession && !forked:
+		return syscall.ENOSYS
+	case sid != pid || sid == p.hostSession:
+		return syscall.EPERM
+	}
+	if have, ok := p.terminals[sid]; ok {
+		if have.device == t.device {
+			return nil
+		}
+		return syscall.EPERM
+	}
+	if taken {
+		return syscall.EPERM
+	}
+	for _, other := range p.terminals {
+		if other.device == t.device {
+			return syscall.EPERM
+		}
+	}
+	if p.terminals == nil {
+		p.terminals = map[int32]sessionTerminal{}
+	}
+	p.terminals[sid] = t
+	return nil
+}
+
+// sessionTerminal returns the name on the host of the controlling
+// terminal of the session of the family's process pid, which /dev/tty
+// opens, when the session is one of the family's own: own is false for
+// the session the host process is in, whose /dev/tty is the host's, and
+// name is empty for a session without one.
+func (p *wasiPIDs) sessionTerminal(pid int32) (name string, own bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	proc := p.procs[pid]
+	if proc == nil || proc.sid == p.hostSession {
+		return "", false
+	}
+	return p.terminals[proc.sid].path, true
 }
 
 // ----- numbers of another system -----------------------------------------------

@@ -477,12 +477,11 @@ func (l turnWriter) Write(p []byte) (int, error) {
 
 // This platform has no process groups or sessions the runtime can change
 // or put a command in: every command is in the host process's.
-func hostGetpgid(pid int32) (int32, error)         { return 0, errors.ErrUnsupported }
-func hostSetpgid(pid, pgid int32) error            { return errors.ErrUnsupported }
-func hostSetsid() (int32, error)                   { return 0, errors.ErrUnsupported }
-func hostJobAttr(job hostJob) *syscall.SysProcAttr { return nil }
-func killHostGroup(pgid int, sig int32) error      { return errors.ErrUnsupported }
-func hostWaitExited(pid int) (int32, error)        { return 0, errors.ErrUnsupported }
+func hostGetpgid(pid int32) (int32, error)    { return 0, errors.ErrUnsupported }
+func hostSetpgid(pid, pgid int32) error       { return errors.ErrUnsupported }
+func hostSetsid() (int32, error)              { return 0, errors.ErrUnsupported }
+func killHostGroup(pgid int, sig int32) error { return errors.ErrUnsupported }
+func hostWaitExited(pid int) (int32, error)   { return 0, errors.ErrUnsupported }
 
 const hostJobControl = false
 
@@ -491,6 +490,7 @@ func hostProcessGroup() int                { return 0 }
 func hostForeground(fd int) (int, error)   { return 0, syscall.ENOTTY }
 func hostSetForeground(fd, pgid int) error { return syscall.ENOTTY }
 func dupHostFD(fd uintptr) (int, error)    { return -1, errors.ErrUnsupported }
+func hostDevice(fd int) (uint64, error)    { return 0, errors.ErrUnsupported }
 
 // commandProcess is a command of the host's the runtime started: package
 // os's process here.

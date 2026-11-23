@@ -478,13 +478,46 @@ func hostSetsid() (int32, error) {
 // and a session of its own or in a group given (hostJobAttr).
 const hostJobControl = true
 
-// hostJobAttr returns the attributes that start a command in the host's
-// process group and session job names, nil for the host process's.
-func hostJobAttr(job hostJob) *syscall.SysProcAttr {
+// hostJobAttr returns the attributes that start a command whose
+// descriptors are files (^uintptr(0) for one it does not get) in the host's
+// process group and session job names, nil for the host process's: with
+// the terminal of job, the first of files open on it is the controlling
+// terminal of the command's session.
+func hostJobAttr(job hostJob, files []uintptr) (*syscall.SysProcAttr, error) {
 	if !job.setsid && !job.setpgid {
-		return nil
+		return nil, nil
 	}
-	return &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid, Foreground: job.foreground, Ctty: job.ctty}
+	attr := &syscall.SysProcAttr{Setsid: job.setsid, Setpgid: job.setpgid, Pgid: job.pgid, Foreground: job.foreground, Ctty: job.ctty}
+	if job.terminal == 0 {
+		return attr, nil
+	}
+	for i, fd := range files {
+		if fd == ^uintptr(0) {
+			continue
+		}
+		device, err := hostDevice(int(fd))
+		if err != nil {
+			return nil, err
+		}
+		if device == job.terminal {
+			attr.Setctty, attr.Ctty = true, i
+			break
+		}
+	}
+	return attr, nil
+}
+
+// hostDevice returns the device the special file open as descriptor fd
+// stands for (st_rdev), 0 for a file of another kind.
+func hostDevice(fd int) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return 0, os.NewSyscallError("fstat", err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		return 0, nil
+	}
+	return uint64(st.Rdev), nil
 }
 
 // hostProcessGroup returns the host process's process group (getpgrp(2)).
@@ -1386,8 +1419,11 @@ func (w *WasiStubs) startCommand(op, path string, argv, env []string, dir string
 		}
 		return withHostDescriptors(setup.conns[:], func(fds []uintptr) error {
 			return withCommandFiles(fds, inherit, func(files []uintptr) error {
-				var err error
-				pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: files, Sys: hostJobAttr(job)})
+				sys, err := hostJobAttr(job, files)
+				if err != nil {
+					return err
+				}
+				pid, _, err = syscall.StartProcess(path, argv, &syscall.ProcAttr{Dir: dir, Env: env, Files: files, Sys: sys})
 				return err
 			})
 		})
