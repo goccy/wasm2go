@@ -1264,6 +1264,23 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// A standard descriptor the guest closed is closed in a command it
+	// starts with it, as exec(2) leaves it: not the null device.
+	t.Run("CommandsHaveClosedStandardDescriptorsClosed", func(t *testing.T) {
+		w, m := newHostNumberedStubs(t, nil, nil)
+		w.cfg.Exec = AllowAllExec
+		closeTestFd(t, w, m, 0)
+		r, wr := newTestPipe(t, w, m)
+		pid := spawnWithStreams(t, w, m, 0, wr, wr, "/bin/cat", "/dev/fd/0")
+		closeTestFd(t, w, m, wr)
+		status := waitStatus(t, w, m, pid)
+		out := readToEnd(t, w, m, r)
+		closeTestFd(t, w, m, r)
+		if status == 0 {
+			t.Fatalf("cat read the command's descriptor 0 (output %q), want it closed", out)
+		}
+	})
+
 	// A descriptor made outside the guest after the instance is the
 	// guest's by its number; one the process had before is not.
 	t.Run("Adopt", func(t *testing.T) {

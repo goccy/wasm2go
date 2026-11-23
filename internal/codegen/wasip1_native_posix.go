@@ -1359,6 +1359,7 @@ func hostRawSyscall(number uintptr, args [6]uint64, ptrs uint32, mem []byte) (in
 //     a pipe or FIFO to or from, and the terminal itself;
 //   - for a stream that is no file of the host, the end of a pipe of the
 //     runtime's that it copies the stream to or from (outputCopy, inputCopy);
+//   - the number closed for a closed one (commandStream.closed);
 //   - the null device for none.
 //
 // A stdout and a stderr with one destination (sameDestination) are one
@@ -1521,6 +1522,8 @@ type commandSetup struct {
 // the command; see startCommand.
 func (c *commandSetup) add(i int, s *commandStream, share *familyStreams, report func(error)) error {
 	switch {
+	case s.closed:
+		return nil // no conn: closed in the command (withHostDescriptors)
 	case s.socket:
 		return c.copyHost(i, s.host, "socket", s, report)
 	case s.host != nil:
@@ -1752,13 +1755,18 @@ func withCommandFiles(std []uintptr, inherit []commandDescriptor, use func(files
 }
 
 // withHostDescriptors calls use with the descriptors of conns, each
-// borrowed as withHostDescriptor borrows it, all at once.
+// borrowed as withHostDescriptor borrows it, all at once; a nil conn is
+// ^uintptr(0), a number syscall.StartProcess closes in the command.
 func withHostDescriptors(conns []syscall.Conn, use func(fds []uintptr) error) error {
 	fds := make([]uintptr, 0, len(conns))
 	var from func(i int) error
 	from = func(i int) error {
 		if i == len(conns) {
 			return use(fds)
+		}
+		if conns[i] == nil {
+			fds = append(fds, ^uintptr(0))
+			return from(i + 1)
 		}
 		return withHostDescriptor(conns[i], func(fd uintptr) error {
 			fds = append(fds, fd)

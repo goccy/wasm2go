@@ -5760,8 +5760,8 @@ func (w *WasiStubs) fdCloexec(m *Module, fd, set, value int32, oldPtr uint64) in
 // guest's descriptor for it resolves (commandStreamLocked): a descriptor
 // of the host (host), which the command is given its own open file
 // description of or shares (startCommand); a stream the runtime copies to
-// or from (reader for the stdin, writer for the stdout and stderr); or
-// none of them, the null device.
+// or from (reader for the stdin, writer for the stdout and stderr); a
+// closed number (closed); or none of them, the null device.
 type commandStream struct {
 	host   syscall.Conn
 	reader io.Reader
@@ -5782,6 +5782,10 @@ type commandStream struct {
 	// stdio is the instance's standard stream (1/2/3, as wasiOpen.stdio)
 	// the stream is, 0 for none.
 	stdio int8
+	// closed marks a descriptor the guest has closed where its descriptors
+	// are the host's (hostFamily): the command has the number closed, as
+	// exec(2) leaves it.
+	closed bool
 }
 
 // commandDescriptor is a descriptor of the guest's above its standard
@@ -5828,7 +5832,9 @@ func (w *WasiStubs) inheritedLocked() []commandDescriptor {
 // the stderr). A negative fd asks for the instance's stream. Any other fd
 // is resolved through the fd table like a read (slot 1) or a write of it:
 // the standard stream, file, pipe end or socket it refers to, and none —
-// the null device — when the fd is closed or not open that way. A socket
+// the null device — when the fd is closed or not open that way (a closed
+// one is closed in the command where the instance's descriptors are the
+// host's, hostFamily). A socket
 // is the host's socket (wasiSocket), or the connection of package net's
 // that has a descriptor of the host; any other socket stands for the
 // instance's stream. Caller holds w.mu.
@@ -5841,6 +5847,9 @@ func (w *WasiStubs) commandStreamLocked(fd int32, slot int8) commandStream {
 		stream, op = w.fdSrcLocked(fd)
 	default:
 		stream, op = w.fdDstLocked(fd)
+	}
+	if fd >= 0 && op == nil && w.hostFamily() {
+		return commandStream{closed: true}
 	}
 	if host := op.hostSocket(); host != nil {
 		return commandStream{host: host, socket: true, op: op}
