@@ -19761,6 +19761,11 @@ type wasiSignals struct {
 	// execed is the command the guest has become (Proc_exec) while it
 	// runs: a signal for the process is the command's (signalProcess).
 	execed *execedCommand
+	// offers are the firings of the interval timer being offered
+	// WASIConfig.TakeSignal (offerAlarm), each closed once it has been
+	// taken or posted. A blocking call that begins or ends waits for the
+	// ones in progress (postDueTimerLocked): their moment came first.
+	offers []chan struct{}
 }
 
 // wasiSignalThread is the signal state of one thread of the guest.
@@ -19842,12 +19847,12 @@ type wasiSignalsDue struct {
 	// alarm is the command the guest has become (Proc_exec), to be sent
 	// the interval timer's SIGALRM (fireDueTimerLocked).
 	alarm *commandProcess
-	// alarmToOffer records a firing of the interval timer to offer
-	// WASIConfig.TakeSignal (fireDueTimerLocked); alarmFor, the thread whose
-	// own host call it came due in, to post it for if not taken
-	// (postForGuestLocked), nil for the host's timer.
-	alarmToOffer bool
-	alarmFor     *wasiSignalThread
+	// alarmOffer is a firing of the interval timer to offer
+	// WASIConfig.TakeSignal (fireDueTimerLocked), one of wasiSignals.offers;
+	// alarmFor, the thread whose own host call it came due in, to post it
+	// for if not taken (postForGuestLocked), nil for the host's timer.
+	alarmOffer chan struct{}
+	alarmFor   *wasiSignalThread
 }
 
 // wasiRaise is a flag word to raise for the signals of bits, posted for
@@ -20203,8 +20208,8 @@ func (w *WasiStubs) unlockSignals() {
 	if due.alarm != nil {
 		w.reportError("proc_itimer", signalHostProc(due.alarm, wasiSIGALRM))
 	}
-	if due.alarmToOffer {
-		w.offerAlarm(due.alarmFor)
+	if due.alarmOffer != nil {
+		w.offerAlarm(due.alarmFor, due.alarmOffer)
 	}
 	// The flags are raised first: a blocking call that a signal interrupts
 	// ends with its thread's flag up, for the guest to find the signal.
@@ -20440,12 +20445,22 @@ func (w *WasiStubs) endBlocking(b *wasiBlocking) (interrupted bool) {
 // postDueTimerLocked posts the firing of the interval timer whose time has
 // come for the guest, from the host call of the thread t
 // (postForGuestLocked), as a blocking call does when it begins and when it
-// ends, and has the guest interrupted by it before the call goes on. Caller
-// holds w.sig.mu, which it holds again on return.
+// ends, and has the guest interrupted by it before the call goes on. A
+// firing the host's timer is offering WASIConfig.TakeSignal meanwhile is
+// waited for until it has been taken or posted. Caller holds w.sig.mu,
+// which it holds again on return.
 func (w *WasiStubs) postDueTimerLocked(t *wasiSignalThread) {
 	w.postForGuestLocked(t, w.fireDueTimerLocked)
-	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil || w.sig.due.alarmToOffer {
+	if len(w.sig.due.raises) > 0 || len(w.sig.due.wakes) > 0 || w.sig.due.alarm != nil || w.sig.due.alarmOffer != nil {
 		w.unlockSignals()
+		w.sig.mu.Lock()
+	}
+	if len(w.sig.offers) > 0 {
+		offers := slices.Clone(w.sig.offers)
+		w.unlockSignals()
+		for _, offer := range offers {
+			<-offer
+		}
 		w.sig.mu.Lock()
 	}
 }
@@ -20779,7 +20794,11 @@ func (w *WasiStubs) fireDueTimerLocked() {
 	}
 	if w.cfg.TakeSignal != nil {
 		// Offered once w.sig.mu is let go (unlockSignals).
-		s.due.alarmToOffer, s.due.alarmFor = true, s.quiet
+		if s.due.alarmOffer == nil {
+			s.due.alarmOffer = make(chan struct{})
+			s.offers = append(s.offers, s.due.alarmOffer)
+		}
+		s.due.alarmFor = s.quiet
 		return
 	}
 	w.postSignalLocked(wasiSIGALRM)
@@ -20787,15 +20806,19 @@ func (w *WasiStubs) fireDueTimerLocked() {
 
 // offerAlarm offers SIGALRM, the firing of the interval timer, to
 // WASIConfig.TakeSignal, and posts it when it is not taken, from the host
-// call of the thread t (postForGuestLocked) when t is not nil. Caller holds
-// neither w.mu nor w.sig.mu; a stream's write lock may be held.
-func (w *WasiStubs) offerAlarm(t *wasiSignalThread) {
-	if w.takeSignal(wasiSIGALRM) {
-		return
+// call of the thread t (postForGuestLocked) when t is not nil; then offer,
+// the firing's in wasiSignals.offers, is closed. Caller holds neither w.mu
+// nor w.sig.mu; a stream's write lock may be held.
+func (w *WasiStubs) offerAlarm(t *wasiSignalThread, offer chan struct{}) {
+	if !w.takeSignal(wasiSIGALRM) {
+		w.sig.mu.Lock()
+		w.postForGuestLocked(t, func() { w.postSignalLocked(wasiSIGALRM) })
+		w.unlockSignals()
 	}
 	w.sig.mu.Lock()
-	w.postForGuestLocked(t, func() { w.postSignalLocked(wasiSIGALRM) })
+	w.sig.offers = slices.DeleteFunc(w.sig.offers, func(c chan struct{}) bool { return c == offer })
 	w.unlockSignals()
+	close(offer)
 }
 
 // postForGuestLocked runs post, which posts signals while the guest's own
