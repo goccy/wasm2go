@@ -140,69 +140,6 @@ func makeIovec(m *Module, iovOff, bufOff, bufLen int32) {
 
 // ─── Tier 1: file primitives ────────────────────────────────────────
 
-// TestWasi_FSAccessHook verifies the host-controlled filesystem policy:
-// the hook is consulted on open/create/unlink with the guest path and a
-// write flag, and a false return surfaces as EACCES without touching the
-// disk. This is the control point an embedding wires its whitelist into.
-func TestWasi_FSAccessHook(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "secret"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "ok"), []byte("y"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	w, m := newTestStubs(t, dir)
-
-	type call struct {
-		path  string
-		write bool
-	}
-	var seen []call
-	w.cfg.FSAccess = func(path string, write bool) bool {
-		seen = append(seen, call{path, write})
-		if path == "secret" {
-			return false // deny reads/writes of "secret"
-		}
-		if write && path == "readonly" {
-			return false // deny writes to "readonly", allow reads
-		}
-		return true
-	}
-
-	rightsRead := int64(1 << 1)
-	rightsWrite := int64(1 << 6)
-
-	// Reading "secret" is denied.
-	off, ln := putPath(m, 128, "secret")
-	if rc := w.Path_open(m, 3, 0, off, ln, 0, rightsRead, 0, 0, 200); rc != _wasiEACCES {
-		t.Fatalf("open secret(read): want EACCES(%d), got %d", _wasiEACCES, rc)
-	}
-	// Reading "ok" is allowed.
-	off, ln = putPath(m, 128, "ok")
-	if rc := w.Path_open(m, 3, 0, off, ln, 0, rightsRead, 0, 0, 200); rc != _wasiESUCCESS {
-		t.Fatalf("open ok(read): want SUCCESS, got %d", rc)
-	}
-	// Writing "readonly" (with O_CREAT) is denied; the file must not appear.
-	off, ln = putPath(m, 128, "readonly")
-	if rc := w.Path_open(m, 3, 0, off, ln, 0x1, rightsWrite, 0, 0, 200); rc != _wasiEACCES {
-		t.Fatalf("open readonly(write): want EACCES, got %d", rc)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "readonly")); !os.IsNotExist(err) {
-		t.Fatalf("denied write must not create the file; stat err=%v", err)
-	}
-	// The write flag must be reported correctly.
-	if len(seen) < 3 || seen[2].path != "readonly" || !seen[2].write {
-		t.Fatalf("hook write-flag not propagated: %+v", seen)
-	}
-	// Clearing the hook restores unrestricted access.
-	w.cfg.FSAccess = nil
-	off, ln = putPath(m, 128, "secret")
-	if rc := w.Path_open(m, 3, 0, off, ln, 0, rightsRead, 0, 0, 200); rc != _wasiESUCCESS {
-		t.Fatalf("open secret after clearing hook: want SUCCESS, got %d", rc)
-	}
-}
-
 // TestWasi_NetAccessHook verifies the network policy hook gates the
 // accept/recv/send surface before any socket work happens (a denied op
 // returns EACCES; an allowed op falls through to the normal EBADF or

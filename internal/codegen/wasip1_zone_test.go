@@ -340,10 +340,12 @@ func TestZone_FilesOfTheGuestFilesystem(t *testing.T) {
 		t.Errorf("TZ=%s = %+v, want UTC", bad, got)
 	}
 	denied := "/zoneinfo/Europe/./Paris"
-	policed := NewWASI(WASIConfig{
-		FS:       newHostFS(t, dir),
-		FSAccess: func(path string, write bool) bool { return path != "zoneinfo/Europe/Paris" },
-	})
+	var seen []string
+	policed := NewWASI(WASIConfig{FS: policyFS{
+		FS:    newHostFS(t, dir),
+		allow: func(path string, write bool) bool { return path != "zoneinfo/Europe/Paris" },
+		seen:  &seen,
+	}})
 	if got := zoneAt(t, policed, m, &denied, summer, false); got.offset != 0 || got.name != "UTC" {
 		t.Errorf("TZ=%s refused by the access policy = %+v, want UTC", denied, got)
 	}

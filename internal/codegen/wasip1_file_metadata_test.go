@@ -345,11 +345,13 @@ func TestWasi_ChownByPathAndDescriptor(t *testing.T) {
 	if rc := w.Fd_chown(m, 1, -1, -1); rc != -_wasiENOSYS {
 		t.Errorf("Fd_chown on a stream that is no file rc=%d, want -ENOSYS", rc)
 	}
-	w.cfg.FSAccess = func(string, bool) bool { return false }
+	var seen []string
+	host := w.cfg.FS
+	w.cfg.FS = policyFS{FS: host, allow: func(string, bool) bool { return false }, seen: &seen}
 	if rc := w.Path_chown(m, off, n, -1, -1, 1); rc != -_wasiEACCES {
-		t.Errorf("Path_chown the access hook refuses rc=%d, want -EACCES", rc)
+		t.Errorf("Path_chown a policy refuses rc=%d, want -EACCES", rc)
 	}
-	w.cfg.FSAccess = nil
+	w.cfg.FS = host
 
 	// A filesystem that keeps no owners has none to change.
 	w.cfg.FS = noOwnerFS{newHostFS(t, dir)}

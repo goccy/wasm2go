@@ -208,7 +208,6 @@ func TestWasi_ConfigIsReadWithoutTheLock(t *testing.T) {
 			t.Errorf("Clock_time_get rc=%d", rc)
 		}
 	})
-	returnsWithin(t, "allowedPath", func() { w.allowedPath("x", false) })
 	returnsWithin(t, "checkNet", func() { w.checkNet("connect") })
 	host, n := putPath(m, pollSubsOff, "example.invalid")
 	returnsWithin(t, "Sock_getaddrinfo", func() {

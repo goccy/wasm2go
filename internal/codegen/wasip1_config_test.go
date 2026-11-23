@@ -2,11 +2,9 @@ package codegen
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -183,9 +181,6 @@ func TestWasi_HostWASIConfig(t *testing.T) {
 	if cfg.FS != (osFS{}) {
 		t.Errorf("FS = %#v, want the whole host filesystem", cfg.FS)
 	}
-	if cfg.FSAccess != nil {
-		t.Error("FSAccess is set, want every access to FS allowed")
-	}
 	if cfg.LocalZone != time.Local {
 		t.Errorf("LocalZone = %v, want time.Local", cfg.LocalZone)
 	}
@@ -210,87 +205,5 @@ func TestWasi_AllowAllHooks(t *testing.T) {
 	if !AllowAllNetAccess("accept") || !AllowAllDial("tcp", "", "127.0.0.1", 1) ||
 		!AllowAllResolve("localhost") || !AllowAllExec("/bin/true", nil) {
 		t.Error("an AllowAll hook denies")
-	}
-}
-
-// FSAccess is consulted on every path operation, with each path it names
-// and whether the operation writes; a denied operation leaves the
-// filesystem as it was.
-func TestWasi_FSAccessGatesEveryPathOperation(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(filepath.Join(dir, "d"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("f", filepath.Join(dir, "l")); err != nil {
-		t.Skipf("no symbolic links: %v", err)
-	}
-	w, m := newTestStubs(t, dir)
-	var seen []string
-	// Only "f" may be written.
-	w.cfg.FSAccess = func(path string, write bool) bool {
-		seen = append(seen, fmt.Sprintf("%s:%v", path, write))
-		return !write || path == "f"
-	}
-	f, fn := putPath(m, 128, "f")
-	g, gn := putPath(m, 160, "g")
-	d, dn := putPath(m, 192, "d")
-	l, ln := putPath(m, 224, "l")
-	type op struct {
-		name   string
-		call   func() int32
-		denied int32
-		seen   []string
-	}
-	writes := []op{
-		{"path_open creating", func() int32 { return w.Path_open(m, 3, 0, g, gn, 0x1, 1<<6, 0, 0, 300) }, _wasiEACCES, []string{"g:true"}},
-		{"path_create_directory", func() int32 { return w.Path_create_directory(m, 3, g, gn) }, _wasiEACCES, []string{"g:true"}},
-		{"path_unlink_file", func() int32 { return w.Path_unlink_file(m, 3, l, ln) }, _wasiEACCES, []string{"l:true"}},
-		{"path_remove_directory", func() int32 { return w.Path_remove_directory(m, 3, d, dn) }, _wasiEACCES, []string{"d:true"}},
-		{"path_rename", func() int32 { return w.Path_rename(m, 3, f, fn, 3, g, gn) }, _wasiEACCES, []string{"f:true", "g:true"}},
-		{"path_link", func() int32 { return w.Path_link(m, 3, 0, f, fn, 3, g, gn) }, _wasiEACCES, []string{"f:true", "g:true"}},
-		{"path_symlink", func() int32 { return w.Path_symlink(m, f, fn, 3, g, gn) }, _wasiEACCES, []string{"g:true", "f:false", "f:true"}},
-		{"path_filestat_set_times", func() int32 { return w.Path_filestat_set_times(m, 3, 0, d, dn, 0, 0, 0x2|0x8) }, _wasiEACCES, []string{"d:true"}},
-		{"path_chmod", func() int32 { return w.Path_chmod(m, d, dn, 0o700) }, -_wasiEACCES, []string{"d:true"}},
-		{"path_chown", func() int32 { return w.Path_chown(m, d, dn, -1, -1, 1) }, -_wasiEACCES, []string{"d:true"}},
-	}
-	reads := []op{
-		{"path_open for reading", func() int32 { return w.Path_open(m, 3, 0, f, fn, 0, 1<<1, 0, 0, 300) }, _wasiEACCES, []string{"f:false"}},
-		{"path_filestat_get", func() int32 { return w.Path_filestat_get(m, 3, 0, f, fn, 300) }, _wasiEACCES, []string{"f:false"}},
-		{"path_filestat_ext", func() int32 { return w.Path_filestat_ext(m, f, fn, 0, 300) }, -_wasiEACCES, []string{"f:false"}},
-		{"path_filestat_mode", func() int32 { return w.Path_filestat_mode(m, f, fn, 0, 300) }, -_wasiEACCES, []string{"f:false"}},
-		{"path_readlink", func() int32 { return w.Path_readlink(m, 3, l, ln, 300, 64, 400) }, _wasiEACCES, []string{"l:false"}},
-	}
-	for _, o := range writes {
-		seen = nil
-		if rc := o.call(); rc != o.denied || !slices.Equal(seen, o.seen) {
-			t.Errorf("%s: rc=%d, hook saw %v; want %d after %v", o.name, rc, seen, o.denied, o.seen)
-		}
-	}
-	for _, name := range []string{"f", "d", "l"} {
-		if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
-			t.Errorf("%s after the denied writes: %v", name, err)
-		}
-	}
-	if _, err := os.Lstat(filepath.Join(dir, "g")); !os.IsNotExist(err) {
-		t.Errorf("g exists after the denied writes: %v", err)
-	}
-	// This hook allows the reads; one that refuses reads denies them.
-	for _, o := range reads {
-		if rc := o.call(); rc != _wasiESUCCESS {
-			t.Errorf("%s allowed: rc=%d", o.name, rc)
-		}
-	}
-	w.cfg.FSAccess = func(path string, write bool) bool {
-		seen = append(seen, fmt.Sprintf("%s:%v", path, write))
-		return write
-	}
-	for _, o := range reads {
-		seen = nil
-		if rc := o.call(); rc != o.denied || !slices.Equal(seen, o.seen) {
-			t.Errorf("%s: rc=%d, hook saw %v; want %d after %v", o.name, rc, seen, o.denied, o.seen)
-		}
 	}
 }

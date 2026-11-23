@@ -775,8 +775,8 @@ func TestWasi_OwnDescriptorNamesAreLinks(t *testing.T) {
 	}
 }
 
-// The preopened root under its own-descriptor name is opened without
-// FSAccess, and a standard stream that is a closed host file is no
+// The preopened root under its own-descriptor name is opened as the root
+// of the FS, and a standard stream that is a closed host file is no
 // descriptor: EBADF, and no entry in a listing.
 func TestWasi_OwnDescriptorNamesOfTheRootAndAClosedStream(t *testing.T) {
 	for _, whole := range []bool{false, true} {
@@ -785,10 +785,9 @@ func TestWasi_OwnDescriptorNamesOfTheRootAndAClosedStream(t *testing.T) {
 		if whole {
 			w.cfg.FS = osFS{}
 		}
-		w.cfg.FSAccess = func(string, bool) bool { return false }
 		fd, errno := w.pathOpen(m, "dev/fd/3", 1, 0x2 /* O_DIRECTORY */, 1<<1, 0)
 		if errno != _wasiESUCCESS {
-			t.Fatalf("open dev/fd/3 with FSAccess denying all errno=%d", errno)
+			t.Fatalf("open dev/fd/3 errno=%d", errno)
 		}
 		closeTestFd(t, w, m, fd)
 
