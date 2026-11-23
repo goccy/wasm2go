@@ -15,18 +15,21 @@ import (
 
 // spawnWithStreams starts argv with the guest's descriptors stdin, stdout
 // and stderr as its standard streams (-1 for the instance's) and returns
-// its pid token. w's FS becomes the whole host filesystem, in which argv[0]
-// is a name.
+// its pid token. The command is started with the whole host filesystem, in
+// which argv[0] is a name, as w's FS; w's own FS is put back afterwards.
 func spawnWithStreams(t *testing.T, w *WasiStubs, m *Module, stdin, stdout, stderr int32, argv ...string) int32 {
 	t.Helper()
 	if _, err := os.Stat(argv[0]); err != nil {
 		t.Skipf("%s not available", argv[0])
 	}
-	w.cfg.FS = osFS{}
 	pathOff := writeCStr(m, 1000, argv[0])
 	argvOff := writeArgv(m, 2000, 3000, argv)
 	const pidOff int32 = 4000
-	if rc := w.Proc_spawn(m, pathOff, argvOff, 0, stdin, stdout, stderr, 0, pidOff); rc != _wasiESUCCESS {
+	fsys := w.cfg.FS
+	w.cfg.FS = osFS{}
+	rc := w.Proc_spawn(m, pathOff, argvOff, 0, stdin, stdout, stderr, 0, pidOff)
+	w.cfg.FS = fsys
+	if rc != _wasiESUCCESS {
 		t.Fatalf("Proc_spawn rc=%d", rc)
 	}
 	return int32(readU32(m.memory, int(pidOff)))
