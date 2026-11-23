@@ -140,7 +140,7 @@ const hostPipeBuf = 512
 
 // hostWritesWithoutWaiting says that a write that waits to a descriptor in
 // blocking mode is not made in steps here (writeHostStream), but to a pipe
-// (writesInSteps): darwin has no write that does not wait in one call on
+// or a terminal (writesInSteps): darwin has no write that does not wait in one call on
 // such a descriptor, so the write is one writev(2), which waits in the
 // kernel, and a signal does not end it.
 const hostWritesWithoutWaiting = false

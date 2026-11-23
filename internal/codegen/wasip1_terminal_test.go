@@ -784,9 +784,6 @@ func TestLinkOfATerminalIsItsName(t *testing.T) {
 // rest; a signal ends the wait, and the write returns what it wrote.
 func TestWasi_BlockingWriteToATerminalIsEndedByASignal(t *testing.T) {
 	skipWithoutStreamWrites(t)
-	if !hostWritesWithoutWaiting {
-		t.Skipf("a write that waits is one writev(2) on %s, which a signal does not end", runtime.GOOS)
-	}
 	// 64 buffers of the same memory: more than a terminal keeps.
 	const iovOff, countOff, iovs int32 = 40000, 40600, 64
 	for _, side := range []string{"master", "slave"} {

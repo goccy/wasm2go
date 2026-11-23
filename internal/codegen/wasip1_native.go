@@ -8597,7 +8597,10 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 	rest := append([][]byte(nil), bufs...)
 	var total uint64
 	file := op.streamFile(dst)
-	steps := op.writesInSteps(file)
+	steps, err := op.writesInSteps(file)
+	if err != nil {
+		return 0, w.guestErrno(call, err)
+	}
 	// write writes rest once. With wait, which holds the turn, the mode is
 	// not asked: in steps the write does not wait in either, and otherwise
 	// the writev(2) waits in blocking mode and takes what fits in
@@ -8671,15 +8674,21 @@ func (w *WasiStubs) writeHostStream(m *Module, call string, op *wasiOpen, dst sy
 // writesInSteps reports whether a write that waits to file, the stream of
 // the entry op, is made in steps that do not wait in the kernel
 // (writeWithoutWaiting): where the host has such a write
-// (hostWritesWithoutWaiting), and to a pipe, not a FIFO with a name,
-// wherever poll(2) waits for room in it, which the host tells
-// (hostPipeWriteNow).
-func (op *wasiOpen) writesInSteps(file *os.File) bool {
+// (hostWritesWithoutWaiting), and, wherever poll(2) waits for room, to a
+// pipe, not a FIFO with a name, which the host tells (hostPipeWriteNow),
+// and to a terminal (terminalOf).
+func (op *wasiOpen) writesInSteps(file *os.File) (bool, error) {
 	if hostWritesWithoutWaiting {
-		return true
+		return true, nil
+	}
+	if !hostPolls {
+		return false, nil
 	}
 	mode, namedFIFO := op.statOf(file)
-	return hostPolls && mode&os.ModeNamedPipe != 0 && !namedFIFO
+	if mode&os.ModeCharDevice != 0 {
+		return op.terminalOf(file)
+	}
+	return mode&os.ModeNamedPipe != 0 && !namedFIFO, nil
 }
 
 // writeHostOnce is a write that does not wait to dst, a descriptor that can
