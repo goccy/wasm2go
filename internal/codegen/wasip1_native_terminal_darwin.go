@@ -315,6 +315,10 @@ func hostTerminalIoctl(fd int, request uint32, arg *terminalArg) (int, error) {
 		return hostIoctlPointer(fd, syscall.TIOCGWINSZ, unsafe.Pointer(&arg.winsize))
 	case linuxTIOCSWINSZ:
 		return hostIoctlPointer(fd, syscall.TIOCSWINSZ, unsafe.Pointer(&arg.winsize))
+	case darwinTIOCPTYGRANT, darwinTIOCPTYUNLK:
+		return hostIoctlValue(fd, request, 0)
+	case darwinTIOCPTYGNAME:
+		return hostIoctlPointer(fd, request, unsafe.Pointer(&arg.name))
 	}
 	// The name of a pseudo-terminal's slave side is no /dev/pts/N here,
 	// which is all TIOCGPTN can tell.

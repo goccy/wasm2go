@@ -16124,13 +16124,26 @@ const (
 	linuxTIOCSPTLCK = 0x40045431
 )
 
+// The requests of a pseudo-terminal's master side darwin makes and Linux
+// has none of (grantpt, unlockpt and ptsname of darwin's C library), as
+// darwin's sys/ttycom.h numbers them: no request of asm-generic has these
+// numbers. TIOCPTYGNAME writes the name of the slave side, a string of
+// darwinPtyNameSize bytes.
+const (
+	darwinTIOCPTYGRANT = 0x20007454
+	darwinTIOCPTYUNLK  = 0x20007452
+	darwinTIOCPTYGNAME = 0x40807453
+	darwinPtyNameSize  = 128
+)
+
 // linuxNCCS is the number of control characters of the kernel's struct
 // termios.
 const linuxNCCS = 19
 
 // What a request of a terminal takes (terminalArg.what): nothing, an int
 // as it is, or the address of an int, of a struct termios, of a struct
-// termios2 or of a struct winsize.
+// termios2, of a struct winsize or of the name of a pseudo-terminal's
+// slave side.
 const (
 	terminalTakesNothing = iota
 	terminalTakesValue
@@ -16138,6 +16151,7 @@ const (
 	terminalTakesTermios
 	terminalTakesTermios2
 	terminalTakesWinsize
+	terminalTakesName
 )
 
 // linuxTermios is the kernel's struct termios2 (asm-generic): struct
@@ -16195,14 +16209,17 @@ type terminalArg struct {
 	value   int32
 	termios linuxTermios
 	winsize linuxWinsize
+	name    [darwinPtyNameSize]byte
 }
 
 // of sets what request takes, and reports whether it is one of the
 // requests of a terminal the runtime makes.
 func (a *terminalArg) of(request uint32) bool {
 	switch request {
-	case linuxTIOCEXCL, linuxTIOCNXCL, linuxTIOCNOTTY:
+	case linuxTIOCEXCL, linuxTIOCNXCL, linuxTIOCNOTTY, darwinTIOCPTYGRANT, darwinTIOCPTYUNLK:
 		a.what = terminalTakesNothing
+	case darwinTIOCPTYGNAME:
+		a.what, a.out = terminalTakesName, true
 	case linuxTCSBRK, linuxTCXONC, linuxTCFLSH, linuxTIOCSCTTY:
 		a.what = terminalTakesValue
 	case linuxTIOCSPGRP, linuxTIOCSPTLCK:
@@ -16239,6 +16256,8 @@ func (a *terminalArg) size() uint64 {
 		return 44
 	case terminalTakesWinsize:
 		return 8
+	case terminalTakesName:
+		return darwinPtyNameSize
 	}
 	return 0
 }
@@ -16272,6 +16291,8 @@ func (a *terminalArg) encode(mem []byte) {
 		binary.LittleEndian.PutUint16(mem[2:], a.winsize.Col)
 		binary.LittleEndian.PutUint16(mem[4:], a.winsize.Xpixel)
 		binary.LittleEndian.PutUint16(mem[6:], a.winsize.Ypixel)
+	case terminalTakesName:
+		copy(mem, a.name[:])
 	}
 }
 
@@ -16282,7 +16303,8 @@ func (a *terminalArg) encode(mem []byte) {
 // TIOCSWINSZ), the line (TCSBRK, TCXONC, TCFLSH), exclusive use
 // (TIOCEXCL, TIOCNXCL), the output queue (TIOCOUTQ), the foreground
 // process group and the session (TIOCGPGRP, TIOCGSID), and a
-// pseudo-terminal's master side (TIOCGPTN, TIOCSPTLCK). arg is the int the
+// pseudo-terminal's master side (TIOCGPTN, TIOCSPTLCK, and darwin's
+// TIOCPTYGRANT, TIOCPTYUNLK, TIOCPTYGNAME on darwin). arg is the int the
 // request takes, or the address of what it takes. A descriptor is a
 // terminal when it is a terminal of the host: a standard stream of the
 // instance or a file of the FS that is a file of the host (*os.File). The

@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"bytes"
 	"os"
 	"syscall"
 	"testing"
@@ -81,5 +82,42 @@ func TestFdIoctlPseudoTerminalMaster(t *testing.T) {
 		if rc := guestIoctl(w, m, fd, request, termiosOff); rc != -_wasiENOTTY {
 			t.Fatalf("ioctl %#x of the master rc=%d, want -ENOTTY", request, rc)
 		}
+	}
+}
+
+// The guest makes a pseudo-terminal usable with darwin's requests of its
+// master side (grantpt, unlockpt, ptsname): the slave side opens at the
+// name TIOCPTYGNAME writes, and is a terminal.
+func TestFdIoctlPseudoTerminalMasterOfDarwin(t *testing.T) {
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Skipf("no pseudo-terminal: %v", err)
+	}
+	closeAtEnd(t, ptmx)
+	w, m := newProcTestStubs(t)
+	w.mu.Lock()
+	fd := addTestFD(w, &wasiOpen{f: ptmx})
+	w.mu.Unlock()
+	for _, request := range []uint32{darwinTIOCPTYGRANT, darwinTIOCPTYUNLK} {
+		if rc := guestIoctl(w, m, fd, request, 0); rc != _wasiESUCCESS {
+			t.Fatalf("ioctl %#x rc=%d", request, rc)
+		}
+	}
+	if rc := guestIoctl(w, m, fd, darwinTIOCPTYGNAME, termiosOff); rc != _wasiESUCCESS {
+		t.Fatalf("TIOCPTYGNAME rc=%d", rc)
+	}
+	field := m.memory[termiosOff : termiosOff+darwinPtyNameSize]
+	end := bytes.IndexByte(field, 0)
+	if end < 0 {
+		t.Fatalf("TIOCPTYGNAME wrote no string: %q", field)
+	}
+	name := string(field[:end])
+	slave, err := os.OpenFile(name, os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", name, err)
+	}
+	closeAtEnd(t, slave)
+	if terminal, err := hostFileTerminal(slave); err != nil || !terminal {
+		t.Fatalf("%s is a terminal: %v, %v", name, terminal, err)
 	}
 }
