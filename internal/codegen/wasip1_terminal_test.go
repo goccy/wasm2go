@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -615,9 +617,11 @@ func TestHostDescriptorsOnATerminal(t *testing.T) {
 
 // The standard input an instance whose descriptors are the host's takes
 // over (takeStandardLocked) is a terminal to the guest when it is the
-// host's.
+// host's, and on the whole host filesystem its link leads to the
+// terminal's name.
 func TestHostDescriptorsOnATerminalInAProcess(t *testing.T) {
-	if os.Getenv(hostTerminalEnv) == "" {
+	name := os.Getenv(hostTerminalEnv)
+	if name == "" {
 		t.Skip("run by TestHostDescriptorsOnATerminal")
 	}
 	w, m := newHostNumberedStubs(t, nil, os.Stdin)
@@ -630,4 +634,43 @@ func TestHostDescriptorsOnATerminalInAProcess(t *testing.T) {
 	if filetype, base, _ := fdstatOf(t, w, m, 0); filetype != 2 || base&(wasiRightFdSeek|wasiRightFdTell) != 0 {
 		t.Errorf("fdstat of the terminal at 0: filetype %d rights %#x, want 2 without FD_SEEK and FD_TELL", filetype, base)
 	}
+	w.cfg.FS = osFS{}
+	if target, rc := guestReadlink(w, m, "dev/fd/0"); rc != _wasiESUCCESS || target != name {
+		t.Errorf("readlink dev/fd/0 of the terminal = %q rc=%d, want %q", target, rc, name)
+	}
+}
+
+// guestReadlink is the guest's readlink of name.
+func guestReadlink(w *WasiStubs, m *Module, name string) (string, int32) {
+	const nameOff, outOff, sizeOff int32 = 0, 1024, 2048
+	off, n := putPath(m, nameOff, name)
+	binary.LittleEndian.PutUint32(m.memory[sizeOff:], 0)
+	rc := w.Path_readlink(m, wasiPreopenFD, off, n, outOff, 256, sizeOff)
+	return string(m.memory[outOff : outOff+int32(readU32(m.memory, int(sizeOff)))]), rc
+}
+
+// On the whole host filesystem the link of a standard stream that is a
+// terminal leads to the terminal's name, as ttyname reads it; that of a
+// file path_open opened to the path it was opened under.
+func TestLinkOfATerminalIsItsName(t *testing.T) {
+	_, slave := openTestPty(t)
+	w, m := newProcTestStubs(t)
+	w.cfg.FS = osFS{}
+	w.cfg.Stdin = slave
+	closeAllAtCleanup(t, w)
+	for _, name := range []string{"dev/fd/0", "proc/self/fd/0"} {
+		if target, rc := guestReadlink(w, m, name); rc != _wasiESUCCESS || target != slave.Name() {
+			t.Errorf("readlink %s of a terminal = %q rc=%d, want %q", name, target, rc, slave.Name())
+		}
+	}
+	path := filepath.Join(t.TempDir(), "a.txt")
+	file, errno := w.pathOpen(m, path[1:], 0, 0x1 /* O_CREAT */, 1<<6, 0)
+	if errno != _wasiESUCCESS {
+		t.Fatalf("open %s errno=%d", path, errno)
+	}
+	name := "dev/fd/" + strconv.Itoa(int(file))
+	if target, rc := guestReadlink(w, m, name); rc != _wasiESUCCESS || target != path {
+		t.Errorf("readlink %s of a regular file = %q rc=%d, want %q", name, target, rc, path)
+	}
+	closeTestFd(t, w, m, file)
 }

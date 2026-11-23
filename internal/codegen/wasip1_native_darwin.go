@@ -50,9 +50,24 @@ func chmodRefused(err error) bool {
 	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EFTYPE)
 }
 
-// hostFDLink reports that the host has no link for descriptor fd of the
-// host process: /dev/fd/N of this system is no link.
-func hostFDLink(fd uintptr) (string, bool, error) { return "", false, nil }
+// hostFDLink returns the target of the host's link for descriptor fd of
+// the host process, and whether the host has one: /dev/fd/N of this system
+// is no link, so a character device (a terminal) has the name fcntl
+// F_GETPATH gives it, and any other file none.
+func hostFDLink(fd uintptr) (string, bool, error) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(fd), &st); err != nil {
+		return "", false, os.NewSyscallError("fstat", err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFCHR {
+		return "", false, nil
+	}
+	name, errno := hostDescriptorPath(fd)
+	if errno != 0 {
+		return "", false, os.NewSyscallError("fcntl", errno)
+	}
+	return name, true, nil
+}
 
 // hostReopen would open descriptor fd again as a new open file
 // description, which this system has no way to (no /proc/self/fd).
@@ -333,22 +348,31 @@ const hostMaxPathLen = 1024
 // hostFDName returns the name the file open as f has now (fcntl F_GETPATH),
 // once a Stat of it finds that file there (sameFileAt).
 func hostFDName(f *os.File) (string, error) {
-	var buf [hostMaxPathLen]byte
-	var errno syscall.Errno
-	if !hostDescriptor(f, func(fd uintptr) {
-		_, _, errno = syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_GETPATH, uintptr(unsafe.Pointer(&buf[0])))
-	}) {
+	var (
+		name  string
+		errno syscall.Errno
+	)
+	if !hostDescriptor(f, func(fd uintptr) { name, errno = hostDescriptorPath(fd) }) {
 		return "", &fs.PathError{Op: "fcntl", Path: f.Name(), Err: errors.ErrUnsupported}
 	}
 	if errno != 0 {
 		return "", &fs.PathError{Op: "fcntl", Path: f.Name(), Err: errno}
 	}
+	return name, sameFileAt(f, name)
+}
+
+// hostDescriptorPath returns the name of the file open as descriptor fd of
+// the host process (fcntl F_GETPATH).
+func hostDescriptorPath(fd uintptr) (string, syscall.Errno) {
+	var buf [hostMaxPathLen]byte
+	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, syscall.F_GETPATH, uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
+		return "", errno
+	}
 	end := bytes.IndexByte(buf[:], 0)
 	if end < 0 {
-		return "", &fs.PathError{Op: "fcntl", Path: f.Name(), Err: syscall.ENAMETOOLONG}
+		return "", syscall.ENAMETOOLONG
 	}
-	name := string(buf[:end])
-	return name, sameFileAt(f, name)
+	return string(buf[:end]), 0
 }
 
 // hostRecordLockCommands are the commands of hostRecordLock, at recordLockGet,

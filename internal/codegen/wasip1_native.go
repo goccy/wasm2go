@@ -10190,8 +10190,9 @@ func (w *WasiStubs) aliasInfo(name string, n int32, ids ProcessIDs, target strin
 // ownLinkTarget returns what the link of descriptor op, or the preopened
 // root, leads to, as Linux names it: the path the descriptor was opened
 // under, absolute in the guest's filesystem ("/" for the root); for a
-// standard stream that is a host file, the target of the host's own link
-// for it where the host has one (hostFDLink), when the FS is a HostRootFS
+// host file without that path (a standard stream, a descriptor the host
+// gave), the target of the host's own link for it where the host has one
+// (hostFDLink), when the FS is a HostRootFS
 // and the target is a name in it or names no file; pipe:[N] or socket:[N] for a
 // pipe or a socket, N the inode number fstat gives it. It is "" for a
 // descriptor that is none of them, which then has no link. errno is a wasi
@@ -10204,7 +10205,7 @@ func (w *WasiStubs) ownLinkTarget(op *wasiOpen, root bool) (string, int32) {
 		return guestPath(op.path), _wasiESUCCESS
 	}
 	if fsys, isHost := w.fs().(HostRootFS); isHost {
-		if file := w.streamFile(op); file != nil {
+		if file := w.opHostFile(op); file != nil {
 			target, ok, err := hostStreamLink(file)
 			if err != nil {
 				return "", w.guestErrno("path_readlink", err)
