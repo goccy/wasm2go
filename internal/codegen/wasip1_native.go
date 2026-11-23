@@ -3530,6 +3530,12 @@ type WASIConfig struct {
 	// CopyForker makes a copy of the forking instance.
 	Fork Forker
 
+	// Children connects the guest's children with the processes of the
+	// host process (Children). nil keeps them the runtime's own: a command
+	// the guest starts is known by a pid token, and its wait reaches only
+	// the processes the runtime made.
+	Children Children
+
 	// Files are descriptors the guest has from its start, under the numbers
 	// they are given at (inherited ones, a listening socket of a
 	// supervisor's). The instance takes them over: the guest's close, or
@@ -3800,6 +3806,15 @@ type wasiProc struct {
 	// guest has become a command or is becoming one (Proc_exec). Guarded by
 	// wasiPIDs.mu; set before the wait for the command begins.
 	inHostGroup, leads, execed bool
+	// byHostPID records that the guest knows the process by the host's pid
+	// of it: a command Children.CommandPID named so, or a child Children
+	// adopted. Set before the process is entered in the family's table.
+	byHostPID bool
+	// release lets go of the host's process once the family has forgotten
+	// it (wasiPIDs.removeLocked): the process of a command known by its
+	// host pid is reaped, an adopted child is the embedder's to reap. nil
+	// for any other process. Set before the family can forget it.
+	release func() error
 }
 
 // jobGroup is what the family knows of one of its process groups besides
@@ -3869,6 +3884,9 @@ type wasiPIDs struct {
 	// that is not the host process's took (TIOCSCTTY), by the session's
 	// id, while the session has a process.
 	terminals map[int32]sessionTerminal
+	// releases are the releases of the processes the family has forgotten
+	// (removeLocked), to be made once no lock is held (releaseForgotten).
+	releases []func() error
 }
 
 // sessionTerminal is the controlling terminal of a session of the family
@@ -3913,10 +3931,14 @@ func (p *wasiPIDs) hasGroupLocked(pgid, sid int32) bool {
 	return false
 }
 
-// removeLocked forgets the process known by pid. Caller holds p.mu.
+// removeLocked forgets the process known by pid, whose release is then to
+// be made (releaseForgotten). Caller holds p.mu.
 func (p *wasiPIDs) removeLocked(pid int32) {
 	if proc := p.procs[pid]; proc != nil {
 		delete(p.procs, pid)
+		if proc.release != nil {
+			p.releases = append(p.releases, proc.release)
+		}
 		p.leftGroupLocked(proc.pgid)
 		p.leftSessionLocked(proc.sid)
 	}
@@ -4580,7 +4602,7 @@ func (w *WasiStubs) CloseAll() error {
 	if leaves && share.live.Add(-1) == 0 {
 		share.stdin.stop()
 	}
-	return errors.Join(err, w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm(), w.stopSyslog())
+	return errors.Join(err, w.releaseForgotten(), w.resyncReleased(), closeWasiOpens(closing), w.detachAllShm(), w.stopSyslog())
 }
 
 // takeAll is CloseAll up to the closing of the descriptors, which it takes
@@ -5010,10 +5032,32 @@ func (w *WasiStubs) finishProc(proc *wasiProc, status int32) {
 		pids.mu.Unlock()
 	}
 	w.mu.Unlock()
+	w.reportError("proc_wait", w.releaseForgotten())
 	// The parent is told, as the kernel tells a process whose child ended.
 	if !taken {
 		w.PostSignal(wasiSIGCHLD)
 	}
+}
+
+// releaseForgotten makes the releases of the processes the family has
+// forgotten (wasiProc.release, wasiPIDs.removeLocked) and returns their
+// errors. Caller holds no lock of the instance.
+func (w *WasiStubs) releaseForgotten() error {
+	w.mu.Lock()
+	pids := w.pids
+	w.mu.Unlock()
+	if pids == nil {
+		return nil
+	}
+	pids.mu.Lock()
+	releases := pids.releases
+	pids.releases = nil
+	pids.mu.Unlock()
+	var err error
+	for _, release := range releases {
+		err = errors.Join(err, release())
+	}
+	return err
 }
 
 // reapFinishedLocked forgets every process of this instance that has ended:
@@ -5135,6 +5179,37 @@ func (w *WasiStubs) procExitFunc(proc *wasiProc) func(status int32) {
 	return func(status int32) {
 		once.Do(func() { w.finishProc(proc, status) })
 	}
+}
+
+// Children is asked about the guest's children besides the processes the
+// runtime makes itself (WASIConfig.Children). A forked instance has its
+// parent's. Its methods are called without the lock of any instance held.
+type Children interface {
+	// CommandPID reports whether the command a guest started (Proc_spawn),
+	// which runs req and is the host's process hostPID, is known to the
+	// guest by hostPID instead of a pid token. Such a command is not
+	// reaped on the host before the guest has waited for it, or nobody is
+	// left to (SIGCHLD ignored, CloseAll): its pid names no other process
+	// meanwhile. Asked once per command, after it has started, while
+	// the family starts no other command, on linux and darwin only:
+	// elsewhere every command gets a pid token.
+	CommandPID(req ExecRequest, hostPID int) bool
+	// Adopt is asked by a guest's wait for pid (Proc_wait) when pid names
+	// no process of the fork family. target is the instance whose guest
+	// waits. ok reports that pid is a child the guest may wait for: it
+	// becomes a process of target under pid, as one NewProc registers, and
+	// the wait goes on as
+	// for any of them. exited is to be called with its wait status (as
+	// NewProc's exited takes it) when it ends, from any goroutine, before
+	// Adopt returns as well; only its first call has an effect. kill
+	// signals it (Proc_kill), as NewProc's kill does; nil when it cannot be
+	// signalled. release is called once, after the guest has collected
+	// its status or nobody is left to (SIGCHLD ignored, CloseAll), without
+	// any lock of an instance held: the embedder reaps it then; nil when
+	// there is nothing to do. Its error is told WASIConfig.Errors. An error
+	// of Adopt fails the wait with its errno (wasiErrnoOf); ok false fails
+	// it with ECHILD.
+	Adopt(target SignalTarget, pid int32, exited func(status int32)) (kill func(sig int32) error, release func() error, ok bool, err error)
 }
 
 // Forker makes the instance the child of a guest's fork runs in
@@ -5394,14 +5469,27 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	return w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{stdinFd, stdoutFd, stderrFd}, false, func(cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs) {
+	return w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{stdinFd, stdoutFd, stderrFd}, false, func(req ExecRequest, cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs) {
 		proc := &wasiProc{host: cmd.process, done: make(chan struct{}), pgid: job.pgid, sid: job.sid, inHostGroup: job.inHostGroup, leads: job.leads}
+		// Only a command whose end is learnt apart from its reap (finish)
+		// can keep its host pid until the family has forgotten it.
+		named := cmd.finish != nil && w.cfg.Children != nil && w.cfg.Children.CommandPID(req, cmd.process.Pid)
 		w.mu.Lock()
-		pid := w.addProcLocked(proc, ids)
+		var pid int32
+		if named {
+			pid, proc.byHostPID = int32(cmd.process.Pid), true
+			w.putProcLocked(pid, proc)
+		} else {
+			pid = w.addProcLocked(proc, ids)
+		}
 		w.enterProcLocked(pid)
 		w.mu.Unlock()
 		w.reportError("proc_spawn", pids.started(job, proc, cmd.process.Pid))
 		go func() {
+			if proc.byHostPID {
+				w.awaitByHostPID(pids, proc, cmd)
+				return
+			}
 			if proc.leads {
 				if status, reap := w.awaitLeader(pids, proc, cmd); reap != nil {
 					w.finishProc(proc, status)
@@ -5420,9 +5508,10 @@ func (w *WasiStubs) procSpawn(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr 
 // fds the guest's descriptors of its standard streams, -1 for the
 // instance's. The command is started where commandJob puts it, as the
 // process of the guest when execs is set, and started is then called with
-// it, while the family's command starts are held (wasiPIDs.starts).
+// what it runs and it, while the family's command starts are held
+// (wasiPIDs.starts).
 // Returns 0, or a negative errno: the command has not started.
-func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, cwdPtr uint64, fds [3]int32, execs bool, started func(cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs)) int32 {
+func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, cwdPtr uint64, fds [3]int32, execs bool, started func(req ExecRequest, cmd *hostCommand, job commandJob, pids *wasiPIDs, ids ProcessIDs)) int32 {
 	op := "proc_spawn"
 	if execs {
 		op = "proc_exec"
@@ -5505,7 +5594,7 @@ func (w *WasiStubs) startGuestCommand(m *Module, abi wasiABI, pathPtr, argvPtr, 
 		w.reportError(op, pids.started(job, nil, 0))
 		return -w.guestErrno(op, startErr)
 	}
-	started(cmd, job, pids, ids)
+	started(req, cmd, job, pids, ids)
 	return _wasiESUCCESS
 }
 
@@ -5672,6 +5761,49 @@ func (w *WasiStubs) awaitLeader(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand
 	}
 }
 
+// awaitByHostPID waits for the end of cmd, the command of proc that the
+// guest knows by its host pid, without reaping it (hostWaitExited),
+// delivers what the runtime copies from it (hostCommand.finish) and
+// publishes its wait status. The command is reaped once the family has
+// forgotten it (wasiProc.release) and, when it leads the host's process
+// group of its group, the group has let it go (leaderEnded), whichever
+// comes last. One that cannot be waited for unreaped is waited for as any
+// other.
+func (w *WasiStubs) awaitByHostPID(pids *wasiPIDs, proc *wasiProc, cmd *hostCommand) {
+	status, err := hostWaitExited(cmd.process.Pid)
+	if err != nil {
+		w.reportError("proc_wait", err)
+		if proc.leads {
+			pids.leaderEnded(proc, false)
+		}
+		w.finishProc(proc, cmd.wait())
+		return
+	}
+	var held <-chan struct{}
+	if proc.leads {
+		held = pids.leaderEnded(proc, true)
+	}
+	var left atomic.Int32
+	left.Store(1)
+	if held != nil {
+		left.Store(2)
+	}
+	letGo := func() error {
+		if left.Add(-1) != 0 {
+			return nil
+		}
+		_, err := cmd.process.Wait()
+		return err
+	}
+	proc.release = letGo
+	cmd.finish()
+	w.finishProc(proc, status)
+	if held != nil {
+		<-held
+		w.reportError("proc_wait", letGo())
+	}
+}
+
 // Proc_exec is a NON-STANDARD host import (module wasip1_posix_extension,
 // name "proc_exec") backing execve and the exec family: the guest becomes
 // the command path, with the arguments argv, the environment envp and the
@@ -5716,7 +5848,7 @@ func (w *WasiStubs) procExec(m *Module, abi wasiABI, pathPtr, argvPtr, envpPtr, 
 		pids   *wasiPIDs
 		execed *execedCommand
 	)
-	if rc := w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{0, 1, 2}, true, func(c *hostCommand, job commandJob, p *wasiPIDs, _ ProcessIDs) {
+	if rc := w.startGuestCommand(m, abi, pathPtr, argvPtr, envpPtr, cwdPtr, [3]int32{0, 1, 2}, true, func(_ ExecRequest, c *hostCommand, job commandJob, p *wasiPIDs, _ ProcessIDs) {
 		cmd, self, pids = c, job.self, p
 		w.reportError("proc_exec", pids.started(job, self, cmd.process.Pid))
 		execed = w.becomeCommand(m, cmd.process)
@@ -6053,10 +6185,11 @@ func (w *WasiStubs) pipe(m *Module, fdsOutPtr uint64) int32 {
 // POSIX wait status at statusOutPtr. options is the waitpid() options mask;
 // bit 0 (WNOHANG) makes it return without blocking when the child is still
 // running (the guest sees the documented "0 means no child ready" result,
-// signalled by writing pid 0 — encoded by returning EAGAIN). Returns 0, or a
-// negative errno: ECHILD for an unknown pid — and, when the guest ignores
-// SIGCHLD, once the process has finished — EINTR when a signal was posted
-// to the guest before the process finished.
+// signalled by writing pid 0 — encoded by returning EAGAIN). A pid that
+// names no process of the instance is offered to Children.Adopt
+// (adoptChild). Returns 0, or a negative errno: ECHILD for an unknown pid
+// — and, when the guest ignores SIGCHLD, once the process has finished —
+// EINTR when a signal was posted to the guest before the process finished.
 func (w *WasiStubs) Proc_wait(m *Module, pid, options, statusOutPtr int32) int32 {
 	return w.procWait(m, pid, options, zext(statusOutPtr))
 }
@@ -6077,7 +6210,13 @@ func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64)
 	proc := w.procs[pid]
 	w.mu.Unlock()
 	if proc == nil {
-		return -_wasiECHILD
+		if w.cfg.Children == nil || pid <= 0 {
+			return -_wasiECHILD
+		}
+		var errno int32
+		if proc, errno = w.adoptChild(pid); proc == nil {
+			return -errno
+		}
 	}
 	const wnohang = 1
 	if options&wnohang != 0 {
@@ -6099,12 +6238,52 @@ func (w *WasiStubs) procWait(m *Module, pid, options int32, statusOutPtr uint64)
 	w.dropProcLocked(pid)
 	reaped := w.sig.reapsChildren()
 	w.mu.Unlock()
+	w.reportError("proc_wait", w.releaseForgotten())
 	if reaped {
 		// The child of a process that ignores SIGCHLD left no status.
 		return -_wasiECHILD
 	}
 	binary.LittleEndian.PutUint32(out, uint32(proc.status))
 	return _wasiESUCCESS
+}
+
+// adoptChild asks Children.Adopt about pid, a pid that names no process of
+// the instance, for its guest's wait: it returns the process pid became,
+// or nil and the wait's errno. A pid of the fork family is no child to
+// adopt (ECHILD).
+func (w *WasiStubs) adoptChild(pid int32) (*wasiProc, int32) {
+	w.enterRoot()
+	ids := w.guestProcess().IDs()
+	w.mu.Lock()
+	pids := w.pidsLocked()
+	w.mu.Unlock()
+	if member, ours := pids.find(pid); member != nil || ours {
+		return nil, _wasiECHILD
+	}
+	pgid, sid := pids.jobOf(ids.PID)
+	proc := &wasiProc{done: make(chan struct{}), pgid: pgid, sid: sid, byHostPID: true}
+	kill, release, ok, err := w.cfg.Children.Adopt(w, pid, w.procExitFunc(proc))
+	switch {
+	case err != nil:
+		return nil, w.guestErrno("proc_wait", err)
+	case !ok:
+		return nil, _wasiECHILD
+	}
+	proc.kill, proc.release = kill, release
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.putProcLocked(pid, proc)
+	w.enterProcLocked(pid)
+	select {
+	case <-proc.done:
+		// It ended before it was entered, when no waiter could see it.
+		if w.procFinished != nil {
+			close(w.procFinished)
+			w.procFinished = nil
+		}
+	default:
+	}
+	return proc, _wasiESUCCESS
 }
 
 // Proc_wait_any is a NON-STANDARD host import (module
@@ -6163,6 +6342,7 @@ func (w *WasiStubs) procWaitAny(m *Module, pgid, options int32, pidOutPtr, statu
 	if pidOut == nil || statusOut == nil {
 		return -_wasiEFAULT
 	}
+	defer func() { w.reportError("proc_wait", w.releaseForgotten()) }()
 	const wnohang = 1
 	for {
 		w.mu.Lock()
@@ -6218,6 +6398,7 @@ func (w *WasiStubs) procWaitAny(m *Module, pgid, options int32, pidOutPtr, statu
 		}
 		finished := w.procFinished
 		w.mu.Unlock()
+		w.reportError("proc_wait", w.releaseForgotten())
 		if !w.awaitInterruptibly(m, finished) {
 			return -_wasiEINTR
 		}
@@ -15008,7 +15189,8 @@ func (w *WasiStubs) procSetgroups(m *Module, listPtr uint64, count int32) int32 
 // PRIO_USER (2) and who the id it applies to, 0 for the caller's own; the
 // guest's own pid is passed on as 0, and the pid token of another process
 // of the fork family or of a process the guest spawned is no process of
-// the host: ESRCH. With set non-zero value becomes the nice value first: by
+// the host: ESRCH, but for the host pid a process is known by (Children),
+// which is passed on. With set non-zero value becomes the nice value first: by
 // the SetPriority of the ProcessChanges (WASIConfig.ProcessChanges) for the
 // family's root instance; a forked instance's guest sets its own nice value
 // alone (PRIO_PROCESS of itself; EPERM for another), and a lower one than it
@@ -15041,7 +15223,7 @@ func (w *WasiStubs) procPriority(m *Module, which, who, set, value int32, outPtr
 			// The guest's own pid is always the guest itself, as for
 			// kill.
 			who = 0
-		} else if member, ours := pids.find(who); member != nil || ours {
+		} else if member, ours := pids.find(who); member != nil && !member.byHostPID || member == nil && ours {
 			// A process of the fork family, or one the guest spawned,
 			// whose token names no process of the host.
 			return -_wasiESRCH
@@ -20586,6 +20768,7 @@ func (w *WasiStubs) Proc_signal_dispositions(m *Module, handled, ignored, blocke
 		w.mu.Lock()
 		w.reapFinishedLocked()
 		w.mu.Unlock()
+		w.reportError("proc_signal_dispositions", w.releaseForgotten())
 	}
 	if w.cfg.Signals != nil {
 		w.cfg.Signals.Dispositions(w, handledNow, ignoredNow, blockedNow)

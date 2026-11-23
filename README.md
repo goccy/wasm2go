@@ -272,6 +272,19 @@ pid tokens of the forks and the commands a guest starts are numbers
 from 4194304 up, above every pid Linux and darwin hand out, so a token
 passed outside the guest names no process of the host.
 
+`Children` relates the guest's children to the host process's: its
+`CommandPID` decides, for each command a guest starts on Linux and
+darwin, whether the guest knows it by its host pid instead of a token;
+such a command is reaped on the host only once the guest has waited
+for it (or nobody is left to), so its pid names no other process
+meanwhile. Its `Adopt` is asked by a guest's `waitpid` for a pid that
+is no process of the fork family nor a command the runtime started,
+and makes a child of the host process that the runtime did not start
+(one native code spawned) a child the guest waits for, signals and
+gets `SIGCHLD` for; its `release` is called once the guest has
+collected the status, for the embedder to reap it. A nil `Children`
+gives every command a token and adopts nothing.
+
 `Fork` makes the instance the child of the guest's `fork`
 (`proc_fork`) runs in; a nil one fails it with `ENOSYS`. `CopyForker`
 copies the forking instance: its memory (into the Go heap, the whole
