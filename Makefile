@@ -60,9 +60,14 @@ test-cover:
 vet:
 	go vet ./...
 
-# lint runs golangci-lint, pinned via tools/go.mod.
+# lint runs golangci-lint, pinned via tools/go.mod, once for each GOOS in
+# LINT_GOOS, so that a file built for one system only is checked on any
+# host. The linter is built for the host (`go tool -n`) and run with each
+# GOOS, since `go tool` would build it for the GOOS in the environment.
+LINT_GOOS ?= linux darwin
 lint:
-	$(LINT) run ./...
+	@set -e; lint=$$($(subst go tool,go tool -n,$(LINT))); \
+	for goos in $(LINT_GOOS); do echo "golangci-lint GOOS=$$goos"; GOOS=$$goos $$lint run ./...; done
 
 # release publishes a tagged release through GoReleaser.
 release:

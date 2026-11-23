@@ -388,7 +388,7 @@ make install/wat2wasm  # install the wat2wasm CLI the test suite needs
 make build             # build the CLI into ./bin
 make test              # run the test suite with the race detector
 make test-cover        # run with coverage and enforce the threshold
-make lint              # run golangci-lint
+make lint              # run golangci-lint as linux and as darwin
 make release/check     # validate the GoReleaser config + dry-run a build
 ```
 
