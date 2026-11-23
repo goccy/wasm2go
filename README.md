@@ -159,8 +159,10 @@ methods, and what it can do beyond them by implementing the same
 interfaces. `Errors` is told the errors the guest cannot be given (nil drops them). Host
 access is opt-in: `HostFS(root)`, `AllowAllNetAccess`, `AllowAllDial`,
 `AllowAllListen`, `AllowAllResolve`, `AllowAllExec`, or `HostWASIConfig()` for what the
-host process has (its args, environment, stdio, the whole host
-filesystem and its local time zone, with every hook allowing).
+host process has and cannot fail to give (its args, environment,
+stdio, the whole host filesystem, its local time zone, its user,
+group and services databases and its `uname`, with every hook
+allowing).
 `HostFS("")` is an error. `HostFS` of a directory other than `/` is
 built on `os.Root`, which refuses a symbolic link that leads out of it
 with `EACCES`; a name with a trailing `/` is refused so only by the
@@ -306,8 +308,8 @@ report, `Services` the services database (`getservbyname`,
 `syslog`, and `Numbering` gives the guest the numbers of another system
 in place of those of its own C library. A nil one is none: a lookup
 finds nothing (`ENOENT`), `uname` and `syslog` fail with `ENOSYS`, and
-the guest keeps its own numbers. `HostUsers()`, `HostSystem()`,
-`HostServices()`, `HostSyslog()` and `HostNumbering()` (the host's
+the guest keeps its own numbers. `HostUsers(report)`, `HostSystem()`,
+`HostServices(report)`, `HostSyslog()` and `HostNumbering()` (the host's
 error numbers, signals, flags and socket options, ... on Linux and
 darwin) give the host's. The guest's
 `flock` locks a file of an `FS` that is a `LockFS` (what `HostFS` and

@@ -6,8 +6,11 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -279,22 +282,82 @@ func TestZone_ErrorsOfLoadingAName(t *testing.T) {
 	}
 }
 
-// A name that starts with '/' is the zone file of that path in the guest's
-// filesystem.
-func TestZone_FilesOfTheGuestFilesystem(t *testing.T) {
+// hostParisZoneFile returns the host's zone file of Europe/Paris, and skips
+// the test when the host has none.
+func hostParisZoneFile(t *testing.T) []byte {
+	t.Helper()
 	var data []byte
 	var err error
 	for _, p := range []string{"/usr/share/zoneinfo/Europe/Paris", "/var/db/timezone/zoneinfo/Europe/Paris"} {
 		if data, err = os.ReadFile(p); err == nil {
-			break
+			return data
 		}
 		if !errors.Is(err, fs.ErrNotExist) {
 			t.Fatal(err)
 		}
 	}
-	if err != nil {
-		t.Skipf("the host has no zone file of Europe/Paris: %v", err)
+	t.Skipf("the host has no zone file of Europe/Paris: %v", err)
+	return nil
+}
+
+// cleaningFS is an fs.FS that opens the clean form of any name it is
+// given, the names fs.ValidPath refuses included.
+type cleaningFS struct{ fstest.MapFS }
+
+func (f cleaningFS) Open(name string) (fs.File, error) { return f.MapFS.Open(path.Clean(name)) }
+
+// A zone name of a configuration with a ZoneInfo is the file of that name
+// in it, and nothing of the host's database; "" and "UTC" are UTC, and a
+// name with a ".." or an empty element names no file.
+func TestZone_ZoneInfo(t *testing.T) {
+	data := hostParisZoneFile(t)
+	var told []string
+	w := NewWASI(WASIConfig{
+		ZoneInfo: cleaningFS{fstest.MapFS{
+			"My/Zone": &fstest.MapFile{Data: data},
+			// A zone file that is too big, which a read of its first
+			// wasiZoneFileMax bytes would take for the zone.
+			"Big": &fstest.MapFile{Data: append(slices.Clone(data), make([]byte, wasiZoneFileMax)...)},
+		}},
+		Errors: func(op string, err error) { told = append(told, op+": "+err.Error()) },
+	})
+	m := newGuestModule(1 << 16)
+	summer := time.Date(2024, 7, 15, 12, 0, 0, 0, time.UTC)
+	mine := "My/Zone"
+	if got := zoneAt(t, w, m, &mine, summer, false); got.offset != 7200 || got.name != "CEST" {
+		t.Errorf("TZ=%s of ZoneInfo = %+v, want CEST", mine, got)
 	}
+	if len(told) != 0 {
+		t.Fatalf("Errors was told %q", told)
+	}
+	for _, name := range []string{"", "UTC"} {
+		if got := zoneAt(t, w, m, &name, summer, false); got.offset != 0 || got.name != "UTC" {
+			t.Errorf("TZ=%q = %+v, want UTC", name, got)
+		}
+	}
+	if len(told) != 0 {
+		t.Fatalf("Errors was told %q for UTC", told)
+	}
+	for _, name := range []string{"Europe/Paris", "My", "Big", "My/../My/Zone", "My//Zone"} {
+		told = nil
+		if got := zoneAt(t, w, m, &name, summer, false); got.offset != 0 || got.name != "UTC" {
+			t.Errorf("TZ=%s = %+v, want UTC", name, got)
+		}
+		if len(told) != 1 {
+			t.Errorf("TZ=%s told Errors %q, want its error", name, told)
+		}
+	}
+	// Without a ZoneInfo the name is not one of the host's database.
+	w = NewWASI(WASIConfig{})
+	if got := zoneAt(t, w, m, &mine, summer, false); got.offset != 0 {
+		t.Errorf("TZ=%s without ZoneInfo = %+v, want UTC", mine, got)
+	}
+}
+
+// A name that starts with '/' is the zone file of that path in the guest's
+// filesystem.
+func TestZone_FilesOfTheGuestFilesystem(t *testing.T) {
+	data := hostParisZoneFile(t)
 	dir := t.TempDir()
 	w, m := newTestStubs(t, dir)
 	zoneinfo := filepath.Join(dir, "zoneinfo")

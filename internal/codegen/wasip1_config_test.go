@@ -184,6 +184,15 @@ func TestWasi_HostWASIConfig(t *testing.T) {
 	if cfg.LocalZone != time.Local {
 		t.Errorf("LocalZone = %v, want time.Local", cfg.LocalZone)
 	}
+	if _, isHost := cfg.Users.(hostUsers); !isHost || cfg.System != HostSystem() {
+		t.Errorf("Users = %#v, System = %#v; want the host's", cfg.Users, cfg.System)
+	}
+	if _, isHost := cfg.Services.(hostServices); !isHost {
+		t.Errorf("Services = %#v, want the host's", cfg.Services)
+	}
+	if cfg.Process != nil || cfg.ProcessChanges != nil || cfg.Signals != nil || cfg.Syslog != nil {
+		t.Error("Process, ProcessChanges, Signals or Syslog is set, want the isolated ones")
+	}
 	if !cfg.NetAccess("send") || !cfg.Dial("tcp", "example.com", "192.0.2.1", 80) ||
 		!cfg.Resolve("example.com") || !cfg.Exec(ExecRequest{Path: "/bin/sh", Argv: []string{"sh"}}) {
 		t.Error("a hook denies")
