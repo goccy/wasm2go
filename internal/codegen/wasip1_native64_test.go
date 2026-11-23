@@ -591,6 +591,8 @@ func TestWasi64_AddressesAboveTheMemoryAreRefused(t *testing.T) {
 		{"proc_wait", func() int32 { return w.Proc_wait64(m, 1000, 1, highAddr) }, -_wasiEFAULT},
 		{"proc_wait_any pid", func() int32 { return w.Proc_wait_any64(m, 1, highAddr, 512) }, -_wasiEFAULT},
 		{"proc_wait_any status", func() int32 { return w.Proc_wait_any64(m, 1, 512, highAddr) }, -_wasiEFAULT},
+		{"proc_wait_group pid", func() int32 { return w.Proc_wait_group64(m, 1, 1, highAddr, 512) }, -_wasiEFAULT},
+		{"proc_wait_group status", func() int32 { return w.Proc_wait_group64(m, 1, 1, 512, highAddr) }, -_wasiEFAULT},
 		{"path_open_mode path", func() int32 { return w.Path_open_mode64(m, 0, highAddr, 1, 0, 1<<1, 0, 0o600, 512) }, -_wasiEFAULT},
 		{"path_open_mode fd", func() int32 { return w.Path_open_mode64(m, 0, 900, 1, 0, 1<<1, 0, 0o600, highAddr) }, -_wasiEFAULT},
 		{"path_create_directory_mode", func() int32 { return w.Path_create_directory_mode64(m, highAddr, 1, 0o700) }, -_wasiEFAULT},
@@ -729,12 +731,12 @@ func TestWasi64_NeutralImportsMatchTheirWasm32Twin(t *testing.T) {
 		{"fd_path",
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_path(m, 3, 2048, 64, 1024) },
 			func(w *WasiStubs, m *Module, fd int32) int32 { return w.Fd_path64(m, 3, 2048, 64, 1024) }},
-		{"proc_wait and proc_wait_any of no process",
+		{"proc_wait, proc_wait_any and proc_wait_group of no process",
 			func(w *WasiStubs, m *Module, fd int32) int32 {
-				return w.Proc_wait(m, 1000, 0, 1024) | w.Proc_wait_any(m, 0, 1024, 1028)
+				return w.Proc_wait(m, 1000, 0, 1024) | w.Proc_wait_any(m, 0, 1024, 1028) | w.Proc_wait_group(m, 1, 0, 1024, 1028)
 			},
 			func(w *WasiStubs, m *Module, fd int32) int32 {
-				return w.Proc_wait64(m, 1000, 0, 1024) | w.Proc_wait_any64(m, 0, 1024, 1028)
+				return w.Proc_wait64(m, 1000, 0, 1024) | w.Proc_wait_any64(m, 0, 1024, 1028) | w.Proc_wait_group64(m, 1, 0, 1024, 1028)
 			}},
 		{"proc_umask, path_open_mode and path_create_directory_mode",
 			func(w *WasiStubs, m *Module, fd int32) int32 {

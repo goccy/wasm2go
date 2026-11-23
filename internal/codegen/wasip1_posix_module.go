@@ -78,6 +78,7 @@ var posixImports = map[string]bool{
 	"proc_user_by_name":          true,
 	"proc_wait":                  true,
 	"proc_wait_any":              true,
+	"proc_wait_group":            true,
 	"sock_bind_addr":             true,
 	"sock_connect":               true,
 	"sock_connect_addr":          true,

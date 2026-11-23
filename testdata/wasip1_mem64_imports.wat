@@ -124,6 +124,8 @@
     (func $proc_wait (param i32 i32 i64) (result i32)))
   (import "wasip1_posix_extension" "proc_wait_any"
     (func $proc_wait_any (param i32 i64 i64) (result i32)))
+  (import "wasip1_posix_extension" "proc_wait_group"
+    (func $proc_wait_group (param i32 i32 i64 i64) (result i32)))
   (import "wasip1_posix_extension" "proc_umask"
     (func $proc_umask (param i32) (result i32)))
   (import "wasip1_posix_extension" "path_open_mode"
@@ -331,6 +333,7 @@
     (drop (call $path_filestat_mode (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_wait (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $proc_wait_any (i32.const 0) (i64.const 0) (i64.const 0)))
+    (drop (call $proc_wait_group (i32.const 0) (i32.const 0) (i64.const 0) (i64.const 0)))
     (drop (call $proc_umask (i32.const 0)))
     (drop (call $path_open_mode (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 0) (i64.const 0)))
     (drop (call $path_create_directory_mode (i64.const 0) (i32.const 0) (i32.const 0)))
