@@ -4920,7 +4920,8 @@ func (w *WasiStubs) NewProc(kill func(sig int32) error) (pid int32, exited func(
 // calls with the POSIX wait status when the copy ends. A signal for the
 // token (Proc_kill) is posted to the copy (PostSignal), and the copy knows
 // the token as its own pid: its Process reports the token as the pid and
-// the pid of w's Process as the ppid, and the rest as w's Process does. Its
+// the pid of w's Process as the ppid (1 once w's process has ended, when w
+// is itself a copy ForkProc made), and the rest as w's Process does. Its
 // kill of the token is a raise, its kill of its ppid reaches the instance
 // that pid names, and its kill of its process group reaches it once.
 // ForkProc is the way to give a copy a pid of its own: a copy made by Fork
@@ -4942,8 +4943,13 @@ func (w *WasiStubs) forkProc(from *Module) (*WasiStubs, int32, *wasiProc) {
 	w.mu.Lock()
 	pid := w.pidsLocked().alloc(ids.PID, ids.PPID)
 	pgid, sid := w.pidsLocked().jobOf(ids.PID)
+	self, _ := w.pidsLocked().find(ids.PID)
 	w.mu.Unlock()
-	child.cfg.Process = forkedProcess{Process: parent, pid: pid, ppid: ids.PID}
+	forked := forkedProcess{Process: parent, pid: pid, ppid: ids.PID}
+	if self != nil {
+		forked.parentDone = self.done
+	}
+	child.cfg.Process = forked
 	return child, pid, &wasiProc{done: make(chan struct{}), instance: child, pgid: pgid, sid: sid}
 }
 
@@ -4957,15 +4963,24 @@ func (w *WasiStubs) enterChild(pid int32, proc *wasiProc) {
 }
 
 // forkedProcess is the Process of a copy made by ForkProc: its pid is its
-// token and its ppid its parent's pid; the rest is its parent's Process.
+// token and its ppid its parent's pid, 1 once the parent has ended
+// (parentDone, its wasiProc's done, which the root's never is; nil when
+// the parent's pid was no longer in the family's table); the rest is its
+// parent's Process.
 type forkedProcess struct {
 	Process
-	pid, ppid int32
+	pid, ppid  int32
+	parentDone <-chan struct{}
 }
 
 func (p forkedProcess) IDs() ProcessIDs {
 	ids := p.Process.IDs()
 	ids.PID, ids.PPID = p.pid, p.ppid
+	select {
+	case <-p.parentDone:
+		ids.PPID = 1
+	default:
+	}
 	return ids
 }
 
