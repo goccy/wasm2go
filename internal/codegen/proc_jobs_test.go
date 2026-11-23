@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -289,12 +290,37 @@ func TestJobs_WaitGroupReapsTheGroupsProcessesOnly(t *testing.T) {
 		t.Fatalf("WNOHANG with the group's process running rc=%d, want -EAGAIN", rc)
 	}
 	secondExited(2 << 8)
-	firstExited(1 << 8)
 	if rc, _, _ := waitGroup(moved, 1); rc != -_wasiEAGAIN {
-		t.Fatalf("WNOHANG with processes of another group finished rc=%d, want -EAGAIN", rc)
+		t.Fatalf("WNOHANG with a process of another group finished rc=%d, want -EAGAIN", rc)
 	}
-	go movedExited(3 << 8)
-	if rc, pid, status := waitGroup(moved, 0); rc != _wasiESUCCESS || pid != moved || status != 3<<8 {
+	// The blocked wait is woken by the end of a process of another group,
+	// scans again (making a new procFinished) and blocks again; the end of
+	// the group's process then ends it. A wait that returns on the wake
+	// instead is reported below.
+	returned := make(chan struct{})
+	ended := whenBlocked(root, func() {
+		defer movedExited(3 << 8)
+		firstExited(1 << 8)
+		for {
+			root.mu.Lock()
+			rescanned := root.procFinished != nil
+			root.mu.Unlock()
+			if rescanned {
+				break
+			}
+			select {
+			case <-returned:
+				return
+			default:
+			}
+			runtime.Gosched()
+		}
+		awaitBlockedCalls(root, 1)
+	})
+	rc, pid, status := waitGroup(moved, 0)
+	close(returned)
+	<-ended
+	if rc != _wasiESUCCESS || pid != moved || status != 3<<8 {
 		t.Fatalf("wait for the child's group = rc %d pid %d status %#x, want pid %d status %#x", rc, pid, status, moved, 3<<8)
 	}
 	if rc, _, _ := waitGroup(moved, 0); rc != -_wasiECHILD {

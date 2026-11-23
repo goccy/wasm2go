@@ -12171,9 +12171,8 @@ type wasiSocket struct {
 	// and getpeername give back; empty for none given.
 	unixLocal, unixPeer string
 	// connecting is the connect(2) a goroutine makes in the host of a
-	// socket in blocking mode (connectInTheHost), under way, or one that
-	// made the connection that no connect of the guest's has reported yet;
-	// nil for none.
+	// socket in blocking mode (connectInTheHost), under way, or one whose
+	// result no call has reported yet (takeHostConnect); nil for none.
 	connecting *hostConnecting
 }
 
@@ -12948,6 +12947,9 @@ func (w *WasiStubs) sockConnectAddr(m *Module, fd int32, addrPtr, pathPtr uint64
 // address a (see Sock_connect_addr). call is the import's name. It reports
 // an errno.
 func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os.File, a wasiSockAddr, path string) int32 {
+	if errno, ok := w.takeHostConnect(call, op, false); ok {
+		return errno
+	}
 	hostPath := ""
 	if a.family == 0 {
 		if op.dgram {
@@ -12975,9 +12977,7 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 			return errno
 		}
 	}
-	// One the host goes on with: not made at once (EINPROGRESS), or
-	// interrupted in the host (EINTR) or under way already (EALREADY).
-	underWay := errors.Is(started, syscall.EINPROGRESS) || errors.Is(started, syscall.EINTR) || errors.Is(started, syscall.EALREADY)
+	underWay := connectUnderWay(started)
 	if (started == nil || underWay) && a.family == wasiSockFamilyUnix {
 		// getpeername asks the host first: the name is the peer's once
 		// the host has a peer.
@@ -13015,9 +13015,11 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 // with EINTR while the connect goes on in the host, as one interrupted by a
 // signal does; a connect of the socket while it is under way waits for it
 // too, or is EALREADY for a socket the guest set non-blocking; one after
-// it made the connection reports that, once, as the connect that waited
-// would have (the host's connect of a connected socket can wait for the
-// listener's room before it tells EISCONN, Linux's AF_UNIX). *started is
+// it returned reports its result, once, but for one the host goes on with
+// (connectUnderWay), as the connect that waited would have (the host's connect of a connected socket can wait for the
+// listener's room before it tells EISCONN, Linux's AF_UNIX), and
+// getsockopt(SO_ERROR) reports a failure, which the host's connect took
+// from the socket, in its place (takeHostConnect). *started is
 // what the guest's connect reports: the connect's result, EINPROGRESS for
 // a socket the guest set non-blocking, or EINTR. The host closes a socket
 // the guest closes meanwhile once the connect has returned.
@@ -13026,11 +13028,11 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 	c := op.sock.connecting
 	nonblocking := op.fdflags&wasiFdflagNonblock != 0
 	if c != nil && closed(c.done) {
-		// made the connection, which no connect has reported yet
+		// returned, which no call has reported yet
 		op.sock.connecting = nil
 		op.mu.Unlock()
-		*started = nil
-		return _wasiESUCCESS
+		*started = c.err
+		return c.errno
 	}
 	if c == nil {
 		c = &hostConnecting{done: make(chan struct{})}
@@ -13038,12 +13040,12 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 		go func() {
 			c.errno = w.socketCall(call, host, func(fd int) { c.err = hostConnect(fd, a, hostPath) })
 			op.mu.Lock()
-			if c.errno != _wasiESUCCESS || c.err != nil {
-				// failed: a later connect makes an attempt of its own
+			if c.errno == _wasiESUCCESS && connectUnderWay(c.err) {
+				// no result: a later connect asks the host itself
 				op.sock.connecting = nil
 			}
-			op.mu.Unlock()
 			close(c.done)
+			op.mu.Unlock()
 		}()
 	} else if nonblocking {
 		op.mu.Unlock()
@@ -13082,6 +13084,32 @@ func closed(done <-chan struct{}) bool {
 	default:
 		return false
 	}
+}
+
+// connectUnderWay reports whether err, of a connect of the host's, is one
+// the host goes on with: not made at once (EINPROGRESS), or interrupted in
+// the host (EINTR) or under way already (EALREADY).
+func connectUnderWay(err error) bool {
+	return errors.Is(err, syscall.EINPROGRESS) || errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EALREADY)
+}
+
+// takeHostConnect reports the result of the connect a goroutine made in the
+// host of the socket op (connectInTheHost) that returned and that no call
+// has reported yet, with failed only a failure, as call's errno, and
+// forgets it; ok is false for none.
+func (w *WasiStubs) takeHostConnect(call string, op *wasiOpen, failed bool) (errno int32, ok bool) {
+	op.mu.Lock()
+	c := op.sock.connecting
+	if c == nil || !closed(c.done) || failed && c.errno == _wasiESUCCESS && c.err == nil {
+		op.mu.Unlock()
+		return 0, false
+	}
+	op.sock.connecting = nil
+	op.mu.Unlock()
+	if c.errno != _wasiESUCCESS {
+		return c.errno, true
+	}
+	return w.guestErrno(call, c.err), true
 }
 
 // Sock_name is a NON-STANDARD host import (module wasip1_posix_extension,
@@ -13388,9 +13416,16 @@ func (w *WasiStubs) sockGetopt(m *Module, fd, option int32, valuePtr uint64) int
 	if out == nil {
 		return -_wasiEFAULT
 	}
-	_, host, errno := w.rawSocketOf(fd)
+	op, host, errno := w.rawSocketOf(fd)
 	if errno != _wasiESUCCESS {
 		return -errno
+	}
+	if option == wasiSockOptError {
+		// a connect in the host took the socket's pending error
+		if errno, failed := w.takeHostConnect("sock_getopt", op, true); failed {
+			binary.LittleEndian.PutUint32(out, uint32(errno))
+			return _wasiESUCCESS
+		}
 	}
 	var value int32
 	var failed error

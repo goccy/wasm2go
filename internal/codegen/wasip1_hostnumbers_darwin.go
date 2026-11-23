@@ -260,6 +260,17 @@ var hostNumbers = map[int32][]hostNumber{
 		{"F_GETOWN", int64(syscall.F_GETOWN)},
 		{"F_SETOWN", int64(syscall.F_SETOWN)},
 	},
+	21: { // ioctl
+		{"TIOCEXCL", int64(syscall.TIOCEXCL)},
+		{"TIOCNXCL", int64(syscall.TIOCNXCL)},
+		{"TIOCSCTTY", int64(syscall.TIOCSCTTY)},
+		{"TIOCGPGRP", int64(syscall.TIOCGPGRP)},
+		{"TIOCSPGRP", int64(syscall.TIOCSPGRP)},
+		{"TIOCOUTQ", int64(syscall.TIOCOUTQ)},
+		{"TIOCGWINSZ", int64(syscall.TIOCGWINSZ)},
+		{"TIOCSWINSZ", int64(syscall.TIOCSWINSZ)},
+		{"TIOCNOTTY", int64(syscall.TIOCNOTTY)},
+	},
 	23: { // termios
 		{"VEOF", int64(syscall.VEOF)},
 		{"VEOL", int64(syscall.VEOL)},

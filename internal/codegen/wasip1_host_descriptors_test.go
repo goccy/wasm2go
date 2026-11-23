@@ -1065,6 +1065,57 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		if _, rc := acceptOn(w, m, server); rc != _wasiESUCCESS {
 			t.Fatalf("accept of the connection made in the host rc=%d", rc)
 		}
+
+		// A connect that went on in the host and failed reports the failure
+		// once, as Linux does: to getsockopt(SO_ERROR), or to the next
+		// connect, blocking or not.
+		filler := openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+		if rc := w.Sock_connect_addr(m, filler, sockAddrOff, sockPathOff, n); rc != _wasiESUCCESS {
+			t.Fatalf("connect filling the backlog rc=%d", rc)
+		}
+		var late [3]int32
+		for i := range late {
+			late[i] = openSocket(t, w, m, wasiSockFamilyUnix, wasiSockTypeStream)
+			postWhenBlocked(w, wasiSIGUSR1)
+			if rc := w.Sock_connect_addr(m, late[i], sockAddrOff, sockPathOff, n); rc != -_wasiEINTR {
+				t.Fatalf("connect %d to a full backlog with a signal rc=%d, want -EINTR", i, rc)
+			}
+			takeSignals(t, w, m)
+		}
+		// the listener's close refuses the connects waiting for its room
+		closeTestFd(t, w, m, server)
+		for _, fd := range late {
+			op := entryOf(t, w, fd)
+			op.mu.Lock()
+			c := op.sock.connecting
+			op.mu.Unlock()
+			if c == nil {
+				t.Fatalf("no connect of %d under way in the host after the interrupted one", fd)
+			}
+			within(t, "the connect in the host", c.done)
+		}
+		// a connect of its own now fails otherwise
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if v, rc := getOpt(w, m, late[0], wasiSockOptError); rc != _wasiESUCCESS || v != _wasiECONNREFUSED {
+			t.Fatalf("SO_ERROR after the connect in the host was refused = %d rc=%d, want ECONNREFUSED", v, rc)
+		}
+		if v, rc := getOpt(w, m, late[0], wasiSockOptError); rc != _wasiESUCCESS || v != 0 {
+			t.Fatalf("SO_ERROR read again = %d rc=%d, want 0", v, rc)
+		}
+		if rc := w.Sock_connect_addr(m, late[1], sockAddrOff, sockPathOff, n); rc != -_wasiECONNREFUSED {
+			t.Fatalf("connect after the connect in the host was refused rc=%d, want -ECONNREFUSED", rc)
+		}
+		if rc := w.Sock_connect_addr(m, late[1], sockAddrOff, sockPathOff, n); rc != -_wasiENOENT {
+			t.Fatalf("connect after the refusal was reported rc=%d, want -ENOENT", rc)
+		}
+		if rc := w.Fd_fdstat_set_flags(m, late[2], wasiFdflagNonblock); rc != _wasiESUCCESS {
+			t.Fatalf("NONBLOCK rc=%d", rc)
+		}
+		if rc := w.Sock_connect_addr(m, late[2], sockAddrOff, sockPathOff, n); rc != -_wasiECONNREFUSED {
+			t.Fatalf("non-blocking connect after the connect in the host was refused rc=%d, want -ECONNREFUSED", rc)
+		}
 	})
 
 	// A command gets the guest's descriptors above 2 that are not
@@ -1803,5 +1854,96 @@ func TestHostDescriptorsPollerInAProcess(t *testing.T) {
 	}
 	if !slices.Equal(before, after) {
 		t.Fatalf("descriptors before a pipe %v, after %v: the poller was made later", before, after)
+	}
+}
+
+// hostUnlistedEnv marks the process TestHostDescriptorsUnlisted starts.
+const hostUnlistedEnv = "WASM2GO_HOST_DESCRIPTORS_UNLISTED"
+
+// When the descriptors the process has open cannot be listed, every open
+// one is the process's but those the runtime has: the guest's dup2 onto
+// one is refused, while a file of Files at its own number and a dup2 onto
+// a free number are the guest's. It runs in a process of its own, whose
+// first instance with the host's descriptors finds no list.
+func TestHostDescriptorsUnlisted(t *testing.T) {
+	if os.Getenv(hostUnlistedEnv) != "" {
+		t.Skip("this is the process of the test")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHostDescriptorsUnlistedInAProcess$", "-test.v")
+	cmd.Env = append(os.Environ(), hostUnlistedEnv+"=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("the process of the test: %v\n%s", err, out)
+	}
+}
+
+// TestHostDescriptorsUnlistedInAProcess is the process of
+// TestHostDescriptorsUnlisted.
+func TestHostDescriptorsUnlistedInAProcess(t *testing.T) {
+	if os.Getenv(hostUnlistedEnv) == "" {
+		t.Skip("run by TestHostDescriptorsUnlisted")
+	}
+	hostDescriptorsDir = filepath.Join(t.TempDir(), "missing")
+	own, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeAtEnd(t, own)
+	given, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	givenFD := int32(entryHostNumberOf(t, given))
+	var listErr error
+	w := NewWASI(WASIConfig{
+		FS:              newHostFS(t, t.TempDir()),
+		Stdin:           bytes.NewReader(nil),
+		Stdout:          &bytes.Buffer{},
+		Stderr:          &bytes.Buffer{},
+		Files:           map[int32]*os.File{givenFD: given},
+		HostDescriptors: true,
+		Errors: func(op string, err error) {
+			if op == "host_descriptors" && listErr == nil && errors.Is(err, os.ErrNotExist) {
+				listErr = err
+				return
+			}
+			t.Errorf("%s: %v", op, err)
+		},
+	})
+	t.Cleanup(func() {
+		if err := w.CloseAll(); err != nil {
+			t.Errorf("CloseAll: %v", err)
+		}
+	})
+	if listErr == nil {
+		t.Fatal("the failure to list the descriptors was not told")
+	}
+	m := newGuestModule(1 << 16)
+	fd := createTestFile(t, w, "a.txt")
+	if !w.hostSlotHeld(givenFD) {
+		t.Fatalf("the given %d is not the guest's slot", givenFD)
+	}
+	ownFD := entryHostNumberOf(t, own)
+	if rc := w.Fd_dup2(m, fd, int32(ownFD)); rc != _wasiEBUSY {
+		t.Fatalf("dup2 onto the process's %d rc=%d, want EBUSY", ownFD, rc)
+	}
+	if !sameHostFile(t, ownFD, int(givenFD)) {
+		t.Fatalf("the process's %d is not %s any more", ownFD, os.DevNull)
+	}
+	free := lowestFreeHost(t)
+	if rc := w.Fd_dup2(m, fd, free); rc != _wasiESUCCESS {
+		t.Fatalf("dup2 onto the free %d rc=%d", free, rc)
+	}
+	if !sameHostFile(t, int(free), int(fd)) {
+		t.Fatalf("host's %d is not the file", free)
+	}
+	// the number of the file of Files, once the guest closed it, is the
+	// process's when code outside the guest opens something there
+	closeTestFd(t, w, m, givenFD)
+	if err := hostDupTo(ownFD, int(givenFD)); err != nil {
+		t.Fatal(err)
+	}
+	closeFDAtEnd(t, int(givenFD))
+	if rc := w.Fd_dup2(m, fd, givenFD); rc != _wasiEBUSY {
+		t.Fatalf("dup2 onto the process's %d, closed by the guest and opened again, rc=%d, want EBUSY", givenFD, rc)
 	}
 }

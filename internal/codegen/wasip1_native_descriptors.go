@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -56,8 +57,13 @@ var hostTable struct {
 	// recorded (startHostNumbers).
 	started bool
 	// adoptable is set when they were: without the record, no descriptor
-	// is taken in by its number.
+	// is taken in by its number, and every open one is the process's but
+	// those the runtime has (reservedLocked).
 	adoptable bool
+	// given holds the numbers of the files of Files of the instances whose
+	// descriptors are the host's that are not placed yet (placeFileLocked),
+	// which are not the process's.
+	given map[int]bool
 	// held maps a slot descriptor to the instance whose slot it is.
 	held map[int]*WasiStubs
 	// reserved holds the descriptors the process had open when its first
@@ -86,12 +92,16 @@ var hostTable struct {
 // guests' numbers, and records, the first time, the descriptors the process
 // has open as its own (hostTable.reserved); the descriptors of files, which
 // are given to the guest, are not. A failure to record them leaves every
-// descriptor of the process out of the guests' reach, and is returned.
+// descriptor of the process out of the guests' reach (reservedLocked), and
+// is returned.
 func startHostNumbers(files map[int32]*os.File) error {
 	hostTable.active.Store(true)
 	hostTable.mu.Lock()
 	defer hostTable.mu.Unlock()
-	given := map[int]bool{}
+	if hostTable.given == nil {
+		hostTable.given = map[int]bool{}
+	}
+	given := hostTable.given
 	for _, f := range files {
 		if f == nil {
 			continue
@@ -156,9 +166,15 @@ func hostIdentityOf(fd int) (id hostIdentity, ok bool) {
 // One that is closed, or open on another file, is the process's no longer,
 // and is forgotten: its owner closed it, and the number was given to
 // something else since. (A file the host gives the identity of one closed
-// before, a new pipe on darwin say, is taken for the old one.) Caller holds
-// hostTable.mu.
+// before, a new pipe on darwin say, is taken for the old one.) Without the
+// record (hostTable.adoptable), every open descriptor is the process's but
+// an instance's slot, a standard descriptor instances share, and a file of
+// Files. Caller holds hostTable.mu.
 func reservedLocked(fd int) bool {
+	if !hostTable.adoptable {
+		_, open := hostIdentityOf(fd)
+		return open && hostTable.held[fd] == nil && !hostTable.given[fd] && (fd > 2 || len(hostTable.standard[fd]) == 0)
+	}
 	id, ok := hostTable.reserved[fd]
 	if !ok {
 		return false
@@ -170,24 +186,35 @@ func reservedLocked(fd int) bool {
 	return false
 }
 
-// openHostDescriptors returns the descriptors the host process has open:
-// the names of /dev/fd that are still open once the directory is read (the
-// one the reading itself used is not).
+// hostDescriptorsDir is the directory whose names are the descriptors the
+// host process has open (openHostDescriptors).
+var hostDescriptorsDir = "/dev/fd"
+
+// openHostDescriptors returns the descriptors the host process has open, in
+// order: the names of hostDescriptorsDir that are still open once the
+// directory is read (the one the reading itself used is not).
 func openHostDescriptors() ([]int, error) {
-	entries, err := os.ReadDir("/dev/fd")
+	dir, err := os.Open(hostDescriptorsDir)
 	if err != nil {
 		return nil, err
 	}
+	// Not os.ReadDir: on darwin it lstats the entries, which fails for a
+	// descriptor closed meanwhile.
+	names, err := dir.Readdirnames(-1)
+	if err := errors.Join(err, dir.Close()); err != nil {
+		return nil, err
+	}
 	var open []int
-	for _, e := range entries {
-		fd, err := strconv.Atoi(e.Name())
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
 		if err != nil {
-			return nil, fmt.Errorf("/dev/fd: %w", err)
+			return nil, fmt.Errorf("%s: %w", hostDescriptorsDir, err)
 		}
 		if _, err := descriptorFlags(fd, syscall.F_GETFD); err == nil {
 			open = append(open, fd)
 		}
 	}
+	slices.Sort(open)
 	return open, nil
 }
 
@@ -761,10 +788,13 @@ func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
 		op, err = hostDescriptorEntry(at, f.Name(), false)
 		return err
 	}); err != nil {
+		forgetGiven(at)
 		return errors.Join(err, f.Close())
 	}
-	if err := w.placeHostSlotLocked(fd, op); err != nil {
-		return errors.Join(fmt.Errorf("descriptor %d: %w", fd, err), closeWasiOpen(op), f.Close())
+	placed := w.placeHostSlotLocked(fd, op)
+	forgetGiven(at)
+	if placed != nil {
+		return errors.Join(fmt.Errorf("descriptor %d: %w", fd, placed), closeWasiOpen(op), f.Close())
 	}
 	var err error
 	if at == int(fd) {
@@ -779,6 +809,15 @@ func (w *WasiStubs) placeFileLocked(fd int32, f *os.File) error {
 	}
 	w.replaceSlotLocked("files", fd, op)
 	return err
+}
+
+// forgetGiven drops at from hostTable.given once the file of Files open
+// there is placed or about to be closed (placeFileLocked): a placed number
+// is held, and a closed one is no file of Files.
+func forgetGiven(at int) {
+	hostTable.mu.Lock()
+	defer hostTable.mu.Unlock()
+	delete(hostTable.given, at)
 }
 
 // hostDescriptorEntry returns an entry of descriptor fd of the host, which
