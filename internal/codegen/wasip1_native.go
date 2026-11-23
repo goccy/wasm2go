@@ -3331,11 +3331,18 @@ type WASIConfig struct {
 	Resolve func(host string) bool
 	// Exec is consulted before every Proc_spawn and Proc_exec, which run a
 	// host binary, with what the command runs (ExecRequest): the command is
-	// started from that very value. Returning false denies the spawn
-	// (EACCES). nil denies every one. A command is a process of the host:
-	// it sees the host's filesystem, not FS, and only an FS that is a
-	// HostRootFS can start one (ENOSYS otherwise).
+	// started from that very value, in the directory CommandDir gives for
+	// its Dir. Returning false denies the spawn (EACCES). nil denies every
+	// one. A command is a process of the host: it sees the host's
+	// filesystem, not FS, and only an FS that is a HostRootFS can start one
+	// (ENOSYS otherwise).
 	Exec func(req ExecRequest) bool
+	// CommandDir returns the host directory a command the guest starts runs
+	// in, given dir, the host path of the guest's working directory
+	// (ExecRequest.Dir, after Exec allowed the command): "" starts it in the
+	// host process's working directory, which it inherits without changing
+	// into it. Its error is the guest's spawn's errno. nil starts it in dir.
+	CommandDir func(dir string) (string, error)
 	// Process supplies the guest's identity and accounting: what getpid,
 	// getppid, the getuid family and times report, the pid whose
 	// /proc/PID/fd lists the guest's descriptors, and the umask the guest
@@ -5244,8 +5251,8 @@ func (w *WasiStubs) readCStrArray(m *Module, abi wasiABI, ptr uint64) (out []str
 // instance's own (commandStreamLocked, startCommand). cwdPtr is the
 // guest's working directory, a guest path of the FS: the command starts in
 // its host path (ExecRequest.Dir), the root of the FS for an empty one, not
-// the host process's working directory. The new pid token is written at
-// pidOutPtr. Returns 0 or a negative errno.
+// the host process's working directory, unless CommandDir says otherwise.
+// The new pid token is written at pidOutPtr. Returns 0 or a negative errno.
 func (w *WasiStubs) Proc_spawn(m *Module, pathPtr, argvPtr, envpPtr, stdinFd, stdoutFd, stderrFd, cwdPtr, pidOutPtr int32) int32 {
 	return w.procSpawn(m, wasiABI32, zext(pathPtr), zext(argvPtr), zext(envpPtr), stdinFd, stdoutFd, stderrFd, zext(cwdPtr), zext(pidOutPtr))
 }
@@ -5386,12 +5393,13 @@ const defaultCommandPath = "/usr/local/bin:/bin:/usr/bin"
 // (looked up by lookCommand when it has no "/"), argv and env the
 // command's, and cwd the guest's working directory, which a relative name
 // is taken from. The executable and the directory are the host's absolute
-// paths of their names in the FS (HostRootFS). It returns a wasi errno: EACCES
-// without a policy or when it refuses, ENOSYS when the FS is no
-// HostRootFS, guestName's and the lookup's.
+// paths of their names in the FS (HostRootFS), the directory then as
+// CommandDir gives it. It returns a wasi errno: EACCES without a policy or
+// when it refuses, ENOSYS when the FS is no HostRootFS, guestName's, the
+// lookup's and CommandDir's.
 func (w *WasiStubs) commandRequest(op, file string, argv, env []string, cwd string) (ExecRequest, int32) {
 	w.mu.Lock()
-	hook := w.cfg.Exec
+	hook, commandDir := w.cfg.Exec, w.cfg.CommandDir
 	fsys, isHost := w.fs().(HostRootFS)
 	w.mu.Unlock()
 	switch {
@@ -5430,6 +5438,11 @@ func (w *WasiStubs) commandRequest(op, file string, argv, env []string, cwd stri
 	req := ExecRequest{Path: hostPathIn(root, name), Argv: argv, Env: env, Dir: hostPathIn(root, dir)}
 	if !hook(req) {
 		return ExecRequest{}, _wasiEACCES
+	}
+	if commandDir != nil {
+		if req.Dir, err = commandDir(req.Dir); err != nil {
+			return ExecRequest{}, w.guestErrno(op, err)
+		}
 	}
 	return req, _wasiESUCCESS
 }
