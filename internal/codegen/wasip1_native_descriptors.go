@@ -45,8 +45,10 @@ var hostTable struct {
 	// (startCommand), as package syscall makes descriptors for it under
 	// numbers the runtime cannot move; and for writing while a guest takes in
 	// a descriptor that is nobody's (adoptHostLocked), which must not be one
-	// of those. It is taken after a WasiStubs' mu, never before, and no
-	// WasiStubs' mu is taken under the read lock.
+	// of those, and while a new slot gets the lowest free number
+	// (hostSlotLocked), which one of those would take. It is taken after a
+	// WasiStubs' mu, never before, and no WasiStubs' mu is taken under the
+	// read lock.
 	making sync.RWMutex
 	// mu guards the fields below and makes the placements of the guests'
 	// descriptors (hostSlotLocked, placeHostSlotLocked) one at a time. It is
@@ -426,6 +428,11 @@ func (w *WasiStubs) withSlotSourceLocked(op *wasiOpen, use func(fd int) error) e
 // Caller holds w.mu.
 func (w *WasiStubs) hostSlotLocked(op *wasiOpen, min int32) (int32, error) {
 	fds := w.fdsLocked() // set up before hostTable.mu is taken (takeStandardLocked)
+	// A descriptor the runtime is making is under a number of the guests'
+	// until it is moved (makeRuntimeDescriptors): the host gives the lowest
+	// number that is free for the guest only while none is.
+	hostTable.making.Lock()
+	defer hostTable.making.Unlock()
 	hostTable.mu.Lock()
 	defer hostTable.mu.Unlock()
 	for {

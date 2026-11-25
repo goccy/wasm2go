@@ -639,6 +639,57 @@ func TestHostDescriptorsInAProcess(t *testing.T) {
 		}
 	})
 
+	// A new slot made while the runtime makes a descriptor, which is under
+	// a number of the guests' until it is moved, gets the lowest number the
+	// host has free once it is moved.
+	t.Run("NewDescriptorWhileTheRuntimeMakesOne", func(t *testing.T) {
+		w, _ := newHostNumberedStubs(t, nil, nil)
+		want := lowestFreeHost(t)
+		made := make(chan int)
+		proceed := make(chan struct{})
+		maker := make(chan error, 1)
+		go func() {
+			maker <- makeRuntimeDescriptors(func() error {
+				r, wr, err := hostWakePipe()
+				if err != nil {
+					return err
+				}
+				made <- r
+				<-proceed
+				if r, err = keepRuntimeFD(r); err != nil {
+					return errors.Join(err, hostCloseFD(wr))
+				}
+				if wr, err = keepRuntimeFD(wr); err != nil {
+					return errors.Join(err, hostCloseFD(r))
+				}
+				return errors.Join(hostCloseFD(r), hostCloseFD(wr))
+			})
+		}()
+		var r int
+		select {
+		case r = <-made:
+		case err := <-maker:
+			t.Fatalf("making the pipe: %v", err)
+		}
+		type opened struct{ fd, errno int32 }
+		open := make(chan opened, 1)
+		go func() {
+			fd, errno := w.pathOpen(nil, "a.txt", 0, 0x1 /* O_CREAT */, 1<<6 /* FD_WRITE */, 0)
+			open <- opened{fd, errno}
+		}()
+		close(proceed)
+		if err := <-maker; err != nil {
+			t.Fatalf("making the pipe: %v", err)
+		}
+		got := <-open
+		if got.errno != _wasiESUCCESS {
+			t.Fatalf("pathOpen errno=%d", got.errno)
+		}
+		if r != int(want) || got.fd != want {
+			t.Fatalf("the runtime's pipe at %d and the guest's file at %d, want both at %d, the host's lowest free", r, got.fd, want)
+		}
+	})
+
 	// The sockets of the guest's — made, of a pair, accepted — are the
 	// guest's numbers, their own descriptors above the floor.
 	t.Run("GuestSockets", func(t *testing.T) {
