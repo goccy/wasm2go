@@ -13767,8 +13767,10 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 	}); errno != _wasiESUCCESS {
 		return errno
 	}
+	var interrupted bool
 	if blocking {
-		if errno := w.connectInTheHost(m, call, op, host, a, hostPath, &started); errno != _wasiESUCCESS {
+		var errno int32
+		if errno, interrupted = w.connectInTheHost(m, call, op, host, a, hostPath, &started); errno != _wasiESUCCESS {
 			return errno
 		}
 	}
@@ -13780,7 +13782,11 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 		op.sock.unixPeer = a.name
 		op.mu.Unlock()
 	}
-	if !underWay || op.nonblocking() || blocking {
+	// A blocking connect whose connect(2) a signal of the host process
+	// interrupted goes on in the host, and is waited for as one the host
+	// did not make at once; any other result of a blocking connect is the
+	// host's (EINPROGRESS: its send timeout passed).
+	if !underWay || op.nonblocking() || blocking && (interrupted || !errors.Is(started, syscall.EINTR)) {
 		return w.guestErrno(call, started)
 	}
 	if errno := w.socketWait(m, call, op, host, hostWantRoom, false, _wasiEINPROGRESS, hostConnectDone); errno != _wasiESUCCESS {
@@ -13816,9 +13822,14 @@ func (w *WasiStubs) connectSocket(m *Module, call string, op *wasiOpen, host *os
 // getsockopt(SO_ERROR) reports a failure, which the host's connect took
 // from the socket, in its place (takeHostConnect). *started is
 // what the guest's connect reports: the connect's result, EINPROGRESS for
-// a socket the guest set non-blocking, or EINTR. The host closes a socket
-// the guest closes meanwhile once the connect has returned.
-func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host *os.File, a wasiSockAddr, hostPath string, started *error) int32 {
+// a socket the guest set non-blocking, or EINTR, with interrupted, for a
+// signal posted to the guest. The connect's result may itself be EINTR: the
+// host's connect(2) was interrupted by a signal of the host process (the Go
+// runtime's own; darwin restarts no connect, nor Linux one with a send
+// timeout), and the connection goes on in the host (connectSocket waits for
+// it). The host closes a socket the guest
+// closes meanwhile once the connect has returned.
+func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host *os.File, a wasiSockAddr, hostPath string, started *error) (errno int32, interrupted bool) {
 	op.mu.Lock()
 	c := op.sock.connecting
 	nonblocking := op.fdflags&wasiFdflagNonblock != 0
@@ -13827,7 +13838,7 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 		op.sock.connecting = nil
 		op.mu.Unlock()
 		*started = c.err
-		return c.errno
+		return c.errno, false
 	}
 	if c == nil {
 		c = &hostConnecting{done: make(chan struct{})}
@@ -13845,12 +13856,12 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 	} else if nonblocking {
 		op.mu.Unlock()
 		*started = syscall.EALREADY
-		return _wasiESUCCESS
+		return _wasiESUCCESS, false
 	}
 	op.mu.Unlock()
 	if nonblocking {
 		*started = syscall.EINPROGRESS
-		return _wasiESUCCESS
+		return _wasiESUCCESS, false
 	}
 	interrupted, _, refused := w.blockingAttempt(m, func() {}, nil, func(stop <-chan struct{}) {
 		select {
@@ -13860,7 +13871,7 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 	})
 	if interrupted || refused {
 		*started = syscall.EINTR
-		return _wasiESUCCESS
+		return _wasiESUCCESS, true
 	}
 	op.mu.Lock()
 	if op.sock.connecting == c {
@@ -13868,7 +13879,7 @@ func (w *WasiStubs) connectInTheHost(m *Module, call string, op *wasiOpen, host 
 	}
 	op.mu.Unlock()
 	*started = c.err
-	return c.errno
+	return c.errno, false
 }
 
 // closed reports whether done has been closed.
